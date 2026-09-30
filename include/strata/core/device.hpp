@@ -38,6 +38,30 @@ std::string gpu_arch_problem(int ordinal);
 // The GPU architectures this binary was compiled for ("gfx1100,gfx1201"); "" on CUDA builds.
 const char* compiled_gpu_archs();
 
+// The compute-capability floor this BINARY admits at run time.  A release build is sm_75 (Turing): the QSA
+// scorer's tf32 mma has a portable fp32-FMA fallback below sm_80 and the tensor-core prompt kernels refuse, but
+// nothing in the arithmetic needs more than that.  -DSTRATA_EXPERIMENTAL_SM60=ON lowers the floor to the Pascal
+// generation that flag exists for; Volta (7.0) sits between that floor and the release one, so the same switch
+// admits it.  The compile-time half of this policy is in CMakeLists.txt.
+#if defined(STRATA_EXPERIMENTAL_SM60)
+inline constexpr int kMinComputeCapability = 60;
+#else
+inline constexpr int kMinComputeCapability = 75;
+#endif
+
+// Why a card reporting `cc_major`.`cc_minor` cannot run this binary, or "" when it can - the sentence
+// `device_info` throws with the device's name in front of it.  Header-only and CUDA-free on purpose: this policy
+// decides whether an sm_70;sm_86 binary runs, and on a host with no GPU the only way to check it is to call it
+// directly.  Keeping it here rather than inline in device.cu is what makes that check possible.
+inline std::string compute_capability_problem(int cc_major, int cc_minor) {
+    if (cc_major * 10 + cc_minor >= kMinComputeCapability) return "";
+    return "reports compute capability " + std::to_string(cc_major) + "." + std::to_string(cc_minor) +
+           "; Strata needs compute capability " + std::to_string(kMinComputeCapability / 10) + "." +
+           std::to_string(kMinComputeCapability % 10) +
+           (kMinComputeCapability < 75 ? " or newer in an experimental SM60 build"
+                                       : " or newer (RTX 20 / 30 / 40 / 50 series)");
+}
+
 // Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
 // run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).

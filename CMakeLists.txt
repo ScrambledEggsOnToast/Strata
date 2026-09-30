@@ -96,6 +96,11 @@ if(STRATA_ENABLE_CUDA)
     endif()
   endforeach()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  # The flag has to REACH the sources.  Until now STRATA_EXPERIMENTAL_SM60 was a configure-time variable only, so
+  # src/core/device.cu's startup admission check kept refusing the Pascal/Volta cards whose code this build emits.
+  if(STRATA_EXPERIMENTAL_SM60)
+    add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
+  endif()
   set(_strata_gpu_runtime_target CUDA::cudart)
   set(_strata_gpu_blas_target CUDA::cublas)
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -840,6 +845,13 @@ endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
+  # The startup admission policy is a header-only predicate (include/strata/core/device.hpp) precisely so it can be
+  # checked on a host with no GPU: the engine's own refusal is only reachable through a real card showing an old cc.
+  # It is registered here because it needs no GPU backend and links no project library - only the header.
+  add_executable(compute_capability_test tests/core/compute_capability_test.cpp)
+  target_include_directories(compute_capability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(compute_capability_test PRIVATE strata_warnings)
+  add_test(NAME compute_capability_test COMMAND compute_capability_test)
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
