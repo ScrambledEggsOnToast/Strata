@@ -258,29 +258,27 @@ void test_cgroup_memory_budget() {
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
-    CgroupMemoryStat clean_cache{40 * GiB, 32 * GiB, 0, 0, true};
+    CgroupMemoryStat clean_cache{40 * GiB, 8 * GiB, 24 * GiB, 32 * GiB, 0, 0, 0, 0, true};
     require(cgroup_available_bytes(56 * GiB, clean_cache, bytes), "valid cgroup memory.stat was rejected");
-    require(bytes == 48 * GiB, "clean inactive file cache was not credited against the cgroup cap");
+    require(bytes == 48 * GiB, "clean active and inactive cache was not credited");
 
-    CgroupMemoryStat dirty_cache{40 * GiB, 32 * GiB, 4 * GiB, 2 * GiB, true};
-    require(cgroup_available_bytes(56 * GiB, dirty_cache, bytes), "valid dirty-cache counters were rejected");
-    require(bytes == 42 * GiB, "dirty/writeback pages were incorrectly counted as reclaimable");
+    CgroupMemoryStat protected_cache{40 * GiB, 8 * GiB, 24 * GiB, 32 * GiB,
+                                     3 * GiB, 1 * GiB, 4 * GiB, 2 * GiB, true};
+    require(cgroup_available_bytes(56 * GiB, protected_cache, bytes), "valid protected cache was rejected");
+    require(bytes == 38 * GiB, "shmem, unevictable, dirty or writeback pages were credited");
 
-    CgroupMemoryStat oversized_inactive{10 * GiB, 20 * GiB, 0, 0, true};
-    require(cgroup_available_bytes(12 * GiB, oversized_inactive, bytes),
-            "valid oversized inactive-file counter was rejected");
-    require(bytes == 12 * GiB, "inactive-file accounting exceeded charged current usage");
+    CgroupMemoryStat oversized_lru{10 * GiB, 20 * GiB, 20 * GiB, 4 * GiB, 0, 0, 0, 0, true};
+    require(cgroup_available_bytes(12 * GiB, oversized_lru, bytes), "oversized LRU was rejected");
+    require(bytes == 6 * GiB, "file charge did not bound cache credit");
 
     const uint64_t max = std::numeric_limits<uint64_t>::max();
-    CgroupMemoryStat large_counters{max, max, max - 1, max, true};
-    require(cgroup_available_bytes(max, large_counters, bytes),
-            "large memory.stat counters were rejected");
-    require(bytes == 0, "dirty/writeback subtraction overflowed or escaped the usage cap");
+    CgroupMemoryStat large_counters{max, max, max, max, 0, 0, max - 1, max, true};
+    require(cgroup_available_bytes(max, large_counters, bytes), "large counters were rejected");
+    require(bytes == 0, "cache accounting overflowed or escaped the usage cap");
 
-    CgroupMemoryStat usage_over_limit{60 * GiB, 0, 0, 0, true};
-    require(cgroup_available_bytes(56 * GiB, usage_over_limit, bytes),
-            "valid over-limit memory counters were rejected");
-    require(bytes == 0, "over-limit cgroup usage produced a positive budget");
+    CgroupMemoryStat usage_over_limit{60 * GiB, 0, 0, 0, 0, 0, 0, 0, true};
+    require(cgroup_available_bytes(56 * GiB, usage_over_limit, bytes), "over-limit counters were rejected");
+    require(bytes == 0, "over-limit usage produced a positive budget");
 
     CgroupMemoryStat missing_stat{};
     bytes = 123;

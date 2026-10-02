@@ -47,12 +47,14 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
     bytes = 0;
     if (!stat.valid) return false;
 
-    // memory.stat's inactive_file can race memory.current, so bound it to charged usage first.
-    uint64_t reclaimable = std::min(stat.inactive_file, stat.current);
-    reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
-    reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
-
-    // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
+    // Active file pages can be reclaimed under pressure too. Bound the file LRU by
+    // the file charge and current usage; shmem, dirty/writeback and unevictable
+    // pages are not safe admission credit (overlap is deliberately conservative).
+    const uint64_t lru = stat.active_file > UINT64_MAX - stat.inactive_file
+        ? UINT64_MAX : stat.active_file + stat.inactive_file;
+    uint64_t reclaimable = std::min({lru, stat.file, stat.current});
+    for (uint64_t excluded : {stat.shmem, stat.file_dirty, stat.file_writeback, stat.unevictable})
+        reclaimable = excluded >= reclaimable ? 0 : reclaimable - excluded;
     const uint64_t usage_after_reclaim = stat.current - reclaimable;
     bytes = usage_after_reclaim < limit ? limit - usage_after_reclaim : 0;
     return true;
@@ -172,7 +174,8 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
     std::ifstream input(path / "memory.stat");
     if (!input) return false;
 
-    bool inactive_file = false, file_dirty = false, file_writeback = false;
+    bool inactive_file = false, active_file = false, file = false, shmem = false;
+    bool unevictable = false, file_dirty = false, file_writeback = false;
     std::string line;
     while (std::getline(input, line)) {
         std::istringstream fields(line);
@@ -186,6 +189,22 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
             if (inactive_file) return false;
             inactive_file = true;
             stat.inactive_file = value;
+        } else if (key == "active_file") {
+            if (active_file) return false;
+            active_file = true;
+            stat.active_file = value;
+        } else if (key == "file") {
+            if (file) return false;
+            file = true;
+            stat.file = value;
+        } else if (key == "shmem") {
+            if (shmem) return false;
+            shmem = true;
+            stat.shmem = value;
+        } else if (key == "unevictable") {
+            if (unevictable) return false;
+            unevictable = true;
+            stat.unevictable = value;
         } else if (key == "file_dirty") {
             if (file_dirty) return false;
             file_dirty = true;
@@ -196,7 +215,8 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
             stat.file_writeback = value;
         }
     }
-    if (!input.eof() || !inactive_file || !file_dirty || !file_writeback) return false;
+    if (!input.eof() || !inactive_file || !active_file || !file || !shmem || !unevictable ||
+        !file_dirty || !file_writeback) return false;
     stat.current = current;
     stat.valid = true;
     return true;

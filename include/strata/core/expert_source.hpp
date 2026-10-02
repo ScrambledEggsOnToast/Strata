@@ -41,17 +41,21 @@ namespace detail {
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
 inline constexpr uint64_t kNoCacheComplement = ~uint64_t{0};
 
-/// Required cgroup-v2 usage counters for the conservative cache-reclaim allowance.
+/// Required cgroup-v2 usage counters for the clean file-cache reclaim allowance.
 struct CgroupMemoryStat {
     uint64_t current = 0;
     uint64_t inactive_file = 0;
+    uint64_t active_file = 0;
+    uint64_t file = 0;
+    uint64_t shmem = 0;
+    uint64_t unevictable = 0;
     uint64_t file_dirty = 0;
     uint64_t file_writeback = 0;
     bool valid = false;
 };
 
-/// Calculate additional bytes under a finite cgroup limit after reclaiming only clean inactive file cache.
-/// Returns false when the required memory.stat counters were unavailable.
+/// Calculate additional bytes under a finite cgroup limit after clean file-cache reclaim.
+/// Excludes shmem, dirty/writeback and unevictable charges; missing counters fail closed.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
