@@ -1410,6 +1410,40 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: positive --max-new and --max-context must fit the prompt and generation\n");
         return 2;
     }
+    // **A DUMP MUST DESCRIBE THE FILE IT WRITES.**  The logits header counts one row per position from 0
+    // (`logits_selection::row_count` over `n_prompt - 1 + max_new`), and the batched prompt path computes no
+    // logits at all, so a run that dumps walks the prompt one position at a time instead of batching it: that
+    // loop is the teacher-forced oracle, and batching the same positions would silently drop their rows.
+    // (Defect #57: a native pack broke out of that loop before its first row, so the header claimed 222 rows
+    // and the file held none.)  The predicate is read from the options, not from the open handles, because the
+    // prompt path's VRAM reservation is priced far earlier than the dump is opened -- reserving buffers the
+    // oracle run will never allocate is exactly how a dumpable run stops fitting.
+    const bool dump_requested = !o.dump_logits.empty() || !o.dump_layers.empty();
+    // A dump is written by the per-position CLI loop, so it is a CLI mode: a serve run batches its prompt and
+    // writes no rows, so the flags are refused there rather than honoured into an empty file.
+    const bool oracle_dump = dump_requested && !o.serve;
+    if (dump_requested && o.serve) {
+        std::fprintf(stderr, "strata generate: --dump-logits/--dump-layers write one row per position and belong "
+                             "to the CLI per-position path; --serve batches its prompt and writes none. Drop "
+                             "--serve or drop the dump.\n");
+        return 2;
+    }
+    // `--prefill-until` exists to compare the batched prefix against the teacher-forced one; a dump that walks
+    // every position itself cannot also validate a batched prefix.
+    if (oracle_dump && o.prefill_until > 0) {
+        std::fprintf(stderr, "strata generate: --prefill-until and a logits dump are mutually exclusive: the "
+                             "batched prefix computes no rows, and those are exactly the rows it compares.\n");
+        return 2;
+    }
+    // The speculative window loop has no row writer, so a dump that hands over to it would leave the tail of the
+    // file empty while the header still claims those rows (the second half of defect #57).
+    if (oracle_dump && o.spec >= 2 && o.max_new > 1) {
+        std::fprintf(stderr, "strata generate: a logits dump must walk every position itself, but --max-new %lld "
+                             "with --spec %d hands the generated positions to the speculative window, which writes "
+                             "no rows. Use --max-new 1, or --spec 0/1, or drop the dump.\n",
+                     (long long) o.max_new, o.spec);
+        return 2;
+    }
     // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
     // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
     // resolved after the model file has had its say, right before session_init.
@@ -1510,6 +1544,19 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    // A NATIVE (IQ) PACK CANNOT WALK ITS POSITIONS, so a dump cannot describe a file it cannot fill. Both
+    // per-position launchers are closed to it: `session_loop`'s captured graphs stage the CANONICAL planes of
+    // every tensor and a native pack does not load them (`session_capture` refuses with "the planes add up to
+    // 0 B but the tensor is 0 B"), and `session_token` has no CPU expert-pool hook at all, so it would measure
+    // a model whose routed experts contribute nothing. Refusing is the honest answer; writing the header
+    // anyway is defect #57.
+    if (oracle_dump) {
+        std::fprintf(stderr, "strata generate: --dump-logits/--dump-layers cannot walk a native (IQ) pack: its "
+                             "tensors are served in native form, so the per-position path cannot be captured, and "
+                             "the pool-free fallback would omit every routed expert. Use a canonical GGUF pack, or "
+                             "drop the dump.\n");
+        return 2;
+    }
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -2006,7 +2053,8 @@ int main(int argc, char** argv) {
     // for buffers that cannot be priced exactly yet because the sessions do not exist.  `plan_lend` uses the
     // exact `Prefill::bytes_needed` as soon as it can.
     const bool pf_borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-    const int64_t split_pf_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+    const int64_t split_pf_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+                                     ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
     // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  The flat 1 GiB this used to withhold from EVERY stage
     // after the first was booked "for its windows and the drafter", but the windows measure 75 MiB ("window up
     // to 6 tokens, 74.1 MiB of device buffers", on every boot) and the drafter is loaded on ONE stage - the
@@ -2342,7 +2390,8 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+                                        ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -2363,7 +2412,8 @@ int main(int argc, char** argv) {
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+                                        ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
@@ -5029,7 +5079,7 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-    if (o.prefill_chunk > 0 && n_prompt > 1) {
+    if (o.prefill_chunk > 0 && n_prompt > 1 && !oracle_dump) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
