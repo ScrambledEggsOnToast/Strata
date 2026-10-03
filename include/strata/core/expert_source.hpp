@@ -24,13 +24,18 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/direct_file.hpp"
 
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <string>
 #include <vector>
+
+namespace strata::kernels::cpu { struct ExpertLayout; }
 
 namespace strata::core {
 
@@ -497,5 +502,179 @@ private:
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
 };
+/// HET-017: the BOUNDED expert source - full architecture, fixed residency, DIRECT IO ONLY.
+///
+/// `FileExpertSource` maps the whole source and `ArenaExpertSource` copies it into RAM; both make admission
+/// charge the FULL source-page bound (`file:expert_streaming_pages`, 50,292,326,400 B for the IQ3_S full
+/// model) because a mapping's faulted pages and an arena's bytes are resident by construction and advisory
+/// `madvise`/`fadvise` cannot prove otherwise (docs/02_HARDWARE_AND_MEMORY.md, HET-017 section).  This class
+/// is the third option, explicit opt-in: the source files are never mapped for data and never buffered into a
+/// growing cache - every blob is read THROUGH a fixed ring of staging slots with `DirectFile` (O_DIRECT /
+/// `FILE_FLAG_NO_BUFFERING`), so the guest's resident envelope is the ring itself.  There is no buffered arm
+/// and no fadvise/mincore bookkeeping: an advisory release could not qualify the host page cache anyway.
+///
+/// THE HOST MIRROR STAYS CHARGED.  The model tree is virtiofs (`virtiofsd` runs WITHOUT `--allow-direct-io`),
+/// so a guest O_DIRECT read proves nothing about the host's page cache: admission keeps the full
+/// `file:expert_streaming_pages` bound while this source is selected.  `planned_bytes()` prices the ring ONLY -
+/// it is not the host bound, and it excludes the reader threads (`reader_threads()`) and any CUDA-side
+/// staging, which the driver reports separately.
+///
+/// THE ENVELOPE (what this class itself accounts, exactly):
+///   * resident: `slots() x slot_stride_bytes()` - anonymous heap, allocated up front, never grown.  A slot
+///     holds one assembled blob at its front `[0, max_blob)` and a page-aligned scratch tail sized for one
+///     read's page-aligned cover (`fill_slot` reads every span through the tail and memmoves it into place; a
+///     single-span canonical blob reads its cover straight into the front).  `slot_stride` is therefore the
+///     page rounding of the largest blob plus the largest span's cover slack - at most two extra pages on the
+///     canonical one-span layout, one span cover on the GGUF layout.
+///   * IO transient: reads land inside their slot, so the only transient is one slot itself
+///     (`io_transient_bytes()` = `slot_stride_bytes()`).  No bounce buffer, no in-flight copy, no staging
+///     area outside the ring.
+///   * metadata/threads, reported separately: `source_bytes()` is the size of the open source files (never
+///     mapped for data, never charged as guest residency here); `reader_threads()` is the `DirectFile` worker
+///     pool (one per source file; their stacks sit outside the ring envelope).
+///
+/// THE CONTRACT (how a blob pointer may be used):
+///   * All blobs of ONE layer are simultaneously valid; a blob stays valid until the epoch boundary - the next
+///     `begin_layer`, or the first fetch for a different layer (prefill never calls `begin_layer`).  Slots
+///     recycle only at that boundary, so the default ring (`slots == n_expert`) never refuses a legal pattern.
+///   * THE CONSUMER OWNS THE POINTER LIFETIME ACROSS THE BOUNDARY.  `pinned()` is false, so no DMA path may
+///     take a blob pointer; and an H2D copy from PAGEABLE memory is allowed by CUDA to complete
+///     asynchronously, so "the pointer is consumed before the copy call returns" MUST NOT be assumed.  Every
+///     consumer therefore completes (synchronizes) its use of a blob BEFORE the next epoch boundary: the CPU
+///     pool returns inside the layer; a queued refill must be made blocking for this source; and any prefill
+///     path that hands raw blob pointers to stager threads must prove the stager DRAINS - and its GPU staging
+///     has landed - before the next layer's first fetch.  The class cannot observe its consumers and recycles
+///     at the boundary regardless, which is why unsupported combinations are refused at startup by the driver
+///     rather than detected here.
+///   * NOT USABLE with prefill's whole-chunk stream (`stream_all`, chunk >= 1024 tokens with the default
+///     staging ring): that path fetches every layer's experts of a chunk up front and keeps the pointers
+///     until the chunk's stager drains, which no bounded ring can honour and this class cannot detect.
+///     A run combining this source with `--prefill-chunk >= 1024` must set `STRATA_PREFILL_RING=8` or
+///     `STRATA_PREFILL_STREAM_MIN` above the chunk, or refuse at startup.
+///   * SINGLE DRIVER THREAD: the thread that calls `blob`/`begin_layer` owns every returned pointer until the
+///     next epoch boundary.  An internal mutex keeps the state machine itself from corrupting under a race,
+///     but returned pointers ESCAPE it - another thread may advance the epoch and overwrite a slot while the
+///     first still reads its blob.  Cross-thread sharing is therefore unsupported, and the driver refuses the
+///     combinations that could do it (splits, remote tiers) rather than relying on this class.
+///
+/// A refused open is named and costs nothing (the ring is allocated only after every check passes); there is
+/// no fallback to buffered IO and no silent downgrade.
+class WindowedExpertSource : public ExpertSource {
+public:
+    struct Config {
+        /// 0 = `n_expert`: one full layer's distinct experts, the worst legal epoch.  A smaller ring is legal
+        /// but refuses - named, at fetch time - a layer that routes more distinct experts than it holds.
+        int64_t slots = 0;
+    };
+
+    WindowedExpertSource() = default;
+    ~WindowedExpertSource() override;
+    WindowedExpertSource(const WindowedExpertSource&) = delete;
+    WindowedExpertSource& operator=(const WindowedExpertSource&) = delete;
+
+    /// Pure preallocation pricing: an upper bound on the `residency_bytes()` an `open()` with this config and
+    /// layout would allocate (`slots() x slot_stride_bytes()`), with no I/O and no state change.  It prices the
+    /// GGUF-plane worst case; a pack served through experts.bin allocates the smaller single-span stride, and
+    /// `residency_bytes()` after `open()` is the exact ring.  This is the RING bound only - not the host
+    /// page-cache mirror (which admission keeps fully charged), not the reader threads, not CUDA-side staging.
+    /// Returns 0 and names the reason when the geometry is empty, unservable or overflows.
+    static uint64_t planned_bytes(const Config& config, const strata::kernels::cpu::ExpertLayout& layout,
+                                  std::string& err);
+
+    /// Native packs without `experts.bin` read their experts straight from the GGUF shards (`native_experts.txt`
+    /// v2 offset metadata, the same per-layer plane offsets the arena's GGUF loader uses), so no derived
+    /// artifact is needed.
+    void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+
+    /// Opens `<pack_dir>/experts.bin` when the pack has one (canonical or native, the exact layout
+    /// `FileExpertSource` validates), otherwise the native pack's GGUF shards.  Every file is opened O_DIRECT
+    /// (`DirectFile`); a filesystem that refuses O_DIRECT refuses the source, with the reason named.  The ring
+    /// is allocated HERE, before any read: a refusal costs nothing.
+    bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+              const Config& config);
+    bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+    void close();
+
+    bool ready() const { return ring_ != nullptr; }
+    int64_t blobs() const { return blobs_; }
+
+    // ---- the envelope and the run report ----
+    /// Resident envelope: the ring's PAYLOAD - the one large allocation this class is responsible for.  The
+    /// small layout tables, the per-file `DirectFile` state and the reader threads' stacks are separate
+    /// (threads are reported by `reader_threads()`); none of this is process RSS, and none of it says anything
+    /// about the host page cache.  Anonymous heap, allocated once at `open`, never grown.
+    uint64_t residency_bytes() const { return ring_bytes_; }
+    uint64_t slot_stride_bytes() const { return slot_stride_; }
+    int64_t slots() const { return (int64_t) slot_count_; }
+    /// IO transient: reads land inside their slot, so the only transient is one slot itself.
+    uint64_t io_transient_bytes() const { return slot_stride_; }
+    /// Sum of the open source files' sizes: report metadata - never mapped for data, never charged as guest
+    /// residency by this class.
+    uint64_t source_bytes() const;
+    /// `DirectFile` worker threads across the open source files (one pool per file); their stacks sit outside
+    /// the ring envelope and are reported so the driver's totals stay honest.
+    int reader_threads() const;
+    /// Bytes read from the source files, for the driver's report.
+    uint64_t io_bytes() const { return io_bytes_; }
+    /// The first failure's detail; `blob()` returns nullptr from then on, like every source.
+    const std::string& error() const { return error_; }
+
+    const uint8_t* blob(int64_t layer, int64_t expert) override;
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    int64_t reads() const override { return reads_; }
+
+private:
+    /// One open source file, read only through `direct` (O_DIRECT; the kernel contract is that these reads do
+    /// not populate the guest page cache - and say nothing about the host's).
+    struct SourceFile {
+        std::string path;
+        uint64_t bytes = 0;
+        strata::platform::DirectFile direct;
+    };
+    /// One contiguous read of a blob's assembly: file-relative span -> destination offset in the slot.
+    struct BlobSpan {
+        size_t file = 0;
+        uint64_t off = 0;       ///< source offset (arbitrary alignment; reads cover-align it)
+        uint64_t len = 0;       ///< source bytes
+        uint64_t dst = 0;       ///< final offset of `off`'s byte inside the slot (0 = straight into the front)
+    };
+
+    bool open_bin(const std::string& path, int64_t n_layers, int64_t n_expert, std::string& err);
+    bool open_gguf(int64_t n_layers, int64_t n_expert, std::string& err);
+    bool open_files(std::string& err);
+    bool fill_slot(int64_t layer, int64_t expert, uint64_t slot, std::string& err);
+    bool read_span_direct(const BlobSpan& span, uint8_t* slot_base, uint64_t tag, std::string& err);
+    void advance_epoch(int64_t layer);
+    void fail(const std::string& message);
+    /// `close()` under the held mutex; `open()` reuses it so a failed open leaves nothing behind.
+    void close_locked();
+
+    mutable std::mutex mu_;                    ///< serializes state; see the contract: pointers escape it
+    Config config_;
+    std::string gguf_;
+    std::vector<std::unique_ptr<SourceFile>> files_;   ///< `SourceFile` holds a non-movable `DirectFile`
+    std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+    std::vector<int> layer_file_;              ///< gguf mode: file index per layer (empty: experts.bin mode)
+    bool gguf_mode_ = false;
+    uint8_t* ring_ = nullptr;
+    uint64_t ring_bytes_ = 0;
+    uint64_t slot_stride_ = 0;
+    uint64_t scratch_at_ = 0;                  ///< slot-relative start of the read-cover scratch tail
+    size_t slot_count_ = 0;
+    size_t slot_cursor_ = 0;
+    int64_t epoch_layer_ = -1;
+    std::vector<int32_t> slot_of_;             ///< per blob: slot, or -1 (reset at each epoch boundary)
+    std::vector<uint8_t> slot_used_;           ///< per slot: occupied within the current epoch
+    int64_t blobs_ = 0;
+    int64_t n_layers_ = 0;
+    int64_t n_expert_ = 0;
+    uint64_t align_ = 4096;                    ///< IO cover alignment: a multiple of the OS page and of
+                                               ///< `DirectFile::alignment()` both (probed at open)
+    int64_t reads_ = 0;
+    uint64_t io_bytes_ = 0;
+    bool failed_ = false;
+    std::string error_;
+};
 
 }  // namespace strata::core
+

@@ -1,6 +1,7 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/graph.hpp"
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -182,6 +183,12 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
                      SessionGraphs& gr, std::string& err, bool split, int64_t layer_lo, int64_t layer_hi) {
     if (gr.captured) return true;
+    session_graphs_free(gr);
+    struct CaptureCleanup {
+        SessionGraphs& graphs;
+        ~CaptureCleanup() { if (!graphs.captured) session_graphs_free(graphs); }
+    } cleanup{gr};
+    gr.allocated_layers = g.n_layers;
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     gr.execs = new cudaGraphExec_t[(size_t) g.n_layers]();
@@ -211,6 +218,8 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture = [&](bool post, cudaGraphExec_t* out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
+            const GraphCaptureProbe probe({"session", what, l, 1, stage_prefix});
+            if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
             cudaStream_t cs = nullptr;
             if (cudaStreamCreate(&cs) != cudaSuccess) {
                 err = std::string("session_capture: stream create failed");
@@ -218,6 +227,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             }
             if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
                 err = "session_capture: begin failed at layer " + std::to_string(l);
+                cudaStreamDestroy(cs);
                 return false;
             }
             err.clear();
@@ -228,24 +238,19 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                                 : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
                                                   s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
-            if (!ok) {
-                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
-                return false;
-            }
             cudaGraph_t graph = nullptr;
             const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-            cudaStreamDestroy(cs);
-            if (ce != cudaSuccess) {
+            bool recorded = ok && ce == cudaSuccess;
+            if (!ok)
+                err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
+            else if (ce != cudaSuccess)
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " +
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
-                return false;
-            }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
-                err = "session_capture: instantiate failed at layer " + std::to_string(l);
-                return false;
-            }
-            cudaGraphDestroy(graph);
-            return true;
+            if (recorded) recorded = graph_capture_instantiate(probe, graph, *out, cs, false, err);
+            if (graph) cudaGraphDestroy(graph);
+            cudaStreamDestroy(cs);
+            if (recorded) recorded = probe.check(GraphCapturePhase::Retained, err);
+            return recorded;
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
         if (!capture(/*post=*/true, &gr.posts[l], "post")) return false;
@@ -477,27 +482,28 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
 
 void session_graphs_free(SessionGraphs& gr) {
     if (gr.execs) {
-        for (int64_t i = 0; i < gr.n; ++i) cudaGraphExecDestroy(gr.execs[i]);
+        for (int64_t i = 0; i < gr.allocated_layers; ++i)
+            if (gr.execs[i]) cudaGraphExecDestroy(gr.execs[i]);
         delete[] gr.execs;
     }
     if (gr.posts) {
-        for (int64_t i = 0; i < gr.n; ++i)
+        for (int64_t i = 0; i < gr.allocated_layers; ++i)
             if (gr.posts[i] != nullptr) cudaGraphExecDestroy(gr.posts[i]);
         delete[] gr.posts;
     }
     if (gr.preA) {
-        for (int64_t i = 0; i < gr.n; ++i)
+        for (int64_t i = 0; i < gr.allocated_layers; ++i)
             if (gr.preA[i] != nullptr) cudaGraphExecDestroy(gr.preA[i]);
         delete[] gr.preA;
     }
     if (gr.preB) {
-        for (int64_t i = 0; i < gr.n; ++i)
+        for (int64_t i = 0; i < gr.allocated_layers; ++i)
             if (gr.preB[i] != nullptr) cudaGraphExecDestroy(gr.preB[i]);
         delete[] gr.preB;
     }
     for (int k = 0; k < 5; ++k) {
         if (gr.preP[k] == nullptr) continue;
-        for (int64_t i = 0; i < gr.n; ++i)
+        for (int64_t i = 0; i < gr.allocated_layers; ++i)
             if (gr.preP[k][i] != nullptr) cudaGraphExecDestroy(gr.preP[k][i]);
         delete[] gr.preP[k];
         gr.preP[k] = nullptr;
@@ -509,6 +515,7 @@ void session_graphs_free(SessionGraphs& gr) {
     gr.execs = nullptr;
     gr.parts_dev = nullptr;
     gr.n = 0;
+    gr.allocated_layers = 0;
     gr.captured = false;
 }
 
@@ -822,6 +829,8 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                            const TokenHits* hits) {
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
     if (tg.captured) return true;
+    const GraphCaptureProbe probe({"session", "token", 0, 1, hits != nullptr ? 1 : 0});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
         err = "session_capture_token: the doorbell has no flag";
         return false;
@@ -872,16 +881,17 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
     }
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-    cudaStreamDestroy(cs);
-    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess) {
-        err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
+    if (!ok || ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        cudaStreamDestroy(cs);
+        if (ok) err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
+    const bool instantiated = graph_capture_instantiate(probe, graph, tg.exec, cs, false, err);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) {
-        err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
+    cudaStreamDestroy(cs);
+    if (!instantiated || !probe.check(GraphCapturePhase::Retained, err)) {
+        token_graph_free(tg);
         return false;
     }
     tg.captured = true;

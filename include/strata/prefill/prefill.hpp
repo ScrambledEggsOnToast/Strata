@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -37,6 +38,38 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// Inputs available before weights/session allocation. n_pages is the primary QSA state's logical page count
+/// (ceil(max_cells / 4)), NOT its resident slot count. Snapshot environment choices with allocation_config().
+struct AllocationConfig {
+    int64_t max_cells = 0, n_pages = 0, chunk = 0;
+    int64_t layer_begin = 0, layer_end = -1; ///< Stage validation; device scratch remains shared/all-path sized.
+    int kv_mode = 0;
+    bool kv_int8 = false, kv_q4 = false, kv_stage_own = false, gr_unfused = false, mmq = true;
+    int ring = 8; ///< Snapshot ring_slots(chunk): 8 routed slots, otherwise clamped 16..512 streaming slots.
+    int stager_ring = 16; ///< Snapshot of the host copy ring for unpinned blobs (STRATA_STAGER_RING, clamped
+                          ///< 2..256 exactly as the stager reads it at init).
+    int device_cc = 0, device_sms = 0;
+    uint64_t device_shared_bytes = 0;
+};
+struct AllocationBytes {
+    uint64_t loanable_device = 0;  ///< Exact aligned bump region, including GEMM and bounded MMQ workspace.
+    uint64_t owned_device = 0;     ///< Token ids, staging identity table, and optionally separately owned KV stage.
+    // Every take(payload) requests ((payload + 511) & ~255): ceil(payload / 256)*256 + 256.
+    // All three attention/MoE overlays are counted by their actual take sequence; only their maximum is allocated.
+    // A profiled/undersized/empty expert cache changes none of these totals. A partial loan cannot price the full
+    // region as borrowed: init requires a 256-byte aligned loan holding at least loanable_device bytes.
+    uint64_t standalone_device = 0;///< loanable_device + owned_device; valid even when no cache slots can be lent.
+    uint64_t mmq_workspace = 0;    ///< Included in loanable_device; configuration-derived maximum, not a heuristic.
+    /// Fixed explicit host payload, excluding separately priced stager blob slots, PLE staging pairs,
+    /// routing table heads, step logs and split hand-offs. Opaque driver storage, thread stacks,
+    /// dynamic stager jobs/ready capacities and transient vectors require a separate unknown class.
+    /// Counts token staging chunk*4; routing counts (2*n_expert+1)*4; stager_ring pinned flags;
+    /// the mapped bounds tail (n_expert+1+ceil(n_expert/16)*17)*4 even without MMQ, because init
+    /// reserves it regardless; and the same-sized bounds staging payload when any layer runs MMQ.
+    /// bounds_host is initially sized to its maximum so per-layer resizing cannot grow capacity.
+    uint64_t host_payload = 0;
+};
 
 class Prefill {
 public:
@@ -69,7 +102,15 @@ public:
     static void set_pinned_share(double share);
     static double pinned_share();
 
-    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
+    /// Snapshot the same runtime switches used by init. Queries device properties, but allocates no device memory.
+    static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
+                                  AllocationConfig& out, std::string& err);
+    /// Pure checked arithmetic; no SessionState, CUDA allocation, global artifact layout, or cache dependency.
+    /// No loan is deducted: callers may subtract loanable_device ONLY after guaranteeing that region is lent.
+    /// Includes explicit CUDA allocations, not opaque driver/cuBLAS handle internals (price those separately).
+    static bool allocation_needed(const core::ModelGeometry& g, const AllocationConfig& config,
+                                  const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err);
+    /// Existing initialized-session consumers need the bump region only. Invalid/overflow returns UINT64_MAX.
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
@@ -109,8 +150,10 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
-    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
+    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    static bool carve_layout(Impl& m, std::size_t T, void* alloc, void* owned_alloc);
+    static bool carve_fixed(Impl& m, void* alloc);
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

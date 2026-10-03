@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/graph.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -837,8 +838,19 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+bool Verifier::prepare_graphs(std::string& err) {
+    if (!wt_ || !ss_ || !cs_) { err = "verify: prepare requires init"; return false; }
+    const OnDevice on_device(device_);
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    if (!capture_commit(err)) return false;
+    return !next_ || next_->prepare_graphs(err);
+}
+
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
+    const GraphCaptureProbe probe({"verify", "window", lb_, T, le_});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
@@ -853,6 +865,7 @@ bool Verifier::capture(int T, std::string& err) {
         return false;
     }
     if (ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
@@ -887,21 +900,22 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    const bool instantiated = graph_capture_instantiate(probe, graph, exec_[T], cs_, true, err);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) {
-        err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
+    if (!instantiated) return false;
+    if (!probe.check(GraphCapturePhase::Retained, err)) {
+        cudaGraphExecDestroy(exec_[T]);
+        exec_[T] = nullptr;
         return false;
     }
-    const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
-    const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    std::fprintf(stderr, "strata verify: captured and uploaded the %d-token window\n", T);
     return true;
 }
 
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
+    const GraphCaptureProbe probe({"verify", "commit", lb_, max_t_, le_});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -957,12 +971,19 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    const bool instantiated = graph_capture_instantiate(probe, graph, commit_exec_, cs_, true, err);
     cudaGraphDestroy(graph);
+    if (!instantiated) return false;
+    if (!probe.check(GraphCapturePhase::Retained, err)) {
+        cudaGraphExecDestroy(commit_exec_);
+        commit_exec_ = nullptr;
+        return false;
+    }
     return true;
 }
 

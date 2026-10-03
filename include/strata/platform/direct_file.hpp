@@ -33,6 +33,9 @@ public:
     uint64_t size() const;
     static constexpr uint32_t alignment() { return 4096; }
 
+    /// Worker threads this instance's pool runs (0 when closed). Reported so callers' thread totals stay honest.
+    int pool_threads() const;
+
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request
     /// always produces exactly one completion.
     bool submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err);

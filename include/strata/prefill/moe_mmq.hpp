@@ -18,6 +18,10 @@ bool supported(int ggml_type);
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// Maximum stream-k allocation over this build's supported types, J=8..128, both row fallbacks. Derived from
+/// pinned GGML configurations: fixup is at most sms*I*J floats. Pure arithmetic; zero without MMQ support.
+bool workspace_bytes(int cc, int sms, uint64_t shared_bytes, uint64_t& bytes);
+bool device_config(int& cc, int& sms, uint64_t& shared_bytes);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
@@ -50,6 +54,8 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    /// Bind preallocated scratch; subsequent launches cannot grow an internal caching pool.
+    void set_workspace(void* workspace, size_t bytes);
 
 private:
     void* ctx_ = nullptr;

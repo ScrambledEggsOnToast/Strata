@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <algorithm>
+#include <limits>
+#include <memory>
 namespace strata::prefill::mmq {
 namespace {
 
@@ -108,6 +111,48 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+bool device_config(int& cc, int& sms, uint64_t& shared_bytes) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    const auto& info = ggml_cuda_info();
+    if (dev < 0 || dev >= info.device_count) return false;
+    cc = info.devices[dev].cc; sms = info.devices[dev].nsm; shared_bytes = info.devices[dev].smpbo;
+    return cc > 0 && sms > 0 && shared_bytes > 0;
+}
+
+bool workspace_bytes(int cc, int sms, uint64_t shared_bytes, uint64_t& bytes) {
+    bytes = 0;
+    if (cc <= 0 || sms <= 0 || shared_bytes == 0) return false;
+    const ggml_type types[] = {GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                              GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+                              GGML_TYPE_Q8_0};
+    for (ggml_type type : types) for (bool fallback : {false, true}) for (int j = 8; j <= 128; j += 8) {
+        const auto c = ggml_cuda_mmq_get_config(type, j, fallback, cc);
+        if (c.type == GGML_TYPE_COUNT || !c.stream_k || mmq_get_nbytes_shared(c, cc) > shared_bytes) continue;
+        // When grid.x == ntiles, no fixup is needed. Every allocating launch instead uses grid.x == sms.
+        const uint64_t tile = (uint64_t) c.I * c.J * sizeof(float);
+        if (tile > std::numeric_limits<uint64_t>::max() / (uint64_t) sms) return false;
+        bytes = std::max(bytes, tile * (uint64_t) sms);
+    }
+    return true;
+}
+
+namespace {
+struct ExternalPool final : ggml_cuda_pool {
+    void* ptr;
+    size_t capacity;
+    bool busy = false;
+    ExternalPool(void* p, size_t n) : ptr(p), capacity(n) {}
+    void* alloc(size_t n, size_t* actual) override {
+        GGML_ASSERT(!busy && ptr != nullptr && n <= capacity);
+        busy = true;
+        *actual = capacity;
+        return ptr;
+    }
+    void free(void* p, size_t) override { GGML_ASSERT(busy && p == ptr); busy = false; }
+};
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
@@ -121,6 +166,11 @@ Context::Context() {
     ctx_ = new ggml_backend_cuda_context(dev);
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
+
+void Context::set_workspace(void* workspace, size_t bytes) {
+    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
+    ctx.pools[ctx.device][ctx.curr_stream_no] = std::make_unique<ExternalPool>(workspace, bytes);
+}
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;

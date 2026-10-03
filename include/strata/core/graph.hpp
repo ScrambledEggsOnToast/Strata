@@ -46,6 +46,62 @@ namespace strata::core {
 enum class LayerType : int { GDN = 0, QSA = 1 };
 inline const char* to_string(LayerType t) { return t == LayerType::GDN ? "GDN" : "QSA"; }
 
+/// Opt-in boot/calibration observations, never a CUDA allocator limit. Device free memory is a
+/// point sample of the current device (all users), so its minimum is only a LOWER bound on peak
+/// usage: transient allocations inside a runtime call can be missed. Linux host RSS/HWM are
+/// process-wide, not graph-owned; unavailable host measurements are marked explicitly.
+/// Graph async-allocation pool watermarks do NOT account for all executable/driver storage.
+enum class GraphCapturePhase { BeforeCapture, AfterCapture, AfterInstantiate, AfterUpload, Retained };
+struct GraphCaptureKey {
+    const char* family;
+    const char* variant;
+    int64_t index = 0;
+    int64_t width = 1;
+    int64_t auxiliary = 0;
+};
+struct GraphCaptureSample {
+    int device = -1;
+    uint64_t free_device_bytes = 0;
+    uint64_t total_device_bytes = 0;
+    bool host_rss_available = false;
+    uint64_t host_rss_bytes = 0;
+    uint64_t host_peak_rss_bytes = 0;
+};
+using GraphCaptureHook = bool (*)(void* user, const GraphCaptureKey&, GraphCapturePhase,
+                                 const GraphCaptureSample&, std::string& err);
+
+/// Thread-local, nestable scope. Hook/user must outlive the scope, and hook must not change the
+/// CUDA device, start capture, or allocate CUDA memory. Return false to reject a NEW capture
+/// before it starts, or to reject observed growth before serving; existing cache hits bypass it.
+/// Keeping a denying scope active while serving prevents lazy graph-cache growth on this thread.
+/// This does NOT prevent an opaque runtime call from temporarily exceeding a sampled cap.
+class GraphCaptureObservationScope {
+public:
+    GraphCaptureObservationScope(GraphCaptureHook hook, void* user);
+    ~GraphCaptureObservationScope();
+    GraphCaptureObservationScope(const GraphCaptureObservationScope&) = delete;
+    GraphCaptureObservationScope& operator=(const GraphCaptureObservationScope&) = delete;
+private:
+    GraphCaptureHook previous_hook_;
+    void* previous_user_;
+};
+
+class GraphCaptureProbe {
+public:
+    explicit GraphCaptureProbe(GraphCaptureKey key) : key_(key) {}
+    bool check(GraphCapturePhase phase, std::string& err) const;
+private:
+    GraphCaptureKey key_;
+};
+
+/// Checks capture/instantiation/upload samples. On failure destroys the new executable and
+/// nulls it; caller still owns the source graph. Observation forces upload + stream sync so
+/// lazy first-upload storage is included without launching kernels or changing model state.
+/// With no hook, upload occurs only for callers that already require it.
+bool graph_capture_instantiate(const GraphCaptureProbe& probe, cudaGraph_t graph,
+                               cudaGraphExec_t& exec, cudaStream_t stream, bool upload,
+                               std::string& err);
+
 /// One recorded graph.  Move-only: it owns a `cudaGraphExec_t` and an event, and two owners would
 /// double-destroy.
 class CapturedGraph {
@@ -58,7 +114,8 @@ public:
     CapturedGraph& operator=(CapturedGraph&& o) noexcept;
 
     /// Start recording everything the caller launches into `stream`.
-    bool begin(void* stream, std::string& err);
+    bool begin(void* stream, std::string& err,
+               GraphCaptureKey key = GraphCaptureKey{"captured_graph", "default", 0, 1, 0});
 
     /// Stop recording, instantiate, and record the completion event.  A capture that produced ZERO nodes is
     /// reported as an error: it means the body did nothing, which is a wiring mistake and NOT an empty graph
@@ -82,6 +139,7 @@ private:
     cudaGraphExec_t exec_ = nullptr;
     cudaEvent_t done_ = nullptr;
     size_t nodes_ = 0;
+    GraphCaptureKey key_{"captured_graph", "default", 0, 1, 0};
 };
 
 /// Capture-once, replay-many, keyed by `(layer_type, n_tokens)`.

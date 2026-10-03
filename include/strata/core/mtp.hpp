@@ -60,6 +60,12 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
+    /// Boot/calibration after bind: capture + upload all reachable prefill/round widths and
+    /// chain steps, including coupled variants when configured, without launching kernels.
+    /// Does not allocate prompt input storage (pf_dev_); that is a separate non-graph sink.
+    /// Keep a denying graph observation scope on each serving thread to forbid new captures.
+    bool prepare_graphs(std::string& err);
+
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);

@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "strata/core/pinned.hpp"
+#include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -1646,6 +1647,620 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+}
+
+// ================================ HET-017: THE WINDOWED SOURCE ================================
+
+namespace {
+
+/// Saturating round-up to `a`.  Every caller bounds its inputs against explicit limits first; this only keeps
+/// the arithmetic itself from wrapping into a small, plausible number.
+inline uint64_t round_up_sat(uint64_t v, uint64_t a) {
+    if (a == 0) return v;
+    const uint64_t rem = v % a;
+    return rem == 0 ? v : (v > std::numeric_limits<uint64_t>::max() - (a - rem)
+                               ? std::numeric_limits<uint64_t>::max()
+                               : v + (a - rem));
+}
+
+/// The one alignment every read cover is rounded to: a multiple of the OS page (the accounting unit) and of
+/// `DirectFile::alignment()` (the O_DIRECT contract) both.
+uint64_t windowed_io_align() {
+#if defined(_WIN32)
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uint64_t page = info.dwPageSize > 0 ? (uint64_t) info.dwPageSize : 4096;
+#else
+    const long system_page = sysconf(_SC_PAGESIZE);
+    const uint64_t page = system_page > 0 ? (uint64_t) system_page : 4096;
+#endif
+    return std::max(page, (uint64_t) strata::platform::DirectFile::alignment());
+}
+
+/// A native blob's three GGUF planes, in blob order: lengths `per[r]` at blob offsets `{0, up_off, down_off}`.
+/// This is the arena loader's span model.  The up plane runs to `down_off` - for every pack the loader accepts
+/// that equals `up_off` (gate and up are the same shape) - and is computed here from the offsets themselves,
+/// so this source and the arena can never disagree about where the up plane ends.
+void plane_spans(const strata::kernels::cpu::NativeFmt& fm, uint64_t blob, uint64_t per[3]) {
+    per[0] = fm.up_off;
+    per[1] = fm.down_off - fm.up_off;
+    per[2] = blob - fm.down_off;
+}
+
+/// The largest blob or GGUF plane this source can serve: the slot stride (blob rounding + one span cover)
+/// must stay within one `DirectFile` read (`uint32_t` length) with room for the alignment slack.
+constexpr uint64_t kMaxServableSpan = std::numeric_limits<uint32_t>::max() / 2;
+
+/// Refuses a span (or the alignment itself) that could make any later stride arithmetic wrap.
+bool windowed_span_ok(uint64_t span, uint64_t align, std::string& err, const char* what) {
+    if (align == 0 || align > std::numeric_limits<uint32_t>::max() / 4) {
+        err = "WindowedExpertSource: the page alignment is unservable on this machine";
+        return false;
+    }
+    if (span > kMaxServableSpan) {
+        err = std::string("WindowedExpertSource: a ") + what + " of " + std::to_string(span) +
+              " B exceeds the largest servable slot (" + std::to_string(kMaxServableSpan) + " B)";
+        return false;
+    }
+    return true;
+}
+
+/// The result of the shared geometry pass: the bounds the slot layout is derived from.
+struct WindowedPlan {
+    uint64_t max_blob = 0;   ///< the largest assembled blob (canonical BLOB or the native per-layer bytes)
+    uint64_t max_span = 0;   ///< the largest single source span (canonical: the blob; GGUF: the largest plane)
+};
+
+/// THE SHARED GEOMETRY VALIDATION for pricing (`planned_bytes`) and `open`, so the two can never drift:
+/// the native per-layer tables must be COMPLETE before anything indexes them, and every blob and GGUF plane
+/// must sit inside the servable bound.  Touches nothing; on false, `err` names the reason.
+bool windowed_plan_geometry(const strata::kernels::cpu::ExpertLayout& lay, uint64_t align, WindowedPlan& plan,
+                            std::string& err) {
+    plan = WindowedPlan{};
+    if (lay.n_layers <= 0 || lay.n_expert <= 0 || lay.total == 0) {
+        err = "WindowedExpertSource: the expert layout is empty";
+        return false;
+    }
+    // BEFORE the first `blob_bytes(l)`: a native layout's `bytes`/`offset`/`fmt` must be complete.
+    if (lay.native && (lay.offset.size() != (size_t) lay.n_layers || lay.bytes.size() != (size_t) lay.n_layers ||
+                       lay.fmt.size() != (size_t) lay.n_layers)) {
+        err = "WindowedExpertSource: the native expert layout is incomplete";
+        return false;
+    }
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        const uint64_t blob = lay.blob_bytes(l);
+        if (blob == 0) {
+            err = "WindowedExpertSource: layer " + std::to_string(l) + " has zero-sized blobs";
+            return false;
+        }
+        if (!windowed_span_ok(blob, align, err, "blob")) return false;
+        plan.max_blob = std::max(plan.max_blob, blob);
+        if (lay.native) {
+            const auto& fm = lay.fmt[(size_t) l];
+            if (fm.bytes != blob || fm.up_off == 0 || fm.down_off <= fm.up_off || fm.down_off >= blob) {
+                err = "WindowedExpertSource: the native blob layout is invalid at layer " + std::to_string(l);
+                return false;
+            }
+            uint64_t per[3];
+            plane_spans(fm, blob, per);
+            for (int r = 0; r < 3; ++r) {
+                if (!windowed_span_ok(per[r], align, err, "GGUF plane")) return false;
+                plan.max_span = std::max(plan.max_span, per[r]);
+            }
+        } else {
+            plan.max_span = std::max(plan.max_span, blob);
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+uint64_t WindowedExpertSource::planned_bytes(const Config& config,
+                                             const strata::kernels::cpu::ExpertLayout& layout,
+                                             std::string& err) {
+    err.clear();
+    if (config.slots < 0) {
+        err = "WindowedExpertSource: the slot count is negative";
+        return 0;
+    }
+    const int64_t slots = config.slots > 0 ? config.slots : layout.n_expert;
+    if ((uint64_t) slots > (uint64_t) std::numeric_limits<int32_t>::max()) {
+        err = "WindowedExpertSource: the slot count overflows the epoch table";
+        return 0;
+    }
+    const uint64_t align = windowed_io_align();
+    WindowedPlan plan;
+    if (!windowed_plan_geometry(layout, align, plan, err)) return 0;
+    // Both bounds are checked against kMaxServableSpan, so every round-up and this sum stay far from any wrap.
+    // THE GGUF-PLANE WORST CASE: a slot carries the assembled blob plus a page-aligned scratch tail sized for
+    // one span's read cover.  A pack served through experts.bin reads its single span straight into the slot
+    // front and allocates the SMALLER stride - `residency_bytes()` is the exact ring after `open()` - so this
+    // price is the conservative bound of the two source modes.  It is the RING ONLY: not the host page-cache
+    // mirror (which admission keeps fully charged), not the reader threads, not CUDA-side staging.
+    const uint64_t slot_stride = round_up_sat(plan.max_blob, align) + round_up_sat(plan.max_span + align - 1, align);
+    if (slot_stride > std::numeric_limits<uint32_t>::max()) {
+        err = "WindowedExpertSource: one slot (" + std::to_string(slot_stride) +
+              " B) exceeds the largest single direct read";
+        return 0;
+    }
+    if ((uint64_t) slots > std::numeric_limits<uint64_t>::max() / slot_stride ||
+        slot_stride * (uint64_t) slots > (uint64_t) std::numeric_limits<size_t>::max()) {
+        err = "WindowedExpertSource: the ring size overflows the host address space";
+        return 0;
+    }
+    return slot_stride * (uint64_t) slots;
+}
+
+WindowedExpertSource::~WindowedExpertSource() { close(); }
+
+bool WindowedExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert,
+                                std::string& err) {
+    return open(pack_dir, n_layers, n_expert, err, Config{});
+}
+
+bool WindowedExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert,
+                                std::string& err, const Config& config) {
+    std::lock_guard<std::mutex> lock(mu_);
+    close_locked();
+    config_ = config;
+    if (n_layers <= 0 || n_expert <= 0) {
+        err = "WindowedExpertSource: the geometry is empty";
+        return false;
+    }
+    if (config_.slots < 0) {
+        err = "WindowedExpertSource: the slot count is negative";
+        return false;
+    }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
+        err = "WindowedExpertSource: the requested geometry does not match the loaded expert layout";
+        return false;
+    }
+    if ((uint64_t) n_layers > (uint64_t) std::numeric_limits<int64_t>::max() / (uint64_t) n_expert) {
+        err = "WindowedExpertSource: the expert count overflows";
+        return false;
+    }
+    align_ = windowed_io_align();
+    // THE SHARED GEOMETRY CHECK, before anything is built, opened or spawned - the same pass
+    // `planned_bytes` runs, so an overflow or an incomplete native table refuses HERE.  (The slot bounds the
+    // pass collects are re-derived per mode below; `open_bin`/`open_gguf` keep their own stride formulas.)
+    WindowedPlan plan;
+    if (!windowed_plan_geometry(lay, align_, plan, err)) return false;
+    (void) plan;
+    blobs_ = n_layers * n_expert;
+    n_layers_ = n_layers;
+    n_expert_ = n_expert;
+    const uint64_t want = lay.total;
+    if (want == 0) {
+        err = "WindowedExpertSource: the loaded expert layout has an invalid size";
+        return false;
+    }
+
+    // The layer tables, exactly what `FileExpertSource` validates before it maps.
+    layer_offsets_.assign((size_t) n_layers, 0);
+    layer_blob_bytes_.assign((size_t) n_layers, 0);
+    if (!lay.native) {
+        const uint64_t blob_count = (uint64_t) n_layers * (uint64_t) n_expert;
+        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) strata::kernels::cpu::BLOB) {
+            err = "WindowedExpertSource: the canonical expert size overflows";
+            return false;
+        }
+        if (want != blob_count * (uint64_t) strata::kernels::cpu::BLOB) {
+            err = "WindowedExpertSource: the canonical expert layout has an inconsistent size";
+            return false;
+        }
+        for (int64_t l = 0; l < n_layers; ++l) {
+            layer_offsets_[(size_t) l] =
+                (uint64_t) l * (uint64_t) n_expert * (uint64_t) strata::kernels::cpu::BLOB;
+            layer_blob_bytes_[(size_t) l] = (uint64_t) strata::kernels::cpu::BLOB;
+        }
+    } else {
+        if (lay.offset.size() != (size_t) n_layers || lay.bytes.size() != (size_t) n_layers ||
+            lay.fmt.size() != (size_t) n_layers) {
+            err = "WindowedExpertSource: the native expert layout is incomplete";
+            return false;
+        }
+        uint64_t at = 0;
+        for (int64_t l = 0; l < n_layers; ++l) {
+            const size_t i = (size_t) l;
+            const uint64_t bytes = (uint64_t) lay.fmt[i].bytes;
+            if (lay.offset[i] != at || bytes == 0 || lay.bytes[i] != bytes ||
+                bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
+                err = "WindowedExpertSource: the native expert layout is invalid at layer " + std::to_string(l);
+                return false;
+            }
+            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+            if (at > want || layer_bytes > want - at) {
+                err = "WindowedExpertSource: the native expert layout exceeds its declared size at layer " +
+                      std::to_string(l);
+                return false;
+            }
+            layer_offsets_[i] = lay.offset[i];
+            layer_blob_bytes_[i] = bytes;
+            at += layer_bytes;
+        }
+        if (at != want) {
+            err = "WindowedExpertSource: the native expert layout has an inconsistent size";
+            return false;
+        }
+    }
+
+    // The source: experts.bin when the pack carries one (canonical or native), else the native GGUF shards.
+    const std::string bin = pack_dir + "/experts.bin";
+    std::error_code ec;
+    const bool have_bin = std::filesystem::exists(bin, ec);
+    if (ec) {
+        err = "WindowedExpertSource: cannot inspect " + bin + ": " + ec.message();
+        return false;
+    }
+    bool ok = false;
+    if (have_bin) {
+        gguf_mode_ = false;
+        ok = open_bin(bin, n_layers, n_expert, err);
+    } else if (lay.native && !lay.gguf_off.empty() && !gguf_.empty()) {
+        gguf_mode_ = true;
+        ok = open_gguf(n_layers, n_expert, err);
+    } else {
+        err = "WindowedExpertSource: " + bin +
+              " is missing and the pack carries no native GGUF expert metadata (set_gguf plus "
+              "native_experts.txt with v2 plane offsets is required)";
+    }
+    if (!ok) {
+        close_locked();
+        return false;
+    }
+    if (!open_files(err)) {
+        close_locked();
+        return false;
+    }
+
+    // THE RING, allocated only after every check above passed: a refusal costs nothing.
+    if ((uint64_t) slot_count_ > (uint64_t) std::numeric_limits<int32_t>::max() ||
+        (size_t) slot_count_ > std::numeric_limits<size_t>::max() / (size_t) slot_stride_ ||
+        slot_stride_ > (uint64_t) std::numeric_limits<uint32_t>::max()) {
+        err = "WindowedExpertSource: the ring geometry overflows";
+        close_locked();
+        return false;
+    }
+    ring_bytes_ = slot_stride_ * (uint64_t) slot_count_;
+    ring_ = (uint8_t*) strata::platform::DirectFile::alloc_aligned((size_t) ring_bytes_);
+    if (ring_ == nullptr) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "WindowedExpertSource: the %.2f GiB ring allocation failed",
+                      (double) ring_bytes_ / 1073741824.0);
+        err = buf;
+        close_locked();
+        return false;
+    }
+    slot_of_.assign((size_t) blobs_, -1);
+    slot_used_.assign(slot_count_, 0);
+    epoch_layer_ = -1;
+    slot_cursor_ = 0;
+    reads_ = 0;
+    io_bytes_ = 0;
+    failed_ = false;
+    error_.clear();
+    uint64_t source = 0;
+    int threads = 0;
+    for (const auto& f : files_) {
+        source += f->bytes;
+        threads += f->direct.pool_threads();
+    }
+    std::fprintf(stderr,
+                 "WindowedExpertSource: direct ring ready: %lld slots x %.2f MiB = %.2f GiB resident; "
+                 "%.2f GiB of source on %d direct reader thread(s); the host page-cache mirror stays charged\n",
+                 (long long) slot_count_, (double) slot_stride_ / 1048576.0,
+                 (double) ring_bytes_ / 1073741824.0, (double) source / 1073741824.0, threads);
+    std::fflush(stderr);
+    return true;
+}
+
+bool WindowedExpertSource::open_bin(const std::string& path, int64_t n_layers, int64_t n_expert,
+                                    std::string& err) {
+    (void) n_layers;
+    (void) n_expert;
+    uint64_t max_blob = 0;
+    for (const uint64_t b : layer_blob_bytes_) max_blob = std::max(max_blob, b);   // bounds already shared-checked
+    // A one-span blob reads its page-aligned cover straight into the slot front: the stride is the blob's page
+    // rounding plus the cover's worst-case overshoot (one page).  No scratch tail is used in this mode.
+    slot_stride_ = round_up_sat(max_blob, align_) + align_;
+    scratch_at_ = 0;
+    slot_count_ = (size_t) (config_.slots > 0 ? config_.slots : n_expert_);
+    // THE source file.  `open_files` opens it and size-checks it through the OPENED HANDLE - not path
+    // metadata, which could change between here and the open.
+    auto file = std::make_unique<SourceFile>();
+    file->path = path;
+    files_.push_back(std::move(file));
+    return true;
+}
+
+bool WindowedExpertSource::open_gguf(int64_t n_layers, int64_t n_expert, std::string& err) {
+    (void) n_expert;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.gguf_off.size() != (size_t) (3 * n_layers)) {
+        err = "WindowedExpertSource: the native GGUF plane offsets are incomplete";
+        return false;
+    }
+    if (!lay.gguf_file.empty() && lay.gguf_file.size() != (size_t) n_layers) {
+        err = "WindowedExpertSource: the native GGUF shard table is incomplete";
+        return false;
+    }
+    // Blob and plane bounds were shared-checked in `windowed_plan_geometry`; this pass only collects the slot
+    // bounds and the GGUF-specific metadata rules.
+    uint64_t max_blob = 0, max_span = 0;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const size_t i = (size_t) l;
+        uint64_t per[3];
+        plane_spans(lay.fmt[i], layer_blob_bytes_[i], per);
+        for (int r = 0; r < 3; ++r) {
+            if (lay.gguf_off[(size_t) (3 * l + r)] == 0) {
+                err = "WindowedExpertSource: native_experts.txt carries no GGUF plane offsets for layer " +
+                      std::to_string(l) + " (the v2 offset metadata is required)";
+                return false;
+            }
+            max_span = std::max(max_span, per[r]);
+        }
+        max_blob = std::max(max_blob, layer_blob_bytes_[i]);
+    }
+    // Multi-span blobs assemble through the scratch tail; the front holds the packed blob.  The two regions
+    // are disjoint by construction of the stride, whatever the planes' sizes.
+    scratch_at_ = round_up_sat(max_blob, align_);
+    slot_stride_ = scratch_at_ + round_up_sat(max_span + align_ - 1, align_);
+    slot_count_ = (size_t) (config_.slots > 0 ? config_.slots : n_expert_);
+
+    // Each layer's shard: the per-layer name beside the --native shard, the arena loader's rule.
+    const size_t cut = gguf_.find_last_of("/\\");
+    const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
+    layer_file_.assign((size_t) n_layers, -1);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const std::string name = lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()
+                                     ? gguf_
+                                     : dir + lay.gguf_file[(size_t) l];
+        int index = -1;
+        for (size_t i = 0; i < files_.size(); ++i)
+            if (files_[i]->path == name) {
+                index = (int) i;
+                break;
+            }
+        if (index < 0) {
+            auto file = std::make_unique<SourceFile>();
+            file->path = name;
+            files_.push_back(std::move(file));
+            index = (int) files_.size() - 1;
+        }
+        layer_file_[(size_t) l] = index;
+    }
+    return true;
+}
+
+bool WindowedExpertSource::open_files(std::string& err) {
+    for (const auto& f : files_) {
+        std::string ferr;
+        if (!f->direct.open(f->path, ferr)) {
+            err = "WindowedExpertSource: the direct-IO open of " + f->path + " was refused (" + ferr +
+                  "); this source reads O_DIRECT only and does not fall back to buffered IO";
+            return false;
+        }
+        f->bytes = f->direct.size();
+    }
+    if (!gguf_mode_) {
+        // experts.bin: the size must match the layout exactly, checked through the opened handle.
+        uint64_t want = 0;
+        for (const uint64_t b : layer_blob_bytes_) want += b * (uint64_t) n_expert_;
+        const SourceFile& f = *files_.front();
+        if (f.bytes != want) {
+            char buf[400];
+            std::snprintf(buf, sizeof buf,
+                          "WindowedExpertSource: %s is %llu B but the loaded expert layout requires %llu B - "
+                          "this is not the pack this geometry came from",
+                          f.path.c_str(), (unsigned long long) f.bytes, (unsigned long long) want);
+            err = buf;
+            return false;
+        }
+        return true;
+    }
+    // Every GGUF plane must lie inside its file: refuse HERE, at startup, never mid-run.
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        const size_t i = (size_t) l;
+        uint64_t per[3];
+        plane_spans(lay.fmt[i], layer_blob_bytes_[i], per);
+        const SourceFile& f = *files_[(size_t) layer_file_[i]];
+        for (int r = 0; r < 3; ++r) {
+            if (per[r] > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert_) {
+                err = "WindowedExpertSource: the GGUF plane size overflows at layer " + std::to_string(l);
+                return false;
+            }
+            const uint64_t off = lay.gguf_off[(size_t) (3 * l + r)];
+            const uint64_t span_bytes = per[r] * (uint64_t) n_expert_;
+            if (off > f.bytes || span_bytes > f.bytes - off) {
+                err = "WindowedExpertSource: GGUF plane " + std::to_string(r) + " of layer " +
+                      std::to_string(l) + " lies outside " + f.path;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void WindowedExpertSource::close() {
+    std::lock_guard<std::mutex> lock(mu_);
+    close_locked();
+}
+
+void WindowedExpertSource::close_locked() {
+    if (ring_ != nullptr) strata::platform::DirectFile::free_aligned(ring_);
+    ring_ = nullptr;
+    files_.clear();   // every SourceFile's DirectFile closes its handle and joins its pool
+    layer_offsets_.clear();
+    layer_blob_bytes_.clear();
+    layer_file_.clear();
+    slot_of_.clear();
+    slot_used_.clear();
+    ring_bytes_ = 0;
+    slot_stride_ = 0;
+    scratch_at_ = 0;
+    slot_count_ = 0;
+    slot_cursor_ = 0;
+    epoch_layer_ = -1;
+    gguf_mode_ = false;
+    blobs_ = 0;
+    n_layers_ = 0;
+    n_expert_ = 0;
+    reads_ = 0;
+    io_bytes_ = 0;
+    failed_ = false;
+    error_.clear();
+}
+
+uint64_t WindowedExpertSource::source_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    uint64_t total = 0;
+    for (const auto& f : files_) total += f->bytes;
+    return total;
+}
+
+int WindowedExpertSource::reader_threads() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    int n = 0;
+    for (const auto& f : files_) n += f->direct.pool_threads();
+    return n;
+}
+
+void WindowedExpertSource::advance_epoch(int64_t layer) {
+    if (layer == epoch_layer_) return;
+    // THE BOUNDARY: every slot becomes free, so every pointer from the previous epoch is stale from here.
+    std::fill(slot_of_.begin(), slot_of_.end(), -1);
+    std::fill(slot_used_.begin(), slot_used_.end(), (uint8_t) 0);
+    slot_cursor_ = 0;
+    epoch_layer_ = layer;
+}
+
+void WindowedExpertSource::fail(const std::string& message) {
+    if (error_.empty()) error_ = message;
+    failed_ = true;   // latched: `blob` returns nullptr for the rest of the source's life
+}
+
+bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slot, std::string& err) {
+    uint8_t* const slot_base = ring_ + (size_t) slot * (size_t) slot_stride_;
+    uint64_t moved = 0;
+    if (!gguf_mode_) {
+        const BlobSpan span{0,
+                            layer_offsets_[(size_t) layer] +
+                                (uint64_t) expert * layer_blob_bytes_[(size_t) layer],
+                            layer_blob_bytes_[(size_t) layer], 0};
+        if (!read_span_direct(span, slot_base, slot, err)) return false;
+        moved = span.len;
+    } else {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const size_t i = (size_t) layer;
+        const auto& fm = lay.fmt[i];
+        uint64_t per[3];
+        plane_spans(fm, layer_blob_bytes_[i], per);
+        const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+        for (int r = 0; r < 3; ++r) {
+            const BlobSpan span{(size_t) layer_file_[i],
+                                lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * per[r], per[r],
+                                at[r]};
+            if (!read_span_direct(span, slot_base, slot, err)) return false;
+            moved += per[r];
+        }
+    }
+    io_bytes_ += moved;   // the blob's own bytes: what the driver's read total means
+    return true;
+}
+
+bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_base, uint64_t tag,
+                                            std::string& err) {
+    SourceFile& f = *files_[span.file];
+    const uint64_t off_lo = span.off - span.off % align_;
+    const uint64_t pad = span.off - off_lo;
+    const uint64_t cover = round_up_sat(pad + span.len, align_);
+    if (span.len == 0 || cover > std::numeric_limits<uint32_t>::max() || off_lo > f.bytes ||
+        pad + span.len > f.bytes - off_lo) {
+        err = "WindowedExpertSource: a span of " + std::to_string(span.len) + " B at " +
+              std::to_string(span.off) + " lies outside " + f.path;
+        return false;
+    }
+    // dst 0 is a blob's FIRST span: the slot front is still empty there, so the cover reads straight into it
+    // and one memmove unpads it.  Every later span reads through the scratch tail, which the stride keeps
+    // disjoint from the assembled front for every plane size.
+    uint8_t* const read_at = slot_base + (span.dst == 0 ? (size_t) 0 : (size_t) scratch_at_);
+    std::string ferr;
+    if (!f.direct.submit(off_lo, read_at, (uint32_t) cover, tag, ferr)) {
+        err = "WindowedExpertSource: the direct read of " + f.path + " could not be queued: " + ferr;
+        return false;
+    }
+    for (;;) {
+        strata::platform::Completion c;
+        const int n = f.direct.wait(&c, 1, -1);
+        if (n < 0 || (n == 0 && !f.direct.is_open())) {
+            err = "WindowedExpertSource: the direct reader for " + f.path + " failed";
+            return false;
+        }
+        if (n == 0 || c.tag != tag) continue;   // not ours (nothing else submits or wakes this pool)
+        if (!c.ok || c.bytes < pad + span.len) {
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "WindowedExpertSource: short or failed direct read of %llu B at %llu in %s (got %u B)",
+                          (unsigned long long) span.len, (unsigned long long) span.off, f.path.c_str(), c.bytes);
+            err = buf;
+            return false;
+        }
+        break;
+    }
+    if (pad != 0 || span.dst != 0)
+        std::memmove(slot_base + (size_t) span.dst, read_at + (size_t) pad, (size_t) span.len);
+    return true;
+}
+
+const uint8_t* WindowedExpertSource::blob(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (failed_ || ring_ == nullptr) return nullptr;
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) {
+        fail("WindowedExpertSource: blob lookup (" + std::to_string(layer) + ", " + std::to_string(expert) +
+             ") is outside the " + std::to_string(n_layers_) + "x" + std::to_string(n_expert_) + " geometry");
+        return nullptr;
+    }
+    advance_epoch(layer);   // the first fetch for a different layer IS the boundary (prefill never calls begin_layer)
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (slot_of_[index] >= 0) {
+        ++reads_;
+        return ring_ + (size_t) slot_of_[index] * (size_t) slot_stride_;
+    }
+    int64_t chosen = -1;
+    for (size_t probe = 0; probe < slot_count_; ++probe) {
+        const size_t cand = (slot_cursor_ + probe) % slot_count_;
+        if (!slot_used_[cand]) {
+            chosen = (int64_t) cand;
+            break;
+        }
+    }
+    if (chosen < 0) {
+        fail("WindowedExpertSource: layer " + std::to_string(layer) + " routed more than the ring's " +
+             std::to_string(slot_count_) + " distinct experts before a layer boundary; enlarge Config::slots");
+        return nullptr;
+    }
+    std::string ferr;
+    if (!fill_slot(layer, expert, (uint64_t) chosen, ferr)) {
+        fail(ferr.empty() ? "WindowedExpertSource: a slot fill failed" : ferr);
+        return nullptr;
+    }
+    slot_of_[index] = (int32_t) chosen;
+    slot_used_[(size_t) chosen] = 1;
+    slot_cursor_ = ((size_t) chosen + 1) % slot_count_;
+    ++reads_;
+    return ring_ + (size_t) chosen * (size_t) slot_stride_;
+}
+
+void WindowedExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    (void) ids;
+    (void) k;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (failed_ || ring_ == nullptr) return;
+    epoch_layer_ = -1; // An explicit boundary also starts a new epoch for the same layer.
+    advance_epoch(layer);
 }
 
 }  // namespace strata::core

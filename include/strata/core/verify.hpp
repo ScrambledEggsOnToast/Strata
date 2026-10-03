@@ -64,6 +64,12 @@ public:
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
+    /// Boot/calibration only: capture/upload every width 1..max_t and commit, without launch
+    /// or state mutation. Set all capture-affecting configuration first. Chained stages follow
+    /// on their own devices. Keep a denying GraphCaptureObservationScope while serving to
+    /// prohibit unseen captures; observed preparation is not an opaque allocator hard bound.
+    bool prepare_graphs(std::string& err);
+
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);

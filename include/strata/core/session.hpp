@@ -133,6 +133,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
 struct SessionGraphs {
     cudaGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
     int64_t n = 0;
+    int64_t allocated_layers = 0;   ///< array extent, including partially captured and sliced layers
     /// **THE SECOND GRAPH PER LAYER: `moe_finish` + `gr_write`, launched AFTER the host has run the pool.**
     ///
     /// Without it the loop has to hand layer `l`'s expert vectors to layer `l+1`, which multiplies them by

@@ -298,6 +298,7 @@ struct Options {
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    bool windowed_experts = false; ///< Direct-I/O one-layer ring; consumers finish before epoch reuse.
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
@@ -594,6 +595,9 @@ void usage() {
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
+                 "  --windowed-experts   fixed one-layer direct-I/O source ring, without a whole-model arena.\n"
+                 "                       No source-cache eviction credit; incompatible modes are refused.\n"
+                 "                       Batched prefill requires STRATA_PREFILL_RING=8 (routed-only).\n"
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
@@ -1304,6 +1308,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--windowed-experts") o.windowed_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
         else if (a == "--resident-experts") {
@@ -1392,6 +1397,22 @@ int main(int argc, char** argv) {
         }
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
+    if (o.windowed_experts) {
+        if (o.mmap_experts || !o.shared_expert_arena.empty() || o.resident_cpu_experts ||
+            !o.layer_split.empty() || o.adapt_swaps > 0 || o.expert_cache_remote[0] > 0 ||
+            o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
+            (o.expert_cache != 0 && o.expert_profile.empty())) {
+            std::fprintf(stderr, "strata generate: --windowed-experts requires one driver, no mmap/resident/shared arena, "
+                                 "no adaptive/remote caches, and a static --expert-profile when caching experts\n");
+            return 2;
+        }
+        const char* ring = std::getenv("STRATA_PREFILL_RING");
+        if ((o.serve || o.prefill_chunk > 0) && (!ring || std::string(ring) != "8")) {
+            std::fprintf(stderr, "strata generate: --windowed-experts prefill requires STRATA_PREFILL_RING=8; "
+                                 "whole-chunk streaming retains pointers across layer epochs\n");
+            return 2;
+        }
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -1878,6 +1899,7 @@ int main(int argc, char** argv) {
     const bool admission_auto_cache = o.expert_cache < 0 || (o.expert_cache == 0 && !o.expert_profile.empty());
     uint64_t admitted_cache_bytes = 0;
     uint64_t pool_bytes = 0;
+    strata::prefill::AllocationBytes admitted_prefill;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
@@ -2004,16 +2026,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: admission refused: canonical pool differs from checked index destination total\n");
             return 1;
         }
-        // The later prefill reserve formulas use signed MiB arithmetic. Reject an
-        // option that cannot be represented there even when startup has no batched prompt.
-        if (o.prefill_chunk > 0 && byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024) >
-                (uint64_t) INT64_MAX / (1ull << 20)) {
-            std::fprintf(stderr, "strata generate: admission refused: prefill byte accounting exceeds runtime integer range\n");
-            return 1;
-        }
         const bool admission_prefill = o.serve || prompt_batched;
-        const uint64_t prefill_mib_gate = admission_prefill
-            ? byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024) : 0;
+        if (admission_prefill) {
+            strata::prefill::AllocationConfig config;
+            const int kv_mode = o.kv_resident > 0 && o.max_context > o.kv_resident ? 1 : 0;
+            if (!strata::prefill::Prefill::allocation_config(o.max_context, o.prefill_chunk, kv_mode,
+                    o.kv == "int8", o.kv == "q4_0", config, err) ||
+                !strata::prefill::Prefill::allocation_needed(g, config,
+                    strata::kernels::cpu::expert_layout(), admitted_prefill, err)) {
+                std::fprintf(stderr, "strata generate: admission refused: %s\n", err.c_str());
+                return 1;
+            }
+        }
         const int64_t headroom_mib =
             o.admission_headroom_mib >= 0 ? o.admission_headroom_mib : o.vram_reserve_mib;
         const bool split_real = multi_gpu;      // distinct stage devices
@@ -2099,8 +2123,10 @@ int main(int argc, char** argv) {
             v0.add("penalty_history_device", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
                    "serving sampler history allocation, including neutral-penalty requests");
         if (admission_prefill) {
-            v0.add("prefill_buffers", byte_mul(prefill_mib_gate, 1ull << 20), "legacy prefill estimate; standalone fallback cannot be omitted for an unproven loan");
-            v0.add_unknown("prefill_allocator_bound", "Prefill::bytes_needed MMQ/ring/attention/KV workspace bound and guaranteed loan not qualified preallocation");
+            v0.add("prefill_buffers", admitted_prefill.standalone_device,
+                   "Prefill::allocation_needed: exact owned plus loanable allocation sequence; no unproven cache loan deducted");
+            v0.add_unknown("prefill_library_storage",
+                   "opaque CUDA/cuBLAS handle and first-use storage is separate from explicit prefill allocator bytes and remains unqualified");
         }
         if (o.spec > 0)
             v0.add("verify_windows", (uint64_t) kWindowMib << 20,
@@ -2158,8 +2184,7 @@ int main(int argc, char** argv) {
                 if (graph_capable)
                     ds.vram.add_unknown("graph_capture_storage", "split verifier/session graph capture storage not qualified");
                 if (admission_prefill) {
-                    ds.vram.add("prefill_buffers", byte_mul(prefill_mib_gate, 1ull << 20), "standalone prefill fallback estimate");
-                    ds.vram.add_unknown("prefill_allocator_bound", "split prefill actual allocator bound not qualified");
+                    ds.vram.add_unknown("prefill_allocator_bound", "split-device preallocation configuration requires each device's MMQ hardware inputs");
                 }
                 if (residency_table)
                     ds.vram.add("device_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers,
@@ -2265,7 +2290,22 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: admission refused: expert layout byte-total overflow or mismatch\n");
             return 1;
         }
-        if (o.mmap_experts) {
+        if (o.windowed_experts) {
+            const uint64_t ring = strata::core::WindowedExpertSource::planned_bytes({}, layout, err);
+            if (!ring) {
+                std::fprintf(stderr, "strata generate: admission refused: %s\n", err.c_str());
+                return 1;
+            }
+            ram("expert_source_ring", ring, "WindowedExpertSource conservative ring bound including aligned read scratch");
+            const bool from_gguf = !std::filesystem::exists(o.pack + "/experts.bin") && layout.native;
+            const uint64_t source_envelope = from_gguf
+                ? byte_add(source_pages(layout.total), byte_mul(3ull * (uint64_t) g.n_layers, 2 * source_page))
+                : source_pages(layout.total);
+            ram("file:expert_streaming_pages", source_envelope,
+                "full source-cache envelope retained: guest direct IO does not qualify virtiofs host cache bypass");
+            ram_unknown("expert_source_runtime_storage",
+                "source metadata, reader thread stacks and filesystem/driver storage lack a complete peak bound");
+        } else if (o.mmap_experts) {
             ram("file:expert_streaming_pages", source_pages(layout.total),
                 "full FileExpertSource mapping page upper bound; access windows and advisory release do not prove eviction");
             if (o.resident_cpu_experts) {
@@ -2278,7 +2318,7 @@ int main(int argc, char** argv) {
                 const uint64_t cache_budget = admission_auto_cache ? admitted_cache_bytes :
                     byte_mul((uint64_t) std::max(o.expert_cache, 0), blob_gate);
                 const uint64_t loan = o.prefill_chunk > 0 && !o.no_prefill_borrow
-                    ? byte_mul(byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024), 1ull << 20) : 0;
+                    ? admitted_prefill.loanable_device : 0;
                 const uint64_t withheld = byte_add(loan, blob_gate);
                 const uint64_t core_budget = cache_budget > withheld ? cache_budget - withheld : 0;
                 uint64_t used = 0, core = 0;
@@ -2392,6 +2432,10 @@ int main(int argc, char** argv) {
                 byte_add(byte_mul(byte_mul(chunk, (uint64_t) K), 32),
                          byte_mul(chunk, strata::kernels::kStepCount * sizeof(int32_t))))))),
                 "Prefill::init stager ring, two PLE row buffers, host routing and step tables");
+            ram("prefill_host_payload", byte_mul(stages, admitted_prefill.host_payload),
+                "Prefill::allocation_needed: token staging, routing counts, mapped/MMQ bounds and pinned flags");
+            ram_unknown("prefill_runtime_storage",
+                "CUDA events, context/registration storage, thread stacks, dynamic stager jobs/ready capacities and transient vectors lack a complete peak bound");
             if (split_real)
                 ram("stage_handoff", byte_mul(byte_mul(byte_mul(2, chunk), (uint64_t) g.hc),
                     byte_mul(byte_mul((uint64_t) g.n_embd, 4), stages - 1)),
@@ -2911,15 +2955,11 @@ int main(int argc, char** argv) {
     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
     // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
-    // THE PROMPT PATH'S BUFFERS ARE BORROWED FROM THE CACHE, NOT WITHHELD BESIDE IT.  With borrowing the cache
-    // is sized first and at full size, and the prompt path is laid out in the tail of it (`Prefill::relayout`),
-    // so it withholds no VRAM of its own and this reserve is zero.  Only without borrowing - no profile to fill
-    // a cache from, or --no-prefill-borrow - do the buffers take a reserve, and then this estimate stands in
-    // for buffers that cannot be priced exactly yet because the sessions do not exist.  `plan_lend` uses the
-    // exact `Prefill::bytes_needed` as soon as it can.
+    // Admission reserves the full standalone prefill allocation before granting cache bytes. An actual
+    // cache loan may reduce allocation later, but an absent or undersized loan cannot enlarge the grant.
     const bool pf_borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
     const int64_t split_pf_mib = (!pf_borrow && prompt_batched)
-                                     ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        ? (int64_t) ((admitted_prefill.standalone_device + (1ull << 20) - 1) / (1ull << 20)) : 0;
     // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  The flat 1 GiB this used to withhold from EVERY stage
     // after the first was booked "for its windows and the drafter", but the windows measure 75 MiB ("window up
     // to 6 tokens, 74.1 MiB of device buffers", on every boot) and the drafter is loaded on ONE stage - the
@@ -3165,8 +3205,20 @@ int main(int argc, char** argv) {
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
     strata::core::ArenaExpertSource arena_src;
+    strata::core::WindowedExpertSource windowed_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    if (o.windowed_experts) {
+        windowed_src.set_gguf(o.native_preset);
+        if (!windowed_src.open(o.pack, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: windowed experts: ring=%llu B slots=%lld source=%llu B reader_threads=%d; "
+                             "full host cache mirror remains charged\n",
+                     (unsigned long long) windowed_src.residency_bytes(), (long long) windowed_src.slots(),
+                     (unsigned long long) windowed_src.source_bytes(), windowed_src.reader_threads());
+        srcp = &windowed_src;
+    } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
         // mode: the experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose
@@ -3253,8 +3305,7 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
-        const int64_t prefill_mib = (!pf_borrow && prompt_batched)
-                                        ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = split_pf_mib;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -3277,8 +3328,7 @@ int main(int argc, char** argv) {
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const int64_t prefill_mib = (!pf_borrow && prompt_batched)
-                                        ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = split_pf_mib;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
@@ -3455,6 +3505,11 @@ int main(int argc, char** argv) {
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
+    }
+    if (o.windowed_experts && o.expert_cache > 0 && xcache.resident() != xcache.slots()) {
+        std::fprintf(stderr, "strata generate: --windowed-experts requires a fully populated static cache; "
+                             "dynamic asynchronous fills cannot retain ring pointers across epochs\n");
+        return 1;
     }
 
     for (auto& stp : stages) {
@@ -5000,7 +5055,8 @@ int main(int argc, char** argv) {
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                        (long long) ((o.windowed_experts ? windowed_src.residency_bytes() :
+                            o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib);
@@ -5456,8 +5512,9 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
+                    if (b == nullptr || !((o.windowed_experts || refill_blocking())
+                            ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                            : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
                 }
@@ -6082,8 +6139,9 @@ int main(int argc, char** argv) {
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
-                                                        : xcache.fill_slot_queued(slot, b, err, nb))) {
+                if (b == nullptr || !((o.windowed_experts || refill_blocking())
+                        ? xcache.fill_slot_blocking(slot, b, err, nb)
+                        : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }

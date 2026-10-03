@@ -2,6 +2,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/graph.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -577,47 +578,74 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
 }
 
 namespace {
-bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
+bool finish_capture(const GraphCaptureProbe& probe, cudaStream_t cs, bool ok, cudaGraphExec_t& exec,
+                    const char* what, std::string& err) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
         return false;
     }
+    // Explicit upload avoids a first implicit upload blocking behind a device-side spin.
+    const bool instantiated = graph_capture_instantiate(probe, graph, exec, cs, true, err);
     cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    cudaGraphUpload(exec, cs);
-    cudaStreamSynchronize(cs);
+    if (!instantiated) return false;
+    if (!probe.check(GraphCapturePhase::Retained, err)) {
+        cudaGraphExecDestroy(exec);
+        exec = nullptr;
+        return false;
+    }
     return true;
 }
 }  // namespace
 
+bool MtpDrafter::prepare_graphs(std::string& err) {
+    if (!wt_ || !head_ || !window_R_ || !cs_) { err = "mtp: prepare requires bind"; return false; }
+    const OnDevice on_device(device_);
+    for (int T = 1; T <= max_t_; ++T) {
+        if (!capture_prefill(T, err) || !capture_prefill_dev(T, err) || !capture_round(T, false, err))
+            return false;
+        if (coupled_ok_ && !capture_round(T, true, err)) return false;
+    }
+    for (int j = 1; j < std::min(max_t_ - 1, max_drafts_); ++j) {
+        if (!capture_step(j, false, err)) return false;
+        if (coupled_ok_ && !capture_step(j, true, err)) return false;
+    }
+    return true;
+}
+
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
+    const GraphCaptureProbe probe({"mtp", "prefill", 0, T, 0});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     using namespace strata::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
-    return finish_capture(cs_, ok, prefill_exec_[T], "prefill", err);
+    return finish_capture(probe, cs_, ok, prefill_exec_[T], "prefill", err);
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
+    const GraphCaptureProbe probe({"mtp", "prefill_device", 0, T, 0});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
-    return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+    return finish_capture(probe, cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
+    const GraphCaptureProbe probe({"mtp", coupled ? "round_coupled" : "round", 0, T, 0});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
@@ -644,7 +672,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+    return finish_capture(probe, cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
@@ -652,6 +680,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
+    const GraphCaptureProbe probe({"mtp", coupled ? "step_coupled" : "step", j, 1, 0});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
@@ -663,7 +693,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
-    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+    return finish_capture(probe, cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {

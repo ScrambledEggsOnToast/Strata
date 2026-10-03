@@ -1,0 +1,205 @@
+// tests/core/prefill_allocation_test.cpp - the prefill allocator's CONSUMER contracts, checked without a
+// device, a session, or weights.  `allocation_needed` is the admission-grade bound: it must run before
+// SessionState exists, fail closed on overflow and invalid configurations, and report the loan/owned split
+// that generate.cpp's lending (bytes_needed) and init's loan validation rely on.  These tests pin those
+// contracts; they deliberately do NOT transcribe the internal take sequence - a copy of the implementation
+// would pass even when the estimator and the carver drifted apart, which is exactly what it must catch.
+#include "strata/prefill/prefill.hpp"
+#include "strata/core/layout.hpp"
+#include "strata/core/session.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <string>
+
+namespace {
+// The allocator's one rounding rule, documented on AllocationBytes: every payload costs
+// ceil(payload / 256) * 256 + 256 (alignment plus guard), so consumers can price single buffers.
+uint64_t allocation(uint64_t payload) { return (payload + 511) & ~UINT64_C(255); }
+int failures = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::fprintf(stderr, "%s\n", what); ++failures; }
+}
+}  // namespace
+
+int main() {
+    using namespace strata;
+    core::ModelGeometry g;                       // the artifact's fixed geometry (validated inside)
+    kernels::cpu::ExpertLayout experts;          // canonical pack: default max_blob, no native tables
+    experts.n_layers = g.n_layers;
+    experts.n_expert = g.n_expert;
+    const kernels::QsaShapes s = kernels::qsa_real_shapes();
+
+    prefill::AllocationConfig c;
+    c.max_cells = 4097;
+    c.n_pages = (c.max_cells + 3) / 4;
+    c.chunk = 64;
+    c.kv_mode = 0;
+    c.ring = 8;
+    c.mmq = false;
+    c.device_cc = 860; c.device_sms = 82; c.device_shared_bytes = 101376;
+
+    prefill::AllocationBytes b, other;
+    std::string err;
+    auto estimate = [&](prefill::AllocationBytes& out) {
+        return prefill::Prefill::allocation_needed(g, c, experts, out, err);
+    };
+
+    // ---- works before SessionState allocation, and is a pure function of its inputs.
+    check(estimate(b), "standalone sizing without initialized session/weights");
+    check(b.standalone_device == b.loanable_device + b.owned_device,
+          "standalone does not assume a cache loan");
+    check(b.loanable_device > 0 && b.owned_device > 0, "both regions are populated");
+
+    // Fixed host payload includes the mapped bounds tail even with MMQ off; dynamic jobs are separate.
+    const uint64_t bounds = (uint64_t) (g.n_expert + 1 + (g.n_expert + 15) / 16 * 17) * 4;
+    check(b.host_payload == (uint64_t) c.chunk * 4 + (2 * (uint64_t) g.n_expert + 1) * 4 + 16 + bounds,
+          "non-MMQ host payload includes the mapped bounds tail");
+
+    // ---- a loan never covers the token ids: they are owned even in the plainest configuration.
+    check(b.owned_device == allocation((uint64_t) c.chunk * 4), "owned token-id allocator count");
+
+    // ---- each streaming ring slot is one aligned expert-blob slot (the ring contract admission lends by).
+    c.ring = 16;
+    check(estimate(other), "expanded ring sizing");
+    check(other.loanable_device - b.loanable_device == 8 * allocation(experts.max_blob),
+          "each ring slot includes its own guard/alignment");
+    check(other.standalone_device == other.loanable_device + other.owned_device,
+          "ring growth keeps the standalone identity");
+    c.ring = 8;
+
+    // ---- a loan sized for the largest chunk covers every smaller relayout of the same configuration.
+    c.chunk = 8192;
+    check(estimate(other), "large chunk sizing");
+    const uint64_t big = other.loanable_device;
+    c.chunk = 64;
+    check(estimate(other) && big >= other.loanable_device, "loan bound is monotone in chunk");
+    const uint64_t small = other.loanable_device;
+    c.ring = 512;
+    check(estimate(other), "widest ring sizing");
+    check(other.loanable_device >= small, "loan bound is monotone in ring at fixed chunk");
+    c.ring = 8;
+
+    // ---- KV STREAMING: the stage pool is sized by LOGICAL pages (ceil(max_cells / 4)), never by the
+    // resident slot count, and the staging identity table is owned, not lent.
+    const uint64_t rows = (uint64_t) c.n_pages * (uint64_t) g.n_head_kv * (uint64_t) s.page_size;
+    c.kv_mode = 1;
+    check(estimate(other), "streamed FP16 stage sizing");
+    const uint64_t fp16_stage = 2 * allocation(rows * (uint64_t) g.head_dim * 2);
+    check(other.loanable_device - b.loanable_device == fp16_stage,
+          "logical pages, not resident KV slots, size streamed stage");
+    check(other.owned_device - b.owned_device == allocation((uint64_t) c.n_pages * 4),
+          "identity table always owned");
+    check(other.standalone_device == other.loanable_device + other.owned_device,
+          "streamed stage keeps the standalone identity");
+    const prefill::AllocationBytes streamed = other;
+
+    // STRATA_KV_STAGE_OWN: the same stage moves from the loan to the owned region.  Standalone is unchanged
+    // (a partial loan cannot price the full region as borrowed), and the loan shrinks by exactly the stage.
+    c.kv_stage_own = true;
+    check(estimate(other), "separate stage sizing");
+    check(other.standalone_device == streamed.standalone_device,
+          "separate stage is never omitted from standalone peak");
+    check(other.loanable_device + fp16_stage == streamed.loanable_device,
+          "separate stage cannot be deducted as a loan");
+    check(other.owned_device == streamed.owned_device + fp16_stage,
+          "stage allocation moves exactly to owned total");
+    c.kv_stage_own = false;
+
+    // ---- KV formats price their documented per-head bytes (INT8: codes + one FP16 scale per 64).
+    c.kv_int8 = true;
+    check(estimate(other), "INT8 stage sizing");
+    check(other.loanable_device - b.loanable_device ==
+          2 * allocation(rows * (uint64_t) g.head_dim) +
+          2 * allocation(rows * (uint64_t) (g.head_dim / 64) * 2), "INT8 codes and scales counted");
+    c.kv_int8 = false;
+    c.kv_q4 = true;
+    check(estimate(other), "Q4 stage sizing");
+    check(other.loanable_device - b.loanable_device ==
+          2 * allocation(rows * kernels::kv_q4_bytes_per_head((int) g.head_dim)),
+          "Q4 stage block bytes counted");
+    c.kv_q4 = false;
+    c.kv_mode = 0;
+
+    // ---- overflow and invalid configuration refuse, and leave the output zeroed (fail closed).
+    c.chunk = std::numeric_limits<int64_t>::max();
+    check(!estimate(other) && other.standalone_device == 0, "chunk overflow fails closed");
+    c.chunk = 64;
+    experts.max_blob = std::numeric_limits<uint64_t>::max() - 511;
+    check(!estimate(other) && other.standalone_device == 0, "ring accumulation overflow fails closed");
+    experts.max_blob = kernels::cpu::BLOB;
+    c.n_pages -= 1;
+    check(!estimate(other), "undersized logical page configuration rejected");
+    c.n_pages += 1;
+    c.ring = 7;
+    check(!estimate(other), "ring below the routed staging minimum rejected");
+    c.ring = 8;
+    c.stager_ring = 1;
+    check(!estimate(other), "out-of-range stager ring rejected");
+    c.stager_ring = 16;
+    c.kv_mode = 3;
+    check(!estimate(other), "unknown KV mode rejected");
+    c.kv_mode = 1; c.kv_int8 = true; c.kv_q4 = true;
+    check(!estimate(other), "INT8 and Q4 together rejected");
+    c.kv_int8 = c.kv_q4 = false;
+    c.kv_mode = 0;
+
+    // ---- the full-model IQ3_S/IQ4_NL geometry qualifies without a session, and the MMQ bound is the
+    // configuration-derived stream-k maximum: the bound is what the external pool launch can never exceed.
+    experts.native = true;
+    experts.fmt.resize((size_t) g.n_layers);
+    experts.bytes.assign((size_t) g.n_layers, 2000000);
+    experts.max_blob = 2000000;
+    for (auto& f : experts.fmt) {
+        f.gu_type = 21; f.d_type = 20;   // GGML IQ3_S and IQ4_NL artifact type ids
+        f.n_embd = 2560; f.n_ff = 640; f.bytes = 2000000;
+    }
+    c.mmq = true;
+    check(estimate(b), "full-model IQ3_S geometry qualifies without session allocation");
+    check(b.standalone_device == b.loanable_device + b.owned_device,
+          "MMQ configuration keeps the standalone identity");
+    if (prefill::mmq::built()) {
+        uint64_t workspace = 0;
+        check(prefill::mmq::workspace_bytes(c.device_cc, c.device_sms, c.device_shared_bytes, workspace) &&
+              b.mmq_workspace == workspace && prefill::mmq::supported(21) && prefill::mmq::supported(20) &&
+              !prefill::mmq::supported(24),
+              "MMQ scratch is explicitly included in estimator; IQ1_M stays on the FP16 path");
+        c.device_sms = 0;
+        check(!estimate(other), "missing MMQ hardware input fails closed");
+        c.device_sms = 82;
+    } else {
+        check(b.mmq_workspace == 0, "no MMQ support: no workspace charged");
+    }
+
+    // Only the staging-vector row depends on MMQ support; the mapped tail is always priced.
+    c.mmq = false;
+    const uint64_t mmq_bounds = prefill::mmq::built() ? bounds : 0;
+    check(estimate(other) && other.host_payload == b.host_payload - mmq_bounds,
+          "MMQ off removes only supported bounds staging payload");
+
+    // ---- native per-layer tables are validated before any arithmetic.
+    experts.fmt[0].n_ff = 641;
+    check(!estimate(other), "native tensor geometry mismatch rejected before allocation");
+
+    // ---- restore the canonical layout: the lending entry point reads the process-wide one.
+    experts = kernels::cpu::ExpertLayout{};
+    experts.n_layers = g.n_layers;
+    experts.n_expert = g.n_expert;
+    c.mmq = false;
+
+    // ---- a session whose logical page count contradicts its max_cells is refused: never under-lend.
+    {
+        core::QsaState q;
+        q.max_cells = c.max_cells;
+        q.n_pages = c.n_pages - 1;           // not ceil(max_cells / 4): refuse
+        core::SessionState ss;
+        ss.qsa_states = &q;
+        check(prefill::Prefill::bytes_needed(g, ss, c.chunk) == UINT64_MAX,
+              "bytes_needed refuses an inconsistent session");
+    }
+    return failures ? 1 : 0;
+}

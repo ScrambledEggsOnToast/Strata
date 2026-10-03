@@ -40,6 +40,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <limits>
 
 #ifndef STRATA_PREFILL_MMQ
 // A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
@@ -47,10 +48,13 @@ namespace strata::prefill::mmq {
 bool built() { return false; }
 bool supported(int) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
+bool workspace_bytes(int, int, uint64_t, uint64_t& bytes) { bytes = 0; return true; }
+bool device_config(int& cc, int& sms, uint64_t& shared) { cc = sms = 0; shared = 0; return true; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
 Context::Context() {}
 Context::~Context() {}
+void Context::set_workspace(void*, size_t) {}
 void Context::run(const Product&, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
@@ -66,8 +70,6 @@ using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
 constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
-// plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
-inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
 // RING_MAX-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
@@ -103,18 +105,21 @@ inline bool gr_unfused() {
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
-// Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
-// no region it only counts, which is how `bytes_needed` sizes the region.
+// One checked allocation policy for both counting and carving: payload rounded to 256 plus a 256-byte guard.
 struct Alloc {
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
-        const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
+        if (!ok) return nullptr;
+        constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+        if (n > (max - 511) / sizeof(T)) { ok = false; return nullptr; }
+        const uint64_t bytes = ((uint64_t) n * sizeof(T) + 511) & ~255ull;
+        if (bytes > max - used) { ok = false; return nullptr; }
         if (count_only) { used += bytes; return nullptr; }
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; return nullptr; }
+            if (used > cap || bytes > cap - used) { ok = false; return nullptr; }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
@@ -298,6 +303,12 @@ struct Prefill::Impl {
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
+    AllocationConfig allocation;
+    bool mmq_any = false, mmq_fallback = true;
+    std::vector<char> mmq_layer;
+    size_t mmq_gu_max = 0, mmq_d_max = 0;
+    uint64_t max_blob = 0, mmq_workspace_bytes = 0;
+    void* mmq_workspace = nullptr;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
@@ -340,14 +351,10 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
-void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+void take_stage(Alloc& o_borrowed, Alloc& own, const AllocationConfig& q0, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
-    const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
-    if (stage_own() && o_borrowed.count_only) return;
-    Alloc own;
-    own.owned = o_borrowed.owned;
-    Alloc& o = stage_own() ? own : o_borrowed;
+    Alloc& o = q0.kv_stage_own ? own : o_borrowed;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
     if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
@@ -391,29 +398,11 @@ Prefill::~Prefill() {
 }
 
 namespace {
-constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
-constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
-
-// THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
-// into the residual, and only then its MoE, so the three sets of scratch are never live at once: one region the size
-// of the largest holds them all.  That is ~260 KB of the ~680 KB a prompt token cost - which is what lets a chunk
-// grow (every expert is streamed once per chunk, so a bigger chunk streams fewer bytes per token).  The sizes are
-// counted with the same `take` sequence `init` uses; a mismatch makes `init` fail with "do not fit", never overlap.
-uint64_t gdn_set_bytes(size_t T) {
-    Alloc a; a.count_only = true; bool ok = true;
-    a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<float>(T * 2 * HV, ok); a.take<float>(T * HV, ok);
-    a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
-    return a.used;
-}
-uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
-                       const strata::kernels::QsaShapes& s) {
-    Alloc a; a.count_only = true; bool ok = true;
-    a.take<float>(T * 512, ok); a.take<float>(T * 512, ok); a.take<float>(T * 12288, ok); a.take<float>(T * ZV, ok);
-    a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
-    a.take<int32_t>(T * (size_t) cap, ok);
-    a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
-    a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
-    return a.used;
+constexpr int64_t GEMM_SCRATCH = 32ll << 20;
+constexpr size_t GEMM_WS = 32u << 20;
+void take_gemm(Alloc& o, uint16_t*& scratch, void*& workspace, bool& ok) {
+    scratch = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    workspace = o.take<uint8_t>(GEMM_WS, ok);
 }
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
@@ -423,48 +412,32 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// The MMQ bounds upload for one layer is [n+1 absolute bounds][ng tables of MMQ_GROUP+1 relative bounds],
+// n = the layer's routed experts (at most n_expert), ng = ceil(n / MMQ_GROUP).  This many int32 must exist on
+// the device and, when the group tables live in mapped memory, past [ids | slot | src] in grp_host.
+inline int64_t mmq_bounds_int32(int64_t n_expert) {
+    return n_expert + 1 + ((n_expert + MMQ_GROUP - 1) / MMQ_GROUP) * (MMQ_GROUP + 1);
+}
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
     size_t gu_max = 0, d_max = 0;
 };
-const MmqPlan& mmq_plan() {
-    static const MmqPlan plan = [] {
-        MmqPlan p;
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
-        const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
-        p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
-        p.fallback = !on || layers <= 0;
-        for (int64_t l = 0; on && l < layers; ++l) {
-            const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-            if (!mmq::supported(gt) || !mmq::supported(dt)) { p.fallback = true; continue; }
-            p.layer[(size_t) l] = 1;
-            p.any = true;
-            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
-            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
-        }
-        return p;
-    }();
-    return plan;
-}
-uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
-    const MmqPlan& mp = mmq_plan();
-    Alloc a; a.count_only = true; bool ok = true;
-    a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
-    a.take<int32_t>(T * K, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
-    a.take<float>(T * K * 1280, ok);
-    if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
-    a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
-    a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
-    if (mp.any) {
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
-        a.take<float>(T * K * 640, ok);
-        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
+MmqPlan mmq_plan(const kernels::cpu::ExpertLayout& lay, bool enabled) {
+    MmqPlan p;
+    const bool on = mmq::built() && enabled;
+    const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
+    p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
+    p.fallback = !on || layers <= 0;
+    for (int64_t l = 0; on && l < layers; ++l) {
+        const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+        if (!mmq::supported(gt) || !mmq::supported(dt)) { p.fallback = true; continue; }
+        p.layer[(size_t) l] = 1;
+        p.any = true;
+        p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+        p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
     }
-    return a.used;
+    return p;
 }
 }
 
@@ -483,19 +456,33 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
+    if (!ss.qsa_states) { err = "prefill: missing primary QSA state"; return false; }
+    const auto& q0 = ss.qsa_states[ss.qsa_primary()];
+    if (!allocation_config(q0.max_cells, chunk, q0.kv_mode, q0.kv_int8, q0.kv_q4, m.allocation, err)) return false;
+    m.allocation.n_pages = q0.n_pages;
+    m.allocation.layer_begin = stage_lb_; m.allocation.layer_end = stage_le_;
+    AllocationBytes sizing;
+    const auto& experts = kernels::cpu::expert_layout();
+    if (!allocation_needed(g, m.allocation, experts, sizing, err)) return false;
+    if (borrow && ((uintptr_t) borrow % 256 != 0 || borrow_bytes < sizing.loanable_device)) {
+        err = "prefill: lent region is unaligned or undersized"; return false;
+    }
+    const MmqPlan mp = mmq_plan(experts, m.allocation.mmq);
+    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback; m.mmq_layer = mp.layer;
+    m.mmq_gu_max = mp.gu_max; m.mmq_d_max = mp.d_max;
+    if (m.mmq_any) m.bounds_host.resize((size_t) mmq_bounds_int32(g.n_expert));
+    m.max_blob = experts.native ? experts.max_blob : std::max<uint64_t>(experts.max_blob, kernels::cpu::BLOB);
+    if (experts.native) for (uint64_t bytes : experts.bytes) m.max_blob = std::max(m.max_blob, bytes);
+    m.mmq_workspace_bytes = sizing.mmq_workspace;
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
-    if (m.tok_dev == nullptr) {
-        if (cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)) != cudaSuccess) {
-            err = "prefill: the token id buffer";
-            return false;
-        }
-        m.owned.push_back(m.tok_dev);
-        m.tok_host.resize((size_t) chunk);
-    }
+    Alloc fixed;
+    fixed.owned = &m.owned;
+    if (!carve_fixed(m, &fixed)) { err = "prefill: fixed device buffers"; return false; }
+    m.tok_host.resize((size_t) chunk);
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
@@ -510,13 +497,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        if (!m.stager->init((size_t) MAXBLOB(), stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
+        if (!m.stager->init((size_t) m.max_blob, stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
             ok = false;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        const size_t need = 3 * T * K + (size_t) mmq_bounds_int32(m.g->n_expert);
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -550,11 +537,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+        if (cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             ok = false;
-        else
-            m.owned.push_back(m.ident_table);
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
     Alloc o;
@@ -562,8 +546,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     {
-        uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-        void* ws = o.take<uint8_t>(GEMM_WS, ok);
+        uint16_t* gs = nullptr;
+        void* ws = nullptr;
+        take_gemm(o, gs, ws, ok);
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     }
@@ -574,16 +559,29 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     return true;
 }
 
-// Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
-// once, and `relayout` for a request's own chunk.  The order is `bytes_needed`'s.
-bool Prefill::carve(size_t T, void* alloc) {
-    Impl& m = *impl_;
+bool Prefill::carve_fixed(Impl& m, void* alloc) {
     Alloc& o = *static_cast<Alloc*>(alloc);
+    bool ok = true;
+    m.tok_dev = o.take<int32_t>((size_t) m.allocation.chunk, ok);
+    if (m.allocation.kv_mode == 1) m.ident_table = o.take<int32_t>((size_t) m.allocation.n_pages, ok);
+    return ok;
+}
+
+// Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
+// once, and relayout for a request's own chunk. allocation_needed counts this identical sequence.
+bool Prefill::carve(size_t T, void* alloc) {
+    Alloc own;
+    own.owned = &impl_->owned;
+    return carve_layout(*impl_, T, alloc, &own);
+}
+
+bool Prefill::carve_layout(Impl& m, size_t T, void* alloc, void* owned_alloc) {
+    Alloc& o = *static_cast<Alloc*>(alloc);
+    Alloc& own = *static_cast<Alloc*>(owned_alloc);
     const core::ModelGeometry& g = *m.g;
-    core::SessionState& ss = *m.ss;
     bool ok = true;
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
-    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
+    m.xn = m.allocation.gr_unfused ? o.take<float>(T * D, ok) : nullptr;
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
@@ -594,21 +592,17 @@ bool Prefill::carve(size_t T, void* alloc) {
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    m.max_blocks = m.allocation.max_cells / s.idx_block + 2;
     {
-        // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
-        const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert)});
-        uint8_t* base = o.take<uint8_t>((size_t) region, ok);
-        m.region = base;
-        m.region_bytes = region;
+        // The same three overlay sequences first count, then carve. No independent sizing transcription.
+        auto overlays = [&](uint8_t* base, uint64_t region, bool count) {
         Alloc a;
-        a.base = base; a.cap = region; a.owned = &m.owned;
+        a.base = base; a.cap = region; a.owned = &m.owned; a.count_only = count;
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
         m.gate = a.take<float>(T * HV, ok); m.beta = a.take<float>(T * HV, ok); m.hbuf = a.take<float>(T * C, ok);
         m.y = a.take<float>(T * ZV, ok); m.y_h = a.take<uint16_t>(T * ZV, ok);
         Alloc b;
-        b.base = base; b.cap = region; b.owned = &m.owned;
+        b.base = base; b.cap = region; b.owned = &m.owned; b.count_only = count;
         m.Kc = b.take<float>(T * 512, ok); m.Vc = b.take<float>(T * 512, ok); m.Qf = b.take<float>(T * 12288, ok);
         m.q = b.take<float>(T * ZV, ok); m.idx_raw = b.take<float>(T * 128, ok); m.q_idx = b.take<float>(T * 512, ok);
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * ZV, ok);
@@ -616,42 +610,54 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
-        c.base = base; c.cap = region; c.owned = &m.owned;
+        c.base = base; c.cap = region; c.owned = &m.owned; c.count_only = count;
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
-        const MmqPlan& mp = mmq_plan();
-        m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        m.Xs = m.mmq_fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
         m.GU = c.take<float>(T * K * 1280, ok);
-        m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.Hh = m.mmq_fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
-        if (mp.any) {
+        if (m.mmq_any) {
             m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
             m.H = c.take<float>(T * K * 640, ok);
             m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
         }
-        if (base == nullptr) ok = false;
+        return std::max({a.used, b.used, c.used});
+        };
+        const uint64_t region = overlays(nullptr, 0, true);
+        uint8_t* base = o.take<uint8_t>((size_t) region, ok);
+        m.region = base;
+        m.region_bytes = region;
+        if (!o.count_only && ok) overlays(base, region, false);
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
-    if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
+    if (m.mmq_any) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.bounds_dev = o.take<int32_t>((size_t) mmq_bounds_int32(m.g->n_expert), ok);
+        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * m.mmq_gu_max + MMQ_TAIL, ok);
+        m.grp_d = o.take<uint8_t>(MMQ_GROUP * m.mmq_d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
-        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
-    m.ring = ring_slots(T);
+    if (mmq::built()) {
+        m.mmq_workspace = m.mmq_workspace_bytes ? o.take<uint8_t>((size_t) m.mmq_workspace_bytes, ok) : nullptr;
+        if (!o.count_only && ok) {
+            if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+            m.mmq_ctx->set_workspace(m.mmq_workspace, (size_t) m.mmq_workspace_bytes);
+        }
+    }
+    m.ring = m.allocation.ring;
     for (int i = 0; i < m.ring; ++i) {
-        m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
+        m.stage_dev[i] = o.take<uint8_t>((size_t) m.max_blob, ok);
         m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    if (o.count_only || !m.allocation.kv_stage_own ||
+        (m.stage.k_pool == nullptr && m.stage.k_q == nullptr && m.stage.k_q4 == nullptr))
+        take_stage(o, own, m.allocation, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
 }
@@ -662,17 +668,26 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
         return false;
     }
+    AllocationConfig c = m.allocation;
+    c.chunk = chunk; c.ring = ring_slots((size_t) chunk);
+    AllocationBytes sizing;
+    if (!allocation_needed(*m.g, c, kernels::cpu::expert_layout(), sizing, err)) return false;
+    if ((uintptr_t) borrow % 256 != 0 || borrow_bytes < sizing.loanable_device) {
+        err = "prefill: lent region is unaligned or undersized"; return false;
+    }
     if (cudaStreamSynchronize(m.cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess) {
         err = "prefill: relayout: the stream failed";
         return false;
     }
+    m.allocation = c;
     bool ok = true;
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
-    uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    void* ws = o.take<uint8_t>(GEMM_WS, ok);
+    uint16_t* gs = nullptr;
+    void* ws = nullptr;
+    take_gemm(o, gs, ws, ok);
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
     if (!ok || !carve((size_t) chunk, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
@@ -753,7 +768,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
-        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+        if (!m.mmq_ctx) return false; // init binds a priced external pool even for draft-only MMQ.
         mmq::iota(ident, B * g.hc, m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
@@ -830,39 +845,100 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
-    // the same allocation sequence as `init`, counted
-    const size_t T = (size_t) chunk;
-    bool ok = true;
-    Alloc o;
-    o.count_only = true;
-    o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    o.take<uint8_t>(GEMM_WS, ok);
-    auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
-    o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
-    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert)}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
-    if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
-        o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
+                                AllocationConfig& out, std::string& err) {
+    out = {};
+    if (max_cells <= 0 || max_cells > INT32_MAX || chunk <= 0 || chunk > INT32_MAX / K) {
+        err = "prefill: context/chunk exceeds supported index range"; return false;
     }
-    for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
-    f(T * N);
-    f((size_t) strata::kernels::NG_HC_DIM);
-    strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
-    return o.used + (8u << 20);   // alignment slack
+    out.max_cells = max_cells; out.n_pages = (max_cells + 3) / 4; out.chunk = chunk;
+    out.kv_mode = kv_mode; out.kv_int8 = kv_int8; out.kv_q4 = kv_q4;
+    out.kv_stage_own = stage_own(); out.gr_unfused = gr_unfused(); out.ring = ring_slots((size_t) chunk);
+    out.stager_ring = 16;
+    if (const char* v = std::getenv("STRATA_STAGER_RING")) out.stager_ring = std::clamp(std::atoi(v), 2, 256);
+    const char* env = std::getenv("STRATA_PREFILL_MMQ");
+    out.mmq = env == nullptr || std::atoi(env) != 0;
+    if (mmq::built() && !mmq::device_config(out.device_cc, out.device_sms, out.device_shared_bytes)) {
+        err = "prefill: device properties unavailable for MMQ qualification"; return false;
+    }
+    return true;
+}
+
+bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationConfig& c,
+                                const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err) {
+    out = {};
+    err.clear();
+    const int64_t end = c.layer_end < 0 ? g.n_layers : c.layer_end;
+    // Kernels/group row maps use int32 indices. These limits also make every element-count product below
+    // representable on the supported 64-bit hosts; take() checks payload/alignment/addition separately.
+    if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || g.n_expert > NE ||
+        g.n_layers < 1 || g.n_layers > 48 || g.n_ff != 640 || g.ssm_conv_channels != C || g.ssm_value_dim != ZV ||
+        g.ssm_v_heads != HV || g.ssm_state_size != 128 || g.ssm_k_heads != 16 || g.ssm_d_conv != 4 ||
+        g.n_head != 24 || g.n_head_kv != 2 || g.head_dim != 256 || g.idx_q_heads != 4 || g.idx_key_dim != 128 ||
+        c.max_cells <= 0 || c.max_cells > INT32_MAX || c.chunk <= 0 || c.chunk > INT32_MAX / K ||
+        c.n_pages != (c.max_cells + 3) / 4 || c.kv_mode < 0 || c.kv_mode > 2 || (c.kv_int8 && c.kv_q4) ||
+        c.ring < 8 || c.ring > RING_MAX || c.stager_ring < 2 || c.stager_ring > 256 ||
+        c.layer_begin < 0 || c.layer_begin >= end || end > g.n_layers ||
+        experts.n_layers != g.n_layers || experts.n_expert != g.n_expert ||
+        (experts.native && (experts.fmt.size() != (size_t) g.n_layers || experts.bytes.size() != (size_t) g.n_layers)) ||
+        experts.max_blob == 0) {
+        err = "prefill: invalid allocation geometry/configuration"; return false;
+    }
+    uint64_t blob = experts.native ? experts.max_blob : std::max<uint64_t>(experts.max_blob, kernels::cpu::BLOB);
+    for (int64_t l = 0; experts.native && l < g.n_layers; ++l) {
+        const auto& f = experts.fmt[(size_t) l];
+        if (f.n_embd != N || f.n_ff != 640 || f.bytes == 0 || experts.bytes[(size_t) l] < f.bytes) {
+            err = "prefill: native expert geometry/blob size mismatch"; return false;
+        }
+        blob = std::max(blob, experts.bytes[(size_t) l]);
+    }
+    if (blob > std::numeric_limits<uint64_t>::max() - 511) {
+        err = "prefill: expert staging allocation overflow"; return false;
+    }
+    Impl m;
+    m.g = &g; m.allocation = c; m.max_blob = blob;
+    const MmqPlan mp = mmq_plan(experts, c.mmq);
+    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback; m.mmq_layer = mp.layer;
+    m.mmq_gu_max = mp.gu_max; m.mmq_d_max = mp.d_max;
+    if (!mmq::workspace_bytes(c.device_cc, c.device_sms, c.device_shared_bytes, m.mmq_workspace_bytes)) {
+        err = "prefill: invalid MMQ device configuration"; return false;
+    }
+    Alloc o, own;
+    o.count_only = own.count_only = true;
+    bool ok = true;
+    uint16_t* gs = nullptr;
+    void* ws = nullptr;
+    take_gemm(o, gs, ws, ok);
+    if (!ok || !carve_fixed(m, &own) || !carve_layout(m, (size_t) c.chunk, &o, &own)) {
+        err = "prefill: allocation arithmetic overflow"; return false;
+    }
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    if (o.used > max - own.used) {
+        err = "prefill: allocation total overflow"; return false;
+    }
+    out.loanable_device = o.used;
+    out.owned_device = own.used;
+    out.standalone_device = o.used + out.owned_device;
+    out.mmq_workspace = m.mmq_workspace_bytes;
+    // Fixed explicit payload only. The mapped bounds tail is allocated independently of MMQ;
+    // bounds_host is sized to its maximum during init before any per-layer resize can grow it.
+    // Stager jobs/ready capacities and transient vectors remain in the caller's unknown runtime class.
+    out.host_payload = (uint64_t) c.chunk * 4 + ((uint64_t) 2 * g.n_expert + 1) * 4 +
+                       (uint64_t) c.stager_ring + (uint64_t) mmq_bounds_int32(g.n_expert) * 4;
+    if (mp.any) out.host_payload += (uint64_t) mmq_bounds_int32(g.n_expert) * 4;
+    return true;
+}
+
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+    if (!ss.qsa_states) return UINT64_MAX;
+    const auto& q = ss.qsa_states[ss.qsa_primary()];
+    AllocationConfig c;
+    AllocationBytes bytes;
+    std::string err;
+    if (!allocation_config(q.max_cells, chunk, q.kv_mode, q.kv_int8, q.kv_q4, c, err)) return UINT64_MAX;
+    c.n_pages = q.n_pages;
+    if (!allocation_needed(g, c, kernels::cpu::expert_layout(), bytes, err)) return UINT64_MAX;
+    return bytes.loanable_device;
 }
 
 namespace {
@@ -1260,14 +1336,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
-                if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                if (m.allocation.gr_unfused) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs);
                 normed = false;
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
-                if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                if (m.allocation.gr_unfused) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
@@ -1544,7 +1620,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::vector<int32_t> order;
                     for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                    const bool use_mmq = m.mmq_any && m.mmq_layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
@@ -1759,7 +1835,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)
                 const int64_t nl = half == 0 ? l : l + 1;
-                const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) &&
+                const bool fuse = !m.allocation.gr_unfused && nl < LE && !(half == 1 && nl == 1 && ple_on) &&
                                   !(half == 1 && strata::kernels::cvec().covers(l));
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {

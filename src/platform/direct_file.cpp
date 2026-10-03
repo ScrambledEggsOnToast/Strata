@@ -81,6 +81,7 @@ struct DirectFile::Impl {
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE port = nullptr;
     uint64_t size = 0;
+    int threads = 0;
     std::mutex mu;                      // everything below
     std::deque<Req*> free_reqs;
     std::vector<Req*> all_reqs;
@@ -184,6 +185,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
     const int n = io_threads(4);
+    impl_->threads = n;
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
@@ -195,12 +197,14 @@ void DirectFile::close() {
     impl_->port = nullptr;
     impl_->file = INVALID_HANDLE_VALUE;
     impl_->size = 0;
+    impl_->threads = 0;
     impl_->immediate.clear();
     impl_->queue.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
 uint64_t DirectFile::size() const { return impl_->size; }
+int DirectFile::pool_threads() const { return impl_->threads; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
     if (!is_open()) { err = "DirectFile: not open"; return false; }
@@ -266,6 +270,7 @@ void DirectFile::wake() {
 struct DirectFile::Impl {
     int fd = -1;
     uint64_t size = 0;
+    int threads = 0;
     std::mutex mu;
     std::condition_variable cv_work, cv_done;
     std::deque<Pending> queue;
@@ -311,6 +316,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
     const int n = io_threads(16);
+    impl_->threads = n;
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
@@ -320,12 +326,14 @@ void DirectFile::close() {
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
     impl_->size = 0;
+    impl_->threads = 0;
     impl_->done.clear();
     impl_->queue.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
 uint64_t DirectFile::size() const { return impl_->size; }
+int DirectFile::pool_threads() const { return impl_->threads; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
     if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
