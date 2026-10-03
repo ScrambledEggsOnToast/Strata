@@ -341,6 +341,56 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+## Memory admission (HET-017)
+
+Before the first model allocation (including the native embedding and PCIe probe), the engine prices the
+configuration from actual pack source/destination spans, GGUF tensor blocks, session arithmetic and the
+expert layout. Both measured total **and free** VRAM must cover each device's demand plus headroom;
+another process's occupied VRAM is not available capacity. Native dense overrides are counted whenever
+the loader enables them, including canonical packs, and the native head includes its Q8_1 scratch.
+
+`--expert-cache auto` (also the profile's implicit auto mode) commits an allocation budget at this gate:
+`floor((min(total, free) - fixed allocations - headroom) / max_blob) * max_blob`, bounded by the model's
+expert count and profile length. Runtime sizing may shrink that budget but never enlarge it. The native
+embedding is priced in host RAM and as a possible device fallback, so failure to pin it cannot silently
+spend the admitted headroom. Expert arena registration defaults to at most 8 GiB, not the entire guest.
+Resident expert complements above 8 GiB use pageable resident RAM rather than pinning the whole allocation.
+The runtime complement is capped by its admitted bytes, so cache shrinking cannot create an unpriced
+larger RAM copy; if the mandatory complement no longer fits, resident allocation refuses.
+
+Startup and runtime guest/physical-host scopes are admitted independently. The full mmap expert
+source is charged page-rounded, not as a two-layer access window: access demand is not an eviction
+guarantee. Native dense/head/embedding, canonical and MTP upload source pages remain charged in both
+phases alongside destination allocations. Only explicitly released anonymous conversion/PCIe scratch
+is startup-only. PLE direct cache/inflight storage or full mmap/locked GGUF pages, conversation state,
+prefill staging and request handoffs are named separately. Locked PLE is still filesystem-backed and
+has a physical-host source-cache mirror; it is not eligible for clean-cache credit.
+
+Physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
+not physical-host telemetry. Already-resident QEMU backing is reflected in host MemAvailable, so the
+host scope charges unbacked guest allocation plus retained filesystem-source mirrors, without sharing
+credit. Advisory release, unmap and close cannot reduce these envelopes. All derived byte arithmetic
+and class totals refuse on overflow.
+
+The guest and available-host envelopes retain their reserve floors (4 GiB and 8 GiB;
+`--guest-reserve-mib` / `--host-reserve-mib` cannot go lower). Unpriced classes or unavailable telemetry
+refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts currently refuse by name
+because their allocation budgets are not knowable at this gate; they are not silently priced as zero.
+CUDA graph executable/capture storage and the exact prefill allocator/loan bound are currently
+unqualified and refuse by name. Serving prefill is charged regardless of the initial one-token
+placeholder. The fixed graph-workspace and legacy chunk estimates are not acceptance proof or a
+substitute for those bounds. This candidate has compile/host-only boundary evidence, not admitted
+full-model runtime validation; HET-017 remains open and it is not deployed as a qualified serving engine.
+`PLAN admit=... limiting=...` reports device demand/headroom and guest/host demand/ceilings plus the
+automatic cache byte budget. Every allocation class is logged with scope, name, bytes, unknown flag and
+allocator provenance. Requests emit `ADMIT cells=... state_demand_bytes=...` before work, or `REJECT ...`
+for an overfull context. `--admission-headroom-mib` sets explicit device headroom (default:
+`--vram-reserve-mib`).
+`strata-plan --json` runs the same decision standalone - per device, guest and host, with labelled
+hypothetical future capacities that are reported but never admitted - as the document
+`schemas/memory-plan.schema.json` describes.
+
+
 ---
 
 ## Using it

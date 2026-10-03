@@ -165,6 +165,7 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
@@ -857,6 +858,13 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(compute_capability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(compute_capability_test PRIVATE strata_warnings)
   add_test(NAME compute_capability_test COMMAND compute_capability_test)
+  # HET-017: the admission arithmetic (include/strata/plan/admission.hpp) is host-only for the same
+  # reason: the engine refuses on exactly the cases these tests replay - one overfull device, an
+  # unmeasured guest, an unknown allocation, a hypothetical-only plan.
+  add_executable(plan_admission_test tests/core/plan_admission_test.cpp)
+  target_include_directories(plan_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(plan_admission_test PRIVATE strata_warnings)
+  add_test(NAME plan_admission_test COMMAND plan_admission_test)
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)

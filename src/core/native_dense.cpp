@@ -52,6 +52,56 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
+                                uint64_t& bytes, std::string& err, uint64_t* source_bytes) {
+    bytes = 0;
+    if (source_bytes) *source_bytes = 0;
+    try {
+        std::set<std::string> seen;
+        int max_in = 0;
+        uint64_t total = 0;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported(tensor.type) ||
+                    tensor.shape.size() != 2)
+                    continue;
+                if (!seen.insert(tensor.name).second) {
+                    err = "native dense: duplicate tensor " + tensor.name;
+                    return false;
+                }
+                if (!tensor.shape[0] || !tensor.shape[1] || tensor.shape[0] > (uint64_t) INT_MAX ||
+                    tensor.shape[1] > (uint64_t) INT_MAX) {
+                    err = "native dense: matrix " + tensor.name + " has invalid int dimensions";
+                    return false;
+                }
+                const uint64_t weight = strata::kernels::native_mmvq_weight_bytes(tensor.type,
+                    (int) tensor.shape[0], (int) tensor.shape[1]);
+                if (!weight || total > UINT64_MAX - weight) {
+                    err = "native dense: weight byte count overflow";
+                    return false;
+                }
+                total += weight;
+                max_in = std::max(max_in, (int) tensor.shape[0]);
+            }
+        }
+        if (source_bytes) *source_bytes = total;
+        if (total > 0) {
+            const uint64_t scratch = strata::kernels::native_q8_1_bytes(max_in);
+            if (total > UINT64_MAX - scratch) {
+                err = "native dense: scratch byte count overflow";
+                return false;
+            }
+            total += scratch;
+        }
+        bytes = total;
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);

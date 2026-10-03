@@ -25,6 +25,12 @@ public:
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
+    /// HET-017: the VRAM `load` would ask for from these shards - weight blocks plus the shared Q8_1
+    /// scratch - read from the GGUF headers only, so the pre-allocation admission gate prices the native
+    /// dense tier with the same arithmetic the loader allocates with.
+    /// Optional source_bytes receives just the tensor payload working set read during upload (no scratch).
+    static bool planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
+                              uint64_t& bytes, std::string& err, uint64_t* source_bytes = nullptr);
     uint64_t weight_bytes() const { return bytes_; }
     size_t tensor_count() const { return weights_.size(); }
 

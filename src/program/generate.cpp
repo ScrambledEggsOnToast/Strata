@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/device.hpp"
+#include "strata/plan/admission.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -47,6 +48,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -64,6 +66,10 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 #endif
 
 #include <cuda_runtime.h>
@@ -81,6 +87,7 @@
 #include <optional>
 #include <new>
 #include <charconv>
+#include <ctime>
 #include <cmath>
 #include <limits>
 #include <cstdio>
@@ -101,6 +108,58 @@ bool refill_blocking() {
 }
 
 using Clock = std::chrono::steady_clock;
+
+struct HostAdmissionSnapshot {
+    uint64_t available = 0, allocation = 0, resident = 0;
+    uint64_t host_reserve = 0, guest_reserve = 0, worker_limit = 0;
+};
+
+bool read_host_admission(HostAdmissionSnapshot& snapshot) {
+#if defined(__linux__)
+    const char* value = std::getenv("STRATA_ADMISSION_SNAPSHOT");
+    if (!value) return false;
+    const std::filesystem::path path(value), root("/run/strata-admission");
+    if (path.parent_path().parent_path() != root || path.filename() != "snapshot") return false;
+    for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+        struct stat st{};
+        if (lstat(parent.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0022))
+            return false;
+        if (parent == parent.root_path()) break;
+    }
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    struct stat st{};
+    char buffer[513];
+    const bool protected_file = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
+                                !(st.st_mode & 0222) && st.st_size > 0 && st.st_size <= 512;
+    const ssize_t size = protected_file ? read(fd, buffer, sizeof buffer) : -1;
+    close(fd);
+    if (size <= 0 || size > 512 || size != st.st_size) return false;
+    const char* cursor = buffer;
+    const char* end = buffer + size;
+    uint64_t fields[8]{};
+    for (auto& field : fields) {
+        while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
+        auto result = std::from_chars(cursor, end, field);
+        if (result.ec != std::errc{} || result.ptr == cursor) return false;
+        cursor = result.ptr;
+        if (cursor < end && *cursor != ' ' && *cursor != '\n') return false;
+    }
+    while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
+    timespec now{};
+    if (cursor != end || clock_gettime(CLOCK_MONOTONIC, &now)) return false;
+    const uint64_t ns = (uint64_t) now.tv_sec * 1000000000ull + (uint64_t) now.tv_nsec;
+    if (fields[0] != 1 || ns < fields[1] || ns - fields[1] > 5000000000ull) return false;
+    for (size_t i = 2; i < 8; ++i) if (fields[i] > (1ull << 50)) return false;
+    if (fields[3] < (4ull << 30) || fields[4] > fields[3] || fields[5] < (8ull << 30) ||
+        fields[6] < (4ull << 30) || fields[7] < (32ull << 20) || fields[7] > fields[3]) return false;
+    snapshot = {fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]};
+    return true;
+#else
+    (void) snapshot;
+    return false;
+#endif
+}
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
@@ -292,6 +351,15 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
+    /// HET-017: the admission policy.  The startup gate (and the per-request ADMIT/REJECT frames) refuses a
+    /// configuration before the first model allocation when a device cannot hold its own share, when the
+    /// guest/host envelope does not close, or when an allocation exists that the accounting cannot size.
+    /// Headroom defaults to `vram_reserve_mib` (the same reserve the auto cache already honours); the
+    /// guest/host reserves floor at the docs/02 design defaults - 4 GiB inside the guest, 8 GiB on the
+    /// host - and the parser refuses smaller values, so no flag can plan the reserves away.
+    int admission_headroom_mib = -1;   ///< < 0: default to `vram_reserve_mib`
+    int64_t guest_reserve_mib = 4096;
+    int64_t host_reserve_mib = 8192;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -509,6 +577,14 @@ void usage() {
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.\n"
+                 "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
+                 "                       every device (default: --vram-reserve-mib).  The gate refuses before\n"
+                 "                       the first allocation when one device's own share will not close even\n"
+                 "                       if the aggregate would, when the guest/host envelope does not close,\n"
+                 "                       or when an allocation exists that the accounting cannot size.\n"
+                 "  --guest-reserve-mib N  admission's guest RAM floor; >= 4096 (the docs/02 default, which is\n"
+                 "                       also the floor - smaller values are refused, not clamped)\n"
+                 "  --host-reserve-mib N   admission's host RAM floor; >= 8192 (same rule)\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -1120,6 +1196,24 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--admission-headroom-mib") o.admission_headroom_mib = std::atoi(next("--admission-headroom-mib"));
+        else if (a == "--guest-reserve-mib") {
+            o.guest_reserve_mib = std::atoll(next("--guest-reserve-mib"));
+            if (o.guest_reserve_mib < 4096) {
+                std::fprintf(stderr, "strata generate: --guest-reserve-mib %lld is below the 4 GiB design "
+                                     "default (docs/02) - admission never plans the reserves away\n",
+                             (long long) o.guest_reserve_mib);
+                return 2;
+            }
+        } else if (a == "--host-reserve-mib") {
+            o.host_reserve_mib = std::atoll(next("--host-reserve-mib"));
+            if (o.host_reserve_mib < 8192) {
+                std::fprintf(stderr, "strata generate: --host-reserve-mib %lld is below the 8 GiB design "
+                                     "default (docs/02) - admission never plans the reserves away\n",
+                             (long long) o.host_reserve_mib);
+                return 2;
+            }
+        }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -1642,27 +1736,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[r], free_gib);
     }
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
-    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
-    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
-    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
-    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
-    if (o.pcie_frac < 0.0) {
-        const double base = native_pack ? 0.55 : 0.2;
-        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
-        if (!native_pack) {
-            o.pcie_frac = base;
-        } else if (bw > 0.0) {
-            // below ~4 GB/s (an x1 link: ~0.9 GB/s) a missed expert's 1.4 MB takes longer to cross than the CPU
-            // pool takes to compute it, so none of them go over the link
-            o.pcie_frac = bw >= 20.0 ? base : bw < 4.0 ? 0.0 : std::min(base, std::max(0.05, base * (bw / 26.0)));
-            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
-                         bw, o.pcie_frac, base);
-        } else {
-            o.pcie_frac = base;
-            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
-        }
-    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -1780,16 +1853,6 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        strata::core::set_native_embed(&native_embed);
-        std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
-                             "type %d in mapped host memory (%.0f MiB)\n",
-                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
-                     native_embed.type(), (double) native_embed.bytes() / 1048576.0);
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
@@ -1804,12 +1867,745 @@ int main(int argc, char** argv) {
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
+    // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
+    // to the expert cache with --native).  `--keep-canonical` loads both, as before.
     }
+    // The engine's own measured runtime reserves, shared by the layer-split stage sizing below and the
+    // HET-017 admission gate: the verify windows (75 MiB measured) and the MTP drafter plus its head
+    // (839 MiB measured), each rounded up.
+    const int64_t kWindowMib = 96;
+    const int64_t kDrafterMib = 1000;
+    const bool admission_auto_cache = o.expert_cache < 0 || (o.expert_cache == 0 && !o.expert_profile.empty());
+    uint64_t admitted_cache_bytes = 0;
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
+
+    // ---- HET-017: the pre-allocation admission gate ------------------------------------------
+    // Everything the accounting names is priced from the artifact or from the very functions the
+    // allocators call - the pack index's pool header, `session_bytes`, the expert layout's blobs, the
+    // native tiers' file sizes - so a refusal here carries the engine's own numbers, and a class that
+    // cannot be priced refuses instead of entering as a silent zero.  Refusing BEFORE the first model
+    // allocation is the point: one overfull device must die at startup with its limiting term named,
+    // not at token 4000 (plan.hpp's DoesNotClose rationale, enforced per device).
+    //
+    // Scope note: the primary device, every layer-split stage device and the first remote-tier device
+    // are measured here.  Remote CUDA2/3 keep their existing per-device preflight refusals (they are
+    // cache-only tiers whose contexts are deliberately NOT created early except under
+    // STRATA_EARLY_REMOTE_CONTEXTS, and creating them sooner would change WSL2's pinned-host budget
+    // behavior - the reason that env var exists).
+    strata::plan::AdmissionDecision admission;
+    uint64_t admitted_resident_bytes = UINT64_MAX;
+    {
+        bool byte_overflow = false;
+        auto byte_add = [&](uint64_t a, uint64_t b) -> uint64_t {
+            if (b > UINT64_MAX - a) byte_overflow = true;
+            return strata::plan::saturating_add(a, b);
+        };
+        auto byte_mul = [&](uint64_t a, uint64_t b) -> uint64_t {
+            if (a && b > UINT64_MAX / a) byte_overflow = true;
+            return strata::plan::saturating_multiply(a, b);
+        };
+        uint64_t source_page = 0;
+#if defined(_WIN32)
+        SYSTEM_INFO system_info{};
+        GetSystemInfo(&system_info);
+        source_page = system_info.dwPageSize;
+#else
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size > 0) source_page = (uint64_t) page_size;
+#endif
+        auto source_pages = [&](uint64_t bytes) -> uint64_t {
+            if (!bytes || !source_page) return bytes;
+            return byte_mul(byte_add(bytes, source_page - 1) / source_page, source_page);
+        };
+        // A read span need not begin on a page boundary. Sum each span conservatively;
+        // shared boundary pages can be double-counted, never omitted.
+        auto source_span_pages = [&](uint64_t bytes) -> uint64_t {
+            return bytes ? source_pages(byte_add(bytes, source_page ? source_page - 1 : 0)) : 0;
+        };
+        auto file_bytes = [](const std::string& path) -> uint64_t {
+            std::error_code ec;
+            const uint64_t n = std::filesystem::file_size(path, ec);
+            return ec ? 0 : n;
+        };
+        auto tensor_payload_bytes = [](const strata::GgufFile& gguf, const strata::TensorInfo& tensor) -> uint64_t {
+            int elements = 0, bytes = 0;
+            if (tensor.shape.empty() || !strata::block_geometry(tensor.type, elements, bytes) ||
+                elements <= 0 || bytes <= 0 || tensor.shape[0] % (uint64_t) elements) return 0;
+            uint64_t n = 1;
+            for (uint64_t d : tensor.shape) {
+                if (!d || n > UINT64_MAX / d) return 0;
+                n *= d;
+            }
+            n /= (uint64_t) elements;
+            if (n > UINT64_MAX / (uint64_t) bytes || gguf.data_start() > gguf.file_size()) return 0;
+            n *= (uint64_t) bytes;
+            const uint64_t payload = gguf.file_size() - gguf.data_start();
+            return tensor.offset <= payload && n <= payload - tensor.offset ? n : 0;
+        };
+        auto tensor_bytes = [&](const std::string& path, const char* name) -> uint64_t {
+            try {
+                strata::GgufFile gguf(path);
+                const auto* tensor = gguf.find(name);
+                return tensor ? tensor_payload_bytes(gguf, *tensor) : 0;
+            } catch (const std::exception&) { return 0; }
+        };
+        const uint64_t embedding_bytes = native_pack
+            ? tensor_bytes(o.native_preset, "token_embd.weight") : 0;
+        const uint64_t head_bytes = o.native_head_gguf.empty()
+            ? 0 : tensor_bytes(o.native_head_gguf, "output.weight");
+        // n_vocab comes from the pack index's `output.weight` row - both pack formats carry the row's
+        // dims even when the tensor is served natively - never from a constant.
+        int64_t n_vocab = 0;
+        uint64_t canonical_source_bytes = 0;
+        uint64_t canonical_destination_bytes = 0;
+        uint64_t index_alignment = 256;
+        bool index_accounted = false;
+        {
+            if (FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
+                char row[512];
+                while (std::fgets(row, sizeof row, f) != nullptr) {
+                    if (row[0] == '#') {
+                        unsigned long long alignment = 0;
+                        if (std::sscanf(row, "# align %llu", &alignment) == 1 && alignment > 0)
+                            index_alignment = alignment;
+                        continue;
+                    }
+                    char name[256];
+                    int file = 0, kind = 0;
+                    unsigned long long offset = 0, source = 0, dst_offset = 0, destination = 0;
+                    long long ne0 = 0, ne1 = 0;
+                    if (std::sscanf(row, "%255s %d %d %llu %llu %llu %llu %lld %lld", name, &file, &kind,
+                                    &offset, &source, &dst_offset, &destination, &ne0, &ne1) != 9) {
+                        index_accounted = false;
+                        break;
+                    }
+                    index_accounted = true;
+                    if (std::string(name) == "output.weight") n_vocab = ne1;
+                    if (!skip.count(name)) {
+                        byte_add(offset, source);
+                        byte_add(dst_offset, destination);
+                        if (skip.empty() && byte_add(dst_offset, destination) > pool_bytes) {
+                            index_accounted = false;
+                            break;
+                        }
+                        canonical_source_bytes = byte_add(canonical_source_bytes, source_span_pages(source));
+                        canonical_destination_bytes = byte_add(canonical_destination_bytes,
+                            byte_mul(byte_add(destination, index_alignment - 1) / index_alignment, index_alignment));
+                    }
+                }
+                std::fclose(f);
+            }
+        }
+        if (index_accounted && !skip.empty() && canonical_destination_bytes != pool_bytes) {
+            std::fprintf(stderr, "strata generate: admission refused: canonical pool differs from checked index destination total\n");
+            return 1;
+        }
+        // The later prefill reserve formulas use signed MiB arithmetic. Reject an
+        // option that cannot be represented there even when startup has no batched prompt.
+        if (o.prefill_chunk > 0 && byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024) >
+                (uint64_t) INT64_MAX / (1ull << 20)) {
+            std::fprintf(stderr, "strata generate: admission refused: prefill byte accounting exceeds runtime integer range\n");
+            return 1;
+        }
+        const bool admission_prefill = o.serve || prompt_batched;
+        const uint64_t prefill_mib_gate = admission_prefill
+            ? byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024) : 0;
+        const int64_t headroom_mib =
+            o.admission_headroom_mib >= 0 ? o.admission_headroom_mib : o.vram_reserve_mib;
+        const bool split_real = multi_gpu;      // distinct stage devices
+        // Only the expert count/K are artifact-overridden; the other session geometry is fixed.
+        // Their allocator/kernel interfaces use int32 counts and top-k supports at most 64.
+        // Validate before session_bytes calls its unchecked internal geometry arithmetic.
+        if (g.n_expert <= 0 || g.n_expert > INT32_MAX || K <= 0 || K > 64 || K > g.n_expert) {
+            std::fprintf(stderr, "strata generate: admission refused: expert geometry exceeds allocator/kernel limits\n");
+            return 1;
+        }
+        const int64_t session_full = strata::core::session_bytes(g, o.max_context, K, 0, -1);
+        const uint64_t blob_gate = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (session_full <= 0 || headroom_mib < 0 || blob_gate == 0) {
+            std::fprintf(stderr, "strata generate: admission refused: invalid session/headroom/expert accounting\n");
+            return 1;
+        }
+
+        std::vector<strata::plan::DeviceCost> devs;
+        std::vector<strata::plan::DeviceTelemetry> tels;
+        devs.reserve(16);   // add_device returns references into this vector; no middle-of-fill reallocs
+        tels.reserve(16);
+        auto add_device = [&](const std::string& name) -> strata::plan::DeviceCost& {
+            devs.push_back(strata::plan::DeviceCost{});
+            devs.back().name = name;
+            return devs.back();
+        };
+        // The primary device (or the only device): canonical pool, native dense/head, MTP, session,
+        // logits, PLE buffers, an explicit expert cache and the R4 hit path.  With a layer split the
+        // MTP drafter and its head live on the LAST stage, so their classes move there.
+        const bool mtp_here = !o.mtp.empty() && !split_real;
+        strata::plan::DeviceCost& d0 = add_device("CUDA0");
+        strata::plan::Scope& v0 = d0.vram;
+        v0.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (pack index header)");
+        uint64_t native_source_bytes = 0;
+        if (!o.native_dense_gguf.empty()) {
+            uint64_t nb = 0;
+            if (!strata::core::NativeDense::planned_bytes(o.native_dense_gguf, o.native_ple_key, nb, err,
+                                                        &native_source_bytes)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            if (nb) v0.add("weights_native_dense", nb, "NativeDense::planned_bytes (GGUF headers)");
+        }
+        if (native_pack) {
+            if (embedding_bytes)
+                v0.add("embedding_vram_fallback", embedding_bytes,
+                       "NativeEmbed::load: full native embedding if mapped pinned allocation fails");
+            else v0.add_unknown("embedding_vram_fallback", "native embedding tensor unreadable");
+        }
+        if (!o.native_head_gguf.empty()) {
+            if (head_bytes) v0.add("weights_native_head", byte_add(head_bytes, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1)),
+                                   "output.weight GGUF block bytes + NativeHead Q8_1 scratch");
+            else v0.add_unknown("weights_native_head", "--native-head-gguf tensor unreadable");
+        }
+        if (native_pack && o.pcie_frac < 0.0)
+            v0.add("pcie_probe_transient", 256ull << 20, "probe_pcie_h2d_gbps device scratch");
+        if (mtp_here) {
+            const uint64_t dense_b = file_bytes(o.mtp + "/dense.bin");
+            const uint64_t experts_b = file_bytes(o.mtp + "/experts.bin");
+            if (dense_b && experts_b)
+                v0.add("mtp_weights", byte_add(dense_b, experts_b), "file sizes of the MTP rt dense.bin + experts.bin");
+            else
+                v0.add_unknown("mtp_weights", "--mtp rt files unreadable");
+            v0.add("mtp_drafter_buffers", (uint64_t) kDrafterMib << 20,
+                   "generate.cpp kDrafterMib: the drafter plus head envelope (839 MiB measured)");
+        }
+        v0.add("session_state", (uint64_t) session_full,
+               "session_bytes(geometry, --max-context, K); a split's per-stage shares are upper-bounded by it");
+        v0.add("decode_parts", byte_mul(byte_mul((uint64_t) K, (uint64_t) g.n_embd), sizeof(float)),
+               "cudaMalloc d_parts: K*n_embd FP32 partials");
+        v0.add("embedding_row", byte_mul((uint64_t) g.n_embd, sizeof(float)), "cudaMalloc d_emb FP32 row");
+        v0.add("sampler_output", sizeof(int), "cudaMalloc d_next");
+        const bool graph_capable = (!o.no_capture && !native_pack) || native_pack || o.spec > 0 || !o.mtp.empty();
+        if (graph_capable)
+            v0.add_unknown("graph_capture_storage", "retained session/token/verifier/MTP CUDA graph executables and capture transients lack a measured conservative bound");
+        const bool residency_table = (admission_auto_cache || o.expert_cache > 0) &&
+            !o.expert_profile.empty() && !o.no_pool && !o.no_capture && !o.no_token_graph &&
+            o.dump_layers.empty() && o.dump_halves.empty();
+        if (residency_table)
+            v0.add("device_residency_table", byte_add(byte_mul(byte_mul((uint64_t) g.n_layers,
+                   (uint64_t) g.n_expert), sizeof(int32_t)), sizeof(int32_t)), "graph hits table plus primary hit count");
+        if (o.serve && !split_real)
+            v0.add("penalty_history_device", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
+                   "serving sampler history allocation, including neutral-penalty requests");
+        if (admission_prefill) {
+            v0.add("prefill_buffers", byte_mul(prefill_mib_gate, 1ull << 20), "legacy prefill estimate; standalone fallback cannot be omitted for an unproven loan");
+            v0.add_unknown("prefill_allocator_bound", "Prefill::bytes_needed MMQ/ring/attention/KV workspace bound and guaranteed loan not qualified preallocation");
+        }
+        if (o.spec > 0)
+            v0.add("verify_windows", (uint64_t) kWindowMib << 20,
+                   "generate.cpp kWindowMib: verify-window envelope (75 MiB measured)");
+        if (n_vocab > 0)
+            v0.add("logits", byte_mul((uint64_t) n_vocab, 4), "pack index output.weight ne1 * sizeof(float)");
+        else
+            v0.add_unknown("logits", "the pack index has no output.weight row");
+        if (!o.ple_gguf.empty() && !o.no_ple)
+            v0.add("ple_buffers", byte_add(byte_mul(strata::kernels::NG_N_EMBD, 4), strata::core::ple_run_scratch_bytes()),
+                   "the PLE row buffer + ple_run_scratch_bytes()");
+        if (!admission_auto_cache && o.expert_cache > 0)
+            v0.add("expert_cache", byte_mul((uint64_t) o.expert_cache, blob_gate),
+                   "--expert-cache * expert_layout().max_blob (per-pair sizing can only shrink)");
+        if ((admission_auto_cache || o.expert_cache > 0) && !o.no_pool)
+            v0.add("hit_path_scratch",
+                   byte_add(strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF),
+                       byte_add(byte_mul(2ull * (uint64_t) K, sizeof(int32_t)),
+                       byte_add(byte_mul((uint64_t) (g.n_embd / 32), 34 + sizeof(float)),
+                                byte_mul(byte_mul((uint64_t) K, (uint64_t) g.n_embd), 4)))),
+                   "moe_hit_grouped_scratch_bytes + the R4 device buffers (the exact alloc set)");
+        if (o.vision)
+            v0.add("vision_positions", byte_mul(byte_add((uint64_t) o.max_context, 64), 3 * sizeof(int32_t)),
+                   "--vision m-rope table, max_context + 64 cells");
+        if (!o.cvec_files.empty())
+            v0.add_unknown("control_vector", "--control-vector files: the accounting cannot price them");
+        d0.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
+
+        // Layer-split stage devices: their own weight arena (every stage loads the full pool), their
+        if (o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
+            v0.add_unknown("late_remote_tiers", "CUDA2/3 telemetry deferred until after model allocations; preflight required");
+        if (multi_gpu)
+            v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
+        // session share (upper-bounded by the full range until the split search has placed it) and the
+        // stage_room reserves.  The last stage carries the MTP drafter.
+        if (split_real) {
+            const size_t last = split_devs.size() - 1;
+            for (size_t i = 0; i < split_devs.size(); ++i) {
+                strata::plan::DeviceCost& ds = add_device("CUDA" + std::to_string(split_devs[i]));
+                ds.vram.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (each stage loads the pool)");
+                ds.vram.add("session_state", (uint64_t) session_full,
+                            "session_bytes upper bound until the split search places the ranges");
+                if (o.spec > 0 && i > 0)
+                    ds.vram.add("verify_windows", (uint64_t) kWindowMib << 20, "generate.cpp kWindowMib");
+                if (!o.mtp.empty() && i == last) {
+                    const uint64_t dense_b = file_bytes(o.mtp + "/dense.bin");
+                    const uint64_t experts_b = file_bytes(o.mtp + "/experts.bin");
+                    if (dense_b && experts_b)
+                        ds.vram.add("mtp_weights", byte_add(dense_b, experts_b), "MTP rt file sizes (last stage)");
+                    else
+                        ds.vram.add_unknown("mtp_weights", "--mtp rt files unreadable");
+                    ds.vram.add("mtp_drafter_buffers", (uint64_t) kDrafterMib << 20, "generate.cpp kDrafterMib");
+                }
+                ds.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
+                if (graph_capable)
+                    ds.vram.add_unknown("graph_capture_storage", "split verifier/session graph capture storage not qualified");
+                if (admission_prefill) {
+                    ds.vram.add("prefill_buffers", byte_mul(prefill_mib_gate, 1ull << 20), "standalone prefill fallback estimate");
+                    ds.vram.add_unknown("prefill_allocator_bound", "split prefill actual allocator bound not qualified");
+                }
+                if (residency_table)
+                    ds.vram.add("device_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers,
+                                (uint64_t) g.n_expert), sizeof(int32_t)), "split graph hits residency table");
+                if (o.serve && i == last)
+                    ds.vram.add("penalty_history_device", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
+                                "serving sampler history on head device");
+            }
+        }
+
+        // The first remote tier shares its device with nothing: cache slots plus the usual reserve.
+        // (When a layer split already runs its first stage on CUDA1, that device's classes above carry
+        // the whole card - adding the remote tier again would check one ceiling twice, not once.)
+        const bool remote1_is_split_stage =
+            std::find(split_devs.begin(), split_devs.end(), 1) != split_devs.end();
+        if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) {
+            strata::plan::DeviceCost& dr = add_device("CUDA1");
+            dr.vram.add("expert_cache_remote", byte_mul((uint64_t) o.expert_cache_remote[0], blob_gate),
+                        "--expert-cache-device1 * expert_layout().max_blob");
+            dr.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
+        }
+
+        // Telemetry.  Device 0 always; stage/first-remote devices in the configurations that create
+        // their contexts anyway.  Missing measurement refuses: unknown telemetry is not zero.
+        int visible = 1;
+        if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 1) visible = 1;
+        cudaGetLastError();
+        auto measure = [&](const std::string& name, int ordinal) {
+            strata::plan::DeviceTelemetry t;
+            t.name = name;
+            if (ordinal < visible) {
+                const strata::core::OnDevice on(ordinal);
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    t.measured = true;
+                    t.total_bytes = total_b;
+                    t.free_bytes = free_b;
+                }
+            }
+            tels.push_back(t);
+        };
+        measure("CUDA0", 0);
+        if (split_real)
+            for (int d : split_devs) measure("CUDA" + std::to_string(d), d);
+        if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) measure("CUDA1", 1);
+        // Auto commits a real byte budget before allocation; runtime may shrink, never grow it.
+        if (admission_auto_cache && !tels.empty() && tels.front().measured && blob_gate > 0) {
+            const uint64_t ceiling = std::min(tels.front().total_bytes, tels.front().free_bytes);
+            const uint64_t fixed = byte_add(v0.known_bytes(), d0.headroom_bytes);
+            admitted_cache_bytes = !v0.overflowed() && !byte_overflow && ceiling > fixed
+                ? (ceiling - fixed) / blob_gate * blob_gate : 0;
+            admitted_cache_bytes = std::min(admitted_cache_bytes,
+                byte_mul(byte_mul((uint64_t) g.n_layers, (uint64_t) g.n_expert), blob_gate));
+            if (!o.expert_profile.empty()) {
+                std::vector<std::pair<int32_t, int32_t>> ranked;
+                int64_t slots = 0;
+                if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, ranked, slots, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+                admitted_cache_bytes = std::min(admitted_cache_bytes, byte_mul((uint64_t) ranked.size(), blob_gate));
+            }
+            v0.add("expert_cache", admitted_cache_bytes,
+                   "auto: floor((min(driver total, free) - fixed classes - headroom)/max_blob) slots");
+        }
+
+        // Clean source pages can accumulate across loaders and remain cached after unmap/close.
+        // No eviction credit is inferred from madvise/fadvise success or a two-layer access window.
+        // Only explicitly freed anonymous upload scratch is separated from runtime below.
+        strata::plan::Scope guest, host, uploads, startup_only;
+        auto ram = [&](const char* name, uint64_t bytes, const char* source) {
+            guest.add(name, bytes, source);
+        };
+        auto ram_unknown = [&](const char* name, const char* source) {
+            guest.add_unknown(name, source);
+        };
+        auto upload = [&](const char* name, uint64_t bytes, const char* source) {
+            uploads.add(name, bytes, source);
+        };
+        if (residency_table)
+            ram("host_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers, (uint64_t) g.n_expert),
+                sizeof(int32_t)), "graph hits host residency vector payload");
+        if (o.serve)
+            ram("penalty_history_host", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
+                "serving hist_stage vector payload");
+        if (!source_page) ram_unknown("source_page_size", "cannot bound filesystem source pages without OS page size");
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        if (layout.n_layers != g.n_layers || layout.n_expert != g.n_expert ||
+            (layout.native && (layout.bytes.size() != (size_t) g.n_layers || layout.offset.size() != (size_t) g.n_layers))) {
+            std::fprintf(stderr, "strata generate: admission refused: expert layout differs from runtime geometry\n");
+            return 1;
+        }
+        uint64_t checked_expert_total = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (layout.layer_offset(l) != checked_expert_total) {
+                std::fprintf(stderr, "strata generate: admission refused: expert layer offset differs from checked total\n");
+                return 1;
+            }
+            checked_expert_total = byte_add(checked_expert_total,
+                byte_mul(layout.blob_bytes(l), (uint64_t) g.n_expert));
+        }
+        if (checked_expert_total != layout.total || byte_overflow) {
+            std::fprintf(stderr, "strata generate: admission refused: expert layout byte-total overflow or mismatch\n");
+            return 1;
+        }
+        if (o.mmap_experts) {
+            ram("file:expert_streaming_pages", source_pages(layout.total),
+                "full FileExpertSource mapping page upper bound; access windows and advisory release do not prove eviction");
+            if (o.resident_cpu_experts) {
+                std::vector<std::pair<int32_t, int32_t>> ranked;
+                int64_t slots = 0;
+                if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, ranked, slots, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+                const uint64_t cache_budget = admission_auto_cache ? admitted_cache_bytes :
+                    byte_mul((uint64_t) std::max(o.expert_cache, 0), blob_gate);
+                const uint64_t loan = o.prefill_chunk > 0 && !o.no_prefill_borrow
+                    ? byte_mul(byte_add(160, byte_mul((uint64_t) o.prefill_chunk, 680) / 1024), 1ull << 20) : 0;
+                const uint64_t withheld = byte_add(loan, blob_gate);
+                const uint64_t core_budget = cache_budget > withheld ? cache_budget - withheld : 0;
+                uint64_t used = 0, core = 0;
+                std::set<std::pair<int32_t, int32_t>> seen;
+                for (const auto& pr : ranked) {
+                    const uint64_t b = layout.blob_bytes(pr.first);
+                    const uint64_t slot = layout.native ? byte_mul(byte_add(b, 255) / 256, 256) : blob_gate;
+                    if (slot > core_budget - std::min(used, core_budget)) break;
+                    used = byte_add(used, slot);
+                    if (seen.insert(pr).second) core = byte_add(core, b);
+                }
+                admitted_resident_bytes = layout.total - std::min(core, layout.total);
+                ram("expert_resident_complement", admitted_resident_bytes,
+                    "actual ranked expert blobs absent from guaranteed cache core; prefill-loan upper bound");
+            }
+        } else {
+            ram("expert_ram_arena", byte_add(byte_add(layout.total, blob_gate), (2ull << 20) + 4096),
+                "PinnedArena: total + max_blob, large-page rounding and shared header upper bound");
+            const bool from_gguf = !std::filesystem::exists(o.pack + "/experts.bin") && layout.native;
+            const uint64_t expert_source_pages = from_gguf
+                ? byte_add(source_pages(layout.total), byte_mul(3ull * (uint64_t) g.n_layers, 2 * source_page))
+                : source_pages(layout.total);
+            upload("file:expert_load_source", expert_source_pages,
+                "full expert read source pages, including GGUF plane boundaries; clean pages retained after close");
+            ram("expert_load_transient", from_gguf ? byte_mul(6ull * 16, blob_gate) : 6ull * (8ull << 20),
+                "six loader workers: 16 GGUF expert planes or 8 MiB source chunks; no allocator return-to-OS credit");
+        }
+        if (native_pack) {
+            if (embedding_bytes) {
+                ram("embedding_pinned", embedding_bytes, "NativeEmbed full pinned table");
+                upload("file:embedding_upload", source_span_pages(embedding_bytes), "mapped source beside pinned destination; retained without eviction proof");
+            } else ram_unknown("embedding_pinned", "GGUF token_embd.weight unavailable");
+        }
+        uint64_t native_dense_source_pages = 0;
+        if (native_source_bytes) {
+            std::set<std::string> served;
+            if (!strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, served, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            uint64_t checked_native_source_bytes = 0;
+            for (const auto& path : o.native_dense_gguf) {
+                try {
+                    strata::GgufFile gguf(path);
+                    for (const auto& tensor : gguf.tensors()) {
+                        if (!served.count(tensor.name)) continue;
+                        const uint64_t bytes = tensor_payload_bytes(gguf, tensor);
+                        if (!bytes) {
+                            ram_unknown("file:native_dense_upload", "native served source span cannot be bounded");
+                            continue;
+                        }
+                        checked_native_source_bytes = byte_add(checked_native_source_bytes, bytes);
+                        native_dense_source_pages = byte_add(native_dense_source_pages, source_span_pages(bytes));
+                    }
+                } catch (const std::exception&) {
+                    ram_unknown("file:native_dense_upload", "native GGUF source unavailable during page accounting");
+                }
+            }
+            if (checked_native_source_bytes != native_source_bytes)
+                ram_unknown("file:native_dense_upload", "native source spans differ from NativeDense::planned_bytes");
+        }
+        upload("file:native_dense_upload", native_dense_source_pages, "each supported native GGUF source span page-rounded; retained after upload/unmap");
+        upload("file:native_head_upload", source_span_pages(head_bytes), "native GGUF output.weight source pages retained after upload/unmap");
+        startup_only.add("canonical_upload_staging", 24ull << 20,
+            "WeightTable CHUNK + 2*CHUNK pinned buffers; cudaFreeHost at end of WeightTable::load");
+        if (index_accounted)
+            upload("file:canonical_upload", canonical_source_bytes,
+                "index source bytes of non-skipped tensors; clean source cache retained after buffered-reader close");
+        else ram_unknown("file:canonical_upload", "pack index source spans unavailable");
+        if (!o.mtp.empty()) {
+            const uint64_t dense = file_bytes(o.mtp + "/dense.bin"), experts = file_bytes(o.mtp + "/experts.bin");
+            if (dense && experts) upload("file:mtp_upload", byte_add(source_pages(dense), source_pages(experts)), "MTP rt retained source pages beside device allocations");
+            else ram_unknown("file:mtp_upload", "MTP rt files unavailable");
+        }
+        if (native_pack && o.pcie_frac < 0.0)
+            startup_only.add("pcie_probe_pinned", 256ull << 20,
+                "probe_pcie_h2d_gbps pinned source scratch; cudaFreeHost before probe returns");
+        if (!o.ple_gguf.empty()) {
+            if (o.ple_io == "direct") {
+                const uint64_t rows = (uint64_t) o.ple_row_cache / 8 * 8;
+                ram("ple_direct_cache", byte_add(byte_mul(rows, strata::kernels::PLE_ROW_BYTES + 4ull),
+                    byte_add(rows / 8, byte_add(byte_mul((uint64_t) o.ple_inflight, 8192), 65536ull * sizeof(float)))),
+                    "PleReader RowCache data+keys+replacement, two-page inflight slab and latency ring");
+            } else {
+                const uint64_t table = tensor_bytes(o.ple_gguf, "per_layer_token_embd.weight");
+                if (table) ram(o.ple_io == "ram" ? "ple_locked_table" : "file:ple_working_set",
+                               source_span_pages(table),
+                               "actual GGUF PLE tensor bytes; mmap includes both boundary pages, no eviction credit");
+                else ram_unknown("ple_table", "PLE GGUF tensor unavailable");
+            }
+        }
+        strata::core::ConversationStateSizes checkpoint;
+        if (o.serve && o.prompt_cache > 0) {
+            if (strata::core::conversation_state_sizes(g, checkpoint, err)) {
+                const uint64_t one = byte_add(byte_add(checkpoint.gdn, checkpoint.ple),
+                    byte_add(byte_mul((uint64_t) g.n_qsa_layers(),
+                                      byte_add(byte_add(checkpoint.tail, checkpoint.dead), checkpoint.block_pos)),
+                             byte_mul((uint64_t) o.max_context, sizeof(int32_t))));
+                ram("conversation_checkpoints", byte_mul(one, byte_add((uint64_t) o.prompt_cache, 1)),
+                    "conversation_state_sizes + context IDs; cache plus checkpoint being captured");
+            } else ram_unknown("conversation_checkpoints", "conversation_state_sizes failed");
+        }
+        if (admission_prefill) {
+            const char* ring_env = std::getenv("STRATA_STAGER_RING");
+            const uint64_t ring = ring_env ? (uint64_t) std::clamp(std::atoi(ring_env), 2, 256) : 16;
+            const uint64_t chunk = (uint64_t) o.prefill_chunk;
+            const uint64_t stages = split_real ? byte_add(split_devs.size(), 1) : 1;
+            ram("prefill_host_staging", byte_mul(stages, byte_add(byte_mul(ring, blob_gate),
+                byte_add(byte_mul(byte_mul(2, chunk), byte_mul((uint64_t) g.n_embd, 4)),
+                byte_add(byte_mul(byte_mul(2, chunk), strata::kernels::PLE_N_HEADS * 4),
+                byte_add(byte_mul(byte_mul(chunk, (uint64_t) K), 32),
+                         byte_mul(chunk, strata::kernels::kStepCount * sizeof(int32_t))))))),
+                "Prefill::init stager ring, two PLE row buffers, host routing and step tables");
+            if (split_real)
+                ram("stage_handoff", byte_mul(byte_mul(byte_mul(2, chunk), (uint64_t) g.hc),
+                    byte_mul(byte_mul((uint64_t) g.n_embd, 4), stages - 1)),
+                    "two Prefill mapped handoff buffers per stage boundary");
+        }
+        if (o.kv_resident > 0 && o.max_context > o.kv_resident)
+            ram_unknown("streamed_kv_pinned",
+                "authoritative host K/V allocator size unavailable before qsa construction");
+        ram("host_logits", n_vocab > 0 ? byte_mul((uint64_t) n_vocab, 4) : 0, "host logits vector");
+        ram("runtime_host_staging", (uint64_t) kWindowMib << 20,
+            "verify/pool mapped handoffs and request metadata: same conservative window envelope");
+        if (o.resident_cpu_experts)
+            ram("resident_exchange_staging", byte_mul((uint64_t) std::max(o.adapt_swaps, 0), blob_gate),
+                "FileExpertSource::reserve_exchanges: swaps * max_blob");
+        if (o.conversation_cache_mib > 0) {
+            const uint64_t conv = byte_mul((uint64_t) o.conversation_cache_mib, 1ull << 20);
+            guest.add("conversation_parked", conv, "--conversation-cache-mib");
+        }
+        if (o.vision) {
+            const uint64_t rows = byte_mul(byte_add((uint64_t) o.max_context, 64), byte_mul((uint64_t) g.n_embd, 4));
+            guest.add("vision_embeddings", rows, "--vision image rows, upper bound at the context");
+        }
+        strata::plan::GuestHostPolicy policy;
+        policy.guest_reserve_bytes = byte_mul((uint64_t) o.guest_reserve_mib, 1ull << 20);
+        policy.host_reserve_bytes = byte_mul((uint64_t) o.host_reserve_mib, 1ull << 20);
+#if defined(_WIN32)
+        {
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys > 0) {
+                policy.guest_total_measured = true;
+                policy.guest_total_bytes = ms.ullTotalPhys;
+            }
+        }
+#elif defined(__linux__)
+        {
+            const long pages = sysconf(_SC_PHYS_PAGES);
+            const long page = sysconf(_SC_PAGE_SIZE);
+            if (pages > 0 && page > 0) {
+                policy.guest_total_measured = true;
+                policy.guest_total_bytes = byte_mul((uint64_t) pages, (uint64_t) page);
+            }
+        }
+#endif
+        uint64_t local_available = 0;
+        const bool local_measured = strata::core::available_memory_bytes(local_available);
+        HostAdmissionSnapshot external;
+        const bool external_measured = read_host_admission(external);
+        if (external_measured) {
+            policy.guest_total_bytes = std::min(policy.guest_total_bytes, external.allocation);
+            policy.guest_reserve_bytes = std::max(policy.guest_reserve_bytes, external.guest_reserve);
+            policy.host_reserve_bytes = std::max(policy.host_reserve_bytes, external.host_reserve);
+            policy.host_available_measured = true;
+            policy.host_available_bytes = external.available;
+            host.add("guest_unbacked_allocation", external.allocation - external.resident,
+                     "measured QEMU memfd allocation minus mincore resident backing; already-backed pages are in host MemAvailable");
+        } else {
+            host.add_unknown("physical_host_snapshot", "protected fresh supervisor host telemetry required; local guest RAM is not physical host RAM");
+        }
+        for (const auto& c : uploads.classes) guest.classes.push_back(c);
+        strata::plan::Scope startup;
+        for (const auto& c : guest.classes) {
+            // Complement and exchange allocations are created after all weight loaders complete.
+            // Retained file sources remain in BOTH phases; only the later anonymous copies differ.
+            if (c.name != "expert_resident_complement" && c.name != "resident_exchange_staging")
+                startup.classes.push_back(c);
+        }
+        for (const auto& c : startup_only.classes) startup.classes.push_back(c);
+        strata::plan::Scope startup_host = host;
+        auto mirror_sources = [](const strata::plan::Scope& phase, strata::plan::Scope& physical) {
+            for (const auto& c : phase.classes) {
+                if (c.name.rfind("file:", 0) != 0 && c.name != "ple_locked_table") continue;
+                const std::string source = "physical host cache mirror upper bound; no sharing/eviction credit: " + c.source;
+                if (c.unknown) physical.add_unknown(c.name, source);
+                else physical.add(c.name, c.bytes, source);
+            }
+        };
+        mirror_sources(startup, startup_host);
+        mirror_sources(guest, host);
+        const uint64_t runtime_peak = guest.known_bytes();
+        const uint64_t startup_peak = startup.known_bytes();
+        const uint64_t guest_peak = std::max(runtime_peak, startup_peak);
+        std::fprintf(stderr, "strata admission phases: startup_bytes=%llu runtime_bytes=%llu retained_upload_bytes=%llu local_available_bytes=%llu physical_host_measured=%d guest_backing_resident_bytes=%llu worker_limit_bytes=%llu\n",
+                     (unsigned long long) startup_peak, (unsigned long long) runtime_peak,
+                     (unsigned long long) uploads.known_bytes(), (unsigned long long) local_available, external_measured ? 1 : 0,
+                     (unsigned long long) external.resident, (unsigned long long) external.worker_limit);
+
+        for (const auto& dev : devs)
+            for (const auto& c : dev.vram.classes)
+                std::fprintf(stderr, "strata admission class: scope=%s name=%s bytes=%llu unknown=%d source=%s\n",
+                    dev.name.c_str(), c.name.c_str(), (unsigned long long) c.bytes, c.unknown ? 1 : 0, c.source.c_str());
+        for (const auto& c : guest.classes)
+            std::fprintf(stderr, "strata admission class: scope=guest-runtime name=%s bytes=%llu unknown=%d source=%s\n",
+                c.name.c_str(), (unsigned long long) c.bytes, c.unknown ? 1 : 0, c.source.c_str());
+        for (const auto& c : startup.classes)
+            std::fprintf(stderr, "strata admission class: scope=guest-startup name=%s bytes=%llu unknown=%d source=%s\n",
+                c.name.c_str(), (unsigned long long) c.bytes, c.unknown ? 1 : 0, c.source.c_str());
+        for (const auto& c : host.classes)
+            std::fprintf(stderr, "strata admission class: scope=physical-host-runtime-incremental name=%s bytes=%llu unknown=%d source=%s\n",
+                c.name.c_str(), (unsigned long long) c.bytes, c.unknown ? 1 : 0, c.source.c_str());
+        for (const auto& c : startup_host.classes)
+            std::fprintf(stderr, "strata admission class: scope=physical-host-startup-incremental name=%s bytes=%llu unknown=%d source=%s\n",
+                c.name.c_str(), (unsigned long long) c.bytes, c.unknown ? 1 : 0, c.source.c_str());
+        bool scope_overflow = guest.overflowed() || startup.overflowed() || host.overflowed() || startup_host.overflowed();
+        for (const auto& dev : devs) {
+            scope_overflow = scope_overflow || dev.vram.overflowed();
+            byte_add(dev.vram.known_bytes(), dev.headroom_bytes);
+        }
+        if (byte_overflow || scope_overflow) {
+            std::fprintf(stderr, "strata generate: admission refused: byte arithmetic or class-total overflow before gate\n");
+            std::printf("PLAN admit=0 limiting=accounting:byte_overflow\n");
+            std::fflush(stdout);
+            return 1;
+        }
+        auto startup_admission = strata::plan::admit_configuration(devs, tels, startup, startup_host, policy, "cold");
+        auto runtime_admission = strata::plan::admit_configuration(devs, tels, guest, host, policy, "cold");
+        // Both phases must fit. Preserve the first phase's root failure; otherwise report the larger guest envelope.
+        admission = !startup_admission.admitted || (runtime_admission.admitted && startup_peak >= runtime_peak)
+            ? std::move(startup_admission) : std::move(runtime_admission);
+        if (!local_measured || local_available < policy.guest_reserve_bytes ||
+            guest_peak > local_available - std::min(local_available, policy.guest_reserve_bytes)) {
+            admission.admitted = false;
+            if (!local_measured) admission.verified = false;
+            admission.guest_fits = false;
+            if (admission.limiting_term.empty() || admission.limiting_term == "none")
+                admission.limiting_term = local_measured ? "guest:cgroup_or_available" : "telemetry:guest_available";
+            admission.reasons.push_back("guest phase peak plus 4 GiB-or-higher guest reserve exceeds local MemAvailable/tightest finite cgroup headroom, or counters unavailable");
+        }
+        if (external_measured && (external.worker_limit < policy.guest_reserve_bytes ||
+            guest_peak > external.worker_limit - std::min(external.worker_limit, policy.guest_reserve_bytes))) {
+            admission.admitted = false;
+            admission.guest_fits = false;
+            if (admission.limiting_term.empty() || admission.limiting_term == "none")
+                admission.limiting_term = "guest:worker_cgroup";
+            admission.reasons.push_back("guest phase peak plus guest reserve exceeds protected worker MemoryMax");
+        }
+        // A total-capacity fit is insufficient when another process owns VRAM. This runtime check
+        // uses the same pre-allocation snapshot and remains valid with a total-only planner core.
+        for (size_t i = 0; i < admission.devices.size(); ++i) {
+            auto& line = admission.devices[i];
+            const auto& t = tels[i];
+            if (t.measured && (line.demand_bytes > t.free_bytes ||
+                line.headroom_bytes > t.free_bytes - std::min(line.demand_bytes, t.free_bytes))) {
+                admission.admitted = false;
+                line.fits = false;
+                if (admission.limiting_term.empty() || admission.limiting_term == "none")
+                    admission.limiting_term = line.name + ":free_vram";
+                admission.reasons.push_back(line.name + " demand + headroom exceeds measured free VRAM");
+            }
+        }
+        // One line on stdout either way: the harness's predicted-vs-observed hook (the observed half is
+        // the INFO line's vram_free_mib and the run's peak telemetry).
+        std::printf("PLAN admit=%d variant=%s devices=%zu", admission.admitted ? 1 : 0,
+                    admission.variant.c_str(), admission.devices.size());
+        for (size_t i = 0; i < admission.devices.size(); ++i) {
+            const auto& line = admission.devices[(size_t) i];
+            std::printf(" device%zu_name=%s device%zu_demand_bytes=%llu device%zu_ceiling_bytes=%llu "
+                        "device%zu_headroom_bytes=%llu device%zu_fits=%d",
+                        i, line.name.c_str(), i, (unsigned long long) line.demand_bytes, i,
+                        (unsigned long long) line.ceiling_bytes, i,
+                        (unsigned long long) line.headroom_bytes, i, line.fits ? 1 : 0);
+        }
+        std::printf(" guest_fits=%d host_fits=%d guest_demand_bytes=%llu host_demand_bytes=%llu "
+                    "guest_ceiling_bytes=%llu host_ceiling_bytes=%llu expert_cache_budget_bytes=%llu limiting=%s\n",
+                    admission.guest_fits ? 1 : 0, admission.host_fits ? 1 : 0,
+                    (unsigned long long) admission.guest_demand_bytes,
+                    (unsigned long long) admission.host_demand_bytes,
+                    (unsigned long long) admission.guest_ceiling_bytes,
+                    (unsigned long long) admission.host_ceiling_bytes,
+                    (unsigned long long) admitted_cache_bytes, admission.limiting_term.c_str());
+        std::fflush(stdout);
+        if (!admission.admitted) {
+            for (const auto& r : admission.reasons)
+                std::fprintf(stderr, "strata generate: admission refused: %s\n", r.c_str());
+            std::fprintf(stderr,
+                         "strata generate: the configuration is refused BEFORE any model allocation - "
+                         "lower --expert-cache / --max-context, or fix the accounting named above\n");
+            return 1;
+        }
+    }
+    if (native_pack) {
+        const strata::core::ModelGeometry g0;
+        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        strata::core::set_native_embed(&native_embed);
+        std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
+                             "type %d in mapped host memory (%.0f MiB)\n",
+                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
+                     native_embed.type(), (double) native_embed.bytes() / 1048576.0);
+    }
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
+    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
+    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
+    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    if (o.pcie_frac < 0.0) {
+        const double base = native_pack ? 0.55 : 0.2;
+        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
+        if (!native_pack) {
+            o.pcie_frac = base;
+        } else if (bw > 0.0) {
+            // below ~4 GB/s (an x1 link: ~0.9 GB/s) a missed expert's 1.4 MB takes longer to cross than the CPU
+            // pool takes to compute it, so none of them go over the link
+            o.pcie_frac = bw >= 20.0 ? base : bw < 4.0 ? 0.0 : std::min(base, std::max(0.05, base * (bw / 26.0)));
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
+                         bw, o.pcie_frac, base);
+        } else {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
+
     void* arena = nullptr;
     if (cudaMalloc(&arena, pool_bytes) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed\n",
@@ -2131,8 +2927,6 @@ int main(int argc, char** argv) {
     // the entire difference between CUDA0's cache and CUDA1's: 814 slots against 188, 2026-09-30.  Both of
     // those allocations are already made before a stage's cache is sized, so what has to be held back here is
     // the windows and - only on the stage that carries them - the drafter and the head.
-    const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
-    const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -2395,7 +3189,7 @@ int main(int argc, char** argv) {
         // Unregistered layers remain in the resident arena and use the CPU expert path.
         // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
         // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        const uint64_t pin_limit = 8ull << 30; // bounded default; never register the whole available guest
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -2468,6 +3262,8 @@ int main(int argc, char** argv) {
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        slots = std::min<int64_t>(slots, (int64_t) (admitted_cache_bytes /
+                                 strata::kernels::cpu::expert_layout().max_blob));
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
@@ -3535,7 +4331,8 @@ int main(int argc, char** argv) {
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
         }
-        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom)) {
+        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+                                    admitted_resident_bytes)) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
@@ -4412,10 +5209,25 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
+            // HET-017: THE OBSERVABLE ADMISSION DECISION, before any prompt work.  ADMIT/REJECT frames
+            // are what lets the harness time admission (`admission_monotonic_s`) and record a
+            // `admission_rejected` status with zero committed tokens instead of a bare ERR-failure.
+            // The state demand is priced with the allocator's own `session_bytes` at the cells this
+            // request can reach - context length, not a slot count.
+            {
+                const int64_t cells_wanted = n + max_new;
+                const uint64_t state_demand =
+                    (uint64_t) strata::core::session_bytes(g, cells_wanted, K, 0, -1);
+                if (cells_wanted + 8 > o.max_context) {
+                    std::printf("REJECT prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld) "
+                                "cells=%lld state_demand_bytes=%llu\n",
+                                (long long) n, (long long) max_new, (long long) o.max_context,
+                                (long long) cells_wanted, (unsigned long long) state_demand);
+                    continue;
+                }
+                std::printf("ADMIT cells=%lld state_demand_bytes=%llu context_limit=%lld\n",
+                            (long long) cells_wanted, (unsigned long long) state_demand,
+                            (long long) o.max_context);
             }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;

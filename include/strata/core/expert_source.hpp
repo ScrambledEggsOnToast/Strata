@@ -36,6 +36,11 @@ namespace strata::core {
 
 class RemoteExperts;
 
+/// MemAvailable clamped by the tightest finite cgroup-v2 ancestor after bounded clean-cache reclaim.
+/// Missing required counters fail closed. Explicit artifact working sets must still be budgeted by
+/// startup admission; this available-memory figure does not make mmap or shared allocations free.
+bool available_memory_bytes(uint64_t& bytes);
+
 namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
@@ -349,7 +354,7 @@ public:
     bool pin_cache_complement(
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
-        uint64_t headroom_bytes = 8ull << 30);
+        uint64_t headroom_bytes = 8ull << 30, uint64_t admitted_bytes = UINT64_MAX);
     void close();
 
     bool mapped() const { return base_ != nullptr; }

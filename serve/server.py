@@ -192,6 +192,13 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("PLAN "):                 # HET-017: the startup admission decision
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    if k == "admit":
+                        self.info["admission_admitted"] = v == "1"
+                    elif k == "limiting":
+                        self.info["admission_limiting"] = v
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -382,6 +389,12 @@ class StrataEngine:
                     self._parse_done(line)
                     done = True
                     return
+                elif line.startswith("ADMIT"):
+                    continue                # HET-017: the admission decision the harness times; the server
+                                            # itself keeps waiting for the tokens it already asked for
+                elif line.startswith("REJECT"):
+                    done = True
+                    raise ValueError(line[8:].strip())   # same contract as ERR: a refusal, zero tokens
                 elif line.startswith("ERR"):
                     done = True
                     raise ValueError(line[4:].strip())
@@ -395,7 +408,7 @@ class StrataEngine:
                         pass
                 while True:
                     line = self.lines.get()
-                    if line is None or line.startswith("ERR"):
+                    if line is None or line.startswith(("ERR", "REJECT")):
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)

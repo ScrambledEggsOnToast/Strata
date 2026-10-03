@@ -223,6 +223,8 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 }
 #endif
 
+}  // namespace
+
 bool available_memory_bytes(uint64_t& bytes) {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
@@ -288,8 +290,6 @@ bool available_memory_bytes(uint64_t& bytes) {
     return bytes > 0;
 #endif
 }
-
-}  // namespace
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
@@ -520,7 +520,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes) {
+    uint64_t headroom_bytes, uint64_t admitted_bytes) {
     err.clear();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -566,6 +566,7 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
         budget = physical > headroom_bytes ? physical - headroom_bytes : 0;
+        budget = std::min(budget, admitted_bytes);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
@@ -609,6 +610,12 @@ bool FileExpertSource::pin_cache_complement(
         }
         arena = nullptr;
     };
+    // Registration is a separate, bounded resource: resident storage may be larger than the
+    // portable pinned-host envelope, but must not pin the entire available guest by default.
+    if (pin && bytes > (8ull << 30)) {
+        pin = false;
+        std::fprintf(stderr, "FileExpertSource: complement exceeds 8 GiB pinned envelope; keeping resident pageable RAM\n");
+    }
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
@@ -687,6 +694,22 @@ bool FileExpertSource::pin_cache_complement(
                 }
                 std::memcpy((uint8_t*) host + (size_t) offset, source, (size_t) blob_bytes);
                 copied.fetch_add(blob_bytes);
+#if defined(__linux__)
+                // Keep six concurrent copies bounded by blobs, not whole
+                // layers: completed clean source pages can leave before the
+                // next expert is copied. Partial boundary pages stay mapped.
+                const uint64_t page = (uint64_t) page_size;
+                const uint64_t begin = layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
+                const uint64_t end = begin + blob_bytes;
+                const uint64_t first = begin + (page - begin % page) % page;
+                const uint64_t last = end - end % page;
+                if (last > first &&
+                    (madvise((void*) (base_ + (size_t) first), (size_t) (last - first), MADV_DONTNEED) != 0 ||
+                     posix_fadvise(fd_, (off_t) first, (off_t) (last - first), POSIX_FADV_DONTNEED) != 0)) {
+                    fail("FileExpertSource: could not release completed expert copy source pages");
+                    return;
+                }
+#endif
             }
 #if !defined(_WIN32)
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
