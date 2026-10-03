@@ -309,6 +309,25 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
 
+bool Verifier::read_logits_rows(int t0, int t1, float* dst, std::string& err) {
+    if (le_ < g_->n_layers) {   // a layer split: the head (and so the rows) belong to the last stage
+        if (next_ == nullptr) { err = "verify: this stage runs no head, so it holds no logits rows"; return false; }
+        return next_->read_logits_rows(t0, t1, dst, err);
+    }
+    if (t0 < 0 || t1 > last_t_ || t0 >= t1) {
+        err = "verify: logits row range " + std::to_string(t0) + ".." + std::to_string(t1) +
+              " outside the last window (" + std::to_string(last_t_) + " rows)";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    if (cudaMemcpy(dst, head_logits_ + (size_t) t0 * (size_t) n_vocab_,
+                   (size_t) (t1 - t0) * (size_t) n_vocab_ * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = std::string("verify: reading the head's rows failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and

@@ -441,7 +441,8 @@ void usage() {
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
-                 "  --dump-logits PATH   write one line of raw logits per position\n"
+                 "  --dump-logits PATH   one float32 logits row per position; canonical packs walk the token loop,\n"
+                 "                       native (IQ) packs take the prompt path + the verify windows' committed rows\n"
                  "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
@@ -804,6 +805,60 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
+
+/// **THE DUMP'S ACCOUNTING IS STRICT: THE HEADER DESCRIBES THE FILE, OR THERE IS NO FILE.**  The header
+/// promises `logits_selection::row_count(n_prompt - 1 + max_new, stride)` rows of `n_vocab` floats; every
+/// writer goes through `write_row`, which counts, and `finish` compares the count at close.  Any path out of
+/// `main` before that - a write failure, an early EOS, a CUDA fault after the header - destroys the guard,
+/// which removes the file: rows that were not written must not be claimed (defect #57, enforced rather than
+/// refused around).  The writers are the per-position token loop, the batched prompt path's head rows and the
+/// verify windows' committed rows (#58).
+struct LogitsDump {
+    std::FILE* f = nullptr;
+    std::string path;
+    int64_t n_vocab = 0, expected_rows = 0, written_rows = 0;
+    ~LogitsDump() {
+        if (f == nullptr) return;
+        std::fclose(f);
+        std::fprintf(stderr, "strata generate: %s held %lld of the %lld logits rows the header claims and is "
+                             "removed: the run ended before it produced every row\n",
+                     path.c_str(), (long long) written_rows, (long long) expected_rows);
+        std::remove(path.c_str());
+    }
+    /// One complete row, already on the host and checked finite by the caller.  false fails the run.
+    bool write_row(const float* row, int64_t pos) {
+        if (std::fwrite(row, sizeof(float), (size_t) n_vocab, f) != (size_t) n_vocab) {
+            std::fprintf(stderr, "strata generate: cannot write logits at position %lld\n", (long long) pos);
+            return false;
+        }
+        ++written_rows;
+        return true;
+    }
+    /// The strict close: what the header claims is what is on disk, or the file goes and the run fails.
+    bool finish() {
+        if (f == nullptr) return true;
+        std::FILE* d = f;
+        f = nullptr;   // the destructor must not remove what finish() has judged
+        if (written_rows != expected_rows) {
+            std::fprintf(stderr, "strata generate: the logits dump holds %lld rows, the header claims %lld\n",
+                         (long long) written_rows, (long long) expected_rows);
+            std::fclose(d);
+            std::remove(path.c_str());
+            return false;
+        }
+        const bool flushed = std::fflush(d) == 0;
+        std::error_code size_error;
+        const auto bytes = std::filesystem::file_size(path, size_error);
+        const auto expected_bytes = uint64_t{8} + uint64_t(expected_rows) * uint64_t(n_vocab) * sizeof(float);
+        const bool closed = std::fclose(d) == 0;
+        if (!flushed || !closed || size_error || bytes != expected_bytes) {
+            std::fprintf(stderr, "strata generate: cannot finish logits dump with the declared byte count\n");
+            std::remove(path.c_str());
+            return false;
+        }
+        return true;
+    }
+};
 
 using ConvStateSizes = strata::core::ConversationStateSizes;
 
@@ -1411,13 +1466,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     // **A DUMP MUST DESCRIBE THE FILE IT WRITES.**  The logits header counts one row per position from 0
-    // (`logits_selection::row_count` over `n_prompt - 1 + max_new`), and the batched prompt path computes no
-    // logits at all, so a run that dumps walks the prompt one position at a time instead of batching it: that
-    // loop is the teacher-forced oracle, and batching the same positions would silently drop their rows.
-    // (Defect #57: a native pack broke out of that loop before its first row, so the header claimed 222 rows
-    // and the file held none.)  The predicate is read from the options, not from the open handles, because the
-    // prompt path's VRAM reservation is priced far earlier than the dump is opened -- reserving buffers the
-    // oracle run will never allocate is exactly how a dumpable run stops fitting.
+    // (`logits_selection::row_count` over `n_prompt - 1 + max_new`), every row the run conditions on must be
+    // written exactly once, and the count is checked at close (`LogitsDump`).  Which path writes which rows
+    // is decided by the pack: a canonical pack walks every position in the token loop (its per-position
+    // writer), while a native pack takes the prompt's rows from the batched prompt path and the generated
+    // positions' committed rows from the verify windows (#58) - it has no token loop to walk.  (Defect #57:
+    // a native pack broke out of the token loop before its first row, so the header claimed 222 rows and the
+    // file held none.)
     const bool dump_requested = !o.dump_logits.empty() || !o.dump_layers.empty();
     // A dump is written by the per-position CLI loop, so it is a CLI mode: a serve run batches its prompt and
     // writes no rows, so the flags are refused there rather than honoured into an empty file.
@@ -1435,13 +1490,21 @@ int main(int argc, char** argv) {
                              "batched prefix computes no rows, and those are exactly the rows it compares.\n");
         return 2;
     }
-    // The speculative window loop has no row writer, so a dump that hands over to it would leave the tail of the
-    // file empty while the header still claims those rows (the second half of defect #57).
-    if (oracle_dump && o.spec >= 2 && o.max_new > 1) {
-        std::fprintf(stderr, "strata generate: a logits dump must walk every position itself, but --max-new %lld "
-                             "with --spec %d hands the generated positions to the speculative window, which writes "
-                             "no rows. Use --max-new 1, or --spec 0/1, or drop the dump.\n",
-                     (long long) o.max_new, o.spec);
+    // Verify windows expose committed logits, but do not write per-layer diagnostics.
+    if (!o.dump_layers.empty() && o.spec >= 2 && o.max_new > 1) {
+        std::fprintf(stderr, "strata generate: --dump-layers with --spec >= 2 and --max-new > 1 "
+                             "is unsupported: speculative windows write no layer rows.\n");
+        return 2;
+    }
+    // **A DUMP WITHOUT THE ROUTED EXPERTS IS A DUMP OF A DIFFERENT MODEL.**  `--no-pool` measures the GPU-only
+    // floor; a per-position distribution from that floor omits every routed expert, and the gate that consumes
+    // the oracle (#6) compares against a reference that has them.  It also closes the last pool-free walk:
+    // `--no-capture` without `--no-pool` is already refused, so the pair of the two was the one dump that ran
+    // and still measured nothing.
+    if (dump_requested && o.no_pool) {
+        std::fprintf(stderr, "strata generate: --dump-logits/--dump-layers describe this model's per-position "
+                             "distribution, which the routed experts shape; --no-pool omits them, so the file "
+                             "would describe a different model. Drop one of the two.\n");
         return 2;
     }
     // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
@@ -1544,19 +1607,25 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
-    // A NATIVE (IQ) PACK CANNOT WALK ITS POSITIONS, so a dump cannot describe a file it cannot fill. Both
-    // per-position launchers are closed to it: `session_loop`'s captured graphs stage the CANONICAL planes of
-    // every tensor and a native pack does not load them (`session_capture` refuses with "the planes add up to
-    // 0 B but the tensor is 0 B"), and `session_token` has no CPU expert-pool hook at all, so it would measure
-    // a model whose routed experts contribute nothing. Refusing is the honest answer; writing the header
-    // anyway is defect #57.
-    if (oracle_dump) {
-        std::fprintf(stderr, "strata generate: --dump-logits/--dump-layers cannot walk a native (IQ) pack: its "
-                             "tensors are served in native form, so the per-position path cannot be captured, and "
-                             "the pool-free fallback would omit every routed expert. Use a canonical GGUF pack, or "
-                             "drop the dump.\n");
+    // **THE NATIVE PACK'S DUMP GOES THROUGH THE PATH IT ACTUALLY RUNS (#58).**  The token loop is closed to a
+    // native pack either way: `session_loop`'s captured graphs stage the CANONICAL planes of every tensor and a
+    // native pack does not load them (`session_capture` refuses with "the planes add up to 0 B but the tensor is
+    // 0 B"), and `session_token` has no CPU expert-pool hook at all.  So the prompt's rows come from the batched
+    // prompt path's head over `R_rows` and the generated positions' rows from the verify windows' committed
+    // head rows. Other diagnostic dumps still depend on the unavailable per-position path.
+    if (native_pack && (!o.dump_layers.empty() || !o.dump_halves.empty() ||
+                        !o.dump_residual.empty() || !o.dump_mixed.empty())) {
+        std::fprintf(stderr, "strata generate: native (IQ) packs support --dump-logits, but not "
+                             "--dump-layers, --dump-halves, --dump-residual or --dump-mixed; "
+                             "those diagnostics require the canonical per-position path.\n");
         return 2;
     }
+    // WHICH PATH WALKS THE PROMPT: a dump normally forces the per-position token loop - the only row writer a
+    // canonical pack has for the prompt - so the batched prompt is suppressed and its buffers are neither
+    // borrowed nor reserved below.  A native pack keeps the batched prompt: the dump does not disable it, so
+    // the pricing sees the same demand as the run.  `n_prompt > 1` is the callers' concern (a one-token prompt
+    // has nothing to batch).
+    const bool prompt_batched = o.prefill_chunk > 0 && o.tokens.size() > 1 && (!oracle_dump || native_pack);
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -2053,7 +2122,7 @@ int main(int argc, char** argv) {
     // for buffers that cannot be priced exactly yet because the sessions do not exist.  `plan_lend` uses the
     // exact `Prefill::bytes_needed` as soon as it can.
     const bool pf_borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-    const int64_t split_pf_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+    const int64_t split_pf_mib = (!pf_borrow && prompt_batched)
                                      ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
     // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  The flat 1 GiB this used to withhold from EVERY stage
     // after the first was booked "for its windows and the drafter", but the windows measure 75 MiB ("window up
@@ -2390,7 +2459,7 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+        const int64_t prefill_mib = (!pf_borrow && prompt_batched)
                                         ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
@@ -2412,7 +2481,7 @@ int main(int argc, char** argv) {
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow && !oracle_dump)
+        const int64_t prefill_mib = (!pf_borrow && prompt_batched)
                                         ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
@@ -2965,33 +3034,38 @@ int main(int argc, char** argv) {
                          (unsigned long long) sp.seed);
     }
 
-    std::FILE* dump = nullptr;
+    LogitsDump dump_acc;   // every row writer below goes through it; the file is removed unless it finishes
     const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
     if (!o.dump_logits.empty()) {
         if (dump_positions > INT32_MAX || n_vocab > INT32_MAX) {
             std::fprintf(stderr, "strata generate: logits dump dimensions exceed int32\n");
             return 2;
         }
-        dump = std::fopen(o.dump_logits.c_str(), "wb");
-        if (dump == nullptr) {
+        dump_acc.f = std::fopen(o.dump_logits.c_str(), "wb");
+        if (dump_acc.f == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_logits.c_str());
             return 1;
         }
-        // **THE COUNT IS `n_prompt - 1 + max_new`, NOT `n_prompt + max_new`.**  The loop writes one row per
-        // position from 0, and it stops once `produced` holds `max_new` tokens - and `produced` only starts
-        // receiving at position `n_prompt - 1`.  So a 5-token prompt with `--max-new 6` writes 10 rows, and the
-        // header used to claim 11.  A header that describes a different file from the one written is the same
-        // class of defect as a self-check that verifies the wrong invariant: anything reading the count instead
-        // of the size gets a wrong answer that looks authoritative.  `tools/logits_identical.py` caught it by
-        // parsing the header and refusing the file.
-        const int32_t n_rows = (int32_t) strata::program::logits_selection::row_count(dump_positions, o.logits_stride);
-        const int32_t hdr[2] = {(int32_t) n_vocab, n_rows};
-        if (std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
+        // **THE COUNT IS `n_prompt - 1 + max_new`, NOT `n_prompt + max_new`.**  One row per position from 0,
+        // and positions stop once `produced` holds `max_new` tokens - and `produced` only starts receiving at
+        // position `n_prompt - 1`.  So a 5-token prompt with `--max-new 6` writes 10 rows, and the header used
+        // to claim 11.  A header that describes a different file from the one written is the same class of
+        // defect as a self-check that verifies the wrong invariant: anything reading the count instead of the
+        // size gets a wrong answer that looks authoritative.  `tools/logits_identical.py` caught it by parsing
+        // the header and refusing the file; `LogitsDump::finish` now enforces the same invariant at write time.
+        dump_acc.path = o.dump_logits;
+        dump_acc.n_vocab = n_vocab;
+        dump_acc.expected_rows = strata::program::logits_selection::row_count(dump_positions, o.logits_stride);
+        const int32_t hdr[2] = {(int32_t) n_vocab, (int32_t) dump_acc.expected_rows};
+        if (std::fwrite(hdr, sizeof hdr, 1, dump_acc.f) != 1) {
             std::fprintf(stderr, "strata generate: cannot write logits header\n");
-            std::fclose(dump);
-            return 1;
+            return 1;   // the guard removes the file
         }
     }
+    // The rows' host staging: the prompt path and the token loop write one row per call, the verify windows
+    // read their round's committed rows (up to --spec of them) in one device-to-host copy.
+    std::vector<float> dump_stage(dump_acc.f != nullptr
+                                      ? (size_t) n_vocab * (size_t) std::max<int64_t>(1, o.spec) : 0);
 
     // ---- THE C1 ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
@@ -5079,7 +5153,10 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-    if (o.prefill_chunk > 0 && n_prompt > 1 && !oracle_dump) {
+    // A dump forces the per-position token loop (a canonical pack's only prompt writer) and suppresses the
+    // batched prompt with it.  A NATIVE pack has no token loop: its prompt rows are written by the batched
+    // prompt path, so `prompt_batched` keeps the path (and the reserve priced above) alive under a dump (#58).
+    if (prompt_batched) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
@@ -5127,7 +5204,54 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+        }
+        // **THE PROMPT'S ROWS (#58): the head over every stride-selected row of the chunk.**  `R_rows` holds
+        // each position's final residual; the token loop would charge the same head GEMV per position, so the
+        // oracle pays the same arithmetic on the batched path.  The rows map one to one: the chunk's row t is
+        // position p0 + t, the prediction after tokens[0..p0+t] - exactly the row the token loop writes for
+        // that position.  `ss.block` is the decode's scratch and sits idle until the token loop; the prefill
+        // stream is synchronized before this runs.  A native pack always loads its head, the canonical path
+        // keeps `lm_head`; both write n_vocab floats of logits for the row.
+        if (dump_acc.f != nullptr || !o.mtp.empty()) {
             prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                if (dump_acc.f != nullptr) {
+                    strata::core::BlockBuffers bb = ss.block;
+                    const int64_t hcn = g.hc * g.n_embd;
+                    for (int64_t t = 0; t < T; ++t) {
+                        const int64_t pos = p0 + t;
+                        const bool selected = strata::program::logits_selection::selected(
+                            pos, dump_positions, o.logits_stride);
+                        if (!selected && !o.check_logits) continue;
+                        bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) hcn;   // the head only reads it
+                        if (native_head.loaded()) {
+                            if (!strata::core::lm_head_mix(wt, g, bb, main_cs, e) ||
+                                !native_head.run(bb.mixed, d_logits, main_cs, e))
+                                return false;
+                        } else if (!strata::core::lm_head(wt, g, bb, d_logits, main_cs, e)) {
+                            return false;
+                        }
+                        // the copy rides the prefill's own (non-blocking) stream: a null-stream memcpy would
+                        // not order against the head kernels just enqueued above
+                        if (cudaMemcpyAsync(dump_stage.data(), d_logits, (size_t) n_vocab * 4,
+                                            cudaMemcpyDeviceToHost, (cudaStream_t) main_cs) != cudaSuccess ||
+                            cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                            e = "reading a prompt-path logits row back failed";
+                            return false;
+                        }
+                        int64_t bad = 0;
+                        for (int64_t v = 0; v < n_vocab; ++v) bad += !std::isfinite(dump_stage[(size_t) v]);
+                        if (bad != 0) {
+                            e = std::to_string((long long) bad) + " of " + std::to_string((long long) n_vocab) +
+                                " logits are not finite at prompt position " + std::to_string((long long) pos);
+                            return false;
+                        }
+                        if (selected && !dump_acc.write_row(dump_stage.data(), pos)) {
+                            e = "the logits dump failed";
+                            return false;
+                        }
+                    }
+                }
+                if (o.mtp.empty()) return true;
                 // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
                 std::vector<int32_t> nxt((size_t) T);
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
@@ -5297,7 +5421,7 @@ int main(int argc, char** argv) {
             ms_head += std::chrono::duration<double, std::milli>(n - tp).count();
             tp = n;
         }
-        const bool emit_logits = dump != nullptr &&
+        const bool emit_logits = dump_acc.f != nullptr &&
             strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
         if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
@@ -5313,11 +5437,7 @@ int main(int argc, char** argv) {
                          (long long) n_vocab, (long long) pos);
             return 1;
         }
-        if (emit_logits && std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
-            std::fprintf(stderr, "strata generate: cannot write logits at position %lld\n", (long long) pos);
-            std::fclose(dump);
-            return 1;
-        }
+        if (emit_logits && !dump_acc.write_row(logits.data(), pos)) return 1;
         {
             // **993 KB OF SYNCHRONOUS D2H AND A 248,320-FLOAT HOST SCAN, EVERY TOKEN.**  (The review's notes
             // say 151,936 floats; the artifact's `output.weight` is 248,320 rows, so the real figure is 1.6x
@@ -5618,10 +5738,45 @@ int main(int argc, char** argv) {
             ++accepted_hist[(size_t) a];
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
+            const size_t produced_before = produced.size();
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+            }
+            // **THE COMMITTED ROWS (#58).**  The window's head rows [0, emitted) are positions p .. p+emitted-1:
+            // row t is the prediction after conditioning on window[0..t], and `commit(a + 1)` kept exactly the
+            // first a+1 tokens' state, so a written row describes a position the run stands behind.  A rejected
+            // draft's row (t > a) is DROPPED, not approximated: that position is re-run in a later window with
+            // the final context, and two rows for one position is the header's lie again.  The rows are valid
+            // until the next `run` - `commit` leaves them alone - so the round's copy is read after the commit.
+            // Greedy (the oracle's mode) makes row p+emitted-1's argmax the last emitted token; a sampled run
+            // keeps the DISTRIBUTION here and the draw elsewhere, as on the token loop.
+            if (dump_acc.f != nullptr) {
+                const int rows = (int) (produced.size() - produced_before);
+                if (rows > 0 &&
+                    !ver.read_logits_rows(0, rows, dump_stage.data(), err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+                for (int t = 0; t < rows; ++t) {
+                    const int64_t pos = p + t;
+                    if (!strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride)) continue;
+                    const float* row = dump_stage.data() + (size_t) t * (size_t) n_vocab;
+                    int64_t bad = 0;
+                    for (int64_t v = 0; v < n_vocab; ++v) bad += !std::isfinite(row[v]);
+                    if (bad != 0) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::fprintf(stderr, "strata generate: %lld of %lld logits are not finite at position %lld\n",
+                                     (long long) bad, (long long) n_vocab, (long long) pos);
+                        return 1;
+                    }
+                    if (!dump_acc.write_row(row, pos)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        return 1;
+                    }
+                }
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -5695,10 +5850,10 @@ int main(int argc, char** argv) {
                         (double) mtp.vram_bytes() / 1048576.0);
     }
 
-    if (dump != nullptr && std::fclose(dump) != 0) {
-        std::fprintf(stderr, "strata generate: cannot finish logits dump\n");
-        return 1;
-    }
+    // **THE STRICT CLOSE.**  The header claimed `expected_rows`; the writers wrote `written_rows`; anything
+    // else - an early EOS, a context overrun that returned before this line, a short fwrite - has already
+    // removed the file through the guard.  Here the count is the run's last word.
+    if (!dump_acc.finish()) return 1;
     if (layer_dump != nullptr) {
         std::fclose(layer_dump);
         cudaFreeHost(layer_stage);
@@ -5865,7 +6020,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
+    if (!o.dump_logits.empty())
+        std::printf("%-24s %s: %lld rows x %lld floats\n", "logits dumped", o.dump_logits.c_str(),
+                    (long long) dump_acc.written_rows, (long long) dump_acc.n_vocab);
 
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);

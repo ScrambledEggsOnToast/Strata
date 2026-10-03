@@ -114,6 +114,16 @@ public:
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
 
+    /// The head's vocabulary size (the row width `read_logits_rows` copies).  The window graph computes the
+    /// head's FULL rows for every one of its T positions (`head_logits_`, T x n_vocab); the decode path reads
+    /// only the argmax, so the rows themselves were unreadable until #58 needed them for `--dump-logits`.
+    int64_t n_vocab() const { return n_vocab_; }
+    /// Rows [t0, t1) of the last `run`'s head (n_vocab floats each) copied to `dst` (host), the stream synced
+    /// on return.  Valid from `run` until the next `run` or `commit` of a new window - `commit` itself leaves
+    /// the rows untouched, so the caller reads the round's committed rows after `commit`.  A layer split's
+    /// rows live in its last stage, so the call chains there.  Dump-only: the decode path never reads rows.
+    bool read_logits_rows(int t0, int t1, float* dst, std::string& err);
+
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
