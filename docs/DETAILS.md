@@ -379,7 +379,10 @@ because their allocation budgets are not knowable at this gate; they are not sil
 CUDA graph executable/capture storage and opaque prefill driver/cuBLAS/runtime storage remain
 unqualified and refuse by name. Explicit prefill device buffers now share checked sizing with the
 allocator, including the full loan region, separately owned buffers and bounded MMQ scratch;
-fixed host payload is priced separately from dynamic jobs, thread stacks and opaque storage.
+fixed host payload and counted init-bound jobs/ready, stream plans, grouping arrays and
+draft/init transients are separate rows. Job buffers refill only after prior workers finish;
+relayout does not grow them. Allocator metadata, vector capacity excess in unchanged containers,
+thread stacks and opaque event/context storage remain unknown rather than being hidden in payload.
 Serving prefill is charged regardless of the initial one-token placeholder. These explicit bounds
 do not qualify a complete full-model peak or permit spending headroom on unknown allocations.
 The current candidate has native SM70/SM86 compilation, host-only allocation/source tests and CLI

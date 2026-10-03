@@ -2434,8 +2434,10 @@ int main(int argc, char** argv) {
                 "Prefill::init stager ring, two PLE row buffers, host routing and step tables");
             ram("prefill_host_payload", byte_mul(stages, admitted_prefill.host_payload),
                 "Prefill::allocation_needed: token staging, routing counts, mapped/MMQ bounds and pinned flags");
+            ram("prefill_host_dynamic", byte_mul(stages, admitted_prefill.host_dynamic),
+                "Prefill::allocation_needed: counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
             ram_unknown("prefill_runtime_storage",
-                "CUDA events, context/registration storage, thread stacks, dynamic stager jobs/ready capacities and transient vectors lack a complete peak bound");
+                "Opaque CUDA events/context/registration storage, resident thread stacks, allocator metadata, init pointer/thread containers, vector capacity excess and diagnostic transients remain unqualified");
             if (split_real)
                 ram("stage_handoff", byte_mul(byte_mul(byte_mul(2, chunk), (uint64_t) g.hc),
                     byte_mul(byte_mul((uint64_t) g.n_embd, 4), stages - 1)),

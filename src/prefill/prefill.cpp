@@ -134,6 +134,10 @@ struct Alloc {
 
 }  // namespace
 
+// One streamed expert of a whole-chunk stream plan: its layer, expert id, host blob, and its stager job
+// (-1: DMA straight from the pinned arena).  sizeof(StreamEntry) prices the plan; see host_dynamic.
+struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
+
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
 // left the GPU without queued work while each ~2 MB memcpy ran (~15 s of a 32K prompt on IQ3_S).  Job j - a layer's
@@ -144,13 +148,15 @@ struct Stager {
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
     struct Job { const uint8_t* src; size_t bytes; };
-    std::vector<uint8_t*> buf;
+    // The counted fixed storage (see AllocationBytes::host_dynamic): every array below is allocated once at init,
+    // exactly count * sizeof(T), and never reallocated - the job list is refilled in place per chunk or layer.
+    std::unique_ptr<uint8_t*[]> buf;
     std::vector<char> pinned;
-    std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
-    std::vector<cudaEvent_t> dma_done;
-    std::vector<Job> jobs;
-    std::unique_ptr<std::atomic<int>[]> ready;
-    size_t ready_cap = 0;
+    std::unique_ptr<std::vector<uint8_t>[]> pageable;   // the fallback when no more RAM can be pinned
+    std::unique_ptr<cudaEvent_t[]> dma_done;
+    std::unique_ptr<Job[]> jobs_storage;                // max_jobs entries; built in place, published by start()
+    size_t jobs_cap = 0, jobs_len = 0;                  // jobs_cap is also the claim word's 16-bit job bound
+    std::unique_ptr<std::atomic<int>[]> ready;          // 2 * max_jobs flags, allocated once
     // gen << 32 | n << 16 | next index: a claim is a CAS on the generation it woke for (a thread late from the
     // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
     std::atomic<uint64_t> head{0};
@@ -162,12 +168,16 @@ struct Stager {
     std::vector<std::thread> threads;
     int device = 0;
 
-    bool init(size_t blob_bytes, int nthreads) {
+    bool init(size_t blob_bytes, int nthreads, size_t max_jobs) {
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
-        buf.assign((size_t) kRing, nullptr);
+        buf.reset(new uint8_t*[(size_t) kRing]());
         pinned.assign((size_t) kRing, 0);
-        dma_done.assign((size_t) kRing, nullptr);
-        pageable.resize(kRing);
+        dma_done.reset(new cudaEvent_t[(size_t) kRing]());
+        pageable.reset(new std::vector<uint8_t>[(size_t) kRing]());
+        jobs_storage.reset(new Job[max_jobs]);
+        jobs_cap = max_jobs;
+        jobs_len = 0;
+        ready.reset(new std::atomic<int>[2 * max_jobs]);
         for (int i = 0; i < kRing; ++i) {
             pinned[i] = cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
             if (!pinned[i]) {
@@ -210,7 +220,7 @@ struct Stager {
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
                     cudaEventSynchronize(dma_done[b]);
                 }
-                std::memcpy(buf[b], jobs[(size_t) j].src, jobs[(size_t) j].bytes);
+                std::memcpy(buf[b], jobs_storage[(size_t) j].src, jobs_storage[(size_t) j].bytes);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
@@ -225,19 +235,24 @@ struct Stager {
             if (head.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return j;
         }
     }
-    /// A layer's jobs; the previous layer's are finished (finish()).
-    void start(std::vector<Job>&& js) {
-        if (js.empty()) return;
+    /// Begin a fresh job list in the fixed storage.  Only after finish(): the previous list's workers are done,
+    /// so no thread can still be reading a job this refill would overwrite (the in-place refill contract).
+    void begin_jobs() { jobs_len = 0; }
+    /// Append a job to the list begun by begin_jobs(): its index, or -1 when the fixed bound is hit (the claim
+    /// word's 16-bit job field) - the caller refuses by name.
+    int push_job(const Job& j) {
+        if (jobs_len >= jobs_cap || jobs_len >= 0xffff) return -1;
+        jobs_storage[jobs_len] = j;
+        return (int) jobs_len++;
+    }
+    /// Publish the list built since begin_jobs(); the previous list's jobs are finished (finish()).
+    void start() {
+        if (jobs_len == 0) return;
         std::lock_guard<std::mutex> lk(mu);
-        jobs = std::move(js);
-        if (ready_cap < jobs.size()) {
-            ready_cap = jobs.size() * 2;
-            ready.reset(new std::atomic<int>[ready_cap]);
-        }
-        for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < jobs_len; ++i) ready[i].store(0, std::memory_order_relaxed);
         issued.store(0);
         ++gen;
-        head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
+        head.store((uint64_t) gen << 32 | (uint64_t) jobs_len << 16, std::memory_order_release);
         cv.notify_all();
     }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
@@ -305,11 +320,22 @@ struct Prefill::Impl {
     std::unique_ptr<mmq::Context> mmq_ctx;
     AllocationConfig allocation;
     bool mmq_any = false, mmq_fallback = true;
-    std::vector<char> mmq_layer;
+    std::unique_ptr<char[]> mmq_layer;        // g.n_layers entries, written once at init
     size_t mmq_gu_max = 0, mmq_d_max = 0;
     uint64_t max_blob = 0, mmq_workspace_bytes = 0;
     void* mmq_workspace = nullptr;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    // The dynamic host payload's counted fixed storage (AllocationBytes::host_dynamic): allocated once at init
+    // at the geometry bound, refilled in place, never grown.  The stream plan is resident in both modes, so a
+    // relayout that flips chunk/ring between routed and whole-chunk staging stays inside the init-time bound.
+    size_t dyn_jobs = 0;                      // stager_max_jobs: the fixed bound behind jobs/ready/seq
+    std::unique_ptr<StreamEntry[]> seq_plan;  // dyn_jobs entries, refilled per chunk
+    size_t seq_len = 0;                       // this chunk's live plan length
+    std::unique_ptr<size_t[]> seq_offsets;    // n_layers + 1 layer-start offsets, refilled per chunk
+    std::unique_ptr<int32_t[]> grp_order, grp_fill;   // n_expert entries, refilled per MoE layer
+    std::unique_ptr<int[]> grp_stage_of, grp_job_of;  // n_expert ring-slot/job indices, refilled per layer
+    std::unique_ptr<int32_t[]> draft_tk;      // the draft layer's token staging, refilled per draft call
+    size_t draft_tk_cap = 0;
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
     // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
@@ -468,9 +494,28 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: lent region is unaligned or undersized"; return false;
     }
     const MmqPlan mp = mmq_plan(experts, m.allocation.mmq);
-    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback; m.mmq_layer = mp.layer;
+    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback;
     m.mmq_gu_max = mp.gu_max; m.mmq_d_max = mp.d_max;
+    m.mmq_layer.reset(new char[(size_t) g.n_layers]);
+    std::copy(mp.layer.begin(), mp.layer.end(), m.mmq_layer.get());
     if (m.mmq_any) m.bounds_host.resize((size_t) mmq_bounds_int32(g.n_expert));
+    // The dynamic host payload's fixed storage, once (see AllocationBytes::host_dynamic): sized by the same
+    // pure bound the estimator prices.  A re-init keeps the first bound - a superset of any later stage's.
+    int64_t dyn_jobs = 0;
+    if (!stager_max_jobs(g, m.allocation, dyn_jobs)) {
+        err = "prefill: the stage's stager job bound is out of range"; return false;
+    }
+    if (m.dyn_jobs == 0 && dyn_jobs > 0) {
+        m.dyn_jobs = (size_t) dyn_jobs;
+        m.seq_plan.reset(new StreamEntry[m.dyn_jobs]);
+        m.seq_offsets.reset(new size_t[(size_t) g.n_layers + 1]());
+        m.grp_order.reset(new int32_t[(size_t) g.n_expert]);
+        m.grp_fill.reset(new int32_t[(size_t) g.n_expert]);
+        m.grp_stage_of.reset(new int[(size_t) g.n_expert]);
+        m.grp_job_of.reset(new int[(size_t) g.n_expert]);
+        m.draft_tk.reset(new int32_t[(size_t) chunk]);
+        m.draft_tk_cap = (size_t) chunk;
+    }
     m.max_blob = experts.native ? experts.max_blob : std::max<uint64_t>(experts.max_blob, kernels::cpu::BLOB);
     if (experts.native) for (uint64_t bytes : experts.bytes) m.max_blob = std::max(m.max_blob, bytes);
     m.mmq_workspace_bytes = sizing.mmq_workspace;
@@ -497,7 +542,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        if (!m.stager->init((size_t) m.max_blob, stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
+        if (!m.stager->init((size_t) m.max_blob, stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4)),
+                            m.dyn_jobs))
             ok = false;
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
@@ -535,9 +581,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
-        std::vector<int32_t> ident((size_t) pages);
+        std::unique_ptr<int32_t[]> ident(new int32_t[(size_t) pages]);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+        if (cudaMemcpy(m.ident_table, ident.get(), (size_t) pages * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             ok = false;
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
@@ -739,6 +785,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
     const int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
     if (B < 64) return false;
+    if ((size_t) B > m.draft_tk_cap) return false;   // the fixed draft token staging never grows
+    int32_t* tk = m.draft_tk.get();
     uint8_t* q = m.region;
     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
     float* emb = (float*) carve((size_t) B * Nn * 4);
@@ -766,7 +814,6 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
-    std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) return false; // init binds a priced external pool even for draft-only MMQ.
         mmq::iota(ident, B * g.hc, m.cs);
@@ -790,7 +837,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             err = "prefill: the draft bounds' upload failed";
             return false;
         }
-        if (cudaMemcpyAsync(tok, tk.data(), (size_t) nb * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+        if (cudaMemcpyAsync(tok, tk, (size_t) nb * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
             err = "prefill: the draft tokens' upload failed";
             return false;
         }
@@ -864,6 +911,17 @@ bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, b
     return true;
 }
 
+bool Prefill::stager_max_jobs(const core::ModelGeometry& g, const AllocationConfig& c, int64_t& max_jobs) {
+    max_jobs = 0;
+    const int64_t end = c.layer_end < 0 ? g.n_layers : c.layer_end;
+    if (g.n_expert < 1 || c.layer_begin < 0 || end <= c.layer_begin || end > g.n_layers) return false;
+    // The stager claim word packs the job count into 16 bits (Stager::head/claim): the bound must be encodable,
+    // never clamped.  The quotient check also rules out any product overflow.
+    if ((uint64_t) (end - c.layer_begin) > (uint64_t) 0xffff / (uint64_t) g.n_expert) return false;
+    max_jobs = (int64_t) (end - c.layer_begin) * g.n_expert;
+    return true;
+}
+
 bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationConfig& c,
                                 const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err) {
     out = {};
@@ -898,7 +956,7 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
     Impl m;
     m.g = &g; m.allocation = c; m.max_blob = blob;
     const MmqPlan mp = mmq_plan(experts, c.mmq);
-    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback; m.mmq_layer = mp.layer;
+    m.mmq_any = mp.any; m.mmq_fallback = mp.fallback;
     m.mmq_gu_max = mp.gu_max; m.mmq_d_max = mp.d_max;
     if (!mmq::workspace_bytes(c.device_cc, c.device_sms, c.device_shared_bytes, m.mmq_workspace_bytes)) {
         err = "prefill: invalid MMQ device configuration"; return false;
@@ -916,16 +974,44 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
     if (o.used > max - own.used) {
         err = "prefill: allocation total overflow"; return false;
     }
+    // Dynamic host payload: the counted fixed storage init allocates, priced from the same pure bound
+    // (stager_max_jobs) init sizes it with.  The stream plan is resident in both modes, so the row never
+    // depends on the device ring and a relayout's routed/stream transition stays inside the init bound.
+    // Checked adds; the row is assigned only on success.  Allocator block headers around these owned
+    // arrays have no portable bound and stay in the caller's unknown class.
+    int64_t max_jobs = 0;
+    if (!stager_max_jobs(g, c, max_jobs)) {
+        err = "prefill: the stager's job bound exceeds the claim word's range"; return false;
+    }
+    uint64_t dyn = 0;
+    bool dyn_ok = true;
+    const auto add_dyn = [&](uint64_t n, uint64_t elem) {
+        if (!dyn_ok) return;
+        if (n > (max - dyn) / elem) { dyn_ok = false; return; }
+        dyn += n * elem;
+    };
+    add_dyn((uint64_t) max_jobs, sizeof(Stager::Job));                // the stager's fixed job list
+    add_dyn(2 * (uint64_t) max_jobs, sizeof(std::atomic<int>));       // its ready flags
+    add_dyn(2 * (uint64_t) c.stager_ring, sizeof(void*));             // ring slot pointers + DMA event handles
+    add_dyn((uint64_t) c.stager_ring, sizeof(std::vector<uint8_t>));  // the fallback slot containers
+    add_dyn((uint64_t) g.n_layers + 1, sizeof(size_t));               // the stream plan's layer offsets
+    add_dyn((uint64_t) max_jobs, sizeof(StreamEntry));                // the stream plan (resident in both modes)
+    add_dyn(2 * (uint64_t) g.n_expert, sizeof(int32_t));              // MoE grouping: order/fill
+    add_dyn(2 * (uint64_t) g.n_expert, sizeof(int));                  // MoE grouping: stage_of/job_of
+    add_dyn((uint64_t) g.n_layers, sizeof(char));                     // the per-layer MMQ table
+    add_dyn((uint64_t) c.chunk, sizeof(int32_t));                     // the draft layer's token staging
+    if (c.kv_mode == 1) add_dyn((uint64_t) c.n_pages, sizeof(int32_t));  // the init identity page table
+    if (!dyn_ok) { err = "prefill: dynamic host payload arithmetic overflow"; return false; }
     out.loanable_device = o.used;
     out.owned_device = own.used;
     out.standalone_device = o.used + out.owned_device;
     out.mmq_workspace = m.mmq_workspace_bytes;
     // Fixed explicit payload only. The mapped bounds tail is allocated independently of MMQ;
     // bounds_host is sized to its maximum during init before any per-layer resize can grow it.
-    // Stager jobs/ready capacities and transient vectors remain in the caller's unknown runtime class.
     out.host_payload = (uint64_t) c.chunk * 4 + ((uint64_t) 2 * g.n_expert + 1) * 4 +
                        (uint64_t) c.stager_ring + (uint64_t) mmq_bounds_int32(g.n_expert) * 4;
     if (mp.any) out.host_payload += (uint64_t) mmq_bounds_int32(g.n_expert) * 4;
+    out.host_dynamic = dyn;
     return true;
 }
 
@@ -1160,38 +1246,42 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
-        std::vector<StreamEntry> seq;
-        std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
         if (stream_all) {
-            seq_start.assign((size_t) g.n_layers + 1, 0);
-            std::vector<Stager::Job> js;
+            // This chunk's stream plan, refilled in place: the previous chunk's stager list is finished
+            // (chunk_stager_done ran at that chunk's end) and its issuer thread joined, so no worker or issuer
+            // can still be reading an entry this overwrite replaces.
+            m.stager->begin_jobs();
+            m.seq_len = 0;
+            for (int64_t l = 0; l <= g.n_layers; ++l) m.seq_offsets[(size_t) l] = 0;
             for (int64_t l = LB; l < LE; ++l) {
-                seq_start[(size_t) l] = seq.size();
+                m.seq_offsets[(size_t) l] = m.seq_len;
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     const uint8_t* b = m.src->blob(l, e);
                     if (!b) { err = "prefill: expert source has no blob"; return false; }
                     int job = -1;
                     if (!m.src->pinned(l, e)) {
-                        job = (int) js.size();
-                        js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                        job = m.stager->push_job({b, (size_t) lay0.blob_bytes(l)});
+                        if (job < 0) { err = "prefill: the stager's fixed job bound is exceeded"; return false; }
                     }
-                    seq.push_back({(int32_t) l, e, b, job});
+                    if ((size_t) m.seq_len >= m.dyn_jobs) {
+                        err = "prefill: the fixed stream-plan bound is exceeded"; return false;
+                    }
+                    m.seq_plan[m.seq_len++] = {(int32_t) l, e, b, job};
                 }
             }
-            for (int64_t l = LE; l <= g.n_layers; ++l) seq_start[(size_t) l] = seq.size();
-            m.stager->start(std::move(js));
+            for (int64_t l = LE; l <= g.n_layers; ++l) m.seq_offsets[(size_t) l] = m.seq_len;
+            m.stager->start();
         }
         struct StagerDone {
             Stager* st;
             ~StagerDone() { if (st) st->finish(); }
         } chunk_stager_done{stream_all ? m.stager.get() : nullptr};
         auto issue_until = [&](size_t limit) {
-            limit = std::min(limit, seq.size());
+            limit = std::min(limit, m.seq_len);
             while (issued < limit) {
-                const StreamEntry& en = seq[issued];
+                const StreamEntry& en = m.seq_plan[issued];
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
@@ -1233,12 +1323,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (threaded_issue) {
             issuer = std::thread([&] {
                 const core::OnDevice od(m.device);
-                for (size_t idx = 0; idx < seq.size(); ++idx) {
+                for (size_t idx = 0; idx < m.seq_len; ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
-                    const StreamEntry& en = seq[idx];
+                    const StreamEntry& en = m.seq_plan[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
@@ -1602,10 +1692,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     m.off[0] = 0;
                     for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
-                    std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                    // the grouping arrays are refilled in place: this layer's host section runs after the previous
+                    // layer's kernels that read them (the sync above), and nothing else reads them across layers
+                    for (int32_t e = 0; e < m.g->n_expert; ++e) m.grp_fill[(size_t) e] = m.off[(size_t) e];
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = ids_h[(size_t) i];
-                        const int32_t p = fill[(size_t) e]++;
+                        const int32_t p = m.grp_fill[(size_t) e]++;
                         slot_h[(size_t) i] = p;
                         src_h[(size_t) p] = (int32_t) (i / K);
                     }
@@ -1617,8 +1709,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     }
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
-                    std::vector<int32_t> order;
-                    for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
+                    size_t order_len = 0;
+                    for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) m.grp_order[order_len++] = e;
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     const bool use_mmq = m.mmq_any && m.mmq_layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
@@ -1631,9 +1723,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
                         // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                         // reads the group's own quantized H)
-                        const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
+                        const size_t n = order_len, ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
                         m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
-                        for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
+                        for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) m.grp_order[j]];
                         m.bounds_host[n] = (int32_t) (T * K);
                         for (size_t g = 0; g < ng; ++g)
                             for (size_t i = 0; i <= MMQ_GROUP; ++i)
@@ -1652,25 +1744,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
-                    std::vector<int> stage_of(order.size(), -1);
+                    for (size_t j = 0; j < order_len; ++j) { m.grp_stage_of[j] = -1; m.grp_job_of[j] = -1; }
                     // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
-                    std::vector<int> job_of(order.size(), -1);
                     if (!stream_all) {
-                        std::vector<Stager::Job> js;
-                        for (size_t j = 0; j < order.size(); ++j) {
-                            const int32_t e = order[j];
+                        m.stager->begin_jobs();
+                        for (size_t j = 0; j < order_len; ++j) {
+                            const int32_t e = m.grp_order[j];
                             if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                             if (m.src->pinned(l, e)) continue;
                             const uint8_t* b = m.src->blob(l, e);
                             if (!b) { err = "prefill: expert source has no blob"; return false; }
-                            job_of[j] = (int) js.size();
-                            js.push_back({b, (size_t) lay.blob_bytes(l)});
+                            const int job = m.stager->push_job({b, (size_t) lay.blob_bytes(l)});
+                            if (job < 0) { err = "prefill: the stager's fixed job bound is exceeded"; return false; }
+                            m.grp_job_of[j] = job;
                         }
-                        m.stager->start(std::move(js));
+                        m.stager->start();
                     }
                     StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                     auto stage_one = [&](size_t j) -> bool {
-                        const int32_t e = order[j];
+                        const int32_t e = m.grp_order[j];
                         const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                         if (resident) return true;
                         const int sl = stage_next;
@@ -1685,14 +1777,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ++stats_.experts_dma;
                         } else {
                             // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
-                            const uint8_t* hb = m.stager->wait(job_of[j]);
+                            const uint8_t* hb = m.stager->wait(m.grp_job_of[j]);
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                            m.stager->issued_one(job_of[j], m.copy);
+                            m.stager->issued_one(m.grp_job_of[j], m.copy);
                         }
                         cudaEventRecord(m.copied[sl], m.copy);
                         m.stage_live[sl] = true;
-                        stage_of[j] = sl;
+                        m.grp_stage_of[j] = sl;
                         stats_.ms_experts_host += ms_since(th);
                         ++stats_.experts_streamed;
                         return true;
@@ -1700,7 +1792,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
-                        const int32_t e = order[j];
+                        const int32_t e = m.grp_order[j];
                         pt.mark(kPfDequant, cs);
                         if (use_mmq) {
                             // gather the expert into its group slot (GGUF blocks, unchanged or converted)
@@ -1713,13 +1805,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                             }
                             if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
-                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                            if (q + 1 < MMQ_GROUP && j + 1 < order_len) return true;
                             // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order_len;
                             const int ngx = (int) (q + 1);
                             const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                             int64_t maxr = 0;
-                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) m.grp_order[i]]);
                             pt.mark(kPfGemmGU, cs);
                             // the zeroed tail after the group's last expert (see MMQ_TAIL)
                             cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
@@ -1762,37 +1854,37 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!stream_all) {
                         size_t staged = 0;
                         const size_t lookahead = STAGE - 1;
-                        for (size_t j = 0; j < order.size(); ++j) {
-                            while (staged < order.size() && staged <= j + lookahead) {
+                        for (size_t j = 0; j < order_len; ++j) {
+                            while (staged < order_len && staged <= j + lookahead) {
                                 if (!stage_one(staged)) return false;
                                 ++staged;
                             }
-                            const int32_t e = order[j];
-                            if (stage_of[j] < 0) {
+                            const int32_t e = m.grp_order[j];
+                            if (m.grp_stage_of[j] < 0) {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                             } else {
                                 pt.mark(kPfWaitCopy, cs);
-                                cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
-                                if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
+                                cudaStreamWaitEvent(m.cs, m.copied[m.grp_stage_of[j]], 0);
+                                if (!compute(j, m.stage_dev[m.grp_stage_of[j]], m.grp_stage_of[j])) return false;
                             }
                         }
                     } else {
                         // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
                         // pick only gives its slot back
-                        size_t k = seq_start[(size_t) l];
-                        const size_t kend = seq_start[(size_t) l + 1];
+                        size_t k = m.seq_offsets[(size_t) l];
+                        const size_t kend = m.seq_offsets[(size_t) l + 1];
                         auto release_to = [&](int32_t e_stop) {
-                            while (k < kend && seq[k].e < e_stop) {
+                            while (k < kend && m.seq_plan[k].e < e_stop) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
                                 give_back(consumed);
                             }
                         };
-                        for (size_t j = 0; j < order.size(); ++j) {
-                            const int32_t e = order[j];
+                        for (size_t j = 0; j < order_len; ++j) {
+                            const int32_t e = m.grp_order[j];
                             release_to(e);
-                            if (k < kend && seq[k].e == e) {
+                            if (k < kend && m.seq_plan[k].e == e) {
                                 const int sl = (int) (k % (size_t) m.ring);
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_issued(k);
@@ -1826,7 +1918,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             reported = stats_.chunks;
                             std::fprintf(stderr, "strata dbg: layer %lld (mmq %d, types %d/%d, %zu experts): non-finite GU %lld "
                                          "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
-                                         order.size(), (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
+                                         order_len, (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
                                          (long long) T);
                         }
                     }

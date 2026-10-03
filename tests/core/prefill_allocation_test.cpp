@@ -125,9 +125,42 @@ int main() {
     c.kv_q4 = false;
     c.kv_mode = 0;
 
+    // ---- DYNAMIC HOST PAYLOAD (host_dynamic): the counted fixed storage init allocates once and the path
+    // refills in place.  Pinned by properties - what moves the row and what must not - never by
+    // transcribing the term list.
+    const uint64_t dyn0 = b.host_dynamic;
+    check(dyn0 > 0, "routed staging still carries counted dynamic host storage");
+    c.ring = 512;   // Estimator ring independence; this does not exercise runtime stream_all.
+    check(estimate(other) && other.host_dynamic == dyn0,
+          "the device ring choice moves no dynamic host storage");
+    check(other.host_payload == b.host_payload, "fixed host payload stays ring-independent");
+    c.ring = 8;
+    c.kv_mode = 0;
+    c.layer_begin = g.n_layers / 2;   // a narrower stage window shrinks the shared job/plan bound
+    check(estimate(other) && other.host_dynamic < dyn0,
+          "a narrower stage window shrinks the dynamic row");
+    c.layer_begin = 0;
+    c.chunk = 8192;   // the bound grows with the chunk, and a relayout to smaller never exceeds it
+    check(estimate(other) && other.host_dynamic > dyn0,
+          "the dynamic row grows with the chunk's draft staging bound");
+    c.chunk = 64;
+    check(estimate(other) && other.host_dynamic == dyn0, "restoring the configuration restores the row");
+
+    // The shared job bound: one pure value sizes init's storage and prices this row, and the stager's
+    // 16-bit claim word must be able to encode everything valid geometry can produce.
+    int64_t jobs = -1;
+    {
+        core::ModelGeometry wide = g;
+        wide.n_expert = 0x10000;
+        int64_t refused = -1;
+        check(!prefill::Prefill::stager_max_jobs(wide, c, refused) && refused == 0,
+              "the job bound refuses, never clamps, past the claim word's range");
+    }
+
     // ---- overflow and invalid configuration refuse, and leave the output zeroed (fail closed).
     c.chunk = std::numeric_limits<int64_t>::max();
-    check(!estimate(other) && other.standalone_device == 0, "chunk overflow fails closed");
+    check(!estimate(other) && other.standalone_device == 0 && other.host_dynamic == 0,
+          "chunk overflow fails closed");
     c.chunk = 64;
     experts.max_blob = std::numeric_limits<uint64_t>::max() - 511;
     check(!estimate(other) && other.standalone_device == 0, "ring accumulation overflow fails closed");

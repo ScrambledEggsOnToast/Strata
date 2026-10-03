@@ -62,13 +62,33 @@ struct AllocationBytes {
     uint64_t standalone_device = 0;///< loanable_device + owned_device; valid even when no cache slots can be lent.
     uint64_t mmq_workspace = 0;    ///< Included in loanable_device; configuration-derived maximum, not a heuristic.
     /// Fixed explicit host payload, excluding separately priced stager blob slots, PLE staging pairs,
-    /// routing table heads, step logs and split hand-offs. Opaque driver storage, thread stacks,
-    /// dynamic stager jobs/ready capacities and transient vectors require a separate unknown class.
+    /// routing table heads, step logs and split hand-offs. Opaque driver storage and thread stacks remain
+    /// a separate unknown class; the counted dynamic host storage is host_dynamic below.
     /// Counts token staging chunk*4; routing counts (2*n_expert+1)*4; stager_ring pinned flags;
     /// the mapped bounds tail (n_expert+1+ceil(n_expert/16)*17)*4 even without MMQ, because init
     /// reserves it regardless; and the same-sized bounds staging payload when any layer runs MMQ.
     /// bounds_host is initially sized to its maximum so per-layer resizing cannot grow capacity.
     uint64_t host_payload = 0;
+    /// The dynamic host payload's counted fixed storage, charged at the geometry bound each buffer is
+    /// allocated to, once, at init (from stager_max_jobs and the config), and never grown:
+    /// - the stager's job list (the stage's layers * n_expert entries) and its ready flags (twice that),
+    ///   refilled in place per chunk or layer and published only after finish() released the previous
+    ///   list, so a late worker can never read an overwritten job;
+    /// - the stager ring's slot-pointer and DMA-event-handle arrays and its fallback slot containers
+    ///   (stager_ring entries each);
+    /// - the whole-chunk stream plan (one entry per streamed expert-layer pair) and its layer offsets,
+    ///   resident in both modes, so a relayout's routed/stream transition stays inside this bound;
+    /// - the MoE grouping arrays (order/fill and the ring-slot/job indices, n_expert entries each),
+    ///   refilled in place per layer;
+    /// - the draft layer's token staging (the init chunk's tokens; exact per call, never beyond this);
+    /// - the KV-streaming init identity page table (n_pages entries, only when kv_mode == 1).
+    /// Every count is enforced - the fillers refuse by name at the bound - and every buffer holds exactly
+    /// count * sizeof(T) for trivially destructible element types; sizes come from sizeof, never hard-coded
+    /// ABI numbers.  NOT included, because nothing documents their sizes (the caller's unknown class):
+    /// host allocator block headers or any other heap/driver metadata around these owned arrays,
+    /// cudaEvent_t driver objects, resident thread stacks, and the container-managed init-lifetime
+    /// device-pointer list, thread-handle container and pinned-flag vector.
+    uint64_t host_dynamic = 0;
 };
 
 class Prefill {
@@ -105,6 +125,12 @@ public:
     /// Snapshot the same runtime switches used by init. Queries device properties, but allocates no device memory.
     static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
                                   AllocationConfig& out, std::string& err);
+    /// The dynamic stager's fixed job bound for a stage: the stage's layer range times n_expert - the most
+    /// expert-layer pairs a chunk's plan or job list can hold - checked against the claim word's 16-bit job
+    /// field (refuse, never clamp; this also rules out any product overflow).  init sizes the counted stager
+    /// and stream-plan storage from this, and allocation_needed prices host_dynamic from the same value.
+    /// false (with max_jobs = 0): the stage range or the expert count is outside the encodable range.
+    static bool stager_max_jobs(const core::ModelGeometry& g, const AllocationConfig& c, int64_t& max_jobs);
     /// Pure checked arithmetic; no SessionState, CUDA allocation, global artifact layout, or cache dependency.
     /// No loan is deducted: callers may subtract loanable_device ONLY after guaranteeing that region is lent.
     /// Includes explicit CUDA allocations, not opaque driver/cuBLAS handle internals (price those separately).
