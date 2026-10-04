@@ -563,6 +563,10 @@ inline std::string admission_json(const AdmissionDecision& d, const std::vector<
           << indent << "      \"has_ceiling\": " << (line.has_ceiling ? "true" : "false") << ",\n"
           << indent << "      \"ceiling_bytes\": " << line.ceiling_bytes << ",\n"
           << indent << "      \"ceiling_gib\": " << num2(gib(line.ceiling_bytes)) << ",\n"
+          // the ceiling the telemetry was taken under: a fixed MPS client budget or plain
+          // device free memory. Emitted so the document and the Python mirror agree.
+          << indent << "      \"cap_declared\": " << (line.cap_declared ? "true" : "false") << ",\n"
+          << indent << "      \"enforced_cap_bytes\": " << line.enforced_cap_bytes << ",\n"
           << indent << "      \"demand_bytes\": " << line.demand_bytes << ",\n"
           << indent << "      \"demand_gib\": " << num2(gib(line.demand_bytes)) << ",\n"
           << indent << "      \"headroom_bytes\": " << line.headroom_bytes << ",\n"

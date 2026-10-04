@@ -283,6 +283,14 @@ struct Options {
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
+    /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
+    /// the finite allowances the operator commits for the two classes that have no size API.
+    /// All three are explicit and must agree with each other and with the verified
+    /// declaration; any one alone refuses, so a configuration is never admitted on an
+    /// allowance that no ceiling enforces.
+    uint64_t mps_cap_bytes = 0;                     // --mps-cap-bytes
+    uint64_t graph_capture_allowance_bytes = 0;     // --graph-capture-allowance-bytes
+    uint64_t prefill_library_allowance_bytes = 0;   // --prefill-library-allowance-bytes
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
@@ -580,6 +588,15 @@ void usage() {
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.\n"
                  "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
+                 "  --mps-cap-bytes N    issue #60: the enforced MPS client ceiling this run is launched under;\n"
+                 "                       must match the verified declaration in this process's environment\n"
+                 "  --graph-capture-allowance-bytes N     issue #60: finite allowance committed for the CUDA\n"
+                 "                       graph executables and capture transients, instead of refusing them as\n"
+                 "                       unknown; needs --mps-cap-bytes and is bounded by the ceiling, not by\n"
+                 "                       this number\n"
+                 "  --prefill-library-allowance-bytes N   issue #60: the same commitment for the opaque\n"
+                 "                       CUDA/cuBLAS handle and first-use storage beside the explicit prefill\n"
+                 "                       allocator bytes\n"
                  "                       every device (default: --vram-reserve-mib).  The gate refuses before\n"
                  "                       the first allocation when one device's own share will not close even\n"
                  "                       if the aggregate would, when the guest/host envelope does not close,\n"
@@ -1096,6 +1113,23 @@ int main(int argc, char** argv) {
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+        // A byte-count flag must parse in full: an unparsable value is a typo, and treating
+        // it as "absent" would silently drop the commitment it was meant to carry.
+        auto bytes_flag = [&](const char* value, const char* what) -> uint64_t {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (end == value || (end != nullptr && *end != '\0')) {
+                std::fprintf(stderr, "%s needs a byte count, got '%s'\n", what, value);
+                std::exit(2);
+            }
+            // The planner refuses above this too, so a value that would overflow here cannot be
+            // accepted by one side and rejected by the other.
+            if (parsed > (1ull << 48)) {
+                std::fprintf(stderr, "%s is out of range: %s\n", what, value);
+                std::exit(2);
+            }
+            return (uint64_t) parsed;
+        };
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
@@ -1179,6 +1213,9 @@ int main(int argc, char** argv) {
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
+        else if (a == "--mps-cap-bytes") o.mps_cap_bytes = bytes_flag(next("--mps-cap-bytes"), "--mps-cap-bytes");
+        else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
+        else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
         else if (a == "--stage-timing") o.stage_timing = true;
@@ -1369,6 +1406,28 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: MPS client ceiling declared: device %d, %llu B, pipe %s\n",
                          mps_ceiling.device, (unsigned long long) mps_ceiling.cap_bytes,
                          mps_ceiling.pipe_directory.c_str());
+    }
+    // Issue #60: an operator-committed allowance for an opaque class is only admissible
+    // inside a ceiling that is actually enforced, and the ceiling the operator planned
+    // against must be the one this process was launched with. Partial commitments refuse.
+    const bool any_allowance = o.graph_capture_allowance_bytes != 0 || o.prefill_library_allowance_bytes != 0;
+    if (any_allowance || o.mps_cap_bytes != 0) {
+        if (o.mps_cap_bytes == 0) {
+            std::fprintf(stderr, "strata generate: an opaque-class allowance needs --mps-cap-bytes: the "
+                                 "allowance is only meaningful inside an enforced ceiling\n");
+            return 2;
+        }
+        if (!mps_ceiling.declared) {
+            std::fprintf(stderr, "strata generate: --mps-cap-bytes %llu was given but no MPS ceiling is declared "
+                                 "in this process's environment; the ceiling must be enforced at creation\n",
+                         (unsigned long long) o.mps_cap_bytes);
+            return 2;
+        }
+        if (o.mps_cap_bytes != mps_ceiling.cap_bytes) {
+            std::fprintf(stderr, "strata generate: --mps-cap-bytes %llu does not match the verified declaration %llu\n",
+                         (unsigned long long) o.mps_cap_bytes, (unsigned long long) mps_ceiling.cap_bytes);
+            return 2;
+        }
     }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
@@ -2131,8 +2190,14 @@ int main(int argc, char** argv) {
         v0.add("embedding_row", byte_mul((uint64_t) g.n_embd, sizeof(float)), "cudaMalloc d_emb FP32 row");
         v0.add("sampler_output", sizeof(int), "cudaMalloc d_next");
         const bool graph_capable = (!o.no_capture && !native_pack) || native_pack || o.spec > 0 || !o.mtp.empty();
-        if (graph_capable)
-            v0.add_unknown("graph_capture_storage", "retained session/token/verifier/MTP CUDA graph executables and capture transients lack a measured conservative bound");
+        if (graph_capable) {
+            if (o.graph_capture_allowance_bytes != 0)
+                v0.add("graph_capture_storage", o.graph_capture_allowance_bytes,
+                       "operator-committed finite allowance inside the enforced MPS client ceiling; the allocation "
+                       "boundary, not this number, is what stops an overrun");
+            else
+                v0.add_unknown("graph_capture_storage", "retained session/token/verifier/MTP CUDA graph executables and capture transients lack a measured conservative bound");
+        }
         const bool residency_table = (admission_auto_cache || o.expert_cache > 0) &&
             !o.expert_profile.empty() && !o.no_pool && !o.no_capture && !o.no_token_graph &&
             o.dump_layers.empty() && o.dump_halves.empty();
@@ -2145,8 +2210,13 @@ int main(int argc, char** argv) {
         if (admission_prefill) {
             v0.add("prefill_buffers", admitted_prefill.standalone_device,
                    "Prefill::allocation_needed: exact owned plus loanable allocation sequence; no unproven cache loan deducted");
-            v0.add_unknown("prefill_library_storage",
-                   "opaque CUDA/cuBLAS handle and first-use storage is separate from explicit prefill allocator bytes and remains unqualified");
+            if (o.prefill_library_allowance_bytes != 0)
+                v0.add("prefill_library_storage", o.prefill_library_allowance_bytes,
+                       "operator-committed finite allowance inside the enforced MPS client ceiling; the allocation "
+                       "boundary, not this number, is what stops an overrun");
+            else
+                v0.add_unknown("prefill_library_storage",
+                       "opaque CUDA/cuBLAS handle and first-use storage is separate from explicit prefill allocator bytes and remains unqualified");
         }
         if (o.spec > 0)
             v0.add("verify_windows", (uint64_t) kWindowMib << 20,
@@ -2202,7 +2272,11 @@ int main(int argc, char** argv) {
                 }
                 ds.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
                 if (graph_capable)
-                    ds.vram.add_unknown("graph_capture_storage", "split verifier/session graph capture storage not qualified");
+                    if (o.graph_capture_allowance_bytes != 0)
+                        ds.vram.add("graph_capture_storage", o.graph_capture_allowance_bytes,
+                                    "operator-committed finite allowance inside the enforced MPS client ceiling");
+                    else
+                        ds.vram.add_unknown("graph_capture_storage", "split verifier/session graph capture storage not qualified");
                 if (admission_prefill) {
                     ds.vram.add_unknown("prefill_allocator_bound", "split-device preallocation configuration requires each device's MMQ hardware inputs");
                 }
@@ -2624,6 +2698,11 @@ int main(int argc, char** argv) {
         }
         // One line on stdout either way: the harness's predicted-vs-observed hook (the observed half is
         // the INFO line's vram_free_mib and the run's peak telemetry).
+        if (o.mps_cap_bytes != 0)
+            std::printf("PLAN mps_cap_bytes=%llu graph_capture_allowance_bytes=%llu prefill_library_allowance_bytes=%llu\n",
+                        (unsigned long long) o.mps_cap_bytes,
+                        (unsigned long long) o.graph_capture_allowance_bytes,
+                        (unsigned long long) o.prefill_library_allowance_bytes);
         std::printf("PLAN admit=%d variant=%s devices=%zu", admission.admitted ? 1 : 0,
                     admission.variant.c_str(), admission.devices.size());
         for (size_t i = 0; i < admission.devices.size(); ++i) {

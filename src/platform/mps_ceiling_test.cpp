@@ -28,8 +28,14 @@ void check(bool condition, const char* what) {
 }
 
 void set_value(const char* name, const char* value) {
+    // POSIX setenv/unsetenv are not available on MSVC, so the Windows build uses _putenv_s
+    // (an empty value removes the variable) rather than not compiling at all.
+#if defined(_WIN32)
+    _putenv_s(name, value == nullptr ? "" : value);
+#else
     if (value == nullptr) unsetenv(name);
     else setenv(name, value, 1);
+#endif
 }
 
 void test_parse() {
