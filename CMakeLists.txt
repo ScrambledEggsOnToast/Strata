@@ -153,6 +153,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # the declared-MPS-ceiling contract: pure parse plus a stat, so it needs no GPU and no model
+  add_executable(mps_ceiling_test src/platform/mps_ceiling_test.cpp src/platform/mps_ceiling.cpp)
+  target_include_directories(mps_ceiling_test PRIVATE include)
+  add_test(NAME mps_ceiling_test COMMAND mps_ceiling_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -170,7 +174,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/platform/mps_ceiling.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the

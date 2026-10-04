@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/device.hpp"
+#include "strata/platform/mps_ceiling.hpp"
 #include "strata/plan/admission.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -1350,6 +1351,25 @@ int main(int argc, char** argv) {
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  Across
     // GPUs, not yet: KV streaming, images, control vectors, the helper caches (--expert-cache-remote), and lending
     // cache slots to the prompt path (each stage's prompt path has its own buffers).
+    // A declared MPS client ceiling is verified BEFORE the first CUDA call. The
+    // supervisor fixes the ceiling in this process's own creation environment, so it
+    // cannot be raised here; what can go wrong is that nothing enforced it. See
+    // include/strata/platform/mps_ceiling.hpp: a client that carries the variable with
+    // no daemon running silently sees the whole device instead of its budget, and every
+    // admission decision below would then be made against the wrong number.
+    strata::platform::MpsCeiling mps_ceiling;
+    {
+        std::string ceiling_error;
+        if (!strata::platform::mps_ceiling_from_environment(mps_ceiling, ceiling_error) ||
+            !strata::platform::mps_ceiling_pipe_identity(mps_ceiling, ceiling_error)) {
+            std::fprintf(stderr, "strata generate: %s\n", ceiling_error.c_str());
+            return 2;
+        }
+        if (mps_ceiling.declared)
+            std::fprintf(stderr, "strata generate: MPS client ceiling declared: device %d, %llu B, pipe %s\n",
+                         mps_ceiling.device, (unsigned long long) mps_ceiling.cap_bytes,
+                         mps_ceiling.pipe_directory.c_str());
+    }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
@@ -2209,6 +2229,7 @@ int main(int argc, char** argv) {
 
         // Telemetry.  Device 0 always; stage/first-remote devices in the configurations that create
         // their contexts anyway.  Missing measurement refuses: unknown telemetry is not zero.
+        bool ceiling_failure = false;
         int visible = 1;
         if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 1) visible = 1;
         cudaGetLastError();
@@ -2221,12 +2242,25 @@ int main(int argc, char** argv) {
                 if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
                     t.measured = true;
                     t.total_bytes = total_b;
+                    // Inside an MPS client this is the remaining CLIENT BUDGET, not device
+                    // free memory; the ceiling check below is what tells the two apart.
                     t.free_bytes = free_b;
+                    if (mps_ceiling.declared) {
+                        std::string ceiling_error;
+                        if (!strata::platform::mps_ceiling_holds(free_b, mps_ceiling.cap_bytes,
+                                                                 ceiling_error)) {
+                            std::fprintf(stderr, "strata generate: %s\n", ceiling_error.c_str());
+                            ceiling_failure = true;
+                        }
+                        t.cap_declared = true;
+                        t.enforced_cap_bytes = mps_ceiling.cap_bytes;
+                    }
                 }
             }
             tels.push_back(t);
         };
         measure("CUDA0", 0);
+        if (ceiling_failure) return 2;   // declared but not enforced: refuse rather than plan against it
         if (split_real)
             for (int d : split_devs) measure("CUDA" + std::to_string(d), d);
         if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) measure("CUDA1", 1);

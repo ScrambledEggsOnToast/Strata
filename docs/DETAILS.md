@@ -397,6 +397,25 @@ for an overfull context. `--admission-headroom-mib` sets explicit device headroo
 hypothetical future capacities that are reported but never admitted - as the document
 `schemas/memory-plan.schema.json` describes.
 
+### A declared MPS client ceiling
+
+When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes that client's total
+device budget at creation (`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`) and names the control pipe
+(`CUDA_MPS_PIPE_DIRECTORY`). `src/platform/mps_ceiling.cpp` reads that pair **before the first CUDA
+call** and refuses the run when the pair is incomplete, when the pipe is missing, unreachable, not a
+directory or not owned by this user or root, or when the limit is unreadable. Nothing is guessed at:
+both variables absent means no ceiling was declared and no behaviour changes.
+
+Inside an MPS client `cudaMemGetInfo` reports the remaining *client budget*, not device free memory, so
+the first measurement also requires the reported free bytes to be at or below the declared ceiling. A
+client that carries the variable with nothing enforcing it - no daemon, or a daemon it never attached to
+- silently sees the whole device instead; that case is refused by name rather than planned against, and
+it is the failure mode the isolated qualification measured (`evidence/HET-017/clientcap-qualification.json`
+in the project repository). The device line's ceiling is therefore the tighter of the driver total and
+the client budget, which is also what bounds `--expert-cache auto`: a 1 GiB client budget grants zero
+cache slots instead of silently over-committing, and the plan reports both the ceiling and
+`enforced_cap_bytes`.
+
 `--windowed-experts --adapt-swaps 0` selects a fixed one-layer direct-I/O source ring for
 canonical/native `experts.bin` or native GGUF planes. No buffered fallback is used. Raw expert
 pointers expire at every explicit layer boundary or first fetch for a different layer; supported

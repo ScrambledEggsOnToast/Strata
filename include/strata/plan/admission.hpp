@@ -106,6 +106,14 @@ struct DeviceTelemetry {
     bool measured = false;
     uint64_t total_bytes = 0;   // driver-visible total
     uint64_t free_bytes = 0;    // driver-visible free before planned allocations; zero admits no bytes
+    /// When a protected supervisor launched this process inside an MPS client, the client's
+    /// total device budget is fixed at creation and `free_bytes` above is that budget's
+    /// RESIDUAL, not device free memory (qualified in
+    /// evidence/HET-017/clientcap-qualification.json). The ceiling below is then the smaller
+    /// of the driver total and this cap, so a plan can never be built on an allowance the
+    /// client does not have.
+    bool cap_declared = false;
+    uint64_t enforced_cap_bytes = 0;
 };
 
 /// Budget policy.  The reserves carry the docs/02 design defaults; an operator may RAISE them through the
@@ -139,6 +147,8 @@ struct DeviceLine {
     std::string name;
     bool hypothetical = false;
     uint64_t ceiling_bytes = 0;    // measured driver-visible total (0 for hypothetical)
+    bool cap_declared = false;     // an MPS client ceiling was in force for this device
+    uint64_t enforced_cap_bytes = 0;
     uint64_t demand_bytes = 0;     // known classes summed
     uint64_t headroom_bytes = 0;
     uint64_t slack_bytes = 0;      // ceiling - demand - headroom (saturating)
@@ -258,6 +268,12 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
                 if (d.limiting_term.empty()) d.limiting_term = "telemetry:" + dev.name;
             } else {
                 line.has_ceiling = true;
+                line.cap_declared = t->cap_declared;
+                line.enforced_cap_bytes = t->enforced_cap_bytes;
+                // With a declared MPS ceiling, `free_bytes` is the client's remaining budget:
+                // taking min(total, free) is still the tightest honest ceiling because the
+                // client may not exceed its budget, and the budget is already below the cap
+                // by whatever the context has charged. Without a ceiling this is unchanged.
                 line.ceiling_bytes = std::min(t->total_bytes, t->free_bytes);
                 line.fits = !dev.vram.overflowed() && line.headroom_bytes <= line.ceiling_bytes &&
                             line.demand_bytes <= line.ceiling_bytes - line.headroom_bytes;
