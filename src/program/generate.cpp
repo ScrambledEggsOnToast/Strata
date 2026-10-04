@@ -291,6 +291,11 @@ struct Options {
     uint64_t mps_cap_bytes = 0;                     // --mps-cap-bytes
     uint64_t graph_capture_allowance_bytes = 0;     // --graph-capture-allowance-bytes
     uint64_t prefill_library_allowance_bytes = 0;   // --prefill-library-allowance-bytes
+    /// Guest-scope counterpart: the finite allowance the operator commits for the prefill run's opaque
+    /// host-side storage (CUDA events/context/registration, thread stacks, allocator metadata). It is
+    /// admissible only inside an enforced worker cgroup ceiling, so it requires the protected
+    /// supervisor's measured worker limit and refuses without it.
+    uint64_t guest_opaque_allowance_bytes = 0;      // --guest-opaque-allowance-bytes
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
@@ -597,6 +602,10 @@ void usage() {
                  "  --prefill-library-allowance-bytes N   issue #60: the same commitment for the opaque\n"
                  "                       CUDA/cuBLAS handle and first-use storage beside the explicit prefill\n"
                  "                       allocator bytes\n"
+                 "  --guest-opaque-allowance-bytes N      issue #60, guest scope: finite allowance for the\n"
+                 "                       prefill run's opaque host-side storage, admissible only inside an\n"
+                 "                       enforced worker cgroup ceiling; the supervisor's measured worker\n"
+                 "                       limit is required and an unmeasured run stays refused\n"
                  "                       every device (default: --vram-reserve-mib).  The gate refuses before\n"
                  "                       the first allocation when one device's own share will not close even\n"
                  "                       if the aggregate would, when the guest/host envelope does not close,\n"
@@ -1216,6 +1225,7 @@ int main(int argc, char** argv) {
         else if (a == "--mps-cap-bytes") o.mps_cap_bytes = bytes_flag(next("--mps-cap-bytes"), "--mps-cap-bytes");
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
+        else if (a == "--guest-opaque-allowance-bytes") o.guest_opaque_allowance_bytes = bytes_flag(next("--guest-opaque-allowance-bytes"), "--guest-opaque-allowance-bytes");
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
         else if (a == "--stage-timing") o.stage_timing = true;
@@ -2544,8 +2554,8 @@ int main(int argc, char** argv) {
                 "Prefill::allocation_needed: token staging, routing counts, mapped/MMQ bounds and pinned flags");
             ram("prefill_host_dynamic", byte_mul(stages, admitted_prefill.host_dynamic),
                 "Prefill::allocation_needed: counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
-            ram_unknown("prefill_runtime_storage",
-                "Opaque CUDA events/context/registration storage, resident thread stacks, allocator metadata, init pointer/thread containers, vector capacity excess and diagnostic transients remain unqualified");
+            // prefill_runtime_storage is added below, once the supervisor's measured worker limit is
+            // known: the operator allowance is only admissible inside an enforced cgroup ceiling.
             if (split_real)
                 ram("stage_handoff", byte_mul(byte_mul(byte_mul(2, chunk), (uint64_t) g.hc),
                     byte_mul(byte_mul((uint64_t) g.n_embd, 4), stages - 1)),
@@ -2594,6 +2604,20 @@ int main(int argc, char** argv) {
         const bool local_measured = strata::core::available_memory_bytes(local_available);
         HostAdmissionSnapshot external;
         const bool external_measured = read_host_admission(external);
+        if (admission_prefill) {
+            if (o.guest_opaque_allowance_bytes != 0 && external_measured && external.worker_limit != 0) {
+                ram("prefill_runtime_storage", o.guest_opaque_allowance_bytes,
+                    "operator-committed finite allowance for the prefill run's opaque host-side storage "
+                    "(CUDA events/context/registration, thread stacks, allocator metadata); the enforced "
+                    "worker cgroup ceiling, not this number, is what bounds the guest");
+            } else {
+                ram_unknown("prefill_runtime_storage",
+                    "Opaque CUDA events/context/registration storage, resident thread stacks, allocator metadata, "
+                    "init pointer/thread containers, vector capacity excess and diagnostic transients remain "
+                    "unqualified (give --guest-opaque-allowance-bytes inside a measured worker cgroup ceiling to "
+                    "bound them)");
+            }
+        }
         if (external_measured) {
             policy.guest_total_bytes = std::min(policy.guest_total_bytes, external.allocation);
             policy.guest_reserve_bytes = std::max(policy.guest_reserve_bytes, external.guest_reserve);
