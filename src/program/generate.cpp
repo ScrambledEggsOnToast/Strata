@@ -187,6 +187,9 @@ int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_p
         struct stat st{};
         if (lstat(parent.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0022))
             return -1;
+        // `parent_path()` of the root is the root, not an empty path, so without this the walk
+        // never ends: the engine spins in userspace before it prints its first admission line.
+        if (parent == parent.root_path()) break;
     }
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return -1;
