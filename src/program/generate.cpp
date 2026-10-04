@@ -162,6 +162,75 @@ bool read_host_admission(HostAdmissionSnapshot& snapshot) {
 #endif
 }
 
+/// An independently measured, identity-verified residency bound for the direct-only expert source.
+///
+/// Like the admission snapshot this is a flat wire record in a root-owned, non-worker-writable
+/// directory under /run/strata-admission, so the process that measured it can be trusted and the
+/// worker cannot author it. It differs in one respect: a traversal measurement is not per-second
+/// telemetry, so freshness cannot be required. It is validated by IDENTITY instead - the expert
+/// file's size, inode, device and mtime must equal the file this process is about to read - which
+/// is what binds the measurement to the bytes whose residency it claims. Nothing here decides that
+/// the measurement is adequate; it decides that the measurement is of these bytes.
+struct SourceResidencyReceipt {
+    uint64_t expert_bytes = 0, expert_inode = 0, expert_device = 0, expert_mtime_ns = 0;
+    uint64_t ring_bytes = 0, guest_pages_bytes = 0, reader_overhead_bytes = 0, host_payload_bytes = 0;
+};
+
+/// 0 = absent (charge the conservative envelope), 1 = accepted, -1 = present but invalid (refused).
+int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_path) {
+#if defined(__linux__)
+    const char* value = std::getenv("STRATA_SOURCE_RECEIPT");
+    if (!value || !*value) return 0;
+    const std::filesystem::path path(value), root("/run/strata-admission");
+    if (path.parent_path().parent_path() != root || path.filename() != "source-receipt") return -1;
+    for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+        struct stat st{};
+        if (lstat(parent.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0022))
+            return -1;
+    }
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    struct stat st{};
+    char buffer[513];
+    const bool protected_file = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
+                                !(st.st_mode & 0222) && st.st_size > 0 && st.st_size <= 512;
+    const ssize_t size = protected_file ? read(fd, buffer, sizeof buffer) : -1;
+    close(fd);
+    if (size <= 0 || size > 512 || size != st.st_size) return -1;
+    const char* cursor = buffer;
+    const char* end = buffer + size;
+    uint64_t fields[9]{};
+    for (auto& field : fields) {
+        while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
+        auto result = std::from_chars(cursor, end, field);
+        if (result.ec != std::errc{} || result.ptr == cursor) return -1;
+        cursor = result.ptr;
+        if (cursor < end && *cursor != ' ' && *cursor != '\n') return -1;
+    }
+    while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
+    if (cursor != end) return -1;
+    if (fields[0] != 1) return -1;
+    // Only the byte counts carry the 2^50 ceiling the snapshot uses: field 4 is a nanosecond
+    // timestamp, which is legitimately larger (about 1.8e18 today) and would otherwise reject
+    // every valid record.
+    for (size_t i = 5; i < 9; ++i) if (fields[i] > (1ull << 50)) return -1;
+    struct stat expert{};
+    if (stat(expert_path.c_str(), &expert) || !S_ISREG(expert.st_mode)) return -1;
+    const uint64_t mtime_ns = (uint64_t) expert.st_mtim.tv_sec * 1000000000ull +
+                              (uint64_t) expert.st_mtim.tv_nsec;
+    if ((uint64_t) expert.st_size != fields[1] || (uint64_t) expert.st_ino != fields[2] ||
+        (uint64_t) expert.st_dev != fields[3] || mtime_ns != fields[4]) return -1;
+    if (fields[5] == 0 || fields[5] > (uint64_t) expert.st_size) return -1;
+    if (fields[6] == 0 || fields[7] == 0) return -1;
+    out = {fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8]};
+    return 1;
+#else
+    (void) out;
+    (void) expert_path;
+    return 0;
+#endif
+}
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -2314,6 +2383,12 @@ int main(int argc, char** argv) {
         // Telemetry.  Device 0 always; stage/first-remote devices in the configurations that create
         // their contexts anyway.  Missing measurement refuses: unknown telemetry is not zero.
         bool ceiling_failure = false;
+        // Set when a verified source receipt priced the direct-only source: the expert-source charge
+        // uses the measured bounds, and the host mirror charges the measured host payload instead of
+        // mirroring the guest figure, because the two caches were measured separately.
+        SourceResidencyReceipt source_receipt;
+        bool source_measured = false;
+        uint64_t measured_source_host_bytes = 0;
         int visible = 1;
         if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 1) visible = 1;
         cudaGetLastError();
@@ -2414,15 +2489,50 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: admission refused: %s\n", err.c_str());
                 return 1;
             }
-            ram("expert_source_ring", ring, "WindowedExpertSource conservative ring bound including aligned read scratch");
             const bool from_gguf = !std::filesystem::exists(o.pack + "/experts.bin") && layout.native;
-            const uint64_t source_envelope = from_gguf
-                ? byte_add(source_pages(layout.total), byte_mul(3ull * (uint64_t) g.n_layers, 2 * source_page))
-                : source_pages(layout.total);
-            ram("file:expert_streaming_pages", source_envelope,
-                "full source-cache envelope retained: guest direct IO does not qualify virtiofs host cache bypass");
-            ram_unknown("expert_source_runtime_storage",
-                "source metadata, reader thread stacks and filesystem/driver storage lack a complete peak bound");
+            // The direct-only source was measured against this exact expert file by the protected
+            // source-residency run. When that measurement is presented in the form this engine can
+            // verify, the measured residency replaces the full envelope in both scopes and the
+            // source's own opaque storage is priced by the same measurement instead of staying
+            // unknown - so nothing is called free, it is charged at what was measured. Without the
+            // receipt the conservative envelope and the unknown stand exactly as before.
+            const int source_state = from_gguf ? 0 : read_source_receipt(source_receipt, o.pack + "/experts.bin");
+            if (source_state < 0) {
+                std::fprintf(stderr, "strata generate: admission refused: STRATA_SOURCE_RECEIPT is present but "
+                                     "does not verify against %s/experts.bin (path, protection, format or "
+                                     "identity)\n", o.pack.c_str());
+                return 1;
+            }
+            if (source_state == 1) {
+                source_measured = true;
+                measured_source_host_bytes = source_receipt.host_payload_bytes;
+                ram("expert_source_ring", source_receipt.ring_bytes,
+                    "measured resident ring of the direct-only traversal (protected identity-verified receipt)");
+                ram("file:expert_streaming_pages", source_receipt.guest_pages_bytes,
+                    "measured guest page-cache growth of the direct-read payload (protected identity-verified "
+                    "receipt); direct I/O was observed not to populate the guest cache");
+                ram("expert_source_runtime_storage", source_receipt.reader_overhead_bytes,
+                    "measured source metadata, reader thread stacks and allocator overhead of the direct-only "
+                    "traversal (protected identity-verified receipt)");
+                std::fprintf(stderr, "strata generate: source receipt accepted: expert %llu B inode %llu ring %llu B "
+                                     "guest pages %llu B reader overhead %llu B host payload %llu B\n",
+                             (unsigned long long) source_receipt.expert_bytes,
+                             (unsigned long long) source_receipt.expert_inode,
+                             (unsigned long long) source_receipt.ring_bytes,
+                             (unsigned long long) source_receipt.guest_pages_bytes,
+                             (unsigned long long) source_receipt.reader_overhead_bytes,
+                             (unsigned long long) source_receipt.host_payload_bytes);
+            } else {
+                ram("expert_source_ring", ring,
+                    "WindowedExpertSource conservative ring bound including aligned read scratch");
+                const uint64_t source_envelope = from_gguf
+                    ? byte_add(source_pages(layout.total), byte_mul(3ull * (uint64_t) g.n_layers, 2 * source_page))
+                    : source_pages(layout.total);
+                ram("file:expert_streaming_pages", source_envelope,
+                    "full source-cache envelope retained: guest direct IO does not qualify virtiofs host cache bypass");
+                ram_unknown("expert_source_runtime_storage",
+                    "source metadata, reader thread stacks and filesystem/driver storage lack a complete peak bound");
+            }
         } else if (o.mmap_experts) {
             ram("file:expert_streaming_pages", source_pages(layout.total),
                 "full FileExpertSource mapping page upper bound; access windows and advisory release do not prove eviction");
@@ -2639,9 +2749,12 @@ int main(int argc, char** argv) {
         }
         for (const auto& c : startup_only.classes) startup.classes.push_back(c);
         strata::plan::Scope startup_host = host;
-        auto mirror_sources = [](const strata::plan::Scope& phase, strata::plan::Scope& physical) {
+        auto mirror_sources = [&](const strata::plan::Scope& phase, strata::plan::Scope& physical) {
             for (const auto& c : phase.classes) {
                 if (c.name.rfind("file:", 0) != 0 && c.name != "ple_locked_table") continue;
+                // A measured source is charged to the host by its own measured payload growth, not by
+                // mirroring the guest figure: the two caches were measured separately.
+                if (source_measured && c.name == "file:expert_streaming_pages") continue;
                 const std::string source = "physical host cache mirror upper bound; no sharing/eviction credit: " + c.source;
                 if (c.unknown) physical.add_unknown(c.name, source);
                 else physical.add(c.name, c.bytes, source);
@@ -2649,6 +2762,12 @@ int main(int argc, char** argv) {
         };
         mirror_sources(startup, startup_host);
         mirror_sources(guest, host);
+        if (source_measured) {
+            const std::string source = "measured physical-host page-cache growth of the direct-read payload "
+                                       "(protected identity-verified receipt)";
+            startup_host.add("expert_source_host_payload", measured_source_host_bytes, source);
+            host.add("expert_source_host_payload", measured_source_host_bytes, source);
+        }
         const uint64_t runtime_peak = guest.known_bytes();
         const uint64_t startup_peak = startup.known_bytes();
         const uint64_t guest_peak = std::max(runtime_peak, startup_peak);
