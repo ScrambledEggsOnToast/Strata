@@ -1921,7 +1921,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         d.fail_layer = d.layers;
         return;
     }
-    if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
+    if (k < 0 || k > (int64_t) d.jobs.size()) {
+        d.failed = true; d.fail = "serial expert routing exceeds setup allocation"; return;
+    }
 
     d.src->begin_layer(d.layers, ids, k);
 
@@ -1940,21 +1942,77 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     const bool graph_hits = d.host_res != nullptr;
     const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
     int64_t njobs = 0;
-
-    if (d.remote_count > 0) {
-        int32_t kind[32];
-        if (k > 32) {
-            d.failed = true; d.fail = "remote experts: routing width exceeds 32"; return;
+    int32_t* const kind = d.worker_assignments;
+    if (k > 32) { d.failed = true; d.fail = "serial routing exceeds bounded assignment storage"; return; }
+    for (int64_t i = 0; i < k; ++i) {
+        if (ids[i] < 0 || ids[i] >= d.n_expert) {
+            d.failed = true; d.fail = "a routed expert id is out of range"; return;
         }
-        for (int64_t i = 0; i < k; ++i)
-            kind[i] = use_hits && ids[i] >= 0 && ids[i] < d.n_expert && (graph_hits
-                ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] >= 0
-                : d.is_hit[(size_t) i] != 0) ? 0 : -1;
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+        kind[i] = use_hits && (graph_hits
+            ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] >= 0
+            : d.is_hit[(size_t) i] != 0) ? 0 : -1;
+    }
+    if (d.worker_contract) {
+        auto& completion = d.completion[d.worker_group];
+        auto& operation = d.operation[d.worker_group];
+        if (completion.active()) {
+            std::string error;
+            auto& primary = d.primary_workers[d.worker_group];
+            if (!primary.consumed(operation) || !primary.finish(nullptr, error)) {
+                d.failed = true; d.fail = "serial primary consumer acknowledgement failed"; return;
             }
+            if ((completion.has_owner(2) && !completion.complete(operation, 2, 1)) || !completion.release(operation)) {
+                d.failed = true; d.fail = "serial expert output reused before consumption"; return;
+            }
+        }
+        operation = {d.request_generation, d.layers, d.next_position, 1, operation.generation + 1};
+        if (!completion.begin(operation, (size_t) k)) {
+            d.failed = true; d.fail = "serial ownership budget exceeded"; return;
+        }
+        for (int64_t i = 0; i < k; ++i) if (kind[i] >= 0 && !completion.claim((size_t) i, 2, 1)) {
+            completion.fail(); d.failed = true; d.fail = "serial primary ownership conflict"; return;
+        }
+        ExpertWork primary_work;
+        primary_work.operation = operation;
+        primary_work.routed_width = k;
+        primary_work.assigned = kind;
+        primary_work.weights = {1, 1, d.src, H, FF, 0, 0};
+        primary_work.input = x_f;
+        primary_work.experts = ids;
+        std::string error;
+        if (!d.primary_workers[d.worker_group].begin(primary_work, error)) {
+            completion.fail(); d.failed = true; d.fail = "serial primary worker submission failed"; return;
+        }
+    }
+
+    if (!d.workers.empty()) {
+        static thread_local std::string remote_error;
+        ExpertWork work;
+        work.operation = d.operation[d.worker_group];
+        work.operation.layer = d.layers;
+        work.operation.token_count = 1;
+        work.weights.input_width = H;
+        work.weights.hidden_width = FF;
+        work.weights.handle = d.src;
+        work.weights.model_generation = 1;
+        work.input = x_f;
+        work.experts = ids;
+        work.routed_width = k;
+        work.assigned = kind;
+        work.primary_residency = d.host_res;
+        if (d.worker_contract) {
+            if (!d.helper_scheduler->begin(work, kind, d.completion[d.worker_group])) {
+                d.completion[d.worker_group].fail();
+                d.failed = true; d.fail = d.helper_scheduler->error().c_str(); return;
+            }
+        } else {
+            for (auto* worker : d.remote) {
+                if (!worker->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); return;
+                }
+                for (int64_t i = 0; i < k; ++i) if (worker->owns(i)) kind[i] = 2;
+            }
+        }
     }
 
     for (int64_t i = 0; i < k; ++i) {
@@ -1976,6 +2034,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_layer = d.layers;
             d.fail_expert = e;
             ++d.missing;
+            if (d.worker_contract) {
+                d.completion[d.worker_group].fail();
+                d.helper_scheduler->cancel();
+            }
             return;
         }
         // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
@@ -1989,8 +2051,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         }
         if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
 
-        bool remote_owns = false;
-        for (int r = 0; r < d.remote_count; ++r) remote_owns |= d.remote[r]->owns(i);
+        bool remote_owns = d.worker_contract && d.helper_scheduler->owns(i);
+        if (!d.worker_contract) for (auto* worker : d.workers) remote_owns |= worker->owns(i);
         if (remote_owns) {
             std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
             continue;
@@ -2005,16 +2067,31 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         j.weight = 1.0f;            // clause 2: a diagnostic field, NOT the router weight
         j.slot = (int) i;
     }
+    if (d.worker_contract)
+        for (int64_t i = 0; i < k; ++i) if (kind[i] < 0 && !d.completion[d.worker_group].claim((size_t) i, 1, 1)) {
+            d.completion[d.worker_group].fail(); d.helper_scheduler->cancel();
+            d.failed = true; d.fail = "serial CPU ownership conflict"; return;
+        }
 
     // Plan v0.3 P4: rows of every expert across all threads (bitwise the same as `run`).
     if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
     else d.pool->run(d.jobs.data(), (int) njobs);
-    if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+    if (d.worker_contract && d.completion[d.worker_group].has_owner(1) &&
+        !d.completion[d.worker_group].complete(d.operation[d.worker_group], 1, 1)) {
+        d.completion[d.worker_group].fail(); d.helper_scheduler->cancel();
+        d.failed = true; d.fail = "serial CPU completion failed"; return;
+    }
+    if (!d.workers.empty()) {
+        if (d.worker_contract) {
+            if (!d.helper_scheduler->finish(out)) {
+                d.failed = true; d.fail = d.helper_scheduler->error().c_str(); return;
             }
+        } else {
+            static thread_local std::string remote_error;
+            for (auto* worker : d.remote) if (!worker->finish(out, remote_error)) {
+                d.failed = true; d.fail = remote_error.c_str(); return;
+            }
+        }
     }
     ++d.layers;
     d.experts += k;
@@ -2026,6 +2103,43 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+
+// Completion preserves the pool's existing epoch/claim/park protocol and arithmetic.
+class CpuExpertWorker final : public ExpertWorker {
+public:
+    CpuExpertWorker(ExpertDispatch& dispatch, int jobs) : dispatch_(dispatch), jobs_(jobs) {}
+    bool begin(const ExpertWork& work, std::string& error) override {
+        if (active_ || work.operation.token_count < 0 || work.operation.token_count > strata::kernels::cpu::MAXT) {
+            error = "CPU expert operation is already active or exceeds its window";
+            return false;
+        }
+        active_ = true;
+        assigned_ = work.assigned;
+        rows_ = work.operation.token_count * work.routed_width;
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        if (jobs_ > 0) {
+            if (layout.native)
+                dispatch_.pool->run_split_multi_native(layout.fmt[(size_t) work.operation.layer], dispatch_.jobs_multi.data(), jobs_);
+            else dispatch_.pool->run_split_multi(dispatch_.jobs_multi.data(), jobs_);
+        }
+        return true;
+    }
+    bool owns(int64_t row) const override { return active_ && row >= 0 && row < rows_ && assigned_[row] < 0; }
+    bool finish(float*, std::string&) override { const bool was_active = active_; active_ = false; return was_active; }
+    bool cancel(std::string&) override { active_ = false; return true; }
+private:
+    ExpertDispatch& dispatch_;
+    int jobs_;
+    const int32_t* assigned_ = nullptr;
+    int64_t rows_ = 0;
+    bool active_ = false;
+};
+
+void drain_failed_workers(ExpertDispatch& d) {
+    auto& completion = d.completion[d.worker_group];
+    completion.fail();
+    if (d.helper_scheduler && d.helper_scheduler->active()) d.helper_scheduler->cancel();
+}
 }  // namespace
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -2045,12 +2159,45 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        if (ids[i] < 0 || ids[i] >= d.n_expert) {
+            d.failed = true; d.fail = "a routed expert id is out of range";
+            d.fail_layer = d.layers; d.fail_expert = ids[i]; return;
+        }
+    }
+    if (d.worker_contract) {
+        // This group's next-layer doorbell follows its own previous consumer.
+        // Another group's doorbell is not completion: its pre-stage can run first.
+        // Primary work remains owned until this matching boundary or terminal sync.
+        if (d.completion[d.worker_group].active()) {
+            std::string error;
+            auto& primary = d.primary_workers[d.worker_group];
+            if (!primary.consumed(d.operation[d.worker_group]) || !primary.finish(nullptr, error)) {
+                d.failed = true; d.fail = "primary graph consumer acknowledgement failed"; return;
+            }
+            if (d.completion[d.worker_group].has_owner(2) && !d.completion[d.worker_group].complete(d.operation[d.worker_group], 2, 1)) {
+                d.completion[d.worker_group].fail(); d.failed = true; d.fail = "stale primary expert completion"; return;
+            }
+            if (!d.completion[d.worker_group].release(d.operation[d.worker_group])) {
+                d.failed = true; d.fail = "expert output reused before completion"; return;
+            }
+        }
+        d.operation[d.worker_group].request = d.request_generation;
+        d.operation[d.worker_group].layer = d.layers;
+        d.operation[d.worker_group].first_position = d.next_position;
+        d.operation[d.worker_group].token_count = n_tok;
+        ++d.operation[d.worker_group].generation;
+        if (!d.completion[d.worker_group].begin(d.operation[d.worker_group], (size_t) (n_tok * k))) {
+            d.failed = true; d.fail = "expert operation exceeds its ownership budget"; return;
+        }
+    }
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
-    if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
-    if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
+    if (d.act_multi.size() < (size_t) n_tok ||
+        (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) ||
+        d.job_of.size() != (size_t) d.n_expert || d.jobs_multi.size() < (size_t) (n_tok * k)) {
+        d.failed = true; d.fail = "expert dispatch scratch exceeds setup allocation"; return;
+    }
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
@@ -2065,7 +2212,30 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t* const kind = d.worker_assignments; // retained until helpers drain, including failed cancellation
+    auto submit_primary = [&]() {
+        auto& primary = d.primary_workers[d.worker_group];
+        primary.set_submission(d.plan, [](void* context) {
+            auto* plan = static_cast<GpuPlanSink*>(context);
+            if (plan && plan->publish) plan->publish(plan->ctx);
+        });
+        ExpertWork work;
+        work.operation = d.operation[d.worker_group];
+        work.weights = {1, 1, d.src, H, native ? lay.fmt[(size_t) d.layers].n_ff : FF,
+                       native ? lay.fmt[(size_t) d.layers].gu_type : 0,
+                       native ? lay.fmt[(size_t) d.layers].d_type : 0};
+        work.input = x_f;
+        work.experts = ids;
+        work.positions = d.positions;
+        work.request_slots = d.request_slots;
+        work.request_ids = d.worker_requests;
+        work.routed_width = k;
+        work.assigned = kind;
+        std::string error;
+        if (primary.begin(work, error)) return true;
+        d.completion[d.worker_group].fail();
+        d.failed = true; d.fail = "primary graph worker submission failed"; return false;
+    };
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -2146,7 +2316,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[2] = fetches;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
-        if (P.publish) P.publish(P.ctx);
+        if (d.worker_contract) { if (!submit_primary()) return; }
+        else if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
@@ -2155,6 +2326,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
+        }
+        if (d.worker_contract && !submit_primary()) return;
+    }
+    if (d.worker_contract) {
+        for (int64_t i = 0; i < n; ++i) {
+            if (kind[i] >= 0 && !d.completion[d.worker_group].claim((size_t) i, kind[i] == 2 ? 3 : 2, 1)) {
+                drain_failed_workers(d);
+                d.failed = true; d.fail = "graph expert row has conflicting ownership"; return;
+            }
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
@@ -2167,13 +2347,43 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
-    if (d.remote_count > 0) {
+    if (!d.workers.empty()) {
         static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r) {
-            if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+        ExpertWork work;
+        work.operation = d.operation[d.worker_group];
+        work.operation.layer = d.layers;
+        work.operation.token_count = n_tok;
+        work.weights.input_width = H;
+        work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
+        work.weights.handle = d.src;
+        work.weights.model_generation = 1; // one immutable model load per engine process
+        work.weights.residency_version = 1;
+        if (native) {
+            work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
+            work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
+        }
+        work.input = x_f;
+        work.experts = ids;
+        work.routed_width = k;
+        work.positions = d.positions;
+        work.request_slots = d.request_slots;
+        work.request_ids = d.worker_requests;
+        work.assigned = kind;
+        work.primary_residency = d.host_res;
+        if (d.worker_contract) {
+            if (!d.helper_scheduler || !d.helper_scheduler->begin(work, kind, d.completion[d.worker_group])) {
+                d.completion[d.worker_group].fail();
+                d.failed = true;
+                d.fail = d.helper_scheduler ? d.helper_scheduler->error().c_str() : "helper scheduler not initialized";
+                d.fail_layer = d.layers; return;
             }
-            for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+        } else {
+            for (auto* worker : d.remote) {
+                if (!worker->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                }
+                for (int64_t i = 0; i < n; ++i) if (worker->owns(i)) kind[i] = 2;
+            }
         }
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
@@ -2187,7 +2397,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
-        const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        const bool ep = d.optimized_remote;
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
@@ -2234,7 +2444,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
+            if (jo < 0 || d.jobs_multi[(size_t) jo].nt == MAXT) {
                 const uint8_t* b = d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
@@ -2242,6 +2452,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
                     ++d.missing;
+                    if (d.worker_contract) drain_failed_workers(d);
                     return;
                 }
                 jo = (int16_t) njobs++;
@@ -2256,18 +2467,58 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    if (d.worker_contract)
+        for (int64_t i = 0; i < n; ++i) if (kind[i] < 0 &&
+            !d.completion[d.worker_group].claim((size_t) i, 1, 1)) {
+            drain_failed_workers(d);
+            d.failed = true; d.fail = "CPU expert row has conflicting ownership"; return;
+        }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (njobs > 0) {
+    if (d.worker_contract) {
+        CpuExpertWorker cpu(d, njobs);
+        ExpertWork work;
+        work.operation = d.operation[d.worker_group];
+        work.weights.handle = d.src;
+        work.weights.model_generation = 1;
+        work.weights.residency_version = 1;
+        work.weights.input_width = H;
+        work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
+        if (native) {
+            work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
+            work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
+        }
+        work.input = x_f;
+        work.experts = ids;
+        work.positions = d.positions;
+        work.request_slots = d.request_slots;
+        work.request_ids = d.worker_requests;
+        work.routed_width = k;
+        work.assigned = kind;
+        std::string error;
+        if (!cpu.begin(work, error) || !cpu.finish(out, error)) {
+            drain_failed_workers(d);
+            d.failed = true; d.fail = "CPU expert worker failed"; return;
+        }
+    } else if (njobs > 0) {
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
-    if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+    if (d.worker_contract && d.completion[d.worker_group].has_owner(1) && !d.completion[d.worker_group].complete(d.operation[d.worker_group], 1, 1)) {
+        drain_failed_workers(d); d.failed = true; d.fail = "stale CPU expert completion"; return;
+    }
+    if (!d.workers.empty()) {
+        if (d.worker_contract) {
+            if (!d.helper_scheduler->finish(out)) {
+                d.failed = true; d.fail = d.helper_scheduler->error().c_str(); d.fail_layer = d.layers; return;
             }
+        } else {
+            static thread_local std::string remote_error;
+            for (auto* worker : d.remote)
+                if (!worker->finish(out, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                }
+        }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
@@ -2278,6 +2529,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             d.fail_layer = d.layers;
             return;
         }
+    }
+    if (d.worker_contract && d.completion[d.worker_group].has_owner(3) && !d.completion[d.worker_group].complete(d.operation[d.worker_group], 3, 1)) {
+        d.completion[d.worker_group].fail(); d.failed = true; d.fail = "stale peer expert completion"; return;
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");

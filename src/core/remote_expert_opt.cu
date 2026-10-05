@@ -151,6 +151,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
     std::string err;
     for (auto& p : peers_) {
         auto& r = *p.remote;
+        if (r.in_flight_) return false;
         std::vector<Swap> swaps;
         std::vector<std::pair<float, int32_t>> candidates, victims;
         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l) {
@@ -188,6 +189,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
             resident[base + s.out] = 0;
             resident[base + s.in] = 1;
         }
+        ++r.residency_version_;
     }
     return true;
 }

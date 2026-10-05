@@ -312,7 +312,7 @@ void session_graphs_free(SessionGraphs& gr);
 /// WHAT THE POOL HAS TO DO, as the loop sees it: given the `x_f` a layer published and the miss list it
 /// selected, produce the `k` expert outputs into `out` (k x n_embd, HOST memory).  A function pointer rather
 /// than a virtual class because the loop is the thing under test and the pool is the thing being faked.
-using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
+using PoolFn = bool (*)(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                         int64_t k, float* out);
 
 /// **R4.2c: THE VRAM-RESIDENT HALF OF THE LAYER'S EXPERTS.**  Called by the loop after the misses have been
@@ -400,6 +400,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 struct TokenGraph {
     cudaGraphExec_t exec = nullptr;
     bool captured = false;
+    bool poisoned = false;
     int64_t n_layers = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)
     size_t parts_bytes = 0;

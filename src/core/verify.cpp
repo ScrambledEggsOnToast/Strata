@@ -186,8 +186,10 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
-        while (cudaStreamQuery(s) == cudaErrorNotReady) {
-            if (ms_since(t0) > timeout_ms) {
+        for (;;) {
+            const cudaError_t status = cudaStreamQuery(s);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady || ms_since(t0) > timeout_ms) {
                 trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
                 return false;
             }
@@ -1526,9 +1528,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        for (int t = 0; t < n; ++t) worker_positions_[t] = pos0 + tb + t;
+        if (pool != nullptr &&
+            !pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l, worker_positions_, nullptr, grp, worker_lane_)) {
+            if (remote_opt_) remote_opt_->end();
+            const bool drained = release_gpu_waits(5000);
+            if (drained) pool(user, nullptr, nullptr, 0, ss.k, nullptr, -2, nullptr, nullptr, -1, worker_lane_);
+            err = "verify: expert worker failed" + released_note(drained);
+            return false;
+        }
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -1575,8 +1584,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
-        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        const cudaError_t copied = cudaStreamSynchronize(copy_);
+        if (copied != cudaSuccess) { err = std::string("verify copies: ") + cudaGetErrorString(copied); return false; }
         copy_used_ = false;
+    }
+    if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss.k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
+        released_.store(true); err = "verify: expert completion failed"; return false;
     }
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -2056,7 +2069,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        if (pool != nullptr && !pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l, pos, rows, 0, worker_lane_)) {
+            const bool drained = release_gpu_waits(5000);
+            if (drained) pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -2, nullptr, nullptr, -1, worker_lane_);
+            err = "verify batch: expert worker failed" + released_note(drained);
+            return false;
+        }
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2076,7 +2094,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
+    const cudaError_t copied = cudaStreamSynchronize(copy_);
+    if (copied != cudaSuccess) { err = std::string("verify batch copies: ") + cudaGetErrorString(copied); return false; }
+    if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
+        released_.store(true); err = "verify batch: expert completion failed"; return false;
+    }
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -2173,7 +2195,12 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        if (pool != nullptr && !pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_, last_pos_b_, last_rows_, 0, worker_lane_)) {
+            const bool drained = release_gpu_waits(5000);
+            if (drained) pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -2, nullptr, nullptr, -1, worker_lane_);
+            err = "verify batch: expert worker failed" + released_note(drained);
+            b_running_ = false; return -1;
+        }
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2197,6 +2224,10 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
+    if (qc != cudaSuccess) { err = std::string("verify batch copies: ") + cudaGetErrorString(qc); b_running_ = false; return -1; }
+    if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
+        released_.store(true); err = "verify batch: expert completion failed"; b_running_ = false; return -1;
+    }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }

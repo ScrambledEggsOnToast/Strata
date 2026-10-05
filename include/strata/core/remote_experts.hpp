@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_worker.hpp"
 
 #include <cuda_runtime.h>
 
@@ -15,7 +16,7 @@ class RemoteExpertOpt;
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
-class RemoteExperts {
+class RemoteExperts : public ExpertWorker {
 public:
     RemoteExperts() = default;
     ~RemoteExperts();
@@ -36,9 +37,12 @@ public:
     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                int64_t k, const int32_t* kind, const int32_t* primary_res,
                std::string& err);
-    bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+    bool begin(const ExpertWork& work, std::string& err) override;
+    uint64_t residency_version() const override { return residency_version_; }
+    bool owns(int64_t index) const override { return index >= 0 && (size_t) index < owned_.size() && owned_[(size_t) index] != 0; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
-    bool finish(float* out, std::string& err);
+    bool finish(float* out, std::string& err) override;
+    bool cancel(std::string& err) override;
     int64_t resident() const { return cache_.resident(); }
     int64_t computed() const { return computed_; }
     int64_t launched_layers() const { return launched_layers_; }
@@ -52,6 +56,8 @@ public:
 private:
     friend class RemoteExpertOpt;
     RemoteExpertOpt* remote_opt_ = nullptr;
+    bool in_flight_ = false;
+    uint64_t residency_version_ = 1;
     int device_ = -1;
     int64_t n_expert_ = 0;
     int32_t groups_ = 0;

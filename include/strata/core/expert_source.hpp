@@ -23,6 +23,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/expert_worker.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/direct_file.hpp"
 
@@ -246,8 +247,22 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
-    int remote_count = 0;
+    std::vector<RemoteExperts*> remote; ///< configured helper adapters; allocated only at setup
+    std::vector<ExpertWorker*> workers; ///< device-independent execution order
+    bool worker_contract = false;
+    bool optimized_remote = false;
+    std::vector<ExpertCompletion> completion;
+    std::vector<ExpertOperation> operation;
+    std::vector<GraphExpertWorker> primary_workers;
+    std::unique_ptr<ExpertHelperScheduler> helper_scheduler;
+    int32_t worker_assignments[ExpertCompletion::kCapacity] = {};
+    uint64_t slot_requests[strata::kernels::cpu::MAXT] = {};
+    uint64_t worker_requests[strata::kernels::cpu::MAXT] = {};
+    uint64_t request_generation = 0;
+    int worker_group = 0;
+    int64_t next_position = 0;
+    const int64_t* positions = nullptr;
+    const int* request_slots = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.

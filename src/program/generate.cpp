@@ -591,6 +591,7 @@ struct Options {
     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
+    bool expert_worker_contract = false;
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
     bool no_prefill_borrow = false;
@@ -848,6 +849,7 @@ void usage() {
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.\n"
+                 "  --expert-worker-contract  enable bounded expert-row ownership and device-independent helpers\n"
                  "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
                  "  --mps-cap-bytes N    issue #60: the enforced MPS client ceiling this run is launched under;\n"
                  "                       must match the verified declaration in this process's environment\n"
@@ -930,13 +932,14 @@ struct Drive {
     std::FILE* routing = nullptr;
 };
 
-void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
+bool drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    if (t->d.failed) return false;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
     // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
     // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
@@ -950,20 +953,64 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= 48) {
             std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
-            return;
+            return false;
         }
         const int32_t rec[2] = {layer_idx, (int32_t) k};
         std::fwrite(rec, sizeof rec, 1, t->routing);
         std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
         std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
     }
+    return true;
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+bool drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer, const int64_t* positions, const int* request_slots, int group, int lane) {
     Drive* t = (Drive*) user;
+    if (lane < 0 || (size_t) lane >= t->d.completion.size() / 2) return false;
+    if ((layer == -1 || layer == -2) && n_tok == 0) {
+        for (int g = 0; g < 2; ++g) {
+            auto& completion = t->d.completion[2 * lane + g];
+            const auto& operation = t->d.operation[2 * lane + g];
+            if (!t->d.worker_contract || !completion.active()) continue;
+            auto& primary = t->d.primary_workers[2 * lane + g];
+            std::string primary_error;
+            const bool acknowledged = primary.consumed(operation);
+            if (layer == -2) {
+                completion.fail();
+                if (acknowledged) primary.cancel(primary_error);
+                completion.drained(operation, 2); // this lane's CUDA graph and copy stream drained
+                completion.release(operation); // undrained CPU/helper/peer ownership remains pinned
+                continue;
+            }
+            if (!acknowledged || !primary.finish(nullptr, primary_error)) {
+                completion.fail(); t->d.failed = true;
+                t->d.fail = "primary graph consumer acknowledgement failed"; return false;
+            }
+            if (completion.has_owner(2) && !completion.complete(operation, 2, 1)) {
+                completion.fail(); t->d.failed = true;
+                t->d.fail = "stale primary expert completion";
+                return false;
+            }
+            if (!completion.release(operation)) {
+                t->d.failed = true;
+                t->d.fail = "expert window completed with missing contributions";
+            }
+        }
+        return !t->d.failed;
+    }
+    if (group < 0 || group > 1) return false;
+    t->d.worker_group = 2 * lane + group;
     t->d.layers = layer;
+    t->d.next_position = positions ? positions[0] : 0;
+    t->d.positions = positions;
+    t->d.request_slots = request_slots;
+    if (n_tok < 0 || n_tok > strata::kernels::cpu::MAXT) return false;
+    for (int64_t row = 0; row < n_tok; ++row) {
+        const int slot = request_slots ? request_slots[row] : -1;
+        if (slot >= strata::kernels::cpu::MAXT || slot < -1) return false;
+        t->d.worker_requests[row] = slot >= 0 ? t->d.slot_requests[slot] : t->d.request_generation;
+    }
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -981,6 +1028,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
             std::fwrite(one, sizeof(float), (size_t) k, t->routing);
         }
     }
+    return !t->d.failed;
 }
 
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
@@ -995,9 +1043,12 @@ struct SplitDrive {
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
 };
-void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+bool drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer, const int64_t* positions, const int* request_slots, int group, int lane) {
     SplitDrive* s = (SplitDrive*) user;
+    if ((layer == -1 || layer == -2) && n_tok == 0) {
+        return drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer, positions, request_slots, group, lane);
+    }
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
     Drive& d = *s->base;
@@ -1005,7 +1056,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
+    return drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer, positions, request_slots, group, lane);
 }
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
@@ -1660,6 +1711,7 @@ int main(int argc, char** argv) {
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
+        else if (a == "--expert-worker-contract") o.expert_worker_contract = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
@@ -2273,6 +2325,10 @@ int main(int argc, char** argv) {
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
+        return 2;
+    }
+    if (o.expert_worker_contract && o.remote_expert_opt) {
+        std::fprintf(stderr, "strata generate: --expert-worker-contract requires unweighted helper rows; --remote-expert-opt changes reduction order\n");
         return 2;
     }
     if (o.remote_expert_opt && !o.serve) {
@@ -3042,6 +3098,14 @@ int main(int argc, char** argv) {
         if (o.serve)
             ram("penalty_history_host", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
                 "serving hist_stage vector payload");
+        ram("expert_worker_ownership", 2 * (split_devs.size() + 1) *
+            (strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity) +
+             sizeof(strata::core::ExpertCompletion) + sizeof(strata::core::ExpertOperation) + sizeof(strata::core::GraphExpertWorker)),
+            "two bounded group ledgers per verifier lane, including retained metadata vectors");
+        static_assert(sizeof(void*) == 8, "update worker helper pointer accounting together");
+        ram("expert_worker_helpers", 6 * sizeof(void*), "two setup-only lists of at most three configured helper pointers");
+        ram("expert_worker_scheduler", sizeof(strata::core::ExpertHelperScheduler) +
+            strata::core::ExpertHelperScheduler::planned_bytes(3), "bounded ordered helper scheduler and diagnostic storage");
         if (!source_page) ram_unknown("source_page_size", "cannot bound filesystem source pages without OS page size");
         const auto& layout = strata::kernels::cpu::expert_layout();
         if (layout.n_layers != g.n_layers || layout.n_expert != g.n_expert ||
@@ -4911,15 +4975,45 @@ int main(int argc, char** argv) {
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
+    drive.d.remote.reserve(3);
+    drive.d.workers.reserve(3);
+    const size_t ownership_groups = 2 * (split_devs.size() + 1);
+    drive.d.completion.reserve(ownership_groups);
+    drive.d.operation.resize(ownership_groups);
+    drive.d.primary_workers.resize(ownership_groups);
+    for (size_t i = 0; i < ownership_groups; ++i)
+        drive.d.completion.emplace_back(strata::core::ExpertCompletion::kCapacity);
+    const bool oversized_ledger = std::any_of(drive.d.completion.begin(), drive.d.completion.end(),
+        [](const auto& completion) { return completion.storage_bytes() >
+            strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity); });
+    if (drive.d.remote.capacity() > 3 || drive.d.workers.capacity() > 3 || oversized_ledger ||
+        drive.d.completion.capacity() > ownership_groups || drive.d.operation.capacity() > ownership_groups ||
+        drive.d.primary_workers.capacity() > ownership_groups) {
+        std::fprintf(stderr, "strata generate: helper list allocation exceeds the admitted bound\n");
+        return 1;
+    }
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-        drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
+        drive.d.remote.push_back(&remote_experts[(size_t) r]);
+    for (auto* worker : drive.d.remote) drive.d.workers.push_back(worker);
+    drive.d.helper_scheduler = std::make_unique<strata::core::ExpertHelperScheduler>(drive.d.workers);
+    if (drive.d.helper_scheduler->storage_bytes() > strata::core::ExpertHelperScheduler::planned_bytes(3)) {
+        std::fprintf(stderr, "strata generate: helper scheduler exceeds admitted storage\n");
+        return 1;
+    }
+    drive.d.optimized_remote = remote_opt != nullptr;
     drive.d.peer = peer.valid() ? &peer : nullptr;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
+    drive.d.worker_contract = o.expert_worker_contract;
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    drive.d.act_multi.resize((size_t) strata::kernels::cpu::MAXT);
+    if (strata::kernels::cpu::expert_layout().native)
+        drive.d.nact_multi.resize((size_t) strata::kernels::cpu::MAXT * strata::kernels::cpu::kNativeActBytes);
+    drive.d.job_of.assign((size_t) g.n_expert, (int16_t) -1);
+    drive.d.jobs_multi.resize((size_t) strata::kernels::cpu::MAXT * K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
@@ -6409,6 +6503,7 @@ int main(int argc, char** argv) {
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
+            stage_ver(st).set_worker_lane(st);
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
@@ -7500,6 +7595,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            ++drive.d.request_generation;
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -8638,6 +8734,7 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};
                     sl.active = true;
+                    drive.d.slot_requests[admit_slot] = drive.d.request_generation;
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
@@ -8957,6 +9054,8 @@ int main(int argc, char** argv) {
         // reason this was a clean error instead of a silently wrong second token.
         drive.d.layers = 0;
         drive.d.experts = 0;
+        drive.d.worker_group = 0;
+        drive.d.next_position = pos;
         drive.d.failed = false;
         err.clear();
         if (o.no_capture) {
@@ -8978,6 +9077,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: session_loop: %s\n", err.c_str());
                 return 1;
             }
+        }
+        if (drive.d.worker_contract && !o.no_capture &&
+            !drive_pool_multi(&drive, nullptr, nullptr, 0, K, nullptr, -1, nullptr, nullptr, -1, 0)) {
+            std::fprintf(stderr, "strata generate: serial expert completion failed\n");
+            return 1;
         }
         if (final_r != nullptr) {
             cudaMemcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float), cudaMemcpyDeviceToHost);

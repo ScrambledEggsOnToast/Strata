@@ -116,6 +116,8 @@ void RemoteExperts::close() {
     d_ptr_ = nullptr;
     original_row_.clear();
     layers_present_.clear();
+    in_flight_ = false;
+    ++residency_version_;
 }
 
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
@@ -236,6 +238,55 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     return true;
 }
 
+bool RemoteExperts::begin(const ExpertWork& work, std::string& err) {
+    if (in_flight_) { err = "remote expert scratch is still in flight"; return false; }
+    if (work.weights.residency_version != residency_version_) {
+        err = "remote expert residency changed before submission";
+        return false;
+    }
+    if (work.weights.input_width != H || work.operation.token_count < 0 ||
+        work.routed_width < 0 || work.operation.token_count > strata::kernels::cpu::MAXT ||
+        work.routed_width > CAP) {
+        err = "remote expert work geometry is unsupported";
+        return false;
+    }
+    if (work.operation.token_count == 0 || work.routed_width == 0) {
+        std::fill(owned_.begin(), owned_.end(), 0);
+        group_id_.clear();
+        return true;
+    }
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    if (work.operation.layer < 0 || work.operation.layer >= layout.n_layers ||
+        work.input == nullptr || work.experts == nullptr || work.weights.handle == nullptr ||
+        work.weights.model_generation == 0) {
+        err = "remote expert work lacks a valid immutable weight/input identity";
+        return false;
+    }
+    const auto layer = (size_t) work.operation.layer;
+    if ((layout.native && (work.weights.hidden_width != layout.fmt[layer].n_ff ||
+         work.weights.gate_up_format != layout.fmt[layer].gu_type ||
+         work.weights.down_format != layout.fmt[layer].d_type)) ||
+        (!layout.native && work.weights.hidden_width != FF)) {
+        err = "remote expert weight geometry or format differs from loaded weights";
+        return false;
+    }
+    // Mark before launching: a failed partial submission still owns staging until drain.
+    in_flight_ = true;
+    return begin(work.operation.layer, work.input, work.experts, work.operation.token_count,
+                 work.routed_width, work.assigned, work.primary_residency, err);
+}
+
+bool RemoteExperts::cancel(std::string& err) {
+    if (!in_flight_) return true;
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    if (!check(cudaStreamSynchronize(stream_), "cancel drain", err, device_)) return false;
+    in_flight_ = false;
+    group_id_.clear();
+    std::fill(owned_.begin(), owned_.end(), 0);
+    return true;
+}
+
 bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                           int64_t k, const int32_t* kind, const int32_t* primary_res,
                           std::string& err) {
@@ -326,11 +377,12 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 }
 
 bool RemoteExperts::finish(float* out, std::string& err) {
-    if (group_id_.empty()) return true;
+    if (group_id_.empty()) { in_flight_ = false; return true; }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto w0 = std::chrono::steady_clock::now();
     if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
+    in_flight_ = false;
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)

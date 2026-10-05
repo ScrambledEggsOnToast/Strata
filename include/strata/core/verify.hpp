@@ -43,8 +43,9 @@ class NativeHead;
 class RemoteExpertOpt;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+/// A zero-row layer=-1 call acknowledges successful final consumption; -2 acknowledges poisoned graph drain.
+using PoolMultiFn = bool (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                             int64_t layer, const int64_t* positions, const int* request_slots, int group, int lane);
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -84,6 +85,8 @@ public:
     /// on their own devices. Keep a denying GraphCaptureObservationScope while serving to
     /// prohibit unseen captures; observed preparation is not an opaque allocator hard bound.
     bool prepare_graphs(std::string& err);
+    /// Distinguishes independently in-flight verifier stages sharing one dispatch.
+    void set_worker_lane(int lane) { worker_lane_ = lane; }
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -340,6 +343,8 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    int worker_lane_ = 0;
+    int64_t worker_positions_[8] = {};
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);

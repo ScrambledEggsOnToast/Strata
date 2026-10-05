@@ -716,7 +716,11 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         if (hits != nullptr) hits(user, cs, HitPhase::Launch, s.db->h_ids, k);
 
         // ---- the pool, on the bytes the doorbell published.  **THESE ARE LAYER `l`'s EXPERTS.**
-        if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, k, y_miss);
+        if (pool != nullptr && !pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, k, y_miss)) {
+            err = "session_loop: expert worker failed";
+            gr.captured = false;
+            return false;
+        }
 
         // ---- **AND THEY ARE COMBINED BY LAYER `l`, NOT BY LAYER `l+1`.**
         //
@@ -913,6 +917,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
 bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, TokenGraph& tg,
                        PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err) {
     if (!tg.captured) { err = "session_run_token: not captured"; return false; }
+    if (tg.poisoned) { err = "session_run_token: previous expert failure poisoned this graph"; return false; }
     if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
     ++tg.calls;
@@ -956,7 +961,17 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         }
         const auto t1 = Clock::now();
         progress_at("token: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
+        if (pool != nullptr && !pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host)) {
+            tg.poisoned = true;
+            // Drain the captured waits solely for teardown; no resulting state is reusable.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *flag = UINT32_MAX;
+            const auto deadline = Clock::now() + std::chrono::seconds(5);
+            while (cudaStreamQuery(cs) == cudaErrorNotReady && Clock::now() < deadline) STRATA_SPIN_PAUSE();
+            err = "session_run_token: expert worker failed; graph poisoned";
+            return false;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *flag = want;
