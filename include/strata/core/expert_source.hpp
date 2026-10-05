@@ -869,7 +869,7 @@ private:
     std::string gguf_;
     std::vector<std::unique_ptr<SourceFile>> files_;   ///< `SourceFile` holds a non-movable `DirectFile`
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
-    std::vector<int> layer_file_;              ///< gguf mode: file index per layer (empty: experts.bin mode)
+    std::vector<int> layer_file_;              ///< gguf mode: file index PER ROLE (3 x layers); empty: experts.bin mode
     bool gguf_mode_ = false;
     uint8_t* ring_ = nullptr;
     uint64_t ring_bytes_ = 0;

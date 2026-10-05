@@ -3359,7 +3359,9 @@ bool WindowedExpertSource::open_gguf(int64_t n_layers, int64_t n_expert, std::st
         err = "WindowedExpertSource: the native GGUF plane offsets are incomplete";
         return false;
     }
-    if (!lay.gguf_file.empty() && lay.gguf_file.size() != (size_t) n_layers) {
+    // The shard table is per layer PER ROLE (3 x n_layers, v4) since upstream's shard-aware packs, and empty
+    // where a role lives in the --native shard.  It used to be one name per layer.
+    if (!lay.gguf_file.empty() && lay.gguf_file.size() != (size_t) (3 * n_layers)) {
         err = "WindowedExpertSource: the native GGUF shard table is incomplete";
         return false;
     }
@@ -3386,27 +3388,31 @@ bool WindowedExpertSource::open_gguf(int64_t n_layers, int64_t n_expert, std::st
     slot_stride_ = scratch_at_ + round_up_sat(max_span + align_ - 1, align_);
     slot_count_ = (size_t) (config_.slots > 0 ? config_.slots : n_expert_);
 
-    // Each layer's shard: the per-layer name beside the --native shard, the arena loader's rule.
+    // Each layer's shard PER ROLE: the name beside the --native shard (native_experts.txt v4: 3 x n_layers
+    // names, a role in another shard leaves the entry empty), or the --native shard itself.  The arena loader's
+    // rule is the same; the table is per role since upstream's shard-aware packs can split inside a layer.
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
-    layer_file_.assign((size_t) n_layers, -1);
+    layer_file_.assign((size_t) (3 * n_layers), -1);
     for (int64_t l = 0; l < n_layers; ++l) {
-        const std::string name = lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()
-                                     ? gguf_
-                                     : dir + lay.gguf_file[(size_t) l];
-        int index = -1;
-        for (size_t i = 0; i < files_.size(); ++i)
-            if (files_[i]->path == name) {
-                index = (int) i;
-                break;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) (3 * l + r);
+            const std::string name =
+                lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i] : gguf_;
+            int index = -1;
+            for (size_t j = 0; j < files_.size(); ++j)
+                if (files_[j]->path == name) {
+                    index = (int) j;
+                    break;
+                }
+            if (index < 0) {
+                auto file = std::make_unique<SourceFile>();
+                file->path = name;
+                files_.push_back(std::move(file));
+                index = (int) files_.size() - 1;
             }
-        if (index < 0) {
-            auto file = std::make_unique<SourceFile>();
-            file->path = name;
-            files_.push_back(std::move(file));
-            index = (int) files_.size() - 1;
+            layer_file_[i] = index;
         }
-        layer_file_[(size_t) l] = index;
     }
     return true;
 }
@@ -3443,8 +3449,8 @@ bool WindowedExpertSource::open_files(std::string& err) {
         const size_t i = (size_t) l;
         uint64_t per[3];
         plane_spans(lay.fmt[i], layer_blob_bytes_[i], per);
-        const SourceFile& f = *files_[(size_t) layer_file_[i]];
         for (int r = 0; r < 3; ++r) {
+            const SourceFile& f = *files_[(size_t) layer_file_[(size_t) (3 * l + r)]];
             if (per[r] > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert_) {
                 err = "WindowedExpertSource: the GGUF plane size overflows at layer " + std::to_string(l);
                 return false;
@@ -3537,7 +3543,7 @@ bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slo
         plane_spans(fm, layer_blob_bytes_[i], per);
         const uint64_t at[3] = {0, fm.up_off, fm.down_off};
         for (int r = 0; r < 3; ++r) {
-            const BlobSpan span{(size_t) layer_file_[i],
+            const BlobSpan span{(size_t) layer_file_[(size_t) (3 * layer + r)],
                                 lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * per[r], per[r],
                                 at[r]};
             if (!read_span_direct(span, slot_base, slot, err)) return false;
