@@ -15,7 +15,6 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -42,6 +41,22 @@ struct PrefillStats {
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
 
+// ============================ FORK: pre-allocation admission (HET-017) ============================
+// Everything below this marker is the fork's, not upstream's.  It exists because the admission gate prices a
+// prompt configuration BEFORE a SessionState exists, while upstream's own counter takes the session.  The two must
+// be one implementation: `bytes_needed` (session) and `bytes_needed_from` (facts) share the same body, so a change
+// to the allocation sequence cannot leave the price behind.
+
+/// The facts the prompt path's allocation depends on, read from the session or supplied by a caller that has none.
+struct PrefillFacts {
+    int64_t max_cells = 0;   ///< the primary QSA state's cell budget
+    int64_t n_pages = 0;     ///< ...and its resident page count (KV streaming's identity table)
+    int kv_mode = 0;         ///< 0: device KV, 1: streaming/native, 2: hybrid
+    bool kv_int8 = false, kv_q4 = false;
+    /// The session's own answer, for `bytes_needed`'s sake.  A session with no QSA states gives a zeroed set.
+    static PrefillFacts of(const core::SessionState& ss);
+};
+
 /// Inputs available before weights/session allocation. n_pages is the primary QSA state's logical page count
 /// (ceil(max_cells / 4)), NOT its resident slot count. Snapshot environment choices with allocation_config().
 struct AllocationConfig {
@@ -49,50 +64,38 @@ struct AllocationConfig {
     int64_t layer_begin = 0, layer_end = -1; ///< Stage validation; device scratch remains shared/all-path sized.
     int kv_mode = 0;
     bool kv_int8 = false, kv_q4 = false, kv_stage_own = false, gr_unfused = false, mmq = true;
-    int ring = 8; ///< Snapshot ring_slots(chunk): 8 routed slots, otherwise clamped 16..512 streaming slots.
+    int ring = 8; ///< Snapshot of ring_slots_for(chunk) - the ring `init` lays out, clamped 16..ring_cap().
     int stager_ring = 16; ///< Snapshot of the host copy ring for unpinned blobs (STRATA_STAGER_RING, clamped
                           ///< 2..256 exactly as the stager reads it at init).
     int device_cc = 0, device_sms = 0;
     uint64_t device_shared_bytes = 0;
+    PrefillFacts facts() const {
+        PrefillFacts f;
+        f.max_cells = max_cells; f.n_pages = n_pages; f.kv_mode = kv_mode; f.kv_int8 = kv_int8; f.kv_q4 = kv_q4;
+        return f;
+    }
 };
 struct AllocationBytes {
-    uint64_t loanable_device = 0;  ///< Exact aligned bump region, including GEMM and bounded MMQ workspace.
-    uint64_t owned_device = 0;     ///< Token ids, staging identity table, and optionally separately owned KV stage.
-    // Every take(payload) requests ((payload + 511) & ~255): ceil(payload / 256)*256 + 256.
-    // All three attention/MoE overlays are counted by their actual take sequence; only their maximum is allocated.
-    // A profiled/undersized/empty expert cache changes none of these totals. A partial loan cannot price the full
-    // region as borrowed: init requires a 256-byte aligned loan holding at least loanable_device bytes.
+    uint64_t loanable_device = 0;  ///< Exact aligned bump region, including the streamed ring and MMQ workspace.
+    uint64_t owned_device = 0;     ///< Token ids, the streaming identity table, and optionally an owned KV stage.
+    /// Every take(payload) requests ((payload + 511) & ~255): ceil(payload / 256)*256 + 256.
+    /// A partial loan cannot price the full region as borrowed: init requires a 256-byte aligned loan holding at
+    /// least loanable_device bytes.
     uint64_t standalone_device = 0;///< loanable_device + owned_device; valid even when no cache slots can be lent.
     uint64_t mmq_workspace = 0;    ///< Included in loanable_device; configuration-derived maximum, not a heuristic.
-    /// Fixed explicit host payload, excluding separately priced stager blob slots, PLE staging pairs,
-    /// routing table heads, step logs and split hand-offs. Opaque driver storage and thread stacks remain
-    /// a separate unknown class; the counted dynamic host storage is host_dynamic below.
-    /// Counts token staging chunk*4; routing counts (2*n_expert+1)*4; stager_ring pinned flags;
-    /// the mapped bounds tail (n_expert+1+ceil(n_expert/16)*17)*4 even without MMQ, because init
-    /// reserves it regardless; and the same-sized bounds staging payload when any layer runs MMQ.
-    /// bounds_host is initially sized to its maximum so per-layer resizing cannot grow capacity.
+    /// Fixed explicit HOST payload (token staging, routing tables, the mapped bounds tail, stager ring flags).
+    /// Opaque driver storage and thread stacks remain a separate unknown class; host_dynamic below is the
+    /// counted storage the stager allocates for its jobs.
     uint64_t host_payload = 0;
-    /// The dynamic host payload's counted fixed storage, charged at the geometry bound each buffer is
-    /// allocated to, once, at init (from stager_max_jobs and the config), and never grown:
-    /// - the stager's job list (the stage's layers * n_expert entries) and its ready flags (twice that),
-    ///   refilled in place per chunk or layer and published only after finish() released the previous
-    ///   list, so a late worker can never read an overwritten job;
-    /// - the stager ring's slot-pointer and DMA-event-handle arrays and its fallback slot containers
-    ///   (stager_ring entries each);
-    /// - the whole-chunk stream plan (one entry per streamed expert-layer pair) and its layer offsets,
-    ///   resident in both modes, so a relayout's routed/stream transition stays inside this bound;
-    /// - the MoE grouping arrays (order/fill and the ring-slot/job indices, n_expert entries each),
-    ///   refilled in place per layer;
-    /// - the draft layer's token staging (the init chunk's tokens; exact per call, never beyond this);
-    /// - the KV-streaming init identity page table (n_pages entries, only when kv_mode == 1).
-    /// Every count is enforced - the fillers refuse by name at the bound - and every buffer holds exactly
-    /// count * sizeof(T) for trivially destructible element types; sizes come from sizeof, never hard-coded
-    /// ABI numbers.  NOT included, because nothing documents their sizes (the caller's unknown class):
-    /// host allocator block headers or any other heap/driver metadata around these owned arrays,
-    /// cudaEvent_t driver objects, resident thread stacks, and the container-managed init-lifetime
-    /// device-pointer list, thread-handle container and pinned-flag vector.
+    /// Host storage whose size the engine's own bound fixes (the stager's job list and its ready flags, the MoE
+    /// grouping arrays, the stream plan, the per-layer MMQ table, the draft layer's token staging, the streaming
+    /// identity page table), priced from the same bound `stager_max_jobs` gives `init`.  NOT included, because
+    /// nothing here bounds them: allocator block headers and other heap/driver metadata around these arrays,
+    /// cudaEvent_t driver objects, resident thread stacks, and the container-managed init-lifetime tables.
     uint64_t host_dynamic = 0;
 };
+
+// ========================== END FORK BLOCK (admission structs) ==========================
 
 class Prefill {
 public:
@@ -136,21 +139,7 @@ public:
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
 
-    /// Snapshot the same runtime switches used by init. Queries device properties, but allocates no device memory.
-    static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
-                                  AllocationConfig& out, std::string& err);
-    /// The dynamic stager's fixed job bound for a stage: the stage's layer range times n_expert - the most
-    /// expert-layer pairs a chunk's plan or job list can hold - checked against the claim word's 16-bit job
-    /// field (refuse, never clamp; this also rules out any product overflow).  init sizes the counted stager
-    /// and stream-plan storage from this, and allocation_needed prices host_dynamic from the same value.
-    /// false (with max_jobs = 0): the stage range or the expert count is outside the encodable range.
-    static bool stager_max_jobs(const core::ModelGeometry& g, const AllocationConfig& c, int64_t& max_jobs);
-    /// Pure checked arithmetic; no SessionState, CUDA allocation, global artifact layout, or cache dependency.
-    /// No loan is deducted: callers may subtract loanable_device ONLY after guaranteeing that region is lent.
-    /// Includes explicit CUDA allocations, not opaque driver/cuBLAS handle internals (price those separately).
-    static bool allocation_needed(const core::ModelGeometry& g, const AllocationConfig& config,
-                                  const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err);
-    /// Existing initialized-session consumers need the bump region only. Invalid/overflow returns UINT64_MAX.
+    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
     /// The same without the streamed ring: what the chunk's own buffers cost.  The auto chunk scan sizes the chunk
@@ -176,6 +165,43 @@ public:
     /// 0.1.39b (#583, the default): the ring as a byte budget, the loan's corrected count and the auto chunk scan that
     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
     static bool ring_bytes_enabled();
+
+    // ---- FORK (HET-017): the admission gate's entry points, priced from the facts above ----
+    /// Snapshot the same runtime switches init uses. Queries device properties, allocates no device memory.
+    static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
+                                  AllocationConfig& out, std::string& err);
+    /// The dynamic stager's fixed job bound for a stage: the stage's layer range times n_expert - the most
+    /// expert-layer pairs a chunk's plan can hold - checked against the claim word's 16-bit job field (refuse,
+    /// never clamp; this also rules out any product overflow).
+    static bool stager_max_jobs(const core::ModelGeometry& g, const AllocationConfig& c, int64_t& max_jobs);
+    /// Pure checked arithmetic; no SessionState, CUDA allocation, global artifact layout, or cache dependency.
+    /// No loan is deducted: callers may subtract loanable_device ONLY after guaranteeing that region is lent.
+    /// Includes explicit CUDA allocations, not opaque driver/cuBLAS handle internals (price those separately).
+    static bool allocation_needed(const core::ModelGeometry& g, const AllocationConfig& config,
+                                  const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err);
+    /// `bytes_needed`'s body, callable without a session: one implementation, two callers.  `ring_slots_override`
+    /// >= 0 prices that many ring slots instead of the engine's own choice, so admission can price the ring a
+    /// configuration names (`allocation_config` snapshots it from ring_slots_for).
+    static uint64_t bytes_needed_from(const core::ModelGeometry& g, const PrefillFacts& f, int64_t chunk,
+                                      int ring_slots_override = -1, uint64_t ring_blob = 0,
+                                      int stage_own_override = -1);
+    /// FORK: the environment switches the price snapshot must agree with `init`/`carve` on - one rule, not two
+    /// copies of it.  `ring_hard_cap` is the array bound the ring can never exceed (RING_MAX / ring_cap()).
+    static bool kv_stage_own_env();
+    static bool gr_unfused_env();
+    static int stager_ring_env();
+    static int ring_hard_cap();
+    /// FORK: the bytes the owned KV stage adds when STRATA_KV_STAGE_OWN is set (the loan counter skips them, as
+    /// they are not lent).  0 when the stage is not owned or the KV mode does not stream.
+    static uint64_t owned_stage_bytes(const core::ModelGeometry& g, const PrefillFacts& f);
+    /// FORK: the host-side price, next to the allocations it prices: `payload` is the fixed explicit staging
+    /// (token staging, routing heads, the stager's pinned flags, the mapped bounds tail) and `dynamic` the
+    /// counted storage whose size the engine's own bound fixes (the stager's job list and ready flags, the MoE
+    /// grouping arrays, the per-layer MMQ table, the draft layer's token staging, the streaming page table).
+    static bool host_allocation_from(const core::ModelGeometry& g, const PrefillFacts& f, int64_t chunk,
+                                     int stager_ring, bool mmq, int64_t max_jobs, uint64_t& payload,
+                                     uint64_t& dynamic);
+    // ---- END FORK (admission) ----
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -244,8 +270,6 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
-    static bool carve_layout(Impl& m, std::size_t T, void* alloc, void* owned_alloc);
-    static bool carve_fixed(Impl& m, void* alloc);
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };
