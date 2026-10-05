@@ -196,6 +196,20 @@ you use all the time stay on the counter, and the rest waits in the pantry.
 The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
 [the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
 
+## CLI logits diagnostics
+
+`--dump-logits PATH` writes a little-endian `int32 [vocabulary, rows]` header followed by full
+float32 target rows. Native IQ packs use the prompt path and committed verifier rows; canonical
+packs retain the per-position token loop. Keep the CPU expert pool enabled. `--logits-stride N`
+selects every Nth input and the final input; N greater than one requires `--max-new 1`.
+
+Completion checks the row count, actual file size, flush and close. Early EOS before the declared
+extent is a failed dump, not a shorter successful artifact. Detected failures remove unfinished
+output; SIGKILL can leave a partial file, which a consumer must reject by its header/byte count.
+The Linux `logits_dump_test` exercises the same production writer with write/flush/close failures
+and interruption. A structurally valid dump is a regression artifact, not independent numerical
+qualification of the model, arithmetic, or sampled speculation.
+
 ## Credits and license
 
 The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
