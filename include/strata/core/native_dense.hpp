@@ -29,10 +29,13 @@ public:
                              std::set<std::string>& out, std::string& err);
     /// HET-017: the VRAM `load` would ask for from these shards - weight blocks plus the shared Q8_1
     /// scratch - read from the GGUF headers only, so the pre-allocation admission gate prices the native
-    /// dense tier with the same arithmetic the loader allocates with.
+    /// dense tier with the same arithmetic the loader allocates with.  `layer_lo`/`layer_hi` are the same
+    /// stage bounds `load` takes (hi < 0 = every layer), and the same selection predicate decides both, so a
+    /// stage's price is the stage's upload.
     /// Optional source_bytes receives just the tensor payload working set read during upload (no scratch).
     static bool planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
-                              uint64_t& bytes, std::string& err, uint64_t* source_bytes = nullptr);
+                              uint64_t& bytes, std::string& err, uint64_t* source_bytes = nullptr,
+                              int64_t layer_lo = 0, int64_t layer_hi = -1);
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);

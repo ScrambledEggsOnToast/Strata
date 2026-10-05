@@ -1820,6 +1820,14 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[batch_key(rows, S, hbase)];
     if (ex != nullptr) return true;
+    // A graph is instantiated only through the qualification seam, the batch window included: the key carries the
+    // row count and the stage's layer range, so a denying observation scope ("no new graph-cache growth while
+    // serving") refuses this capture before the stream capture starts instead of growing the cache behind it.
+    // Preparing the batch keys that a run will use is part of the same contract as prepare_graphs and is not done
+    // here; until it is, a prepared-service scope reports the first unseen batch key as a denial rather than
+    // letting the capture through.
+    const GraphCaptureProbe probe({"verify", "batch-window", lb_, S, le_});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
@@ -1838,11 +1846,14 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    const bool instantiated = graph_capture_instantiate(probe, graph, ex, cs_, true, err);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) { err = std::string("verify: batch instantiate: ") + cudaGetErrorString(ie); return false; }
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
+    if (!instantiated) return false;
+    if (!probe.check(GraphCapturePhase::Retained, err)) {
+        cudaGraphExecDestroy(ex);
+        ex = nullptr;
+        return false;
+    }
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -1852,6 +1863,8 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& cex = commit_bm_[batch_key(rows, S, hbase)];
     if (cex != nullptr) return true;
+    const GraphCaptureProbe probe({"verify", "batch-commit", lb_, S, le_});
+    if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
@@ -1916,12 +1929,19 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&cex, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    const bool instantiated = graph_capture_instantiate(probe, graph, cex, cs_, true, err);
     cudaGraphDestroy(graph);
+    if (!instantiated) return false;
+    if (!probe.check(GraphCapturePhase::Retained, err)) {
+        cudaGraphExecDestroy(cex);
+        cex = nullptr;
+        return false;
+    }
     return true;
 }
 

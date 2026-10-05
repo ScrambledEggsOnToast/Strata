@@ -34,6 +34,24 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+/// The one place a native matrix's inclusion is decided, so pricing (`planned_bytes`) and loading (`load`)
+/// cannot drift apart: an eligible name, a kernel-supported type, a 2-D shape, the stage's layer range
+/// (`layer_hi >= 0`: only `blk.<l>` with `layer_lo <= l < layer_hi`, the PLE tensors everywhere) and the
+/// process-wide range `set_layer_range` installs.  Exactly `load`'s rule, character for character.
+/// The #326 case (a `blk.1.ple_key.weight` the canonical pack serves from the arena) is deliberately NOT here:
+/// it needs the canonical pack's own answer, which only `load` has.  A price that includes it is the safe
+/// direction (it can refuse a configuration, never under-price one) until the pricing call site can answer it.
+bool selects(const strata::TensorInfo& tensor, bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+    if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported(tensor.type) ||
+        tensor.shape.size() != 2)
+        return false;
+    if (layer_hi >= 0) {   // the loader's `outside`
+        const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+        if (l < layer_lo || l >= layer_hi) return false;
+    }
+    // the loader's global range, and its exception: every `ple` tensor loads on every stage
+    return in_range(tensor.name) || tensor.name.find("ple") != std::string::npos;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -61,8 +79,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
-bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
-                                uint64_t& bytes, std::string& err, uint64_t* source_bytes) {
+bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool include_ple_key, uint64_t& bytes,
+                                std::string& err, uint64_t* source_bytes, int64_t layer_lo, int64_t layer_hi) {
     bytes = 0;
     if (source_bytes) *source_bytes = 0;
     try {
@@ -72,9 +90,7 @@ bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool inc
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported(tensor.type) ||
-                    tensor.shape.size() != 2)
-                    continue;
+                if (!selects(tensor, include_ple_key, layer_lo, layer_hi)) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name;
                     return false;
@@ -129,11 +145,6 @@ NativeDense::~NativeDense() {
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
-    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
-        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
-        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
-        return l < layer_lo || l >= layer_hi;
-    };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -202,8 +213,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
-                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!selects(tensor, include_ple_key, layer_lo, layer_hi)) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }

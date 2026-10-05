@@ -1677,16 +1677,21 @@ bool FileExpertSource::pin_cache_complement(
                 // Keep six concurrent copies bounded by blobs, not whole
                 // layers: completed clean source pages can leave before the
                 // next expert is copied. Partial boundary pages stay mapped.
-                const uint64_t page = (uint64_t) page_size;
-                const uint64_t begin = layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
-                const uint64_t end = begin + blob_bytes;
-                const uint64_t first = begin + (page - begin % page) % page;
-                const uint64_t last = end - end % page;
-                if (last > first &&
-                    (madvise((void*) (base_ + (size_t) first), (size_t) (last - first), MADV_DONTNEED) != 0 ||
-                     posix_fadvise(fd_, (off_t) first, (off_t) (last - first), POSIX_FADV_DONTNEED) != 0)) {
-                    fail("FileExpertSource: could not release completed expert copy source pages");
-                    return;
+                // experts.bin only: in GGUF mode `base_` is the first shard's mapping and `fd_` is -1, so these
+                // logical offsets name nothing - the role mappings' pages are left to the OS (as the layer-level
+                // release below does). A GGUF-specific release needs each role's own mapping, fd and offset.
+                if (role_ptr_.empty()) {
+                    const uint64_t page = (uint64_t) page_size;
+                    const uint64_t begin = layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
+                    const uint64_t end = begin + blob_bytes;
+                    const uint64_t first = begin + (page - begin % page) % page;
+                    const uint64_t last = end - end % page;
+                    if (last > first &&
+                        (madvise((void*) (base_ + (size_t) first), (size_t) (last - first), MADV_DONTNEED) != 0 ||
+                         posix_fadvise(fd_, (off_t) first, (off_t) (last - first), POSIX_FADV_DONTNEED) != 0)) {
+                        fail("FileExpertSource: could not release completed expert copy source pages");
+                        return;
+                    }
                 }
 #endif
             }
