@@ -175,11 +175,6 @@ elseif(STRATA_ENABLE_CUDA)
     add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
   endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
-  # The flag has to REACH the sources.  Until now STRATA_EXPERIMENTAL_SM60 was a configure-time variable only, so
-  # src/core/device.cu's startup admission check kept refusing the Pascal/Volta cards whose code this build emits.
-  if(STRATA_EXPERIMENTAL_SM60)
-    add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
-  endif()
   set(_strata_gpu_runtime_target CUDA::cudart)
   set(_strata_gpu_blas_target CUDA::cublas)
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
