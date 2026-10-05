@@ -549,7 +549,9 @@ void test_windowed_direct_native_gguf() {
     }
     require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load the GGUF layout: " + err);
     require(expert_layout().gguf_off.size() == (size_t) (3 * layers) &&
-                expert_layout().gguf_file[(size_t) layers - 1] == "shardB.bin",
+                expert_layout().gguf_file.size() == (size_t) (3 * layers) &&
+                expert_layout().gguf_file[(size_t) (3 * (layers - 1))] == "shardB.bin" &&
+                expert_layout().gguf_file[(size_t) (3 * (layers - 1) + 2)] == "shardB.bin",
             "the plane offsets did not load");
 
     WindowedExpertSource::Config cfg;
@@ -587,6 +589,68 @@ void test_windowed_direct_native_gguf() {
     require(!src.ready(), "close did not release the GGUF ring");
 }
 #endif
+// #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
+// (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
+void test_host_memory() {
+    using namespace strata::core::detail;
+    constexpr uint64_t GiB = 1ull << 30;
+    HostMemory m;
+#if defined(__linux__)
+    TempDirectory t;
+    auto put = [&](const fs::path& rel, const std::string& text) {
+        fs::create_directories((t.path / rel).parent_path());
+        std::ofstream(t.path / rel) << text;
+    };
+    put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");   // 100 GiB available
+    const std::string mi = (t.path / "meminfo").string(), cg = (t.path / "cgroup").string(),
+                      root = (t.path / "fs").string();
+    auto probe = [&](const std::string& self) {
+        put("cgroup", self);
+        return host_available_memory(m, mi, cg, root);
+    };
+    // no cgroup line at all: MemAvailable alone (before #633: "cannot determine")
+    require(probe("") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup: MemAvailable alone");
+    // v2, a 48 GiB limit with 16 GiB charged, 4 GiB of it clean cache.  The stat carries all seven counters the
+    // credit rule reads (active_file/inactive_file/file/shmem/unevictable/file_dirty/file_writeback): the rule
+    // is one rule, and it refuses to credit a group whose counters it cannot see, so a three-key memory.stat
+    // (the shape this fixture had before the merge with the fork's conservative credit) is a refusal, not a
+    // smaller credit.
+    put("fs/cgroup.controllers", "memory\n");
+    put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");
+    put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
+    put("fs/box/memory.stat", "active_file 0\ninactive_file " + std::to_string(4 * GiB) +
+                                  "\nfile " + std::to_string(4 * GiB) +
+                                  "\nshmem 0\nunevictable 0\nfile_dirty 0\nfile_writeback 0\n");
+    require(probe("0::/box\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB, "v2 limit");
+    // and the same group with the counters the rule needs missing: refused, not credited from the three keys
+    // the pre-merge fixture wrote
+    put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+    require(!probe("0::/box\n"), "a memory.stat without the credit rule's counters was accepted");
+    put("fs/box/memory.stat", "active_file 0\ninactive_file " + std::to_string(4 * GiB) +
+                                  "\nfile " + std::to_string(4 * GiB) +
+                                  "\nshmem 0\nunevictable 0\nfile_dirty 0\nfile_writeback 0\n");
+    put("fs/box/memory.max", "max\n");
+    require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 max");
+    put("fs/box/memory.max", "48G\n");
+    require(!probe("0::/box\n"), "v2 malformed limit accepted");
+    fs::remove(t.path / "fs/box/memory.max");
+    require(!probe("0::/box\n"), "v2 group without memory.max accepted");
+    // v1: the memory controller's group (a hybrid line list), a 32 GiB limit with 10 GiB used
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
+    put("fs/memory/memory.limit_in_bytes", "9223372036854771712\n");   // the root: unlimited
+    put("fs/memory/memory.usage_in_bytes", std::to_string(50 * GiB) + "\n");
+    require(probe("12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n1:name=systemd:/docker/abc\n") &&
+            m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "v1 limit");
+    put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
+    require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
+    // a v1 group not visible here (another namespace): MemAvailable alone
+    require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
+#else
+    require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
+    (void) GiB;
+#endif
+}
 
 }  // namespace
 
@@ -596,6 +660,7 @@ int main() {
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+        test_host_memory();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
