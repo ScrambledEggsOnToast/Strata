@@ -466,6 +466,141 @@ Without the key nothing is counted or written. Setup rewrites the config when ru
 
 ---
 
+## Memory admission (HET-017)
+
+Before the first model allocation (including the native embedding and PCIe probe), the engine prices the
+configuration from actual pack source/destination spans, GGUF tensor blocks, session arithmetic and the
+expert layout. Both measured total **and free** VRAM must cover each device's demand plus headroom;
+another process's occupied VRAM is not available capacity. Native dense overrides are counted whenever
+the loader enables them, including canonical packs, and the native head includes its Q8_1 scratch.
+
+`--expert-cache auto` (also the profile's implicit auto mode) commits an allocation budget at this gate:
+`floor((min(total, free) - fixed allocations - headroom) / max_blob) * max_blob`, bounded by the model's
+expert count and profile length. Runtime sizing may shrink that budget but never enlarge it. The native
+embedding is priced in host RAM and as a possible device fallback, so failure to pin it cannot silently
+spend the admitted headroom. Expert arena registration defaults to at most 8 GiB, not the entire guest.
+Resident expert complements above 8 GiB use pageable resident RAM rather than pinning the whole allocation.
+The runtime complement is capped by its admitted bytes, so cache shrinking cannot create an unpriced
+larger RAM copy; if the mandatory complement no longer fits, resident allocation refuses.
+
+Startup and runtime guest/physical-host scopes are admitted independently. The full mmap expert
+source is charged page-rounded, not as a two-layer access window: access demand is not an eviction
+guarantee. Native dense/head/embedding, canonical and MTP upload source pages remain charged in both
+phases alongside destination allocations. Only explicitly released anonymous conversion/PCIe scratch
+is startup-only. PLE direct cache/inflight storage or full mmap/locked GGUF pages, conversation state,
+prefill staging and request handoffs are named separately. Locked PLE is still filesystem-backed and
+has a physical-host source-cache mirror; it is not eligible for clean-cache credit.
+
+Physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
+not physical-host telemetry. Already-resident QEMU backing is reflected in host MemAvailable, so the
+host scope charges unbacked guest allocation plus retained filesystem-source mirrors, without sharing
+credit. Advisory release, unmap and close cannot reduce these envelopes. All derived byte arithmetic
+and class totals refuse on overflow.
+
+The guest and available-host envelopes retain their reserve floors (4 GiB and 8 GiB;
+`--guest-reserve-mib` / `--host-reserve-mib` cannot go lower). Unpriced classes or unavailable telemetry
+refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts currently refuse by name
+because their allocation budgets are not knowable at this gate; they are not silently priced as zero.
+CUDA graph executable/capture storage and opaque prefill driver/cuBLAS/runtime storage remain
+unqualified and refuse by name. Explicit prefill device buffers now share checked sizing with the
+allocator, including the full loan region, separately owned buffers and bounded MMQ scratch;
+fixed host payload and counted init-bound jobs/ready, stream plans, grouping arrays and
+draft/init transients are separate rows. Job buffers refill only after prior workers finish;
+relayout does not grow them. Allocator metadata, vector capacity excess in unchanged containers,
+thread stacks and opaque event/context storage remain unknown rather than being hidden in payload.
+Serving prefill is charged regardless of the initial one-token placeholder. These explicit bounds
+do not qualify a complete full-model peak or permit spending headroom on unknown allocations.
+The current candidate has native SM70/SM86 compilation, host-only allocation/source tests and CLI
+refusal smoke proof, not admitted full-model runtime validation; HET-017 remains open and this is
+not deployed as a qualified serving engine. V100 runtime remains untested.
+`PLAN admit=... limiting=...` reports device demand/headroom and guest/host demand/ceilings plus the
+automatic cache byte budget. Every allocation class is logged with scope, name, bytes, unknown flag and
+allocator provenance. Requests emit `ADMIT cells=... state_demand_bytes=...` before work, or `REJECT ...`
+for an overfull context. `--admission-headroom-mib` sets explicit device headroom (default:
+`--vram-reserve-mib`).
+`strata-plan --json` runs the same decision standalone - per device, guest and host, with labelled
+hypothetical future capacities that are reported but never admitted - as the document
+`schemas/memory-plan.schema.json` describes.
+
+### A declared MPS client ceiling
+
+When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes that client's total
+device budget at creation (`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`) and names the control pipe
+(`CUDA_MPS_PIPE_DIRECTORY`). `src/platform/mps_ceiling.cpp` reads that pair **before the first CUDA
+call** and refuses the run when the pair is incomplete, when the pipe is missing, unreachable, not a
+directory or not owned by this user or root, or when the limit is unreadable. Nothing is guessed at:
+both variables absent means no ceiling was declared and no behaviour changes.
+
+Inside an MPS client `cudaMemGetInfo` reports the remaining *client budget*, not device free memory, so
+the first measurement also requires the reported free bytes to be at or below the declared ceiling. A
+client that carries the variable with nothing enforcing it - no daemon, or a daemon it never attached to
+- silently sees the whole device instead; that case is refused by name rather than planned against, and
+it is the failure mode the isolated qualification measured (`evidence/HET-017/clientcap-qualification.json`
+in the project repository). The device line's ceiling is therefore the tighter of the driver total and
+the client budget, which is also what bounds `--expert-cache auto`: a 1 GiB client budget grants zero
+cache slots instead of silently over-committing, and the plan reports both the ceiling and
+`enforced_cap_bytes`.
+
+`--windowed-experts --adapt-swaps 0` selects a fixed one-layer direct-I/O source ring for
+canonical/native `experts.bin` or native GGUF planes. No buffered fallback is used. Raw expert
+pointers expire at every explicit layer boundary or first fetch for a different layer; supported
+consumers finish their reads before recycling. Static caching requires `--expert-profile`, and
+prefill/serving requires `STRATA_PREFILL_RING=8` to exclude whole-chunk pointer retention.
+Splits, mmap/resident/shared arenas, adaptive and remote caches are refused. The ring's byte
+bound does not bound reader stacks/metadata or source page cache. Admission still charges the
+full guest/physical-host source-page envelope: guest O_DIRECT alone cannot prove host bypass,
+particularly when virtiofsd does not enable direct I/O. This mode does not yet make the current
+full model safely admissible.
+
+### Graph capture qualification seams
+
+`GraphCaptureObservationScope` in `core/graph.hpp` installs a thread-local boot/calibration hook.
+It receives a capture key (family, variant, layer/step index, width, auxiliary range/prefix), current
+CUDA device, free/total VRAM and, on Linux, process RSS and process lifetime peak RSS. Capture seams
+emit `BeforeCapture`, `AfterCapture`, `AfterInstantiate`, `AfterUpload` and `Retained`; observations
+force checked upload and stream synchronization without executing the graph. No observation runs
+inside active stream capture. Cache hits do not invoke the hook. Returning false before capture
+refuses new graph-cache growth; refusal after a sample destroys the new executable before serving.
+Session capture failures also release partial layer graphs and temporary capture streams.
+
+`Verifier::prepare_graphs` prepares widths 1 through its configured maximum plus commit, including
+chained stages. `MtpDrafter::prepare_graphs` prepares both prefill input paths, all round widths and
+reachable chain steps, plus coupled variants when configured. These methods capture/upload only;
+they do not run model kernels or modify model state. Configure graph-affecting modes before preparation.
+While serving, keep a scope that rejects every `BeforeCapture` on **each** request/capture thread.
+An incomplete preparation is a startup failure: discard those model/graph owners rather than serve.
+MTP's separately growing prompt input allocation is not graph storage and is not covered by this hook.
+Bracket the entire preparation externally as well: layer pointer arrays and caller state precede the
+first per-graph sample. For each device report baseline free VRAM, final retained free VRAM, minimum
+sampled free VRAM and sample count. Observed incremental peak is `max(0, baseline - minimum)`;
+retained delta is `max(0, baseline - final)`. A negative raw delta indicates changing device occupancy
+and must not be treated as graph credit. Host RSS deltas are process-wide; a lifetime peak that already
+predates capture cannot isolate capture's host peak. Neither reading covers guest/host-wide source
+cache, QEMU backing, driver kernel memory or every locked-memory charge; protected supervisor
+measurements must continue to cover those scopes.
+
+These are **measurements, not an allocator hard cap**. CUDA's [graph memory attribute API](https://docs.nvidia.com/cuda/archive/12.0.1/cuda-runtime-api/group__CUDART__GRAPH.html)
+reports the graph asynchronous allocation-node allocator; its setters reset watermarks, not a storage
+limit. It does not price all graph executable/driver storage. `cudaGraphUpload` uses stream-cached
+memory to back executable allocations, so source graph destruction does not imply all overhead was
+released. Free-VRAM point samples can miss a transient peak inside capture, instantiate or upload;
+the measured incremental peak is a **lower bound**, not a preallocation guarantee. Post-call rejection,
+polling, an arbitrary allowance, or a sacrificial device allocation cannot be represented as a documented
+hard bound on all opaque driver allocations.
+
+Protected calibration must therefore remain a non-serving, non-promotion experiment unless its
+supervisor can enforce the required complete device/guest/host allocation envelope throughout each
+opaque call. Pin model/artifact hashes, binary, CUDA runtime/driver, GPU UUID, context, device placement,
+widths and every graph-affecting option; admit known weights/state/source lifetimes first, commit the
+finite experimental graph allowance separately, then prepare the entire cache while preserving all
+existing thermal and memory floors. Record independent device/process/guest/physical-host observations
+through capture, upload, first execution, repeated execution and destruction, with sampling interval
+and missed-transient uncertainty explicit. A receipt is empirical for that tuple, not a worst-case CUDA
+storage bound; an unobserved width/configuration/runtime must refuse before new capture. On a 3090,
+the reviewed CUDA graph APIs provide no executable allocator budget/arena contract. If the protected
+environment cannot enforce the opaque phase's full bound, strict precommitted-cap qualification remains
+unresolved: measurements alone must not promote this candidate to safely admitted full-model serving.
+
 ## Using it
 
 The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or edit the run script).
