@@ -26,6 +26,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/verify_ownership.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -88,7 +89,13 @@ public:
     /// Distinguishes independently in-flight verifier stages sharing one dispatch.
     void set_worker_lane(int lane) { worker_lane_ = lane; }
 
-    /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
+    /// All APIs have ONE host submitter. Reject overlapping/uncommitted windows;
+    /// watchdog release poisons the verifier permanently. Bind a nonzero caller
+    /// ID at every serving request start, before touching request state/staging.
+    /// Legacy non-serving callers may leave it zero: staging is still checked,
+    /// but diagnostics label that identity unbound, never a request-ID proof.
+    bool set_request_id(uint64_t request_id, std::string& err);
+    /// One window: tokens[0..T) at consecutive positions, out[t] = head pick.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
@@ -147,13 +154,16 @@ public:
     // per window for all the sequences.  Row s's arithmetic is the single-token window's, so a slot's greedy
     // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice: STRATA_IQ_MT_MIN=1).
     //
-    // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
+    // Request-local sampling and penalties; no drafts (MTP) in a batch window. `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
+    /// Capture cache is capped at kVerifyBatchGraphKeys distinct row-order/base
+    /// keys (window + commit per key). An unseen key past the cap is rejected
+    /// before capture; graphs are never evicted while a request can use them.
     /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
@@ -161,22 +171,23 @@ public:
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
 
-    // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
-    // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
-    // keeps every row, so the commit needs no host decision), and the host serves the rings of every stage that has
-    // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
-    // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share a hand-off row.
-    bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    // ---- The stages of a layer split as a PIPELINE. A window carries only the active `rows` of a group.
+    // It launches on ONE stage with its commit immediately behind it; the host serves every stage's rings
+    // from one thread (batch_poll does not block). Packed row t uses hand-off row base+t on every stage.
+    // Group hand-off ranges remain disjoint, and inactive resident state is neither read nor committed.
+    bool batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
-    /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
-    /// default.  Set on the first stage, it reaches the last.
-    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
-        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
-        if (next_) next_->set_slot_sampling(slot, sp);
+    /// Bind/rebind an idle resident slot at admission. IDs must be nonzero and
+    /// distinct across slots. History stays alive until rebind; do not mutate it
+    /// while an operation owns scratch. Also forwards to chained stages.
+    bool set_slot_context(int slot, uint64_t request_id, const strata::kernels::SamplerParams& sp,
+                          const std::vector<int32_t>* history, bool steering, std::string& err);
+    /// Last GPU-validated owner, zero before validation/rebind or after failure.
+    uint64_t validated_slot_request_id(int slot) const {
+        return !released_.load() && slot >= 0 && slot < (int) slots_.size() ? validated_slot_id_[slot] : 0;
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -253,6 +264,43 @@ private:
     std::chrono::steady_clock::time_point b_last_;
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    const std::vector<int32_t>* slot_history_[8] = {};
+    int slot_steering_[8] = {};
+    int32_t* steering_b_ = nullptr;
+    int32_t* history_b_ = nullptr;
+    std::vector<int32_t> history_stage_b_;
+    int history_len_b_[8] = {};
+    VerifyScratchOwnership scratch_;
+    // On every exit after acquisition, either transfer ownership explicitly or
+    // drain/poison launched work. Unlaunched setup failures are safely retryable.
+    struct ScratchGuard {
+        Verifier& v;
+        bool launched = false;
+        bool keep = false;
+        ~ScratchGuard();
+    };
+    bool acquire_scratch(std::string& err);
+    bool context_idle(std::string& err);
+    bool fail_operation(std::string& err);
+    bool reserve_batch_key(uint64_t key, std::string& err);
+    bool observe_committed_rows(int count, std::string& err);
+    void* h_route_trace_ = nullptr;
+    void* m_route_trace_ = nullptr;
+    uint64_t observed_rows_ = 0;
+    std::FILE* row_trace_ = nullptr;
+    uint64_t request_id_ = 0, canary_epoch_ = 0;
+    uint64_t slot_request_id_[8] = {};
+    uint64_t validated_slot_id_[8] = {};
+    VerifyCanaryInput expected_canary_[8] = {};
+    VerifyCanaryInput *h_canary_ = nullptr, *m_canary_ = nullptr;
+    VerifyCanaryOwner *h_owner_ = nullptr, *m_owner_ = nullptr;
+    VerifyCanaryOwner* owner_ = nullptr;
+    VerifyCanaryOutput *canary_ = nullptr, *h_canary_out_ = nullptr, *m_canary_out_ = nullptr;
+    VerifyCanaryOutput *h_canary_commit_ = nullptr, *m_canary_commit_ = nullptr;
+    void stage_canaries(const int* rows, int T, const int32_t* tokens, const int64_t* pos, int64_t pos0);
+    void record_canaries(int T, const int* rows, bool begin, bool commit, cudaStream_t stream);
+    bool check_canaries(bool commit, std::string& err);
+    bool validate_slot_context(int slot, std::string& err);
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -285,7 +333,6 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
-    bool staged_ = false;
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);

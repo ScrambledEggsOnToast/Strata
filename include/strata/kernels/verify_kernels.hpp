@@ -15,10 +15,31 @@
 #pragma once
 
 #include <cstdint>
+#include "strata/core/verify_ownership.hpp"
 
 namespace strata::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
+
+// Each row's graph bakes its slot/owner address exactly as its session-state
+// kernels do. Start copies mapped request staging into owned device scratch;
+// finish rechecks independent owners, live staging, token/position and the
+// resident steering row actually consumed by cvec_apply. No model arithmetic.
+void verify_canary_begin(const core::VerifyCanaryInput* input, const core::VerifyCanaryOwner* owner,
+                         int graph_slot, const int32_t* token, const int32_t* position,
+                         const int32_t* steering, core::VerifyCanaryOutput* scratch, void* stream);
+void verify_canary_finish(const core::VerifyCanaryInput* input, const core::VerifyCanaryOwner* owner,
+                          int graph_slot, const int32_t* token, const int32_t* position,
+                          const int32_t* steering, core::VerifyCanaryOutput* scratch,
+                          const int32_t* output_token, core::VerifyCanaryOutput* output,
+                          uint32_t phase, void* stream);
+
+void operation_inputs_stage(core::OperationInputs value, core::OperationInputs* destination, void* stream);
+// draft_step < 0: consecutive catch-up rows; >= 0: accepted row plus draft_step.
+// A chain step consumes the previous graph's independent mapped output token.
+void operation_inputs_check(core::OperationInputs* expected, core::VerifyCanaryOutput* scratch,
+                            const int32_t* tokens, const int32_t* steps, const int32_t* positions,
+                            int rows, int heads, int draft_step, const int32_t* previous, void* stream);
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.

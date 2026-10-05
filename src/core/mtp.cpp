@@ -3,6 +3,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/graph.hpp"
+#include "strata/core/conversation_snapshot.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -29,6 +30,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -107,9 +109,50 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }
 
 }  // namespace
+MtpDrafter::Operation::Operation(MtpDrafter& owner, std::string& err, int slot, cudaStream_t external,
+                                int32_t token, int32_t position)
+    : owner_(owner), slot_(slot), external_(external) {
+    acquired_ = !owner_.scratch_owned_.test_and_set(std::memory_order_acquire);
+    if (!acquired_) { err = "mtp: operation scratch is in flight or poisoned by a failed operation"; return; }
+    owner_.canary_.begin(slot_, owner_.cs_, token, position);
+}
+
+MtpDrafter::Operation::~Operation() {
+    if (acquired_ && !finished_) {
+        const OnDevice on(owner_.device_);
+        for (cudaStream_t stream : {external_, owner_.cs_})
+            if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
+    }
+    // Failed work remains poisoned: draining does not repair partially written request state.
+}
+
+bool MtpDrafter::Operation::finish(std::string& err) {
+    if (!acquired_) return false;
+    if (external_ && cudaStreamSynchronize(external_) != cudaSuccess) {
+        err = "mtp: external prefill stream failed"; return false;
+    }
+    owner_.canary_.check(slot_, owner_.cs_);
+    if (!owner_.idle(err) || !owner_.canary_.validate("mtp", err)) return false;
+    finished_ = true;
+    owner_.scratch_owned_.clear(std::memory_order_release);
+    return true;
+}
+
+bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
+    const OnDevice on(device_);
+    if (!g_) return true;
+    if (scratch_owned_.test_and_set(std::memory_order_acquire)) {
+        err = "mtp: owner rebind while scratch is in flight or poisoned"; return false;
+    }
+    const bool ok = canary_.bind(slot, request, err);
+    if (ok) scratch_owned_.clear(std::memory_order_release);
+    return ok;
+}
+
 
 MtpDrafter::~MtpDrafter() {
-    if (cs_) cudaStreamSynchronize(cs_);
+    const OnDevice on_device(device_);
+    if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) std::terminate();
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -117,6 +160,17 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& slot : slots_) {
+        if (slot.advance) cudaGraphExecDestroy(slot.advance);
+        qsa_state_release(slot.state);
+        if (slot.arena) {
+            if (cudaFree(slot.arena) != cudaSuccess) std::terminate();
+            if (std::getenv("STRATA_STATE_HASH"))
+                std::fprintf(stderr, "STATE_DRAFT_ALLOCATION slot=%zu phase=release bytes=%llu\n",
+                             (size_t) (&slot - slots_.data()), (unsigned long long) slot.arena_bytes);
+        }
+    }
+    qsa_state_release(st_);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -224,6 +278,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
+    struct RestoreKvFormat {
+        bool hybrid, int8;
+        ~RestoreKvFormat() { qsa_set_kv_int8(int8); qsa_set_kv_hybrid(hybrid); }
+    } restore_format{kv_hybrid_was, kv_int8_was};
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
@@ -232,7 +290,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
+        qsa_state_release(st_);
         cudaFree(state_arena_);
+        state_arena_ = nullptr;
         st_ = QsaState{};
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
@@ -259,6 +319,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_);
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
+    if (!canary_.init(err)) return false;
+    vram_ += kOperationCanaryDeviceBytes;
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
         ident_ = b.take<int32_t>(T * (uint64_t) cap_);
@@ -370,16 +432,26 @@ bool MtpDrafter::setup_coupled(std::string& err) {
 }
 
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
+    const OnDevice on_device(device_);
+    std::string err;
+    Operation operation(*this, err);
+    if (!operation) std::terminate();
     coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
-    if (!coupled_active_) return;
+    if (!coupled_active_) { if (!operation.finish(err)) std::terminate(); return; }
     *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
+    if (!operation.finish(err)) std::terminate();
 }
 
 void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next) {
-    if (!coupled_active_) return;
+    const OnDevice on_device(device_);
+    std::string err;
+    Operation operation(*this, err);
+    if (!operation) std::terminate();
+    if (!coupled_active_) { if (!operation.finish(err)) std::terminate(); return; }
     const int h = coupled_hist_len(h_cparams_->penalty_last_n, kCoupledHistCap);
     coupled_hist_base(tail, n_tail, next, h, h_chist_ + (kCoupledHistCap - h));
+    if (!operation.finish(err)) std::terminate();
 }
 
 namespace {
@@ -456,14 +528,17 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
-    return true;
+    if (!prepare_slots(err)) return false;
+    const char* probe = std::getenv("STRATA_MTP_CANARY_PROBE");
+    return !probe || probe[0] != '1' || check_input_graphs(err);
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, const QsaState* state) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
+    const QsaState& kv = state ? *state : st_;
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
     const int row0 = full ? step_row0 : -1 - step_row0;
@@ -514,27 +589,27 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
             if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
-            else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
+            else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, kv.cos_tab, kv.sin_tab, p, cs);
         };
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
-            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+            if (kv.kv_rot) {   // rotated K and V use this request's state format
                 fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
                 fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
             }
             // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-            if (st_.kv_q4)
-                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                  vcur_ + t * NKV * HD, s, cs, &st_.host);
-            else if (st_.kv_int8)
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
+            if (kv.kv_q4)
+                kv_append_q4_step(kv.k_q4, kv.v_q4, kv.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                  vcur_ + t * NKV * HD, s, cs, &kv.host);
+            else if (kv.kv_int8)
+                kv_append_q8_step(kv.k_q, kv.v_q, kv.k_scale, kv.v_scale, kv.page_table, step + t * 4,
+                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &kv.host);
             else
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs, &st_.host);
+                kv_append_step(kv.k_pool, kv.v_pool, kv.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                               vcur_ + t * NKV * HD, s, cs, &kv.host);
         }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
@@ -546,12 +621,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 return false;
             }
             norm_rope(qc, f32("self_attn.q_norm.weight"), (int) NH, (int) HD, pos + t * NH);
-            if (st_.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
+            if (kv.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
         }
-        const QsaAttnPools pools = qsa_attn_pools(st_);
+        const QsaAttnPools pools = qsa_attn_pools(kv);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
-        if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        if (kv.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         for (int t = 0; t < T; ++t)
             native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
@@ -677,9 +752,125 @@ bool finish_capture(const GraphCaptureProbe& probe, cudaStream_t cs, bool ok, cu
 }
 }  // namespace
 
+bool MtpDrafter::init_slots(const std::vector<SessionState*>& sessions, std::string& err) {
+    if (!g_ || !cs_ || !slots_.empty() || sessions.empty() || sessions.size() > 8) {
+        err = "mtp: invalid resident slot initialization"; return false;
+    }
+    const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    if (!operation) return false;
+    struct RestoreFormat {
+        bool hybrid = qsa_kv_hybrid(), int8 = qsa_kv_int8();
+        ~RestoreFormat() { qsa_set_kv_hybrid(hybrid); qsa_set_kv_int8(int8); }
+    } restore;
+    qsa_set_kv_hybrid(false);
+    qsa_set_kv_int8(st_.kv_int8);
+    const int64_t ring = st_.kv_mode == 2 ? st_.n_slots * shapes_of(*g_).page_size : -1;
+    const uint64_t bytes = qsa_state_bytes(*g_, st_.max_cells, false, ring);
+    slots_.resize(sessions.size());
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        auto& slot = slots_[i];
+        if (!sessions[i] || sessions[i]->max_cells != st_.max_cells ||
+            cudaMalloc(&slot.arena, bytes) != cudaSuccess) {
+            err = "mtp: resident request K/V allocation failed"; return false;
+        }
+        slot.arena_bytes = bytes;
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "STATE_DRAFT_ALLOCATION slot=%zu phase=allocate bytes=%llu\n",
+                         i, (unsigned long long) bytes);
+        if (qsa_state_init(*g_, st_.max_cells, slot.arena, slot.state, &st_, ring) == 0) {
+            err = "mtp: resident request K/V initialization failed"; return false;
+        }
+        qsa_state_zero(slot.state, *g_, cs_);
+        vram_ += bytes;
+    }
+    return operation.finish(err);
+}
+
+bool MtpDrafter::prepare_slots(std::string& err) {
+    using namespace strata::kernels;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        auto& slot = slots_[i];
+        if (slot.advance) continue;
+        const GraphCaptureProbe probe({"mtp", "resident_slot", (int64_t) i, 1, 0});
+        if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
+        if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            err = "mtp: resident slot capture failed"; return false;
+        }
+        copy_i32_from_mapped(tok_, m_tok_, 1, cs_);
+        copy_i32_from_mapped(step_, m_step_, 4, cs_);
+        copy_i32_from_mapped(pos_, m_pos_, g_->n_head, cs_);
+        canary_.check((int) i, cs_, tok_, pos_);
+        const bool ok = record_forward(1, -1, cs_, err, &slot.state);
+        if (ok) canary_.check((int) i, cs_, tok_, pos_);
+        if (!finish_capture(probe, cs_, ok, slot.advance, "resident slot", err)) return false;
+    }
+    return true;
+}
+
+const QsaState* MtpDrafter::slot_state(int slot) const {
+    return slot >= 0 && (size_t) slot < slots_.size() ? &slots_[(size_t) slot].state : nullptr;
+}
+
+bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
+    if (!slot_state(slot) || cells < 0 || cells > st_.max_cells) {
+        err = "mtp: invalid slot save"; return false;
+    }
+    const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    if (!operation) return false;
+    if (!idle(err)) return false;
+    ConversationKv image;
+    if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
+        !conversation_kv_restore(image, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+    slots_[(size_t) slot].cells = cells;
+    return operation.finish(err);
+}
+
+bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
+    if (!slot_state(slot) || cells < 0 || cells > slots_[(size_t) slot].cells) {
+        err = "mtp: invalid slot resume extent"; return false;
+    }
+    const OnDevice on_device(device_);
+    if (!idle(err)) return false;
+    Operation operation(*this, err);
+    if (!operation) return false;
+    ConversationKv image;
+    if (!conversation_kv_save(image, slots_[(size_t) slot].state, *g_, cells, false, err) ||
+        !conversation_kv_restore(image, st_, *g_, cells, false, err)) return false;
+    restore_ring(cells);
+    return operation.finish(err);
+}
+
+bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_token,
+                              int64_t cell, std::string& err) {
+    if (!slot_state(slot) || !slots_[(size_t) slot].advance || !residual ||
+        cell != slots_[(size_t) slot].cells || cell >= st_.max_cells) {
+        err = "mtp: resident slot position or graph mismatch"; return false;
+    }
+    const OnDevice on_device(device_);
+    Operation operation(*this, err, slot, nullptr, next_token, (int32_t) cell);
+    if (!operation) return false;
+    // Every public operation drains this stream before releasing the shared scratch.
+    h_tok_[0] = next_token;
+    h_step_[0] = (int32_t) cell; h_step_[1] = (int32_t) (cell + 1);
+    h_step_[2] = (int32_t) ((cell + 1) / 4); h_step_[3] = (int32_t) (cell + 1);
+    for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[h] = (int32_t) cell;
+    if (cudaMemcpyAsync(Rin_, residual, (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+        cudaGraphLaunch(slots_[(size_t) slot].advance, cs_) != cudaSuccess || !idle(err)) {
+        if (err.empty()) err = "mtp: resident slot advance failed";
+        return false;
+    }
+    ++slots_[(size_t) slot].cells;
+    return operation.finish(err);
+}
+
 bool MtpDrafter::prepare_graphs(std::string& err) {
     if (!wt_ || !head_ || !window_R_ || !cs_) { err = "mtp: prepare requires bind"; return false; }
     const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    if (!operation) return false;
     for (int T = 1; T <= max_t_; ++T) {
         if (!capture_prefill(T, err) || !capture_prefill_dev(T, err) || !capture_round(T, false, err))
             return false;
@@ -689,6 +880,75 @@ bool MtpDrafter::prepare_graphs(std::string& err) {
         if (!capture_step(j, false, err)) return false;
         if (coupled_ok_ && !capture_step(j, true, err)) return false;
     }
+    return operation.finish(err);
+}
+
+bool MtpDrafter::check_input_graphs(std::string& err) {
+    // Exercise the actual captured model graphs, not a replica of their staging.
+    // Every corruption is a valid in-range token/position. Only private draft state
+    // and operation scratch are touched; reset both before admitting a request.
+    const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    if (!operation) return false;
+    const int T = std::min(4, max_t_);
+    if (T < 3 || st_.max_cells < 8 || n_vocab_ <= 76) {
+        err = "mtp graph canary probe requires width >=3 and bounded input cells"; return false;
+    }
+    if (!idle(err)) return false;
+    int graphs = 0, controls = 0;
+    const int32_t expected[] = {71, 72, 73, 74};
+    for (int variant = 0; variant < (coupled_ok_ ? 6 : 4); ++variant) {
+        const bool chain = variant == 3 || variant == 5;
+        const bool coupled = variant >= 4;
+        if ((variant == 0 && !capture_prefill(T, err)) ||
+            (variant == 1 && !capture_prefill_dev(T, err)) ||
+            ((variant == 2 || variant == 4) && !capture_round(T, coupled, err)) ||
+            (chain && !capture_step(1, coupled, err))) return false;
+        const cudaGraphExec_t graph = variant == 0 ? prefill_exec_[T] : variant == 1 ? prefill_dev_exec_[T] :
+            chain ? (coupled ? step_exec_c_[1] : step_exec_[1]) : (coupled ? round_exec_c_[T] : round_exec_[T]);
+        for (int fault = 0; fault < 4; ++fault) {
+            qsa_state_zero(st_, *g_, cs_);
+            canary_.begin(8, cs_);
+            canary_.stage_inputs(expected, T, 0, 1, cs_);
+            for (int t = 0; t < T; ++t) h_tok_[t] = expected[t];
+            for (int row = 0; row < 2 * max_t_; ++row) {
+                const int cell = row == 2 * max_t_ - 1 ? 1 : row >= max_t_ ? row - max_t_ + 2 : row;
+                h_step_[row * 4] = cell; h_step_[row * 4 + 1] = cell + 1;
+                h_step_[row * 4 + 2] = (cell + 1) / 4; h_step_[row * 4 + 3] = cell + 1;
+                for (int h = 0; h < g_->n_head; ++h) h_pos_[row * g_->n_head + h] = cell;
+            }
+            h_row_[0] = 1; h_row_[1] = 0;
+            h_out_[0] = 75;
+            if (chain) h_tok_[0] = 75;
+            const int row = chain ? max_t_ : 0;
+            if (fault == 1) ++h_tok_[0];
+            if (fault == 2) ++h_step_[row * 4 + 1];
+            if (fault == 3) ++h_pos_[row * g_->n_head + g_->n_head - 1];
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata::kernels::copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+            strata::kernels::copy_i32_from_mapped(step_, m_step_, 2 * max_t_ * 4, cs_);
+            strata::kernels::copy_i32_from_mapped(pos_, m_pos_, 2 * max_t_ * g_->n_head, cs_);
+            strata::kernels::copy_i32_from_mapped(row_, m_row_, 2, cs_);
+            const size_t residual_bytes = (size_t) T * g_->hc * g_->n_embd * sizeof(float);
+            if (cudaMemsetAsync(Rin_, 0, residual_bytes, cs_) != cudaSuccess ||
+                cudaMemsetAsync(const_cast<float*>(window_R_), 0, residual_bytes, cs_) != cudaSuccess ||
+                cudaGraphLaunch(graph, cs_) != cudaSuccess) { err = "mtp graph canary probe launch failed"; return false; }
+            canary_.check(8, cs_); // later owner-only checks must preserve the detected corruption
+            if (!idle(err)) return false;
+            std::string observed;
+            const bool valid = canary_.validate("mtp-probe", observed);
+            if (valid != (fault == 0)) {
+                err = "mtp graph input control failed: variant=" + std::to_string(variant) + " fault=" + std::to_string(fault);
+                return false;
+            }
+            ++controls;
+        }
+        ++graphs;
+    }
+    qsa_state_zero(st_, *g_, cs_);
+    canary_.begin(8, cs_);
+    if (!operation.finish(err)) return false;
+    std::fprintf(stderr, "MTP_INPUT_CANARIES graphs=%d controls=%d failures=0\n", graphs, controls);
     return true;
 }
 
@@ -700,8 +960,11 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
+    canary_.check(8, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
+    canary_.check_inputs(tok_, step_, pos_, T, (int) g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
+    if (ok) canary_.check(8, cs_);
     return finish_capture(probe, cs_, ok, prefill_exec_[T], "prefill", err);
 }
 
@@ -710,7 +973,10 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     const GraphCaptureProbe probe({"mtp", "prefill_device", 0, T, 0});
     if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    canary_.check(8, cs_);
+    canary_.check_inputs(tok_, step_, pos_, T, (int) g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
+    if (ok) canary_.check(8, cs_);
     return finish_capture(probe, cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
 
@@ -722,6 +988,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    canary_.check(8, cs_);
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -730,6 +997,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
     copy_i32_from_mapped(row_, m_row_, 2, cs_);
     copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    canary_.check_inputs(tok_, step_, pos_, T, (int) g_->n_head, cs_);
     // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
     // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
     // (`capture_step`) so the host can stop it when a draft is unlikely
@@ -739,12 +1007,14 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     if (ok) {
         copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
         copy_i32_from_mapped(pos_ + ra * g_->n_head, m_pos_ + ra * g_->n_head, g_->n_head, cs_);
+        canary_.check_inputs(tok_, step_ + ra * 4, pos_ + ra * g_->n_head, 1, (int) g_->n_head, cs_, 0);
         coupled_rec_ = coupled;
         coupled_j_ = 0;
         ok = record_forward(1, ra, cs_, err);
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok) canary_.check(8, cs_);
     return finish_capture(probe, cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
 
@@ -759,28 +1029,42 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    canary_.check(8, cs_);
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
+    canary_.check_inputs(tok_, step_ + row * 4, pos_ + row * g_->n_head, 1, (int) g_->n_head, cs_, j, m_out_ + j - 1);
     coupled_rec_ = coupled;
     coupled_j_ = j;
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok) canary_.check(8, cs_);
     return finish_capture(probe, cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
+    const OnDevice on_device(device_);
+    std::string err;
+    Operation operation(*this, err);
+    if (!operation) std::terminate();
+    restore_ring(upto);
+    if (!operation.finish(err)) std::terminate();
+}
+
+void MtpDrafter::restore_ring(int64_t upto) {
     const OnDevice on_device(device_);
     if (st_.kv_mode != 2 || upto <= 0) return;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    cudaStreamSynchronize(cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) std::terminate();
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    if (!operation) return false;
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
@@ -839,6 +1123,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
             if (!capture_prefill_dev(T, err)) return false;
+            canary_.stage_inputs(next_tokens + c, T, (int32_t) (cell0 + c), 0, cs_);
             if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
@@ -854,7 +1139,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             return false;
         }
         ms_prefill += ms_since(t0);
-        return true;
+        return operation.finish(err);
     }
     for (int64_t c = 0; c < n; c += max_t_) {
         const int T = (int) std::min<int64_t>(max_t_, n - c);
@@ -869,6 +1154,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
         }
+        canary_.stage_inputs(next_tokens + c, T, (int32_t) (cell0 + c), 0, cs_);
         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                             cs_) != cudaSuccess ||
             cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
@@ -878,11 +1164,18 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         }
     }
     ms_prefill += ms_since(t0);
-    return true;
+    return operation.finish(err);
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
+    const OnDevice on_device(device_);
+    Operation operation(*this, err);
+    return operation && draft_impl(T, tokens, p, a, drafts, err, probs, min_p, n_drafts) && operation.finish(err);
+}
+
+bool MtpDrafter::draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                          float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
@@ -910,6 +1203,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    canary_.stage_inputs(tokens, T, (int32_t) p, a, cs_);
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1008,6 +1302,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_) { err = "mtp: first draft width out of range"; return false; }
+    Operation operation(*this, err);
+    if (!operation) return false;
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
@@ -1016,8 +1313,9 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             err = "mtp: staging the first residual failed";
             return false;
         }
-    std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    std::array<int32_t, strata::kernels::kVerifyMaxT> toks;
+    std::fill_n(toks.begin(), T, token);
+    return draft_impl(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts) && operation.finish(err);
 }
 
 }  // namespace strata::core

@@ -13,6 +13,66 @@
 namespace strata::kernels {
 namespace {
 
+__global__ void verify_canary_begin_kernel(const core::VerifyCanaryInput* input,
+    const core::VerifyCanaryOwner* owner, int graph_slot, const int32_t* token,
+    const int32_t* position, const int32_t* steering, core::VerifyCanaryOutput* scratch) {
+    core::VerifyCanaryOutput out{};
+    out.input = *input;
+    out.owner_id = owner->request_id;
+    out.graph_slot = graph_slot;
+    out.owner_steering = owner->steering;
+    out.token = *token;
+    out.position = *position;
+    out.steering = steering ? *steering : owner->steering;
+    out.errors = (out.input.request_id != out.owner_id ? 1u : 0u) |
+        (out.input.slot != graph_slot ? 2u : 0u) |
+        (out.input.token != out.token || out.input.position != out.position ? 4u : 0u) |
+        (out.input.steering != out.steering || out.owner_steering != out.steering ? 8u : 0u);
+    *scratch = out;
+}
+
+__global__ void verify_canary_finish_kernel(const core::VerifyCanaryInput* input,
+    const core::VerifyCanaryOwner* owner, int graph_slot, const int32_t* token,
+    const int32_t* position, const int32_t* steering, core::VerifyCanaryOutput* scratch,
+    const int32_t* output_token, core::VerifyCanaryOutput* output, uint32_t phase) {
+    core::VerifyCanaryOutput out = *scratch;
+    const core::VerifyCanaryInput now = *input;
+    if (now.request_id != out.input.request_id || now.epoch != out.input.epoch ||
+        now.slot != out.input.slot || now.token != out.input.token ||
+        now.position != out.input.position || now.steering != out.input.steering) out.errors |= 16u;
+    if (owner->request_id != out.owner_id || owner->steering != out.owner_steering ||
+        graph_slot != out.graph_slot) out.errors |= 32u;
+    if (*token != out.token || *position != out.position ||
+        (steering && *steering != out.steering)) out.errors |= 64u;
+    out.output_token = output_token ? *output_token : -1;
+    out.phase = phase;
+    *output = out;
+    *scratch = out; // commit preserves every window failure, never overwrites it with success
+}
+
+__global__ void operation_inputs_stage_kernel(core::OperationInputs value, core::OperationInputs* dst) {
+    value.checks = dst->checks; // checks accumulate over every graph in the operation
+    *dst = value;
+}
+
+__global__ void operation_inputs_check_kernel(core::OperationInputs* expected, core::VerifyCanaryOutput* scratch,
+    const int32_t* tokens, const int32_t* steps, const int32_t* positions,
+    int rows, int heads, int draft_step, const int32_t* previous) {
+    if (expected->request_id != scratch->input.request_id || expected->epoch != scratch->input.epoch)
+        scratch->errors |= 128u;
+    for (int t = 0; t < rows; ++t) {
+        const int offset = draft_step < 0 ? t : expected->accepted + draft_step;
+        const int cell = expected->position + offset;
+        const int token = draft_step > 0 ? *previous : expected->tokens[draft_step < 0 ? t : expected->accepted];
+        if (tokens[t] != token || steps[t * 4] != cell || steps[t * 4 + 1] != cell + 1 ||
+            steps[t * 4 + 2] != (cell + 1) / 4 || steps[t * 4 + 3] != cell + 1)
+            scratch->errors |= 256u;
+        for (int h = 0; h < heads; ++h)
+            if (positions[t * heads + h] != cell) scratch->errors |= 512u;
+    }
+    ++expected->checks;
+}
+
 constexpr int S = 128;          // GDN state size
 constexpr int RG = 4;
 constexpr int RPG = S / RG;
@@ -359,6 +419,32 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 }
 
 }  // namespace
+
+void verify_canary_begin(const core::VerifyCanaryInput* input, const core::VerifyCanaryOwner* owner,
+    int graph_slot, const int32_t* token, const int32_t* position, const int32_t* steering,
+    core::VerifyCanaryOutput* scratch, void* stream) {
+    verify_canary_begin_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(input, owner, graph_slot,
+        token, position, steering, scratch);
+}
+
+void verify_canary_finish(const core::VerifyCanaryInput* input, const core::VerifyCanaryOwner* owner,
+    int graph_slot, const int32_t* token, const int32_t* position, const int32_t* steering,
+    core::VerifyCanaryOutput* scratch, const int32_t* output_token,
+    core::VerifyCanaryOutput* output, uint32_t phase, void* stream) {
+    verify_canary_finish_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(input, owner, graph_slot,
+        token, position, steering, scratch, output_token, output, phase);
+}
+
+void operation_inputs_stage(core::OperationInputs value, core::OperationInputs* destination, void* stream) {
+    operation_inputs_stage_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(value, destination);
+}
+
+void operation_inputs_check(core::OperationInputs* expected, core::VerifyCanaryOutput* scratch,
+    const int32_t* tokens, const int32_t* steps, const int32_t* positions,
+    int rows, int heads, int draft_step, const int32_t* previous, void* stream) {
+    operation_inputs_check_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(expected, scratch, tokens, steps,
+        positions, rows, heads, draft_step, previous);
+}
 
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;

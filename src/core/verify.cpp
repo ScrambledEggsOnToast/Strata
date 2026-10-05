@@ -39,6 +39,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <map>
 #include <string>
@@ -174,6 +175,7 @@ const int64_t g_test_stall = [] {
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
+    scratch_.poison();
     trace_ev("RELEASE", -1, -1, timeout_ms);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
@@ -184,9 +186,14 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     _mm_sfence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    for (cudaStream_t s : {cs_, copy_}) {
+    for (cudaStream_t s : {cs_, sh_cs_, copy_}) {
         if (s == nullptr) continue;
         for (;;) {
+            // The submitter may have been publishing/resetting a ring when the
+            // watchdog fired. Keep release monotonic until all consumers drain.
+            for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+                if (p) *(volatile uint32_t*) p = UINT32_MAX;
+            _mm_sfence();
             const cudaError_t status = cudaStreamQuery(s);
             if (status == cudaSuccess) break;
             if (status != cudaErrorNotReady || ms_since(t0) > timeout_ms) {
@@ -271,14 +278,17 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() {
+    const OnDevice on_device(device_);
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     for (auto& slot : g_live) {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
-    if (cs_) cudaStreamSynchronize(cs_);
-    if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    for (cudaStream_t stream : {cs_, sh_cs_, copy_})
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
+    if (row_trace_ && std::fclose(row_trace_) != 0) std::terminate();
+    if (h_route_trace_) cudaFreeHost(h_route_trace_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -290,11 +300,13 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
-    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (copy_) cudaStreamDestroy(copy_);
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
+    if (canary_) cudaFree(canary_);
+    if (h_canary_) cudaFreeHost(h_canary_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
@@ -527,13 +539,44 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
+    void* hc = nullptr;
+    void* mc = nullptr;
+    if (!mapped(kVerifyCanaryHostBytes, &hc, &mc)) {
+        if (hc) cudaFreeHost(hc);
+        err = "verify: request canary staging allocation failed"; return false;
+    }
+    h_canary_ = (VerifyCanaryInput*) hc;
+    m_canary_ = (VerifyCanaryInput*) mc;
+    h_owner_ = (VerifyCanaryOwner*) (h_canary_ + kVerifyCanaryRows);
+    m_owner_ = (VerifyCanaryOwner*) (m_canary_ + kVerifyCanaryRows);
+    h_canary_out_ = (VerifyCanaryOutput*) (h_owner_ + kVerifyCanaryRows + 1);
+    m_canary_out_ = (VerifyCanaryOutput*) (m_owner_ + kVerifyCanaryRows + 1);
+    h_canary_commit_ = h_canary_out_ + kVerifyCanaryRows;
+    m_canary_commit_ = m_canary_out_ + kVerifyCanaryRows;
+    if (cudaMalloc((void**) &canary_, kVerifyCanaryDeviceBytes) != cudaSuccess) {
+        err = "verify: request canary scratch allocation failed"; return false;
+    }
+    owner_ = (VerifyCanaryOwner*) ((uint8_t*) canary_ + sizeof(VerifyCanaryOutput) * kVerifyCanaryRows);
+    if (cudaMemset(canary_, 0, kVerifyCanaryDeviceBytes) != cudaSuccess) {
+        err = "verify: canary initialization failed"; return false;
+    }
+    if (env_on("STRATA_SESSION_ROWS")) {
+        // Diagnostic-only mapped routing transcript: actual IDs AND weights for every layer/row.
+        // The admission gate always charges the 256-KiB host diagnostic envelope, including readback stack.
+        if (g.n_layers > 48 || ss.k > 64 ||
+            !mapped((size_t) g.n_layers * strata::kernels::kVerifyMaxT * (size_t) ss.k * 8, &h_route_trace_, &m_route_trace_)) {
+            err = "verify: bounded routing observation storage failed"; return false;
+        }
+    }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
 }
 
-const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+const float* Verifier::final_R(int t) const {
+    return next_ ? next_->final_R(t) : R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd);
+}
 
 bool Verifier::read_logits_rows(int t0, int t1, float* dst, std::string& err) {
     if (le_ < g_->n_layers) {   // a layer split: the head (and so the rows) belong to the last stage
@@ -551,6 +594,59 @@ bool Verifier::read_logits_rows(int t0, int t1, float* dst, std::string& err) {
         err = std::string("verify: reading the head's rows failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    return true;
+}
+
+bool Verifier::observe_committed_rows(int count, std::string& err) {
+    if (!h_route_trace_ || !head_sampling_) return true; // prompt-only read_windows commits emit no token
+    if (next_ || lb_ != 0 || !last_stage()) {
+        err = "verify: exact row observation requires the qualified single-device layout"; return false;
+    }
+    if (count < 1 || count > last_t_ || observed_rows_ + count > 256) {
+        err = "verify: committed row observation bound exceeded"; return false;
+    }
+    std::array<float, 16384> buffer;
+    for (int t = 0; t < count; ++t) {
+        if (observed_rows_ % 16 == 0) {
+            if (row_trace_ && std::fclose(row_trace_) != 0) {
+                row_trace_ = nullptr; err = "verify: closing row observation failed"; return false;
+            }
+            char name[80];
+            std::snprintf(name, sizeof name, "session-rows-%d-%03llu.bin", device_,
+                          (unsigned long long) (observed_rows_ / 16));
+            row_trace_ = std::fopen(name, "wbx");
+            if (!row_trace_) { err = "verify: creating exclusive row observation failed"; return false; }
+        }
+        const auto& identity = expected_canary_[t];
+        const uint64_t header[] = {0x31574f5253545353ull, identity.request_id,
+            (uint64_t) identity.position, (uint64_t) (uint32_t) last_tokens_[t],
+            (uint64_t) n_vocab_, (uint64_t) g_->n_layers, (uint64_t) ss_->k, (uint64_t) identity.slot};
+        if (std::fwrite(header, sizeof header, 1, row_trace_) != 1) {
+            err = "verify: row observation header write failed"; return false;
+        }
+        for (int64_t v = 0; v < n_vocab_;) {
+            const size_t n = (size_t) std::min<int64_t>(buffer.size(), n_vocab_ - v);
+            if (cudaMemcpy(buffer.data(), head_logits_ + (size_t) t * n_vocab_ + v, n * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = "verify: row observation readback failed"; return false;
+            }
+            for (size_t i = 0; i < n; ++i)
+                if (!std::isfinite(buffer[i])) { err = "verify: nonfinite observed logit"; return false; }
+            if (std::fwrite(buffer.data(), sizeof(float), n, row_trace_) != n) {
+                err = "verify: row observation payload write failed"; return false;
+            }
+            v += n;
+        }
+        for (int64_t l = 0; l < g_->n_layers; ++l) {
+            const auto* row = static_cast<const uint8_t*>(h_route_trace_) +
+                              (size_t) (l * strata::kernels::kVerifyMaxT + t) * ss_->k * 8;
+            if (std::fwrite(row, (size_t) ss_->k * 8, 1, row_trace_) != 1) {
+                err = "verify: routing observation write failed"; return false;
+            }
+        }
+        ++observed_rows_;
+    }
+    if (std::fflush(row_trace_) != 0) { err = "verify: flushing row observations failed"; return false; }
     return true;
 }
 
@@ -597,6 +693,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    record_canaries(T, batch_rec_ ? brow_ : nullptr, true, false, cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -956,6 +1053,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        if (m_route_trace_) {
+            for (int t = tb; t < te; ++t) {
+                auto* row = static_cast<uint8_t*>(m_route_trace_) + (size_t) (l * kVerifyMaxT + t) * K * 8;
+                if (cudaMemcpyAsync(row, ids_ + t * K, (size_t) K * 4, cudaMemcpyDeviceToDevice, cs) != cudaSuccess ||
+                    cudaMemcpyAsync(row + K * 4, w_ + t * K, (size_t) K * 4, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    err = "verify: capturing actual routing observation failed"; return false;
+                }
+            }
+        }
         if (all_resident_) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1116,10 +1222,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
-                if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
+                if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs,
+                                               batch_rec_ ? steering_b_ + tb : nullptr);
             }
         } else if (cvec().covers(l)) {
-            cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
+            cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs,
+                       batch_rec_ ? steering_b_ + tb : nullptr);
         }
         return true;
     };
@@ -1136,6 +1244,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
         copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
+        record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);
         return true;
     }
 
@@ -1192,6 +1301,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
     stamp(g.n_layers, 1, 0);
+    record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);
     return true;
 }
 
@@ -1224,10 +1334,15 @@ std::string Verifier::profile_report() {
 bool Verifier::prepare_graphs(std::string& err) {
     if (!wt_ || !ss_ || !cs_) { err = "verify: prepare requires init"; return false; }
     const OnDevice on_device(device_);
+    if (!acquire_scratch(err)) return false;
+    ScratchGuard guard{*this};
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;
-    return !next_ || next_->prepare_graphs(err);
+    if (next_ && !next_->prepare_graphs(err)) return false;
+    if (!scratch_.abandon_unlaunched()) { err = "verify: preparation ownership was poisoned"; return false; }
+    guard.keep = true;
+    return true;
 }
 
 bool Verifier::capture(int T, std::string& err) {
@@ -1340,10 +1455,12 @@ bool Verifier::capture_commit(std::string& err) {
                     native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                               rope_scaling(), cs_);
+                native_qsa_indexer_commit(commit_ + 2, commit_, ib, cs_);
                 ++qsa_index;
             }
         }
         if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
+        if (ok) record_canaries((int) MT, nullptr, false, true, cs_);
     } catch (const std::exception& e) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
@@ -1392,7 +1509,6 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
-    staged_ = true;
 }
 
 void Verifier::collect_profile() {
@@ -1429,21 +1545,179 @@ void Verifier::collect_profile() {
     ++prof_windows_;
 }
 
+Verifier::ScratchGuard::~ScratchGuard() {
+    if (keep) return;
+    if (launched) {
+        v.release_gpu_waits(5000); // partial state is never reusable, even if draining succeeds
+    } else {
+        const cudaError_t drained = cudaStreamSynchronize(v.cs_);
+        if (drained == cudaSuccess) v.scratch_.abandon_unlaunched();
+        else { v.released_.store(true); v.scratch_.poison(); }
+    }
+}
+
+bool Verifier::fail_operation(std::string& err) {
+    if (!released_.load()) err += released_note(release_gpu_waits(5000));
+    scratch_.poison();
+    b_running_ = false;
+    return false;
+}
+
+bool Verifier::context_idle(std::string& err) {
+    if (!wait_commit(err)) return false;
+    if (released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle) {
+        err = "verify: request context requires idle, unpoisoned operation scratch"; return false;
+    }
+    return true;
+}
+
+bool Verifier::set_request_id(uint64_t request_id, std::string& err) {
+    if (!request_id || !h_owner_) { err = "verify: a nonzero request ID after init is required"; return false; }
+    if (!context_idle(err)) return false;
+    if (next_ && !next_->set_request_id(request_id, err)) return false;
+    const OnDevice on_device(device_);
+    request_id_ = request_id;
+    h_owner_[kVerifySoloOwner] = {request_id, 0, 0};
+    if (cudaMemcpyAsync(owner_ + kVerifySoloOwner, h_owner_ + kVerifySoloOwner, sizeof(VerifyCanaryOwner),
+                        cudaMemcpyHostToDevice, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: solo request owner upload failed"; return fail_operation(err);
+    }
+    return true;
+}
+
+bool Verifier::set_slot_context(int slot, uint64_t request_id, const strata::kernels::SamplerParams& sp,
+                                const std::vector<int32_t>* history, bool steering, std::string& err) {
+    if (slot < 0 || slot >= (int) slots_.size() || !request_id) {
+        err = "verify: slot context needs a valid slot and nonzero request ID"; return false;
+    }
+    if (!context_idle(err)) return false;
+    for (int s = 0; s < (int) slots_.size(); ++s)
+        if (s != slot && slot_request_id_[s] == request_id) {
+            err = "verify: resident request ID already owns another slot"; return false;
+        }
+    if (next_ && !next_->set_slot_context(slot, request_id, sp, history, steering, err)) return false;
+    validated_slot_id_[slot] = 0;
+    slot_sp_[(size_t) slot] = sp;
+    slot_history_[slot] = history;
+    slot_steering_[slot] = steering ? 1 : 0;
+    slot_request_id_[slot] = request_id;
+    h_owner_[slot] = {request_id, steering ? 1 : 0, 0};
+    return validate_slot_context(slot, err);
+}
+
+bool Verifier::validate_slot_context(int slot, std::string& err) {
+    const OnDevice on_device(device_);
+    if (!acquire_scratch(err)) return false;
+    ScratchGuard guard{*this, true};
+    const int32_t token = -1;
+    const int64_t position = 0;
+    stage_canaries(&slot, 1, &token, &position, 0);
+    h_tok_[0] = token;
+    h_pos_[0] = 0;
+    if (cudaMemcpyAsync(owner_ + slot, h_owner_ + slot, sizeof(VerifyCanaryOwner),
+                        cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+        cudaMemcpyAsync(steering_b_, &h_owner_[slot].steering, sizeof(int32_t),
+                        cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = "verify: resident request owner upload failed"; return false;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    strata::kernels::copy_i32_from_mapped(tok_, m_tok_, 1, cs_);
+    strata::kernels::copy_i32_from_mapped(pos_, m_pos_, 1, cs_);
+    record_canaries(1, &slot, true, false, cs_);
+    // No inference or token readback at admission: output identity is produced
+    // by the GPU using the same independent owners/steering/staging as replay.
+    strata::kernels::verify_canary_finish(m_canary_, owner_ + slot, slot, tok_, pos_, steering_b_,
+        canary_, nullptr, m_canary_out_, 1u, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess ||
+        !verify_canary_matches(h_canary_out_[0], expected_canary_[0], 1u)) {
+        err = "verify: resident admission request-ID canary failed"; return false;
+    }
+    if (!scratch_.finish_batch()) { err = "verify: admission ownership was poisoned"; return false; }
+    validated_slot_id_[slot] = h_canary_out_[0].owner_id;
+    guard.keep = true;
+    if (env_on("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_CANARY request=%llu slot=%d row=0 rows=1 epoch=%llu phase=admit checked=1\n",
+            (unsigned long long) validated_slot_id_[slot], slot, (unsigned long long) canary_epoch_);
+    return true;
+}
+
+void Verifier::stage_canaries(const int* rows, int T, const int32_t* tokens, const int64_t* pos, int64_t pos0) {
+    ++canary_epoch_; // a new epoch even when replaying the same token/position/request
+    for (int t = 0; t < T; ++t) {
+        const int slot = rows ? rows[t] : kVerifySoloOwner;
+        expected_canary_[t] = {rows ? slot_request_id_[slot] : request_id_, canary_epoch_, slot,
+                              tokens[t], (int32_t) (pos ? pos[t] : pos0 + t), rows ? slot_steering_[slot] : 0};
+        h_canary_[t] = expected_canary_[t];
+        h_canary_out_[t] = {};
+        h_canary_commit_[t] = {};
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+}
+
+void Verifier::record_canaries(int T, const int* rows, bool begin, bool commit, cudaStream_t stream) {
+    for (int t = 0; t < T; ++t) {
+        const int slot = rows ? rows[t] : kVerifySoloOwner;
+        const int32_t* steering = rows ? steering_b_ + t : nullptr;
+        const int32_t* position = pos_ + (size_t) t * g_->n_head;
+        if (begin)
+            strata::kernels::verify_canary_begin(m_canary_ + t, owner_ + slot, slot, tok_ + t,
+                                                 position, steering, canary_ + t, stream);
+        else
+            strata::kernels::verify_canary_finish(m_canary_ + t, owner_ + slot, slot, tok_ + t,
+                position, steering, canary_ + t, last_stage() ? m_out_ + t : nullptr,
+                (commit ? m_canary_commit_ : m_canary_out_) + t, commit ? 2u : 1u, stream);
+    }
+}
+
+bool Verifier::check_canaries(bool commit, std::string& err) {
+    const auto* output = commit ? h_canary_commit_ : h_canary_out_;
+    for (int t = 0; t < last_t_; ++t) {
+        const auto& expected = expected_canary_[t];
+        if (!verify_canary_matches(output[t], expected, commit ? 2u : 1u) ||
+            (!commit && last_stage() && output[t].output_token != h_out_[t])) {
+            err = "verify: request-ID canary mismatch at row " + std::to_string(t) +
+                  " slot " + std::to_string(expected.slot) + " request " + std::to_string(expected.request_id);
+            return fail_operation(err);
+        }
+        if (expected.slot < kVerifySoloOwner) validated_slot_id_[expected.slot] = output[t].owner_id;
+        if (env_on("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "STATE_CANARY request=%llu identity=%s slot=%d row=%d rows=%d epoch=%llu phase=%s checked=1\n",
+                (unsigned long long) expected.request_id, expected.request_id ? "bound" : "unbound", expected.slot, t, last_t_,
+                (unsigned long long) expected.epoch, commit ? "commit" : "window");
+    }
+    return true;
+}
+
+bool Verifier::acquire_scratch(std::string& err) {
+    if (!wait_commit(err)) return false;
+    if (released_.load() || !scratch_.begin()) {
+        err = "verify: operation scratch still owned by an in-flight, uncommitted or poisoned window";
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (pos0 < 0 || pos0 > ss.qsa_states[ss.qsa_primary()].max_cells - T) {
+        err = "verify: the window runs past the context"; return false;
+    }
+    if (!acquire_scratch(err)) return false;
+    ScratchGuard guard{*this};
+    last_batch_ = false;
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
-    if (!staged_) stage_inputs(T, tokens, pos0);
-    staged_ = false;
+    stage_inputs(T, tokens, pos0);
+    stage_canaries(nullptr, T, tokens, nullptr, pos0);
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
     if (do_ple) {
@@ -1460,6 +1734,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    if (released_.load()) { err = "verify: watchdog released window before launch"; return false; }
+    guard.launched = true;
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -1582,6 +1858,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     commit_pending_ = false;
+    if (released_.load()) { err = "verify: window released by watchdog"; return false; }
+    if (!check_canaries(false, err)) return false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
         const cudaError_t copied = cudaStreamSynchronize(copy_);
@@ -1598,7 +1876,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        if (next_ && !next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
+        if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
+        guard.keep = true;
+        return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
@@ -1631,6 +1912,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ++windows;
     progress_at("decode");
     progress_beat();
+    if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
+    guard.keep = true;
     return true;
 }
 
@@ -1752,6 +2035,11 @@ void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("S
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (last_batch_ || released_.load() || !scratch_.commit()) {
+        err = "verify: commit does not own a completed solo window"; return false;
+    }
+    ScratchGuard guard{*this, true};
+    if (!observe_committed_rows(n_keep, err)) return false;
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
@@ -1765,6 +2053,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     if (!g_commit_async || next_ != nullptr) {
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        if (!check_canaries(true, err)) return false;
     } else {
         const cudaError_t re = cudaEventRecord(commit_done_, cs_);
         if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
@@ -1777,17 +2066,26 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    if (next_ && !next_->commit(n_keep, err)) return false;
+    if (!commit_pending_ && !scratch_.finish()) { err = "verify: commit ownership was poisoned"; return false; }
+    guard.keep = true;
+    return true;
 }
 
 bool Verifier::wait_commit(std::string& err) {
+    if (released_.load()) { err = "verify: operation scratch is poisoned; restart the engine"; return false; }
     if (commit_pending_) {
         const OnDevice on_device(device_);
-        commit_pending_ = false;
         const cudaError_t se = cudaEventSynchronize(commit_done_);
-        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        if (se != cudaSuccess) {
+            err = std::string("verify: commit: ") + cudaGetErrorString(se); return fail_operation(err);
+        }
+        if (!check_canaries(true, err)) return false;
+        if (!scratch_.finish()) { err = "verify: commit ownership was poisoned"; return fail_operation(err); }
+        commit_pending_ = false;
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    if (next_ && !next_->wait_commit(err)) return fail_operation(err);
+    return true;
 }
 
 
@@ -1796,6 +2094,8 @@ bool Verifier::wait_commit(std::string& err) {
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     const OnDevice on_device(device_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
+    if (!context_idle(err)) return false;
+    if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: init_slots may only run once"; return false; }
     if (slots.empty() || (int) slots.size() > max_t_) {
         err = "verify: init_slots needs 1.." + std::to_string(max_t_) + " sessions";
         return false;
@@ -1806,6 +2106,12 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
             err = "verify: a slot's session is not carved like the stage's own (layer range, context)";
             return false;
         }
+        int aliases = 0;
+        for (SessionState* y : slots) {
+            if (x == y) ++aliases;
+            else if (y && x->gdn_state && x->gdn_state == y->gdn_state) ++aliases;
+        }
+        if (aliases != 1) { err = "verify: resident sessions alias state"; return false; }
     }
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
@@ -1816,7 +2122,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
-    if (cudaMalloc(&d, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4) != cudaSuccess) {
+    const uint64_t tail_bytes = (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4;
+    const uint64_t controls = (a + tail_bytes + 255) & ~255ull;
+    if (cudaMalloc(&d, controls + (uint64_t) S * (4096 + 1) * sizeof(int32_t)) != cudaSuccess) {
         err = "verify: the batch buffers do not fit";
         return false;
     }
@@ -1824,13 +2132,31 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
-    slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+    slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_context
+    steering_b_ = (int32_t*) ((uint8_t*) d + controls);
+    history_b_ = steering_b_ + S;
+    history_stage_b_.resize((size_t) S * 4096, -1);
+    for (int i = 0; i < S; ++i) slot_steering_[i] = 1;
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
     return true;
 }
 
+bool Verifier::reserve_batch_key(uint64_t key, std::string& err) {
+    if (exec_bm_.find(key) != exec_bm_.end()) return true;
+    if (exec_bm_.size() >= kVerifyBatchGraphKeys) {
+        err = "verify: bounded batch graph cache exhausted (32 row-order keys); restart with a bounded row schedule";
+        return false;
+    }
+    // Reserve both sides together; failed captures retain their key, so even
+    // repeated failures cannot grow map metadata without bound. No live eviction.
+    exec_bm_.emplace(key, nullptr);
+    commit_bm_.emplace(key, nullptr);
+    return true;
+}
+
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
+    if (!reserve_batch_key(batch_key(rows, S, hbase), err)) return false;
     cudaGraphExec_t& ex = exec_bm_[batch_key(rows, S, hbase)];
     if (ex != nullptr) return true;
     // A graph is instantiated only through the qualification seam, the batch window included: the key carries the
@@ -1874,6 +2200,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
 }
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
+    if (!reserve_batch_key(batch_key(rows, S, hbase), err)) return false;
     cudaGraphExec_t& cex = commit_bm_[batch_key(rows, S, hbase)];
     if (cex != nullptr) return true;
     const GraphCaptureProbe probe({"verify", "batch-commit", lb_, S, le_});
@@ -1924,6 +2251,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
                                               0, (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                    native_qsa_indexer_commit(commitb_ + (size_t) rows[t] * CB + 2,
+                                              commitb_ + (size_t) rows[t] * CB, ib, cs_);
                 }
                 ++qsa_index;
             }
@@ -1932,6 +2261,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             for (int t = 0; t < S; ++t)
                 copy_indexed(slots_[(size_t) rows[t]]->ple_hist, hist_snap_ + (size_t) t * HS, HS,
                              commitb_ + (size_t) rows[t] * CB + 1, HS, cs_);
+        if (ok) record_canaries(S, rows, false, true, cs_);
     } catch (const std::exception& e) {
         err = std::string("verify batch commit: ") + e.what();
         ok = false;
@@ -1961,7 +2291,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 || hbase + S > (int) slots_.size()) {
+    if (S < 1 || S > max_t_ || hbase < 0 || hbase > (int) slots_.size() - S) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -1969,17 +2299,41 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         bool dup = false;
         for (int u = 0; u < t; ++u) dup = dup || rows[u] == rows[t];
         if (rows[t] < 0 || rows[t] >= (int) slots_.size() || dup) { err = "verify: a batch row's slot is out of range or twice"; return false; }
+        if (!slot_request_id_[rows[t]]) { err = "verify: bind request IDs before resident windows"; return false; }
     }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     for (int t = 0; t < S; ++t)
-        if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
+        if (pos[t] < 0 || pos[t] >= slots_[(size_t) rows[t]]->max_cells) {
             err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
             return false;
         }
+    if (!acquire_scratch(err)) return false;
+    ScratchGuard guard{*this};
     if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
+    int32_t steering[8] = {};
+    for (int t = 0; t < S; ++t) {
+        const int slot = rows[t];
+        steering[t] = slot_steering_[slot];
+        const int n = std::clamp(slot_sp_[(size_t) slot].penalty_last_n, 0, 4096);
+        history_len_b_[t] = n;
+        if (n > 0 && le_ == g.n_layers) {
+            const auto* history = slot_history_[slot];
+            if (!history) { err = "verify: resident penalty history is not bound"; return false; }
+            penalty_rows(history->data(), (int64_t) history->size(), tokens + t, 1, n,
+                         history_stage_b_.data() + (size_t) t * 4096);
+            if (cudaMemcpyAsync(history_b_ + (size_t) t * 4096, history_stage_b_.data() + (size_t) t * 4096,
+                                (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                err = "verify: resident penalty history upload failed"; return false;
+            }
+        }
+    }
+    if (cudaMemcpyAsync(steering_b_, steering, (size_t) S * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: resident controls upload failed"; return false;
+    }
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
@@ -2018,6 +2372,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     last_batch_ = true;
     for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
     ms_host += ms_since(t0);
+    stage_canaries(rows, S, tokens, pos, 0);
+    if (all_resident_) { *(volatile uint32_t*) h_flag_ = 1; _mm_sfence(); }
+    guard.keep = true; // caller immediately launches or adopts an error guard
     return true;
 }
 
@@ -2034,12 +2391,14 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    ScratchGuard guard{*this, true};
+    if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     const cudaError_t le = cudaGraphLaunch(exec_bm_[batch_key(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    const int64_t steps = all_resident_ ? 0 : le_ - lb_;
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -2099,19 +2458,33 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
         released_.store(true); err = "verify batch: expert completion failed"; return false;
     }
+    if (released_.load()) { err = "verify: batch window released by watchdog"; return false; }
+    if (!check_canaries(false, err)) return false;
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    if (le_ < g.n_layers) {
+        if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
+        if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
+        guard.keep = true;
+        return true;
+    }
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_at("decode");
     progress_beat();
+    if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
+    guard.keep = true;
     return true;
 }
 
 bool Verifier::commit_slots(std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
+    if (released_.load() || !scratch_.commit()) {
+        err = "verify: batch commit does not own a completed window"; return false;
+    }
+    ScratchGuard guard{*this, true};
+    if (!observe_committed_rows(last_t_, err)) return false;
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2119,6 +2492,7 @@ bool Verifier::commit_slots(std::string& err) {
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+    if (!check_canaries(true, err)) return false;
     if (ple_stage())
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) last_rows_[t]];
@@ -2126,50 +2500,51 @@ bool Verifier::commit_slots(std::string& err) {
             sx.ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit_slots(err);
+    if (next_ && !next_->commit_slots(err)) return false;
+    if (!scratch_.finish()) { err = "verify: batch commit ownership was poisoned"; return false; }
+    guard.keep = true;
+    return true;
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       m_out_ + t, cs_);
+        const int n = history_len_b_[t];
+        if ((sp.greedy || sp.temperature <= 0.0f) && n == 0) continue;
+        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position), never a process-wide draw sequence
+        sp.penalty_last_n = n;
+        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                                       n ? history_b_ + (size_t) t * 4096 : nullptr, n, sp, m_out_ + t, cs_);
         any = true;
     }
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 }
 
-bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+    ScratchGuard guard{*this, true};
+    if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     cudaError_t le = cudaGraphLaunch(exec_bm_[batch_key(rows, S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[batch_key(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
-    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
-        for (int t = 0; t < S; ++t) {
-            SessionState& sx = *slots_[(size_t) rows[t]];
-            sx.ple_prev[0] = sx.ple_prev[1];
-            sx.ple_prev[1] = tokens[t];
-        }
     b_running_ = true;
     b_k_ = 0;
-    b_steps_ = le_ - lb_;
+    b_steps_ = all_resident_ ? 0 : le_ - lb_;
     b_last_ = Clock::now();
+    guard.keep = true; // batch_poll now holds the lease until both streams drain
     return true;
 }
 
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (released_.load()) { err = "verify: batch operation is poisoned"; return -1; }
     if (!b_running_) return 1;
     const OnDevice on_device(device_);
+    ScratchGuard guard{*this, true};
     volatile uint32_t* const seq = h_seq_;
     const int S = last_t_;
     while (b_k_ < b_steps_) {
@@ -2190,6 +2565,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
                     return -1;
                 }
             }
+            guard.keep = true;
             return 0;
         }
         const Clock::time_point b = Clock::now();
@@ -2220,14 +2596,16 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         ++b_k_;
     }
     const cudaError_t q = cudaStreamQuery(cs_);
-    if (q == cudaErrorNotReady) return 0;
+    if (q == cudaErrorNotReady) { guard.keep = true; return 0; }
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
-    if (qc == cudaErrorNotReady) return 0;
+    if (qc == cudaErrorNotReady) { guard.keep = true; return 0; }
     if (qc != cudaSuccess) { err = std::string("verify batch copies: ") + cudaGetErrorString(qc); b_running_ = false; return -1; }
     if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
         released_.store(true); err = "verify batch: expert completion failed"; b_running_ = false; return -1;
     }
+    if (!check_canaries(false, err) || !check_canaries(true, err)) { b_running_ = false; return -1; }
+    if (!observe_committed_rows(S, err)) { b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -2235,6 +2613,14 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     }
     ++windows;
     b_running_ = false;
+    if (ple_stage())
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) last_rows_[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = last_tokens_[t];
+        }
+    if (!scratch_.finish_batch()) { err = "verify: batch ownership was poisoned"; return -1; }
+    guard.keep = true;
     progress_beat();
     return 1;
 }

@@ -17,6 +17,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <future>
 #include <memory>
@@ -127,6 +128,7 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    bool bind_request(uint64_t request, std::string& err);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
@@ -255,6 +257,7 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    std::atomic<bool> public_running_{false};
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;

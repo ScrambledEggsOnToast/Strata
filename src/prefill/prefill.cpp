@@ -496,6 +496,11 @@ struct Prefill::Impl {
     bool borrowed = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
+    core::OperationCanary canary;
+    std::atomic<bool> running{false};
+    bool poisoned = false;
+    std::thread::id callback_thread;
+    bool draft_active = false;
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
@@ -617,6 +622,7 @@ Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 
 void Prefill::reset() {
+    if (public_running_.load() || (impl_ && impl_->running.load())) std::terminate();
     release();
     impl_.reset(new Impl);
     stats_ = PrefillStats{};
@@ -624,8 +630,11 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
-    if (impl_->cs) cudaStreamSynchronize(impl_->cs);
-    if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    if (public_running_.load() || impl_->running.load()) std::terminate();
+    std::string ignored;
+    if (!drain_pipeline(ignored)) std::terminate();
+    if (impl_->cs && cudaStreamSynchronize(impl_->cs) != cudaSuccess) std::terminate();
+    if (impl_->copy && cudaStreamSynchronize(impl_->copy) != cudaSuccess) std::terminate();
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -850,7 +859,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
-    return true;
+    return m.canary.init(err);
 }
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
@@ -942,6 +951,9 @@ bool Prefill::carve(size_t T, void* alloc) {
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
+    if (public_running_.load() || m.running.load() || m.poisoned) {
+        err = "prefill: relayout while scratch is in flight or poisoned"; return false;
+    }
     if (!m.borrowed || borrow == nullptr || chunk <= 0 || chunk > m.T_max) {
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
         return false;
@@ -967,16 +979,28 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 
+bool Prefill::bind_request(uint64_t request, std::string& err) {
+    Impl& m = *impl_;
+    if (public_running_.load() || m.running.load() || m.poisoned) {
+        err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
+    }
+    if (!m.canary.bind(8, request, err)) return false;
+    return !next_ || next_->bind_request(request, err);
+}
+
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
     Impl& m = *impl_;
+    if (!m.running.load() || m.callback_thread != std::this_thread::get_id() || m.draft_active || m.poisoned) {
+        err = "prefill: draft K/V requires the drained on_chunk lease"; return false;
+    }
     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
     // still reach (r0 below), which the ring holds, so no two of them share a slot.  STRATA_MTP_BATCH_RING=0: the
     // drafter's own pass for a ring (the A/B).
     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
-    core::QsaState& st = mtp.kv_state_rw();
+    const core::QsaState& st = mtp.kv_state();
     if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
         st.kv_hybrid || mtp.device() != m.device)
         return false;
@@ -1038,6 +1062,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
+    struct DraftScope {
+        Impl& m;
+        explicit DraftScope(Impl& state) : m(state) { m.draft_active = true; }
+        ~DraftScope() { m.draft_active = false; }
+    } draft_scope{m};
+    core::MtpDrafter::Operation operation(mtp, err, 8, m.cs);
+    if (!operation) return false;
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) cudaStreamSynchronize(m.cs);
     const auto ti0 = Clock::now();
@@ -1127,7 +1158,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
                      "the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0, (long long) (cell0 + r0),
                      (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
-    return true;
+    return operation.finish(err);
 }
 namespace {
 // Layer split: STRATA_PREFILL_HELP=1 lends the idle stage's GPU (opt-in: the helped rows are computed in another MMQ
@@ -1582,6 +1613,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    if (m.running.exchange(true)) { err = "prefill: scratch already in flight"; return false; }
+    struct RunLease {
+        Impl& m;
+        bool complete = false;
+        ~RunLease() {
+            if (!complete) {
+                for (cudaStream_t stream : {m.cs, m.copy})
+                    if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
+                m.poisoned = true;
+            }
+            m.callback_thread = {};
+            m.running.store(false);
+        }
+    } lease{m};
+    if (m.poisoned) { err = "prefill: scratch poisoned by failed work"; return false; }
+    m.canary.begin(8, m.cs, n > 0 ? (int32_t) tokens[0] : 0, (int32_t) pos0);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -1652,7 +1699,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int ple_buf = 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        if (should_stop && should_stop()) {
+            m.canary.check(8, m.cs);
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess || !m.canary.validate("prefill", err)) return false;
+            lease.complete = true; err = "cancelled"; return false;
+        }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
@@ -1755,6 +1806,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
         cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
                         cudaMemcpyHostToDevice, m.cs);
+        // The first chunk's actual embedding IDs and QSA positions must belong to
+        // this operation, not just agree with a second copy of its canary metadata.
+        if (c0 == 0) m.canary.check(8, m.cs, batched ? m.tok_dev : nullptr, m.steps_dev);
 
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
@@ -2996,7 +3050,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            if (on_chunk) {
+                m.callback_thread = std::this_thread::get_id();
+                const bool ok = on_chunk(m.R, T, p0, err);
+                m.callback_thread = {};
+                if (!ok) return false;
+            }
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
@@ -3023,6 +3082,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
+    m.canary.check(8, m.cs);
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -3032,6 +3092,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
+    if (!m.canary.validate("prefill", err)) return false;
+    lease.complete = true;
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();
@@ -3104,6 +3166,11 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    if (public_running_.exchange(true)) { err = "prefill: public run already in flight"; return false; }
+    struct PublicLease {
+        std::atomic<bool>& running;
+        ~PublicLease() { running.store(false); }
+    } lease{public_running_};
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

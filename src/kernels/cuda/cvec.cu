@@ -46,12 +46,12 @@ __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __ex
 __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir, const float* __restrict__ s_l,
                             const int* __restrict__ on, int mode, int64_t layer, int n, int hc, int64_t r_ld,
                             const float* __restrict__ bo, int64_t bo_ld, const float* __restrict__ inj,
-                            int64_t inj_ld, int write) {
+                            int64_t inj_ld, int write, int row_flags) {
     const int c = blockIdx.x;
     const int64_t t = blockIdx.y;
     float* r = R + t * r_ld + (int64_t) c * n;
     const float s = s_l[layer];
-    const bool steer = *on != 0 && s != 0.0f;   // uniform over the block
+    const bool steer = on[row_flags ? t : 0] != 0 && s != 0.0f;
     if (!steer && !write) return;
     const float* v = dir + layer * n;
     const float w = write ? 2.0f * sigmoidf_(inj[t * inj_ld + c] / (float) hc) : 0.0f;
@@ -152,14 +152,14 @@ void cvec_set_enabled(bool on) {
 bool cvec_enabled() { return g_cvec.loaded() && g_on_host; }
 
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
-                int64_t inj_ld, bool write, void* stream) {
+                int64_t inj_ld, bool write, void* stream, const int* row_enabled) {
     if (!g_cvec.loaded() || T < 1) return;
     const DevTables& t = g_dev[cur_device()];
     if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
     const dim3 grid((unsigned) g_cvec.hc, (unsigned) T);
-    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, t.dir, t.s, t.on, g_cvec.mode, layer,
+    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, t.dir, t.s, row_enabled ? row_enabled : t.on, g_cvec.mode, layer,
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
-                                                            inj, inj_ld, write ? 1 : 0);
+                                                            inj, inj_ld, write ? 1 : 0, row_enabled ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
 }
 

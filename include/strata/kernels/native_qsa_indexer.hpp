@@ -43,4 +43,10 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+// After replaying accepted rows, discard a speculative completed block that has
+// overwritten the logical spare. first_position and count are device scalars;
+// the accepted prefix is nonempty. Leaves completed keys and arithmetic intact.
+void native_qsa_indexer_commit(const int32_t* first_position, const int32_t* count,
+                               const QsaIndexerBuffers& buffers, void* stream);
+
 } // namespace strata::kernels

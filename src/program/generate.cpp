@@ -30,6 +30,8 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/resident_memory.hpp"
+#include "strata/core/verify_ownership.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -57,6 +59,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/session_fingerprint.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1069,7 +1072,8 @@ struct GpuStage {
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
-    strata::core::SessionState ss;
+    strata::core::SessionOwner session_owner;
+    strata::core::SessionState& ss = session_owner.state();
     cudaStream_t stream = nullptr;
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
@@ -1329,16 +1333,6 @@ struct LogitsDump {
     }
 };
 
-using ConvStateSizes = strata::core::ConversationStateSizes;
-
-ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss) {
-    ConvStateSizes z;
-    std::string error;
-    // a split stage's session owns only its layer range's state (see SessionState's carve note); the geometry
-    // and the carve have already passed engine validation
-    strata::core::conversation_session_sizes(g, ss, z, error);
-    return z;
-}
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
@@ -2842,6 +2836,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         const int64_t session_full = strata::core::session_bytes(g, o.max_context, K, 0, -1);
+        const int requested_slots = std::clamp(o.batch, 0, strata::kernels::kVerifyMaxT);
+        strata::plan::ResidentBytes resident;
+        strata::core::SessionAllocationBytes session_allocation;
+        if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation) ||
+            (requested_slots && !strata::core::resident_allocation_bytes(
+                g, o.max_context, K, requested_slots, !o.mtp.empty(), resident))) {
+            std::fprintf(stderr, "strata generate: admission refused: resident ownership pricing requires fully resident FP16 KV\n");
+            return 1;
+        }
         const uint64_t blob_gate = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (session_full <= 0 || headroom_mib < 0 || blob_gate == 0) {
             std::fprintf(stderr, "strata generate: admission refused: invalid session/headroom/expert accounting\n");
@@ -2899,6 +2902,15 @@ int main(int argc, char** argv) {
         }
         v0.add("session_state", (uint64_t) session_full,
                "session_bytes(geometry, --max-context, K); a split's per-stage shares are upper-bounded by it");
+        if (requested_slots) {
+            v0.add("resident_session_device", resident.session_device, "requested resident SessionOwner arenas before runtime fallback");
+            v0.add("resident_verifier_device", resident.verifier_device, "bounded per-slot commit/indexer/steering/penalty controls");
+            if (mtp_here) v0.add("resident_mtp_device", resident.mtp_device, "one private QSA draft state per requested slot");
+        }
+        if (o.spec > 0 || !o.mtp.empty() || requested_slots)
+            v0.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "shared verifier ownership records and device owner table");
+        v0.add("operation_canary_device", 2 * strata::core::kOperationCanaryDeviceBytes,
+               "one prefill and one MTP serialized scratch owner table per device; conservative for inactive paths");
         v0.add("decode_parts", byte_mul(byte_mul((uint64_t) K, (uint64_t) g.n_embd), sizeof(float)),
                "cudaMalloc d_parts: K*n_embd FP32 partials");
         v0.add("embedding_row", byte_mul((uint64_t) g.n_embd, sizeof(float)), "cudaMalloc d_emb FP32 row");
@@ -2973,6 +2985,15 @@ int main(int argc, char** argv) {
                 ds.vram.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (each stage loads the pool)");
                 ds.vram.add("session_state", (uint64_t) session_full,
                             "session_bytes upper bound until the split search places the ranges");
+                if (requested_slots) {
+                    ds.vram.add("resident_session_device", resident.session_device, "requested slots; full session bound before split placement");
+                    ds.vram.add("resident_verifier_device", resident.verifier_device, "per-stage resident controls");
+                    if (i == last) ds.vram.add("resident_mtp_device", resident.mtp_device, "draft slot state on final stage");
+                }
+                if (o.spec > 0 || !o.mtp.empty() || requested_slots)
+                    ds.vram.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "per-stage verifier ownership records");
+                ds.vram.add("operation_canary_device", 2 * strata::core::kOperationCanaryDeviceBytes,
+                            "bounded prefill/MTP scratch owner tables, conservatively per stage");
                 if (o.spec > 0 && i > 0)
                     ds.vram.add("verify_windows", (uint64_t) kWindowMib << 20, "generate.cpp kWindowMib");
                 if (!o.mtp.empty() && i == last) {
@@ -3092,6 +3113,26 @@ int main(int argc, char** argv) {
         auto upload = [&](const char* name, uint64_t bytes, const char* source) {
             uploads.add(name, bytes, source);
         };
+        const uint64_t stage_count = split_real ? split_devs.size() + 1 : 1;
+        ram("session_host_pinned", byte_mul(stage_count, session_allocation.host_pinned), "SessionAllocationBytes per-stage QSA mapped staging bound");
+        ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
+            (uint64_t) g.n_qsa_layers() * strata::plan::kResidentQsaBytes), "ABI-checked owner/QSA envelopes");
+        startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
+        if (o.spec > 0 || !o.mtp.empty() || requested_slots)
+            ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
+        ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
+            "prefill and MTP independent owner staging/readback");
+        if (requested_slots) {
+            ram("resident_session_pinned", byte_mul(stage_count, resident.session_pinned), "private QSA staging per requested slot/stage");
+            ram("resident_session_owner", byte_mul(stage_count, resident.session_owner), "ABI-checked resident owner envelopes");
+            ram("resident_histories", resident.histories, "three context-bounded token histories per requested slot");
+            ram("resident_checkpoints", byte_mul(stage_count, resident.checkpoints), "one retained checkpoint per slot, full session envelope");
+            ram("resident_verifier_pinned", byte_mul(stage_count, resident.verifier_pinned), "mapped slot commit controls");
+            ram("resident_verifier_history", byte_mul(stage_count, resident.verifier_history), "4096 int32 history entries per slot");
+            ram("resident_mtp_pinned", resident.mtp_pinned, "private draft QSA mapped staging");
+            ram("resident_mtp_owner", resident.mtp_owner, "draft slot owner envelope, weights and scratch shared");
+            ram("resident_transfer_transient", resident.transfer_transient, "serial checkpoint and one-layer QSA transfer envelope");
+        }
         if (residency_table)
             ram("host_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers, (uint64_t) g.n_expert),
                 sizeof(int32_t)), "graph hits host residency vector payload");
@@ -3320,6 +3361,8 @@ int main(int argc, char** argv) {
         ram("host_logits", n_vocab > 0 ? byte_mul((uint64_t) n_vocab, 4) : 0, "host logits vector");
         ram("runtime_host_staging", (uint64_t) kWindowMib << 20,
             "verify/pool mapped handoffs and request metadata: same conservative window envelope");
+        ram("verifier_diagnostic_host", byte_mul(stage_count, 262144),
+            "bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit");
         if (o.resident_cpu_experts)
             ram("resident_exchange_staging", byte_mul((uint64_t) std::max(o.adapt_swaps, 0), blob_gate),
                 "FileExpertSource::reserve_exchanges: swaps * max_blob");
@@ -3357,14 +3400,14 @@ int main(int argc, char** argv) {
         const bool local_measured = strata::core::available_memory_bytes(local_available);
         HostAdmissionSnapshot external;
         const bool external_measured = read_host_admission(external);
-        if (admission_prefill) {
+        if (admission_prefill || requested_slots) {
             if (o.guest_opaque_allowance_bytes != 0 && external_measured && external.worker_limit != 0) {
-                ram("prefill_runtime_storage", o.guest_opaque_allowance_bytes,
+                ram(admission_prefill ? "prefill_runtime_storage" : "resident_runtime_storage", o.guest_opaque_allowance_bytes,
                     "operator-committed finite allowance for the prefill run's opaque host-side storage "
                     "(CUDA events/context/registration, thread stacks, allocator metadata); the enforced "
                     "worker cgroup ceiling, not this number, is what bounds the guest");
             } else {
-                ram_unknown("prefill_runtime_storage",
+                ram_unknown(admission_prefill ? "prefill_runtime_storage" : "resident_runtime_storage",
                     "Opaque CUDA events/context/registration storage, resident thread stacks, allocator metadata, "
                     "init pointer/thread containers, vector capacity excess and diagnostic transients remain "
                     "unqualified (give --guest-opaque-allowance-bytes inside a measured worker cgroup ceiling to "
@@ -3628,8 +3671,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    strata::core::SessionState ss;
-    void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
+    strata::core::SessionOwner session_owner;
+    strata::core::SessionState& ss = session_owner.state();
+    // All resident state outlives every stage/verifier/drafter graph borrowing it.
+    std::vector<std::vector<std::unique_ptr<strata::core::SessionOwner>>> bslot_ss;
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
     // i.e. stream 0.  `bench/micro/kernel_costs.cu` measures what that costs: EVERY kernel it launches through
@@ -4166,12 +4211,8 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: session state allocation failed\n");
-            return 1;
-        }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
-            std::fprintf(stderr, "strata generate: session_init failed\n");
+        if (!session_owner.init(g, o.max_context, K, err, 0, hi0)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
@@ -4200,9 +4241,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
-        void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
+        if (!st.session_owner.init(g, o.max_context, K, err, st.lb, st.le)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
@@ -4226,7 +4265,6 @@ int main(int argc, char** argv) {
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
     // engine still starts and serves one request at a time.
-    std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -4257,11 +4295,9 @@ int main(int argc, char** argv) {
             const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
-                auto u = std::make_unique<strata::core::SessionState>();
-                void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                auto u = std::make_unique<strata::core::SessionOwner>();
+                if (!u->init(g, o.max_context, K, err, lo, hi)) {
                     cudaGetLastError();
-                    if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
                     std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
@@ -4270,7 +4306,7 @@ int main(int argc, char** argv) {
                     fit = b;
                     break;
                 }
-                strata::core::session_zero(*u, g, nullptr, nullptr);
+                strata::core::session_zero(u->state(), g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -4294,6 +4330,11 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+    // Resident init, partial failure and stage-count trimming can retire the latest
+    // registered table. Bind the longer-lived working owner on every actual device,
+    // even when >=2 slots survived, before any MTP/prefill/verifier graph captures it.
+    session_owner.bind_rope();
+    for (const auto& stage : stages) stage->session_owner.bind_rope();
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
@@ -4311,6 +4352,13 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (o.batch > 0 && !o.mtp.empty()) {
+            std::vector<strata::core::SessionState*> ptrs;
+            for (auto& u : bslot_ss.back()) ptrs.push_back(&u->state());
+            if (!mtp.init_slots(ptrs, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+            }
+        }
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
@@ -6409,6 +6457,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        struct HistoryOwner {
+            int32_t* data;
+            int device;
+            ~HistoryOwner() {
+                const strata::core::OnDevice on(device);
+                if (cudaDeviceSynchronize() != cudaSuccess || cudaFree(data) != cudaSuccess) std::terminate();
+            }
+        } history_owner{d_hist, hist_dev};
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -6492,7 +6548,7 @@ int main(int argc, char** argv) {
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
-                for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
+                for (auto& u : bslot_ss[k]) ptrs.push_back(&u->state());
                 strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
@@ -7102,7 +7158,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        strata::spec::DraftPolicy policy(S);   // reset at each request; no cross-request learning
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -7233,6 +7289,7 @@ int main(int argc, char** argv) {
         // ---- --batch: the slots of the batch windows
         struct BSlot {
             bool active = false, stop = false;
+            uint64_t request = 0;          ///< stable owner across pause, cancellation and resume
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
@@ -7251,8 +7308,25 @@ int main(int argc, char** argv) {
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
             bool partial = false, partial_from0 = false;
+            void observe(const char* phase, int slot) const {
+                if (request && std::getenv("STRATA_STATE_HASH"))
+                    std::fprintf(stderr, "STATE_RESIDENCY request=%llu slot=%d phase=%s cells=%zu\n",
+                                 (unsigned long long) request, slot, phase, ids.size());
+            }
+            void retire(int slot) {
+                if (active) observe("failure", slot);
+                observe("release", slot);
+                request = 0;
+            }
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        struct ResidencyRelease {
+            std::vector<BSlot>& slots;
+            ~ResidencyRelease() {
+                if (cudaDeviceSynchronize() != cudaSuccess) std::terminate();
+                for (size_t i = 0; i < slots.size(); ++i) slots[i].retire((int) i);
+            }
+        } residency_release{bs};
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -7269,12 +7343,33 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        auto slot_observe = [&](const char* phase, int slot, int64_t cells, std::string& e) -> bool {
+            if (!std::getenv("STRATA_STATE_HASH")) return true;
+            const auto* draft = mtp.slot_state(slot);
+            if (!draft) { e = "resident draft state missing"; return false; }
+            strata::program::SessionFingerprint h;
+            if (!strata::program::session_fingerprint(bslot_ss[0][(size_t) slot]->state(), *draft, g, cells, h, e))
+                return false;
+            const uint64_t id = bs[(size_t) slot].request;
+            if (std::strcmp(phase, "commit") != 0)
+                bs[(size_t) slot].observe(std::strcmp(phase, "admit") == 0 ? "start" : phase, slot);
+            if (id == 0 || drive.d.slot_requests[slot] != id) { e = "resident request owner mismatch"; return false; }
+            const uint64_t observed = ver.validated_slot_request_id(slot);
+            if (observed != id) { e = "resident graph canary mismatch"; return false; }
+            std::fprintf(stderr, "strata serve: STATE_SLOT phase=%s slot=%d request=%llu cells=%lld gdn=%016llx "
+                         "ple=%016llx kv=%016llx draft=%016llx canary=%llu\n", phase, slot,
+                         (unsigned long long) id, (long long) cells, (unsigned long long) h.gdn,
+                         (unsigned long long) strata::program::fingerprint_ple(h, bslot_ss[0][(size_t) slot]->state()),
+                         (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.draft,
+                         (unsigned long long) observed);
+            return true;
+        };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& to = bslot_ss[k][(size_t) b]->state();
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
@@ -7292,7 +7387,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
-            return true;
+            return mtp.bind_request(b, drive.d.request_generation, e) && mtp.save_slot(b, upto, e);
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
@@ -7301,7 +7396,7 @@ int main(int argc, char** argv) {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& from = bslot_ss[k][(size_t) b]->state();
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
@@ -7325,7 +7420,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
-            return true;
+            return mtp.restore_slot(b, upto, e) && slot_observe("resume", b, upto, e);
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -7373,7 +7468,13 @@ int main(int argc, char** argv) {
                 const int b = rows[t];
                 BSlot& sl = bs[(size_t) b];
                 const int32_t y = outb[t];
+                if (!mtp.advance_slot(b, ver.final_R(t), y, pos[t], err)) {
+                    std::printf("ERR %s\n", err.c_str()); return false;
+                }
                 sl.ids.push_back(sl.x);    // the window fed it: the slot's sessions hold it now
+                if (!slot_observe("commit", b, (int64_t) sl.ids.size(), err)) {
+                    std::printf("ERR %s\n", err.c_str()); return false;
+                }
                 std::printf("BT %d %d\n", b, (int) y);
                 ++sl.produced;
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -7382,7 +7483,11 @@ int main(int argc, char** argv) {
                 if (fin != nullptr) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                    if (sl.stop && !slot_observe("cancel", b, (int64_t) sl.ids.size(), err)) {
+                        std::printf("ERR %s\n", err.c_str()); return false;
+                    }
                     sl.active = false;
+                    sl.observe("pause", b);
                     sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
                 } else {
                     sl.x = y;
@@ -7419,6 +7524,8 @@ int main(int argc, char** argv) {
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
+            int count = 0;
+            int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
@@ -7452,11 +7559,14 @@ int main(int argc, char** argv) {
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
-                for (int t = 0; t < GS; ++t) {
-                    BSlot& sl = bs[(size_t) (gi * GS + t)];
+                for (int t = 0; t < G.count; ++t) {
+                    BSlot& sl = bs[(size_t) G.rows[t]];
                     if (!sl.active) continue;
                     const int32_t y = outb[t];
-                    std::printf("BT %d %d\n", gi * GS + t, (int) y);
+                    if (!mtp.advance_slot(G.rows[t], vk.final_R(t), y, G.pos[t], err)) {
+                        std::printf("ERR %s\n", err.c_str()); return false;
+                    }
+                    std::printf("BT %d %d\n", G.rows[t], (int) y);
                     ++sl.produced;
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -7465,9 +7575,9 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f\n", G.rows[t], (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        sl.cached = false;   // pipelined groups retain no conversation-cache contract
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -7496,11 +7606,14 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
+                    G.count = 0;
                     for (int t = 0; t < GS; ++t) {
-                        BSlot& sl = bs[(size_t) (pick * GS + t)];
-                        G.tok[t] = sl.active ? sl.x : 0;
-                        G.pos[t] = sl.active ? sl.p : 0;
-                        if (!sl.active) sl.cached = false;   // its pad row writes its state
+                        const int slot = pick * GS + t;
+                        const BSlot& sl = bs[(size_t) slot];
+                        if (!sl.active) continue;
+                        G.rows[G.count] = slot;
+                        G.tok[G.count] = sl.x;
+                        G.pos[G.count++] = sl.p;
                     }
                     G.inflight = true;
                     G.stage = 0;
@@ -7509,7 +7622,7 @@ int main(int argc, char** argv) {
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
-                if (!stage_verifier(k).batch_launch(pick * GS, GS, G.tok, G.pos, err)) {
+                if (!stage_verifier(k).batch_launch(pick * GS, G.rows, G.count, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
@@ -7596,6 +7709,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             ++drive.d.request_generation;
+            if (!ver.set_request_id(drive.d.request_generation, err) ||
+                !mtp.bind_request(8, drive.d.request_generation, err) || !sp.bind_request(drive.d.request_generation, err)) {
+                std::printf("ERR %s\n", err.c_str()); return 1;
+            }
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
@@ -8231,6 +8348,7 @@ int main(int argc, char** argv) {
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+            strata::kernels::SamplerParams req_sp;
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
@@ -8268,16 +8386,25 @@ int main(int argc, char** argv) {
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                         if (can && copy_to_slot(ys, pre, ye)) {
                             BSlot& sl = bs[(size_t) ys];
+                            sl.retire(ys);
                             sl = BSlot{};
                             sl.ids = std::move(pre);
+                            sl.ids.reserve((size_t) o.max_context);
+                            sl.request = drive.d.request_generation;
+                            drive.d.slot_requests[ys] = sl.request;
                             sl.cached = true;
                             sl.partial = true;
                             sl.partial_from0 = read_from == 0 || resumed_from0;
                             sl.cvec = cvec_cached;
-                            for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
-                                if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
-                                        [](int32_t x, int64_t y) { return (int64_t) x == y; }))
-                                    sl.checks.push_back(c);
+                            const ConvCheckpoint* best = nullptr;
+                            for (const ConvCheckpoint& c : checks)
+                                if ((int64_t) c.ids.size() <= q && (!best || c.ids.size() > best->ids.size()) &&
+                                    std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
+                                        [](int32_t x, int64_t y) { return (int64_t) x == y; })) best = &c;
+                            if (best) sl.checks.push_back(*best);
+                            if (!ver.set_slot_context(ys, sl.request, req_sp, &sl.ids, sl.cvec, ye) ||
+                                !slot_observe("admit", ys, q, ye)) { e = ye; return false; }
+                            sl.observe("pause", ys);
                             yielded_at = q;
                             yielded_slot = ys;
                             std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d "
@@ -8308,7 +8435,6 @@ int main(int argc, char** argv) {
             };
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
-            strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
@@ -8421,6 +8547,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) S, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
+            policy = strata::spec::DraftPolicy(S);
             if (o.suffix_draft > 0) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
@@ -8505,24 +8632,30 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // A paused/cancelled request must never retain unreported rows.
+                int keep = (int) std::min<int64_t>(a + 1, max_new - produced_n);
+                for (int i = 0; i < keep; ++i)
+                    if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                        keep = i + 1; break;
+                    }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                if (!ver.commit(keep, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                // Only the emitted prefix is now committed; the final pick is next x.
+                for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
-                draft_accepted += a;
+                draft_accepted += std::min(a, keep - 1);
                 first_window = false;
                 bool eos = false;
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                for (int i = 0; i < keep; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -8536,8 +8669,12 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                // Terminal windows still populate their committed draft KV before
+                // admission/snapshot. Previously this left another request's cells.
+                const bool terminal = eos || produced_n >= max_new || stop_req.load();
+                const bool drafted = terminal
+                    ? mtp.prefill(ver.final_R_all(), outv.data(), keep, p, err)
+                    : mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -8553,13 +8690,24 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (T > keep && std::getenv("STRATA_STATE_HASH")) {
+                    strata::program::SessionFingerprint h;
+                    if (!ver.wait_commit(err) || !strata::program::session_fingerprint(ss, mtp.kv_state(), g, p + keep, h, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: STATE_ROLLBACK request=%llu cells=%lld window=%d keep=%d accepted=%d "
+                                 "gdn=%016llx ple=%016llx kv=%016llx draft=%016llx\n",
+                                 (unsigned long long) drive.d.request_generation, (long long) (p + keep), T, keep, a,
+                                 (unsigned long long) h.gdn, (unsigned long long) strata::program::fingerprint_ple(h, ss),
+                                 (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.draft);
+                }
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                x = outv[(size_t) keep - 1];
+                p += keep;
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
-                x = outv[(size_t) a];
-                p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -8591,113 +8739,17 @@ int main(int argc, char** argv) {
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
-                // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
-                // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                if (cudaDeviceSynchronize() != cudaSuccess) {
-                    std::printf("ERR synchronizing state fingerprint\n");
-                    return 1;
-                }
+                strata::program::SessionFingerprint h;
                 const int64_t L = (int64_t) live.size();
-                const strata::kernels::QsaShapes qs = [&] {
-                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-                    s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
-                    return s;
-                }();
-                bool hash_ok = true;
-                std::array<uint8_t, 65536> hash_buffer;
-                auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
-                    for (size_t offset = 0; hash_ok && offset < bytes;) {
-                        const size_t n = std::min(hash_buffer.size(), bytes - offset);
-                        // VRAM or a streamed host copy, with fixed diagnostic workspace.
-                        if (cudaMemcpy(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n, cudaMemcpyDefault) != cudaSuccess) {
-                            hash_ok = false;
-                            break;
-                        }
-                        h = fnv1a(hash_buffer.data(), n, h);
-                        offset += n;
-                    }
-                    return h;
-                };
-                // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
-                auto hash_cells = [&](const void* pool, int64_t per_cell, int64_t c0, int64_t c1, uint64_t h) {
-                    const int64_t ps = qs.page_size;
-                    for (int64_t pg = c0 / ps; pg * ps < c1; ++pg)
-                        for (int64_t hd = 0; hd < qs.n_head_kv; ++hd) {
-                            const int64_t a = std::max(c0, pg * ps) - pg * ps, e = std::min(c1, (pg + 1) * ps) - pg * ps;
-                            const size_t off = (size_t) (((pg * qs.n_head_kv + hd) * ps + a) * per_cell);
-                            h = hash_dev((const uint8_t*) pool + off, (size_t) ((e - a) * per_cell), h);
-                        }
-                    return h;
-                };
-                const ConvStateSizes z = conv_state_sizes(g, ss);
-                uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr && ss.gdn_alloc > 0) {   // per GDN layer: which one differs first
-                    const size_t per = z.gdn / (size_t) ss.gdn_alloc;
-                    std::string s;
-                    char b[8];
-                    for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
-                        std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev((const uint8_t*) ss.gdn_state + i * per, per, 1469598103934665603ull) & 0xffff));
-                        s += b;
-                    }
-                    std::fprintf(stderr, "strata serve: STATE_HASH_GDN %s\n", s.c_str());
-                }
-                uint64_t h_ple = hash_dev(ss.ple_hist, ss.ple_hist ? z.ple : 0, 1469598103934665603ull);
-                uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
-                // pooled= keeps its 0.1.29 meaning: the completed rows [0, L / idx_block) only.  pooled_full= adds the
-                // spare row at L / idx_block (the `dead` key the next block completion overwrites), which a
-                // conversation restore writes back; dead= is the spare key itself
-                uint64_t h_dead = h_tail, h_pool_full = h_tail;
-                const int64_t kvb = qs.head_dim, scb = (qs.head_dim / 64) * 2;
-                // a state's K/V arrays and their bytes per (cell, head) row: the host copy when it has one
-                auto kv_arrays = [&](const strata::core::QsaState& st) {
-                    const bool h = st.kv_mode != 0;
-                    std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
-                        const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                        a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
-                    } else if (st.kv_hybrid) {
-                        const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
-                        a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q4 : st.v_q4, q4b},
-                             {h ? st.host.k_scale : st.k_scale, scb}};
-                    } else if (st.kv_int8) {
-                        a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q : st.v_q, kvb},
-                             {h ? st.host.k_scale : st.k_scale, scb}, {h ? st.host.v_scale : st.v_scale, scb}};
-                    } else {
-                        a = {{h ? st.host.k_pool : st.k_pool, qs.head_dim * 2},
-                             {h ? st.host.v_pool : st.v_pool, qs.head_dim * 2}};
-                    }
-                    return a;
-                };
-                const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
-                                                           ss.max_cells);   // = the primary state's max_cells
-                for (int64_t j = 0; j < ss.qsa_alloc; ++j) {   // this session's owned QSA ordinals only
-                    const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
-                    h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
-                    h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
-                                           h_pool_full);
-                    // KV streaming: the host copy is the identity layout and holds every cell
-                    for (const auto& [pool, w] : kv_arrays(st)) {
-                        h_kv = hash_cells(pool, w, 0, L, h_kv);
-                        h_stale = hash_cells(pool, w, L, end_cell, h_stale);
-                    }
-                }
-                const strata::core::QsaState& ms = mtp.kv_state();
-                uint64_t h_mtp = 1469598103934665603ull;
-                const int64_t mL = std::min<int64_t>(L, ms.max_cells);
-                for (const auto& [pool, w] : kv_arrays(ms))
-                    if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
-                if (!hash_ok) {
-                    std::printf("ERR reading state fingerprint\n");
-                    return 1;
+                if (!strata::program::session_fingerprint(ss, mtp.kv_state(), g, L, h, err)) {
+                    std::printf("ERR %s\n", err.c_str()); return 1;
                 }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
-                                     "kv=%016llx mtp=%016llx stale=%016llx dead=%016llx pooled_full=%016llx ple_prev=%d,%d\n", (long long) L,
-                             (unsigned long long) h_gdn, (unsigned long long) h_ple, (unsigned long long) h_tail,
-                             (unsigned long long) h_pool, (unsigned long long) h_kv, (unsigned long long) h_mtp,
-                             (unsigned long long) h_stale, (unsigned long long) h_dead,
-                             (unsigned long long) h_pool_full, ss.ple_prev[0], ss.ple_prev[1]);
+                                     "kv=%016llx mtp=%016llx stale=%016llx dead=%016llx pooled_full=%016llx ple_prev=%d,%d\n",
+                             (long long) L, (unsigned long long) h.gdn, (unsigned long long) h.ple,
+                             (unsigned long long) h.tail, (unsigned long long) h.pooled, (unsigned long long) h.kv,
+                             (unsigned long long) h.draft, (unsigned long long) h.stale, (unsigned long long) h.dead,
+                             (unsigned long long) h.pooled_full, ss.ple_prev[0], ss.ple_prev[1]);
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
@@ -8730,17 +8782,19 @@ int main(int argc, char** argv) {
                     cont = false;
                 }
                 if (cont) {
-                    ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     BSlot& sl = bs[(size_t) admit_slot];
+                    sl.retire(admit_slot);
                     sl = BSlot{};
                     sl.active = true;
                     drive.d.slot_requests[admit_slot] = drive.d.request_generation;
+                    sl.request = drive.d.request_generation;
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    sl.ids.reserve((size_t) o.max_context);
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
                     const ConvCheckpoint* best = nullptr;
@@ -8749,6 +8803,12 @@ int main(int argc, char** argv) {
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
                     if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    if (!ver.set_slot_context(admit_slot, sl.request, req_sp, &sl.ids, sl.cvec, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    if (!slot_observe("admit", admit_slot, (int64_t) sl.ids.size(), err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
@@ -9811,7 +9871,6 @@ int main(int argc, char** argv) {
     cudaFree(d_logits);
     cudaFree(d_emb);
     cudaFree(d_parts);
-    cudaFree(sbuf);
     cudaFree(arena);
     return 0;
 }

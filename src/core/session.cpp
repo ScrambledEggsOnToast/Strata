@@ -13,11 +13,15 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
 #include <vector>
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
@@ -44,6 +48,52 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
 }
 
+// The existing layer counters use unchecked products. Bound their inputs to the artifact's dimensions
+// before calling them; even INT32_MAX context then fits uint64_t (and the kernels' position indices).
+bool allocation_shape(const ModelGeometry& g, int64_t cells, int64_t k, int64_t& lo, int64_t& hi) {
+    const ModelGeometry limit;
+    const int64_t ModelGeometry::* dimensions[] = {
+        &ModelGeometry::n_embd, &ModelGeometry::n_layers, &ModelGeometry::ssm_state_size,
+        &ModelGeometry::ssm_k_heads, &ModelGeometry::ssm_v_heads, &ModelGeometry::ssm_d_conv,
+        &ModelGeometry::ssm_conv_channels, &ModelGeometry::ssm_value_dim, &ModelGeometry::n_head,
+        &ModelGeometry::n_head_kv, &ModelGeometry::head_dim, &ModelGeometry::idx_q_heads,
+        &ModelGeometry::idx_key_dim, &ModelGeometry::hc, &ModelGeometry::hc_lr,
+        &ModelGeometry::n_expert, &ModelGeometry::n_ff
+    };
+    for (auto d : dimensions) if (g.*d <= 0 || g.*d > limit.*d) return false;
+    if (g.qsa_interval <= 0 || cells <= 0 || cells > INT32_MAX || k < 1 || k > 64 ||
+        qsa_kv_resident() > INT32_MAX) return false;
+    if (hi < 0 || hi > g.n_layers) hi = g.n_layers;
+    if (lo < 0) lo = 0;
+    return lo < hi;
+}
+
+void teardown_check(cudaError_t result, const char* operation) noexcept {
+    if (result == cudaSuccess) return;
+    std::fprintf(stderr, "strata session teardown: %s: %s\n", operation, cudaGetErrorString(result));
+    std::terminate();   // no safe reuse/release is possible after a failed device drain
+}
+
+struct SessionDevice {
+    int previous = -1;
+    explicit SessionDevice(int device) {
+        teardown_check(cudaGetDevice(&previous), "get device");
+        if (previous != device) teardown_check(cudaSetDevice(device), "select device");
+    }
+    ~SessionDevice() { teardown_check(cudaSetDevice(previous), "restore device"); }
+};
+
+void release_drained(SessionState& s) noexcept {
+    for (int64_t j = 0; s.qsa_states && j < s.qsa_alloc; ++j)
+        qsa_state_release(s.qsa_states[s.qsa_ord0 + j]);
+    const uint64_t id = s.allocation_id, heap = s.qsa_heap_bytes;
+    delete[] s.qsa_states;
+    if (heap && std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_SESSION_HEAP owner=%llu phase=release bytes=%llu\n",
+                     (unsigned long long) id, (unsigned long long) heap);
+    s = SessionState{};
+}
+
 }  // namespace
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
@@ -53,8 +103,7 @@ static uint64_t ple_hist_bytes() {
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
-    if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
-    if (layer_lo < 0) layer_lo = 0;
+    if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
     const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
     const int64_t q_lo = layer_lo / I, q_hi = layer_hi / I;
@@ -73,10 +122,113 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
+bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
+                              SessionAllocationBytes& out, int64_t layer_lo, int64_t layer_hi) {
+    out = {};
+    if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return false;
+    const int64_t nq = g.n_qsa_layers();
+    const int64_t count = std::max<int64_t>(layer_hi / g.qsa_interval - layer_lo / g.qsa_interval, nq ? 1 : 0);
+    SessionAllocationBytes b;
+    b.device = session_bytes(g, max_cells, k, layer_lo, layer_hi);
+    b.host_pinned = (uint64_t) count * qsa_state_host_bytes(g, max_cells);
+    b.host_heap = sizeof(SessionOwner) + (uint64_t) nq * sizeof(QsaState);
+    if (count) {
+        const auto shape = strata::kernels::qsa_real_shapes();
+        const uint64_t rope = (uint64_t) max_cells * (shape.n_rot / 2) * sizeof(float) * 2;
+        const uint64_t pages = ((uint64_t) max_cells + shape.page_size - 1) / shape.page_size;
+        b.host_transient = std::max(rope, pages * sizeof(int32_t));
+    }
+    const uint64_t largest = (uint64_t) std::numeric_limits<size_t>::max();
+    if (b.device > largest || b.host_pinned > largest || b.host_heap > largest || b.host_transient > largest)
+        return false;
+    out = b;
+    return true;
+}
+
+SessionOwner::~SessionOwner() noexcept { reset(); }
+
+bool SessionOwner::init(const ModelGeometry& g, int64_t max_cells, int64_t k, std::string& err,
+                        int64_t layer_lo, int64_t layer_hi) {
+    err.clear();
+    if (arena_) { err = "session: owner already initialized"; return false; }
+    static std::atomic<uint64_t> next_id{0};
+    allocation_id_ = ++next_id;
+    SessionAllocationBytes bytes;
+    if (!session_allocation_bytes(g, max_cells, k, bytes, layer_lo, layer_hi)) {
+        err = "session: invalid allocation geometry/configuration";
+        return false;
+    }
+    if (cudaGetDevice(&device_) != cudaSuccess) {
+        device_ = -1;
+        err = "session: cannot identify allocation device";
+        return false;
+    }
+    const cudaError_t allocated = cudaMalloc(&arena_, (size_t) bytes.device);
+    if (allocated != cudaSuccess) {
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=failure device=%d bytes=0\n",
+                         (unsigned long long) allocation_id_, device_);
+        arena_ = nullptr;
+        device_ = -1;
+        err = std::string("session: arena allocation: ") + cudaGetErrorString(allocated);
+        return false;
+    }
+    memory_ = bytes;
+    state_.allocation_id = allocation_id_;
+    if (std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=allocate device=%d bytes=%llu\n",
+                     (unsigned long long) allocation_id_, device_, (unsigned long long) memory_.device);
+    try {
+        if (session_init(g, max_cells, k, arena_, state_, layer_lo, layer_hi) != 0) return true;
+        err = "session: QSA initialization failed";
+    } catch (...) {
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=failure device=%d bytes=%llu\n",
+                         (unsigned long long) allocation_id_, device_, (unsigned long long) memory_.device);
+        reset();
+        throw;
+    }
+    if (std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=failure device=%d bytes=%llu\n",
+                     (unsigned long long) allocation_id_, device_, (unsigned long long) memory_.device);
+    reset();
+    return false;
+}
+
+void SessionOwner::bind_rope() const noexcept {
+    if (!arena_ || !state_.qsa_states || state_.qsa_alloc == 0 ||
+        strata::kernels::qsa_real_shapes().n_rot != 64) return;
+    const SessionDevice on(device_);
+    const QsaState& primary = state_.qsa_states[state_.qsa_primary()];
+    strata::kernels::rope_table_set(primary.cos_tab, primary.sin_tab, (int) state_.max_cells,
+                                  strata::kernels::rope_scaling());
+}
+
+void SessionOwner::reset() noexcept {
+    if (!arena_) return;
+    const SessionDevice on(device_);
+    teardown_check(cudaDeviceSynchronize(), "drain device");
+    release_drained(state_);
+    teardown_check(cudaFree(arena_), "free arena");
+    if (std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=release device=%d bytes=%llu\n",
+                     (unsigned long long) allocation_id_, device_, (unsigned long long) memory_.device);
+    arena_ = nullptr;
+    device_ = -1;
+    memory_ = {};
+    allocation_id_ = 0;
+}
+
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo, int64_t layer_hi) {
-    if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
-    if (layer_lo < 0) layer_lo = 0;
+    if (!base || s.allocation_device >= 0 || s.qsa_states ||
+        !allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return 0;
+    if (cudaGetDevice(&s.allocation_device) != cudaSuccess) { s.allocation_device = -1; return 0; }
+    struct InitGuard {
+        SessionState& state;
+        bool complete = false;
+        ~InitGuard() { if (!complete) session_release(state); }
+    } guard{s};
     uint8_t* p = (uint8_t*) base;
     uint64_t used = 0;
     auto take = [&](uint64_t bytes) {
@@ -91,7 +243,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.layer_hi = layer_hi;
     const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
     const int64_t q_n_range = layer_hi / I - layer_lo / I;
-    s.qsa_ord0 = layer_lo / I;
+    // A suffix after the final QSA still needs a primary; keep it INSIDE the global ordinal array.
+    s.qsa_ord0 = g.n_qsa_layers() ? std::min(layer_lo / I, g.n_qsa_layers() - 1) : 0;
     s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
@@ -106,7 +259,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
     const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
-    s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
+    s.qsa_states = g.n_qsa_layers() ? new (std::nothrow) QsaState[(size_t) g.n_qsa_layers()]() : nullptr;
+    if (g.n_qsa_layers() && !s.qsa_states) return 0;
+    s.qsa_heap_bytes = (uint64_t) g.n_qsa_layers() * sizeof(QsaState);
+    if (s.qsa_heap_bytes && std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_SESSION_HEAP owner=%llu phase=allocate bytes=%llu\n",
+                     (unsigned long long) s.allocation_id, (unsigned long long) s.qsa_heap_bytes);
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
@@ -126,15 +284,15 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
+    guard.complete = true;
     return used;
 }
 
 void session_release(SessionState& s) {
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (s.qsa_states[j].owns_rope) {
-            strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
-            s.qsa_states[j].owns_rope = false;
-        }
+    if (s.allocation_device < 0) return;
+    const SessionDevice on(s.allocation_device);
+    teardown_check(cudaDeviceSynchronize(), "drain external-arena session");
+    release_drained(s);
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {

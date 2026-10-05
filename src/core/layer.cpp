@@ -31,6 +31,7 @@
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <cuda_runtime.h>
@@ -574,8 +575,64 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     return align_up16(n) + 256;
 }
 
+uint64_t qsa_state_host_bytes(const ModelGeometry& g, int64_t max_cells, int64_t ring_cells) {
+    const QsaShapes s = qsa_shapes(g);
+    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const int fmt = g_kv_q4 ? strata::kernels::kKvQ4
+                          : (g_kv_int8 || g_kv_hybrid) ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+    return strata::kernels::qsa_step_bytes() + sizeof(int32_t) + (uint64_t) s.n_head * sizeof(int32_t) +
+           (p.mode == 0 ? 0 : (uint64_t) p.pages * strata::kernels::kv_block_bytes(s, fmt) + 4 * 256);
+}
+
+namespace {
+void qsa_release_check(cudaError_t result, const char* operation) noexcept {
+    if (result == cudaSuccess) return;
+    std::fprintf(stderr, "strata QSA teardown: %s: %s\n", operation, cudaGetErrorString(result));
+    std::terminate();
+}
+}
+
+void qsa_state_release(QsaState& st) noexcept {
+    if (st.owns_rope) strata::kernels::rope_table_release(st.cos_tab);
+    if (st.host_step) qsa_release_check(cudaFreeHost(st.host_step), "free step staging");
+    if (st.host_pos) qsa_release_check(cudaFreeHost(st.host_pos), "free position staging");
+    if (st.host_allocation) qsa_release_check(cudaFreeHost(st.host_allocation), "free host KV");
+    if (st.allocation_id && std::getenv("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_QSA owner=%llu phase=release allocations=%u bytes=%llu\n",
+                     (unsigned long long) st.allocation_id, st.pinned_allocations, (unsigned long long) st.pinned_bytes);
+    g_kv_host_bytes -= st.host_allocation_bytes;
+    st = QsaState{};
+}
+
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
+    if (st.host_step || st.host_pos || st.host_allocation || st.owns_rope) return 0;
+    static std::atomic<uint64_t> next_id{0};
+    st.allocation_id = ++next_id;
+    auto allocated = [&](uint64_t bytes) {
+        st.pinned_bytes += bytes;
+        ++st.pinned_allocations;
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "STATE_QSA owner=%llu phase=allocate allocations=1 bytes=%llu\n",
+                         (unsigned long long) st.allocation_id, (unsigned long long) bytes);
+    };
+    // The same guard handles CUDA failures and host allocation exceptions. Keep kv_mode for MTP's existing
+    // streamed-to-resident fallback, but release every acquired handle before it overwrites the state.
+    struct InitGuard {
+        QsaState& state;
+        bool complete = false;
+        ~InitGuard() {
+            if (complete) return;
+            if (std::getenv("STRATA_STATE_HASH"))
+                std::fprintf(stderr, "STATE_QSA owner=%llu phase=failure allocations=%u bytes=%llu\n",
+                             (unsigned long long) state.allocation_id, state.pinned_allocations,
+                             (unsigned long long) state.pinned_bytes);
+            const int mode = state.kv_mode;
+            qsa_release_check(cudaDeviceSynchronize(), "drain partial initialization");
+            qsa_state_release(state);
+            state.kv_mode = mode;
+        }
+    } guard{st};
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -646,21 +703,25 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
     if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
-                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
-            cudaSuccess) {
-        return 0;   // the caller sees a zero byte count; a half-built state is worse than none
-    }
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return 0;
+    allocated(strata::kernels::qsa_step_bytes() + sizeof(int32_t));
+    if (cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4,
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return 0;
+    allocated((uint64_t) s.n_head * 4);
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = strata::kernels::KvHostPools{};
     if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
-        uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        const cudaError_t pinned = cudaHostAlloc(&st.host_allocation, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (pinned == cudaSuccess) {
+            allocated(bytes);
+            g_kv_host_bytes += bytes;
+            st.host_allocation_bytes = bytes;
+        }
+        if (pinned != cudaSuccess || cudaHostGetDevicePointer((void**) &d, st.host_allocation, 0) != cudaSuccess) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
@@ -668,7 +729,6 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
-        g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
@@ -691,8 +751,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
-        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        if (cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
@@ -702,13 +762,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
-        cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+        if (cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     } else if (p.mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
     } else {
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
-    cudaDeviceSynchronize();
+    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    guard.complete = true;
     return c.used;
 }
 
@@ -739,6 +800,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_block_pos, 0, sizeof(int32_t), cs);
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {

@@ -234,6 +234,12 @@ struct QsaState {
     int kv_mode = 0;
     int64_t n_slots = 0;
     strata::kernels::KvHostPools host;
+    /// Allocation handle, NOT the mapped device alias in `host`; retained even during partial init.
+    void* host_allocation = nullptr;
+    uint64_t host_allocation_bytes = 0;
+    uint64_t allocation_id = 0;
+    uint64_t pinned_bytes = 0;
+    uint32_t pinned_allocations = 0;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -304,8 +310,17 @@ inline int qsa_kv_format(const QsaState& st) {
     }
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+/// Initialize a fresh state, never a live owner's copy. Failure releases acquired secondary allocations;
+/// kv_mode alone is retained for the drafter's resident fallback. The device arena remains caller-owned.
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+/// Releases only allocations outside the caller's device arena (pinned KV and token staging), and the
+/// owned RoPE registration. Caller must first drain the owning device and retire graph/prefill borrowers.
+/// Safe for partial initialization and repeated calls; never cudaFree's an arena or a borrowed RoPE table.
+void qsa_state_release(QsaState& st) noexcept;
+/// Exact persistent pinned payload for one state under the current KV settings; excludes driver metadata.
+/// Like qsa_state_bytes, requires validated geometry/positive context and ring capacity (or -1 resident).
+uint64_t qsa_state_host_bytes(const ModelGeometry& g, int64_t max_cells, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

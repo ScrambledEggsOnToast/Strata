@@ -211,6 +211,15 @@ __global__ void append_tail(const float* __restrict__ raw, int64_t n, int64_t p0
     if (cell < p0) return;
     tail[s * D + d] = __half2float(__float2half_rn(raw[(cell - p0) * D + d]));
 }
+
+__global__ void commit_spare(const int32_t* first_position, const int32_t* count,
+                             const float* dead, float* pooled, int32_t* block_pos) {
+    const int cells = *first_position + *count;
+    const int blocks = cells / R;
+    const int d = threadIdx.x;
+    if (d < D) pooled[std::size_t(blocks) * D + d] = dead[d];
+    if (d == 0) *block_pos = blocks > 0 ? (blocks - 1) * R : 0;
+}
 struct Span { const void* p; std::size_t n; };
 void validate(Span s) {
     const auto p = reinterpret_cast<std::uintptr_t>(s.p);
@@ -284,6 +293,13 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
         append_blocks<false><<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon,
             b.tail, b.dead, b.pooled, b.block_pos, first, hi, theta_scale, fsf, cl, ch, ef, ms, mtab, rt);
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_commit(const int32_t* first_position, const int32_t* count,
+                               const QsaIndexerBuffers& b, void* stream) {
+    commit_spare<<<1, D, 0, static_cast<cudaStream_t>(stream)>>>(first_position, count, b.dead, b.pooled, b.block_pos);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

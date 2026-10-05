@@ -21,13 +21,18 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/core/operation_canary.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+namespace strata::prefill { class Prefill; }
 
 namespace strata::core {
 
@@ -99,16 +104,50 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
-    QsaState& kv_state_rw() { return st_; }
+    bool bind_request(int slot, uint64_t request, std::string& err);
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
+        const OnDevice on_device(device_);
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
     }
 
+    // Resident requests share immutable MTP weights and serialized operation
+    // scratch, never K/V. Allocate/capture once before requests are admitted.
+    bool init_slots(const std::vector<SessionState*>& sessions, std::string& err);
+    bool save_slot(int slot, int64_t cells, std::string& err);
+    bool restore_slot(int slot, int64_t cells, std::string& err);
+    bool advance_slot(int slot, const float* residual, int32_t next_token,
+                      int64_t cell, std::string& err);
+    const QsaState* slot_state(int slot) const;
+
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    friend class strata::prefill::Prefill;
+    // One host submitter; a failed operation poisons the lease until teardown.
+    // A successful operation releases it only after the device stream drains.
+    class Operation {
+    public:
+        Operation(MtpDrafter& owner, std::string& err, int slot = 8, cudaStream_t external = nullptr,
+                  int32_t token = 0, int32_t position = 0);
+        ~Operation();
+        explicit operator bool() const { return acquired_; }
+        bool finish(std::string& err);
+    private:
+        MtpDrafter& owner_;
+        bool acquired_ = false, finished_ = false;
+        int slot_ = 8;
+        cudaStream_t external_ = nullptr;
+    };
+    std::atomic_flag scratch_owned_ = ATOMIC_FLAG_INIT;
+    OperationCanary canary_;
+    bool draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                    float* probs, float min_p, int* n_drafts);
+    void restore_ring(int64_t upto);
+    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err,
+                        const QsaState* state = nullptr);
+    bool prepare_slots(std::string& err);
+    bool check_input_graphs(std::string& err); // opt-in protected qualification, before any request
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
@@ -153,6 +192,15 @@ private:
     uint8_t* experts_ = nullptr;
     void* state_arena_ = nullptr;
     QsaState st_;
+    struct SlotState {
+        QsaState state;
+        void* arena = nullptr;
+        cudaGraphExec_t advance = nullptr;
+        int64_t cells = 0;
+        uint64_t arena_bytes = 0;
+    };
+    static_assert(sizeof(SlotState) <= 4096, "resident.hpp slot owner envelope");
+    std::vector<SlotState> slots_;
     void* arena_ = nullptr;
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,

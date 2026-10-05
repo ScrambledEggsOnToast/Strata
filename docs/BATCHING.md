@@ -32,25 +32,25 @@ With a layer split, the engine options go into the config's `args`:
 | `--batch-groups G` | with a layer split: the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
-The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots (a
-window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
-the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
+The fork's admission gate prices the **requested** count before allocation, including private main-model and
+MTP state, pinned staging, histories/checkpoints and transfer peaks. It refuses unsupported resident KV formats
+or an over-budget plan. After admission, runtime allocation may still reduce the count, retaining the
+single-session fallback when fewer than two slots fit. The server reads the effective count from
+`INFO batch_slots=N`; `GET /v1/status` reports `concurrency.serving`.
 
 ### What a slot costs, and what setup recommends
 
-Every slot's session takes VRAM that the expert cache would otherwise hold: 0.56 GiB at a 32K context with 8-bit
-KV, more with a longer context unless the KV cache streams (`--kv-resident`: then only the attention's 32K window
-stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K). On a card whose experts mostly run
-on the CPU, a batch also reads about as many distinct experts as the requests one by one (different conversations
-route to different experts), so the gain is in **latency** (nobody waits for a whole answer), and a request alone
-runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below.
+Each resident slot owns a `SessionOwner` (GDN recurrence/convolution, QSA KV/indexer and PLE history), a private
+MTP KV arena, sampling/steering settings, token history and bounded checkpoint. Mutable verifier, MTP and prefill
+scratch is serialized under operation ownership; immutable weights remain shared. Resident admission currently
+supports fully resident FP16 KV only. Quantized/streamed KV is not qualified for additional resident slots;
+the single-session path is unchanged. Native and Python HET-017 accounting charge these payloads before the
+automatic expert-cache grant, even if a later runtime fallback reduces the active slot count.
 
-So setup recommends `"parallel"` **only where the experts mostly fit in VRAM**: the expert cache (each card's VRAM
-less ~5 GB, every card of a layer split counted) must still hold at least half of the model's experts beside the
-slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at 32K that is 3 slots on a 24 GB
-card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split. Everywhere else (any 12 or 16 GB
-card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
-about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
+The upstream setup heuristic recommends `"parallel"` where experts mostly fit in VRAM. It is a recommendation,
+not an admission calculation or evidence for this fork. The historical measurements below show why slots can
+reduce waiting while slowing a request alone: their private state reduces the expert cache. Use the emitted
+admission plan for the actual context/slot count, not those historical per-slot memory estimates.
 
 ## How the server uses the slots
 
@@ -60,9 +60,9 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   new request is admitted next to it. A request in a slot decodes **without MTP drafts** (one token per window).
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path: the slot is
   stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with
-  `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). The draft layer's own K/V was
-  built for another conversation then, but measured it accepted as many drafts (140 of 172) as a draft layer that
-  read the conversation (140 of 173).
+  `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). Every resident commit advances
+  that slot's private MTP KV using its own final residual and next token. Resume restores the same conversation's
+  draft state; another conversation's draft KV is never an acceptable substitute.
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or
   decoding, its tokens and tok/s; `live.running` the requests in flight).
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
@@ -85,13 +85,14 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 
 ## Exactness
 
-A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch
-produces exactly the tokens it produces alone** - verified token by token for 8 concurrent conversations of 150
-tokens, with and without the pipeline (`tools/batch_test.py`), and on one RTX 5070 for 4 conversations, for a long
-prompt read while two others decode, for a prompt that gave way and went on, for a next turn continued from its
-slot (from all it holds, and from its turn checkpoint without the reply's thinking), and for a request stopped in
-its slot and continued on the solo path (`tools/batch_interleave_test.py`). These
-settings make the comparison exact:
+The historical upstream tests below established token equality for their own configurations; they are not this
+fork's acceptance evidence. HET-035 qualifies two coexisting sessions on a single RTX 3090 using the pinned full
+Flash-Next IQ3_S architecture. Its gate is exact committed full-vocabulary FP32 logits, actual routing IDs/weights,
+tokens and logical state, including rejected-window restoration and cancellation/resume. The parent repository's
+`evidence/HET-035/` records measured outcomes and limitations; a completed vehicle is not ticket acceptance.
+No V100, multi-GPU, quantized/streamed resident KV, or arbitrary host-thread concurrency is implied.
+
+The numerical comparison requires the same execution configuration on both sides:
 
 - `STRATA_IQ_MT_MIN=1` (the multi-token CPU expert kernels for every group, as for the solo path's own
   exactness tests: by default an expert's rows round differently alone than in a group, so the output depends on
@@ -109,20 +110,28 @@ differed for one, because the adaptive VRAM tier had moved experts between the s
 texts read as well as their solo runs.
 
 Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row with the solo window's
-counter-based draw (Philox(seed, position)).
+counter-based draw (Philox(seed, position)). Each resident row also stages its own bounded repetition/frequency/
+presence-penalty history and steering flag. The shared process registry holds immutable steering tensors;
+captured resident graphs consume explicit row flags rather than the solo request's global switch.
+
+Resident initialization failure or slot-count reduction can retire the latest RoPE-table registration.
+After all such setup/unwind paths, each device rebinds the longer-lived working session's immutable table
+before graph capture. This preserves table-backed arithmetic (`STRATA_ROPE_TABLE=1`) in both the surviving
+batch and the single-session fallback; resident teardown cannot invalidate a captured working-table pointer.
 
 ## Limits (for now)
 
 - Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps
   its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
-- Repetition / frequency / presence penalties are not applied in batch windows.
+- Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
+  beyond the bound refuses before capture; live graphs are not evicted.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
 - `--batch-groups` needs every stage on its own GPU; a pipelined slot is not kept as a conversation cache.
-- The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
+- Additional resident slots require fully resident FP16 KV; each requested slot is charged before allocation.
 
-## Measured
+## Historical upstream measurements (not fork qualification)
 
 One RTX 5070 (12 GB), Ryzen 5 7600, 64 GB DDR5, Q2_0, 32K context, through the HTTP server: C different requests
 sent at once (an 800-word essay each, 256 tokens per answer, greedy, thinking off), median of 3 rounds:
@@ -172,6 +181,10 @@ two long conversations alternating through the HTTP server: the first turns took
 (their prompts read), the follow-ups 0.53 s and 0.46 s.
 
 ## Testing
+
+In the Strata engine project, run GPU/model checks only through the protected external supervisor. The parent
+repository's `tools/het035-session/USAGE.txt` describes the bounded qualification vehicle and retained evidence.
+The scripts below document upstream interfaces; they do not authorize direct unsupervised GPU workloads.
 
 Four scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
 tests the server's side with a scripted engine (no GPU).

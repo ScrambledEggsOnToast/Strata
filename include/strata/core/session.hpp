@@ -30,6 +30,7 @@ namespace strata::core {
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
     int64_t max_cells = 0;
+    int allocation_device = -1;     ///< device captured by session_init; -1 for a non-owning/manual view
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
@@ -59,6 +60,8 @@ struct SessionState {
     int64_t qsa_alloc = 0;                ///< allocated QSA states (>= 1 whenever the model has any)
     int64_t gdn_ord0 = 0;                 ///< global GDN ordinal of `gdn_state` row 0
     int64_t gdn_alloc = 0;                ///< allocated GDN rows
+    uint64_t allocation_id = 0;
+    uint64_t qsa_heap_bytes = 0;
     int qsa_primary() const { return (int) qsa_ord0; }
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
@@ -95,17 +98,67 @@ struct SessionState {
 /// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model);
 /// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
+/// Returns 0 for invalid ranges or inputs outside session_allocation_bytes' bounded geometry contract.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
-/// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
+/// Carves caller-owned `base` (DEVICE memory) into a fresh `s`. Returns bytes used, or 0 on failure with
+/// secondary allocations already released. The caller ALWAYS retains ownership of `base`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo = 0, int64_t layer_hi = -1);
-/// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
-/// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
+/// Drains the initialization device, releases pinned QSA storage/registrations and the QSA struct array,
+/// then clears the view. Idempotent; NEVER frees the externally allocated device arena. Stop submitting
+/// work and retire graph/prefill/MTP borrowers first. A failed device selection/drain terminates rather
+/// than freeing storage still reachable by the device. Manual views not created by session_init are untouched.
+/// A copied SessionState is only a borrowed view: never release both it and its original/SessionOwner.
 void session_release(SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+
+/// Allocation payloads, not CUDA/host allocator or graph metadata. `host_transient` is the maximum live
+/// RoPE/page-table construction payload (one layer at a time), in addition to persistent host storage.
+struct SessionAllocationBytes {
+    uint64_t device = 0;
+    uint64_t host_pinned = 0;
+    uint64_t host_heap = 0;          ///< owner object plus globally indexed QsaState array
+    uint64_t host_transient = 0;
+};
+/// Pure preallocation pricing with the current, frozen process KV settings. False/zero output on invalid
+/// inputs or unsupported geometry: positive dimensions no larger than the artifact's ModelGeometry defaults,
+/// context and KV-resident cells <= INT32_MAX, k in [1,64]. Call before allocating ANY resident slots.
+/// Excludes weights, verifier/prefill/MTP scratch, request containers and allocator/driver overhead.
+bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
+                              SessionAllocationBytes& out, int64_t layer_lo = 0, int64_t layer_hi = -1);
+
+/// Owns one stable-address session and its arena, on the device current at init. No copying or moving:
+/// graph nodes and PLE token/history pointers may point into state(). The process dispatch is serial;
+/// this owner does not make the shared verifier, RoPE registry or KV configuration thread-safe.
+/// Reset/destruction requires all host submitters stopped and borrowers retired, and drains the device.
+class SessionOwner {
+public:
+    SessionOwner() = default;
+    ~SessionOwner() noexcept;
+    SessionOwner(const SessionOwner&) = delete;
+    SessionOwner& operator=(const SessionOwner&) = delete;
+    SessionOwner(SessionOwner&&) = delete;
+    SessionOwner& operator=(SessionOwner&&) = delete;
+    bool init(const ModelGeometry& g, int64_t max_cells, int64_t k, std::string& err,
+              int64_t layer_lo = 0, int64_t layer_hi = -1);
+    void reset() noexcept;
+    /// Rebind this surviving working session's immutable RoPE table after resident setup/unwind,
+    /// before graph capture. All borrowers must retire before this owner; dispatch remains serial.
+    void bind_rope() const noexcept;
+    SessionState& state() noexcept { return state_; }
+    const SessionState& state() const noexcept { return state_; }
+    const SessionAllocationBytes& memory() const noexcept { return memory_; }
+    int device() const noexcept { return device_; }
+private:
+    SessionState state_;
+    void* arena_ = nullptr;
+    int device_ = -1;
+    SessionAllocationBytes memory_;
+    uint64_t allocation_id_ = 0;
+};
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///
