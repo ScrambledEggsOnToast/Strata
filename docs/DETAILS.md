@@ -524,22 +524,37 @@ hypothetical future capacities that are reported but never admitted - as the doc
 
 ### A declared MPS client ceiling
 
-When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes that client's total
-device budget at creation (`CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`) and names the control pipe
-(`CUDA_MPS_PIPE_DIRECTORY`). `src/platform/mps_ceiling.cpp` reads that pair **before the first CUDA
-call** and refuses the run when the pair is incomplete, when the pipe is missing, unreachable, not a
-directory or not owned by this user or root, or when the limit is unreadable. Nothing is guessed at:
-both variables absent means no ceiling was declared and no behaviour changes.
+When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes the
+creation-time device budget with `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=<positive limit>` and
+names `CUDA_MPS_PIPE_DIRECTORY`. A declaration also requires exactly one complete GPU UUID
+in `CUDA_VISIBLE_DEVICES`. Missing, malformed or multi-device declarations refuse; neither
+limit nor pipe present leaves ordinary non-MPS behavior unchanged. MPS split, remote-cache,
+peer-device and HIP execution are unsupported and refuse before CUDA.
 
-Inside an MPS client `cudaMemGetInfo` reports the remaining *client budget*, not device free memory, so
-the first measurement also requires the reported free bytes to be at or below the declared ceiling. A
-client that carries the variable with nothing enforcing it - no daemon, or a daemon it never attached to
-- silently sees the whole device instead; that case is refused by name rather than planned against, and
-it is the failure mode the isolated qualification measured (`evidence/HET-017/clientcap-qualification.json`
-in the project repository). The device line's ceiling is therefore the tighter of the driver total and
-the client budget, which is also what bounds `--expert-cache auto`: a 1 GiB client budget grants zero
-cache slots instead of silently over-committing, and the plan reports both the ceiling and
-`enforced_cap_bytes`.
+`src/platform/mps_ceiling.cpp` checks pipe identity/ownership and current daemon default
+readback, then queries that exact UUID's physical free memory **before this client's context**.
+The full cap plus positive `--mps-outside-client-allowance-bytes` must fit that snapshot.
+After CUDA0 context creation, and before even the default native PCIe allocation probe,
+the engine verifies the actual CUDA UUID, its own PID in exactly one daemon server's client
+list, that server's device-0 cap, and `cudaMemGetInfo` residual <= declared cap. Fixed read-only
+control queries have a three-second total deadline per phase and bounded output/PID lists.
+
+`cudaMemGetInfo` inside MPS reports the **remaining client budget**, not physical free memory.
+Planned demand plus headroom must independently fit `min(driver_total, residual_client_free)`;
+that unchanged residual formula also funds `--expert-cache auto`. A physical snapshot or the
+full cap never funds extra cache space. `--graph-capture-allowance-bytes` and
+`--prefill-library-allowance-bytes` replace only their named unknown classes when accompanied
+by a matching `--mps-cap-bytes`; an omitted class stays unknown and refuses. Outside-client
+allowance is separate from those client costs. Zero cap, impossible residual, missing physical
+measurement/allowance or an overflowing physical envelope refuses with identity retained.
+
+These are trusted-client checks, not an immutable numeric-cap query: current default/server
+limits configure future clients. Residual <= cap alone cannot prove attachment on a busy GPU.
+The pre-context physical sample is not a reservation, and all allowances remain explicit
+planning commitments rather than measured peaks. External exclusivity and safety monitoring
+remain necessary. `PLAN` prints the cap, named allowances and physical timepoint; native and
+Python decision JSON expose the same fields. The standalone `mps_ceiling_smoke` target exercises
+the actual module under the protected supervisor only; it is deliberately not a GPU CTest.
 
 `--windowed-experts --adapt-swaps 0` selects a fixed one-layer direct-I/O source ring for
 canonical/native `experts.bin` or native GGUF planes. No buffered fallback is used. Raw expert

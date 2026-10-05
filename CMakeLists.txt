@@ -227,7 +227,7 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
-  # the declared-MPS-ceiling contract: pure parse plus a stat, so it needs no GPU and no model
+  # Host-only MPS declaration, bounded control transport and verification contract.
   add_executable(mps_ceiling_test src/platform/mps_ceiling_test.cpp src/platform/mps_ceiling.cpp)
   target_include_directories(mps_ceiling_test PRIVATE include)
   add_test(NAME mps_ceiling_test COMMAND mps_ceiling_test)
@@ -438,6 +438,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(verify_canary_test tests/core/verify_canary_test.cpp)
     target_include_directories(verify_canary_test PRIVATE include ${_strata_gpu_include_directories})
     target_link_libraries(verify_canary_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906 AND UNIX AND NOT APPLE)
+      # Explicit protected execution only; never registered as an unguarded CTest.
+      add_executable(mps_ceiling_smoke tests/core/mps_ceiling_smoke.cpp)
+      target_link_libraries(mps_ceiling_smoke PRIVATE strata_core ${_strata_gpu_runtime_target} Threads::Threads)
+    endif()
     if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       target_compile_definitions(session_owner_test PRIVATE STRATA_SESSION_TEST_WRAP=1)
       target_link_options(session_owner_test PRIVATE

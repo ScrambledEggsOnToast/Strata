@@ -257,6 +257,69 @@ void test_explain_or_shrink_comparison() {
             "an explained overshoot still blocked enlargement");
 }
 
+void test_mps_physical_and_residual_gates_are_independent() {
+    DeviceCost device;
+    device.vram.add("payload", 80, "boundary");
+    auto t = measured("CUDA0", 100);
+    t.free_bytes = 80;
+    t.cap_declared = true;
+    t.enforced_cap_bytes = 90;
+    t.physical_free_measured = true;
+    t.physical_free_bytes = 100;
+    t.outside_client_allowance_bytes = 10;
+    const auto decide = [&]() { return admit_configuration({device}, {t}, {}, {}, {}); };
+    auto d = decide();
+    require(d.admitted && d.verified && d.devices[0].ceiling_bytes == 80,
+            "MPS equality boundary must admit against residual, not physical capacity");
+    t.physical_free_bytes = 200;
+    d = decide();
+    require(d.admitted && d.devices[0].ceiling_bytes == 80 && d.devices[0].slack_bytes == 0,
+            "extra physical headroom changed client budget");
+    t.physical_free_bytes = 99;
+    d = decide();
+    require(!d.admitted && d.verified && !d.devices[0].fits,
+            "one-byte physical overflow must be a measured refusal");
+    t.free_bytes = 79;
+    d = decide();
+    require(d.reasons.size() == 2 && d.limiting_term == "CUDA0:payload",
+            "physical refusal hid independent client-demand refusal");
+    t.physical_free_bytes = 100;
+    require(!decide().admitted, "physical capacity rescued an overfull client");
+    t.free_bytes = 80;
+    t.physical_free_measured = false;
+    d = decide();
+    require(!d.admitted && !d.verified && d.devices[0].cap_declared &&
+            d.devices[0].enforced_cap_bytes == 90 && d.devices[0].physical_free_bytes == 100 &&
+            d.devices[0].outside_client_allowance_bytes == 10,
+            "missing physical measurement was verified or lost declaration identity");
+    t.physical_free_measured = true;
+    t.outside_client_allowance_bytes = 0;
+    require(!decide().admitted && !decide().verified, "missing outside allowance admitted");
+    t.outside_client_allowance_bytes = 10;
+    t.enforced_cap_bytes = 0;
+    require(!decide().admitted && !decide().verified, "declared zero cap admitted");
+    t.enforced_cap_bytes = 79;
+    require(!decide().admitted && !decide().verified, "residual above cap admitted");
+    t.enforced_cap_bytes = 90;
+    t.measured = false;
+    d = decide();
+    require(!d.verified && d.devices[0].cap_declared && d.devices[0].physical_free_measured,
+            "unmeasured client telemetry lost physical identity");
+    t.measured = true;
+    t.total_bytes = UINT64_MAX;
+    t.enforced_cap_bytes = UINT64_MAX;
+    t.physical_free_bytes = UINT64_MAX;
+    t.outside_client_allowance_bytes = 1;
+    require(!decide().admitted, "overflowing full cap plus allowance admitted");
+    t.enforced_cap_bytes = UINT64_MAX - 1;
+    require(decide().admitted, "UINT64 equality physical envelope refused");
+    t.cap_declared = false;
+    t.physical_free_measured = false;
+    t.physical_free_bytes = 0;
+    t.outside_client_allowance_bytes = 0;
+    require(decide().admitted, "non-MPS unexpectedly required physical telemetry");
+}
+
 void test_overflow_refuses_in_every_scope_and_request() {
     const uint64_t largest = UINT64_MAX;
     DeviceCost device;
@@ -307,6 +370,7 @@ int main() {
         test_request_admission_by_state_demand();
         test_explain_or_shrink_comparison();
         test_overflow_refuses_in_every_scope_and_request();
+        test_mps_physical_and_residual_gates_are_independent();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;

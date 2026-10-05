@@ -465,10 +465,11 @@ struct Options {
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
     /// the finite allowances the operator commits for the two classes that have no size API.
-    /// All three are explicit and must agree with each other and with the verified
-    /// declaration; any one alone refuses, so a configuration is never admitted on an
-    /// allowance that no ceiling enforces.
+    /// The declared cap and outside-client allowance are explicit. Opaque-class allowances
+    /// stay unknown unless that cap is verified; physical headroom is a separate gate,
+    /// never funding for the client's automatic expert cache.
     uint64_t mps_cap_bytes = 0;                     // --mps-cap-bytes
+    uint64_t mps_outside_client_allowance_bytes = 0; // --mps-outside-client-allowance-bytes
     uint64_t graph_capture_allowance_bytes = 0;     // --graph-capture-allowance-bytes
     uint64_t prefill_library_allowance_bytes = 0;   // --prefill-library-allowance-bytes
     /// Guest-scope counterpart: the finite allowance the operator commits for the prefill run's opaque
@@ -856,6 +857,9 @@ void usage() {
                  "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
                  "  --mps-cap-bytes N    issue #60: the enforced MPS client ceiling this run is launched under;\n"
                  "                       must match the verified declaration in this process's environment\n"
+                 "  --mps-outside-client-allowance-bytes N  positive separate allowance for MPS/server device\n"
+                 "                       costs outside the client cap; cap + allowance must fit physical free\n"
+                 "                       memory measured before this client's context (not a reservation)\n"
                  "  --graph-capture-allowance-bytes N     issue #60: finite allowance committed for the CUDA\n"
                  "                       graph executables and capture transients, instead of refusing them as\n"
                  "                       unknown; needs --mps-cap-bytes and is bounded by the ceiling, not by\n"
@@ -1538,7 +1542,7 @@ int main(int argc, char** argv) {
         auto bytes_flag = [&](const char* value, const char* what) -> uint64_t {
             char* end = nullptr;
             const unsigned long long parsed = std::strtoull(value, &end, 10);
-            if (end == value || (end != nullptr && *end != '\0')) {
+            if (*value < '0' || *value > '9' || end == value || (end != nullptr && *end != '\0')) {
                 std::fprintf(stderr, "%s needs a byte count, got '%s'\n", what, value);
                 std::exit(2);
             }
@@ -1635,6 +1639,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--mps-cap-bytes") o.mps_cap_bytes = bytes_flag(next("--mps-cap-bytes"), "--mps-cap-bytes");
+        else if (a == "--mps-outside-client-allowance-bytes") o.mps_outside_client_allowance_bytes = bytes_flag(next("--mps-outside-client-allowance-bytes"), "--mps-outside-client-allowance-bytes");
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
         else if (a == "--guest-opaque-allowance-bytes") o.guest_opaque_allowance_bytes = bytes_flag(next("--guest-opaque-allowance-bytes"), "--guest-opaque-allowance-bytes");
@@ -1862,19 +1867,34 @@ int main(int argc, char** argv) {
     // prompt path (each stage's prompt path has its own buffers).
     // --pcie-frac given: that one share is every stage's (the stages' own link probes are skipped), so a split over
     // a fast and a slow link cannot set the two apart from the command line (#485)
-    // A declared MPS client ceiling is verified BEFORE the first CUDA call. The
-    // supervisor fixes the ceiling in this process's own creation environment, so it
-    // cannot be raised here; what can go wrong is that nothing enforced it. See
-    // include/strata/platform/mps_ceiling.hpp: a client that carries the variable with
-    // no daemon running silently sees the whole device instead of its budget, and every
-    // admission decision below would then be made against the wrong number.
+    // Validate the complete single-device MPS declaration before any CUDA call. Daemon
+    // readback and the independent physical sample follow immediately before context
+    // creation; own-PID attachment is then verified before the first planned allocation.
     strata::platform::MpsCeiling mps_ceiling;
+    strata::platform::MpsVerification mps_verification;
     {
         std::string ceiling_error;
         if (!strata::platform::mps_ceiling_from_environment(mps_ceiling, ceiling_error) ||
             !strata::platform::mps_ceiling_pipe_identity(mps_ceiling, ceiling_error)) {
             std::fprintf(stderr, "strata generate: %s\n", ceiling_error.c_str());
             return 2;
+        }
+        if (mps_ceiling.declared) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            std::fprintf(stderr, "strata generate: an NVIDIA MPS ceiling cannot be enforced by HIP\n");
+            return 2;
+#endif
+            if (!o.layer_split.empty() || !o.split_device.empty() || o.peer_device >= 1 ||
+                o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {
+                std::fprintf(stderr, "strata generate: MPS ceiling verification supports one CUDA device only; "
+                                     "layer splits, remote caches and peer devices are unsupported\n");
+                return 2;
+            }
+            if (o.mps_outside_client_allowance_bytes == 0) {
+                std::fprintf(stderr, "strata generate: a declared MPS ceiling requires a positive "
+                                     "--mps-outside-client-allowance-bytes commitment\n");
+                return 2;
+            }
         }
         if (mps_ceiling.declared)
             std::fprintf(stderr, "strata generate: MPS client ceiling declared: device %d, %llu B, pipe %s\n",
@@ -1884,7 +1904,8 @@ int main(int argc, char** argv) {
     // Issue #60: an operator-committed allowance for an opaque class is only admissible
     // inside a ceiling that is actually enforced, and the ceiling the operator planned
     // against must be the one this process was launched with. Partial commitments refuse.
-    const bool any_allowance = o.graph_capture_allowance_bytes != 0 || o.prefill_library_allowance_bytes != 0;
+    const bool any_allowance = o.graph_capture_allowance_bytes != 0 || o.prefill_library_allowance_bytes != 0 ||
+                               o.mps_outside_client_allowance_bytes != 0;
     if (any_allowance || o.mps_cap_bytes != 0) {
         if (o.mps_cap_bytes == 0) {
             std::fprintf(stderr, "strata generate: an opaque-class allowance needs --mps-cap-bytes: the "
@@ -2456,6 +2477,50 @@ int main(int argc, char** argv) {
     // the pricing sees the same demand as the run.  `n_prompt > 1` is the callers' concern (a one-token prompt
     // has nothing to batch).
     const bool prompt_batched = o.prefill_chunk > 0 && o.tokens.size() > 1 && (!oracle_dump || native_pack);
+    if (mps_ceiling.declared) {
+        if (!strata::platform::mps_verify_before_cuda(mps_ceiling, o.mps_outside_client_allowance_bytes,
+                                                     mps_verification, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 2;
+        }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        // cudaSetDevice may itself create the context. The physical sample above must
+        // precede it, while all allocations (including the PCIe probe) must follow this check.
+        cudaDeviceProp properties{};
+        size_t free_b = 0, total_b = 0;
+        cudaError_t status = cudaSetDevice(0);
+        if (status == cudaSuccess) status = cudaFree(nullptr);
+        if (status == cudaSuccess) status = cudaGetDeviceProperties(&properties, 0);
+        if (status == cudaSuccess) status = cudaMemGetInfo(&free_b, &total_b);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot establish MPS CUDA0 context: %s\n",
+                         cudaGetErrorString(status));
+            return 2;
+        }
+        char actual_uuid[41] = "GPU-";
+        size_t at = 4;
+        constexpr char hex[] = "0123456789abcdef";
+        for (int i = 0; i < 16; ++i) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) actual_uuid[at++] = '-';
+            const auto byte = static_cast<unsigned char>(properties.uuid.bytes[i]);
+            actual_uuid[at++] = hex[byte >> 4];
+            actual_uuid[at++] = hex[byte & 15];
+        }
+        if (!strata::platform::mps_verify_after_cuda(mps_ceiling, actual_uuid, free_b, mps_verification, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "strata MPS verified: uuid=%s client_pid=%d server_pid=%d cap_bytes=%llu "
+                             "default_cap_bytes=%llu server_cap_bytes=%llu residual_free_bytes=%llu "
+                             "physical_free_bytes=%llu outside_client_allowance_bytes=%llu precontext=1\n",
+                     actual_uuid, mps_verification.client_pid, mps_verification.server_pid,
+                     (unsigned long long) mps_ceiling.cap_bytes,
+                     (unsigned long long) mps_verification.default_cap_bytes,
+                     (unsigned long long) mps_verification.server_cap_bytes, (unsigned long long) free_b,
+                     (unsigned long long) mps_verification.physical_free_bytes,
+                     (unsigned long long) mps_verification.outside_client_allowance_bytes);
+#endif
+    }
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -3057,8 +3122,8 @@ int main(int argc, char** argv) {
                 if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
                     t.measured = true;
                     t.total_bytes = total_b;
-                    // Inside an MPS client this is the remaining CLIENT BUDGET, not device
-                    // free memory; the ceiling check below is what tells the two apart.
+                    // Under the already verified attachment this is the client's residual
+                    // budget, independent of the retained pre-context physical sample.
                     t.free_bytes = free_b;
                     if (mps_ceiling.declared) {
                         std::string ceiling_error;
@@ -3069,6 +3134,9 @@ int main(int argc, char** argv) {
                         }
                         t.cap_declared = true;
                         t.enforced_cap_bytes = mps_ceiling.cap_bytes;
+                        t.physical_free_measured = mps_verification.physical_free_measured;
+                        t.physical_free_bytes = mps_verification.physical_free_bytes;
+                        t.outside_client_allowance_bytes = mps_verification.outside_client_allowance_bytes;
                     }
                 }
             }
@@ -3528,10 +3596,14 @@ int main(int argc, char** argv) {
         // One line on stdout either way: the harness's predicted-vs-observed hook (the observed half is
         // the INFO line's vram_free_mib and the run's peak telemetry).
         if (o.mps_cap_bytes != 0)
-            std::printf("PLAN mps_cap_bytes=%llu graph_capture_allowance_bytes=%llu prefill_library_allowance_bytes=%llu\n",
+            std::printf("PLAN mps_cap_bytes=%llu graph_capture_allowance_bytes=%llu prefill_library_allowance_bytes=%llu "
+                        "physical_free_measured=%d physical_free_bytes=%llu outside_client_allowance_bytes=%llu\n",
                         (unsigned long long) o.mps_cap_bytes,
                         (unsigned long long) o.graph_capture_allowance_bytes,
-                        (unsigned long long) o.prefill_library_allowance_bytes);
+                        (unsigned long long) o.prefill_library_allowance_bytes,
+                        mps_verification.physical_free_measured ? 1 : 0,
+                        (unsigned long long) mps_verification.physical_free_bytes,
+                        (unsigned long long) mps_verification.outside_client_allowance_bytes);
         std::printf("PLAN admit=%d variant=%s devices=%zu", admission.admitted ? 1 : 0,
                     admission.variant.c_str(), admission.devices.size());
         for (size_t i = 0; i < admission.devices.size(); ++i) {

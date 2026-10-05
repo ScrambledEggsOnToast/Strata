@@ -106,14 +106,13 @@ struct DeviceTelemetry {
     bool measured = false;
     uint64_t total_bytes = 0;   // driver-visible total
     uint64_t free_bytes = 0;    // driver-visible free before planned allocations; zero admits no bytes
-    /// When a protected supervisor launched this process inside an MPS client, the client's
-    /// total device budget is fixed at creation and `free_bytes` above is that budget's
-    /// RESIDUAL, not device free memory (qualified in
-    /// evidence/HET-017/clientcap-qualification.json). The ceiling below is then the smaller
-    /// of the driver total and this cap, so a plan can never be built on an allowance the
-    /// client does not have.
+    /// Creation-time MPS client budget; free_bytes is its residual, not physical free.
+    /// The independent physical envelope uses the sample taken before this context.
     bool cap_declared = false;
     uint64_t enforced_cap_bytes = 0;
+    bool physical_free_measured = false;
+    uint64_t physical_free_bytes = 0;
+    uint64_t outside_client_allowance_bytes = 0;
 };
 
 /// Budget policy.  The reserves carry the docs/02 design defaults; an operator may RAISE them through the
@@ -149,6 +148,9 @@ struct DeviceLine {
     uint64_t ceiling_bytes = 0;    // measured driver-visible total (0 for hypothetical)
     bool cap_declared = false;     // an MPS client ceiling was in force for this device
     uint64_t enforced_cap_bytes = 0;
+    bool physical_free_measured = false;
+    uint64_t physical_free_bytes = 0;
+    uint64_t outside_client_allowance_bytes = 0;
     uint64_t demand_bytes = 0;     // known classes summed
     uint64_t headroom_bytes = 0;
     uint64_t slack_bytes = 0;      // ceiling - demand - headroom (saturating)
@@ -259,6 +261,13 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
             // (the check after this loop).  The label travels on the DeviceLine instead.
         } else {
             all_hypothetical = false;
+            if (t != nullptr) {
+                line.cap_declared = t->cap_declared;
+                line.enforced_cap_bytes = t->enforced_cap_bytes;
+                line.physical_free_measured = t->physical_free_measured;
+                line.physical_free_bytes = t->physical_free_bytes;
+                line.outside_client_allowance_bytes = t->outside_client_allowance_bytes;
+            }
             if (t == nullptr || !t->measured) {
                 line.fits = false;
                 line.has_ceiling = false;
@@ -268,8 +277,6 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
                 if (d.limiting_term.empty()) d.limiting_term = "telemetry:" + dev.name;
             } else {
                 line.has_ceiling = true;
-                line.cap_declared = t->cap_declared;
-                line.enforced_cap_bytes = t->enforced_cap_bytes;
                 // With a declared MPS ceiling, `free_bytes` is the client's remaining budget:
                 // taking min(total, free) is still the tightest honest ceiling because the
                 // client may not exceed its budget, and the budget is already below the cap
@@ -295,6 +302,45 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
                                         std::to_string(line.ceiling_bytes) + " B (limiting class " +
                                         line.limiting_class + ") - aggregate VRAM cannot rescue it");
                     if (d.limiting_term.empty()) d.limiting_term = dev.name + ":" + line.limiting_class;
+                }
+            }
+            // This envelope is independent of the residual client-demand gate above.
+            // A measured physical refusal remains verified; absent/invalid evidence does not.
+            if (t != nullptr && t->cap_declared) {
+                std::string failure;
+                std::string limiting;
+                bool valid = false;
+                if (t->enforced_cap_bytes == 0) {
+                    limiting = "declared MPS ceiling is zero";
+                    failure = "telemetry declares an MPS ceiling of zero bytes - refuse";
+                } else if (t->free_bytes > t->enforced_cap_bytes) {
+                    limiting = "MPS residual exceeds declared ceiling";
+                    failure = "MPS residual " + std::to_string(t->free_bytes) +
+                              " B exceeds declared ceiling " + std::to_string(t->enforced_cap_bytes) +
+                              " B - refuse";
+                } else if (!t->physical_free_measured) {
+                    limiting = "physical telemetry missing";
+                    failure = "pre-context physical free memory unmeasured - refuse (fail-closed)";
+                } else if (t->outside_client_allowance_bytes == 0) {
+                    limiting = "outside-client allowance missing";
+                    failure = "declared MPS ceiling requires a positive outside-client allowance - refuse";
+                } else {
+                    valid = true;
+                    if (t->enforced_cap_bytes > t->physical_free_bytes ||
+                        t->outside_client_allowance_bytes > t->physical_free_bytes - t->enforced_cap_bytes) {
+                        limiting = "physical envelope";
+                        failure = "MPS physical envelope overfull: cap " + std::to_string(t->enforced_cap_bytes) +
+                                  " B + outside-client allowance " + std::to_string(t->outside_client_allowance_bytes) +
+                                  " B > pre-context physical free " + std::to_string(t->physical_free_bytes) + " B";
+                    }
+                }
+                if (!failure.empty()) {
+                    line.fits = false;
+                    line.slack_bytes = 0;
+                    if (!valid) line.has_ceiling = false;
+                    if (line.limiting_class.empty()) line.limiting_class = limiting;
+                    d.reasons.push_back(dev.name + ": " + failure);
+                    if (d.limiting_term.empty()) d.limiting_term = "mps:" + dev.name;
                 }
             }
         }
@@ -567,6 +613,9 @@ inline std::string admission_json(const AdmissionDecision& d, const std::vector<
           // device free memory. Emitted so the document and the Python mirror agree.
           << indent << "      \"cap_declared\": " << (line.cap_declared ? "true" : "false") << ",\n"
           << indent << "      \"enforced_cap_bytes\": " << line.enforced_cap_bytes << ",\n"
+          << indent << "      \"physical_free_measured\": " << (line.physical_free_measured ? "true" : "false") << ",\n"
+          << indent << "      \"physical_free_bytes\": " << line.physical_free_bytes << ",\n"
+          << indent << "      \"outside_client_allowance_bytes\": " << line.outside_client_allowance_bytes << ",\n"
           << indent << "      \"demand_bytes\": " << line.demand_bytes << ",\n"
           << indent << "      \"demand_gib\": " << num2(gib(line.demand_bytes)) << ",\n"
           << indent << "      \"headroom_bytes\": " << line.headroom_bytes << ",\n"
