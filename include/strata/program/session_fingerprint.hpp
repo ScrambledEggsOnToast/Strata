@@ -17,6 +17,7 @@ struct SessionFingerprint {
     static constexpr uint64_t basis = 1469598103934665603ull;
     uint64_t gdn = basis, ple = basis, tail = basis, pooled = basis;
     uint64_t kv = basis, draft = basis, stale = basis, dead = basis, pooled_full = basis;
+    uint64_t residual = basis;
 };
 
 inline uint64_t fingerprint_word(uint64_t h, uint64_t word) {
@@ -38,7 +39,7 @@ inline uint64_t fingerprint_kv(const SessionFingerprint& h) {
 // cells from the equality contract. One fixed 64-KiB transfer buffer, no allocation.
 inline bool session_fingerprint(const core::SessionState& session, const core::QsaState& draft,
                                 const core::ModelGeometry& g, int64_t cells,
-                                SessionFingerprint& out, std::string& err) {
+                                SessionFingerprint& out, std::string& err, const float* final_residual = nullptr) {
     const core::OnDevice on(session.allocation_device);
     if (cells < 0 || cells > session.max_cells || (draft.max_cells > 0 && cells > draft.max_cells) ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -125,7 +126,19 @@ inline bool session_fingerprint(const core::SessionState& session, const core::Q
         out.stale = kv(state, cells, end, out.stale);
     }
     if (draft.max_cells > 0) out.draft = kv(draft, 0, cells, out.draft);
+    // Verifier residuals live in per-operation rows, not session.R (which is
+    // legacy token-path scratch). Caller supplies the last committed row.
+    if (final_residual) out.residual = bytes(final_residual, (size_t) g.hc * g.n_embd * sizeof(float), out.residual);
     if (!ok) err = "state fingerprint: device read failed";
     return ok;
+}
+
+inline void report_batch_state(const char* phase, uint64_t request, int slot, int64_t cells,
+                               const core::SessionState& session, const SessionFingerprint& h) {
+    std::fprintf(stderr, "STATE_BATCH_STATE phase=%s request=%llu slot=%d cells=%lld gdn=%016llx "
+        "ple=%016llx kv=%016llx residual=%016llx draft=%016llx\n", phase,
+        (unsigned long long) request, slot, (long long) cells, (unsigned long long) h.gdn,
+        (unsigned long long) fingerprint_ple(h, session), (unsigned long long) fingerprint_kv(h),
+        (unsigned long long) h.residual, (unsigned long long) h.draft);
 }
 } // namespace strata::program

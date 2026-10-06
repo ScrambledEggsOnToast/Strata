@@ -57,6 +57,25 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
+/// Independent requests, never speculative positions of one sequence. Cancellation
+/// is linearized by the single host submitter before launching a window; a launched
+/// window must commit/drain before another thread's cancellation can be observed.
+enum class BatchRowMask : uint8_t { active, padding, finished, cancelled };
+struct BatchRow {
+    uint64_t request_id = 0, cancellation_generation = 0;
+    SessionState* state = nullptr;
+    int slot = -1;
+    int32_t token = -1;
+    int64_t position = 0, sequence_begin = 0, sequence_end = 0;
+    int verification_span = 1, output_offset = 0;
+    BatchRowMask mask = BatchRowMask::padding;
+};
+
+struct BatchResources {
+    uint64_t device_bytes = 0, pinned_bytes = 0, history_bytes = 0;
+    size_t graph_keys = 0, graph_execs = 0;
+};
+
 class Verifier {
 public:
     Verifier() = default;
@@ -168,6 +187,20 @@ public:
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
+    /// Compact active metadata rows into run_slot_rows. Inert rows are never
+    /// staged, sampled or committed and return -1 at their output offset.
+    /// An all-inert/empty window still requires exactly one commit_slots call.
+    bool run_slot_rows(const BatchRow* rows, int count, PoolMultiFn pool, void* user,
+                       int32_t* out, std::string& err);
+    uint64_t slot_generation(int slot) const {
+        return slot >= 0 && slot < (int) slots_.size() ? slot_request_id_[slot] : 0;
+    }
+    /// Safe only between operations. Releases graph variants or all batch-only
+    /// scratch without touching resident/cached state, solo graphs or MTP borrowers.
+    /// init_slots may bind the same stable sessions again after resource release.
+    bool release_batch_graphs(std::string& err);
+    bool release_batch_resources(std::string& err);
+    BatchResources batch_resources() const;
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
 
@@ -291,6 +324,8 @@ private:
     uint64_t request_id_ = 0, canary_epoch_ = 0;
     uint64_t slot_request_id_[8] = {};
     uint64_t validated_slot_id_[8] = {};
+    uint64_t batch_device_bytes_ = 0, batch_pinned_bytes_ = 0;
+    void report_batch_resources(const char* phase) const;
     VerifyCanaryInput expected_canary_[8] = {};
     VerifyCanaryInput *h_canary_ = nullptr, *m_canary_ = nullptr;
     VerifyCanaryOwner *h_owner_ = nullptr, *m_owner_ = nullptr;

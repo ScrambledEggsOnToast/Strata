@@ -2095,7 +2095,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     const OnDevice on_device(device_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (!context_idle(err)) return false;
-    if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: init_slots may only run once"; return false; }
+    if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: release batch resources before rebinding slots"; return false; }
     if (slots.empty() || (int) slots.size() > max_t_) {
         err = "verify: init_slots needs 1.." + std::to_string(max_t_) + " sessions";
         return false;
@@ -2121,14 +2121,19 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         err = "verify: the batch commit staging failed";
         return false;
     }
+    batch_pinned_bytes_ = (uint64_t) S * CB * 4 + 16;
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
     const uint64_t tail_bytes = (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4;
     const uint64_t controls = (a + tail_bytes + 255) & ~255ull;
     if (cudaMalloc(&d, controls + (uint64_t) S * (4096 + 1) * sizeof(int32_t)) != cudaSuccess) {
+        cudaFreeHost(h_commitb_);
+        h_commitb_ = m_commitb_ = nullptr;
+        batch_pinned_bytes_ = 0;
         err = "verify: the batch buffers do not fit";
         return false;
     }
     arena_b_ = d;
+    batch_device_bytes_ = controls + (uint64_t) S * (4096 + 1) * sizeof(int32_t);
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
@@ -2139,13 +2144,79 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     for (int i = 0; i < S; ++i) slot_steering_[i] = 1;
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
+    report_batch_resources("init");
+    return true;
+}
+
+BatchResources Verifier::batch_resources() const {
+    BatchResources out{batch_device_bytes_, batch_pinned_bytes_,
+                       history_stage_b_.capacity() * sizeof(int32_t), exec_bm_.size(), 0};
+    for (const auto& graph : exec_bm_) out.graph_execs += graph.second != nullptr;
+    for (const auto& graph : commit_bm_) out.graph_execs += graph.second != nullptr;
+    return out;
+}
+
+void Verifier::report_batch_resources(const char* phase) const {
+    if (!env_on("STRATA_STATE_HASH")) return;
+    const auto b = batch_resources();
+    // Graph internals are opaque: report counts, never invent bytes. Admission
+    // retains HET-017's independent graph allowance, including capture peaks.
+    std::fprintf(stderr, "STATE_BATCH_RESOURCES phase=%s stage=%lld device=%llu pinned=%llu history=%llu keys=%zu execs=%zu\n",
+        phase, (long long) lb_, (unsigned long long) b.device_bytes, (unsigned long long) b.pinned_bytes,
+        (unsigned long long) b.history_bytes, b.graph_keys, b.graph_execs);
+}
+
+bool Verifier::release_batch_graphs(std::string& err) {
+    if (!context_idle(err)) return false;
+    const OnDevice on_device(device_);
+    for (cudaStream_t stream : {cs_, sh_cs_, copy_})
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) {
+            err = "verify: batch resource drain failed"; return fail_operation(err);
+        }
+    if (next_ && !next_->release_batch_graphs(err)) return false;
+    report_batch_resources("before_graph_release");
+    for (auto* graphs : {&exec_bm_, &commit_bm_}) {
+        for (auto& entry : *graphs) {
+            if (entry.second && cudaGraphExecDestroy(entry.second) != cudaSuccess) {
+                err = "verify: batch graph destruction failed"; return fail_operation(err);
+            }
+            entry.second = nullptr;
+        }
+        graphs->clear();
+    }
+    report_batch_resources("graphs_released");
+    return true;
+}
+
+bool Verifier::release_batch_resources(std::string& err) {
+    if (!release_batch_graphs(err)) return false;
+    const OnDevice on_device(device_);
+    if (next_ && !next_->release_batch_resources(err)) return false;
+    if (arena_b_ && cudaFree(arena_b_) != cudaSuccess) {
+        err = "verify: batch arena release failed"; return fail_operation(err);
+    }
+    arena_b_ = nullptr; batch_device_bytes_ = 0;
+    commitb_ = steering_b_ = history_b_ = nullptr; tail_snap_b_ = nullptr;
+    if (h_commitb_ && cudaFreeHost(h_commitb_) != cudaSuccess) {
+        err = "verify: batch staging release failed"; return fail_operation(err);
+    }
+    h_commitb_ = m_commitb_ = nullptr; batch_pinned_bytes_ = 0;
+    std::vector<int32_t>().swap(history_stage_b_);
+    std::vector<SessionState*>().swap(slots_);
+    std::vector<strata::kernels::SamplerParams>().swap(slot_sp_);
+    for (int i = 0; i < 8; ++i) {
+        slot_request_id_[i] = validated_slot_id_[i] = 0;
+        slot_history_[i] = nullptr;
+    }
+    last_batch_ = false; last_t_ = 0;
+    report_batch_resources("released");
     return true;
 }
 
 bool Verifier::reserve_batch_key(uint64_t key, std::string& err) {
     if (exec_bm_.find(key) != exec_bm_.end()) return true;
     if (exec_bm_.size() >= kVerifyBatchGraphKeys) {
-        err = "verify: bounded batch graph cache exhausted (32 row-order keys); restart with a bounded row schedule";
+        err = "verify: bounded batch graph cache exhausted; release idle batch graphs before another row schedule";
         return false;
     }
     // Reserve both sides together; failed captures retain their key, so even
@@ -2378,6 +2449,55 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     return true;
 }
 
+bool Verifier::run_slot_rows(const BatchRow* metadata, int count, PoolMultiFn pool, void* user,
+                             int32_t* out, std::string& err) {
+    if (!g_ || count < 0 || count > max_t_ || (count && (!metadata || !out))) {
+        err = "verify: invalid batch metadata extent"; return false;
+    }
+    if (!context_idle(err)) return false;
+    int rows[8] = {}, offsets[8] = {}, active = 0;
+    int32_t tokens[8] = {}, picks[8] = {};
+    int64_t positions[8] = {};
+    unsigned outputs = 0, slots = 0;
+    for (int i = 0; i < count; ++i) {
+        const BatchRow& row = metadata[i];
+        if (row.output_offset < 0 || row.output_offset >= count || (outputs & (1u << row.output_offset))) {
+            err = "verify: duplicate or invalid batch output offset"; return false;
+        }
+        outputs |= 1u << row.output_offset;
+        if (row.mask == BatchRowMask::padding || row.mask == BatchRowMask::finished ||
+            row.mask == BatchRowMask::cancelled) continue;
+        if (row.mask != BatchRowMask::active || row.slot < 0 || row.slot >= (int) slots_.size() ||
+            (slots & (1u << row.slot)) || row.state != slots_[(size_t) row.slot] ||
+            !row.request_id || row.request_id != slot_request_id_[row.slot] ||
+            row.cancellation_generation != slot_request_id_[row.slot] ||
+            row.verification_span != 1 || row.sequence_begin < 0 || row.position < row.sequence_begin ||
+            row.position >= row.state->max_cells || row.sequence_end != row.position + 1 ||
+            row.token < 0 || row.token >= n_vocab_) {
+            err = "verify: stale owner or invalid independent-request batch metadata"; return false;
+        }
+        slots |= 1u << row.slot;
+        rows[active] = row.slot; offsets[active] = row.output_offset;
+        tokens[active] = row.token; positions[active++] = row.position;
+    }
+    // Validate the entire descriptor before any model state or caller output changes.
+    for (int i = 0; i < count; ++i) out[i] = -1;
+    if (active) {
+        if (!run_slot_rows(rows, active, tokens, positions, pool, user, picks, err)) return false;
+        for (int i = 0; i < active; ++i) out[offsets[i]] = picks[i];
+    } else {
+        if (!acquire_scratch(err)) return false;
+        ScratchGuard guard{*this};
+        if (next_ && !next_->run_slot_rows(metadata, count, pool, next_user_, out, err)) return false;
+        last_t_ = 0; last_batch_ = true;
+        if (!scratch_.ready()) { err = "verify: empty batch ownership poisoned"; return false; }
+        guard.keep = true;
+    }
+    if (env_on("STRATA_STATE_HASH"))
+        std::fprintf(stderr, "STATE_BATCH rows=%d active=%d inert=%d\n", count, active, count - active);
+    return true;
+}
+
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
     int rows[8] = {};
@@ -2479,9 +2599,14 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
 
 bool Verifier::commit_slots(std::string& err) {
     const OnDevice on_device(device_);
-    if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
+    if (!last_batch_ || last_t_ < 0) { err = "verify: commit_slots without a batch window"; return false; }
     if (released_.load() || !scratch_.commit()) {
         err = "verify: batch commit does not own a completed window"; return false;
+    }
+    if (last_t_ == 0) {
+        if (next_ && !next_->commit_slots(err)) return fail_operation(err);
+        if (!scratch_.finish()) { err = "verify: empty commit ownership poisoned"; return fail_operation(err); }
+        return true;
     }
     ScratchGuard guard{*this, true};
     if (!observe_committed_rows(last_t_, err)) return false;

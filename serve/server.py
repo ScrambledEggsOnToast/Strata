@@ -4,7 +4,8 @@
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One admitted request by default;
+explicit resident slots enable bounded concurrency (not a claim of simultaneous arithmetic).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -45,7 +46,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,6 +138,14 @@ class EngineStarting(RuntimeError):
 
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
+
+
+class AdmissionError(RuntimeError):
+    """A bounded request queue or budget refused work before generation."""
+
+    def __init__(self, message, status=429):
+        super().__init__(message)
+        self.status = status
 
 
 class EngineSilent(EngineDied):
@@ -421,6 +430,7 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+        self.resident_multiplex = "--resident-multiplex" in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -496,6 +506,9 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        if self.resident_multiplex and (self.batch < 2 or self.info.get("resident_multiplex") != 1):
+            self.close()
+            raise RuntimeError("resident_multiplex requires at least two effective slots and INFO resident_multiplex=1")
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -514,7 +527,7 @@ class StrataEngine:
         self.slot_cv = threading.Condition()
         self.waiting = 0                                # requests waiting for the control lines (ctl)
         self.wait_lens: list[list[int]] = []            # ... their prompt lengths (a long read gives way to short ones)
-        self.ctl_epoch = 0                              # how often the control lines were taken
+        self.control_waiters = collections.deque()
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.ctl = threading.Lock()                     # one admission or solo request on the control lines at a time
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -746,6 +759,9 @@ class StrataEngine:
                     stopped = True
                 yield False                              # a token is pending (not a heartbeat)
             elif line.startswith("PP "):
+                if cancel.is_set() and not stopped:
+                    self._send("STOP")
+                    stopped = True
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
@@ -762,15 +778,16 @@ class StrataEngine:
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
-            elif line.startswith("ERR"):
-                raise ValueError(line[4:].strip())
+            elif line.startswith(("ERR", "REJECT")):
+                # Refusals have no BADM boundary. Poison rather than assign an ambiguous pipe to another owner.
+                raise self._silent("engine admission refused: " + line.strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
 
     def _drain_control(self, until: str, timeout: float = 300.0):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
-        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered)."""
+        request does not read this one's leftovers.  A missing boundary poisons the process, never the next request."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
@@ -781,61 +798,63 @@ class StrataEngine:
                 return None
             if line.startswith("DONE"):
                 self._parse_done(line)
-            if line.startswith(until) or line.startswith("ERR"):
+            if line.startswith(("ERR", "REJECT")):
+                raise self._silent("engine refused while draining: " + line.strip())
+            if line.startswith(until):
                 return line
-        return None
+        raise self._silent(f"the engine did not acknowledge {until} within {timeout:g} s")
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
-        """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
-        says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
-        come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
-        try:
-            self._send(f"BSTOP {slot}")
-        except EngineDied:
-            pass
-        def wait():
-            end = time.monotonic() + 600.0
-            tail = list(stream or [])
-            while time.monotonic() < end:
-                try:
-                    line = self.slot_q[slot].get(timeout=5.0)
-                except queue.Empty:
-                    continue
-                if line is None:
-                    tail = []
-                    break
-                if line.startswith("BT "):
-                    try:
-                        tail.append(int(line.split()[2]))
-                    except (IndexError, ValueError):
-                        tail = []
-                if line.startswith("BDONE "):
-                    break
-            self.slot_held[slot] = tail[:-1] if stream and tail else []
-            with self.slot_cv:
-                self.slot_busy[slot] = False
-                self.slot_cv.notify_all()
-        threading.Thread(target=wait, daemon=True).start()
+        """Stop and drain synchronously: neither admission nor embeddings may be freed before BDONE.
+
+        A missing acknowledgement ends the process. Never mark a still-running slot reusable on a timer.
+        """
+        self._send(f"BSTOP {slot}")
+        end = time.monotonic() + 600.0
+        tail = list(stream or [])
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                raise self._silent("the engine did not acknowledge BSTOP within 600 s")
+            try:
+                line = self.slot_q[slot].get(timeout=left)
+            except queue.Empty:
+                raise self._silent("the engine did not acknowledge BSTOP within 600 s") from None
+            if line is None:
+                tail = []
+                break
+            if line.startswith("BT "):
+                tail.append(int(line.split()[2]))
+            if line.startswith("BDONE "):
+                break
+        self.slot_held[slot] = tail[:-1] if stream and tail else []
+        with self.slot_cv:
+            self.slot_busy[slot] = False
+            self.slot_cv.notify_all()
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
-        """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
+    def _take_control(self, cancel, plen: int, on_control=None):
+        """FIFO control ownership; a yielded chunk read rejoins behind already-waiting requests."""
+        entry = [plen, object()]
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
+            # Identity, not prompt length, orders equal-sized requests. Requeued chunk reads go to the back.
+            self.__dict__.setdefault("control_waiters", collections.deque()).append(entry)
         beat = time.monotonic()
+        queued_at = time.perf_counter()
         try:
             while True:
                 with self.slot_cv:
-                    turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
-                if turn and self.ctl.acquire(timeout=0.5):
-                    break
-                if not turn:
-                    with self.slot_cv:
-                        self.slot_cv.wait(timeout=0.5)
+                    turn = self.control_waiters[0] is entry
+                    if cancel.is_set():
+                        return False
+                    if turn and self.ctl.acquire(blocking=False):
+                        break
+                    self.slot_cv.wait(timeout=0.5)
+                if not self.alive():
+                    raise EngineDied("the engine ended while waiting for control ownership")
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
@@ -845,9 +864,10 @@ class StrataEngine:
             with self.slot_cv:
                 self.waiting -= 1
                 self.wait_lens.remove(entry)
-        with self.slot_cv:
-            self.ctl_epoch += 1
-            self.slot_cv.notify_all()
+                self.control_waiters.remove(entry)
+                self.slot_cv.notify_all()
+        if callable(on_control):
+            on_control(time.perf_counter() - queued_at)
         return True
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
@@ -857,7 +877,8 @@ class StrataEngine:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
-        if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
+        if (getattr(self, "resident_multiplex", False) or embeddings or times >= self.SOLO_AGAIN_MAX or
+                left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
@@ -878,11 +899,15 @@ class StrataEngine:
         A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         self.progress = None
+        priority = (sampling or {}).get("strata_priority", "foreground")
+        if priority not in ("foreground", "background"):
+            raise ValueError("strata_priority must be foreground or background")
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
-        ok = yield from self._take_control(cancel, len(prompt))
+        on_control = (sampling or {}).get("_strata_control_ready")
+        ok = yield from self._take_control(cancel, len(prompt), on_control)
         if not ok:
             return
         holding = True
@@ -894,13 +919,13 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, len(prompt), on_control)
                     if not ok:
                         return
                     holding = True
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                if alone and left > 1 and not getattr(self, "resident_multiplex", False):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
@@ -960,18 +985,21 @@ class StrataEngine:
                         yields += 1
                         self.ctl.release()
                         holding = False
-                        with self.slot_cv:
-                            epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        ok = yield from self._take_control(cancel, len(prompt), on_control)
                         if not ok:
                             return
                         holding = True
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
+                    if getattr(self, "resident_multiplex", False):
+                        self._send(f"BPRIORITY {slot} {(sampling or {}).get('strata_priority', 'foreground')}")
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
+                    on_slot = (sampling or {}).get("_strata_slot")
+                    if callable(on_slot):
+                        on_slot(slot)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
@@ -1061,13 +1089,13 @@ class StrataEngine:
                     self._send("STOP")
                     self._drain_control("DONE")
                 elif phase == "admit":
+                    self._send("STOP")
                     line = self._drain_control("BADM")
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
-            except EngineDied:
-                pass
-            if holding:
-                self.ctl.release()
+            finally:
+                if holding:
+                    self.ctl.release()
             if reserved is not None:
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
@@ -1078,7 +1106,7 @@ class StrataEngine:
                 if phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    self._release_slot_when_done(slot, stream)    # admission held until BDONE
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -1489,6 +1517,13 @@ def engine_args(cfg: dict) -> list[str]:
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
+    multiplex = cfg.get("resident_multiplex", False)
+    if not isinstance(multiplex, bool):
+        raise ValueError('"resident_multiplex" must be true or false')
+    if multiplex and "--resident-multiplex" not in args:
+        if not any(k in args for k in ("--batch", "--slots")):
+            raise ValueError('"resident_multiplex" requires explicit "parallel": N or --batch N')
+        args.append("--resident-multiplex")
     return learned_profile_args(cfg, args)
 
 
@@ -1708,6 +1743,17 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.admission_cv = threading.Condition(self.status_lock)
+        self.admission_waiters = []
+        self.admission_active = {}
+        self.admission_foreground = 0
+        self.request_queue_limit = 32
+        self.request_timeout_s = 600.0
+        self.request_body_bytes = 4 * 1024 * 1024
+        self.request_context_tokens = None
+        self.lifecycle_api = False
+        self.lifecycles = collections.deque(maxlen=500)
+        self.lifecycle_local = threading.local()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -1739,6 +1785,112 @@ class Service:
             if x and x != self.model and x not in names:
                 names.append(x)
         self.aliases = names
+
+    def configure_admission(self, cfg):
+        for key, default in (("request_queue_limit", 32), ("request_body_bytes", 4 * 1024 * 1024)):
+            value = cfg.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key.endswith("limit") else 1):
+                raise ValueError(f'{key} must be a nonnegative queue limit or positive byte budget')
+            setattr(self, key, value)
+        value = cfg.get("request_timeout_s", 600)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 86400:
+            raise ValueError("request_timeout_s must be finite and in (0, 86400]")
+        self.request_timeout_s = float(value)
+        value = cfg.get("request_context_tokens")
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= CTX_SLACK):
+            raise ValueError("request_context_tokens must exceed the engine context slack")
+        self.request_context_tokens = value
+        self.lifecycle_api = cfg.get("lifecycle_api") is True
+
+    def register_lifecycle(self, req, cancel):
+        priority = req.get("strata_priority", "foreground")
+        if priority not in ("foreground", "background"):
+            raise ValueError("strata_priority must be foreground or background")
+        timeout = req.get("strata_timeout_s", self.request_timeout_s)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= self.request_timeout_s:
+            raise ValueError("strata_timeout_s must be positive and no greater than request_timeout_s")
+        now = time.perf_counter()
+        record: dict[str, Any] = {"id": uuid.uuid4().hex, "priority": priority, "state": "queued", "started_at": time.time(),
+                  "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
+                  "events": [{"state": "queued", "elapsed_s": 0.0}], "_clock": now,
+                  "_deadline": now + timeout, "_cancel": cancel}
+        with self.admission_cv:
+            capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
+            if len(self.admission_active) + len(self.admission_waiters) >= capacity + self.request_queue_limit:
+                record.update(state="rejected", error="request queue is full", completion_s=0.0)
+                record["events"].append({"state": "rejected", "elapsed_s": 0.0})
+                self.lifecycles.append(record)
+                raise AdmissionError("request queue is full; retry after a request completes")
+            self.admission_waiters.append(record)
+            self.lifecycles.append(record)
+            self.status["queued"] += 1
+            self.lifecycle_local.record = record
+            self.admission_cv.notify_all()
+        return record
+
+    def lifecycle_note(self, record, state, **values):
+        with self.status_lock:
+            record.update(values)
+            record["state"] = state
+            if len(record["events"]) < 128:
+                record["events"].append({"state": state, "elapsed_s": round(time.perf_counter() - record["_clock"], 6)})
+
+    def acquire_request(self, record):
+        with self.admission_cv:
+            while True:
+                if record["_cancel"].is_set():
+                    raise AdmissionError(record.get("cancel_reason", "cancelled"),
+                                         408 if record.get("cancel_reason") == "timeout" else 409)
+                if time.perf_counter() >= record["_deadline"]:
+                    record["cancel_reason"] = "timeout"
+                    record["_cancel"].set()
+                    raise AdmissionError("request timed out while queued", 408)
+                foreground = next((r for r in self.admission_waiters if r["priority"] == "foreground"), None)
+                background = next((r for r in self.admission_waiters if r["priority"] == "background"), None)
+                chosen = background if background is not None and (foreground is None or self.admission_foreground >= 3) else foreground
+                capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
+                if chosen is record and len(self.admission_active) < capacity:
+                    self.admission_waiters.remove(record)
+                    self.admission_active[record["id"]] = record
+                    self.admission_foreground = self.admission_foreground + 1 if record["priority"] == "foreground" else 0
+                    self.status["queued"] -= 1
+                    record["queue_s"] = round(time.perf_counter() - record["_clock"], 6)
+                    self.admission_cv.notify_all()
+                    break
+                self.admission_cv.wait(timeout=0.25)
+        self.lifecycle_note(record, "admitted")
+
+    def finish_lifecycle(self, record):
+        with self.admission_cv:
+            if record in self.admission_waiters:
+                self.admission_waiters.remove(record)
+                self.status["queued"] -= 1
+            self.admission_active.pop(record["id"], None)
+            record["completion_s"] = round(time.perf_counter() - record["_clock"], 6)
+            if record["state"] == "queued":
+                record["queue_s"] = record["completion_s"]
+            self.admission_cv.notify_all()
+        self.lifecycle_note(record, record.get("cancel_reason") or ("error" if record.get("error") else "completed"))
+        self.lifecycle_local.record = None
+
+    def lifecycle_records(self, request_id=None):
+        with self.status_lock:
+            records = list(self.lifecycles)
+            records = list({r["id"]: r for r in records + self.admission_waiters + list(self.admission_active.values())}.values())
+            public = [{k: list(v) if k == "events" else v for k, v in r.items() if not k.startswith("_")}
+                      for r in records if request_id is None or r["id"] == request_id]
+            return public if request_id is None else (public[0] if public else None)
+
+    def cancel_request(self, request_id):
+        with self.admission_cv:
+            record = self.admission_active.get(request_id) or next(
+                (r for r in self.admission_waiters if r["id"] == request_id), None)
+            if record is None:
+                return False
+            record["cancel_reason"] = "cancelled"
+            record["_cancel"].set()
+            self.admission_cv.notify_all()
+            return True
 
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
@@ -1788,6 +1940,11 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        with self.status_lock:
+            current = getattr(self.lifecycle_local, "record", None)
+            others = [r for r in self.admission_active.values() if r is not current]
+            if self.live_reqs or any(r.get("_generators") for r in others):
+                raise EngineDied("the old engine still has request consumers; retry after they drain")
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
@@ -1896,6 +2053,8 @@ class Service:
                 return "not loaded"
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
+                    return "busy"
+                if self.admission_active:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -2162,6 +2321,8 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
+            if getattr(self.engine, "resident_multiplex", False):
+                raise ValueError("resident_multiplex qualification is text-only; disable it for image requests")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -2203,6 +2364,8 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        if self.request_context_tokens is not None:
+            ctx = min(ctx, self.request_context_tokens)
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
@@ -2256,6 +2419,22 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        lifecycle = getattr(self.lifecycle_local, "record", None)
+        if lifecycle is not None:
+            self.lifecycle_note(lifecycle, "generating", prompt_tokens=len(ids), max_tokens=max_new,
+                                context_budget=len(ids) + max_new + CTX_SLACK)
+            if cancel.is_set():
+                raise ValueError("request cancelled before generation")
+            if isinstance(self.engine, StrataEngine) and self.engine.batch:
+                def control_ready(waited):
+                    with self.status_lock:
+                        lifecycle["queue_s"] += waited
+                        if trace is not None:
+                            trace["queue_s"] += waited
+                def slot_assigned(slot):
+                    self.lifecycle_note(lifecycle, "prefill", slot=slot)
+                sampling = {**(sampling or {}), "_strata_control_ready": control_ready,
+                            "_strata_slot": slot_assigned}
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
@@ -2278,8 +2457,9 @@ class Service:
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
-        with self.status_lock:
-            self.status["queued"] += 1
+        if lifecycle is None:
+            with self.status_lock:
+                self.status["queued"] += 1
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
@@ -2288,9 +2468,12 @@ class Service:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
-                        self.status["queued"] -= 1
+                        if lifecycle is None:
+                            self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
+                    if lifecycle is not None and cancel.is_set():
+                        raise ValueError("request cancelled before generation")
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
                     with self.status_lock:
@@ -2308,14 +2491,24 @@ class Service:
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        if lifecycle is not None:
+                            lifecycle.setdefault("_generators", []).append(gen)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         try:
                             for t in gen:
+                                if cancel.is_set():
+                                    break
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
                                     yield "ping", None
                                     continue
                                 n += 1
+                                if lifecycle is not None:
+                                    with self.status_lock:
+                                        lifecycle["output_tokens"] = lifecycle.get("output_tokens", 0) + 1
+                                if lifecycle is not None and lifecycle["first_token_s"] is None:
+                                    self.lifecycle_note(lifecycle, "first_token",
+                                                        first_token_s=round(time.perf_counter() - lifecycle["_clock"], 6))
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
@@ -2355,9 +2548,14 @@ class Service:
                             raise
                         finally:
                             try:
+                                if lifecycle is not None:
+                                    self.lifecycle_note(lifecycle, "draining")
                                 gen.close()             # STOP+drain to THIS request's DONE while still holding the
                                 #                         fifo, so a stop-token break can't leave the shared engine
                                 #                         queue mid-drain for the next request to read as its own DONE
+                                if lifecycle is not None:
+                                    self.lifecycle_note(lifecycle, "drained")
+                                    lifecycle["_generators"].remove(gen)
                             except EngineSilent as e:   # #481: the STOP was never acknowledged: the engine is ended
                                 finish = "error"
                                 self._say_died(e)
@@ -2415,7 +2613,11 @@ class Service:
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "time": started,
+                                "duration_s": round(time.perf_counter() - (lifecycle["_clock"] if lifecycle else waiting), 3),
+                                "queue_s": lifecycle["queue_s"] if lifecycle else None,
+                                "first_token_s": lifecycle["first_token_s"] if lifecycle else None,
+                                "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
@@ -2471,6 +2673,8 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+        if lifecycle is not None and lifecycle.get("cancel_reason") in ("timeout", "cancelled"):
+            raise ValueError(f"request {lifecycle['cancel_reason']}; engine work has been drained")
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -2841,6 +3045,8 @@ def make_handler(svc: Service):
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
+        lifecycle = None
+        request_cancel = None
 
         def log_message(self, fmt, *args):
             pass
@@ -2896,6 +3102,11 @@ def make_handler(svc: Service):
 
             def watch():
                 while not done.wait(0.5) and not cancel.is_set():
+                    if self.lifecycle is not None and time.perf_counter() >= self.lifecycle["_deadline"]:
+                        with svc.status_lock:
+                            self.lifecycle["cancel_reason"] = "timeout"
+                        cancel.set()
+                        return
                     try:
                         readable, _, _ = select.select([sock], [], [], 0)
                         gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
@@ -2915,6 +3126,12 @@ def make_handler(svc: Service):
             if self.record is not None:
                 with svc.status_lock:
                     self.record.update(values)
+            if self.lifecycle is not None:
+                with svc.status_lock:
+                    if values.get("outcome") == "disconnected":
+                        self.lifecycle["cancel_reason"] = "disconnected"
+                    if "error" in values:
+                        self.lifecycle["error"] = values["error"]
 
         def _cors(self):
             """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
@@ -2945,6 +3162,8 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj):
+            if isinstance(obj, dict) and "error" in obj:
+                self._note(error=obj["error"])
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -2956,6 +3175,10 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if self.lifecycle is not None:
+                self.send_header("X-Strata-Request-Id", self.lifecycle["id"])
+            if code == 429:
+                self.send_header("Retry-After", "1")
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -2973,6 +3196,13 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/lifecycle":
+                if self._lifecycle_allowed():
+                    request_id = parse_qs(urlsplit(self.path).query).get("id", [None])[0]
+                    record = svc.lifecycle_records(request_id)
+                    self._json(200 if record is not None else 404, record if record is not None else
+                               {"error": {"message": "request not found"}})
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -3088,6 +3318,16 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _lifecycle_allowed(self):
+            # Deliberately not a public monitoring/cancellation API; proxy forwarding headers confer no trust.
+            if not svc.lifecycle_api or self.client_address[0] not in ("127.0.0.1", "::1"):
+                self._json(404, {"error": {"message": "not found"}})
+                return False
+            if self.headers.get("Origin"):
+                self._json(403, {"error": {"message": "private test API does not accept browser origins"}})
+                return False
+            return self._authorized()
+
         def do_POST(self):
             if not self._authorized():
                 return
@@ -3121,9 +3361,20 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                length = int(self.headers.get("Content-Length", 0))
+                if not 0 <= length <= svc.request_body_bytes:
+                    raise AdmissionError("request body exceeds request_body_bytes", 413)
+                req = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path == "/api/lifecycle/cancel":
+                    if self._lifecycle_allowed():
+                        request_id = req.get("id")
+                        if not isinstance(request_id, str):
+                            raise ValueError("id must be a request id")
+                        found = svc.cancel_request(request_id)
+                        self._json(202 if found else 404, {"id": request_id, "cancel_requested": found})
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -3165,6 +3416,15 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                    self.request_cancel = threading.Event()
+                    self.lifecycle = svc.register_lifecycle(req, self.request_cancel)
+                    # A client that stops consuming must not hold a resident slot forever in a socket write.
+                    self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
+                    self._watch_client(self.request_cancel)
+                    svc.acquire_request(self.lifecycle)
+                    if self.record is not None:
+                        with svc.status_lock:
+                            self.record["queue_s"] += self.lifecycle["queue_s"]
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
@@ -3180,6 +3440,8 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except AdmissionError as e:
+                self._json(e.status, {"error": {"type": "admission_error", "message": str(e)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:
@@ -3194,10 +3456,27 @@ def make_handler(svc: Service):
 
             except OSError:
                 self._note(outcome="disconnected")
+                if self.request_cancel is not None:
+                    self.request_cancel.set()
                 raise                                        # as before #332: the server's own handling
             finally:
                 if self.watch_done is not None:
                     self.watch_done.set()
+                # Explicitly close all engine consumers even if an outer dialect generator retained one.
+                if self.lifecycle is not None:
+                    for gen in list(self.lifecycle.get("_generators", [])):
+                        self.lifecycle["_cancel"].set()
+                        try:
+                            gen.close()
+                        except (EngineDied, ValueError) as e:
+                            self._note(error={"type": "drain_error", "message": str(e)})
+                    self.lifecycle["_generators"] = []
+                if self.lifecycle is not None:
+                    svc.finish_lifecycle(self.lifecycle)
+                emb = getattr(svc.embeddings, "path", None)
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
+                    svc.embeddings.path = None
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
@@ -3327,6 +3606,8 @@ def make_handler(svc: Service):
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            if self.lifecycle is not None:
+                self.send_header("X-Strata-Request-Id", self.lifecycle["id"])
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
@@ -3391,8 +3672,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            cancel = self.request_cancel
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -3438,8 +3718,7 @@ def make_handler(svc: Service):
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            cancel = self.request_cancel
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -3563,8 +3842,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            cancel = self.request_cancel
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
@@ -4031,6 +4309,7 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
+        svc.configure_admission(cfg)
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
     if svc.aliases:

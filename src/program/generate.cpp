@@ -615,6 +615,7 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
+    bool resident_multiplex = false;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -784,6 +785,7 @@ void usage() {
                  "                       give VRAM back to other programs between requests and take it back later\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
+                 "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -1668,6 +1670,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
+        else if (a == "--resident-multiplex") o.resident_multiplex = true;
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
@@ -1802,6 +1805,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (o.resident_multiplex && (!o.serve || o.batch < 2 || o.batch_groups != 1 || !o.layer_split.empty())) {
+        std::fprintf(stderr, "strata generate: --resident-multiplex requires single-device --serve --batch >= 2 and one group\n");
+        return 2;
     }
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
@@ -7141,7 +7148,8 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
+                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                       " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -7310,6 +7318,8 @@ int main(int argc, char** argv) {
         // ---- --batch: the slots of the batch windows
         struct BSlot {
             bool active = false, stop = false;
+            bool foreground = true;
+            strata::kernels::SamplerParams sampling;
             uint64_t request = 0;          ///< stable owner across pause, cancellation and resume
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             int64_t p = 0;                 ///< its position
@@ -7341,6 +7351,8 @@ int main(int argc, char** argv) {
             }
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        size_t resident_cursor = 0;
+        unsigned resident_credit = 0;
         struct ResidencyRelease {
             std::vector<BSlot>& slots;
             ~ResidencyRelease() {
@@ -7364,12 +7376,12 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        auto slot_observe = [&](const char* phase, int slot, int64_t cells, std::string& e) -> bool {
+        auto slot_observe = [&](const char* phase, int slot, int64_t cells, std::string& e, const float* residual = nullptr) -> bool {
             if (!std::getenv("STRATA_STATE_HASH")) return true;
             const auto* draft = mtp.slot_state(slot);
             if (!draft) { e = "resident draft state missing"; return false; }
             strata::program::SessionFingerprint h;
-            if (!strata::program::session_fingerprint(bslot_ss[0][(size_t) slot]->state(), *draft, g, cells, h, e))
+            if (!strata::program::session_fingerprint(bslot_ss[0][(size_t) slot]->state(), *draft, g, cells, h, e, residual))
                 return false;
             const uint64_t id = bs[(size_t) slot].request;
             if (std::strcmp(phase, "commit") != 0)
@@ -7383,6 +7395,8 @@ int main(int argc, char** argv) {
                          (unsigned long long) strata::program::fingerprint_ple(h, bslot_ss[0][(size_t) slot]->state()),
                          (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.draft,
                          (unsigned long long) observed);
+            if (residual && std::getenv("STRATA_BATCH_DIAGNOSTICS"))
+                strata::program::report_batch_state(phase, id, slot, cells, bslot_ss[0][(size_t) slot]->state(), h);
             return true;
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
@@ -7448,15 +7462,42 @@ int main(int argc, char** argv) {
         auto batch_step = [&]() -> bool {
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
+            int32_t outb[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            for (int b = 0; b < (int) bs.size() && S < strata::kernels::kVerifyMaxT; ++b)
-                if (bs[(size_t) b].active) {
-                    rows[S] = b;
-                    tok[S] = bs[(size_t) b].x;
-                    pos[S] = bs[(size_t) b].p;
-                    ++S;
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                BSlot& sl = bs[(size_t) b];
+                if (!sl.active || !sl.stop) continue;
+                // The previous operation has drained. Cancellation must not execute another row.
+                if (!slot_observe("cancel", b, (int64_t) sl.ids.size(), err)) return false;
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
+                sl.active = false;
+                sl.observe("pause", b);
+                sl.cached = o.prompt_cache > 0 && !sl.img;
+            }
+            std::fflush(stdout);
+            if (o.resident_multiplex) {
+                for (size_t scanned = 0; scanned < bs.size(); ++scanned) {
+                    BSlot& sl = bs[resident_cursor];
+                    if (sl.active) {
+                        if (!resident_credit) resident_credit = sl.foreground ? 3 : 1;
+                        rows[0] = (int) resident_cursor;
+                        pos[0] = sl.p;
+                        S = 1;
+                        if (--resident_credit == 0) resident_cursor = (resident_cursor + 1) % bs.size();
+                        break;
+                    }
+                    resident_credit = 0;
+                    resident_cursor = (resident_cursor + 1) % bs.size();
                 }
+            } else {
+                for (int b = 0; b < (int) bs.size() && S < strata::kernels::kVerifyMaxT; ++b)
+                    if (bs[(size_t) b].active) {
+                        rows[S] = b;
+                        pos[S] = bs[(size_t) b].p;
+                        ++S;
+                    }
+            }
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -7470,7 +7511,24 @@ int main(int argc, char** argv) {
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+            strata::core::BatchRow metadata[strata::kernels::kVerifyMaxT];
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                auto& row = metadata[b];
+                const auto& sl = bs[(size_t) b];
+                row.request_id = sl.request;
+                row.cancellation_generation = sl.request;
+                row.state = &bslot_ss[0][(size_t) b]->state();
+                row.slot = b;
+                row.token = sl.x;
+                row.position = sl.p;
+                row.sequence_end = sl.p + 1;
+                row.output_offset = b;
+                row.mask = sl.stop ? strata::core::BatchRowMask::cancelled
+                         : sl.request && !sl.active ? strata::core::BatchRowMask::finished
+                         : strata::core::BatchRowMask::padding;
+            }
+            for (int t = 0; t < S; ++t) metadata[rows[t]].mask = strata::core::BatchRowMask::active;
+            if (!ver.run_slot_rows(metadata, (int) bs.size(), win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -7488,12 +7546,12 @@ int main(int argc, char** argv) {
             for (int t = 0; t < S; ++t) {
                 const int b = rows[t];
                 BSlot& sl = bs[(size_t) b];
-                const int32_t y = outb[t];
+                const int32_t y = outb[b];
                 if (!mtp.advance_slot(b, ver.final_R(t), y, pos[t], err)) {
                     std::printf("ERR %s\n", err.c_str()); return false;
                 }
                 sl.ids.push_back(sl.x);    // the window fed it: the slot's sessions hold it now
-                if (!slot_observe("commit", b, (int64_t) sl.ids.size(), err)) {
+                if (!slot_observe("commit", b, (int64_t) sl.ids.size(), err, ver.final_R(t))) {
                     std::printf("ERR %s\n", err.c_str()); return false;
                 }
                 std::printf("BT %d %d\n", b, (int) y);
@@ -7680,8 +7738,95 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            if (std::getenv("STRATA_BATCH_DIAGNOSTICS") && line == "BINERT") {
+                if (batch_on() || piped || bs.empty()) {
+                    std::printf("ERR BINERT: requires idle single-stage resident slots\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                auto snapshot = [&](std::vector<uint64_t>& words) -> bool {
+                    words.clear();
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const auto& sl = bs[b];
+                        const auto& state = bslot_ss[0][b]->state();
+                        const auto* draft = mtp.slot_state((int) b);
+                        strata::program::SessionFingerprint h;
+                        if (!draft || !strata::program::session_fingerprint(state, *draft, g,
+                                (int64_t) sl.ids.size(), h, err)) return false;
+                        for (uint64_t v : {h.gdn, h.ple, h.tail, h.pooled, h.kv, h.draft,
+                                           h.stale, h.dead, h.pooled_full}) words.push_back(v);
+                        words.push_back((uint32_t) state.ple_prev[0]);
+                        words.push_back((uint32_t) state.ple_prev[1]);
+                        words.push_back(sl.request);
+                        words.push_back(ver.slot_generation((int) b));
+                        words.push_back(sl.p);
+                        words.push_back(sl.x);
+                        words.push_back(sl.sampling.counter);
+                        words.push_back(sl.ids.size());
+                        for (int32_t id : sl.ids) words.push_back((uint32_t) id);
+                    }
+                    return true;
+                };
+                std::vector<uint64_t> before, after;
+                if (!snapshot(before)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                for (auto mask : {strata::core::BatchRowMask::padding, strata::core::BatchRowMask::finished,
+                                  strata::core::BatchRowMask::cancelled}) {
+                    strata::core::BatchRow rows[strata::kernels::kVerifyMaxT];
+                    int32_t output[strata::kernels::kVerifyMaxT];
+                    for (int b = 0; b < (int) bs.size(); ++b) { rows[b].mask = mask; rows[b].output_offset = b; }
+                    if (!ver.run_slot_rows(rows, (int) bs.size(), win_pool_fn, win_pool_user, output, err) ||
+                        !ver.commit_slots(err) || !snapshot(after)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    for (int b = 0; b < (int) bs.size(); ++b)
+                        if (output[b] != -1) { std::printf("ERR BINERT: non-inert output\n"); return 1; }
+                    if (before != after) { std::printf("ERR BINERT: resident state advanced\n"); return 1; }
+                }
+                std::fprintf(stderr, "STATE_BATCH_INERT masks=3 checked=1\n");
+                std::printf("BINERT checked=3\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (std::getenv("STRATA_BATCH_DIAGNOSTICS") && line.rfind("BRESOURCES ", 0) == 0) {
+                if (batch_on() || (piped && pipe_inflight())) {
+                    std::printf("ERR BRESOURCES: resident requests active\n");
+                } else if (line == "BRESOURCES release") {
+                    if (!ver.release_batch_resources(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    std::printf("BRESOURCES released\n");
+                } else if (line == "BRESOURCES init") {
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                        std::vector<strata::core::SessionState*> ptrs;
+                        for (auto& u : bslot_ss[k]) ptrs.push_back(&u->state());
+                        auto& vk = k == 0 ? ver : stages[k - 1]->ver;
+                        const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                        if (!vk.init_slots(ptrs, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    }
+                    for (int b = 0; b < (int) bs.size(); ++b) {
+                        auto& sl = bs[(size_t) b];
+                        if (sl.request && !ver.set_slot_context(b, sl.request, sl.sampling, &sl.ids, sl.cvec, err)) {
+                            std::printf("ERR %s\n", err.c_str()); return 1;
+                        }
+                    }
+                    std::printf("BRESOURCES initialized\n");
+                } else std::printf("ERR BRESOURCES: expected release or init\n");
+                std::fflush(stdout);
+                continue;
+            }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
+            if (line.rfind("BPRIORITY ", 0) == 0) {
+                char* end = nullptr;
+                const long b = std::strtol(line.c_str() + 10, &end, 10);
+                const bool valid_slot = end != line.c_str() + 10 && b >= 0 && b < (long) bs.size();
+                if (!valid_slot || (std::strcmp(end, " foreground") != 0 && std::strcmp(end, " background") != 0)) {
+                    std::printf("ERR BPRIORITY: expected slot and foreground|background\n");
+                    std::fflush(stdout);
+                } else {
+                    bs[(size_t) b].foreground = std::strcmp(end, " foreground") == 0;
+                    if ((size_t) b == resident_cursor) resident_credit = 0;
+                }
+                continue;
+            }
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
@@ -8423,6 +8568,7 @@ int main(int argc, char** argv) {
                                     std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
                                         [](int32_t x, int64_t y) { return (int64_t) x == y; })) best = &c;
                             if (best) sl.checks.push_back(*best);
+                            sl.sampling = req_sp;
                             if (!ver.set_slot_context(ys, sl.request, req_sp, &sl.ids, sl.cvec, ye) ||
                                 !slot_observe("admit", ys, q, ye)) { e = ye; return false; }
                             sl.observe("pause", ys);
@@ -8573,8 +8719,15 @@ int main(int argc, char** argv) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
             }
+            static const bool lookup_trace = std::getenv("STRATA_LOOKUP_TRACE") != nullptr;
+            int64_t lookup_ns = 0, lookup_positions = 0;
+            if (lookup_trace)
+                std::fprintf(stderr, "LOOKUP_REQUEST request=%llu suffix=%d history=%zu capacity=%zu\n",
+                             (unsigned long long) drive.d.request_generation, o.suffix_draft, sfx.size(),
+                             (size_t) o.max_context + 4096);
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            const float* last_committed_residual = nullptr;
             int64_t draft_offered = 0, draft_accepted = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
@@ -8613,15 +8766,20 @@ int main(int argc, char** argv) {
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
-                int sfx_match = 0;
+                int sfx_match = 0, lookup_proposed = 0;
+                const auto lookup_start = lookup_trace ? Clock::now() : Clock::time_point{};
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
+                    lookup_proposed = k;
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                const auto proposal_ns = lookup_trace ?
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - lookup_start).count() : 0;
+                lookup_ns += proposal_ns;
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
@@ -8659,6 +8817,13 @@ int main(int argc, char** argv) {
                     if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
                         keep = i + 1; break;
                     }
+                lookup_positions += T;
+                if (lookup_trace)
+                    std::fprintf(stderr, "LOOKUP_ROUND request=%llu position=%lld history=%zu match=%d proposed=%d "
+                                         "selected=%d width=%d accepted=%d rejected=%d emitted=%d proposal_ns=%lld\n",
+                                 (unsigned long long) drive.d.request_generation, (long long) p, sfx.size(), sfx_match,
+                                 lookup_proposed, (int) from_sfx, T, from_sfx ? a : 0, from_sfx ? T - 1 - a : 0,
+                                 keep, (long long) proposal_ns);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -8711,6 +8876,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                last_committed_residual = ver.final_R(keep - 1);
                 if (T > keep && std::getenv("STRATA_STATE_HASH")) {
                     strata::program::SessionFingerprint h;
                     if (!ver.wait_commit(err) || !strata::program::session_fingerprint(ss, mtp.kv_state(), g, p + keep, h, err)) {
@@ -8762,7 +8928,7 @@ int main(int argc, char** argv) {
             if (state_hash && live_ok) {
                 strata::program::SessionFingerprint h;
                 const int64_t L = (int64_t) live.size();
-                if (!strata::program::session_fingerprint(ss, mtp.kv_state(), g, L, h, err)) {
+                if (!strata::program::session_fingerprint(ss, mtp.kv_state(), g, L, h, err, last_committed_residual)) {
                     std::printf("ERR %s\n", err.c_str()); return 1;
                 }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
@@ -8771,6 +8937,8 @@ int main(int argc, char** argv) {
                              (unsigned long long) h.tail, (unsigned long long) h.pooled, (unsigned long long) h.kv,
                              (unsigned long long) h.draft, (unsigned long long) h.stale, (unsigned long long) h.dead,
                              (unsigned long long) h.pooled_full, ss.ple_prev[0], ss.ple_prev[1]);
+                if (last_committed_residual && std::getenv("STRATA_BATCH_DIAGNOSTICS"))
+                    strata::program::report_batch_state("solo", drive.d.request_generation, 8, L, ss, h);
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
@@ -8804,8 +8972,10 @@ int main(int argc, char** argv) {
                 }
                 if (cont) {
                     BSlot& sl = bs[(size_t) admit_slot];
+                    const bool foreground = sl.foreground;
                     sl.retire(admit_slot);
                     sl = BSlot{};
+                    sl.foreground = foreground;
                     sl.active = true;
                     drive.d.slot_requests[admit_slot] = drive.d.request_generation;
                     sl.request = drive.d.request_generation;
@@ -8824,6 +8994,7 @@ int main(int argc, char** argv) {
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
                     if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    sl.sampling = req_sp;
                     if (!ver.set_slot_context(admit_slot, sl.request, req_sp, &sl.ids, sl.cvec, err)) {
                         std::printf("ERR %s\n", err.c_str()); return 1;
                     }
@@ -8905,6 +9076,12 @@ int main(int argc, char** argv) {
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+            if (lookup_trace)
+                std::fprintf(stderr, "LOOKUP_DONE request=%llu history=%zu proposal_ns=%lld lookup_windows=%lld "
+                                     "lookup_offered=%lld lookup_accepted=%lld verify_positions=%lld\n",
+                             (unsigned long long) drive.d.request_generation, sfx.size(), (long long) lookup_ns,
+                             (long long) sfx_windows, (long long) sfx_drafts, (long long) sfx_ok,
+                             (long long) lookup_positions);
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
@@ -9495,6 +9672,11 @@ int main(int argc, char** argv) {
             for (int64_t t : o.tokens) sfx.append((int32_t) t);
             for (int64_t t : produced) sfx.append((int32_t) t);
         }
+        const bool lookup_trace = std::getenv("STRATA_LOOKUP_TRACE") != nullptr;
+        int64_t lookup_ns = 0, lookup_positions = 0;
+        if (lookup_trace)
+            std::fprintf(stderr, "LOOKUP_REQUEST request=0 suffix=%d history=%zu capacity=%zu\n",
+                         o.suffix_draft, sfx.size(), (size_t) o.max_context + 4096);
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < o.max_new) {
@@ -9506,15 +9688,20 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
-            int sfx_match = 0;
+            int sfx_match = 0, lookup_proposed = 0;
+            const auto lookup_start = lookup_trace ? Clock::now() : Clock::time_point{};
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
+                lookup_proposed = k;
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
+            const auto proposal_ns = lookup_trace ?
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - lookup_start).count() : 0;
+            lookup_ns += proposal_ns;
             const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
@@ -9585,6 +9772,13 @@ int main(int argc, char** argv) {
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
             }
+            lookup_positions += T;
+            if (lookup_trace)
+                std::fprintf(stderr, "LOOKUP_ROUND request=0 position=%lld history=%zu match=%d proposed=%d "
+                                     "selected=%d width=%d accepted=%d rejected=%d emitted=%zu proposal_ns=%lld\n",
+                             (long long) p, o.suffix_draft > 0 ? sfx.size() - (produced.size() - produced_before) : 0,
+                             sfx_match, lookup_proposed, (int) from_sfx, T, from_sfx ? a : 0,
+                             from_sfx ? T - 1 - a : 0, produced.size() - produced_before, (long long) proposal_ns);
             // **THE COMMITTED ROWS (#58).**  The window's head rows [0, emitted) are positions p .. p+emitted-1:
             // row t is the prediction after conditioning on window[0..t], and `commit(a + 1)` kept exactly the
             // first a+1 tokens' state, so a written row describes a position the run stands behind.  A rejected
@@ -9658,6 +9852,11 @@ int main(int argc, char** argv) {
         if (o.suffix_draft > 0)
             std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
                         (long long) sfx_ok, (long long) sfx_drafts);
+        if (lookup_trace)
+            std::fprintf(stderr, "LOOKUP_DONE request=0 history=%zu proposal_ns=%lld lookup_windows=%lld "
+                                 "lookup_offered=%lld lookup_accepted=%lld verify_positions=%lld\n",
+                         sfx.size(), (long long) lookup_ns, (long long) sfx_windows, (long long) sfx_drafts,
+                         (long long) sfx_ok, (long long) lookup_positions);
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");

@@ -4,10 +4,11 @@
 // output quotes its input (edits, refactors, repeated code) the continuation is usually exact, and a verify pass
 // accepts many tokens at once. It needs no model and costs microseconds.
 //
-// Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in a
-// fixed-size open-addressing table, so memory is bounded (~20 bytes per history token) and appends are O(1).
-// A proposal checks those candidates, extends each match backwards up to `max_match`, and takes the longest
-// (most recent on ties). Matches shorter than `min_match` propose nothing.
+// Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions.
+// The table has next_power_of_two(2 * capacity_tokens) Slots (including ABI padding), not 20 bytes/token.
+// Linear probing visits at most table_.size() slots; matching checks WAYS candidates up to max_match each.
+// capacity_tokens reserves history but does not cap it: callers must bound appended tokens (the engine uses
+// max_context and resets on each request). Matches shorter than min_match propose nothing.
 #pragma once
 
 #include <cstddef>

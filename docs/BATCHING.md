@@ -38,6 +38,48 @@ or an over-budget plan. After admission, runtime allocation may still reduce the
 single-session fallback when fewer than two slots fit. The server reads the effective count from
 `INFO batch_slots=N`; `GET /v1/status` reports `concurrency.serving`.
 
+### Resident multiplexing without compute batching
+
+`--serve --batch N --resident-multiplex` keeps the resident state allocation but
+executes one request row per quantum on a single device. It does not advertise
+batched arithmetic. `BPRIORITY <slot> foreground|background` selects weighted
+round-robin service: foreground receives three consecutive quanta and background
+one. With N continuously active slots, a background slot waits at most
+`3 * (N - 1)` other decode quanta between turns. Prefill chunks remain separate
+safe scheduling boundaries; this quantum bound is not a wall-clock latency claim.
+No full conversation image is copied to alternate decode turns. Priority must be
+set before each admission; the default is foreground. Multi-device pipelines are
+not supported by this mode.
+
+At a drained non-pipelined boundary, `BSTOP` completes cancellation without
+executing another token for that row. Other resident requests continue. The
+parent project's HET-036 evidence records the tested envelope; implementation
+alone does not qualify HTTP concurrency, latency, or fairness.
+
+### Explicit rows and idle resource diagnostics
+
+The non-pipelined host path submits one descriptor per physical slot. Active rows
+carry the bound request/generation, stable session pointer, token and position,
+sequence extent, and output offset. Validation precedes execution; padding,
+finished, and cancelled rows are compacted out and return `-1`, without sampling
+or committing model state. Packed verifier residual indices remain distinct from
+physical output offsets. This is independent-request batching, not speculative
+positions from one request.
+
+With the private `STRATA_BATCH_DIAGNOSTICS=1` gate, idle `BINERT` exercises all
+three inert masks and compares resident fingerprints, history, positions and
+sampling counters before acknowledging. `BRESOURCES release` drains and releases
+batch graphs and batch-only device/pinned/history scratch; cached sessions and
+solo/MTP resources remain. `BRESOURCES init` rebinds those stable sessions and
+saved request contexts. Reinitializing without release is an error. The separate
+`STATE_BATCH_STATE` diagnostic includes the actual committed verifier residual;
+the existing `STATE_HASH` format is unchanged. Graph internals remain covered by
+the admission allowance, not byte estimates inferred from graph counts.
+
+The project's protected B1 greedy cell exercised this path successfully. B2/B4,
+sampling, configured EOS, and multiplex qualification are separate gates; this
+result does not establish those capabilities or V100 runtime support.
+
 ### What a slot costs, and what setup recommends
 
 Each resident slot owns a `SessionOwner` (GDN recurrence/convolution, QSA KV/indexer and PLE history), a private
@@ -51,6 +93,24 @@ The upstream setup heuristic recommends `"parallel"` where experts mostly fit in
 not an admission calculation or evidence for this fork. The historical measurements below show why slots can
 reduce waiting while slowing a request alone: their private state reduces the expert cache. Use the emitted
 admission plan for the actual context/slot count, not those historical per-slot memory estimates.
+
+## Private resident multiplexing qualification
+
+`"resident_multiplex": true` with an explicit `"parallel": N` adds `--resident-multiplex`. Unlike the batch
+mode described below, this mode schedules **one resident row per quantum**: it is time multiplexing, not
+simultaneous arithmetic. Requests use `BGEN` even when alone, without solo promotion/demotion. The native
+scheduler, not the Python HTTP queue, enforces foreground/background quantum fairness. The service sends
+`BPRIORITY` before every admission, including reused slots; HTTP admission separately uses bounded 3:1
+foreground/background queues. See [DETAILS.md](DETAILS.md#bounded-admission-and-private-resident-multiplexing-het-036)
+for request/config fields, private lifecycle/cancellation endpoints, budgets and protected smoke scenarios.
+This is an opt-in qualification surface, not measured acceptance or a reason to enable public concurrency.
+The multiplex service path explicitly refuses images; concurrent image-encoder work is not qualified.
+
+Cancellation keeps the HTTP admission reservation through synchronous `STOP`/`BADM` or `BSTOP`/`BDONE`
+draining. Slots and embeddings cannot be freed by a background timer while the engine may still consume
+them. A missing boundary or ambiguous native admission refusal fails the process closed. Reused state is
+resident; this service adds no per-token state swaps. Native metadata compaction, operation ownership and
+safe-boundary retirement must be validated independently of HTTP correctness.
 
 ## How the server uses the slots
 
@@ -215,11 +275,12 @@ On top of `GEN` / `GENI`:
 | Line | Direction | Meaning |
 | --- | --- | --- |
 | `BGEN <slot> <max_new> [keys] <ids>` | in | read the prompt (as `GEN 1`), then continue in `<slot>` |
+| `BPRIORITY <slot> foreground\|background` | in | set the resident slot's scheduling class before BGEN (multiplex mode); no success reply, malformed requests emit ERR |
 | `BGENI <slot> <max_new> [keys] <file> <ids>` | in | the same with images |
 | `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
 | `BT <slot> <id>` | out | a token of that slot |
 | `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
-| `BSTOP <slot>` | in | end that slot at its next window |
+| `BSTOP <slot>` | in | retire that slot at the next safe boundary; BDONE acknowledges retirement, without advancing it another token |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |

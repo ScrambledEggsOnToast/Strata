@@ -1275,3 +1275,90 @@ with **262,144 characters per input/output/reasoning/response field** and visibl
 responses are unaffected. Headers are not recorded, and the monitor key is kept in this tab's session storage.
 Treat request history as sensitive input/output when exposing Strata on a network: set an API key as above.
 The page uses relative URLs and works through the existing host binding or a reverse proxy.
+
+### Bounded admission and private resident multiplexing (HET-036)
+
+The default remains one admitted HTTP generation request. Explicit `"parallel": N` uses the effective count
+reported by the engine (`INFO batch_slots=N`), not a guessed memory allowance. Add `"resident_multiplex": true`
+to select the engine's `--resident-multiplex` mode with those slots. This is **resident time multiplexing, not
+simultaneous arithmetic or a batched-compute speedup**. It stays opt-in pending protected qualification.
+In this mode every request uses `BGEN`, even when alone; the server does not promote or demote it to the solo
+path. Request state remains in its resident slot between native scheduling quanta. Set `parallel` back to 1 and
+remove the multiplex flag to revert to single admission after an isolation or scheduling failure.
+
+All three generation endpoints accept `"strata_priority": "foreground"` (default) or `"background"`, and
+`"strata_timeout_s"` to shorten the server deadline. Admission is FIFO within each class: if background work
+waits, at most three foreground admissions precede its next admission. This is an **admission-count** bound,
+not a wall-clock bound. Native decode fairness is separate: before each `BGEN` the server sends
+`BPRIORITY <slot> foreground|background` (no success reply); the native scheduler owns its 3:1 quantum policy.
+The server cannot infer native quanta or pauses from HTTP token arrival times. Prefill/control ownership is
+FIFO, with yielded chunk reads rejoining behind current waiters; native safe boundaries remain responsible
+for interleaving prefill and decode. No per-token state swapping is introduced by the service.
+
+Run-config budgets (all bounded per request, not replacements for native byte-level memory admission):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `request_queue_limit` | 32 | waiting HTTP generations beyond the effective resident count; 0 refuses overflow immediately |
+| `request_timeout_s` | 600 | maximum request lifetime in seconds, including admission/loading/generation; positive, at most 86400 |
+| `request_body_bytes` | 4194304 | maximum JSON POST body size |
+| `request_context_tokens` | engine context | optional smaller positive prompt + output + 8-token-slack budget |
+| `lifecycle_api` | false | enable the private, loopback-peer-only lifecycle API below |
+
+A full queue returns **429** and `Retry-After: 1`; a queued deadline returns **408**. Oversized bodies return
+**413**; invalid priority/deadline/context requests return **400**. A deadline during generation sets the same
+cancellation event as disconnect, drains work, then reports an error using the endpoint's existing JSON/SSE
+error path. A timeout is a cancellation deadline, **not permission to free buffers while a kernel runs**.
+SSE headers are sent only after HTTP admission. Queue waiting counts from parsed request registration;
+body upload time is not included.
+Private cancellation while generating also returns an endpoint error after drain, rather than a successful
+completion with truncated output. A socket write that stalls for 10 seconds (or the shorter requested timeout)
+is treated as a disconnect. The resident multiplex mode requires the startup receipt
+`INFO resident_multiplex=1` and at least two effective slots; absent support or fallback refuses startup.
+
+With `lifecycle_api` enabled, `GET /api/lifecycle` lists retained metadata and
+`GET /api/lifecycle?id=<id>` selects one request. `POST /api/lifecycle/cancel` with `{"id":"<id>"}` returns
+**202** when cancellation was requested or **404** when no active/queued request matches. It acknowledges
+the request to cancel, not completed retirement. These endpoints require a direct loopback peer, reject
+all browser `Origin` headers, and honor the configured API key; do not proxy them onto a public listener.
+Generation responses include `X-Strata-Request-Id` for correlation. Poll the private list to find a request
+that has not yet received response headers.
+
+Records retain no prompts or completions. They include priority, context/output budget, queue seconds,
+queue-inclusive `first_token_s` and `completion_s`, errors, and bounded timestamped lifecycle transitions
+(`queued`, `admitted`, `generating`, `prefill` with an assigned slot, `first_token`, `draining`, `drained`, and terminal outcome). The last 500
+records are kept in memory, with active/queued records retained independently and at most 128 transitions
+per record. `completion_s` includes response handling and drain; engine `timings` remain compute-only.
+`/metrics` history duration and TTFT include HTTP queue wait; private/API-monitor queue time also includes
+waiting for the engine's serialized control owner. A first token is a native generated token, even if it
+is an end-of-turn marker or buffered by structured output rather than visible to the client.
+
+Cancellation during admission sends `STOP` and consumes `DONE`/`BADM`; an active resident slot receives
+`BSTOP` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned
+through that drain. Missing acknowledgements or ambiguous native admission errors end the engine rather
+than return a potentially live slot to the queue. Existing consumers must retire before restart. This
+fail-closed path can fail other active requests; it must not silently mutate or complete them with another
+request's output. Qualification must exercise both successful isolated cancellation and failure/retry.
+
+Protected smoke scenarios (not results): use the same pinned full model/tokenizer and supervisor as HET-035,
+an explicit two-slot configuration, `lifecycle_api: true`, queue limit 2 and finite output/context budgets.
+Keep all raw HTTP bodies, lifecycle snapshots, native scheduler traces and exact configuration:
+
+1. Compare deterministic foreground/background replies with isolated runs. Keep both resident; check native
+   quantum gaps against the declared `3*(N-1)` other-quanta bound and separately measure HTTP token gaps.
+2. Occupy both slots, queue background then at least three foreground requests as capacity permits, and
+   verify class FIFO/three-foreground admission bound. A fifth outstanding request with queue limit 2 must
+   receive 429. The queued request's TTFT/completion must include its measured wait.
+3. Cancel a queued request through the private API; require no BGEN for it. Cancel a decoding request;
+   require BSTOP followed by BDONE before slot reuse and compare its unaffected peer with isolation.
+4. Disconnect streaming and non-streaming clients during prefill and decode, then retry with different
+   prompts. Check ownership/drain order, correct outputs, zero leaked admission reservations, and no stale
+   tokens. Repeat on each slot, including reuse with the opposite priority.
+5. Use `strata_timeout_s` shorter than a measured queue wait, then shorter than a measured active request;
+   require terminal `timeout`, queued 408 or active endpoint error, completed drain and a valid peer/retry.
+6. Exceed context and body budgets; require rejection without native generation. Force an engine failure
+   under the protected vehicle, require explicit lifecycle errors, and retry only after old consumers drain.
+7. Check the private API is 404 when disabled, rejects foreign peers/browser origins, and enforces the key.
+
+These are qualification instructions, not acceptance evidence. No new hardware, sampled correctness,
+multi-GPU, image concurrency, or native fairness claim follows from service implementation alone.
