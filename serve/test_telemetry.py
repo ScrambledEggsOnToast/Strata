@@ -239,6 +239,33 @@ class ServingOwnership(unittest.TestCase):
         self.assertFalse(sampler._thread.is_alive())
         httpd.server_close()
 
+    def test_model_unload_keeps_server_sampler_alive_until_http_close(self):
+        svc = self.service()
+        engine = mock.Mock(spec=["alive", "unload", "max_context"])
+        engine.max_context = 4096
+        engine.alive.return_value = True
+        engine.unload.side_effect = lambda: setattr(engine.alive, "return_value", False)
+        svc.engine = engine
+        reader = SamplerOwnership().reader()
+        with mock.patch.object(telemetry, "gpu_reader", return_value=reader):
+            httpd = server.serve(svc, port=0)
+        sampler = svc.telemetry
+        try:
+            self.assertEqual(svc.unload(), "unloaded")
+            self.assertIs(svc.telemetry, sampler)
+            self.assertTrue(sampler._thread.is_alive())
+            reader.close.assert_not_called()
+            engine.unload.assert_called_once_with()
+            self.assertEqual(svc.unload(), "not loaded")
+            self.assertTrue(sampler._thread.is_alive())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        httpd.server_close()
+        self.assertFalse(sampler._thread.is_alive())
+        reader.close.assert_called_once_with()
+
+
     def test_bind_failure_does_not_start_telemetry(self):
         svc = self.service()
         with mock.patch.object(server, "Server", side_effect=OSError("port occupied")), \

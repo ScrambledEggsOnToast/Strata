@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import time
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve
+from serve.server import AdmissionError, ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve
 
 
 class ResidentEngine(StrataEngine):
@@ -200,6 +201,69 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.request("/v1/unload", {})[0], 409)
         self.assertEqual(self.engine.closes, 0)
         self.assertEqual(self.request("/v1/load", {}, {"Content-Type": "text/plain"})[0], 415)
+
+    def test_every_json_route_enforces_the_request_body_budget(self):
+        self.svc.request_body_bytes = 16
+        for path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/settings", "/config"):
+            with self.subTest(path=path):
+                status, body = self.request(path, {"oversized": "x" * 40})
+                self.assertEqual(status, 413)
+                self.assertIn("request_body_bytes", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+        self.assertEqual(self.svc.admission_waiters, [])
+
+
+class RequestAdmission(unittest.TestCase):
+    def service(self):
+        tok = ByteTokenizer()
+        return Service(MockEngine(tok, "ok"), tok, None)
+
+    def test_priority_fairness_bounds_foreground_bypass(self):
+        svc = self.service()
+        records = []
+        for priority in ("foreground", "foreground", "foreground", "foreground", "background"):
+            records.append(svc.register_lifecycle({"strata_priority": priority}, threading.Event()))
+        for index in (0, 1, 2, 4, 3):
+            svc.acquire_request(records[index])
+            self.assertEqual(list(svc.admission_active), [records[index]["id"]])
+            svc.finish_lifecycle(records[index])
+        self.assertEqual((svc.admission_active, svc.admission_waiters, svc.status["queued"]), ({}, [], 0))
+        self.assertEqual([r["state"] for r in svc.lifecycle_records()], ["completed"] * 5)
+
+    def test_queue_rejection_and_expired_waiter_do_not_take_engine_capacity(self):
+        svc = self.service()
+        svc.request_queue_limit = 1
+        first = svc.register_lifecycle({}, threading.Event())
+        svc.acquire_request(first)
+        second = svc.register_lifecycle({}, threading.Event())
+        with self.assertRaises(AdmissionError):
+            svc.register_lifecycle({}, threading.Event())
+        second["_deadline"] = 0
+        with self.assertRaises(AdmissionError) as error:
+            svc.acquire_request(second)
+        self.assertEqual(error.exception.status, 408)
+        svc.finish_lifecycle(second)
+        self.assertEqual(list(svc.admission_active), [first["id"]])
+        svc.finish_lifecycle(first)
+        self.assertEqual((svc.admission_active, svc.admission_waiters, svc.status["queued"]), ({}, [], 0))
+        self.assertEqual([r["state"] for r in svc.lifecycle_records()], ["completed", "timeout", "rejected"])
+
+    def test_cancelled_equal_priority_waiter_leaves_fifo_without_consuming_slot(self):
+        svc = self.service()
+        first, cancelled, last = [svc.register_lifecycle({}, threading.Event()) for _ in range(3)]
+        self.assertTrue(svc.cancel_request(cancelled["id"]))
+        with self.assertRaises(AdmissionError) as error:
+            svc.acquire_request(cancelled)
+        self.assertEqual(error.exception.status, 409)
+        svc.finish_lifecycle(cancelled)
+        for record in (first, last):
+            svc.acquire_request(record)
+            svc.finish_lifecycle(record)
+        self.assertEqual(svc.status["queued"], 0)
+        public = svc.lifecycle_records(cancelled["id"])
+        self.assertEqual(public["state"], "cancelled")
+        self.assertFalse(any(key.startswith("_") for key in public))
+
 
 
 if __name__ == "__main__":

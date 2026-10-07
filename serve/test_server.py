@@ -1841,6 +1841,7 @@ class LiveRate(unittest.TestCase):
         engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
         engine.lines = queue.Queue()
         engine.can_stop = False
+        engine.wlock = threading.Lock()
         engine.max_context = 262144
         engine.prefill_tok_s_mean = 9999.0
         engine.lines.put("PP 10000 12000 2000 1000.0")  # 8000 cached, 2000 newly read in two seconds

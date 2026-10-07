@@ -17,6 +17,7 @@ import json
 import random
 import sys
 import unittest
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -208,6 +209,51 @@ class VisibleAnswer(unittest.TestCase):
         p = OutputParser(thinking=False, tools=SCHEMA)
         evs = p.feed("```\n" + RM + "\n```") + p.finish()
         self.assertEqual(calls(evs), [])
+
+
+class ServiceFinishReasons(unittest.TestCase):
+    def run_reply(self, text, *, maximum=None):
+        tok, cancel = ByteTokenizer(), threading.Event()
+        svc = Service(MockEngine(tok, text, max_context=CTX), tok, None)
+        events, done = [], None
+        for kind, value in svc.run([1], True, SCHEMA, maximum or 800, {}, cancel):
+            if kind == "event":
+                events.append(value)
+            elif kind == "done":
+                done = value
+        return events, done, svc
+
+    def test_exact_call_length_cut_keeps_every_character_as_reasoning(self):
+        text = "Now.\n" + CALL
+        events, done, svc = self.run_reply(text, maximum=len(text.encode()))
+        self.assertEqual(done["finish"], "length")
+        self.assertEqual(calls(events), [])
+        self.assertEqual(reasoning(events), text)
+        self.assertEqual(svc.totals["tool_calls_from_reasoning"], 0)
+
+    def test_cancel_after_complete_call_keeps_the_call_as_reasoning(self):
+        text = "Now.\n" + CALL
+        # The call is buffered until the reason is known. Only its leading prose
+        # is streamed, so cancel the engine after the exact text has been generated.
+        tok, cancel = ByteTokenizer(), threading.Event()
+        class CancelAtEnd(MockEngine):
+            def generate(self, *args, **kwargs):
+                for token in self.tok.encode(text):
+                    yield token
+                cancel.set()
+        svc = Service(CancelAtEnd(tok, text), tok, None)
+        items = list(svc.run([1], True, SCHEMA, 800, {}, cancel))
+        events = [value for kind, value in items if kind == "event"]
+        self.assertEqual(items[-1][1]["finish"], "cancel")
+        self.assertEqual(calls(events), [])
+        self.assertEqual(reasoning(events), text)
+        self.assertEqual(svc.totals["tool_calls_from_reasoning"], 0)
+
+    def test_natural_stop_rescues_and_counts_the_same_call(self):
+        events, done, svc = self.run_reply("Now.\n" + CALL)
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(calls(events), ["write"])
+        self.assertEqual(svc.totals["tool_calls_from_reasoning"], 1)
 
 
 class OverHttp(unittest.TestCase):

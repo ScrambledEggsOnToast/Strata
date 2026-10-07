@@ -181,6 +181,15 @@ class ParallelArgs(unittest.TestCase):
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
 
+    def test_resident_multiplex_is_explicit_and_demands_slots(self):
+        self.assertEqual(engine_args({"args": []}), [])
+        self.assertEqual(engine_args({"args": [], "parallel": 2, "resident_multiplex": True}),
+                         ["--batch", "2", "--resident-multiplex"])
+        with self.assertRaisesRegex(ValueError, "requires explicit"):
+            engine_args({"args": [], "resident_multiplex": True})
+        with self.assertRaises(ValueError):
+            engine_args({"args": [], "resident_multiplex": "true"})
+
 
 class PickSlot(unittest.TestCase):
     def engine(self, n):
@@ -263,6 +272,21 @@ class ParallelService(unittest.TestCase):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+
+    def test_multiplex_requires_native_acknowledgement(self):
+        self.start(2)
+        self.engine.close()
+        self.engine.spawn[1].append("--resident-multiplex")
+        import serve.server as server
+        real = server.subprocess.Popen
+        script = Path(self.tmp.name) / "fake_strata.py"
+        with mock.patch.object(server.subprocess, "Popen",
+                               lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+            with self.assertRaisesRegex(RuntimeError, "INFO resident_multiplex=1"):
+                self.engine.restart(tries=1)
+        self.assertFalse(self.engine.alive())
+        self.assertIsNone(self.engine.proc)
+
 
     def test_stop_strings_in_a_batch_slot(self):
         """#454: a stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""

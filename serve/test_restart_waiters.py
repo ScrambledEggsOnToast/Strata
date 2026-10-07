@@ -69,6 +69,7 @@ class RestartWaiters(unittest.TestCase):
     def clean(self):
         e = self.engine
         self.assertEqual((e.waiting, e.wait_lens), (0, []))
+        self.assertEqual(list(e.control_waiters), [])
         self.assertFalse(e.ctl.locked())
 
     def kill(self):
@@ -79,15 +80,20 @@ class RestartWaiters(unittest.TestCase):
         self.start(slots)
         e = self.engine
         cv, ctl, old_proc = e.slot_cv, e.ctl, e.proc
-        out, threads = self.waiters(3)
-        self.kill()
-        restarter = threading.Thread(target=e.restart)               # what ensure_loaded does for the next request
+        n = min(3, slots)      # Service admission bounds active consumers to effective slots.
+        out, threads = self.waiters(n)
+        lens, fifo = e.wait_lens, e.control_waiters
+        entries = list(fifo)
+        restarter = threading.Thread(target=e.restart)
         restarter.start()
-        time.sleep(0.2)
-        e.ctl.release()                                              # the request that held the lines is gone
         restarter.join(120)
+        self.assertFalse(restarter.is_alive())
+        self.assertIs(e.wait_lens, lens)
+        self.assertIs(e.control_waiters, fifo)
+        self.assertEqual([id(x) for x in fifo], [id(x) for x in entries])
+        e.ctl.release()
         self.joined(threads)
-        self.assertEqual(out, {i: ("ok", "ok, done.") for i in range(3)})
+        self.assertEqual(out, {i: ("ok", "ok, done.") for i in range(n)})
         self.assertIsNot(e.proc, old_proc)
         self.assertIs(e.slot_cv, cv)                                 # the same condition variable and lock
         self.assertIs(e.ctl, ctl)
@@ -99,13 +105,95 @@ class RestartWaiters(unittest.TestCase):
     def test_waiters_go_on_with_the_new_engine_4_slots(self):
         self.go_on(4)
 
+    def test_restart_retains_equal_length_fifo_identities_and_cancellation(self):
+        self.start(2)
+        e = self.engine
+        self.assertTrue(e.ctl.acquire(timeout=5))
+        order, errors, threads = [], [], []
+        cancels = [threading.Event() for _ in range(3)]
+
+        def take(i):
+            try:
+                acquired = None
+                gen = e._take_control(cancels[i], 17, lambda _: order.append(i))
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration as done:
+                        acquired = done.value
+                        break
+                if acquired:
+                    e.ctl.release()
+                    with e.slot_cv:
+                        e.slot_cv.notify_all()
+            except Exception as error:
+                errors.append(error)
+
+        init = e.__init__
+        entered, resume = threading.Event(), threading.Event()
+
+        def paused_init(*args, **kwargs):
+            entered.set()
+            if not resume.wait(5):
+                raise RuntimeError("restart was not released")
+            init(*args, **kwargs)
+
+        try:
+            for i in range(3):
+                th = threading.Thread(target=take, args=(i,))
+                threads.append(th)
+                th.start()
+                with e.slot_cv:
+                    self.assertTrue(e.slot_cv.wait_for(lambda: e.waiting == i + 1, timeout=3))
+            cv, ctl, lens, fifo = e.slot_cv, e.ctl, e.wait_lens, e.control_waiters
+            entries, epoch = list(fifo), e.ctl_epoch
+            e.__init__ = paused_init
+            restarter = threading.Thread(target=e.restart, kwargs={"tries": 1})
+            restarter.start()
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(e.starting)
+            self.assertIsNone(e.proc)
+            self.assertEqual([id(x) for x in fifo], [id(x) for x in entries])
+            resume.set()
+            restarter.join(10)
+            self.assertFalse(restarter.is_alive())
+            for current, original in ((e.slot_cv, cv), (e.ctl, ctl), (e.wait_lens, lens),
+                                      (e.control_waiters, fifo)):
+                self.assertIs(current, original)
+            self.assertEqual([id(x) for x in fifo], [id(x) for x in entries])
+            cancels[1].set()
+            with cv:
+                cv.notify_all()
+                self.assertTrue(cv.wait_for(lambda: e.waiting == 2, timeout=3))
+            self.assertEqual([id(x) for x in fifo], [id(entries[0]), id(entries[2])])
+            ctl.release()
+            with cv:
+                cv.notify_all()
+            self.joined(threads)
+            self.assertEqual(errors, [])
+            self.assertEqual(order, [0, 2])
+            self.assertEqual(e.ctl_epoch, epoch + 2)
+            self.clean()
+        finally:
+            resume.set()
+            del e.__init__
+            for cancel in cancels:
+                cancel.set()
+            with e.slot_cv:
+                e.slot_cv.notify_all()
+            if e.ctl.locked():
+                e.ctl.release()
+            self.joined(threads)
+
+
     def stays_down(self, slots):
         self.start(slots)
-        out, threads = self.waiters(3)
+        n = min(3, slots)
+        out, threads = self.waiters(n)
         self.kill()
         self.engine.ctl.release()
         self.joined(threads)
-        for i in range(3):
+        for i in range(n):
             self.assertEqual(out[i][:2], ("http", 503), out[i])
             self.assertNotIn("list.remove", out[i][2])
             self.assertIn("engine", out[i][2])
