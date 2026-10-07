@@ -3272,6 +3272,7 @@ class SilentEngine(unittest.TestCase):
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None
+        engine.wlock = threading.Lock()
         engine.lines, engine.can_stop, engine.max_context = queue.Queue(), can_stop, 4096
         engine.silence_s, engine.log_path = silence, None
         return engine
