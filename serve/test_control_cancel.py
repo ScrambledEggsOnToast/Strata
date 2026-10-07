@@ -64,6 +64,18 @@ class ControlCancelTest(unittest.TestCase):
         self.assertEqual(tokens, [])
         eng._silent.assert_called_once()
 
+    def test_bounded_batch_refusal_drains_its_boundary_without_consuming_next_request(self):
+        eng = self._engine(["REJECT bounded=1 prompt exceeds context", "BADM 0 0", "T 91", "DONE 1"])
+        eng._ctl_mode = "batch"
+        eng._silent = mock.Mock(return_value=server.EngineSilent("unexpected poisoning"))
+        with self.assertRaises(server.AdmissionError):
+            list(eng._control(threading.Event(), lambda token: self.fail("refused request emitted a token")))
+        eng._silent.assert_not_called()
+        eng._ctl_mode = "solo"
+        tokens = []
+        list(eng._control(threading.Event(), tokens.append))
+        self.assertEqual(tokens, [91])
+
     def test_active_slot_is_not_reusable_until_bdone(self):
         eng = self._engine([])
         eng.gen = 1

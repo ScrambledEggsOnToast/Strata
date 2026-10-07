@@ -924,6 +924,18 @@ The shared snapshot core validates all layers and checkpoints before applying an
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
 rather than permission to continue with partial state. Indexer spare keys and the
 moving spare row are preserved, including checkpoint rewinds.
+Every entry - and the live session and every slot's cached conversation - is keyed
+by its identity (HET-042): the model fingerprint and the resolved config (the
+session-file machinery's fingerprints: model bytes, rope, K/V and state format,
+steering-vector contents, arithmetic), the serving frontend's tokenizer/template
+digest, and the request's authorization namespace, which the server derives from
+its authentication gate (the digest of the API key it authenticated, or one shared
+anonymous namespace when no key is required - the documented single-user trust
+model). A request with no identity - the keys missing or malformed - is offered
+nothing and reads from the start. Another principal's entries are kept for their
+owner, never offered across namespaces even for byte-identical prompts; a model,
+config or frontend change discards the entries it invalidates outright. The
+engine log reports invalidations and, for storage-tier restores, their traffic.
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not
@@ -979,13 +991,41 @@ every line: a malformed or unknown one, counts that are negative or go back, an 
 that is not a finite number end the engine as out of step.
 
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
-the draft layer's K/V. Format v1, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
-compile): a 64-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config
-fingerprint u64, payload length u64, two reserved u64 that must be 0, a hash of the first 56 bytes), the payload
+the draft layer's K/V. Format v2, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
+compile): an 80-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config
+fingerprint u64, frontend digest u64, namespace u64 pair, payload length u64, one reserved u64 that must be 0, a hash
+of the first 72 bytes), the payload
 (geometry, layer range, cvec flag, the live state, the checkpoints, the K/V layers; every array preceded by its u64
 count), the payload hash and the end marker `STRSEND\x01`. The hash is a 64-bit function with xxHash64-style rounds,
 not the standard XXH64 stream; it detects accidental corruption and does not authenticate a file: restore only files
 this engine wrote. An unknown version is refused; a new format gets a new version number.
+
+The header's frontend digest and namespace (HET-042) bind the file to the tokenizer/template identity and the
+authorization namespace of the request that saved it. A restore carries the requesting request's own identity (the
+server derives it, as for every generation), and the engine mounts the file only when the two match exactly - a file
+another principal saved is refused (`SERR invalid ... another authorization namespace`), never re-stamped onto the
+requester. Files of an engine before namespace binding (v1 headers: 64 bytes, no namespace fields) still read, but
+bind no namespace: they never authorize a namespace-scoped mount and are refused for any named principal (re-save
+them with this engine). A cache entry's key is the same tuple - model fingerprint, config fingerprint (the resolved
+rope, K/V and state format, steering-vector contents, arithmetic), frontend digest, namespace - so a model,
+quantization, rope, template, tokenizer or principal change is a key-equality change: matching entries are discarded
+(in RAM and in the storage tier below), not merely failed at restore time.
+
+The model fingerprint reads every model input byte in bounded blocks, once per distinct file
+at startup. Same-size middle edits therefore invalidate saved state, not just head/tail edits.
+This adds startup I/O and hashing cost; it is not repeated per request. Inputs must remain
+immutable while loaded. Fingerprints detect mismatches, not maliciously forged session files:
+external restores still require trusted files and the matching authorization namespace.
+
+**Storage-tier parking (off by default).** With `--conversation-cache-dir DIR` and
+`--conversation-cache-disk-mib N`, conversations that no longer fit the RAM budget park, in the same file format, in
+an exclusive per-process subdirectory of DIR (`strata-park-<pid>-<random>`): no two engines share one, a previous
+process's files are never touched, and only names this process admitted are ever removed (with them when the engine
+exits; nothing survives a restart). Restores are admitted like any other allocation - the parse's peak RAM is priced
+against the physical floor before anything is allocated - and a failed read discards its entry, never continues from
+a partial state. `--conversation-cache-disk-min-tokens N` parks only conversations of at least N tokens. The tier is
+off by default, and staying off is the honest default: whether a disk restore beats recomputation is a measured
+claim (the parking benchmark), not an assumption.
 
 A file is bound to the model inputs and to the settings that change what the saved bytes mean. The model fingerprint
 samples (size, first and last MiB) every file the engine loads, by its role: the GGUF shards (also

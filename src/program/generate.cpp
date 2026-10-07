@@ -23,6 +23,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -703,6 +704,8 @@ struct Options {
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
     bool resident_multiplex = false;
+    double prefill_latency_ms = 0; // zero keeps the configured arithmetic/chunk partition
+    double batch_decode_share = 0.5;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -762,6 +765,13 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// HET-042 storage-tier parking: with --conversation-cache-disk-mib > 0, conversations that no longer fit
+    /// the RAM budget park as session-file images in an owned subdirectory of --conversation-cache-dir (one
+    /// engine process at a time; nothing survives the process).  Off by default: adopting it is a measured
+    /// claim (restore traffic against recomputation, the parking benchmark), not a default.
+    std::string conversation_cache_dir;
+    int64_t conversation_cache_disk_mib = 0;
+    int64_t conversation_cache_disk_min_tokens = 0;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -903,6 +913,13 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --conversation-cache-dir DIR  --serve: with --conversation-cache-disk-mib, parked conversations\n"
+                 "                       that outgrow the RAM budget go to an owned subdirectory of DIR (nothing\n"
+                 "                       survives the process; off by default)\n"
+                 "  --conversation-cache-disk-mib N  --serve: storage-tier parking budget (default 0 = off; adoption\n"
+                 "                       is a measured claim, not a default)\n"
+                 "  --conversation-cache-disk-min-tokens N  --serve: park to storage only conversations of at least N\n"
+                 "                       tokens (default 0; raise when measurements say restores pay)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -911,6 +928,8 @@ void usage() {
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
+                 "  --prefill-latency-ms M --batch: cap subsequent chunk work using measured ms/token (0 = fixed chunks)\n"
+                 "  --batch-decode-share F --batch: positive decode time share between prompt chunks (default 0.5)\n"
                  "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
@@ -1562,6 +1581,30 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
     return h;
 }
 
+// Fixed-width lowercase hex as the serving frontend sends it (16 digits = one value, 32 = two, high words
+// first).  false on any other character: an identity key that is not exactly the agreed width is no identity.
+bool hex_identity(const char* s, size_t digits, uint64_t& a, uint64_t* b = nullptr) {
+    auto one = [&s](uint64_t& out) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < 16; ++i, ++s) {
+            const int d = *s >= '0' && *s <= '9' ? *s - '0' : *s >= 'a' && *s <= 'f' ? *s - 'a' + 10 : -1;
+            if (d < 0) return false;
+            v = (v << 4) | (uint64_t) d;
+        }
+        out = v;
+        return true;
+    };
+    if (digits == 16) { uint64_t v; if (!one(v)) return false; a = v; return true; }
+    if (digits == 32 && b != nullptr) {
+        uint64_t hi, lo;
+        if (!one(hi) || !one(lo)) return false;
+        a = hi;
+        *b = lo;
+        return true;
+    }
+    return false;
+}
+
 using strata::program::LogitsDump;
 
 
@@ -1977,6 +2020,8 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--resident-multiplex") o.resident_multiplex = true;
+        else if (a == "--prefill-latency-ms") o.prefill_latency_ms = std::atof(next("--prefill-latency-ms"));
+        else if (a == "--batch-decode-share") o.batch_decode_share = std::atof(next("--batch-decode-share"));
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--batch-mtp") o.batch_mtp = true;
@@ -2000,6 +2045,11 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-disk-mib")
+            o.conversation_cache_disk_mib = std::max(0LL, std::atoll(next("--conversation-cache-disk-mib")));
+        else if (a == "--conversation-cache-disk-min-tokens")
+            o.conversation_cache_disk_min_tokens = std::max(0LL, std::atoll(next("--conversation-cache-disk-min-tokens")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
             const std::string value = next(a.c_str());
@@ -2136,6 +2186,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (!std::isfinite(o.prefill_latency_ms) || o.prefill_latency_ms < 0 ||
+        !std::isfinite(o.batch_decode_share) || o.batch_decode_share <= 0 || o.batch_decode_share > 16) {
+        std::fprintf(stderr, "strata generate: prefill latency must be finite and nonnegative; decode share in (0,16]\n");
+        return 2;
     }
     if (o.resident_multiplex && (!o.serve || o.batch < 2 || o.batch_groups != 1 || !o.layer_split.empty())) {
         std::fprintf(stderr, "strata generate: --resident-multiplex requires single-device --serve --batch >= 2 and one group\n");
@@ -4890,8 +4945,7 @@ int main(int argc, char** argv) {
 
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
-    // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
-    // engine still starts and serves one request at a time.
+    // Refuse an unsupported or unfillable requested profile; never advertise a smaller batch silently.
     // --batch-mtp / STRATA_BATCH_MTP=1 is opt-in; unsupported requests refuse, never silently disable drafting.
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
@@ -4909,22 +4963,21 @@ int main(int argc, char** argv) {
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
-            o.batch = 0;
+            std::fprintf(stderr, "strata generate: --batch %d refused: %s\n", o.batch, off);
+            return 1;
         } else if (o.batch > cap) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
-                                 "slots\n", o.batch, cap, cap);
-            o.batch = cap;
+            std::fprintf(stderr, "strata generate: --batch %d refused: maximum supported capacity is %d\n", o.batch, cap);
+            return 1;
         }
     }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group\n", o.batch_groups, o.batch);
-        o.batch_groups = 1;
+        std::fprintf(stderr, "strata generate: --batch-groups %d refused: needs a layer split and must divide --batch %d\n",
+                     o.batch_groups, o.batch);
+        return 1;
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
-        int fit = o.batch;   // the slots every stage could carve
+        const int fit = o.batch;
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
@@ -4939,11 +4992,10 @@ int main(int argc, char** argv) {
                     cudaGetLastError();
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
-                                         "(%.2f GiB each, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
-                                 (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
-                    fit = b;
-                    break;
+                    std::fprintf(stderr, "strata generate: --batch %d refused: slot %d does not fit on CUDA%d "
+                                         "(%.2f GiB each, %.2f GiB free)\n", o.batch, b, dev,
+                                 (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+                    return 1;
                 }
                 strata::core::session_zero(u->state(), g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
@@ -4954,24 +5006,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
-        for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
-                                 "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
-            bslot_ss.clear();
-            o.batch = 0;
-        } else {
-            o.batch = fit;
-            if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
-            // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
-            std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
-                                 "expert cache would otherwise hold\n", o.batch,
-                         (double) bytes0 * o.batch / 1073741824.0);
-        }
+        // The sessions' VRAM is the expert cache's: report the admitted trade.
+        std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
+                             "expert cache would otherwise hold\n", o.batch,
+                     (double) bytes0 * o.batch / 1073741824.0);
     }
-    // Resident init, partial failure and stage-count trimming can retire the latest
-    // registered table. Bind the longer-lived working owner on every actual device,
-    // even when >=2 slots survived, before any MTP/prefill/verifier graph captures it.
+    // Resident owners registered their immutable tables most recently. Rebind
+    // the longer-lived working owner before MTP/prefill/verifier graph capture.
     session_owner.bind_rope();
     for (const auto& stage : stages) stage->session_owner.bind_rope();
 
@@ -7857,13 +7898,54 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // HET-042: the conversation cache keys every entry by the same identity session files are bound to
+        // (the model files and the resolved config), plus the per-request frontend (tokenizer/template
+        // digest) and authorization namespace (tenant) the serving frontend sends.  Computed once here so a
+        // request never pays the fingerprint reads; unavailable fingerprints leave the identity zero, which
+        // matches nothing (reuse off, recompute as usual).
+        strata::core::ConversationIdentity cache_identity;
+        strata::core::ConversationIdentity session_ident;   // who the live session's conversation belongs to
+        uint64_t seen_model = 0, seen_config = 0, seen_frontend = 0;   // one-time invalidation on a change
+        bool ident_seen = false;
+        int64_t disk_seq = 0;
+        if (o.serve && o.prompt_cache > 0) {
+            strata::core::SessionFileIdentity fp;
+            std::string ie;
+            if (session_identity(fp, ie, [] { strata::core::progress_at("fingerprinting model identity"); })) {
+                cache_identity.model = fp.model;
+                cache_identity.config = fp.config;
+                std::fprintf(stderr, "strata serve: conversation cache identity: model=%016llx config=%016llx\n",
+                             (unsigned long long) fp.model, (unsigned long long) fp.config);
+            } else {
+                std::fprintf(stderr, "strata serve: conversation cache identity unavailable (%s): no request "
+                             "keeps cached state\n", ie.c_str());
+            }
+        }
+        // Storage-tier parking (off by default): an owned, exclusive subdirectory; only this process's own
+        // admitted files are ever removed, and nothing here is reused after a restart.
+        strata::core::ConversationDiskCache disk_cache;
+        if (o.serve && o.prompt_cache > 0 && !o.conversation_cache_dir.empty()) {
+            std::string de;
+            if (o.conversation_cache_disk_mib <= 0) {
+                std::fprintf(stderr, "strata serve: --conversation-cache-dir needs --conversation-cache-disk-mib "
+                             "> 0: storage-tier parking stays off\n");
+            } else if (disk_cache.open(o.conversation_cache_dir, de)) {
+                disk_cache.set_budget((uint64_t) o.conversation_cache_disk_mib << 20);
+                std::fprintf(stderr, "strata serve: conversation cache storage tier: %s (%lld MiB, not durable "
+                             "across restarts)\n", disk_cache.dir().c_str(),
+                             (long long) o.conversation_cache_disk_mib);
+            } else {
+                std::fprintf(stderr, "strata serve: conversation cache storage tier unavailable (%s): parking "
+                             "stays in RAM\n", de.c_str());
+            }
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, session_ident))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
@@ -7881,7 +7963,7 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            auto reuse = conversations.take_reuse(session_ident);   // the retained K/V described this conversation
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -7967,11 +8049,71 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // The parked image stays the outgoing conversation's property (its own namespace), never the
+                // incoming request's.  An unowned (zero) identity parks nowhere.
+                image.identity = session_ident;
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                if (!stored && disk_cache.enabled() && image.identity.known() &&
+                    (int64_t) image.live.ids.size() >= o.conversation_cache_disk_min_tokens) {
+                    // The storage tier: the image did not fit (or was refused by) the RAM budget.  The writer
+                    // asks this tier's admission with the file's EXACT total bytes before its temporary file is
+                    // created (SessionWriteOptions.admit): the tier evicts oldest-first then, or refuses - so
+                    // the transient footprint (the tier's files, the new file and its temporary) never exceeds
+                    // the budget while the bytes are on disk.  The writer's 16 MiB staging is priced against
+                    // the physical-RAM floor first, on top of the captured image and everything held.
+                    const std::string name = "park-" + std::to_string(++disk_seq) + ".bin";
+                    const std::string path = disk_cache.dir() + "/" + name;
+                    if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                            (uint64_t) 16 << 20, (uint64_t) o.conversation_cache_min_free_mib << 20)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip storage parking (physical RAM "
+                                     "admission for the writer's staging; need 16 MiB plus a floor of %lld MiB)\n",
+                                     (long long) o.conversation_cache_min_free_mib);
+                    } else {
+                        strata::core::SessionWriteOptions wo;
+                        wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                        wo.admit = [&disk_cache](uint64_t need, std::string& why) {
+                            if (disk_cache.make_room(need)) return true;
+                            why = "the storage tier cannot hold it within its budget";
+                            return false;
+                        };
+                        wo.phase = [](const char* phase, uint64_t bytes) {
+                            strata::core::progress_at(phase);
+                            strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+                        };
+                        size_t file_bytes = 0;
+                        std::string werr;
+                        strata::core::SessionStatus st;
+                        const auto t0d = Clock::now();
+                        strata::core::progress_at("parking a conversation to storage");
+                        const bool wrote = strata::core::session_file_write(path, image,
+                                {image.identity.model, image.identity.config, image.identity.frontend,
+                                 image.identity.tenant_lo, image.identity.tenant_hi}, file_bytes, werr, wo, &st);
+                        strata::core::progress_at("request");
+                        strata::core::progress_allow(0);
+                        if (wrote || st.published) {   // published: the file is complete, only the folder flush failed
+                            // The admission priced exactly this size; the trim is a formality.  A trim that
+                            // cannot unlink keeps the new entry CHARGED - the budget may then read over by
+                            // exactly the stuck file, loudly, rather than the disk holding uncharged bytes.
+                            const bool trimmed = disk_cache.make_room(file_bytes);
+                            disk_cache.admit({image.identity, image.cvec, image.live.ids, image.live.imgs,
+                                              (uint64_t) file_bytes, name});
+                            std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to storage "
+                                         "(%s, %zu bytes) in %.1f ms; disk=%zu bytes in %zu files%s\n",
+                                         image.live.ids.size(), path.c_str(), file_bytes,
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t0d).count(),
+                                         disk_cache.bytes(), disk_cache.size(),
+                                         trimmed ? "" : " (over budget: an eviction could not be removed; charged)");
+                        } else {
+                            std::fprintf(stderr, "strata serve: conversation cache: storage parking refused or "
+                                         "failed (%s); conversation recomputes next time\n", werr.c_str());
+                            err.clear();
+                        }
+                    }
+                }
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -8854,6 +8996,7 @@ int main(int argc, char** argv) {
         const auto& bs = resident.slots();
         size_t resident_cursor = 0;
         unsigned resident_credit = 0;
+        const bool batch_diagnostics = std::getenv("STRATA_BATCH_DIAGNOSTICS") != nullptr;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -8963,12 +9106,15 @@ int main(int argc, char** argv) {
             const Clock::time_point w1 = Clock::now();
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             int keep[8] = {};
+            int rejected_drafts = 0;
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                if (batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] != tok[i + 1])
+                    ++rejected_drafts;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
@@ -8980,6 +9126,7 @@ int main(int argc, char** argv) {
             bt_commit += msd(w1, w2);
             ++bt_windows;
             bt_rows += S;
+            const int64_t committed_before = bt_tokens;
             for (int t = 0; t < (batch_mtp ? A : S); ++t) {
                 const int b = batch_mtp ? active[t] : rows[t];
                 const auto& sl = bs[(size_t) b];
@@ -8993,6 +9140,11 @@ int main(int argc, char** argv) {
                         std::printf("ERR %s\n", err.c_str()); return false;
                     }
                     std::printf("BT %d %d\n", b, (int) y);
+                    if (batch_diagnostics)
+                        std::fprintf(stderr, "TOKEN_MARK request=%llu slot=%d ordinal=%lld token=%d emission_ns=%lld\n",
+                                     (unsigned long long) sl.request, b, (long long) sl.produced, (int) y,
+                                     (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+                    ++bt_tokens;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -9009,6 +9161,16 @@ int main(int argc, char** argv) {
                     std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
                 }
             }
+            if (batch_diagnostics) {
+                const int64_t committed = bt_tokens - committed_before;
+                const int requests = batch_mtp ? A : S;
+                std::fprintf(stderr, "BATCH_ITERATION iteration=%lld requests=%d scheduled_positions=%d "
+                                     "padding_positions=%d draft_positions=%d rejected_positions=%d discarded_positions=%lld "
+                                     "committed_tokens=%lld run_ms=%.3f commit_ms=%.3f\n",
+                             (long long) bt_windows, requests, S, count - S,
+                             batch_mtp ? S - A : 0, rejected_drafts, (long long) (S - committed),
+                             (long long) committed, msd(w0, w1), msd(w1, w2));
+            }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
             strata::core::progress().busy.store(was_busy);
@@ -9017,12 +9179,12 @@ int main(int argc, char** argv) {
                 const double L = (double) g.n_layers;
                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
-                                     "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f rows/s over %.0f ms of wall time (admissions "
-                                     "included)\n",
+                                     "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f committed tokens/s over %.0f ms of wall time "
+                                     "(admissions included)\n",
                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
-                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_tokens / std::max(wall, 1e-9), wall);
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
@@ -9082,7 +9244,11 @@ int main(int argc, char** argv) {
                         std::printf("ERR %s\n", err.c_str()); return false;
                     }
                     std::printf("BT %d %d\n", G.rows[t], (int) y);
-                    ++bt_rows;
+                    if (batch_diagnostics)
+                        std::fprintf(stderr, "TOKEN_MARK request=%llu slot=%d ordinal=%lld token=%d emission_ns=%lld\n",
+                                     (unsigned long long) sl.request, G.rows[t], (long long) sl.produced, (int) y,
+                                     (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+                    ++bt_tokens;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -9096,6 +9262,7 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++bt_windows;
+                bt_rows += G.count;
                 G.inflight = false;
             }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
@@ -9141,15 +9308,15 @@ int main(int argc, char** argv) {
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
-                const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
-                std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
-                                     "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
-                             (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld committed tokens in %.0f ms = "
+                                     "%.1f committed tokens/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
+                             (long long) bt_tokens, wall, 1000.0 * bt_tokens / std::max(wall, 1e-9));
                 for (int k = 0; k < n_pipe; ++k) {
                     const std::string pr = stage_verifier(k).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
-                bt_windows = bt_rows = 0;
+                bt_windows = bt_rows = bt_tokens = 0;
                 strata::core::progress().busy.store(false);
             }
             return true;
@@ -9170,7 +9337,7 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
-            if (std::getenv("STRATA_BATCH_DIAGNOSTICS") && line == "BINERT") {
+            if (batch_diagnostics && line == "BINERT") {
                 if (batch_on() || piped || bs.empty()) {
                     std::printf("ERR BINERT: requires idle single-stage resident slots\n");
                     std::fflush(stdout);
@@ -9220,7 +9387,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            if (std::getenv("STRATA_BATCH_DIAGNOSTICS") && line.rfind("BRESOURCES ", 0) == 0) {
+            if (batch_diagnostics && line.rfind("BRESOURCES ", 0) == 0) {
                 if (batch_on() || (piped && pipe_inflight())) {
                     std::printf("ERR BRESOURCES: resident requests active\n");
                 } else if (line == "BRESOURCES release") {
@@ -9310,7 +9477,29 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                // RESTORE takes an optional strict identity suffix after the path (single spaces, exact widths):
+                // ` tenant=<32 hex> frontend=<16 hex>` - the namespace and frontend the file must be bound to.
+                // The serving frontend derives both from its own state; they are never client text.  A RESTORE
+                // without them binds no namespace: a v2 file refuses it, and what mounts then stays unclaimable
+                // by the cache (session_ident zero), so no private state is ever authorized by the path alone.
+                uint64_t f_tenant_lo = 0, f_tenant_hi = 0, f_frontend = 0;
+                bool f_identified = false;
+                std::string path = line.substr(save ? 5 : 8);
+                if (!save) {
+                    const std::string tkey = " tenant=";
+                    const size_t te = path.rfind(tkey);
+                    if (te != std::string::npos) {
+                        const std::string tail = path.substr(te + tkey.size());   // "<32 hex> frontend=<16 hex>"
+                        const std::string fkey = " frontend=";
+                        const size_t fe = tail.find(fkey);
+                        if (fe == 32 && tail.size() == 32 + fkey.size() + 16 &&
+                            hex_identity(tail.c_str(), 32, f_tenant_lo, &f_tenant_hi) &&
+                            hex_identity(tail.c_str() + 32 + fkey.size(), 16, f_frontend)) {
+                            f_identified = true;
+                            path.resize(te);
+                        }
+                    }
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -9360,6 +9549,19 @@ int main(int argc, char** argv) {
                 } catch (const std::exception& e) {
                     refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
                     continue;
+                }
+                // The namespace binding (HET-042): a SAVE binds the file to the conversation's own identity (the
+                // session as it stands; zero when no identified request has claimed it, which then never
+                // authorizes a namespace-scoped mount); a RESTORE demands exactly the namespace and frontend the
+                // command carried - a file another principal saved is refused, never re-stamped onto the caller.
+                if (save) {
+                    id.frontend = session_ident.frontend;
+                    id.tenant_lo = session_ident.tenant_lo;
+                    id.tenant_hi = session_ident.tenant_hi;
+                } else {
+                    id.frontend = f_frontend;
+                    id.tenant_lo = f_tenant_lo;
+                    id.tenant_hi = f_tenant_hi;
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
@@ -9502,6 +9704,14 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    // The mounted file proved its identity (model, config, and - on a v2 file - the namespace and
+                    // frontend the command demanded).  The session belongs to exactly that identity; with none
+                    // (v1 file, or no suffix) it stays unclaimable by the cache.
+                    session_ident = cache_identity;
+                    session_ident.frontend = id.frontend;
+                    session_ident.tenant_lo = id.tenant_lo;
+                    session_ident.tenant_hi = id.tenant_hi;
+                    if (!f_identified) session_ident = {};
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
@@ -9534,6 +9744,13 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // HET-042 cache identity: `tenant=<32 hex>` is the request's authorization namespace (derived by the
+            // serving frontend from its authentication gate, never client text) and `frontend=<16 hex>` its
+            // tokenizer/template digest.  BOTH must be present and exactly well-formed: anything else (missing,
+            // malformed, partial) is no identity - the request matches no cached state and reads from the start.
+            // Recompute is the safe fallback, never a partial or foreign mount.
+            uint64_t req_tenant_lo = 0, req_tenant_hi = 0, req_frontend = 0;
+            bool tenant_ok = false, frontend_ok = false;   // both decide req_identified below
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -9559,6 +9776,9 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "tenant")
+                        tenant_ok = hex_identity(tok.c_str() + eq + 1, 32, req_tenant_lo, &req_tenant_hi);
+                    else if (key == "frontend") frontend_ok = hex_identity(tok.c_str() + eq + 1, 16, req_frontend);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9567,6 +9787,35 @@ int main(int argc, char** argv) {
                 while (*endp == ' ') ++endp;
                 char* gap = std::strchr(endp, ' ');
                 if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
+            }
+            // The request's full cache identity: the engine's model/config fingerprints plus this request's
+            // frontend and namespace.  Namespace COMPLETENESS: every part must be present and nonzero - an
+            // unavailable fingerprint, a malformed key, or an all-zero digest is no identity at all, and
+            // zero-equals-zero never authorizes reuse of anything.
+            strata::core::ConversationIdentity req_ident = cache_identity;
+            req_ident.frontend = req_frontend;
+            req_ident.tenant_lo = req_tenant_lo;
+            req_ident.tenant_hi = req_tenant_hi;
+            const bool req_identified = tenant_ok && frontend_ok && req_frontend != 0 &&
+                (req_tenant_lo || req_tenant_hi) &&
+                cache_identity.model != 0 && cache_identity.config != 0;
+            if (!req_identified || !req_ident.known()) req_ident = {};
+            // AC-3 invalidation by key equality: entries whose model, config or frontend no longer matches can
+            // never be selected again, so they go now (RAM and storage tier), not merely at restore time.  A
+            // tenant change is NOT an invalidation: other namespaces' entries stay for their owners.
+            if (req_ident.known() &&
+                (!ident_seen || req_ident.model != seen_model || req_ident.config != seen_config ||
+                 req_ident.frontend != seen_frontend)) {
+                const size_t gone = conversations.invalidate_except(req_ident);
+                const size_t gone_disk = disk_cache.invalidate_except(req_ident);
+                ident_seen = true;
+                seen_model = req_ident.model;
+                seen_config = req_ident.config;
+                seen_frontend = req_ident.frontend;
+                if (gone + gone_disk > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache: invalidated %zu parked conversation(s)"
+                                 " (%zu RAM, %zu storage): model/config/frontend changed\n", gone + gone_disk, gone,
+                                 gone_disk);
             }
             std::vector<int64_t> ids;
             std::string pe;
@@ -9673,19 +9922,24 @@ int main(int argc, char** argv) {
             // The state demand is priced with the allocator's own `session_bytes` at the cells this
             // request can reach - context length, not a slot count.
             {
-                const int64_t cells_wanted = n + max_new;
-                const uint64_t state_demand =
-                    (uint64_t) strata::core::session_bytes(g, cells_wanted, K, 0, -1);
-                if (cells_wanted + 8 > o.max_context) {
-                    std::printf("REJECT prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld) "
-                                "cells=%lld state_demand_bytes=%llu\n",
-                                (long long) n, (long long) max_new, (long long) o.max_context,
-                                (long long) cells_wanted, (unsigned long long) state_demand);
+                const int64_t requested_new = admit_slot >= 0 ? admit_max_new : max_new;
+                if (requested_new > o.max_context || n > o.max_context - requested_new - 8) {
+                    std::printf("REJECT %sprompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n",
+                                admit_slot >= 0 ? "bounded=1 " : "", (long long) n,
+                                (long long) requested_new, (long long) o.max_context);
+                    if (admit_slot >= 0) std::printf("BADM %d 0\n", admit_slot);
+                    std::fflush(stdout);
                     continue;
                 }
-                std::printf("ADMIT cells=%lld state_demand_bytes=%llu context_limit=%lld\n",
+                const int64_t cells_wanted = n + requested_new;
+                const uint64_t state_demand =
+                    (uint64_t) strata::core::session_bytes(g, cells_wanted, K, 0, -1);
+                const uint64_t slot_capacity = (uint64_t) strata::core::session_bytes(g, o.max_context, K, 0, -1);
+                std::printf("ADMIT cells=%lld state_demand_bytes=%llu context_limit=%lld "
+                            "batch_capacity=%d slot_capacity_bytes=%llu admission_ns=%lld\n",
                             (long long) cells_wanted, (unsigned long long) state_demand,
-                            (long long) o.max_context);
+                            (long long) o.max_context, o.batch, (unsigned long long) slot_capacity,
+                            (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
             }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
@@ -9733,6 +9987,9 @@ int main(int argc, char** argv) {
             input.sampling.penalty_repeat = req_penalty_repeat;
             input.sampling.penalty_freq = req_penalty_freq;
             input.sampling.penalty_present = req_penalty_present;
+            // `input.identity` carries the request's identity into its slot (a slot's cached conversation is a
+            // prefix source only for its own namespace/frontend; resident yielded resume re-verifies it below).
+            input.identity = req_ident;
             if (!resident.begin(admit_slot, ids, input, err)) {
                 std::printf("ERR %s\n", err.c_str()); return 1;
             }
@@ -9755,7 +10012,11 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            // The live session and its checkpoint chain belong to one conversation, and that conversation to
+            // one identity: only a request with the same KNOWN identity continues it.  Zero never matches zero
+            // (default-deny, AC-2): an unidentified request always reads from the start.
+            if (o.prompt_cache > 0 && want_cvec == cvec_cached && req_ident.known() &&
+                session_ident.known() && req_ident == session_ident) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -9772,7 +10033,11 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
-                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
+                    // A slot's cached conversation stays its owner's property: another namespace/frontend (or an
+                    // unidentified request, or a slot without a known identity - zero never matches zero) never
+                    // reads from it, it would only overwrite it.
+                    if (sl.active || !sl.cached || sl.cvec != want_cvec || !sl.identity.known() ||
+                        !(sl.identity == req_ident)) continue;
                     if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
@@ -9786,15 +10051,72 @@ int main(int argc, char** argv) {
                         }
                 }
             const int yielded_source = resident.working().resume_slot;
-            if (yielded_source >= 0) {
+            if (yielded_source >= 0 && (!bs[(size_t) yielded_source].identity.known() ||
+                                        !(bs[(size_t) yielded_source].identity == req_ident))) {
+                // A yielded read resumes only its own request's slot (defense in depth: the parked part-read is
+                // that request's property; zero never matches zero).  Anything else is no source.
+                slot_source = -1;
+            } else if (yielded_source >= 0) {
                 slot_source = yielded_source;
                 slot_tokens = (int64_t) bs[(size_t) slot_source].ids.size();
                 slot_ck = nullptr;
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids, req_imgs, want_cvec, req_ident);
             std::optional<strata::core::SavedConversation> incoming;
-            if (yielded_source < 0 && parked.tokens > std::max(resume, slot_tokens))
+            int64_t incoming_tokens = 0;            // the matched prefix of whichever source `incoming` came from
+            bool incoming_live = false;
+            if (yielded_source < 0 && parked.tokens > std::max(resume, slot_tokens)) {
                 incoming.emplace(conversations.take(parked.index));
+                incoming_tokens = parked.tokens;
+                incoming_live = parked.live;
+            } else if (yielded_source < 0 && disk_cache.enabled() && req_ident.known()) {
+                const auto hit = disk_cache.best(ids, req_imgs, want_cvec, req_ident);
+                if (hit.tokens > std::max({resume, slot_tokens, parked.tokens})) {
+                    // Same bounds a session file reads under (geometry, layer range, every array), and the
+                    // parse's peak RAM priced against the physical floor BEFORE anything is allocated (AC-4).
+                    const strata::core::ConversationDiskCache::Entry& e = disk_cache.entry(hit.index);
+                    const std::string path = disk_cache.dir() + "/" + e.name;
+                    strata::core::SavedConversation loaded;
+                    size_t bytes = 0;
+                    std::string derr;
+                    strata::core::SessionReadLimits limits;
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                        const auto avail = strata::core::conversation_available_memory();
+                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                        why = "not enough RAM to read the parked conversation (" + std::to_string(need >> 20) +
+                              " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
+                              " MiB needed)";
+                        return false;
+                    };
+                    const auto th0 = Clock::now();
+                    if (strata::core::conversation_session_read_limits(
+                            limits, ss, g, mtp.kv_state(),
+                            (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), derr) &&
+                        strata::core::session_file_read(path,
+                            {e.identity.model, e.identity.config, e.identity.frontend, e.identity.tenant_lo,
+                             e.identity.tenant_hi}, loaded, bytes, derr, limits)) {
+                        // Consumed on read, like a RAM take(): the file goes now, so a corrupt or unsuitable
+                        // image can never be offered twice (AC-3: failed restores invalidate, not retry forever).
+                        if (!disk_cache.remove(hit.index))
+                            std::fprintf(stderr, "strata serve: conversation cache: could not unlink a storage "
+                                         "entry; it stays charged and will be offered again\n");
+                        incoming.emplace(std::move(loaded));
+                        incoming_tokens = hit.tokens;
+                        incoming_live = true;   // the storage image restores the conversation's whole live state
+                        std::fprintf(stderr, "strata serve: conversation cache: storage hit %lld tokens (%s, %zu "
+                                     "bytes) in %.1f ms\n", (long long) hit.tokens, path.c_str(), bytes,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - th0).count());
+                    } else {
+                        // A failed read invalidates the entry (AC-3): it is removed either way, and the request
+                        // falls back to recomputation - never to a partial state.
+                        std::fprintf(stderr, "strata serve: conversation cache: storage read failed (%s); entry "
+                                     "discarded\n", derr.c_str());
+                        err.clear();
+                        disk_cache.remove(hit.index);
+                    }
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -9825,6 +10147,9 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // From here the session is becoming THIS request's conversation (parked above under its own
+            // identity, or continued as the same one).  Until a request completes, live_ok says so.
+            session_ident = req_ident;
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 if (!resident.resume(slot_source, slot_ck, err)) {
@@ -9907,12 +10232,12 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
+                resume = incoming_tokens;   // the RAM entry's or the storage hit's matched prefix
+                from_live = incoming_live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), req_ident);
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
@@ -10306,15 +10631,13 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-            // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
+            // Fixed mode preserves configured prompt chunks. A positive latency target chooses smaller
+            // subsequent chunks from measured cost; this is a distinct arithmetic partition to qualify.
+            // Between chunks slots decode for a positive share of the measured chunk time, so a long
             // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
             // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
-            static const double decode_share = [] {
-                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
-                return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
-            }();
+            const double decode_share = o.batch_decode_share;
+            static double prefill_ms_per_token = 0;
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -10323,15 +10646,26 @@ int main(int argc, char** argv) {
             // `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
-            // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+            // continues from the slot at that boundary. Fixed mode retains its chunk partition.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    int64_t take = C;
+                    if (o.prefill_latency_ms > 0 && prefill_ms_per_token > 0)
+                        take = std::max<int64_t>(1, (int64_t) std::min((double) C, o.prefill_latency_ms / prefill_ms_per_token));
+                    const int64_t r = std::min(b0, q + take);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    const double chunk_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    const double observed_cost = chunk_ms / (double) (r - q);
+                    prefill_ms_per_token = prefill_ms_per_token > 0
+                        ? 0.75 * prefill_ms_per_token + 0.25 * observed_cost : observed_cost;
+                    if (batch_diagnostics)
+                        std::fprintf(stderr, "PREFILL_CHUNK request=%llu from=%lld to=%lld ms=%.3f ms_per_token=%.6f\n",
+                                     (unsigned long long) resident.working().request,
+                                     (long long) q, (long long) r, chunk_ms, prefill_ms_per_token);
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -10383,7 +10717,7 @@ int main(int argc, char** argv) {
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    const double budget = decode_share * chunk_ms;
                     const auto td = Clock::now();
                     do {
                         if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
@@ -11034,6 +11368,11 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        if (batch_diagnostics)
+                            std::fprintf(stderr, "TOKEN_MARK request=%llu slot=-1 ordinal=%lld token=%d emission_ns=%lld\n",
+                                         (unsigned long long) resident.working().request, (long long) produced_n + 1,
+                                         (int) outp[(size_t) i],
+                                         (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -11278,6 +11617,11 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = 0; i < keep; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (batch_diagnostics)
+                        std::fprintf(stderr, "TOKEN_MARK request=%llu slot=-1 ordinal=%lld token=%d emission_ns=%lld\n",
+                                     (unsigned long long) resident.working().request, (long long) produced_n + 1,
+                                     (int) outv[(size_t) i],
+                                     (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
                     strata::core::progress_beat();
                     ++produced_n;
                     if (o.suffix_draft > 0 || o.lookup_chain > 0) sfx.append(outv[(size_t) i]);
@@ -11380,7 +11724,7 @@ int main(int argc, char** argv) {
                              (unsigned long long) h.tail, (unsigned long long) h.pooled, (unsigned long long) h.kv,
                              (unsigned long long) h.draft, (unsigned long long) h.stale, (unsigned long long) h.dead,
                              (unsigned long long) h.pooled_full, ss.ple_prev[0], ss.ple_prev[1]);
-                if (last_committed_residual && std::getenv("STRATA_BATCH_DIAGNOSTICS"))
+                if (last_committed_residual && batch_diagnostics)
                     strata::program::report_batch_state("solo", drive.d.request_generation, 8, L, ss, h);
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
@@ -11535,6 +11879,9 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        // The storage tier was never durable: this process takes its own parked files (and, when empty, its own
+        // subdirectory) with it.  Another process's subdirectory is never touched.
+        disk_cache.close();
         return 0;
     }
 

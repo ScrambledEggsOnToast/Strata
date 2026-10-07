@@ -23,6 +23,9 @@ struct ResidentRequest {
     int64_t max_new = 0;
     bool steering = true, images = false;
     double pcie_fraction = 0, spec_min_probability = 0;
+    // Who the request is for (model/config/frontend/tenant, conversation_cache.hpp): a slot's cached
+    // conversation is a prefix source only for a request with the same identity.  Zero matches nothing.
+    core::ConversationIdentity identity;
 };
 
 struct ResidentWorking {
@@ -46,6 +49,7 @@ struct ResidentSlot {
     ResidentRequest input;
     int original_slot = -1;
     bool cached = false, cvec = true, img = false;
+    core::ConversationIdentity identity;   // the request this slot's cached conversation belongs to
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
     bool failed = false;

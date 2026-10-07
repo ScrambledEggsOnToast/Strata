@@ -1,10 +1,12 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
-// the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
-// docs/DETAILS.md (Session files).
+// the draft layer's K/V.  Pure host code: no CUDA.  Format v2 (with the namespace binding) and the fail-closed
+// read order are in docs/DETAILS.md (Session files).
 //
-// Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
-// compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
+// Formats v1 and v2 are little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is
+// refused at compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore
+// trusted files only.  v1 binds no authorization namespace: it reads, but never authorizes a namespace-scoped
+// mount (HET-042).
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -20,10 +22,15 @@
 
 namespace strata::core {
 
-// What the file is bound to: the model files it was computed with, and the engine settings that change what the
-// saved bytes mean.  A read with any other identity is refused before the payload is parsed.
+// What the file is bound to: the model files it was computed with, the engine settings that change what the
+// saved bytes mean, and the authorization namespace it belongs to.  A read with any other identity is refused
+// before the payload is parsed.  The namespace fields (HET-042) bind the file to one frontend (tokenizer/
+// template digest) and one principal: a file another principal (or an engine before namespace binding, whose
+// files carry none) presents is refused, never re-stamped onto the requester.
 struct SessionFileIdentity {
     uint64_t model = 0, config = 0;
+    uint64_t frontend = 0;
+    uint64_t tenant_lo = 0, tenant_hi = 0;
 };
 
 // Non-cryptographic 64-bit hash with xxHash64-style rounds (NOT the standard XXH64 stream): corruption and identity
@@ -91,10 +98,9 @@ struct SessionModelFile {
     std::string role, path;
     bool optional = false;
 };
-// Sampled fingerprint of the model inputs: role, size, first and last MiB of each entry, in the given order (a file
-// listed under several roles is read once).  Paths are UTF-8 (wide APIs on Windows; invalid UTF-8 is refused).  An
-// edit in the middle of a file that keeps its size is NOT detected: model files must not change while sessions saved
-// with them are kept.  `beat` (optional) is called after each distinct file is read.
+// Full-content fingerprint of model inputs: role, size and all bytes in fixed-size blocks,
+// in the given order (a file listed under several roles is read once). Paths are UTF-8.
+// Model inputs remain immutable while loaded; `beat` is called after each block read.
 bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint64_t& fingerprint, std::string& error,
                                const std::function<void()>& beat = {});
 
@@ -145,6 +151,10 @@ struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
     // write starts.  Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
+    // The caller's own admission, asked ONCE with the new file's exact total bytes (header + payload + trailer)
+    // before the temporary file is created: false refuses the write before anything is on disk (HET-042's
+    // storage tier prices and evicts here, so the tier never transiently holds more than its budget).
+    std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts

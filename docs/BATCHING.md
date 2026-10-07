@@ -34,9 +34,29 @@ With a layer split, the engine options go into the config's `args`:
 
 The fork's admission gate prices the **requested** count before allocation, including private main-model and
 MTP state, pinned staging, histories/checkpoints and transfer peaks. It refuses unsupported resident KV formats
-or an over-budget plan. After admission, runtime allocation may still reduce the count, retaining the
-single-session fallback when fewer than two slots fit. The server reads the effective count from
-`INFO batch_slots=N`; `GET /v1/status` reports `concurrency.serving`.
+or an over-budget plan. Runtime allocation must fill the requested profile or refuse startup;
+it does not silently shrink the count or switch to serial execution. Choose a smaller profile
+explicitly. The server checks `INFO batch_slots=N` against its request; `GET /v1/status`
+reports `concurrency.serving`.
+
+HTTP admission and prompt-control ownership use priority FIFO with a bounded foreground burst.
+`foreground_burst` (integer 1..64, default 3) applies to both queues; FIFO order is retained
+within each priority. Background prompt reads can yield to foreground arrivals at chunk
+boundaries, with bounded repeated yields so a long prompt still progresses.
+
+`--prefill-latency-ms M` uses measured chunk milliseconds per token to choose subsequent
+subchunks, bounded by the already admitted prefill workspace. Zero (default) retains the
+configured chunk partition. A positive target is an adaptive arithmetic partition, not a
+hard latency guarantee; qualify it separately against the fixed-partition control.
+`--batch-decode-share F` (finite, in (0,16], default 0.5) budgets decode work between chunks
+as a share of measured prompt work. Both bounds are scheduling policy, not measured promises.
+
+`STRATA_BATCH_DIAGNOSTICS=1` records `BATCH_ITERATION` scheduled, padding, draft,
+rejected-draft, discarded and committed counts separately. Discarded positions include
+termination/length boundaries and are not all speculative rejections. `TOKEN_MARK` records
+each committed token's engine emission time on the steady clock, including tokens emitted
+in one verification burst; it is not a separate compute-completion timestamp. Aggregate
+rates count committed tokens over the common wall interval, including intervening admissions.
 
 ### Resident multiplexing without compute batching
 
@@ -113,7 +133,7 @@ MTP KV arena, sampling/steering settings, token history and bounded checkpoint. 
 scratch is serialized under operation ownership; immutable weights remain shared. Resident admission currently
 supports fully resident FP16 KV only. Quantized/streamed KV is not qualified for additional resident slots;
 the single-session path is unchanged. Native and Python HET-017 accounting charge these payloads before the
-automatic expert-cache grant, even if a later runtime fallback reduces the active slot count.
+automatic expert-cache grant; a runtime allocation failure refuses the requested profile.
 
 The upstream setup heuristic recommends `"parallel"` where experts mostly fit in VRAM. It is a recommendation,
 not an admission calculation or evidence for this fork. The historical measurements below show why slots can
@@ -202,10 +222,34 @@ counter-based draw (Philox(seed, position)). Each resident row also stages its o
 presence-penalty history and steering flag. The shared process registry holds immutable steering tensors;
 captured resident graphs consume explicit row flags rather than the solo request's global switch.
 
-Resident initialization failure or slot-count reduction can retire the latest RoPE-table registration.
-After all such setup/unwind paths, each device rebinds the longer-lived working session's immutable table
-before graph capture. This preserves table-backed arithmetic (`STRATA_ROPE_TABLE=1`) in both the surviving
-batch and the single-session fallback; resident teardown cannot invalidate a captured working-table pointer.
+Resident initialization registers each slot's RoPE table. After successful setup,
+each device rebinds the longer-lived working session's immutable table before graph capture.
+This preserves table-backed arithmetic (`STRATA_ROPE_TABLE=1`) in both the
+batch and the explicit single-session profile; resident teardown cannot invalidate a captured working-table pointer.
+
+## Grouped expert dispatch across requests (HET-038)
+
+The dispatch derives contiguous request verification spans from packed active metadata before
+worker submission. Mixed bound/unbound identities, one request in multiple slots, and noncontiguous
+spans refuse before execution. Inert descriptor padding never reaches the expert pool.
+
+`STRATA_EXPERT_GROUPING=0` is the paired control: CPU jobs form and run per request within the
+same whole-window GPU plan/helper/ledger. Grouped mode shares distinct-expert CPU jobs across
+request spans. The existing group-size-sensitive arithmetic is pinned with `STRATA_IQ_MT_MIN=1`
+for matched exact qualification; grouping does not waive routing or exactly-once ownership.
+
+Counters distinguish actual shared-launch entries (`group_reuse_entries`), logical payload bytes
+(`group_payload_bytes`: blobs, quantized input, CPU result rows and PCIe staging), bounded formation
+time and helper submission/queue-plus-service wall. Logical payload is not measured DRAM traffic.
+`group_launches_avoided` derives spans minus one: it counts avoided dispatch formations, not actual
+CPU/GPU kernel launches. Report deltas; never infer kernel savings or weight reuse from batch size.
+`EXPERT_GROUP_TOTAL` emits cumulative successful-dispatch counters under the diagnostic gate;
+`cpu_jobs` counts actual distinct-expert CPU job formations. Compare matched arm deltas to
+measure their reduction, separately from derived dispatch savings and logical payload volume.
+
+Formation uses fixed eight-row/128-entry tables and one global CPU pool. Unsupported merge bounds
+select per-span CPU jobs within the same ownership envelope; unrepresentable window extents refuse.
+Cancellation drains versioned buffers before reuse; cancelled members cannot publish to successors.
 
 ## Limits (for now)
 

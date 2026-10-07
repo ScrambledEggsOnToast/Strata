@@ -273,7 +273,7 @@ class RestartWaiters(unittest.TestCase):
             self.engine._send("STOP")
 
     def test_solo_engine_is_unchanged(self):
-        self.start(4, fit=0)                                          # the engine turns batching off
+        self.start(0)  # Serial execution is an explicit profile, not a silent batch fallback.
         self.kill()
         self.assertEqual(self.chat("hi")["choices"][0]["message"]["content"], "ok, done.")
 

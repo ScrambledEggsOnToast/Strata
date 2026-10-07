@@ -239,6 +239,114 @@ private:
     bool failed_ = false;
 };
 
+// ================================ HET-038: CROSS-REQUEST EXPERT GROUPING ================================
+//
+// A verify window's staged rows are independent requests' rows: one row per slot, or one request's short
+// verification span as consecutive rows. The expert dispatch groups those rows by layer, expert, weight
+// format and worker while every result still belongs to exactly one (request, layer, speculative position).
+// The analysis below is the pure, device-independent decision the dispatch and its tests share: it derives
+// each request's span from the per-row metadata the pool already receives, validates the ownership identity
+// (wrong-delivery and partial-cancellation guards fail closed here, before any worker is submitted), and
+// decides whether the window forms one merged group or falls back to per-request jobs when the merged
+// formation bounds are exceeded. No CUDA type, allocation or waiting crosses this seam.
+struct ExpertGroupSpan {
+    uint64_t request = 0;      ///< the rows' request generation (0 = unbound, solo/legacy callers only)
+    int32_t slot = -1;         ///< the batch slot, -1 for solo windows
+    int64_t first_position = 0;///< the span's first speculative position
+    int32_t first_row = 0;     ///< the span's first row in the window
+    int32_t rows = 0;          ///< the span's packed rows (its verification-span length)
+};
+
+enum class ExpertGroupPlan {
+    merged,    ///< one grouped formation over every staged row (the production path)
+    per_span,  ///< merged bounds exceeded: independent per-request CPU jobs inside the same window ownership
+    refused,   ///< the window's identity or shape cannot be served; the caller must fail the layer closed
+};
+
+struct ExpertGroupBounds {
+    int64_t max_window_rows = 8;      ///< the window tables' row bound (MAXT)
+    int64_t max_window_entries = 128; ///< the merged formation's routed-entry bound (the window tables)
+    int64_t max_span_rows = 8;        ///< one request span's rows bound
+    int32_t max_spans = 8;            ///< the span table's capacity
+};
+
+/// Walks one window's packed rows into per-request verification spans. `worker_requests[r]` is row r's
+/// request generation (the hook substitutes each slotted row's published binding; solo rows carry the
+/// dispatch's own window generation). A span extends while the request id, slot and consecutive positions
+/// continue; every other invariant the resident verifier enforces upstream is re-checked here so the
+/// dispatch fails closed on any window its result scatter could not be audited for. Refusals name the
+/// reason and leave the span table cleared.
+inline ExpertGroupPlan analyze_expert_groups(const int64_t* positions, const int* request_slots,
+                                             const uint64_t* worker_requests, int64_t n_tok, int64_t k,
+                                             const ExpertGroupBounds& bounds, ExpertGroupSpan* spans,
+                                             int32_t& n_spans, const char*& error) {
+    n_spans = 0;
+    error = nullptr;
+    if (n_tok < 0 || k < 0 || (n_tok > 0 && (positions == nullptr || worker_requests == nullptr))) {
+        error = "expert group analysis: the window's request metadata is missing";
+        return ExpertGroupPlan::refused;
+    }
+    bool bound = false, unbound = false;
+    for (int64_t r = 0; r < n_tok; ++r) {
+        if (positions[r] < 0 || positions[r] == std::numeric_limits<int64_t>::max()) {
+            error = "expert group analysis: token position is outside the representable sequence extent";
+            n_spans = 0;
+            return ExpertGroupPlan::refused;
+        }
+        const int slot = request_slots ? request_slots[r] : -1;
+        if (slot < -1) {
+            error = "expert group analysis: a batch slot index is negative";
+            n_spans = 0;
+            return ExpertGroupPlan::refused;
+        }
+        const uint64_t id = worker_requests[r];
+        if (id == 0) unbound = true; else bound = true;
+        const bool extends = n_spans > 0 && spans[n_spans - 1].request == id &&
+                             spans[n_spans - 1].slot == slot &&
+                             positions[r] == spans[n_spans - 1].first_position + spans[n_spans - 1].rows;
+        if (!extends) {
+            // One request owns rows in one slot and one contiguous span: anything else could deliver a
+            // result to a request at a position its verification span never held.
+            for (int32_t s = 0; s < n_spans; ++s) {
+                if (spans[s].request == id) {
+                    error = spans[s].slot != slot
+                          ? "expert group analysis: a request owns rows in more than one slot"
+                          : "expert group analysis: a request's rows are not one contiguous verification span";
+                    n_spans = 0;
+                    return ExpertGroupPlan::refused;
+                }
+            }
+            if (n_spans >= bounds.max_spans) {
+                error = "expert group analysis: the window holds more request spans than the span table";
+                n_spans = 0;
+                return ExpertGroupPlan::refused;
+            }
+            spans[n_spans] = {id, slot, positions[r], (int32_t) r, 0};
+            ++n_spans;
+        }
+        ++spans[n_spans - 1].rows;
+    }
+    if (bound && unbound) {
+        error = "expert group analysis: the window mixes bound and unbound request identities";
+        n_spans = 0;
+        return ExpertGroupPlan::refused;
+    }
+    if (n_tok <= bounds.max_window_rows && n_tok * k <= bounds.max_window_entries)
+        return ExpertGroupPlan::merged;
+    if (n_spans <= 1) {
+        error = "expert group analysis: the window exceeds the merged formation bounds";
+        n_spans = 0;
+        return ExpertGroupPlan::refused;
+    }
+    for (int32_t s = 0; s < n_spans; ++s)
+        if (spans[s].rows > bounds.max_span_rows || (int64_t) spans[s].rows * k > bounds.max_window_entries) {
+            error = "expert group analysis: one request span exceeds the per-request formation bounds";
+            n_spans = 0;
+            return ExpertGroupPlan::refused;
+        }
+    return ExpertGroupPlan::per_span;
+}
+
 // Ordered, non-owning helper dispatch. Construct once, outside dispatch; workers
 // and any active ledger must outlive this module. One helper operation may be
 // active at a time. The caller owns ledger.begin(), CPU/primary/peer claims and

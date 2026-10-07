@@ -230,6 +230,24 @@ class RequestAdmission(unittest.TestCase):
         self.assertEqual((svc.admission_active, svc.admission_waiters, svc.status["queued"]), ({}, [], 0))
         self.assertEqual([r["state"] for r in svc.lifecycle_records()], ["completed"] * 5)
 
+    def test_configured_foreground_burst_admits_background_before_next_arrival(self):
+        svc = self.service()
+        svc.configure_admission({"foreground_burst": 1})
+        first = svc.register_lifecycle({}, threading.Event())
+        background = svc.register_lifecycle({"strata_priority": "background"}, threading.Event())
+        second = svc.register_lifecycle({}, threading.Event())
+        svc.acquire_request(first)
+        svc.finish_lifecycle(first)
+        # A nonchosen waiter expires immediately: an incorrect foreground choice
+        # must fail instead of hanging this deterministic policy test.
+        background["_deadline"] = time.perf_counter() + 0.05
+        svc.acquire_request(background)
+        self.assertEqual(list(svc.admission_active), [background["id"]])
+        svc.finish_lifecycle(background)
+        svc.acquire_request(second)
+        svc.finish_lifecycle(second)
+        self.assertEqual([r["state"] for r in svc.lifecycle_records()], ["completed"] * 3)
+
     def test_queue_rejection_and_expired_waiter_do_not_take_engine_capacity(self):
         svc = self.service()
         svc.request_queue_limit = 1

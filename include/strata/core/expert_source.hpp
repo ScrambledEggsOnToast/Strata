@@ -405,9 +405,39 @@ struct ExpertDispatch {
     std::vector<float> usage;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
-    /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
+    /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of the CPU (kind 2).
     PeerExperts* peer = nullptr;
     int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
+
+    // ================================ HET-038: GROUPED INDEPENDENT-BATCH DISPATCH ================================
+    //
+    // The window's staged rows are independent requests' rows (one per slot, or a request's short
+    // verification span as consecutive rows).  `expert_pool_dispatch_multi` derives each request's span with
+    // `analyze_expert_groups` before anything is claimed, so every row's ownership identity is validated
+    // (a window the scatter could not be audited for is refused, fail-closed) and the group's formation is
+    // bounded before any worker is submitted.  Only packed active rows are seen here: inert descriptor
+    // padding is compacted away by the verifier before the pool call, so nothing below counts padding.
+    //
+    // The counters are cumulative like `multi_misses`; the driver reports deltas, it does not reset them.
+    // Reuse, launch savings and payload volume are measured separately, never inferred from batch size:
+    // reuse counts routed entries that shared one distinct expert's launch (CPU tier; the VRAM tier's is
+    // `cache_hits`), launch savings count the per-request dispatches a merged window replaced (spans - 1),
+    // and payload counts the bytes the grouped path itself moved (blob reads, quantized input, CPU result
+    // rows, PCIe staging).  Helper cost is explicit: the submission's own cost and the worker queue+service
+    // wall from submission to completion, timed by the dispatch thread in both the contract and legacy arms.
+    ExpertGroupSpan group_spans[8];    ///< the window's request spans, rebuilt every dispatch call
+    int32_t group_span_count = 0;      ///< spans found in the current window (0 before the first call)
+    int64_t group_windows = 0;         ///< dispatched windows that merged more than one request span
+    int64_t group_launches_avoided = 0;///< over merged windows: per-request dispatches the grouping replaced
+    int64_t group_reuse_entries = 0;   ///< CPU-tier routed entries that reused a distinct expert's launch
+    uint64_t group_cpu_jobs = 0;       ///< distinct CPU expert jobs formed; success records follow completed dispatch
+    int64_t group_payload_bytes = 0;   ///< blob + quantized input + CPU result rows + PCIe staging bytes
+    uint64_t group_formation_us = 0;   ///< the bounded span/ownership analysis, measured
+    uint64_t group_fallback_windows = 0; ///< windows whose merged bounds were exceeded: per-span CPU jobs
+    uint64_t helper_submit_us = 0;     ///< worker submission cost, dispatch thread, both arms
+    uint64_t helper_busy_us = 0;       ///< worker queue+service wall, submission to completion, both arms
+    uint64_t helper_submissions = 0;   ///< timed worker submissions
+
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.

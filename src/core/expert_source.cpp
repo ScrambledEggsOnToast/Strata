@@ -2537,7 +2537,8 @@ static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify wi
 // Completion preserves the pool's existing epoch/claim/park protocol and arithmetic.
 class CpuExpertWorker final : public ExpertWorker {
 public:
-    CpuExpertWorker(ExpertDispatch& dispatch, int jobs) : dispatch_(dispatch), jobs_(jobs) {}
+    CpuExpertWorker(ExpertDispatch& dispatch, int jobs, int base = 0)
+        : dispatch_(dispatch), jobs_(jobs), base_(base) {}
     bool begin(const ExpertWork& work, std::string& error) override {
         if (active_ || work.operation.token_count < 0 || work.operation.token_count > strata::kernels::cpu::MAXT) {
             error = "CPU expert operation is already active or exceeds its window";
@@ -2549,8 +2550,9 @@ public:
         const auto& layout = strata::kernels::cpu::expert_layout();
         if (jobs_ > 0) {
             if (layout.native)
-                dispatch_.pool->run_split_multi_native(layout.fmt[(size_t) work.operation.layer], dispatch_.jobs_multi.data(), jobs_);
-            else dispatch_.pool->run_split_multi(dispatch_.jobs_multi.data(), jobs_);
+                dispatch_.pool->run_split_multi_native(layout.fmt[(size_t) work.operation.layer],
+                                                       dispatch_.jobs_multi.data() + base_, jobs_);
+            else dispatch_.pool->run_split_multi(dispatch_.jobs_multi.data() + base_, jobs_);
         }
         return true;
     }
@@ -2560,6 +2562,7 @@ public:
 private:
     ExpertDispatch& dispatch_;
     int jobs_;
+    int base_ = 0;
     const int32_t* assigned_ = nullptr;
     int64_t rows_ = 0;
     bool active_ = false;
@@ -2594,6 +2597,40 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             d.failed = true; d.fail = "a routed expert id is out of range";
             d.fail_layer = d.layers; d.fail_expert = ids[i]; return;
         }
+    }
+    // ---- HET-038: the window's rows are independent requests' rows.  Derive and validate each request's
+    // verification span before anything is claimed or submitted: a window whose ownership identity could not
+    // be audited end to end is refused here, fail-closed, exactly like a wrong-range expert id.  Only packed
+    // active rows are seen (inert descriptor padding never reaches the pool), so every group counter below
+    // counts executed work and nothing else.
+    //
+    // STRATA_EXPERT_GROUPING=0 is the paired-qualification opt-out: the window still validates identity and
+    // still runs as one dispatch call (the GPU plan, helper submission and ledger are whole-window), but the
+    // CPU jobs are formed, claimed and run per request exactly as separate execution forms them - no
+    // cross-request expert launch, no cross-request reuse.  The opt-out never weakens the identity checks.
+    static const bool grouping_enabled = [] {
+        const char* v = std::getenv("STRATA_EXPERT_GROUPING");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const char* group_error = nullptr;
+    d.group_span_count = 0;
+    const auto g0 = std::chrono::steady_clock::now();
+    const ExpertGroupPlan group_plan_raw =
+        analyze_expert_groups(d.positions, d.request_slots, d.worker_requests, n_tok, k,
+                              {MAXT, kMaxWindowEntries, MAXT, 8}, d.group_spans, d.group_span_count,
+                              group_error);
+    d.group_formation_us +=
+        (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g0).count();
+    if (group_plan_raw == ExpertGroupPlan::refused) {
+        d.failed = true; d.fail = group_error; d.fail_layer = d.layers; return;
+    }
+    const bool group_merged = grouping_enabled && group_plan_raw == ExpertGroupPlan::merged &&
+                              d.group_span_count > 1;
+    const bool group_fallback = !group_merged && d.group_span_count > 1;   // per-span independent jobs
+    if (group_merged) {
+        ++d.group_windows;
+        d.group_launches_avoided += d.group_span_count - 1;   // derived, labeled as such: the per-request
+                                                              // dispatches this window's spans replaced
     }
     if (d.worker_contract) {
         // This group's next-layer doorbell follows its own previous consumer.
@@ -2761,6 +2798,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         else if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        d.group_payload_bytes += (uint64_t) fetches * bb;   // HET-038: the staged share's bytes, measured
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -2788,6 +2826,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
+    // HET-038: the workers' cost is explicit.  `helper_submit_us` is the submission's own cost;
+    // `helper_busy_us` is the queue+service wall from submission to completion as the dispatch thread sees
+    // it (the CPU pool's work overlaps it; the two are reported separately, never added together).
+    const auto helper_t0 = std::chrono::steady_clock::now();
     if (!d.workers.empty()) {
         static thread_local std::string remote_error;
         ExpertWork work;
@@ -2812,17 +2854,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         work.assigned = kind;
         work.primary_residency = d.host_res;
         if (d.worker_contract) {
-            if (!d.helper_scheduler || !d.helper_scheduler->begin(work, kind, d.completion[d.worker_group])) {
+            const auto submit_t0 = std::chrono::steady_clock::now();
+            const bool submitted = d.helper_scheduler && d.helper_scheduler->begin(work, kind, d.completion[d.worker_group]);
+            d.helper_submit_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - submit_t0).count();
+            if (!submitted) {
                 d.completion[d.worker_group].fail();
                 d.failed = true;
                 d.fail = d.helper_scheduler ? d.helper_scheduler->error().c_str() : "helper scheduler not initialized";
                 d.fail_layer = d.layers; return;
             }
+            ++d.helper_submissions;
         } else {
             for (auto* worker : d.remote) {
-                if (!worker->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                const auto submit_t0 = std::chrono::steady_clock::now();
+                const bool launched = worker->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error);
+                d.helper_submit_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - submit_t0).count();
+                if (!launched) {
                     d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
                 }
+                ++d.helper_submissions;
                 for (int64_t i = 0; i < n; ++i) if (worker->owns(i)) kind[i] = 2;
             }
         }
@@ -2836,6 +2888,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     for (int64_t i = 0; i < n; ++i)
         if (kind[i] < 0) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
+    int64_t quant_rows = 0;
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.optimized_remote;
@@ -2847,7 +2900,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
             else
                 act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            ++quant_rows;
         }
+        d.group_payload_bytes += (uint64_t) quant_rows * (uint64_t) H * sizeof(float);   // HET-038: the
+        // activations the CPU tier consumed, measured, not inferred from the window's row count
     }
     const auto c2 = std::chrono::steady_clock::now();
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
@@ -2860,90 +2916,159 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
-                if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0 || d.jobs_multi[(size_t) jo].nt == MAXT) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
+    // HET-038: the CPU jobs are formed over the window's staged rows.  Merged: one formation groups every
+    // row routed to a distinct expert into that expert's one launch (the reuse the group reports).  Fallback
+    // (merged bounds exceeded, or STRATA_EXPERT_GROUPING=0 with several requests): each request span's jobs
+    // are formed, claimed and run on their own, straight after their formation, inside the same window
+    // ownership envelope - the GPU plan, helper submission and ledger stay whole-window, so unsupported
+    // shapes fall back to independent per-request jobs without a second plan publication and without
+    // touching another request's rows.  Arithmetic per row is the solo window's either way: a span's jobs
+    // are exactly what separate execution forms for that request.
+    const bool per_span_jobs = group_fallback;
+    if (per_span_jobs) ++d.group_fallback_windows;
+    double cpu_run_ms = 0;
+    const int job_groups = per_span_jobs ? d.group_span_count : 1;
+    for (int gsp = 0; gsp < job_groups; ++gsp) {
+        const int64_t ta = per_span_jobs ? d.group_spans[gsp].first_row : 0;
+        const int64_t te = per_span_jobs ? ta + d.group_spans[gsp].rows : n_tok;
+        const int jobs_at_group_start = njobs;
+        int64_t span_entries = 0;
+        for (int64_t t = ta; t < te; ++t)
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t i = t * k + j;
+                const int64_t e = ids[i];
+                float* row = out + (size_t) i * H;
+                if (e < 0 || e >= d.n_expert) {
                     d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
+                    d.fail = "a routed expert id is out of range";
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
-                    ++d.missing;
-                    if (d.worker_contract) drain_failed_workers(d);
                     return;
                 }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
+                if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+                    if (kind[i] == 0) ++d.cache_hits;
+                    else ++d.offload_entries;                       // #588: PCIe or another GPU
+                    if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+                    // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
+                    // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
+                    if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                          (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                        std::memset(row, 0, (size_t) H * sizeof(float));
+                    continue;
+                }
+                ++d.cache_refused;
+                int16_t& jo = d.job_of[(size_t) e];
+                if (jo < 0 || d.jobs_multi[(size_t) jo].nt == MAXT) {
+                    const uint8_t* b = d.src->blob(d.layers, e);
+                    if (b == nullptr) {
+                        d.failed = true;
+                        d.fail = "the expert source could not produce a blob";
+                        d.fail_layer = d.layers;
+                        d.fail_expert = e;
+                        ++d.missing;
+                        if (d.worker_contract) drain_failed_workers(d);
+                        return;
+                    }
+                    d.group_payload_bytes += lay.blob_bytes(d.layers);   // HET-038: the bytes this launch reads
+                    jo = (int16_t) njobs++;
+                    ++d.group_cpu_jobs;
+                    ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                    nj.blob = b;
+                    nj.nt = 0;
+                }
+                ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+                jb.act[jb.nt] = &d.act_multi[(size_t) t];
+                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                jb.out[jb.nt] = row;
+                ++jb.nt;
+                ++d.multi_entries;
+                ++span_entries;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
-            ++d.multi_entries;
+        // HET-038: reuse measured at formation - the entries this formation group served beyond its distinct
+        // launches.  The merged window's grouping is the only thing that produces it; the fallback reports
+        // the (near-zero) reuse independent execution actually got.
+        d.group_reuse_entries += span_entries - (njobs - jobs_at_group_start);
+        d.group_payload_bytes += (uint64_t) span_entries * (uint64_t) H * sizeof(float);   // result rows
+        // CPU ownership claims for exactly this formation group's rows, before any of its runs.
+        if (d.worker_contract)
+            for (int64_t i = ta * k; i < te * k; ++i) if (kind[i] < 0 &&
+                !d.completion[d.worker_group].claim((size_t) i, 1, 1)) {
+                drain_failed_workers(d);
+                d.failed = true; d.fail = "CPU expert row has conflicting ownership"; return;
+            }
+        // Fallback: this request's jobs run on their own, right after their formation.
+        if (per_span_jobs && njobs > jobs_at_group_start) {
+            const auto r0 = std::chrono::steady_clock::now();
+            if (d.worker_contract) {
+                CpuExpertWorker cpu(d, njobs - jobs_at_group_start, jobs_at_group_start);
+                ExpertWork work;
+                work.operation = d.operation[d.worker_group];
+                work.weights.handle = d.src;
+                work.weights.model_generation = 1;
+                work.weights.residency_version = 1;
+                work.weights.input_width = H;
+                work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
+                if (native) {
+                    work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
+                    work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
+                }
+                work.input = x_f;
+                work.experts = ids;
+                work.positions = d.positions;
+                work.request_slots = d.request_slots;
+                work.request_ids = d.worker_requests;
+                work.routed_width = k;
+                work.assigned = kind;
+                std::string error;
+                if (!cpu.begin(work, error) || !cpu.finish(out, error)) {
+                    drain_failed_workers(d);
+                    d.failed = true; d.fail = "CPU expert worker failed"; return;
+                }
+            } else {
+                if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers],
+                                                           d.jobs_multi.data() + jobs_at_group_start,
+                                                           njobs - jobs_at_group_start);
+                else d.pool->run_split_multi(d.jobs_multi.data() + jobs_at_group_start,
+                                             njobs - jobs_at_group_start);
+            }
+            const auto r1 = std::chrono::steady_clock::now();
+            cpu_run_ms += std::chrono::duration<double, std::milli>(r1 - r0).count();
+            // The next span forms its own jobs even for the same experts: independent per-request jobs.
+            for (int64_t i = ta * k; i < te * k; ++i) d.job_of[(size_t) ids[i]] = -1;
         }
-    if (d.worker_contract)
-        for (int64_t i = 0; i < n; ++i) if (kind[i] < 0 &&
-            !d.completion[d.worker_group].claim((size_t) i, 1, 1)) {
-            drain_failed_workers(d);
-            d.failed = true; d.fail = "CPU expert row has conflicting ownership"; return;
-        }
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (d.worker_contract) {
-        CpuExpertWorker cpu(d, njobs);
-        ExpertWork work;
-        work.operation = d.operation[d.worker_group];
-        work.weights.handle = d.src;
-        work.weights.model_generation = 1;
-        work.weights.residency_version = 1;
-        work.weights.input_width = H;
-        work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
-        if (native) {
-            work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
-            work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
+    if (!per_span_jobs) {                    // merged: one launch over the whole window's jobs
+        if (d.worker_contract) {
+            CpuExpertWorker cpu(d, njobs);
+            ExpertWork work;
+            work.operation = d.operation[d.worker_group];
+            work.weights.handle = d.src;
+            work.weights.model_generation = 1;
+            work.weights.residency_version = 1;
+            work.weights.input_width = H;
+            work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
+            if (native) {
+                work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
+                work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
+            }
+            work.input = x_f;
+            work.experts = ids;
+            work.positions = d.positions;
+            work.request_slots = d.request_slots;
+            work.request_ids = d.worker_requests;
+            work.routed_width = k;
+            work.assigned = kind;
+            std::string error;
+            if (!cpu.begin(work, error) || !cpu.finish(out, error)) {
+                drain_failed_workers(d);
+                d.failed = true; d.fail = "CPU expert worker failed"; return;
+            }
+        } else if (njobs > 0) {
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
         }
-        work.input = x_f;
-        work.experts = ids;
-        work.positions = d.positions;
-        work.request_slots = d.request_slots;
-        work.request_ids = d.worker_requests;
-        work.routed_width = k;
-        work.assigned = kind;
-        std::string error;
-        if (!cpu.begin(work, error) || !cpu.finish(out, error)) {
-            drain_failed_workers(d);
-            d.failed = true; d.fail = "CPU expert worker failed"; return;
-        }
-    } else if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
     if (d.worker_contract && d.completion[d.worker_group].has_owner(1) && !d.completion[d.worker_group].complete(d.operation[d.worker_group], 1, 1)) {
         drain_failed_workers(d); d.failed = true; d.fail = "stale CPU expert completion"; return;
@@ -2951,14 +3076,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.workers.empty()) {
         if (d.worker_contract) {
             if (!d.helper_scheduler->finish(out)) {
+                d.helper_busy_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - helper_t0).count();
                 d.failed = true; d.fail = d.helper_scheduler->error().c_str(); d.fail_layer = d.layers; return;
             }
+            d.helper_busy_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - helper_t0).count();
         } else {
             static thread_local std::string remote_error;
+            bool remote_ok = true;
             for (auto* worker : d.remote)
                 if (!worker->finish(out, remote_error)) {
-                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers;
+                    remote_ok = false;
+                    break;
                 }
+            d.helper_busy_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - helper_t0).count();
+            if (!remote_ok) return;
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
@@ -2979,14 +3114,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
-    d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c3, c4);
+    d.ms_jobs += ms(c2, c3) - cpu_run_ms;   // the fallback's runs are timed where they happen, not here
+    d.ms_run += ms(c3, c4) + cpu_run_ms;
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;
     ++d.layers;
+    static const bool group_diagnostics = std::getenv("STRATA_BATCH_DIAGNOSTICS") != nullptr;
+    if (group_diagnostics)
+        std::fprintf(stderr, "EXPERT_GROUP_TOTAL layer=%lld requests=%d merged_windows=%lld "
+                             "cpu_jobs=%llu reuse_entries=%lld logical_payload_bytes=%lld "
+                             "dispatch_formations_avoided_derived=%lld formation_us=%llu "
+                             "fallback_windows=%llu helper_submit_us=%llu helper_queue_service_us=%llu helper_submissions=%llu\n",
+                     (long long) d.layers - 1, d.group_span_count, (long long) d.group_windows,
+                     (unsigned long long) d.group_cpu_jobs, (long long) d.group_reuse_entries,
+                     (long long) d.group_payload_bytes, (long long) d.group_launches_avoided,
+                     (unsigned long long) d.group_formation_us, (unsigned long long) d.group_fallback_windows,
+                     (unsigned long long) d.helper_submit_us, (unsigned long long) d.helper_busy_us,
+                     (unsigned long long) d.helper_submissions);
     d.experts += n_tok * k;
 }
 

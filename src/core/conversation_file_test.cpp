@@ -92,9 +92,9 @@ SavedConversation sample() {
     return s;
 }
 
-// format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878535;
-constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+// format golden: v2 froze the byte layout; the fixed sample's structural fields are checked exactly and the
+// format's determinism is checked by writing twice.  v1 (64-byte header, no namespace fields) is exercised by
+// rebuilding a v1 header over a written file's payload: it must read under a zero namespace only.
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
@@ -163,22 +163,71 @@ int main() {
     check(session_file_write(good.string(), original, id, written, error), "write succeeds");
     check(error.empty(), "write leaves no error");
 
-    // golden: format v1 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
-    // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
+    // golden: format v2 is frozen. The fixed sample must give these exact header fields (little-endian at
+    // fixed offsets, the header hash over exactly the header's own bytes, and the payload length the size
+    // implies); the whole-file bytes are pinned by the deterministic-write checks below.
     {
         const std::vector<char> g = slurp(good);
         auto u32 = [&](size_t o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         auto u64 = [&](size_t o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
-        check(g.size() >= 80 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
-        check(u32(8) == 1 && u32(12) == 64, "golden: version 1, header 64 bytes (little-endian)");
+        check(g.size() >= 96 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
+        check(u32(8) == 2 && u32(12) == 80, "golden: version 2, header 80 bytes (little-endian)");
         check(u64(16) == id.model && u64(24) == id.config, "golden: fingerprints at offsets 16 and 24");
-        check(u64(32) == g.size() - 64 - 16, "golden: payload length at offset 32");
-        check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
+        check(u64(32) == 0 && u64(40) == 0 && u64(48) == 0,
+              "golden: namespace fields at 32/40/48 (this file binds none)");
+        check(u64(56) == g.size() - 80 - 16, "golden: payload length at offset 56");
+        check(u64(64) == 0, "golden: reserved field is zero");
+        check(u64(72) == session_hash64((const uint8_t*) g.data(), 72, 0), "golden: header hash covers bytes 0..71");
         check(std::memcmp(g.data() + g.size() - 8, "STRSEND\x01", 8) == 0, "golden: end marker");
-        const uint64_t h = session_hash64(g.data(), g.size(), 0);
         const char* golden = std::getenv("STRATA_SESSION_GOLDEN_PRINT");
-        if (golden) std::printf("golden size %zu hash %016llx\n", g.size(), (unsigned long long)h);
-        check(g.size() == kGoldenSize && h == kGoldenHash, "golden: the fixed sample's file bytes are unchanged");
+        if (golden)
+            std::printf("golden size %zu payload %llu\n", g.size(),
+                        (unsigned long long) (g.size() - 80 - 16));
+    }
+    // namespace binding (HET-042): the identity in the header is matched exactly
+    {
+        const SessionFileIdentity named{0x1111222233334444ull, 0x5555666677778888ull, 0xfeedull, 7, 9};
+        const fs::path mine = dir / "mine.bin";
+        check(session_file_write(mine.string(), original, named, written, error), "write binds a namespace");
+        {
+            SavedConversation back;
+            size_t read = 0;
+            check(session_file_read(mine.string(), named, back, read, error), "the owner's namespace reads it");
+            check(same(original, back), "owner's round trip is identical");
+        }
+        check(rejects(mine, {named.model, named.config, named.frontend, 8, 9}, "namespace"),
+              "another tenant's namespace is refused, not re-stamped");
+        check(rejects(mine, {named.model, named.config, named.frontend ^ 1, 7, 9}, "namespace"),
+              "another frontend is refused");
+        check(rejects(mine, {named.model, named.config}, "namespace"),
+              "no namespace at all cannot mount a bound file");
+        // v1 compat: a v1 header (64 bytes, no namespace fields) over the same payload reads under a zero
+        // namespace only - it can never authorize a namespace-scoped mount.
+        const std::vector<char> g = slurp(mine);
+        std::vector<char> v1(64);
+        std::memcpy(v1.data(), g.data(), 16);                     // magic, version field patched below
+        const uint32_t v1_version = 1, v1_hsize = 64;
+        std::memcpy(v1.data() + 8, &v1_version, 4);
+        std::memcpy(v1.data() + 12, &v1_hsize, 4);
+        const uint64_t payload_len = g.size() - 80 - 16;
+        std::memcpy(v1.data() + 16, &named.model, 8);
+        std::memcpy(v1.data() + 24, &named.config, 8);
+        std::memcpy(v1.data() + 32, &payload_len, 8);             // v1: payload at 32, two reserved words
+        const uint64_t v1_hash = session_hash64((const uint8_t*) v1.data(), 56, 0);
+        std::memcpy(v1.data() + 56, &v1_hash, 8);
+        std::vector<char> legacy = v1;
+        legacy.insert(legacy.end(), g.begin() + 80, g.end() - 16);   // the payload, unchanged
+        legacy.insert(legacy.end(), g.end() - 16, g.end());          // trailer: payload hash + end marker
+        const fs::path oldf = dir / "v1.bin";
+        spit(oldf, legacy);
+        check(rejects(oldf, named, "namespace binding"), "a v1 file never authorizes a namespace-scoped mount");
+        {
+            SavedConversation back;
+            size_t read = 0;
+            check(session_file_read(oldf.string(), {named.model, named.config}, back, read, error),
+                  "a v1 file still reads under no namespace");
+            check(same(original, back), "v1 round trip is identical");
+        }
     }
     check(written == fs::file_size(good), "write reports the file size");
     check(no_temp(dir), "no temporary left behind");
@@ -243,20 +292,20 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
-        const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+        const uint64_t h = session_hash64((const uint8_t*) d.data(), 72, 0); std::memcpy(d.data() + 72, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
     }
     // a corrupted element count with a recomputed payload hash must fail on bounds, not allocate
     {
         auto d = image;
-        // payload starts at 64: geometry 18*8, layer_lo, layer_hi, cvec = 21*8 bytes, then live.ids count
-        const size_t at = 64 + 21 * 8;
+        // payload starts at 80: geometry 18*8, layer_lo, layer_hi, cvec = 21*8 bytes, then live.ids count
+        const size_t at = 80 + 21 * 8;
         uint64_t huge = 0x0fffffffffffffffull; std::memcpy(d.data() + at, &huge, 8);
-        uint64_t payload = 0; std::memcpy(&payload, d.data() + 32, 8);
-        const uint64_t h = session_hash64(d.data() + 64, payload, 0);
-        std::memcpy(d.data() + 64 + payload, &h, 8);
+        uint64_t payload = 0; std::memcpy(&payload, d.data() + 56, 8);
+        const uint64_t h = session_hash64(d.data() + 80, payload, 0);
+        std::memcpy(d.data() + 80 + payload, &h, 8);
         const fs::path p = dir / "count.bin"; spit(p, d);
         check(rejects(p, id, "count"), "oversized count rejected before allocation");
     }
@@ -307,6 +356,14 @@ int main() {
         fs::copy_file(m1, moved / "m1.bin"); fs::copy_file(m2, moved / "m2.bin");
         const std::vector<SessionModelFile> moved_list = {{"a", (moved / "m1.bin").string()}, {"b", (moved / "m2.bin").string()}};
         check(session_model_fingerprint(moved_list, f6, error) && f6 == f1, "fingerprint does not follow the folder");
+        auto middle = slurp(m1);
+        middle[middle.size() / 2] = 'z';
+        spit(m1, middle);
+        uint64_t middle_fp = 0;
+        check(session_model_fingerprint(both, middle_fp, error) && middle_fp != f1,
+              "same-size middle model edits invalidate saved state");
+        middle[middle.size() / 2] = 'a';
+        spit(m1, middle);
         // an optional input that is absent is recorded, not an error; a present one changes the fingerprint
         const std::vector<SessionModelFile> absent = {{"a", m1.string()}, {"b", m2.string()}, {"c", (dir / "nothere").string(), true}};
         const std::vector<SessionModelFile> present = {{"a", m1.string()}, {"b", m2.string()}, {"c", m2.string(), true}};
@@ -502,13 +559,13 @@ int main() {
         // a huge count in a state array with a recomputed hash: refused by the bound, nothing allocated
         auto d = image;
         // live: ids count (8) + 1000*4, imgs count (8) + 1*16, then the gdn byte count
-        const size_t at = 64 + 21 * 8 + 8 + 1000 * 4 + 8 + 16;
+        const size_t at = 80 + 21 * 8 + 8 + 1000 * 4 + 8 + 16;
         uint64_t was = 0; std::memcpy(&was, d.data() + at, 8);
         check(was == 4099, "limits: test offset finds the GDN count");
         uint64_t huge = 3ull << 30; std::memcpy(d.data() + at, &huge, 8);
-        uint64_t payload = 0; std::memcpy(&payload, d.data() + 32, 8);
-        const uint64_t h = session_hash64(d.data() + 64, payload, 0);
-        std::memcpy(d.data() + 64 + payload, &h, 8);
+        uint64_t payload = 0; std::memcpy(&payload, d.data() + 56, 8);
+        const uint64_t h = session_hash64(d.data() + 80, payload, 0);
+        std::memcpy(d.data() + 80 + payload, &h, 8);
         const fs::path p = dir / "bigstate.bin"; spit(p, d);
         check(rejects(p, id, nullptr, exact()), "limits: an oversized state count refused before allocation");
         // status kinds of a read

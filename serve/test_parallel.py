@@ -268,10 +268,9 @@ class ParallelService(unittest.TestCase):
         with urllib.request.urlopen(self.base + path, timeout=10) as r:
             return json.loads(r.read().decode())
 
-    def test_engine_reports_fewer_slots(self):
-        self.start(4, fit=2)
-        self.assertEqual(self.engine.batch, 2)
-        self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+    def test_requested_capacity_is_refused_when_only_fewer_slots_fit(self):
+        with self.assertRaisesRegex(RuntimeError, "requested.*4.*effective.*2"):
+            self.start(4, fit=2)
 
     def test_multiplex_requires_native_acknowledgement(self):
         self.start(2)
@@ -328,10 +327,9 @@ class ParallelService(unittest.TestCase):
         self.assertEqual((c["message"]["content"], c["finish_reason"]), ("ok, ", "stop"))
         self.assertEqual(self.chat("again")["choices"][0]["message"]["content"], "ok, done.")
 
-    def test_engine_turns_batching_off(self):
-        self.start(4, fit=0)
-        self.assertEqual(self.engine.batch, 0)
-        self.assertEqual(self.chat("hi")["choices"][0]["message"]["content"], "ok, done.")
+    def test_requested_batching_is_refused_when_no_slots_fit(self):
+        with self.assertRaisesRegex(RuntimeError, "requested.*4.*effective.*0"):
+            self.start(4, fit=0)
 
     def test_concurrent_requests_share_the_slots(self):
         self.start(2)

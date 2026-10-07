@@ -34,6 +34,7 @@ import os
 import queue
 import re
 import select
+import secrets
 import signal
 import socket
 import struct
@@ -596,6 +597,8 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []
             self.control_waiters = collections.deque()
             self.ctl_epoch = 0
+            self.control_foreground = 0
+            self.foreground_burst = 3
             self.ctl = threading.Lock()
         self.wlock = threading.Lock()
         try:                            # a ready-made engine's BUILD.json says its version
@@ -664,16 +667,16 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
-        # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
+        # Requested concurrency is a contract, not permission to silently reduce capacity.
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if self.resident_multiplex and (self.batch < 2 or self.info.get("resident_multiplex") != 1):
             self.close()
             raise RuntimeError("resident_multiplex requires at least two effective slots and INFO resident_multiplex=1")
         if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
-                  "(its log says why)", flush=True)
+            self.close()
+            raise RuntimeError(f"requested batch capacity {asked}, effective capacity {self.batch}; "
+                               "choose an admitted smaller profile explicitly")
         groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
@@ -684,6 +687,9 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        # #42: each slot's cached conversation belongs to one principal (see pick_slot); the engine only ever
+        # gives a slot's held prefix back to a request with the same namespace
+        self.slot_tenant: list[str | None] = [None] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         self.gen = self.__dict__.get("gen", 0) + 1
@@ -927,6 +933,7 @@ class StrataEngine:
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
         stopped = False
+        rejection = None
         born, lines = getattr(self, "gen", None), self.lines
         while True:
             if born is not None and self.gen != born:
@@ -972,11 +979,17 @@ class StrataEngine:
             elif line.startswith("BADM "):
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                if rejection is not None:
+                    if f[2:] != ["0"]:
+                        raise self._silent("refused admission unexpectedly continued")
+                    raise AdmissionError(rejection)
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
+            elif line.startswith("REJECT bounded=1 ") and self._ctl_mode == "batch":
+                rejection = line[len("REJECT bounded=1 "):].strip()
             elif line.startswith(("ERR", "REJECT")):
                 # Refusals have no BADM boundary. Poison rather than assign an ambiguous pipe to another owner.
                 raise self._silent("engine admission refused: " + line.strip())
@@ -1049,9 +1062,9 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, on_control=None):
-        """FIFO control ownership; a yielded chunk read rejoins behind already-waiting requests."""
-        entry = [plen, object()]
+    def _take_control(self, cancel, plen: int, on_control=None, priority="foreground"):
+        """Priority FIFO with a finite foreground burst; yielded reads rejoin the queue."""
+        entry = [plen, object(), priority]
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1068,11 +1081,16 @@ class StrataEngine:
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
-                    turn = self.control_waiters[0] is entry and not getattr(self, "starting", False)
+                    foreground = next((e for e in self.control_waiters if e[2] == "foreground"), None)
+                    background = next((e for e in self.control_waiters if e[2] == "background"), None)
+                    chosen = background if background is not None and (
+                        foreground is None or self.control_foreground >= self.foreground_burst) else foreground
+                    turn = chosen is entry and not getattr(self, "starting", False)
                     if cancel.is_set():
                         return False
                     if turn and self.ctl.acquire(blocking=False):
                         if self.alive():
+                            self.control_foreground = self.control_foreground + 1 if priority == "foreground" else 0
                             break
                         self.ctl.release()
                     self.slot_cv.wait(timeout=0.5)
@@ -1108,10 +1126,11 @@ class StrataEngine:
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
-    def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+    def _shorter_waiting(self, plen: int, priority="foreground") -> bool:
+        """Yield background prefill to foreground arrivals, or any read to a much shorter prompt."""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            return any(e[0] * 2 <= plen or (priority == "background" and e[2] == "foreground")
+                       for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -1129,11 +1148,21 @@ class StrataEngine:
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
         keys = self.sampling_keys(sampling or {})
+        # #42 cache identity, server-derived (never client text): run() writes this key AFTER the request's own
+        # values are merged, so a client cannot name a namespace.  With both parts present the two keys ride
+        # every GEN/BGEN head; anything else sends none - the engine then offers this request no cached state
+        # (default-deny; recompute is the safe fallback).
+        cache_id = (sampling or {}).get("_strata_cache")
+        tenant = cache_id[0] if isinstance(cache_id, tuple) and len(cache_id) == 2 and isinstance(cache_id[0], str) \
+            and cache_id[0] else None
+        frontend = cache_id[1] if isinstance(cache_id, tuple) and len(cache_id) == 2 and isinstance(cache_id[1], str) \
+            and cache_id[1] else None
+        idkeys = f" tenant={tenant} frontend={frontend}" if tenant and frontend else ""
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
         on_control = (sampling or {}).get("_strata_control_ready")
-        ok = yield from self._take_control(cancel, len(prompt), on_control)
+        ok = yield from self._take_control(cancel, len(prompt), on_control, priority)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1147,7 +1176,7 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt), on_control)
+                    ok = yield from self._take_control(cancel, len(prompt), on_control, priority)
                     if not ok:
                         return
                     holding = True
@@ -1156,7 +1185,7 @@ class StrataEngine:
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1 and not getattr(self, "resident_multiplex", False):
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    head = f"GENI {left}{keys}{idkeys} {embeddings}" if embeddings else f"GEN {left}{keys}{idkeys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1170,11 +1199,12 @@ class StrataEngine:
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
                             if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                                    self._shorter_waiting(len(prompt), priority)):
                                 with self.slot_cv:          # the slot the part read will wait in
-                                    reserved = self.pick_slot(prompt)
+                                    reserved = self.pick_slot(prompt, tenant)
                                     if reserved is not None:
                                         self.slot_busy[reserved] = True
+                                        self.slot_tenant[reserved] = tenant
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
@@ -1204,9 +1234,10 @@ class StrataEngine:
                             while True:
                                 if self.gen != born or not self.alive():
                                     raise EngineDied("the engine stopped while waiting for a batch slot")
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, tenant)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
+                                    self.slot_tenant[slot] = tenant
                                     break
                                 self.slot_cv.wait(timeout=10.0)
                                 if cancel.is_set():
@@ -1218,7 +1249,7 @@ class StrataEngine:
                         yields += 1
                         self.ctl.release()
                         holding = False
-                        ok = yield from self._take_control(cancel, len(prompt), on_control)
+                        ok = yield from self._take_control(cancel, len(prompt), on_control, priority)
                         if not ok:
                             return
                         holding = True
@@ -1228,7 +1259,8 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     if getattr(self, "resident_multiplex", False):
                         self._send(f"BPRIORITY {slot} {(sampling or {}).get('strata_priority', 'foreground')}")
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    head = f"BGENI {slot} {left}{keys}{idkeys} {embeddings}" if embeddings else \
+                        f"BGEN {slot} {left}{keys}{idkeys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -1247,7 +1279,7 @@ class StrataEngine:
                             yield t
                         if x is None:
                             if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                                    self._shorter_waiting(len(prompt), priority)):
                                 self._send(f"BYIELD {slot}")
                                 asked = True
                             yield None
@@ -1330,6 +1362,8 @@ class StrataEngine:
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
+                if phase == "admit" and self._ctl_result == ("badm", False):
+                    phase = "none"  # A bounded refusal already drained its own boundary.
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
@@ -1364,14 +1398,20 @@ class StrataEngine:
                         slot_busy[slot] = False
                         self.slot_cv.notify_all()
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], tenant: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        conversations other slots hold stay for their next turns.  None: every slot is busy.
+        #42: a slot's held prefix is offered only to its own principal - another tenant (or an unidentified
+        request) may take the slot over, but never continues its conversation; the engine re-checks this."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
         def held_prefix(b):
+            # No tenant (an unidentified request): nothing held is offered, not even a slot whose holder was
+            # unidentified too - the engine denies it natively; the server does not even pick it for reuse.
+            if tenant is None or self.slot_tenant[b] != tenant:
+                return 0                    # another principal's conversation: no prefix of it is reusable
             h = self.slot_held[b]
             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
         best = max(free, key=held_prefix)
@@ -1404,9 +1444,14 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # #42: the same server-derived cache identity the batched heads carry (see generate_batched).
+        cache_id = (sampling or {}).get("_strata_cache")
+        solo_id = cache_id if isinstance(cache_id, tuple) and len(cache_id) == 2 and \
+            isinstance(cache_id[0], str) and cache_id[0] and isinstance(cache_id[1], str) and cache_id[1] else None
+        idkeys = f" tenant={solo_id[0]} frontend={solo_id[1]}" if solo_id else ""
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})}{idkeys} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}{idkeys}"
         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
         born, lines = getattr(self, "gen", None), self.lines
         done = False
@@ -1523,8 +1568,12 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, tenant: str | None = None, frontend: str | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+        #42: a restore carries the request's cache identity as a strict suffix (` tenant=<32 hex>
+        frontend=<16 hex>`, server-derived like the GEN/BGEN keys): the engine binds the mounted session to
+        exactly that namespace and refuses a file saved by another principal, instead of re-stamping the caller
+        onto it.  A restore without both (an unidentified request) mounts nothing the cache can reuse.
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
@@ -1537,7 +1586,8 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
-        self._send(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}")
+        suffix = f" tenant={tenant} frontend={frontend}" if action == "restore" and tenant and frontend else ""
+        self._send(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}{suffix}")
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = "SAVED" if action == "save" else "RESTORED"
@@ -2242,6 +2292,17 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # #42 cache identity: which principal's state may be reused.  `auth_local.principal` is the request's
+        # namespace - a salted digest of the API key it authenticated with (or the one anonymous namespace when
+        # no key is required, the documented single-user trust model) - stamped by _authorized on the request's
+        # own thread and cleared on every failure, never retained and never client-supplied.  The salt is per
+        # process: parked state is never reusable across a restart, by construction.  `cache_frontend` is the
+        # tokenizer/template digest computed once at startup (content, not paths): a template or tokenizer
+        # change is a restart, and the new digest selects none of the old frontend's entries.
+        self.auth_local = threading.local()
+        self.cache_salt = secrets.token_bytes(16)
+        self.anonymous_namespace = hashlib.blake2b(b"", key=self.cache_salt, digest_size=16).hexdigest()
+        self.cache_frontend = ""
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -2281,6 +2342,7 @@ class Service:
         self.admission_waiters = []
         self.admission_active = {}
         self.admission_foreground = 0
+        self.foreground_burst = 3
         self.request_queue_limit = 32
         self.request_timeout_s = 600.0
         self.request_body_bytes = 4 * 1024 * 1024
@@ -2302,6 +2364,45 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def cache_identity_tuple(self) -> tuple[str, str] | None:
+        """#42: (namespace, frontend) - this request's cached-state identity - or None to send no identity keys
+        (the engine then offers the request no cached state and it reads from the start).  The namespace exists
+        only for an authenticated request; the frontend only once startup has hashed the tokenizer/template."""
+        principal = getattr(self.auth_local, "principal", None)
+        return (principal, self.cache_frontend) if principal and self.cache_frontend else None
+
+    def compute_frontend_digest(self, tokenizer_dir) -> str:
+        """#42: the serving frontend's cache-identity digest - the RESOLVED chat template's bytes, the
+        tokenizer's actual vocab, merges and token types, and the template settings (the effort turn).  Content,
+        never paths: the same directory with different contents digests differently.  Computed once at startup:
+        the template and tokenizer are immutable while serving, and a change to any of them is a restart - the
+        fresh digest then selects none of the old frontend's cache entries (AC-3, by key equality)."""
+        h = hashlib.blake2b(digest_size=8, key=self.cache_salt)
+        h.update(b"template\x00")
+        source = getattr(self.template, "source", None)
+        if isinstance(source, str):
+            h.update(source.encode("utf-8", "replace"))
+        else:                                   # a list of the resolved script texts, or their token ids
+            for part in (source or []):
+                h.update(repr(part).encode("utf-8", "replace"))
+                h.update(b"\x00")
+        h.update(b"effort_end\x00" + (b"1" if self.effort_end else b"0"))
+        for name in ("vocab.json", "merges.txt", "token_type.json"):
+            p = Path(tokenizer_dir) / name
+            h.update(name.encode() + b"\x00")
+            try:
+                h.update(p.read_bytes())
+            except FileNotFoundError:
+                pass                            # absent file: hashed as absent, the same way on the next start
+            except OSError as e:
+                # An unreadable file that EXISTS must not silently become "absent": the digest would bind a
+                # frontend identity to partial contents.  Startup refuses instead - no cache identity is safer
+                # than a wrong one.
+                raise ValueError(f"the tokenizer's {p} exists but cannot be read ({e}); refusing to derive a "
+                                 "cache identity from partial contents") from None
+        self.cache_frontend = h.hexdigest()
+        return self.cache_frontend
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -2351,7 +2452,9 @@ class Service:
                                    else "restoring a session", started=time.time(), first_token=None,
                                    prompt_tokens=None, generated=None, max_tokens=None)
             try:
-                r = self.engine.session_file(action, path)
+                r = self.engine.session_file(action, path,
+                                             tenant=getattr(self.auth_local, "principal", None),
+                                             frontend=self.cache_frontend or None)
             except SessionRefused as e:
                 body = error(e.status, str(e))
                 body[1]["error"]["kind"] = e.kind
@@ -2397,6 +2500,12 @@ class Service:
             if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key.endswith("limit") else 1):
                 raise ValueError(f'{key} must be a nonnegative queue limit or positive byte budget')
             setattr(self, key, value)
+        value = cfg.get("foreground_burst", 3)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
+            raise ValueError("foreground_burst must be an integer in [1, 64]")
+        self.foreground_burst = value
+        if isinstance(self.engine, StrataEngine):
+            self.engine.foreground_burst = value
         value = cfg.get("request_timeout_s", 600)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 86400:
             raise ValueError("request_timeout_s must be finite and in (0, 86400]")
@@ -2452,7 +2561,8 @@ class Service:
                     raise AdmissionError("request timed out while queued", 408)
                 foreground = next((r for r in self.admission_waiters if r["priority"] == "foreground"), None)
                 background = next((r for r in self.admission_waiters if r["priority"] == "background"), None)
-                chosen = background if background is not None and (foreground is None or self.admission_foreground >= 3) else foreground
+                chosen = background if background is not None and (
+                    foreground is None or self.admission_foreground >= self.foreground_burst) else foreground
                 capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
                 if chosen is record and len(self.admission_active) < capacity:
                     self.admission_waiters.remove(record)
@@ -3090,6 +3200,11 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # #42: the request's cache identity - its authenticated principal (stamped by _authorized on this
+        # request's thread) plus the startup tokenizer/template digest - written after the merge above, so a
+        # client-supplied value can never name a namespace, and a request that did not authenticate carries no
+        # identity at all (the engine offers it no cached state).
+        sampling = {**(sampling or {}), "_strata_cache": self.cache_identity_tuple()}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
@@ -4035,11 +4150,18 @@ def make_handler(svc: Service):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
+            # The request's cache namespace is decided here, on this request's thread: a matched key digests to
+            # it, everything else (no key required: the one anonymous principal; a wrong or missing key: None,
+            # which denies every cached prefix) is set explicitly, so nothing survives from another request.
+            svc.auth_local.principal = None
             if not svc.api_key:
+                svc.auth_local.principal = svc.anonymous_namespace
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
+                svc.auth_local.principal = hashlib.blake2b(svc.api_key.encode(), key=svc.cache_salt,
+                                                           digest_size=16).hexdigest()
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -5271,6 +5393,15 @@ def main() -> int:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    # #42: the frontend's cache-identity digest - resolved template bytes, tokenizer vocab/merges/token types
+    # and the effort-turn setting - hashed once now; every request carries it, and the engine drops entries of
+    # any other frontend (so a template or tokenizer change, which is a restart, selects nothing old).
+    try:
+        svc.compute_frontend_digest(tpath)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}")
+    print(f"[strata] cache identity: frontend={svc.cache_frontend}"
+          f"{'' if svc.api_key else ' (no API key: one shared namespace)'}", flush=True)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]

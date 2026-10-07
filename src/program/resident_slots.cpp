@@ -280,6 +280,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     } else state.prompt.clear();
     state.sampling = working_.sampling;
     state.request = working_.request;
+    state.identity = input_.identity;   // the cached conversation stays this request's identity's property
     state.x = request.next_token;
     state.p = (int64_t) prefix.size();
     state.produced = parked ? 0 : 1;

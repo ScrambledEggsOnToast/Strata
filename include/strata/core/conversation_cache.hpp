@@ -14,6 +14,20 @@
 
 namespace strata::core {
 
+/// The identity an entry is parked under, matched exactly before any token
+/// comparison: the engine's model-artifact and resolved-config fingerprints
+/// (session_file.hpp: weights, rope, K/V and state format, arithmetic), the
+/// serving frontend's tokenizer/template digest, and the authorization
+/// namespace the conversation was captured for.  A zero identity never
+/// matches: state without a known owner is not reusable (default-deny).
+struct ConversationIdentity {
+    uint64_t model = 0, config = 0;
+    uint64_t frontend = 0;
+    uint64_t tenant_lo = 0, tenant_hi = 0;
+    bool operator==(const ConversationIdentity&) const = default;
+    bool known() const { return (model | config | frontend | tenant_lo | tenant_hi) != 0; }
+};
+
 struct ConversationImageKey {
     int64_t start = 0;
     uint64_t hash = 0;
@@ -146,6 +160,10 @@ struct SavedConversation {
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
     int64_t layer_lo = 0, layer_hi = 0;
+    // Who captured it (model/config/frontend/tenant): selection matches this
+    // key exactly, before tokens or geometry are considered.  Untagged (zero)
+    // images are never offered to a request.
+    ConversationIdentity identity;
     ConversationCheckpoint live;
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
@@ -164,18 +182,24 @@ struct SavedConversation {
 };
 
 template<class Token>
-int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
-                            const std::vector<ConversationImageKey>& images) {
-    const size_t n = c.ids.size();
+int64_t conversation_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                            const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images) {
+    const size_t n = ids.size();
     // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || n >= prompt.size() || !std::equal(ids.begin(), ids.end(), prompt.begin())) return 0;
     size_t j = 0;
     for (const auto& image : images) {
         if (image.start >= (int64_t) n) continue;
-        if (j == c.imgs.size() || !(c.imgs[j++] == image)) return 0;
+        if (j == imgs.size() || !(imgs[j++] == image)) return 0;
     }
-    if (j != c.imgs.size()) return 0;
+    if (j != imgs.size()) return 0;
     return (int64_t) n;
+}
+
+template<class Token>
+int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
+                            const std::vector<ConversationImageKey>& images) {
+    return conversation_prefix(c.ids, c.imgs, prompt, images);
 }
 
 class ConversationCache {
@@ -195,33 +219,63 @@ public:
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
+    // The buffers are the restored conversation's, kept for that identity only.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, const ConversationIdentity& id = {}) {
         reuse_ = {};
+        reuse_identity_ = id;
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
+        if (enabled() && id.known() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    // The retained buffers only ever describe the conversation they were
+    // restored for: another identity (the next request's) is refused and the
+    // stale buffers released.
+    ConversationKvReuse take_reuse(const ConversationIdentity& id = {}) {
+        if (!(id.known() && reuse_identity_ == id)) { reuse_ = {}; reuse_identity_ = {}; return {}; }
+        return std::exchange(reuse_, {});
+    }
     size_t retained_bytes() const { return reuse_.bytes(); }
+    // Entries whose model, config or frontend no longer matches can never be
+    // selected again (AC-3): drop them now instead of failing them at restore
+    // time.  Other tenants' entries stay: they are valid for their owners.
+    // Returns how many entries were discarded.
+    size_t invalidate_except(const ConversationIdentity& keep) {
+        size_t dropped = 0;
+        for (size_t i = 0; i < entries_.size();) {
+            const ConversationIdentity& e = entries_[i].identity;
+            if (e.model != keep.model || e.config != keep.config || e.frontend != keep.frontend) {
+                bytes_ -= entries_[i].bytes();
+                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                ++dropped;
+                continue;
+            }
+            ++i;
+        }
+        if (reuse_identity_.model != keep.model || reuse_identity_.config != keep.config ||
+            reuse_identity_.frontend != keep.frontend) { reuse_ = {}; reuse_identity_ = {}; }
+        return dropped;
+    }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
     }
 
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+               const ConversationIdentity& id) const {
         Match best;
+        if (!id.known()) return best;   // no known owner: nothing is offered (default-deny)
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
+            if (e.cvec != cvec || !(e.identity == id)) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
                 if (n > best.tokens) best = {i, n, live};
@@ -260,7 +314,8 @@ public:
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                           const ConversationIdentity& id) {
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;
             for (const auto& k : checkpoints)
@@ -273,7 +328,7 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
+            if (e.cvec == cvec && e.identity == id && deepest && !deepest->ids.empty() && held(*deepest)) {
                 bytes_ -= e.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
@@ -288,8 +343,8 @@ public:
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        if (!enabled() || !image.identity.known() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, image.identity);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         bytes_ += n;
@@ -300,6 +355,7 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
+    ConversationIdentity reuse_identity_;
 };
 
 } // namespace strata::core

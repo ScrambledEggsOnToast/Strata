@@ -17,11 +17,13 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
     s.live.ids = ids;
     s.live.gdn.resize(64, 7);
     s.cvec = cvec;
+    s.identity = {1, 1, 1, 1, 1};   // the tests' one principal, unless a block says otherwise
     return s;
 }
 }
 
 int main() {
+    const ConversationIdentity any{1, 1, 1, 1, 1};   // the principal the plain image() helper tags
     {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
@@ -67,13 +69,13 @@ int main() {
         const size_t parked = image({1,2,3}).bytes();
         ConversationCache cache(retained + parked, 4);
         check(cache.put(image({1,2,3})), "park before retaining active storage");
-        cache.retain(std::move(layers), 16);
+        cache.retain(std::move(layers), 16, {}, any);
         check(cache.bytes() == retained + parked && cache.size() == 1, "active retained storage consumes bytes but no parked slot");
         cache.limit_reuse(9); cache.limit_reuse(12);
-        auto reuse = cache.take_reuse();
+        auto reuse = cache.take_reuse(any);
         check(reuse.unchanged_tokens == 9, "a later continuation cannot undo a rewind's dirty boundary");
         check(cache.bytes() == parked, "taking retained buffers releases their budget accounting");
-        cache.retain(std::move(reuse.kv), 16);
+        cache.retain(std::move(reuse.kv), 16, {}, any);
         check(!cache.can_fit(parked),"retained storage is counted when checking a capture without eviction");
         check(cache.retained_bytes() == retained && cache.size() == 1 && cache.evictions() == 0,
               "optional reuse admission does not evict or release anything");
@@ -87,15 +89,15 @@ int main() {
         ConversationCache cache(1024, 2);
         check(cache.put(image({1, 2, 3})), "park A");
         check(cache.put(image({9, 8, 7})), "park B");
-        auto match = cache.best(a, {}, true);
+        auto match = cache.best(a, {}, true, any);
         check(match.tokens == 3 && match.live, "A/B/A: recover A");
         auto restored = cache.take(match.index);
         check(restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
-        check(cache.size() == 1 && cache.best(b, {}, true).tokens == 3, "B remains parked");
+        check(cache.size() == 1 && cache.best(b, {}, true, any).tokens == 3, "B remains parked");
         check(cache.bytes() == image({9,8,7}).bytes(), "byte accounting after take");
         check(cache.put(std::move(restored)), "park returned A as newest");
         check(cache.put(image({5, 6})), "evict oldest by slot limit");
-        check(cache.best(b, {}, true).tokens == 0 && cache.best(a, {}, true).tokens == 3, "B evicted before A");
+        check(cache.best(b, {}, true, any).tokens == 0 && cache.best(a, {}, true, any).tokens == 3, "B evicted before A");
         check(cache.evictions() == 1, "eviction counter");
     }
     {
@@ -105,33 +107,33 @@ int main() {
         s.checkpoints.push_back(cp);
         ConversationCache cache(4096, 4);
         cache.put(std::move(s));
-        auto match = cache.best(std::vector<int64_t>{1, 2, 9, 4}, {}, true);
+        auto match = cache.best(std::vector<int64_t>{1, 2, 9, 4}, {}, true, any);
         check(match.tokens == 2 && !match.live, "edited suffix falls back to parked checkpoint");
-        check(cache.best(a, {}, true).tokens == 3, "live prefix beats shorter checkpoint");
-        check(cache.best(a, {}, false).tokens == 0, "steering mode is isolated");
-        check(cache.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 0, "equal-length checkpoint cannot consume last token");
-        check(cache.best(std::vector<int64_t>{1}, {}, true).tokens == 0, "short prompt cannot match");
-        check(cache.best(std::vector<int64_t>{}, {}, true).tokens == 0, "empty prompt cannot match");
+        check(cache.best(a, {}, true, any).tokens == 3, "live prefix beats shorter checkpoint");
+        check(cache.best(a, {}, false, any).tokens == 0, "steering mode is isolated");
+        check(cache.best(std::vector<int64_t>{1, 2}, {}, true, any).tokens == 0, "equal-length checkpoint cannot consume last token");
+        check(cache.best(std::vector<int64_t>{1}, {}, true, any).tokens == 0, "short prompt cannot match");
+        check(cache.best(std::vector<int64_t>{}, {}, true, any).tokens == 0, "empty prompt cannot match");
         cache.put(image({1, 2, 3}));
-        check(cache.best(a, {}, true).index == 1, "ties prefer most recently parked");
+        check(cache.best(a, {}, true, any).index == 1, "ties prefer most recently parked");
     }
     {
         auto s = image({1, 2, 3});
         s.live.imgs = {{1, 123}};
         ConversationCache cache(1024, 3);
         cache.put(std::move(s));
-        check(cache.best(a, {{1,123}}, true).tokens == 3, "same image can resume");
-        check(cache.best(a, {{1,124}}, true).tokens == 0, "different image pixels invalidate same pad tokens");
-        check(cache.best(a, {}, true).tokens == 0, "missing image invalidates prefix");
-        check(cache.best(a, {{1,123},{2,45}}, true).tokens == 0, "additional image in cached prefix invalidates");
-        check(cache.best(a, {{1,123},{3,45}}, true).tokens == 3, "image after cached prefix does not invalidate");
+        check(cache.best(a, {{1,123}}, true, any).tokens == 3, "same image can resume");
+        check(cache.best(a, {{1,124}}, true, any).tokens == 0, "different image pixels invalidate same pad tokens");
+        check(cache.best(a, {}, true, any).tokens == 0, "missing image invalidates prefix");
+        check(cache.best(a, {{1,123},{2,45}}, true, any).tokens == 0, "additional image in cached prefix invalidates");
+        check(cache.best(a, {{1,123},{3,45}}, true, any).tokens == 3, "image after cached prefix does not invalidate");
     }
     {
         const size_t one = image({1,2,3}).bytes();
         ConversationCache cache(one*2, 8);
         cache.put(image({1,2,3})); cache.put(image({9,8,7}));
         check(cache.bytes() == one*2, "budget holds two exact-sized images");
-        auto held = cache.take(cache.best(a, {}, true).index);
+        auto held = cache.take(cache.best(a, {}, true, any).index);
         check(cache.make_room(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
         check(cache.size() == 0, "in-flight reservation evicts otherwise fitting B");
         check(cache.put(image({5,6,7}), held.bytes()), "insert with in-flight accounting");
@@ -170,9 +172,9 @@ int main() {
             history = with(history, {30, (int32_t) turn});       // the reply as the next request renders it
         }
         check(cache.evictions() == 0 && cache.superseded() == 8, "8 superseded copies dropped, nothing evicted");
-        const auto m = cache.best(with(with(root, {10, 11, 12}), {13, 14, 15}), {}, true);
+        const auto m = cache.best(with(with(root, {10, 11, 12}), {13, 14, 15}), {}, true, any);
         check(m.tokens == 9 && m.live, "MAIN still restores in full");
-        const auto s = cache.best(with(history, {40}), {}, true);
+        const auto s = cache.best(with(history, {40}), {}, true, any);
         check(s.tokens == (int64_t) history.size() - 2, "SUB resumes from its last turn boundary");
     }
     {
@@ -208,7 +210,7 @@ int main() {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");
-        check(disabled.best(a,{},true).tokens == 0, "disabled cache has no matches");
+        check(disabled.best(a,{},true,any).tokens == 0, "disabled cache has no matches");
     }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
@@ -276,30 +278,83 @@ int main() {
             for (auto& l : v) l.k.resize(n, 1);
             return v;
         };
+        const ConversationIdentity owner{1, 2, 3, 4, 5};
         ConversationCache cache(1 << 20, 4);
         std::vector<std::vector<ConversationKv>> stage_kv;
         stage_kv.push_back(kv(1000));
         stage_kv.push_back(kv(2000));
-        cache.retain(kv(500), 40, std::move(stage_kv));
+        cache.retain(kv(500), 40, std::move(stage_kv), owner);
         check(cache.retained_bytes() >= 2 * (500 + 1000 + 2000), "retained bytes count every stage");
         cache.limit_reuse(30);
-        auto r = cache.take_reuse();
+        auto r = cache.take_reuse(owner);
         check(r.kv.size() == 2 && r.stages.size() == 2 && r.unchanged_tokens == 30 &&
               r.stages[0].unchanged_tokens == 30 && r.stages[1].unchanged_tokens == 30 &&
               r.stages[1].captured_tokens == 40, "every stage's reuse is limited to the first rewrite");
         check(cache.retained_bytes() == 0, "taken once");
         std::vector<std::vector<ConversationKv>> big;
         big.push_back(kv(1 << 20));
-        cache.retain(kv(500), 40, std::move(big));
+        cache.retain(kv(500), 40, std::move(big), owner);
         check(cache.retained_bytes() == 0, "a stage's K/V over the budget drops the whole reuse");
         std::vector<std::vector<ConversationKv>> one;
         one.push_back(kv(100));
-        cache.retain(kv(500), 40, std::move(one));
+        cache.retain(kv(500), 40, std::move(one), owner);
         cache.limit_reuse(0);
         check(cache.retained_bytes() == 0, "a rewrite from the start drops every stage's reuse");
-        cache.retain(kv(500), 40);
-        r = cache.take_reuse();
+        cache.retain(kv(500), 40, {}, owner);
+        r = cache.take_reuse(owner);
         check(r.kv.size() == 2 && r.stages.empty(), "no layer split: no stage reuse, as before");
+        // #42: the retained buffers belong to the conversation they were restored for
+        cache.retain(kv(500), 40, {}, owner);
+        check(cache.take_reuse({2, 2, 2, 2, 2}).kv.empty() && cache.retained_bytes() == 0,
+              "another identity's retained K/V is refused and released");
+        cache.retain(kv(500), 40, {}, owner);
+        check(cache.take_reuse({}).kv.empty(), "an unidentified request gets no retained K/V");
+    }
+    {
+        // #42 cache identity: selection, supersede and invalidation match the whole key (model revision,
+        // resolved config, tokenizer/template digest and the authorization namespace), never tokens alone.
+        const ConversationIdentity t1{0xabcd, 0x1234, 0x77, 1, 0};   // tenant 1
+        const ConversationIdentity t2{0xabcd, 0x1234, 0x77, 2, 0};   // tenant 2: same model/config/frontend
+        const ConversationIdentity t1new{0xabcd, 0x1234, 0x88, 1, 0};   // tenant 1, another frontend
+        auto tagged = [&](std::initializer_list<int32_t> ids, const ConversationIdentity& id) {
+            SavedConversation s = image(ids);
+            s.identity = id;
+            return s;
+        };
+        ConversationCache cache(4096, 4);
+        SavedConversation unowned = image({1, 2, 3});
+        unowned.identity = {};
+        check(!cache.put(std::move(unowned)), "an unowned (zero-identity) image parks nowhere");
+        check(cache.put(tagged({1, 2, 3}, t1)) && cache.put(tagged({1, 2, 3}, t2)), "both tenants park");
+        check(cache.best(a, {}, true, t1).tokens == 3 && cache.best(a, {}, true, t2).tokens == 3,
+              "each tenant recovers its own conversation");
+        check(cache.best(a, {}, true, t1new).tokens == 0, "another frontend's request is offered nothing");
+        check(cache.best(a, {}, true, ConversationIdentity{}).tokens == 0,
+              "an unidentified request (default-deny) is offered nothing");
+        check(cache.take(cache.best(a, {}, true, t2).index).live.ids == std::vector<int32_t>({1, 2, 3}) &&
+              cache.size() == 1, "the canary tenant never takes the other's entry");
+        // supersede (#342) stays within one identity: tenant 2's copy of the conversation survives tenant 1's turn
+        ConversationCache cache2(4096, 4);
+        auto checkpointed = tagged({1, 2, 3}, t1);
+        checkpointed.checkpoints.push_back(checkpointed.live);
+        cache2.put(std::move(checkpointed));
+        cache2.put(tagged({1, 2, 3}, t2));
+        cache2.drop_superseded({1, 2, 3}, {}, {}, true, t1);
+        check(cache2.size() == 1, "superseding drops only the same identity's copies");
+        check(cache2.best(a, {}, true, t2).tokens == 3, "the other tenant's copy is kept");
+        // invalidation by key equality (AC-3): a frontend change discards every entry of the old frontend now,
+        // for every tenant; other tenants of the CURRENT frontend stay
+        ConversationCache cache3(4096, 4);
+        cache3.put(tagged({1, 2, 3}, t1));
+        cache3.put(tagged({1, 2, 3}, t2));
+        check(cache3.invalidate_except(t1new) == 2, "a frontend change invalidates every old-frontend entry");
+        check(cache3.size() == 0, "invalidated entries are discarded, not merely mismatched");
+        cache3.put(tagged({1, 2, 3}, t1new));
+        cache3.put(tagged({1, 2, 3}, t2));
+        check(cache3.invalidate_except(t1) == 1 && cache3.size() == 1 &&
+              cache3.best(a, {}, true, t2).tokens == 3,
+              "invalidation keeps other tenants of the current frontend");
+        check(cache3.invalidate_except(t1) == 0, "no change, nothing to discard");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

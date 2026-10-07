@@ -1091,6 +1091,30 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
     return h;
 }
 
+// Fixed-width lowercase hex as the serving frontend sends it (16 digits = one value, 32 = two, high words
+// first).  false on any other character: an identity key that is not exactly the agreed width is no identity.
+bool hex_identity(const char* s, size_t digits, uint64_t& a, uint64_t* b = nullptr) {
+    auto one = [&s](uint64_t& out) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < 16; ++i, ++s) {
+            const int d = *s >= '0' && *s <= '9' ? *s - '0' : *s >= 'a' && *s <= 'f' ? *s - 'a' + 10 : -1;
+            if (d < 0) return false;
+            v = (v << 4) | (uint64_t) d;
+        }
+        out = v;
+        return true;
+    };
+    if (digits == 16) { uint64_t v; if (!one(v)) return false; a = v; return true; }
+    if (digits == 32 && b != nullptr) {
+        uint64_t hi, lo;
+        if (!one(hi) || !one(lo)) return false;
+        a = hi;
+        *b = lo;
+        return true;
+    }
+    return false;
+}
+
 using ConvStateSizes = strata::core::ConversationStateSizes;
 
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss) {
@@ -5525,12 +5549,19 @@ int main(int argc, char **argv) try {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
+        // HET-042: entries are keyed by the request's frontend (tokenizer/template digest) and authorization
+        // namespace (tenant).  This build binds no model/config fingerprints (no session-file machinery): the
+        // model is fixed for the process, and the RAM cache dies with it - so a model or config change restarts
+        // the engine into an empty cache.  Default-deny holds: an unidentified request matches nothing.
+        strata::core::ConversationIdentity session_ident;   // who the live session's conversation belongs to
+        uint64_t seen_model = 0, seen_config = 0, seen_frontend = 0;
+        bool ident_seen = false;
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            auto reuse = conversations.take_reuse(session_ident);   // the retained K/V described this conversation
             size_t estimate = 0;
             if (!strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
@@ -5552,7 +5583,7 @@ int main(int argc, char **argv) try {
             // a capped figure would under-evict and overfill the budget.
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, session_ident))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             if (!conversations.make_room(estimate, held)) {
@@ -5579,6 +5610,7 @@ int main(int argc, char **argv) try {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                image.identity = session_ident;   // the parked conversation stays its owner's property
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -6314,6 +6346,11 @@ int main(int argc, char **argv) try {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // HET-042 cache identity: `tenant=<32 hex>` (the authorization namespace, server-derived) and
+            // `frontend=<16 hex>` (the tokenizer/template digest).  BOTH must be exactly well-formed; anything
+            // else is no identity - the request matches no cached state and reads from the start.
+            uint64_t req_tenant_lo = 0, req_tenant_hi = 0, req_frontend = 0;
+            bool tenant_ok = false, frontend_ok = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -6339,6 +6376,9 @@ int main(int argc, char **argv) try {
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "tenant")
+                        tenant_ok = hex_identity(tok.c_str() + eq + 1, 32, req_tenant_lo, &req_tenant_hi);
+                    else if (key == "frontend") frontend_ok = hex_identity(tok.c_str() + eq + 1, 16, req_frontend);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -6505,9 +6545,34 @@ int main(int argc, char **argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // The request's full cache identity (this build binds no model/config fingerprints - the model is
+            // fixed for the process - but requires a nonzero frontend AND namespace).  Namespace COMPLETENESS:
+            // a malformed key or an all-zero digest is no identity, and zero never matches zero.
+            strata::core::ConversationIdentity req_ident;
+            req_ident.frontend = req_frontend;
+            req_ident.tenant_lo = req_tenant_lo;
+            req_ident.tenant_hi = req_tenant_hi;
+            if (!(tenant_ok && frontend_ok) || req_frontend == 0 || !(req_tenant_lo || req_tenant_hi) ||
+                !req_ident.known())
+                req_ident = {};
+            if (req_ident.known() &&
+                (!ident_seen || req_ident.model != seen_model || req_ident.config != seen_config ||
+                 req_ident.frontend != seen_frontend)) {
+                const size_t gone = conversations.invalidate_except(req_ident);
+                ident_seen = true;
+                seen_model = req_ident.model;
+                seen_config = req_ident.config;
+                seen_frontend = req_ident.frontend;
+                if (gone > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache: invalidated %zu parked conversation(s): "
+                                 "frontend changed\n", gone);
+            }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            // The live session and its checkpoint chain belong to one identity: only the same KNOWN identity
+            // continues it; zero never matches zero (default-deny, AC-2).
+            if (o.prompt_cache > 0 && want_cvec == cvec_cached && req_ident.known() &&
+                session_ident.known() && req_ident == session_ident) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -6515,7 +6580,7 @@ int main(int argc, char **argv) try {
                         from_live = false;
                     }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids, req_imgs, want_cvec, req_ident);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > resume) incoming.emplace(conversations.take(parked.index));
             // Reject the entire image before parking/overwriting the outgoing
@@ -6531,6 +6596,7 @@ int main(int argc, char **argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            session_ident = req_ident;   // the session becomes this request's conversation
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err) !=
@@ -6559,7 +6625,7 @@ int main(int argc, char **argv) try {
                 resume = parked.tokens;
                 from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()));
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), {}, req_ident);
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",

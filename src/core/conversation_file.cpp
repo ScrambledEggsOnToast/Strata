@@ -45,8 +45,7 @@ namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
-constexpr size_t kHeader = 64, kTrailer = 16;
+// kVersion/kHeader live with header_bytes() below (v2, with the namespace binding; v1 still reads).
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -801,8 +800,13 @@ bool has_stage_parts(const SavedConversation& s) {
     return false;
 }
 
-// header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
-// header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
+// header v2, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 frontend:u64
+// tenant_lo:u64 tenant_hi:u64 payload:u64 reserved:u64 header_hash:u64 (session_hash64 of bytes 0..71, seed 0).
+// v1 (64-byte header, no namespace fields) is still read: it binds no namespace, so it can never authorize a
+// namespace-scoped mount - the reader reports a zero namespace for it.
+constexpr uint32_t kVersion = 2;
+constexpr size_t kHeader = 80, kTrailer = 16;
+
 void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
@@ -811,9 +815,12 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
-    std::memcpy(h + 32, &payload, 8);
-    const uint64_t hh = session_hash64(h, 56, 0);
-    std::memcpy(h + 56, &hh, 8);
+    std::memcpy(h + 32, &id.frontend, 8);
+    std::memcpy(h + 40, &id.tenant_lo, 8);
+    std::memcpy(h + 48, &id.tenant_hi, 8);
+    std::memcpy(h + 56, &payload, 8);
+    const uint64_t hh = session_hash64(h, kHeader - 8, 0);
+    std::memcpy(h + kHeader - 8, &hh, 8);
 }
 } // namespace
 
@@ -944,8 +951,8 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
                                const std::function<void()>& beat) {
     SessionIdentityBuilder h(0x5354524154414d44ull);
     std::vector<uint8_t> buf(1u << 20);
-    // a file in several roles is read once; its sample enters the fingerprint under every role
-    std::unordered_map<std::string, std::pair<bool, uint64_t>> seen;   // path -> (present, sample digest)
+    // A file in several roles is read once; its complete content digest enters every role.
+    std::unordered_map<std::string, std::pair<bool, uint64_t>> seen;
     h.u64("files", files.size());
     for (const auto& file : files) {
         auto it = seen.find(file.path);
@@ -959,21 +966,17 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
                     return false;
                 }
             } else {
-                SessionIdentityBuilder one(0x46494c4553414d50ull);   // "FILESAMP"
+                SessionIdentityBuilder one(0x46494c4546554c4cull);   // "FILEFULL"
                 one.u64("size", size);
-                const uint64_t head = std::min<uint64_t>(size, buf.size());
-                if (!f.read_at(0, buf.data(), (size_t) head)) {
-                    error = "session fingerprint: reading " + file.path + ": " + f.error();
-                    return false;
-                }
-                one.bytes("head", buf.data(), (size_t) head);
-                if (size > buf.size()) {
-                    const uint64_t tail = std::min<uint64_t>(size - head, buf.size());
-                    if (!f.read_at(size - tail, buf.data(), (size_t) tail)) {
+                for (uint64_t offset = 0; offset < size;) {
+                    const size_t count = (size_t) std::min<uint64_t>(size - offset, buf.size());
+                    if (!f.read_at(offset, buf.data(), count)) {
                         error = "session fingerprint: reading " + file.path + ": " + f.error();
                         return false;
                     }
-                    one.bytes("tail", buf.data(), (size_t) tail);
+                    one.bytes("content", buf.data(), count);
+                    offset += count;
+                    if (beat) beat();
                 }
                 d = {true, one.digest()};
             }
@@ -986,7 +989,7 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
             continue;
         }
         h.str("role", file.role);
-        h.u64("sample", it->second.second);
+        h.u64("content", it->second.second);
     }
     fingerprint = h.digest();
     return true;
@@ -1040,6 +1043,16 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     }
     const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
     st.error = SessionError::io;
+    // The caller's own admission (HET-042's storage tier), asked with the file's exact total bytes BEFORE the
+    // temporary file is created: a refusal here writes nothing and leaves nothing to clean up.
+    if (opt.admit) {
+        std::string aw;
+        if (!opt.admit(total, aw)) {
+            st.error = SessionError::storage;
+            error = "session file: not admitted where it is written" + (aw.empty() ? std::string() : ": " + aw);
+            return false;
+        }
+    }
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
         if (!free_space(path, avail)) { error = "session file: cannot read the free disk space for " + path; return false; }
@@ -1191,21 +1204,53 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (limits.progress) f.progress.emplace(limits.progress);
     f.expected = size;
     uint8_t h[kHeader];
-    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    // The version and header size come first: a v1 file's header is 64 bytes and its payload starts there, so
+    // only the header's own bytes are ever consumed here.
+    if (!f.read(h, 16)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
     uint32_t version = 0, hsize = 0;
-    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
-    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
-    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
-    if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (version != 1 && version != 2) {
+        error = "session file: unsupported version " + std::to_string(version);
+        return false;
+    }
+    const size_t expect = version == 2 ? kHeader : (size_t) 64;
+    if (hsize != expect) { error = "session file: invalid header size"; return false; }
+    if (!f.read(h + 16, hsize - 16)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    uint64_t model = 0, config = 0;
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8);
+    uint64_t frontend = 0, tenant_lo = 0, tenant_hi = 0;   // v1 files bind none: a zero namespace
+    uint64_t payload = 0, r0 = 0, r1 = 0;
+    if (version == 2) {
+        std::memcpy(&frontend, h + 32, 8);
+        std::memcpy(&tenant_lo, h + 40, 8);
+        std::memcpy(&tenant_hi, h + 48, 8);
+        std::memcpy(&payload, h + 56, 8);
+        std::memcpy(&r0, h + 64, 8);
+    } else {
+        std::memcpy(&payload, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8);
+        std::memcpy(&r1, h + 48, 8);
+    }
+    uint64_t hh = 0;
+    std::memcpy(&hh, h + hsize - 8, 8);
+    if (hh != session_hash64(h, hsize - 8, 0)) { error = "session file: header checksum mismatch"; return false; }
+    if (r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
-    if (payload > size || size - kHeader - kTrailer != payload) {
+    // The namespace binding (HET-042): a file is mounted only by the principal and frontend it was saved for,
+    // exactly.  A v1 file (or any file) bound to no namespace never authorizes a namespace-scoped mount, and a
+    // foreign namespace is a refusal, never a re-stamp of the requester onto the file.
+    if (frontend != id.frontend || tenant_lo != id.tenant_lo || tenant_hi != id.tenant_hi) {
+        error = version == 1
+            ? "session file: saved before namespace binding (re-save it with this engine to mount it for a "
+              "principal)"
+            : "session file: saved for another authorization namespace or frontend";
+        return false;
+    }
+    if (payload > size || size - hsize - kTrailer != payload) {
         error = "session file: size " + std::to_string(size) + " does not match the header (" +
-                std::to_string(kHeader + payload + kTrailer) + ")";
+                std::to_string(hsize + payload + kTrailer) + ")";
         return false;
     }
     if (limits.admit) {
