@@ -129,6 +129,13 @@ int resident_model_checks(strata::program::ResidentSlots&, strata::core::ExpertD
                           const strata::core::ModelGeometry&, strata::core::SessionState&,
                           strata::core::SessionState&, strata::core::SessionState&, strata::core::MtpDrafter&);
 #endif
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+#include "strata/platform/protected_test.hpp"
+int residency_model_checks(const strata::core::WeightTable&, const strata::core::ModelGeometry&,
+                           strata::core::SessionState&, strata::core::SessionState&, strata::core::SessionState&,
+                           strata::core::ExpertCache&, std::vector<int32_t>&, int32_t*,
+                           strata::core::ExpertDispatch&, strata::core::PoolMultiFn, void*);
+#endif
 
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -1746,6 +1753,12 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+    if (!std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0) {
+        std::fprintf(stderr, "residency regression requires the protected supervisor\n");
+        return 2;
+    }
+#endif
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -2189,6 +2202,12 @@ int main(int argc, char** argv) {
                          mps_ceiling.device, (unsigned long long) mps_ceiling.cap_bytes,
                          mps_ceiling.pipe_directory.c_str());
     }
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+    if (!mps_ceiling.declared || mps_ceiling.cap_bytes != (10ull << 30)) {
+        std::fprintf(stderr, "residency regression requires the protected 10 GiB MPS client ceiling\n");
+        return 2;
+    }
+#endif
     // Issue #60: an operator-committed allowance for an opaque class is only admissible
     // inside a ceiling that is actually enforced, and the ceiling the operator planned
     // against must be the one this process was launched with. Partial commitments refuse.
@@ -2801,6 +2820,9 @@ int main(int argc, char** argv) {
                      (unsigned long long) mps_verification.outside_client_allowance_bytes);
 #endif
     }
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+    if (!strata::platform::acknowledge_protected_test()) return 2;
+#endif
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -3522,6 +3544,13 @@ int main(int argc, char** argv) {
             ram("resident_mtp_owner", resident.mtp_owner, "draft slot owner envelope, weights and scratch shared");
             ram("resident_transfer_transient", resident.transfer_transient, "serial checkpoint and one-layer QSA transfer envelope");
         }
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+        // One mapped hand-off plus control/candidate copies; all Verifier arenas are serial.
+        ram("residency_regression_host", byte_add(byte_mul(8ull * sizeof(float),
+            (uint64_t) strata::core::Verifier::handoff_floats(g)),
+            byte_add(blob_gate, byte_add(byte_mul((uint64_t) g.n_expert, sizeof(int32_t)), 1ull << 20))),
+            "single-layer test hand-off/control outputs, one expert readback and bounded fixture storage");
+#endif
         if (residency_table)
             ram("host_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers, (uint64_t) g.n_expert),
                 sizeof(int32_t)), "graph hits host residency vector payload");
@@ -6975,6 +7004,16 @@ int main(int argc, char** argv) {
 #endif
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
+#ifdef STRATA_RESIDENCY_MODEL_TEST
+    if (!o.serve || !stages.empty() || !split_devs.empty() || bslot_ss.size() != 1 ||
+        bslot_ss[0].size() != 2 || o.spec < 2 || o.no_pool || !mps_ceiling.declared ||
+        !std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0) {
+        std::fprintf(stderr, "residency regression requires protected MPS single-device --serve --batch 2 --spec >= 2 startup\n");
+        return 2;
+    }
+    return residency_model_checks(wt, g, ss, bslot_ss[0][0]->state(), bslot_ss[0][1]->state(),
+                                  xcache, host_res, d_res, drive.d, &drive_pool_multi, &drive);
+#endif
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {

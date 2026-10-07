@@ -578,6 +578,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(strata-resident-test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(strata-resident-test PRIVATE strata_resident strata_spec ${_strata_gpu_runtime_target})
     target_link_options(strata-resident-test PRIVATE "-Wl,--wrap=cudaMemcpy")
+    # Real initialized Verifier regression. GPU execution is protected-supervisor-only, never CTest.
+    add_executable(strata-residency-test src/program/generate.cpp tests/core/residency_model_test.cpp)
+    target_compile_definitions(strata-residency-test PRIVATE STRATA_RESIDENCY_MODEL_TEST=1)
+    target_include_directories(strata-residency-test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(strata-residency-test PRIVATE strata_resident strata_spec ${_strata_gpu_runtime_target})
   endif()
 
   if(STRATA_ENABLE_HIP)
