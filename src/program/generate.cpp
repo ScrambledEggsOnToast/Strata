@@ -8068,6 +8068,9 @@ int main(int argc, char** argv) {
                     // the physical-RAM floor first, on top of the captured image and everything held.
                     const std::string name = "park-" + std::to_string(++disk_seq) + ".bin";
                     const std::string path = disk_cache.dir() + "/" + name;
+                    strata::core::ConversationDiskCache::Entry disk_entry{
+                        image.identity, image.cvec, image.live.ids, image.live.imgs, 0, name};
+                    disk_cache.reserve_entry();
                     if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
                             (uint64_t) 16 << 20, (uint64_t) o.conversation_cache_min_free_mib << 20)) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip storage parking (physical RAM "
@@ -8096,18 +8099,14 @@ int main(int argc, char** argv) {
                         strata::core::progress_at("request");
                         strata::core::progress_allow(0);
                         if (wrote || st.published) {   // published: the file is complete, only the folder flush failed
-                            // The admission priced exactly this size; the trim is a formality.  A trim that
-                            // cannot unlink keeps the new entry CHARGED - the budget may then read over by
-                            // exactly the stuck file, loudly, rather than the disk holding uncharged bytes.
-                            const bool trimmed = disk_cache.make_room(file_bytes);
-                            disk_cache.admit({image.identity, image.cvec, image.live.ids, image.live.imgs,
-                                              (uint64_t) file_bytes, name});
+                            // Exact prewrite admission already reserved the footprint.
+                            disk_entry.file_bytes = (uint64_t) file_bytes;
+                            disk_cache.admit(std::move(disk_entry));
                             std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to storage "
-                                         "(%s, %zu bytes) in %.1f ms; disk=%zu bytes in %zu files%s\n",
+                                         "(%s, %zu bytes) in %.1f ms; disk=%zu bytes in %zu files\n",
                                          image.live.ids.size(), path.c_str(), file_bytes,
                                          std::chrono::duration<double, std::milli>(Clock::now() - t0d).count(),
-                                         disk_cache.bytes(), disk_cache.size(),
-                                         trimmed ? "" : " (over budget: an eviction could not be removed; charged)");
+                                         disk_cache.bytes(), disk_cache.size());
                         } else {
                             std::fprintf(stderr, "strata serve: conversation cache: storage parking refused or "
                                          "failed (%s); conversation recomputes next time\n", werr.c_str());

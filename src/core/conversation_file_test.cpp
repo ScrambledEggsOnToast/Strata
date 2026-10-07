@@ -609,6 +609,18 @@ int main() {
             }
             check(no_temp(dir), "fault: no temporary left behind");
         }
+        {
+            SessionWriteOptions opt;
+            opt.fault = [](const char* step) -> int {
+                if (std::strcmp(step, "dir_flush") == 0) throw std::bad_alloc();
+                return 0;
+            };
+            SessionStatus st;
+            written = 0;
+            check(!session_file_write(p.string(), original, id, written, error, opt, &st) &&
+                  st.published && st.error == SessionError::memory && written == image.size() && slurp(p) == image,
+                  "postrename allocation failure preserves owned file extent and status");
+        }
 #ifndef _WIN32
         // a filesystem that cannot flush a folder: saved, and said
         spit(p, old);

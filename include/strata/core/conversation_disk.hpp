@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 #include <random>
 #include <string>
 #include <vector>
@@ -104,10 +103,13 @@ public:
         return hit;
     }
 
+    // Reserve index allocation before publication; construct Entry metadata before writing.
+    void reserve_entry() { entries_.reserve(entries_.size() + 1); }
     // Records a file the caller has written and owns; its size joins the budget.
     void admit(Entry&& e) {
-        bytes_ += e.file_bytes;
+        const uint64_t charge = e.file_bytes;
         entries_.push_back(std::move(e));
+        bytes_ += charge;
     }
     // Oldest-first eviction so `incoming` more bytes fit.  false when the file alone exceeds the budget, or
     // when an evicted file cannot be unlinked: the charge then stays, and the caller refuses the park instead
@@ -179,7 +181,7 @@ private:
 
     std::string dir_;
     uint64_t budget_ = 0, bytes_ = 0, evictions_ = 0;
-    std::deque<Entry> entries_;
+    std::vector<Entry> entries_;
 };
 
 } // namespace strata::core

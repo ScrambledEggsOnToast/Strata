@@ -1110,6 +1110,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         st.error = out.read_failed ? SessionError::io : f.kind();
     } else {
         if (opt.phase) opt.phase("publish", total);
+        bytes = (size_t) total; // retained even if publication diagnostics allocate and fail
         if (pub.publish(why, opt.durable, st, fault)) {
             st.error = SessionError::none;
             bytes = (size_t) total;
@@ -1130,7 +1131,7 @@ bool write_guarded(const std::string& path, const SavedConversation& image, cons
     try {
         ok = write_impl(path, image, sources, id, bytes, error, opt, st);
     } catch (const std::bad_alloc&) {
-        error = "session file: out of memory while writing " + path;
+        error.clear(); // no allocation: published ownership must always reach the caller
         st.error = SessionError::memory;
         ok = false;
     }
