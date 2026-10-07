@@ -120,6 +120,17 @@ int main() {
     first.remove(0);
     check(first.size() == 0 && first.bytes() == 0, "remove drops the record and its bytes");
     check(fs::directory_iterator(first.dir()) == fs::directory_iterator(), "the owned directory is empty");
+    // An unreadable/corrupt entry must stop matching even when unlink fails.
+    const auto blocked = fs::path(first.dir()) / "blocked.bin";
+    fs::create_directory(blocked);
+    { std::ofstream f(blocked / "child"); f << "prevents directory removal"; }
+    first.admit({t1, true, img.live.ids, img.live.imgs, 8, "blocked.bin"});
+    check(!first.remove(0) && first.bytes() == 8 && first.size() == 1,
+          "failed unlink retains the owned footprint charge");
+    check(first.best(prompt, {}, true, t1).tokens == 0,
+          "failed unlink cannot offer invalidated state again");
+    fs::remove(blocked / "child");
+    check(first.remove(0) && first.bytes() == 0, "invalidated footprint can be reclaimed later");
     second.admit({t1, true, img.live.ids, img.live.imgs, 4, "park-1.bin"});
     { std::ofstream f(fs::path(second.dir()) / "park-1.bin"); f << "other"; }
     first.close();

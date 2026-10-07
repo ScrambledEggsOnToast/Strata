@@ -380,6 +380,11 @@ public:
         if (::fstat(fd_, &st) != 0) { error_ = std::strerror(errno); return false; }
         if (!S_ISREG(st.st_mode)) { error_ = "not a regular file"; return false; }
         size = (uint64_t) st.st_size;
+        try_direct();
+        if (size > kBlock && !direct_) {
+            error_ = "large model fingerprint requires direct I/O";
+            return false;
+        }
         return true;
     }
     bool is_open() const { return fd_ >= 0; }
@@ -407,10 +412,12 @@ public:
     }
     bool read_at(uint64_t offset, uint8_t* p, size_t n) {
         while (n) {
-            const ssize_t r = ::pread(fd_, p, n, (off_t) offset);
+            const size_t wanted = direct_ ? (n + kAlign - 1) / kAlign * kAlign : n;
+            const ssize_t r = ::pread(fd_, p, wanted, (off_t) offset);
             if (r < 0 && errno == EINTR) continue;
             if (r <= 0) { kind_ = r < 0 ? errno_kind(errno) : SessionError::io; error_ = r < 0 ? std::strerror(errno) : "file ends early"; return false; }
-            p += r; n -= (size_t) r; offset += (uint64_t) r;
+            const size_t consumed = std::min<size_t>((size_t) r, n);
+            p += consumed; n -= consumed; offset += consumed;
         }
         return true;
     }
@@ -950,7 +957,8 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
 bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint64_t& fingerprint, std::string& error,
                                const std::function<void()>& beat) {
     SessionIdentityBuilder h(0x5354524154414d44ull);
-    std::vector<uint8_t> buf(1u << 20);
+    auto buf = aligned_block();
+    if (!buf) { error = "session fingerprint: allocating aligned read buffer"; return false; }
     // A file in several roles is read once; its complete content digest enters every role.
     std::unordered_map<std::string, std::pair<bool, uint64_t>> seen;
     h.u64("files", files.size());
@@ -969,12 +977,12 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
                 SessionIdentityBuilder one(0x46494c4546554c4cull);   // "FILEFULL"
                 one.u64("size", size);
                 for (uint64_t offset = 0; offset < size;) {
-                    const size_t count = (size_t) std::min<uint64_t>(size - offset, buf.size());
-                    if (!f.read_at(offset, buf.data(), count)) {
+                    const size_t count = (size_t) std::min<uint64_t>(size - offset, 1u << 20);
+                    if (!f.read_at(offset, buf.get(), count)) {
                         error = "session fingerprint: reading " + file.path + ": " + f.error();
                         return false;
                     }
-                    one.bytes("content", buf.data(), count);
+                    one.bytes("content", buf.get(), count);
                     offset += count;
                     if (beat) beat();
                 }
@@ -1108,6 +1116,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
             return true;
         }
     }
+    if (st.published) bytes = (size_t) total;
     error = "session file: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
     if (st.published) error += " (the new file has already replaced the old one; its folder entry may not survive a power loss)";
     return false;   // Publisher removes this call's temporary file, and only that

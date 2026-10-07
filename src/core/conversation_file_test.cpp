@@ -596,12 +596,14 @@ int main() {
             const int code = c.err;
             opt.fault = [want, code](const char* step) { return want == step ? code : 0; };
             SessionStatus st;
+            written = 0;
             const bool ok = session_file_write(p.string(), original, id, written, error, opt, &st);
             check(!ok && st.error == c.kind, "fault: the failure has its kind");
             check(st.published == c.published, "fault: publication reported exactly");
             if (c.published) {
                 check(slurp(p) == image && error.find("replaced") != std::string::npos,
                       "fault: after a published failure the new file is there and the error says so");
+                check(written == image.size(), "published failure reports actual owned file bytes");
             } else {
                 check(slurp(p) == old, "fault: a failure before the rename keeps the old file");
             }

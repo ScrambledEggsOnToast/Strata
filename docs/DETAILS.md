@@ -1016,6 +1016,10 @@ at startup. Same-size middle edits therefore invalidate saved state, not just he
 This adds startup I/O and hashing cost; it is not repeated per request. Inputs must remain
 immutable while loaded. Fingerprints detect mismatches, not maliciously forged session files:
 external restores still require trusted files and the matching authorization namespace.
+On Linux, large input fingerprinting requires aligned direct I/O; if unavailable,
+cache identity is refused rather than traversing the full buffered expert payload.
+Authenticated namespaces and frontend content identities survive a restart with
+unchanged credentials/content; anonymous namespaces remain process-local.
 
 **Storage-tier parking (off by default).** With `--conversation-cache-dir DIR` and
 `--conversation-cache-disk-mib N`, conversations that no longer fit the RAM budget park, in the same file format, in

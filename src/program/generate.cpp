@@ -7942,7 +7942,7 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if ((!conversations.enabled() && !disk_cache.enabled()) || !live_ok || live.empty()) return true;
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, session_ident))
@@ -8013,7 +8013,8 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            const bool ram_room = conversations.make_room(estimate, held);
+            if (!ram_room && !disk_cache.enabled()) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -8052,7 +8053,7 @@ int main(int argc, char** argv) {
                 // The parked image stays the outgoing conversation's property (its own namespace), never the
                 // incoming request's.  An unowned (zero) identity parks nowhere.
                 image.identity = session_ident;
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = ram_room && conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -10100,7 +10101,7 @@ int main(int argc, char** argv) {
                         // image can never be offered twice (AC-3: failed restores invalidate, not retry forever).
                         if (!disk_cache.remove(hit.index))
                             std::fprintf(stderr, "strata serve: conversation cache: could not unlink a storage "
-                                         "entry; it stays charged and will be offered again\n");
+                                         "entry; it stays charged but cannot be selected again\n");
                         incoming.emplace(std::move(loaded));
                         incoming_tokens = hit.tokens;
                         incoming_live = true;   // the storage image restores the conversation's whole live state

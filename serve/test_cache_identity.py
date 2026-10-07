@@ -95,6 +95,8 @@ class FrontendDigest(unittest.TestCase):
         base = {"vocab.json": '{"a": 0}', "merges.txt": "a b\n", "token_type.json": "[0]"}
         first = self.digest(svc, base)
         self.assertEqual(first, self.digest(svc, dict(base)), "the same contents digest the same")
+        self.assertEqual(first, self.digest(self.svc(), base),
+                         "unchanged frontend identity survives a service restart")
         self.assertNotEqual(first, self.digest(svc, {**base, "vocab.json": '{"a": 0, "b": 1}'}),
                             "another vocab is another frontend")
         self.assertNotEqual(first, self.digest(svc, {**base, "merges.txt": "a b\nb a\n"}),
@@ -161,6 +163,22 @@ class PrincipalNamespace(unittest.TestCase):
         for name, _ in ns:
             self.assertEqual(len(name), 32)
             self.assertNotIn("key-", name, "the namespace is a digest, never the credential")
+        tok = ByteTokenizer()
+        engine = RecordingEngine(tok, "ok")
+        restarted = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        restarted.api_key = "key-a"
+        with tempfile.TemporaryDirectory() as directory:
+            restarted.compute_frontend_digest(Path(directory))
+        httpd = serve(restarted, port=0)
+        old_base = self.base
+        try:
+            self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            self.assertEqual(self.chat("key-a")[0], 200)
+            self.assertEqual(a, identities(engine)[0], "same authorization/content survives restart")
+        finally:
+            self.base = old_base
+            httpd.shutdown()
+            httpd.server_close()
 
     def test_no_identity_without_a_principal(self):
         self.svc.api_key = "secret"

@@ -40,6 +40,7 @@ public:
         std::vector<ConversationImageKey> imgs;
         uint64_t file_bytes = 0;
         std::string name;                            // inside the owned directory; never a path with separators
+        bool selectable = true;                     // failed unlink keeps charge, never reuse eligibility
     };
     struct Hit {
         size_t index = 0;
@@ -96,7 +97,7 @@ public:
         if (!id.known()) return hit;
         for (size_t i = entries_.size(); i-- > 0;) {
             const Entry& e = entries_[i];
-            if (e.cvec != cvec || !(e.identity == id)) continue;
+            if (!e.selectable || e.cvec != cvec || !(e.identity == id)) continue;
             const int64_t n = conversation_prefix(e.ids, e.imgs, prompt, images);
             if (n > hit.tokens) hit = {i, n};
         }
@@ -124,7 +125,8 @@ public:
     // false (record and charge kept) when the file could not be removed: an uncharged footprint would let the
     // real usage drift past the budget.  A file that has already vanished is gone: the record goes too.
     bool remove(size_t index) {
-        const Entry& e = entries_.at(index);
+        Entry& e = entries_.at(index);
+        e.selectable = false;
         const std::filesystem::path p = std::filesystem::path(dir_) / e.name;
         std::error_code ec;
         if (std::filesystem::exists(p, ec)) {

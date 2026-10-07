@@ -2378,7 +2378,7 @@ class Service:
         never paths: the same directory with different contents digests differently.  Computed once at startup:
         the template and tokenizer are immutable while serving, and a change to any of them is a restart - the
         fresh digest then selects none of the old frontend's cache entries (AC-3, by key equality)."""
-        h = hashlib.blake2b(digest_size=8, key=self.cache_salt)
+        h = hashlib.blake2b(digest_size=8, person=b"strata-frontend")
         h.update(b"template\x00")
         source = getattr(self.template, "source", None)
         if isinstance(source, str):
@@ -4160,7 +4160,7 @@ def make_handler(svc: Service):
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
-                svc.auth_local.principal = hashlib.blake2b(svc.api_key.encode(), key=svc.cache_salt,
+                svc.auth_local.principal = hashlib.blake2b(svc.api_key.encode(), person=b"strata-principal",
                                                            digest_size=16).hexdigest()
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
