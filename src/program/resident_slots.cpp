@@ -266,8 +266,9 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.checks.swap(selected);
     selected.clear();
     try {
-        if (!copy_to(slot, prefix, error) || !draft_.bind_request(slot, working_.request, error) ||
-            !draft_.save_slot(slot, (int64_t) prefix.size(), error)) return fail(slot);
+        if (!copy_to(slot, prefix, error) || (draft_.kv_state().max_cells > 0 &&
+            (!draft_.bind_request(slot, working_.request, error) ||
+             !draft_.save_slot(slot, (int64_t) prefix.size(), error)))) return fail(slot);
     } catch (const std::bad_alloc&) {
         error = "resident admission: transfer allocation failed"; return fail(slot);
     }
@@ -344,7 +345,8 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
     const auto cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
     working_failed_ = true; // any partial write or exception makes the working context unusable
     try {
-        if (!copy_from(slot, checkpoint, error) || !draft_.restore_slot(slot, cells, error) ||
+        if (!copy_from(slot, checkpoint, error) ||
+            (draft_.kv_state().max_cells > 0 && !draft_.restore_slot(slot, cells, error)) ||
             !observe("resume", slot, cells, error)) {
             return fail(slot);
         }
@@ -396,7 +398,7 @@ bool ResidentSlots::committed(int slot, int32_t next, const float* residual, std
     }
     auto& state = slots_[(size_t) slot];
     if (!slot_idle(slot, error)) return false;
-    if (!draft_.advance_slot(slot, residual, next, state.p, error)) return fail(slot);
+    if (draft_.kv_state().max_cells > 0 && !draft_.advance_slot(slot, residual, next, state.p, error)) return fail(slot);
     state.ids.push_back(state.x);
     if (diagnostic && !observe("commit", slot, (int64_t) state.ids.size(), error, residual)) return fail(slot);
     ++state.produced;
@@ -432,7 +434,8 @@ bool ResidentSlots::finish(int slot, bool keep_cache, std::string& error, bool d
 
 bool ResidentSlots::observe(const char* phase, int slot, int64_t cells, std::string& error, const float* residual) {
     if (!std::getenv("STRATA_STATE_HASH")) return true;
-    const auto* draft = draft_.slot_state(slot);
+    const core::QsaState empty_draft{};
+    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : &empty_draft;
     if (!draft) { error = "resident draft state missing"; return false; }
     auto& session = *stages_[0].slots[(size_t) slot];
     SessionFingerprint h;

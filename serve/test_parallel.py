@@ -288,6 +288,34 @@ class ParallelService(unittest.TestCase):
         self.assertIsNone(self.engine.proc)
 
 
+    def test_early_close_does_not_release_successor_reservation(self):
+        self.start(2)
+        engine = self.engine
+        engine.slot_busy[1] = True  # peer reservation forces the real BGEN/BDONE path
+        release = engine._release_slot_when_done
+        successor = []
+        def reserve_after_drain(slot, stream=None):
+            release(slot, stream)
+            with engine.slot_cv:
+                chosen = engine.pick_slot([])
+                self.assertEqual(chosen, slot)
+                engine.slot_busy[chosen] = True
+                successor.append(chosen)
+        output = engine.generate_batched(list(b'LONGREPLY'), 64, {}, threading.Event())
+        try:
+            with mock.patch.object(engine, '_release_slot_when_done', side_effect=reserve_after_drain):
+                self.assertIsInstance(next(output), int)
+                self.assertIsInstance(next(output), int)  # first BT after BADM, not admission T
+                output.close()
+            self.assertEqual(len(successor), 1)
+            self.assertTrue(engine.slot_busy[successor[0]], 'old consumer released the successor reservation')
+        finally:
+            for slot in successor:
+                engine.slot_busy[slot] = False
+            engine.slot_busy[1] = False
+            output.close()
+
+
     def test_stop_strings_in_a_batch_slot(self):
         """#454: a stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""
         self.start(2)

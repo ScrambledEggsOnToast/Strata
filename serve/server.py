@@ -1359,9 +1359,6 @@ class StrataEngine:
                     slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # admission held until BDONE
-                    with self.slot_cv:
-                        slot_busy[slot] = False
-                        self.slot_cv.notify_all()
                 else:
                     with self.slot_cv:
                         slot_busy[slot] = False

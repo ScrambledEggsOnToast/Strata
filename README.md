@@ -225,6 +225,13 @@ GPU process. Unsupervised test behavior is unchanged. Attachment and successful
 supervisor cleanup are required in addition to the test's return code; operator
 checks alone do not qualify full-model behavior or untested hardware.
 
+Resident serving without `--mtp` retains private model sessions and cache state,
+but does not save/restore/advance nonexistent draft slots. State diagnostics use
+an empty draft state only in that unloaded configuration; missing state with an
+active MTP drafter remains an error. Batch cancellation releases a slot once,
+after `BDONE`, so a successor's reservation cannot be freed by the old consumer.
+
+
 ## Credits and license
 
 The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was

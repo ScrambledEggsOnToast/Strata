@@ -9181,7 +9181,8 @@ int main(int argc, char** argv) {
                     for (size_t b = 0; b < bs.size(); ++b) {
                         const auto& sl = bs[b];
                         const auto& state = bslot_ss[0][b]->state();
-                        const auto* draft = mtp.slot_state((int) b);
+                        const strata::core::QsaState empty_draft{};
+                        const auto* draft = use_mtp ? mtp.slot_state((int) b) : &empty_draft;
                         strata::program::SessionFingerprint h;
                         if (!draft || !strata::program::session_fingerprint(state, *draft, g,
                                 (int64_t) sl.ids.size(), h, err)) return false;
