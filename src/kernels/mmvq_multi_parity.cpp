@@ -28,6 +28,7 @@
 // reported as that coincidence rather than skipped.  The control needs a row long enough for the two layouts to
 // group blocks differently: IQ4_XS takes 16 blocks per iteration with 4 warps and 8 with 2, so at n_in = 2048 (8
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -211,6 +212,7 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 }  // namespace
 
 int main() {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
 

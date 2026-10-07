@@ -24,6 +24,7 @@
 // Check 5 holds the TWO PATHS together: the table path's float64 host trig and the native path's float32
 // fast-math device trig must answer to the same `RopeScaling`, yarn and none alike, so one cache never
 // mixes two rotations.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -50,6 +51,7 @@ void check(cudaError_t e, const char* what) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;

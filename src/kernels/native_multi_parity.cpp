@@ -8,6 +8,7 @@
 //     output, k = 9 and a null shared row take the scalar one) against a host replay of the documented contract:
 //     the first product rounds to F32, the next ones accumulate with FMA in expert order, the shared row is added
 //     once: memcmp.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 
@@ -48,6 +49,7 @@ std::vector<T> down(const T* d, size_t n) {
 }  // namespace
 
 int main(int argc, char**) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     (void) argc;
     using namespace strata::kernels;
     std::mt19937 rng(783);

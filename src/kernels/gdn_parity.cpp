@@ -18,6 +18,7 @@
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -97,6 +98,7 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;

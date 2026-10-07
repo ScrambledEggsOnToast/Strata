@@ -4,6 +4,7 @@
 // Cells land at scattered positions through a non-identity page table; the K/V rows are random with small, large and
 // all-zero groups. Three layouts: INT8 K and V, Q4_0 K and V, and the K8V4 hybrid's folded call (the K pool passed as
 // both halves, one plane). GPU, synthetic, no model.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -46,6 +47,7 @@ bool same(const void* a, const void* b, size_t bytes) { return std::memcmp(a, b,
 }  // namespace
 
 int main() {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     k::QsaShapes s = k::qsa_real_shapes();
     s.page_size = 64;
     const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / k::KV_Q8_GROUP;

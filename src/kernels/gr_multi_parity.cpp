@@ -4,6 +4,7 @@
 // Real geometry (n_embd 2560, hc 4, hc_lr 320), the pinned native MMVF path, every T = 1..8, with and without an
 // injection weight (a layer read vs the final mixer), and the write both out of place and in place (R_out == R).
 // Each output of the multi call must equal the token-by-token one bit for bit. GPU, synthetic, no model.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/gr.hpp"
 
 #include <cuda_runtime.h>
@@ -52,6 +53,7 @@ uint16_t bf16_of(float f) {
 }  // namespace
 
 int main() {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     const long long n_embd = 2560, hc = 4, hc_lr = 320, hc_dim = hc * n_embd;
     const float eps = 1e-6f;
     std::mt19937 rng(783);

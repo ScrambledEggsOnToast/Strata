@@ -1,5 +1,6 @@
 // Synthetic GPU seam only. Run exclusively through the protected supervisor.
 // Uses production kernels: no weights/model, no substitute host echo.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -189,6 +190,7 @@ int main() {
         int devices = 0;
         const auto status = cudaGetDeviceCount(&devices);
         if (status != cudaSuccess || devices == 0) { std::puts("GPU unavailable: canary seam not run"); return 77; }
+        if (!strata::platform::acknowledge_protected_test()) return 2;
         Fixture f;
         f.init();
         indexer_rollback_test(f.stream);

@@ -4,6 +4,7 @@
 // accepted exactly when greedy decode would have produced them), so every kernel here is checked against the
 // one it stands in for, on random inputs that include -0.0, denormals, NaN, -inf and large values.  The tests
 // follow eddoursul's fork (MIT; verify_parity.cpp), ported to this tree's kernels.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -110,6 +111,7 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) != "--selftest") {
             std::fprintf(stderr, "usage: verify_parity [--selftest]\n");

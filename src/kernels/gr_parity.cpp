@@ -478,37 +478,14 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
 }  // namespace
 
+#include "strata/platform/protected_test.hpp"
 int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else { std::fprintf(stderr, "usage: gr_parity [--selftest]\n"); return 2; }
     }
-#if defined(__linux__)
-    if (const char* supervised = std::getenv("STRATA_SUPERVISED"); supervised && std::strcmp(supervised, "1") == 0) {
-        const char* snapshot = std::getenv("STRATA_ADMISSION_SNAPSHOT");
-        if (!snapshot) { std::fprintf(stderr, "missing protected admission path\n"); return 2; }
-        const std::string path(snapshot);
-        const auto slash = path.find_last_of('/');
-        if (slash == std::string::npos) return 2;
-        const std::string receipt = path.substr(0, slash + 1) + "mps-client";
-        check(cudaFree(nullptr), "initialize protected operator context");
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-        bool released = false;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (FILE* file = std::fopen(receipt.c_str(), "r")) {
-                long pid = 0;
-                released = std::fscanf(file, "%ld", &pid) == 1 && pid == static_cast<long>(getpid());
-                std::fclose(file);
-                if (released) break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (!released) { std::fprintf(stderr, "protected MPS acknowledgement timed out\n"); return 2; }
-        std::printf("protected MPS client acknowledged: %ld\n", static_cast<long>(getpid()));
-        std::fflush(stdout);
-    }
-#endif
+    if (!strata::platform::acknowledge_protected_test()) return 2;
 
     const long long n_embd = 256, hc = 4, hc_lr = 32;
     const long long hc_dim = hc * n_embd;

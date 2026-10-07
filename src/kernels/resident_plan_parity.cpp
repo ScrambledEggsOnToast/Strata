@@ -9,6 +9,7 @@
 // then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
 // sets *plan_err).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -32,6 +33,7 @@ void ck(cudaError_t e, const char* w) {
 }  // namespace
 
 int main() {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     const int K = 10, NE = 512;
     const long long capx = (long long) k::kVerifyMaxT * K;
     const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;

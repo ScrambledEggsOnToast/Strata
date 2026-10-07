@@ -12,6 +12,7 @@
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -337,6 +338,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
