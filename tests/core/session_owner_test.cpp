@@ -7,6 +7,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/platform/protected_test.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
     if (!std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0) {
         std::fprintf(stderr, "--gpu requires the protected supervisor\n"); return 2;
     }
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess) return 1;
     static float rope_canary[1];
