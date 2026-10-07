@@ -25,7 +25,7 @@ struct Api {
 template <class F> bool resolve(const char* name, F& f) {
     cudaDriverEntryPointQueryResult q{};
     void* p = nullptr;
-    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+    if (cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q) != cudaSuccess ||
         q != cudaDriverEntryPointSuccess || p == nullptr)
         return false;
     f = (F) p;
