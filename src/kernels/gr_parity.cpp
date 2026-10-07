@@ -19,6 +19,7 @@
 //      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -33,11 +34,6 @@
 #include <random>
 #include <string>
 #include <vector>
-#if defined(__linux__)
-#include <chrono>
-#include <thread>
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -478,7 +474,6 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
 }  // namespace
 
-#include "strata/platform/protected_test.hpp"
 int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {

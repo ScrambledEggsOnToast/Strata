@@ -211,6 +211,20 @@ The Linux `logits_dump_test` exercises the same production writer with write/flu
 and interruption. A structurally valid dump is a regression artifact, not independent numerical
 qualification of the model, arithmetic, or sampled speculation.
 
+## Protected GPU tests
+
+On Linux, the fork's short-lived GPU parity/canary tests honor `STRATA_SUPERVISED=1`:
+they initialize their own CUDA context and wait up to 60 seconds for the protected
+`mps-client` receipt beside `STRATA_ADMISSION_SNAPSHOT` to name their own PID.
+Missing acknowledgement fails the test before its kernel assertions run. This lets
+the supervisor verify the actual client and its MPS ceiling before it exits.
+
+Launch one GPU executable per protected run. A wrapper must not attach on behalf
+of a child, and a campaign must not replace the acknowledged client with another
+GPU process. Unsupervised test behavior is unchanged. Attachment and successful
+supervisor cleanup are required in addition to the test's return code; operator
+checks alone do not qualify full-model behavior or untested hardware.
+
 ## Credits and license
 
 The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
