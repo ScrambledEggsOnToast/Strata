@@ -210,7 +210,7 @@ public:
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// An operator may tighten the priced 32-key bound, never enlarge it or request an unbounded cache.
-    void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n == 0 ? kVerifyBatchGraphKeys : std::min(n, kVerifyBatchGraphKeys); }
+    void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n == 0 ? kVerifyBatchGraphKeys : std::min<size_t>(n, kVerifyBatchGraphKeys); }
 
     // ---- The stages of a layer split as a PIPELINE. A window carries only the active `rows` of a group.
     // It launches on ONE stage with its commit immediately behind it; the host serves every stage's rings

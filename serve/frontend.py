@@ -625,19 +625,29 @@ class OutputParser:
                 elif not s:
                     self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    self.ticks = self._inline_delimiter(line, self.ticks)
             else:
                 self.line += part
         return text
 
+    @staticmethod
+    def _inline_delimiter(text: str, opened: int) -> int:
+        for match in re.finditer(r"`+", text):
+            width = len(match.group())
+            if not opened:
+                opened = width
+            elif width == opened:
+                opened = 0
+        return opened
+
     def _opener_ok(self) -> bool:
         """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
         inline code."""
-        return not self.fence and not self.line.strip() and self.ticks % 2 == 0
+        return not self.fence and not self.line.strip() and self.ticks == 0
 
     def _in_code(self) -> bool:
         """The text so far leaves the next character inside a code fence or inline code."""
-        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+        return bool(self.fence) or bool(self._inline_delimiter(self.line, self.ticks))
 
     def _release(self, deliver: bool) -> list[Event]:
         """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""

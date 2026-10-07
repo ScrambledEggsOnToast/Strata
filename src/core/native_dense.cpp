@@ -268,7 +268,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
                 // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
+                if (selects(tensor, include_ple_key, layer_lo, layer_hi) &&
                     strata::kernels::native_mmvq_supported(tensor.type))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }

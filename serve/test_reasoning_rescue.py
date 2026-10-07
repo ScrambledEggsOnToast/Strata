@@ -73,6 +73,23 @@ class Corpus(unittest.TestCase):
         self.assertEqual((len(SPECIMENS), sum(bool(s["calls"]) for s in SPECIMENS)), (37, 16))
 
 
+class InlineCodeDelimiters(unittest.TestCase):
+    def test_multi_backtick_examples_never_emit_tool_events(self):
+        for delimiter in ("``", "````"):
+            text = delimiter + " example ` " + CALL + delimiter
+            for thinking in (False, True):
+                for width in WIDTHS:
+                    with self.subTest(delimiter=delimiter, thinking=thinking, width=width):
+                        parser = OutputParser(thinking=thinking, tools=SCHEMA, stream_tools=True)
+                        events = []
+                        step = width or 3
+                        for start in range(0, len(text), step):
+                            events += parser.feed(text[start:start + step])
+                        events += parser.finish("stop")
+                        self.assertFalse(any(event.kind.startswith("tool") for event in events))
+                        self.assertEqual("".join(event.text for event in events), text)
+
+
 class Gates(unittest.TestCase):
     def check(self, text, expect, finish=None, tools=SCHEMA):
         for width in WIDTHS:

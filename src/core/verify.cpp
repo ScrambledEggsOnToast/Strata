@@ -2534,7 +2534,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
     const uint64_t tail_bytes = (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4;
     const uint64_t controls = (a + tail_bytes + 255) & ~255ull;
-    if (cudaMalloc(&d, controls + (uint64_t) kVerifyMaxT * (4096 + 1) * sizeof(int32_t)) != cudaSuccess) {
+    if (cudaMalloc(&d, controls + (uint64_t) strata::kernels::kVerifyMaxT * (4096 + 1) * sizeof(int32_t)) != cudaSuccess) {
         cudaFreeHost(h_commitb_);
         h_commitb_ = m_commitb_ = nullptr;
         batch_pinned_bytes_ = 0;
@@ -2542,14 +2542,14 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     arena_b_ = d;
-    batch_device_bytes_ = controls + (uint64_t) kVerifyMaxT * (4096 + 1) * sizeof(int32_t);
+    batch_device_bytes_ = controls + (uint64_t) strata::kernels::kVerifyMaxT * (4096 + 1) * sizeof(int32_t);
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_context
     steering_b_ = (int32_t*) ((uint8_t*) d + controls);
-    history_b_ = steering_b_ + kVerifyMaxT;
-    history_stage_b_.resize((size_t) kVerifyMaxT * 4096, -1);
+    history_b_ = steering_b_ + strata::kernels::kVerifyMaxT;
+    history_stage_b_.resize((size_t) strata::kernels::kVerifyMaxT * 4096, -1);
     for (int i = 0; i < S; ++i) slot_steering_[i] = 1;
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
@@ -3146,7 +3146,7 @@ bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tok
     (void) cudaStreamQuery(cs_);
     b_running_ = true;
     b_k_ = 0;
-    b_steps_ = all_resident_ ? 0 : le_ - lb_;
+    b_steps_ = ar_on() ? 0 : le_ - lb_;
     b_last_ = Clock::now();
     guard.keep = true; // batch_poll now holds the lease until both streams drain
     return true;

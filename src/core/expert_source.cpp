@@ -2674,8 +2674,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // over the primary's link instead (2x RX 6900 XT, IQ3_S, --remote-expert-opt with the probed share 0.39: ~4
         // helper experts per layer-window moved to PCIe, 59 ms per window against 34 ms)
         auto helper_holds = [&](int32_t e) {
-            for (int r = 0; r < d.remote_count; ++r)
-                if (d.remote[r]->holds(d.layers, e)) return true;
+            for (auto* remote : d.remote)
+                if (remote->holds(d.layers, e)) return true;
             return false;
         };
         for (int64_t i = 0; i < n; ++i) {

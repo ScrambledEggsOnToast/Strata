@@ -375,6 +375,8 @@ int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_p
     (void) expert_path;
     return 0;
 #endif
+}
+
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
 // LOOKUP_PON, PRESTAGE, AGREE, SNAP_OVERLAP) is read only with STRATA_PIPELINE_DEBUG=1; without it the defaults apply.
 static const char* pipe_dbg_env(const char* name) {
@@ -5741,8 +5743,8 @@ int main(int argc, char** argv) {
     const bool disjoint_adapt = [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
     auto helper_holds = [&](int64_t l, int32_t e) -> bool {
         if (!disjoint_adapt) return false;
-        for (int r = 0; r < drive.d.remote_count; ++r)
-            if (drive.d.remote[r]->holds(l, e)) return true;
+        for (auto* remote : drive.d.remote)
+            if (remote->holds(l, e)) return true;
         return false;
     };
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
@@ -11238,7 +11240,7 @@ int main(int argc, char** argv) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
-                    if (sfx_on) sfx.append(outv[(size_t) i]);
+                    if (o.suffix_draft > 0 || o.lookup_chain > 0) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
