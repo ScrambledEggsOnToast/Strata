@@ -22,6 +22,7 @@ using namespace strata;
 struct PoolProbe {
     core::PoolMultiFn forward = nullptr;
     void* user = nullptr;
+    core::ExpertDispatch* dispatch = nullptr;
     int64_t width = 0;
     int missing = -1;
     int layers = 0, completions = 0, missed_rows = 0;
@@ -50,6 +51,10 @@ struct PoolProbe {
         } else if (layer == -1) {
             if (count != 0 || group != -1 || ++probe.completions != 1) {
                 probe.error = "unexpected final consumer acknowledgement";
+                return false;
+            }
+            if (probe.layers && !probe.dispatch->completion[0].active()) {
+                probe.error = "missing actual expert-consumer ownership before acknowledgement";
                 return false;
             }
         }
@@ -105,7 +110,7 @@ int residency_model_checks(const strata::core::WeightTable& weights, const strat
                 "fixture requires the real Flash-Next layer-zero GDN geometry");
         require(main.layer_lo == 0 && main.layer_hi == geometry.n_layers && main.max_cells >= 2 &&
                 a.gdn_state && b.gdn_state && pool && dispatch.pool && dispatch.src &&
-                dispatch.remote.empty() && dispatch.workers.empty() && !dispatch.peer && !dispatch.failed &&
+                dispatch.worker_contract && dispatch.remote.empty() && dispatch.workers.empty() && !dispatch.peer && !dispatch.failed &&
                 device_residency && residency.size() == (size_t) (geometry.n_layers * geometry.n_expert),
                 "initialized single-device real-model/session/pool prerequisites");
         for (const auto& completion : dispatch.completion)
@@ -184,11 +189,23 @@ int residency_model_checks(const strata::core::WeightTable& weights, const strat
         auto window = [&](core::Verifier& verifier, const char* phase, int64_t position, int missing,
                           int expected_layers, Observation* observation) {
             PoolProbe probe;
-            probe.forward = pool; probe.user = user; probe.width = geometry.n_expert; probe.missing = missing;
+            probe.forward = pool; probe.user = user; probe.dispatch = &dispatch;
+            probe.width = geometry.n_expert; probe.missing = missing;
             const int64_t positions[2] = {position, position};
             const int64_t cpu_before = dispatch.multi_misses;
-            require(verifier.batch_launch(0, rows, 2, position == 0 ? first : second, positions, error),
-                    "launch real batch stage and commit");
+            auto fail_drained = [&](const char* message) {
+                verifier.diag(stderr);
+                if (!verifier.release_gpu_waits(5000)) {
+                    std::fprintf(stderr, "RESIDENCY_MODEL_CHECKS failures=1 phase=%s undrained=1 error=%s\n",
+                                 phase, error.c_str());
+                    std::fflush(stderr);
+                    std::_Exit(1);
+                }
+                pool(user, nullptr, nullptr, 0, main.k, nullptr, -2, nullptr, nullptr, -1, 0);
+                require(false, message);
+            };
+            if (!verifier.batch_launch(0, rows, 2, position == 0 ? first : second, positions, error))
+                fail_drained("launch real batch stage and commit");
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             int result = 0;
             do {
@@ -198,17 +215,8 @@ int residency_model_checks(const strata::core::WeightTable& weights, const strat
                 else break;
             } while (true);
             if (result != 1) {
-                verifier.diag(stderr);
-                const bool drained = verifier.release_gpu_waits(5000);
-                if (drained) pool(user, nullptr, nullptr, 0, main.k, nullptr, -2, nullptr, nullptr, -1, 0);
-                else {
-                    std::fprintf(stderr, "RESIDENCY_MODEL_CHECKS failures=1 phase=%s undrained=1 error=%s\n",
-                                 phase, error.c_str());
-                    std::fflush(stderr);
-                    std::_Exit(1); // never destroy storage still reachable by a GPU consumer
-                }
                 if (result == 0) error = "five-second batch_poll deadline expired (no forced completion accepted)";
-                require(false, "bounded production batch completes");
+                fail_drained("bounded production batch completes");
             }
             if (!probe.error.empty()) error = probe.error;
             require(probe.layers == expected_layers && probe.completions == 1 && probe.error.empty(),

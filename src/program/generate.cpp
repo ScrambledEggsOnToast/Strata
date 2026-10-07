@@ -7006,9 +7006,9 @@ int main(int argc, char** argv) {
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
 #ifdef STRATA_RESIDENCY_MODEL_TEST
     if (!o.serve || !stages.empty() || !split_devs.empty() || bslot_ss.size() != 1 ||
-        bslot_ss[0].size() != 2 || o.spec < 2 || o.no_pool || !mps_ceiling.declared ||
+        bslot_ss[0].size() != 2 || o.spec < 2 || o.no_pool || !o.expert_worker_contract || !mps_ceiling.declared ||
         !std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0) {
-        std::fprintf(stderr, "residency regression requires protected MPS single-device --serve --batch 2 --spec >= 2 startup\n");
+        std::fprintf(stderr, "residency regression requires protected MPS single-device --serve --batch 2 --spec >= 2 --expert-worker-contract startup\n");
         return 2;
     }
     return residency_model_checks(wt, g, ss, bslot_ss[0][0]->state(), bslot_ss[0][1]->state(),
