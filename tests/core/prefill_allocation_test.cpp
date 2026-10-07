@@ -21,6 +21,7 @@ namespace {
 // The allocator's one rounding rule, documented on AllocationBytes: every payload costs
 // ceil(payload / 256) * 256 + 256 (alignment plus guard), so consumers can price single buffers.
 uint64_t allocation(uint64_t payload) { return (payload + 511) & ~UINT64_C(255); }
+uint64_t owned(uint64_t payload) { return (payload + (2ull << 20) - 1) & ~((2ull << 20) - 1); }
 int failures = 0;
 void check(bool ok, const char* what) {
     if (!ok) { std::fprintf(stderr, "%s\n", what); ++failures; }
@@ -52,8 +53,9 @@ int main() {
 
     // ---- works before SessionState allocation, and is a pure function of its inputs.
     check(estimate(b), "standalone sizing without initialized session/weights");
-    check(b.standalone_device == b.loanable_device + b.owned_device,
-          "standalone does not assume a cache loan");
+    check(b.standalone_device == prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, c.ring,
+          experts.max_blob, 0, true) + b.owned_device,
+          "standalone prices owned facts sequence plus raw independent allocations");
     check(b.loanable_device > 0 && b.owned_device > 0, "both regions are populated");
 
     // Fixed host payload includes the mapped bounds tail even with MMQ off; dynamic jobs are separate.
@@ -62,16 +64,20 @@ int main() {
           "non-MMQ host payload includes the mapped bounds tail");
 
     // ---- a loan never covers the token ids: they are owned even in the plainest configuration.
-    check(b.owned_device == allocation((uint64_t) c.chunk * 4), "owned token-id allocator count");
+    check(b.owned_device == owned((uint64_t) c.chunk * 4), "raw token allocation uses 2 MiB granules");
 
     // ---- each streaming ring slot is one aligned expert-blob slot (the ring contract admission lends by).
     c.ring = 16;
     check(estimate(other), "expanded ring sizing");
     check(other.loanable_device - b.loanable_device == 8 * allocation(experts.max_blob),
           "each ring slot includes its own guard/alignment");
-    check(other.standalone_device == other.loanable_device + other.owned_device,
-          "ring growth keeps the standalone identity");
+    check(other.standalone_device == prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, c.ring,
+          experts.max_blob, 0, true) + other.owned_device,
+          "owned ring is a single guarded take");
     c.ring = 8;
+    const uint64_t ring_base = prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, 0, 1, 0, true);
+    const uint64_t ring_one = prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, 8, 1, 0, true);
+    check(ring_one - ring_base == owned(allocation(8)), "eight tiny owned ring slots consume one granule, not eight");
 
     // ---- a loan sized for the largest chunk covers every smaller relayout of the same configuration.
     c.chunk = 8192;
@@ -93,22 +99,23 @@ int main() {
     const uint64_t fp16_stage = 2 * allocation(rows * (uint64_t) g.head_dim * 2);
     check(other.loanable_device - b.loanable_device == fp16_stage,
           "logical pages, not resident KV slots, size streamed stage");
-    check(other.owned_device - b.owned_device == allocation((uint64_t) c.n_pages * 4),
+    check(other.owned_device - b.owned_device == owned((uint64_t) c.n_pages * 4),
           "identity table always owned");
-    check(other.standalone_device == other.loanable_device + other.owned_device,
-          "streamed stage keeps the standalone identity");
+    check(other.standalone_device == prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, c.ring,
+          experts.max_blob, 0, true) + other.owned_device,
+          "streamed stage uses owned facts sequence");
     const prefill::AllocationBytes streamed = other;
 
-    // STRATA_KV_STAGE_OWN: the same stage moves from the loan to the owned region.  Standalone is unchanged
-    // (a partial loan cannot price the full region as borrowed), and the loan shrinks by exactly the stage.
+    // STRATA_KV_STAGE_OWN moves stage buffers from guarded borrowing to independent 2 MiB pages.
     c.kv_stage_own = true;
     check(estimate(other), "separate stage sizing");
     check(other.standalone_device == streamed.standalone_device,
           "separate stage is never omitted from standalone peak");
     check(other.loanable_device + fp16_stage == streamed.loanable_device,
           "separate stage cannot be deducted as a loan");
-    check(other.owned_device == streamed.owned_device + fp16_stage,
-          "stage allocation moves exactly to owned total");
+    const uint64_t owned_fp16_stage = 2 * owned(allocation(rows * (uint64_t) g.head_dim * 2));
+    check(other.owned_device == streamed.owned_device + owned_fp16_stage,
+          "stage allocation moves to independent owned page demand");
     c.kv_stage_own = false;
 
     // ---- KV formats price their documented per-head bytes (INT8: codes + one FP16 scale per 64).
@@ -123,6 +130,14 @@ int main() {
     check(other.loanable_device - b.loanable_device ==
           2 * allocation(rows * kernels::kv_q4_bytes_per_head((int) g.head_dim)),
           "Q4 stage block bytes counted");
+    c.kv_q4 = false;
+    c.kv_hybrid = true;
+    check(estimate(other), "K8V4 stage sizing");
+    check(other.loanable_device - b.loanable_device ==
+          allocation(rows * (uint64_t) g.head_dim) + allocation(rows * (uint64_t) (g.head_dim / 64) * 2) +
+          allocation(rows * kernels::kv_q4_bytes_per_head((int) g.head_dim)),
+          "K8V4 counts K codes/scales and V Q4 blocks separately");
+    c.kv_hybrid = false;
     c.kv_q4 = false;
     c.kv_mode = 0;
 
@@ -165,6 +180,8 @@ int main() {
     c.chunk = 64;
     experts.max_blob = std::numeric_limits<uint64_t>::max() - 511;
     check(!estimate(other) && other.standalone_device == 0, "ring accumulation overflow fails closed");
+    check(prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, 8, experts.max_blob, 0, true) == UINT64_MAX,
+          "public owned facts counter independently refuses ring multiplication overflow");
     experts.max_blob = kernels::cpu::BLOB;
     c.n_pages -= 1;
     check(!estimate(other), "undersized logical page configuration rejected");
@@ -194,8 +211,9 @@ int main() {
     }
     c.mmq = true;
     check(estimate(b), "full-model IQ3_S geometry qualifies without session allocation");
-    check(b.standalone_device == b.loanable_device + b.owned_device,
-          "MMQ configuration keeps the standalone identity");
+    check(b.standalone_device == prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, c.ring,
+          experts.max_blob, 0, true) + b.owned_device,
+          "MMQ uses owned facts sequence plus raw independent allocations");
     if (prefill::mmq::built()) {
         uint64_t workspace = 0;
         check(prefill::mmq::workspace_bytes(c.device_cc, c.device_sms, c.device_shared_bytes, workspace) &&

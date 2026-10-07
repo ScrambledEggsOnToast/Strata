@@ -39,9 +39,9 @@ inline bool resident_bytes(uint64_t slots, uint64_t cells, uint64_t nq, uint64_t
     out.checkpoints = slots * session_device; // full arena bounds one state-only checkpoint
     const uint64_t commit = slots * (2 + kResidentMaxSlots) * sizeof(int32_t);
     out.verifier_device = align256(align256(commit) + slots * std::max<uint64_t>(nq, 1) * tail_floats * 4)
-                          + slots * (4096 + 1) * sizeof(int32_t);
+                          + kResidentMaxSlots * (4096 + 1) * sizeof(int32_t);
     out.verifier_pinned = commit + 16;
-    out.verifier_history = slots * 4096 * sizeof(int32_t);
+    out.verifier_history = kResidentMaxSlots * 4096 * sizeof(int32_t);
     out.mtp_device = mtp ? slots * draft_device : 0;
     out.mtp_pinned = mtp ? slots * draft_pinned : 0;
     out.mtp_owner = mtp ? slots * (kResidentQsaBytes + 3 * sizeof(uint64_t)) : 0;

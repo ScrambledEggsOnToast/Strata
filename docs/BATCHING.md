@@ -209,8 +209,11 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 
 ## Limits (for now)
 
-- Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps
-  its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
+- Batch windows carry no MTP drafts by default. `--batch-mtp` (or `STRATA_BATCH_MTP=1`) enables one proposal
+  per resident request on a single GPU. At most four requests occupy the eight-row verifier quantum; a rotating
+  cursor services larger slot sets. Each request retains its private draft KV and uses the one serialized MTP
+  scratch/head/weight owner. A proposal is kept only when the independently sampled target equals it; target
+  Philox counters and per-row penalty histories remain request-local. This is not coupled draft sampling.
 - Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
   beyond the bound refuses before capture; live graphs are not evicted.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
@@ -218,6 +221,22 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - Admissions are one at a time: two new long prompts are read one after the other.
 - `--batch-groups` needs every stage on its own GPU; a pipelined slot is not kept as a conversation cache.
 - Additional resident slots require fully resident FP16 KV; each requested slot is charged before allocation.
+
+### Allocation and optional upstream modes
+
+The owned prefill ring is one allocation. Every guarded owned buffer is charged in 2 MiB granules; raw token
+and streaming identity allocations are independently rounded to that granule. Borrowed cache buffers retain
+their 256-byte alignment/guards, and host staging/direct-read rings do not inherit device-page rounding.
+Both prices use the same facts counter as the actual allocation sequence.
+
+New allocation-bearing opt-ins remain off by default. Elastic KV growth, pipelined windows, asynchronous
+adaptive refill, MTP Q4 conversion, and quantization-fusion workspace report unknown admission demand and
+refuse until their allocation peaks are qualified. Their upstream implementation is retained; refusal is not
+permission to silently fall back to a different requested mode. Batch-MTP prices its full eight-row verifier
+arena through the same layout routine used by `Verifier::init`, in addition to private slot resources and
+the existing opaque graph-storage allowance. Kernel exactness/performance still require parent-project
+qualification; source integration is not runtime evidence.
+
 
 ## Historical upstream measurements (not fork qualification)
 

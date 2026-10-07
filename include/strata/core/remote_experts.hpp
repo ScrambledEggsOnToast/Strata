@@ -40,6 +40,8 @@ public:
     bool begin(const ExpertWork& work, std::string& err) override;
     uint64_t residency_version() const override { return residency_version_; }
     bool owns(int64_t index) const override { return index >= 0 && (size_t) index < owned_.size() && owned_[(size_t) index] != 0; }
+    /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
+    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     bool finish(float* out, std::string& err) override;
     bool cancel(std::string& err) override;

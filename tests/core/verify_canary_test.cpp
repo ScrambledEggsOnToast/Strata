@@ -35,7 +35,7 @@ struct Fixture {
     Staging *h = nullptr, *m = nullptr;
     Device* d = nullptr;
     cudaStream_t stream = nullptr;
-    cudaGraphExec_t exec[3] = {};
+    cudaGraphExec_t exec[4] = {};
     ~Fixture() {
         if (stream) cudaStreamSynchronize(stream);
         for (auto e : exec) if (e) cudaGraphExecDestroy(e);
@@ -54,26 +54,26 @@ struct Fixture {
         for (int j = 256; j < 512; ++j) direction[(size_t) j] = 1.0f;
         REQUIRE(cvec_upload(direction, scales, 1, 1, 1, 256, 1, err));
         cvec_set_enabled(false); // row flags must override even the disabled global flag
-        // Captured correct mapping, swapped window mapping, swapped commit mapping.
-        for (int variant = 0; variant < 3; ++variant) {
+        // Correct mapping, swapped window, swapped commit, and two consecutive rows owned by slot zero.
+        for (int variant = 0; variant < 4; ++variant) {
             CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
             copy_i32_from_mapped(d->token, m->token, 2, stream);
             copy_i32_from_mapped(d->position, m->position, 2, stream);
             // Steering is deliberately uploaded independently before replay, as in Verifier.
             for (int t = 0; t < 2; ++t) {
-                const int slot = variant == 1 ? 1 - t : t;
+                const int slot = variant == 3 ? 0 : variant == 1 ? 1 - t : t;
                 verify_canary_begin(m->input + t, d->owners + slot, slot, d->token + t,
                     d->position + t, d->steering + t, d->scratch + t, stream);
             }
             cvec_apply(d->residual, 1, 2, 256, nullptr, 0, nullptr, 0, false, stream, d->steering);
             for (int t = 0; t < 2; ++t) {
-                const int slot = variant == 1 ? 1 - t : t;
+                const int slot = variant == 3 ? 0 : variant == 1 ? 1 - t : t;
                 verify_canary_finish(m->input + t, d->owners + slot, slot, d->token + t,
                     d->position + t, d->steering + t, d->scratch + t, m->picked + t,
                     m->output + t, 1, stream);
             }
             for (int t = 0; t < 2; ++t) {
-                const int slot = variant == 2 ? 1 - t : t;
+                const int slot = variant == 3 ? 0 : variant == 2 ? 1 - t : t;
                 verify_canary_finish(m->input + t, d->owners + slot, slot, d->token + t,
                     d->position + t, d->steering + t, d->scratch + t, m->picked + t,
                     m->committed + t, 2, stream);
@@ -133,8 +133,11 @@ void indexer_rollback_test(cudaStream_t stream) {
     const auto shape = qsa_real_shapes();
     const RopeScaling scaling;
     const auto buffers = [](State* s) { return QsaIndexerBuffers{s->tail, s->dead, s->pooled, &s->block_pos}; };
-    const auto append = [&](State* s, int first, int end) {
-        for (int i = first; i < end; ++i)
+    const auto append = [&](State* s, int first, int end, bool steps = false) {
+        if (steps) {
+            native_qsa_indexer_append_steps(device->raw + first * D, device->positions + first, 1, end - first,
+                                           0, device->gamma, 1e-6f, buffers(s), shape, CELLS, scaling, stream);
+        } else for (int i = first; i < end; ++i)
             native_qsa_indexer_append(device->raw + i * D, device->positions + i, 0,
                                       device->gamma, 1e-6f, buffers(s), shape, CELLS, scaling, stream);
     };
@@ -160,9 +163,9 @@ void indexer_rollback_test(cudaStream_t stream) {
         append(&device->reference, 0, cells);
         append(&device->candidate, 0, first);
         CUDA_OK(cudaMemcpyAsync(device->saved_tail, device->candidate.tail, sizeof(host.saved_tail), cudaMemcpyDeviceToDevice, stream));
-        append(&device->candidate, first, first + width);
+        append(&device->candidate, first, first + width, true);
         CUDA_OK(cudaMemcpyAsync(device->candidate.tail, device->saved_tail, sizeof(host.saved_tail), cudaMemcpyDeviceToDevice, stream));
-        append(&device->candidate, first, cells);
+        append(&device->candidate, first, cells, true);
         CUDA_OK(cudaStreamSynchronize(stream));
         CUDA_OK(cudaMemcpy(&host.reference, &device->reference, sizeof(State), cudaMemcpyDeviceToHost));
         CUDA_OK(cudaMemcpy(&host.candidate, &device->candidate, sizeof(State), cudaMemcpyDeviceToHost));
@@ -178,7 +181,7 @@ void indexer_rollback_test(cudaStream_t stream) {
         REQUIRE(equal(host.reference, host.candidate, cells));
     }
     REQUIRE(negative_controls == 2);
-    std::puts("indexer rollback: 7 exact states, 2 failing-before controls, captured commit passed");
+    std::puts("indexer rollback: batched append versus independent per-cell states, 2 failing-before controls, captured commit passed");
 }
 
 int main() {
@@ -213,6 +216,18 @@ int main() {
         f.h->input[0].request_id = f.h->owners[0].request_id = 303;
         f.upload_controls(); f.replay(0);
         REQUIRE(verify_canary_matches(f.h->output[0], f.h->input[0], 1));
+        f.stage(3);
+        f.h->input[1].request_id = f.h->input[0].request_id;
+        f.h->input[1].slot = 0;
+        f.h->input[1].steering = f.h->steering[1] = 0;
+        f.upload_controls(); f.replay(3);
+        for (int t = 0; t < 2; ++t) {
+            REQUIRE(verify_canary_matches(f.h->output[t], f.h->input[t], 1));
+            REQUIRE(verify_canary_matches(f.h->committed[t], f.h->input[t], 2));
+        }
+        ++f.h->token[1]; f.replay(3);
+        REQUIRE(verify_canary_matches(f.h->output[0], f.h->input[0], 1));
+        REQUIRE(!verify_canary_matches(f.h->output[1], f.h->input[1], 1));
         f.stage(3); f.upload_controls(); f.replay(1);
         REQUIRE(!verify_canary_matches(f.h->output[0], f.h->input[0], 1));
         f.replay(2);

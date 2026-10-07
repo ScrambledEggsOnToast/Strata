@@ -28,11 +28,15 @@ namespace {
 /// The allocator's one rounding rule, from prefill.cpp's `Alloc::take`: every payload costs
 /// ceil(payload / 256) * 256 + 256 (alignment plus guard).
 uint64_t alloc_bytes(uint64_t payload) { return (payload + 511) & ~UINT64_C(255); }
+uint64_t owned_bytes(uint64_t payload) {
+    constexpr uint64_t granule = 2ull << 20;
+    return (payload + granule - 1) / granule * granule;
+}
 
 }  // namespace
 
 bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
-                                AllocationConfig& out, std::string& err) {
+                                AllocationConfig& out, std::string& err, bool kv_hybrid) {
     out = {};
     err.clear();
     // The artifact's fixed geometry gives its own bounds; these are the admission-side index limits: every
@@ -42,7 +46,7 @@ bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, b
         err = "prefill: context/chunk exceeds supported index range";
         return false;
     }
-    if (kv_mode < 0 || kv_mode > 2 || (kv_int8 && kv_q4)) {
+    if (kv_mode < 0 || kv_mode > 2 || (int) kv_int8 + (int) kv_q4 + (int) kv_hybrid > 1) {
         err = "prefill: invalid KV configuration";
         return false;
     }
@@ -52,6 +56,7 @@ bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, b
     out.kv_mode = kv_mode;
     out.kv_int8 = kv_int8;
     out.kv_q4 = kv_q4;
+    out.kv_hybrid = kv_hybrid;
     out.kv_stage_own = kv_stage_own_env();
     out.gr_unfused = gr_unfused_env();
     out.ring = (int) ring_slots_for(chunk);
@@ -89,7 +94,7 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
         g.ssm_d_conv != 4 || g.n_head != 24 || g.n_head_kv != 2 || g.head_dim != 256 || g.idx_q_heads != 4 ||
         g.idx_key_dim != 128 || c.max_cells <= 0 || c.max_cells > INT32_MAX || c.chunk <= 0 ||
         c.chunk > INT32_MAX / 10 || c.n_pages != (c.max_cells + 3) / 4 || c.kv_mode < 0 || c.kv_mode > 2 ||
-        (c.kv_int8 && c.kv_q4) || c.ring < 8 || c.ring > ring_hard_cap() || c.stager_ring < 2 ||
+        ((int) c.kv_int8 + (int) c.kv_q4 + (int) c.kv_hybrid > 1) || c.ring < 8 || c.ring > ring_hard_cap() || c.stager_ring < 2 ||
         c.stager_ring > 256 || c.layer_begin < 0 || c.layer_begin >= end || end > g.n_layers ||
         experts.n_layers != g.n_layers || experts.n_expert != g.n_expert ||
         (experts.native && (experts.fmt.size() != (size_t) g.n_layers ||
@@ -126,16 +131,16 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
         return false;
     }
     out.loanable_device = bytes_needed_from(g, c.facts(), c.chunk, c.ring, blob, c.kv_stage_own ? 1 : 0);
-    if (out.loanable_device == 0) {
+    if (out.loanable_device == 0 || out.loanable_device == UINT64_MAX) {
         err = "prefill: the allocation count overflowed";
         return false;
     }
     // Owned device: the token ids, the streaming identity page table, and an owned KV stage when the stage owns
     // it (the loan counter deliberately excludes the last: it is not lent).
     const uint64_t max = std::numeric_limits<uint64_t>::max();
-    uint64_t owned = alloc_bytes((uint64_t) c.chunk * sizeof(int32_t));
+    uint64_t owned = owned_bytes((uint64_t) c.chunk * sizeof(int32_t));
     if (c.kv_mode == 1) {
-        const uint64_t table = alloc_bytes((uint64_t) c.n_pages * sizeof(int32_t));
+        const uint64_t table = owned_bytes((uint64_t) c.n_pages * sizeof(int32_t));
         if (owned > max - table) {
             err = "prefill: owned device count overflow";
             return false;
@@ -155,7 +160,13 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
         return false;
     }
     out.owned_device = owned;
-    out.standalone_device = out.loanable_device + owned;
+    const uint64_t standalone = bytes_needed_from(g, c.facts(), c.chunk, c.ring, blob,
+                                                 c.kv_stage_own ? 1 : 0, true);
+    const uint64_t separate = owned - (c.kv_stage_own ? owned_stage_bytes(g, c.facts()) : 0);
+    if (standalone > max - separate) {
+        err = "prefill: standalone allocation count overflow"; return false;
+    }
+    out.standalone_device = standalone + separate;
     out.mmq_workspace = 0;
     if (c.mmq && mmq::built() &&
         !mmq::workspace_bytes(c.device_cc, c.device_sms, c.device_shared_bytes, out.mmq_workspace)) {

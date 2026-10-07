@@ -38,6 +38,7 @@ struct ResidentSlot {
     kernels::SamplerParams sampling;
     uint64_t request = 0;
     int32_t x = 0;
+    int32_t draft = -1;
     int64_t p = 0, produced = 0, max_new = 0;
     std::chrono::steady_clock::time_point t0;
     std::vector<int32_t> ids;
@@ -53,6 +54,7 @@ struct ResidentSlot {
 struct ResidentAdmission {
     int32_t next_token = 0;
     const core::ConversationCheckpoint* checkpoint = nullptr;
+    const float* residual = nullptr;
 };
 
 // One host submitter, the same as Verifier. Scheduling and protocol emission
@@ -89,6 +91,7 @@ public:
     bool resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error);
     // Called only for a GPU-committed row. No state migration or allocation.
     bool committed(int slot, int32_t next, const float* residual, std::string& error, bool observe = true);
+    bool propose(int slot, const float* residual, std::string& error);
     bool finish(int slot, bool keep_cache, std::string& error, bool diagnostic = true);
 private:
     enum class Resources { released, ready, failed };

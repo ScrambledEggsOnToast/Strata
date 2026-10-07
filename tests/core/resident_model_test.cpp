@@ -5,6 +5,7 @@
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/verify.hpp"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,11 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
     };
     try {
+        const uint64_t w4 = core::Verifier::planned_device_bytes(geometry, main.max_cells, 150000, 4);
+        const uint64_t w8 = core::Verifier::planned_device_bytes(geometry, main.max_cells, 150000, 8);
+        require(w4 > 0 && w8 > w4 && w8 != UINT64_MAX, "full eight-row verifier uses bounded actual arena sequence");
+        require(core::Verifier::planned_device_bytes(geometry, main.max_cells, 150000, 9) == UINT64_MAX,
+                "pricing refuses unsupported window width");
         const std::vector<int64_t> prompt{11, 22, 33, 44};
         const std::vector<int32_t> prefix{11, 22};
         program::ResidentRequest request;

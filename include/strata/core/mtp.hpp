@@ -53,6 +53,21 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
+    /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
+    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
+    bool hnorm_per_stream() const { return hnorm_stream_; }
+    /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
+    /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
+    /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
+    void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
+    /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
+    /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
+    void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
+    /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
+    static bool top2_env();
+    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
+    int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -72,8 +87,14 @@ public:
     bool prepare_graphs(std::string& err);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
-    /// the token at position cell+1).  Runs in batches of up to max_t rows.
-    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    /// the token at position cell+1).  Runs in batches of up to max_t rows.  `sync` false: returns without waiting
+    /// for the drafter's stream (the caller orders on it: `stream()`).
+    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                 bool sync = true);
+    /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
+    /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
+    bool prepare_prefill(std::string& err);
+    cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -96,6 +117,31 @@ public:
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
     bool coupled() const { return coupled_active_; }
 
+    // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
+    // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
+    // a window already in flight), each output read once the event after its step has completed.
+    /// Before `load`: the round/step graphs get the forcing kernel (a no-op while its token is -1), and the drafter's
+    /// stream the highest priority (STRATA_MTP_PRIORITY=0: the default priority).
+    void set_force_capture(bool on) { force_on_ = on; }
+    /// The rows the next round reads (null: the bound `window_R`), copied into the bound buffer before the round.
+    void set_source_R(const float* rows) { src_R_ = rows; }
+    /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
+    bool prepare_chain(std::string& err);
+    /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
+    /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
+    /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
+    bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
+                      int n_early, std::string& err);
+    /// 1: every output is in chain_tok()/chain_prob(); 0: still running; -1: an error.
+    int chain_poll(std::string& err);
+    /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed in
+    /// chain_tok()/chain_prob(); -1: an error.  A window's size is often decided by its first outputs (a draft below
+    /// spec_min_p ends it), so the next launch need not wait for all of them.
+    int chain_outputs_ready(std::string& err);
+    bool chain_live() const { return chain_live_; }
+    const int32_t* chain_tok() const { return chain_tok_; }
+    const float* chain_prob() const { return chain_prob_; }
+
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
@@ -107,11 +153,7 @@ public:
     bool bind_request(int slot, uint64_t request, std::string& err);
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
-    bool idle(std::string& err) {
-        const OnDevice on_device(device_);
-        if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
-        return true;
-    }
+    bool idle(std::string& err);
     /// Lifecycle preflight: unlike idle(), also rejects an owned/poisoned lease.
     bool context_idle(std::string& err);
 
@@ -122,6 +164,9 @@ public:
     bool restore_slot(int slot, int64_t cells, std::string& err);
     bool advance_slot(int slot, const float* residual, int32_t next_token,
                       int64_t cell, std::string& err);
+    void set_batch_drafting(bool on) { batch_drafting_ = on; }
+    bool propose_slot(int slot, const float* residual, int32_t next_token, int64_t cell,
+                      int32_t& proposal, std::string& err);
     const QsaState* slot_state(int slot) const;
 
 private:
@@ -135,6 +180,7 @@ private:
         ~Operation();
         explicit operator bool() const { return acquired_; }
         bool finish(std::string& err);
+        void detach() { finished_ = true; owner_.async_owned_ = true; }
     private:
         MtpDrafter& owner_;
         bool acquired_ = false, finished_ = false;
@@ -150,6 +196,14 @@ private:
                         const QsaState* state = nullptr);
     bool prepare_slots(std::string& err);
     bool check_input_graphs(std::string& err); // opt-in protected qualification, before any request
+    /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
+    /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
+    bool record_front(int T, int row0, cudaStream_t cs, std::string& err, const QsaState* state = nullptr);
+    /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
+    /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
+    bool record_rest(int step_row, cudaStream_t cs, std::string& err, const QsaState* state = nullptr);
+    void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs,
+                   const QsaState* state = nullptr);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
@@ -179,6 +233,30 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    bool hnorm_stream_ = false;
+    bool q4_ = false, q4_head_ = false;
+    uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
+    std::vector<std::pair<std::string, uint64_t>> q4_off_;
+    int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
+    std::string dvocab_path_;
+    std::string vocab_file() const { return dvocab_path_.empty() ? rt_dir_ + "/draft_vocab.bin" : dvocab_path_; }
+    /// a projection's weights for the draft layer's own pass: the Q4_0 copy under --mtp-q4, else the Q8_0 original
+    const void* wq(const char* name, int& type) const;
+    bool make_q4_dense(const std::vector<uint8_t>& blob, std::string& err);
+    bool make_q4_head(std::string& err);
+    void record_top2(int j);
+    std::vector<int32_t> top2_, dvocab_host_;
+    std::vector<float> lg_host_;
+    // --pipeline-windows 2 (chain_launch)
+    bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
+    bool force_on_ = false, chain_live_ = false;
+    const float* src_R_ = nullptr;
+    int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
+    cudaEvent_t ev_chain_ = nullptr;
+    cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
+    int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
+    int32_t chain_tok_[8] = {};
+    float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
@@ -186,6 +264,8 @@ private:
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
+    cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
+    cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
     cudaGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
@@ -200,9 +280,12 @@ private:
         cudaGraphExec_t advance = nullptr;
         int64_t cells = 0;
         uint64_t arena_bytes = 0;
+        int32_t proposal = -1;
     };
     static_assert(sizeof(SlotState) <= 4096, "resident.hpp slot owner envelope");
     std::vector<SlotState> slots_;
+    bool batch_drafting_ = false;
+    bool async_owned_ = false;
     void* arena_ = nullptr;
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,
@@ -219,6 +302,8 @@ private:
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;
+    uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
+    uint8_t* top_scratch_ = nullptr;
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;

@@ -53,7 +53,7 @@ struct LoadStats;
 /// MemAvailable clamped by the tightest finite cgroup-v2 ancestor after bounded clean-cache reclaim.
 /// Missing required counters fail closed. Explicit artifact working sets must still be budgeted by
 /// startup admission; this available-memory figure does not make mmap or shared allocations free.
-bool available_memory_bytes(uint64_t& bytes);
+bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr);
 
 namespace detail {
 

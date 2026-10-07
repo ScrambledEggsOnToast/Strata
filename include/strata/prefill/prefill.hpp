@@ -53,7 +53,7 @@ struct PrefillFacts {
     int64_t max_cells = 0;   ///< the primary QSA state's cell budget
     int64_t n_pages = 0;     ///< ...and its resident page count (KV streaming's identity table)
     int kv_mode = 0;         ///< 0: device KV, 1: streaming/native, 2: hybrid
-    bool kv_int8 = false, kv_q4 = false;
+    bool kv_int8 = false, kv_q4 = false, kv_hybrid = false;
     /// The session's own answer, for `bytes_needed`'s sake.  A session with no QSA states gives a zeroed set.
     static PrefillFacts of(const core::SessionState& ss);
 };
@@ -64,7 +64,7 @@ struct AllocationConfig {
     int64_t max_cells = 0, n_pages = 0, chunk = 0;
     int64_t layer_begin = 0, layer_end = -1; ///< Stage validation; device scratch remains shared/all-path sized.
     int kv_mode = 0;
-    bool kv_int8 = false, kv_q4 = false, kv_stage_own = false, gr_unfused = false, mmq = true;
+    bool kv_int8 = false, kv_q4 = false, kv_hybrid = false, kv_stage_own = false, gr_unfused = false, mmq = true;
     int ring = 8; ///< Snapshot of ring_slots_for(chunk) - the ring `init` lays out, clamped 16..ring_cap().
     int stager_ring = 16; ///< Snapshot of the host copy ring for unpinned blobs (STRATA_STAGER_RING, clamped
                           ///< 2..256 exactly as the stager reads it at init).
@@ -73,6 +73,7 @@ struct AllocationConfig {
     PrefillFacts facts() const {
         PrefillFacts f;
         f.max_cells = max_cells; f.n_pages = n_pages; f.kv_mode = kv_mode; f.kv_int8 = kv_int8; f.kv_q4 = kv_q4;
+        f.kv_hybrid = kv_hybrid;
         return f;
     }
 };
@@ -82,7 +83,7 @@ struct AllocationBytes {
     /// Every take(payload) requests ((payload + 511) & ~255): ceil(payload / 256)*256 + 256.
     /// A partial loan cannot price the full region as borrowed: init requires a 256-byte aligned loan holding at
     /// least loanable_device bytes.
-    uint64_t standalone_device = 0;///< loanable_device + owned_device; valid even when no cache slots can be lent.
+    uint64_t standalone_device = 0;///< Owned allocation sequence, each allocation rounded to a 2 MiB granule.
     uint64_t mmq_workspace = 0;    ///< Included in loanable_device; configuration-derived maximum, not a heuristic.
     /// Fixed explicit HOST payload (token staging, routing tables, the mapped bounds tail, stager ring flags).
     /// Opaque driver storage and thread stacks remain a separate unknown class; host_dynamic below is the
@@ -177,7 +178,7 @@ public:
     // ---- FORK (HET-017): the admission gate's entry points, priced from the facts above ----
     /// Snapshot the same runtime switches init uses. Queries device properties, allocates no device memory.
     static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
-                                  AllocationConfig& out, std::string& err);
+                                  AllocationConfig& out, std::string& err, bool kv_hybrid = false);
     /// The dynamic stager's fixed job bound for a stage: the stage's layer range times n_expert - the most
     /// expert-layer pairs a chunk's plan can hold - checked against the claim word's 16-bit job field (refuse,
     /// never clamp; this also rules out any product overflow).
@@ -192,7 +193,7 @@ public:
     /// configuration names (`allocation_config` snapshots it from ring_slots_for).
     static uint64_t bytes_needed_from(const core::ModelGeometry& g, const PrefillFacts& f, int64_t chunk,
                                       int ring_slots_override = -1, uint64_t ring_blob = 0,
-                                      int stage_own_override = -1);
+                                      int stage_own_override = -1, bool owned_pages = false);
     /// FORK: the environment switches the price snapshot must agree with `init`/`carve` on - one rule, not two
     /// copies of it.  `ring_hard_cap` is the array bound the ring can never exceed (RING_MAX / ring_cap()).
     static bool kv_stage_own_env();

@@ -289,6 +289,8 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.stop = false;
     state.partial_from0 = parked && from_start;
     dispatch_.slot_requests[slot] = working_.request;
+    if (request.residual && !draft_.propose_slot(slot, request.residual, state.x, state.p - 1,
+                                                state.draft, error)) return fail(slot);
     if (!stages_[0].verifier->set_slot_context(slot, working_.request, state.sampling,
                                               &state.ids, state.cvec, error) ||
         !observe(continuing ? "resume" : "admit", slot, (int64_t) prefix.size(), error)) {
@@ -402,6 +404,15 @@ bool ResidentSlots::committed(int slot, int32_t next, const float* residual, std
     ++state.p;
     return true;
 }
+
+bool ResidentSlots::propose(int slot, const float* residual, std::string& error) {
+    if (slot < 0 || (size_t) slot >= slots_.size() || !slots_[(size_t) slot].active ||
+        !slot_idle(slot, error)) return false;
+    auto& state = slots_[(size_t) slot];
+    if (!draft_.propose_slot(slot, residual, state.x, state.p - 1, state.draft, error)) return fail(slot);
+    return true;
+}
+
 
 bool ResidentSlots::finish(int slot, bool keep_cache, std::string& error, bool diagnostic) {
     if (slot < 0 || (size_t) slot >= slots_.size() || !slots_[(size_t) slot].active) {
