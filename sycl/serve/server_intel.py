@@ -42,7 +42,11 @@ def install_xe_reader():
         if g.ok():
             return g
         xe = _XeGpu(index)
-        return xe if xe.ok() else g
+        if xe.ok():
+            g.close()
+            return xe
+        xe.close()
+        return g
 
     T.gpu_reader = gpu_reader
 

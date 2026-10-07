@@ -979,11 +979,17 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 
-bool Prefill::bind_request(uint64_t request, std::string& err) {
-    Impl& m = *impl_;
+bool Prefill::context_idle(std::string& err) const {
+    const Impl& m = *impl_;
     if (public_running_.load() || m.running.load() || m.poisoned) {
         err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
     }
+    return !next_ || next_->context_idle(err);
+}
+
+bool Prefill::bind_request(uint64_t request, std::string& err) {
+    Impl& m = *impl_;
+    if (!context_idle(err)) return false;
     if (!m.canary.bind(8, request, err)) return false;
     return !next_ || next_->bind_request(request, err);
 }

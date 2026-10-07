@@ -76,6 +76,32 @@ saved request contexts. Reinitializing without release is an error. The separate
 the existing `STATE_HASH` format is unchanged. Graph internals remain covered by
 the admission allowance, not byte estimates inferred from graph counts.
 
+`program::ResidentSlots` owns request identities, bounded histories and the
+ordering of verifier, prefill, dispatch and private MTP transitions. The serving
+loop selects work and emits protocol frames; it does not rebind those owners
+independently. Admission and resource re-init require drained consumers. A failed
+partial transfer leaves its target unavailable; a failed restore also prevents
+continued use of the working session. Session and graph addresses remain stable.
+
+A yielded request retains its identity and resolved automatic seed when its full
+prompt and request settings are resent unchanged to the same destination, or when
+the server promotes a solo `GEN` into the physical slot where `BYIELD` parked it.
+A cancelled request or ordinary cached-prefix reuse receives a new monotonically
+allocated identity. Released batch scratch still permits cached solo restoration;
+resident admission waits for re-init, which never revives failed contexts. No
+full-session copying is added to per-token scheduling.
+
+`STATE_RETAINED` reports restored private bytes while batch resources are released;
+its zero canary explicitly means no live batch-graph validation. `STATE_RESOURCES`
+marks successful release/re-init boundaries, and re-init uploads and validates
+retained owners again before live `STATE_SLOT` observations resume.
+
+The protected lifecycle vehicle can explicitly set `STRATA_SESSION_ROWS_MAX=544`
+for its expanded sequence; the default remains 256. Both envelopes retain 16 rows
+per diagnostic file and the fixed routing/readback memory bound. This affects only
+bounded diagnostic disk output, not the inference arithmetic or memory ceilings.
+
+
 The project's protected B1 greedy cell exercised this path successfully. B2/B4,
 sampling, configured EOS, and multiplex qualification are separate gates; this
 result does not establish those capabilities or V100 runtime support.
@@ -111,6 +137,8 @@ draining. Slots and embeddings cannot be freed by a background timer while the e
 them. A missing boundary or ambiguous native admission refusal fails the process closed. Reused state is
 resident; this service adds no per-token state swaps. Native metadata compaction, operation ownership and
 safe-boundary retirement must be validated independently of HTTP correctness.
+For a yielded, inactive request, the server instead sends `BSTOP` before releasing its frontend slot;
+there is no `BDONE` for that parked state. This ends continuation ownership while retaining cached bytes.
 
 ## How the server uses the slots
 
@@ -280,7 +308,7 @@ On top of `GEN` / `GENI`:
 | `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
 | `BT <slot> <id>` | out | a token of that slot |
 | `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
-| `BSTOP <slot>` | in | retire that slot at the next safe boundary; BDONE acknowledges retirement, without advancing it another token |
+| `BSTOP <slot>` | in | retire an active slot at the next safe boundary with BDONE, without another token; for an inactive yielded slot, end continuation ownership without BDONE |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |

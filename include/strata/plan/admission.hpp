@@ -50,22 +50,58 @@ inline uint64_t saturating_multiply(uint64_t a, uint64_t b) {
 //
 // `unknown` is the load-bearing flag: `bytes == 0 && !unknown` is a measured/derived zero, while
 // `unknown == true` means "this allocation exists and I cannot size it", which refuses admission.
+enum class ByteMeaning { anonymous, clean_file, locked_file, measured, measured_clean };
+
+inline const char* byte_meaning_name(ByteMeaning meaning) {
+    switch (meaning) {
+    case ByteMeaning::anonymous: return "anonymous";
+    case ByteMeaning::clean_file: return "clean-file";
+    case ByteMeaning::locked_file: return "locked-file";
+    case ByteMeaning::measured: return "measured";
+    case ByteMeaning::measured_clean: return "measured-clean";
+    }
+    return "invalid";
+}
+
+inline bool parse_byte_meaning(const std::string& text, ByteMeaning& meaning) {
+    for (auto candidate : {ByteMeaning::anonymous, ByteMeaning::clean_file, ByteMeaning::locked_file,
+                           ByteMeaning::measured, ByteMeaning::measured_clean})
+        if (text == byte_meaning_name(candidate)) { meaning = candidate; return true; }
+    return false;
+}
+
 struct Accounted {
     std::string name;
     uint64_t bytes = 0;
     bool unknown = false;
     std::string source;   // where the number came from, e.g. "index.txt pool header" - printed in the plan
+    ByteMeaning meaning = ByteMeaning::anonymous;
+    bool mirrors_host() const { return meaning == ByteMeaning::clean_file || meaning == ByteMeaning::locked_file; }
+    bool clean_credit() const { return meaning == ByteMeaning::clean_file || meaning == ByteMeaning::measured_clean; }
 };
 
 // A scope is one ceiling's worth of classes: one device's VRAM, the guest's RAM, or the host's.
 struct Scope {
     std::vector<Accounted> classes;
 
-    void add(std::string name, uint64_t bytes, std::string source) {
-        classes.push_back(Accounted{std::move(name), bytes, false, std::move(source)});
+    void add(std::string name, uint64_t bytes, std::string source, ByteMeaning meaning = ByteMeaning::anonymous) {
+        classes.push_back(Accounted{std::move(name), bytes, false, std::move(source), meaning});
     }
-    void add_unknown(std::string name, std::string source) {
-        classes.push_back(Accounted{std::move(name), 0, true, std::move(source)});
+    void add_unknown(std::string name, std::string source, ByteMeaning meaning = ByteMeaning::anonymous) {
+        classes.push_back(Accounted{std::move(name), 0, true, std::move(source), meaning});
+    }
+    void mirror_into(Scope& host) const {
+        for (const auto& c : classes) if (c.mirrors_host()) {
+            auto mirrored = c;
+            mirrored.source = "physical host cache mirror upper bound (no sharing credit): " + c.source;
+            host.classes.push_back(std::move(mirrored));
+        }
+    }
+    uint64_t credit_eligible_bytes() const {
+        uint64_t bytes = 0;
+        for (const auto& c : classes)
+            if (!c.unknown && c.clean_credit()) bytes = saturating_add(bytes, c.bytes);
+        return bytes;
     }
     const Accounted* find(const std::string& name) const {
         for (const Accounted& c : classes)
@@ -354,12 +390,7 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
 
     // 3. Guest scope: a real limit (AC-2).  File-backed demand is counted; the bounded clean-cache credit
     //    is the only discount, and it can never exceed the counted bytes.
-    const uint64_t guest_file = [&] {
-        uint64_t n = 0;
-        for (const Accounted& c : guest_demand.classes)
-            if (c.name.rfind("file:", 0) == 0) n = saturating_add(n, c.bytes);
-        return n;
-    }();
+    const uint64_t guest_file = guest_demand.credit_eligible_bytes();
     const uint64_t guest_known = guest_demand.known_bytes();
     const uint64_t guest_credit = std::min(p.file_cache_credit_bytes, guest_file);
     d.guest_known = p.guest_total_measured;
@@ -389,12 +420,7 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
     }
 
     // 4. Host scope, same shape.  The 8 GiB host reserve is the floor; telemetry missing refuses.
-    const uint64_t host_file = [&] {
-        uint64_t n = 0;
-        for (const Accounted& c : host_demand.classes)
-            if (c.name.rfind("file:", 0) == 0) n = saturating_add(n, c.bytes);
-        return n;
-    }();
+    const uint64_t host_file = host_demand.credit_eligible_bytes();
     const uint64_t host_known = host_demand.known_bytes();
     const uint64_t host_credit = std::min(p.file_cache_credit_bytes, host_file);
     d.host_known = p.host_available_measured;
@@ -564,7 +590,9 @@ inline std::string num2(double v) {
 inline void emit_accounted(std::ostringstream& o, const Accounted& c, const std::string& pad) {
     o << pad << "{\"name\": \"" << json_escape(c.name) << "\", \"bytes\": " << c.bytes
       << ", \"gib\": " << num2(gib(c.bytes)) << ", \"unknown\": " << (c.unknown ? "true" : "false")
-      << ", \"source\": \"" << json_escape(c.source) << "\"}";
+      << ", \"source\": \"" << json_escape(c.source) << "\", \"meaning\": \"" << byte_meaning_name(c.meaning)
+      << "\", \"host_mirror\": " << (c.mirrors_host() ? "true" : "false")
+      << ", \"clean_credit\": " << (c.clean_credit() ? "true" : "false") << "}";
 }
 
 inline void emit_scope(std::ostringstream& o, const Scope& s, const std::string& pad) {

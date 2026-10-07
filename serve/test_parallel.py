@@ -378,5 +378,93 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
 
 
+class ParkedCancellation(unittest.TestCase):
+    def test_cancelled_park_is_not_continued_by_an_identical_request(self):
+        # Stateful protocol peer: the server must end parked ownership, not merely
+        # recycle its frontend reservation. This is not CUDA isolation evidence.
+        peer = r'''import queue,sys,threading
+lines=queue.Queue()
+def reader():
+    for line in sys.stdin: lines.put(line.strip())
+threading.Thread(target=reader,daemon=True).start()
+print('INFO batch_slots=2 slot_cache=1',flush=True)
+print('READY 4096 stop',flush=True)
+parked=False
+yielded=False
+while True:
+    line=lines.get(timeout=10)
+    if line=='QUIT': break
+    if line.startswith('BSTOP '):
+        parked=False
+        continue
+    if not line.startswith(('GEN ','BGEN ')): continue
+    fields=line.split();slot=int(fields[1]) if fields[0]=='BGEN' else None
+    long=len(fields[-1].split(','))>100
+    if long and not yielded:
+        while True:
+            print('PP 64 481 1 1',flush=True)
+            try: command=lines.get(timeout=.02)
+            except queue.Empty: continue
+            if command.startswith('BYIELD '):
+                destination=int(command.split()[1]);break
+        yielded=parked=True
+        print(f'YIELDED {destination} 64',flush=True)
+        print('DONE 0 481 1 0 cancel 0 0 0',flush=True)
+        if slot is not None: print(f'BADM {slot} 0',flush=True)
+        continue
+    # A later identical request gets the parked identity unless cancelled.
+    print('T '+str(71 if long and parked else 72 if long else 73),flush=True)
+    print('DONE 1 481 1 1 stop 0 0 0',flush=True)
+    if slot is not None: print(f'BADM {slot} 0',flush=True)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'peer.py'
+            script.write_text(peer)
+            import serve.server as server
+            popen = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, 'Popen',
+                                   lambda cmd, **kw: popen([sys.executable, str(script), *cmd[1:]], **kw)):
+                engine = StrataEngine('strata', [])
+            long_cancel, short_release, long_started = threading.Event(), threading.Event(), threading.Event()
+            errors, output = [], {}
+
+            def consume(name, prompt, cancel, ready):
+                try:
+                    output[name] = [t for t in engine.generate(prompt, 2, {'_strata_control_ready': ready}, cancel)
+                                    if t is not None]
+                except Exception as error:
+                    errors.append(error)
+
+            def short_holds_control(_):
+                long_cancel.set()
+                if not short_release.wait(5):
+                    raise TimeoutError('parked cancellation did not release its frontend slot')
+
+            long = threading.Thread(target=consume, args=('long', [1] * 481, long_cancel,
+                                                          lambda _: long_started.set()))
+            short = threading.Thread(target=consume, args=('short', [2] * 4, threading.Event(), short_holds_control))
+            try:
+                long.start()
+                self.assertTrue(long_started.wait(3))
+                short.start()
+                long.join(4)
+                self.assertFalse(long.is_alive(), 'cancelled parked request did not terminate')
+                short_release.set()
+                short.join(4)
+                self.assertFalse(short.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(output, {'long': [], 'short': [73]})
+                again = [t for t in engine.generate([1] * 481, 2, {}, threading.Event()) if t is not None]
+                self.assertEqual(again, [72], 'new request inherited cancelled parked ownership')
+                self.assertFalse(any(engine.slot_busy))
+            finally:
+                short_release.set()
+                long_cancel.set()
+                engine.unload()
+                long.join(5)
+                if short.ident is not None:
+                    short.join(5)
+
+
 if __name__ == "__main__":
     unittest.main()

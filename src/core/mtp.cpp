@@ -149,6 +149,16 @@ bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
     return ok;
 }
 
+bool MtpDrafter::context_idle(std::string& err) {
+    if (scratch_owned_.test_and_set(std::memory_order_acquire)) {
+        err = "mtp: operation scratch is in flight or poisoned"; return false;
+    }
+    // Every successful operation drains before releasing this lease. Don't add
+    // another CUDA synchronization to each resident committed row.
+    scratch_owned_.clear(std::memory_order_release);
+    return true;
+}
+
 
 MtpDrafter::~MtpDrafter() {
     const OnDevice on_device(device_);

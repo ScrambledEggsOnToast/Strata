@@ -11,6 +11,7 @@ Anything that cannot be read is None; nothing here can stop the server.
 from __future__ import annotations
 
 import collections
+import contextlib
 import ctypes
 import os
 import platform
@@ -31,6 +32,7 @@ class _Nvml:
 
     def __init__(self, index=0):
         self.lib = self.dev = None
+        self._shutdown = None
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                           "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
             else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
@@ -43,17 +45,30 @@ class _Nvml:
         if self.lib is None:
             return
         try:
+            shutdown = self.lib.nvmlShutdown             # do not acquire a reference we cannot release
             init = getattr(self.lib, "nvmlInit_v2", None) or self.lib.nvmlInit
             if init() != 0:
-                self.lib = None
                 return
+            self._shutdown = shutdown                  # one successful init owns one shutdown
             h = ctypes.c_void_p()
             get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
             if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
-                self.lib = None
                 return
             self.dev = h
         except (AttributeError, OSError):
+            pass
+        finally:
+            if self.dev is None:
+                self.close()
+
+    def close(self):
+        """Release this reader's NVML reference once, including after a failed handle lookup."""
+        shutdown, self._shutdown = self._shutdown, None
+        self.dev = None
+        try:
+            if shutdown is not None:
+                shutdown()
+        finally:
             self.lib = None
 
     def ok(self):
@@ -87,6 +102,7 @@ class _Nvml:
         try:
             if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
                 out["mem_used"], out["mem_total"] = m.used, m.total
+                out["mem_free"] = m.free
         except (AttributeError, OSError):
             pass
         out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
@@ -151,6 +167,10 @@ class _Amd:
     def ok(self):
         return self.dev is not None
 
+    def close(self):
+        # sysfs files are opened only for each reading; there is no library reference to release.
+        self.dev = self.hwmon = None
+
     @staticmethod
     def _int(path):
         try:
@@ -190,12 +210,17 @@ def gpu_reader(index=0, amd=False):
 def free_vram_mib(index=0, amd=False):
     """Free VRAM of a card in MiB, or None when it cannot be read."""
     g = gpu_reader(index, amd)
-    if not g.ok():
-        return None
-    r = g.read()
-    if r.get("mem_total") is None or r.get("mem_used") is None:
-        return None
-    return int((r["mem_total"] - r["mem_used"]) >> 20)
+    try:
+        if not g.ok():
+            return None
+        r = g.read()
+        if r.get("mem_free") is not None:
+            return int(r["mem_free"] >> 20)
+        if r.get("mem_total") is None or r.get("mem_used") is None:
+            return None
+        return int((r["mem_total"] - r["mem_used"]) >> 20)
+    finally:
+        g.close()
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
@@ -272,28 +297,44 @@ class Telemetry:
         cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self._close_lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
-        self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
-        self.gpu = self.gpus[0][1]
-        try:
-            import psutil  # noqa: F401
-            self.ps = sys.modules["psutil"]
-        except ImportError:
-            self.ps = None
-        self.fallback = _CpuRamFallback()
-        self.static = {
-            "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
-            "gpu_count": len(self.gpus),
-            "cpu_name": _cpu_name(),
-            "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
-            "threads": os.cpu_count(),
-            "psutil": self.ps is not None,
-        }
-        self._disk_prev = None
-        threading.Thread(target=self._loop, daemon=True).start()
+        with contextlib.ExitStack() as readers:
+            self.gpus = []
+            for i in idx:
+                g = gpu_reader(i, amd)
+                readers.callback(g.close)
+                self.gpus.append((i, g))
+            self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
+            self.gpu = self.gpus[0][1]
+            try:
+                import psutil  # noqa: F401
+                self.ps = sys.modules["psutil"]
+            except ImportError:
+                self.ps = None
+            self.fallback = _CpuRamFallback()
+            self.static = {
+                "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
+                "gpu_count": len(self.gpus),
+                "cpu_name": _cpu_name(),
+                "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
+                "threads": os.cpu_count(),
+                "psutil": self.ps is not None,
+            }
+            self._disk_prev = None
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            self._readers = readers.pop_all()           # constructor failures release even filtered-out readers
+
+    def close(self):
+        """Stop sampling and finish any in-flight read before releasing the GPU readers; safe to repeat."""
+        with self._close_lock:
+            self._stop.set()
+            self._thread.join()
+            self._readers.close()
 
     def _disk(self):
         if not self.ps:
@@ -317,7 +358,7 @@ class Telemetry:
             if len(reads) > 1:
                 def vals(k):
                     return [r[k] for _, r in reads if r.get(k) is not None]
-                for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
+                for k in ("mem_used", "mem_total", "mem_free", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
                     v = vals(k)
                     g[k] = sum(v) if v else None
                 u = vals("util")
@@ -347,7 +388,7 @@ class Telemetry:
         return s
 
     def _loop(self):
-        while True:
+        while not self._stop.is_set():
             s = self.sample()
             with self.lock:
                 self.now = s
@@ -355,7 +396,7 @@ class Telemetry:
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
-            time.sleep(1.0)
+            self._stop.wait(1.0)
 
     def snapshot(self):
         with self.lock:

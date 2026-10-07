@@ -36,6 +36,10 @@ class _XeGpu:
     def ok(self):
         return self.dev is not None and sys.platform.startswith("linux")
 
+    def close(self):
+        # Readings open their own sysfs/stat files; no NVML or persistent descriptor is owned.
+        self.dev = self.hwmon = self._e = None
+
     def name(self):
         st = self._stat()
         return (st or {}).get("name") or "Intel Arc GPU"

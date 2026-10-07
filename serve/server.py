@@ -28,7 +28,6 @@ import base64
 import hashlib
 import hmac
 import codecs
-import ctypes
 import json
 import os
 import queue
@@ -796,6 +795,9 @@ class StrataEngine:
                 break
             if line is None:
                 return None
+            if line.startswith("YIELDED "):
+                fields = line.split()
+                self._yielded = (int(fields[1]), int(fields[2]))
             if line.startswith("DONE"):
                 self._parse_done(line)
             if line.startswith(("ERR", "REJECT")):
@@ -980,6 +982,7 @@ class StrataEngine:
                                 if cancel.is_set():
                                     return
                     if self._yielded is not None:           # it gave way: the others waiting then go first
+                        phase = "parked"
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
                         yields += 1
@@ -1018,6 +1021,8 @@ class StrataEngine:
                             yield None
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
+                    if not cont and self._yielded is not None and self._yielded[0] == slot:
+                        phase = "parked"
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -1093,6 +1098,13 @@ class StrataEngine:
                     line = self._drain_control("BADM")
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
+                # A parked slot is inactive: BSTOP invalidates its continuation,
+                # but produces no BDONE. Order it before frontend reuse.
+                parked = slot if phase == "parked" else None
+                if holding and self._yielded is not None and self._yielded[0] in (slot, reserved):
+                    parked = self._yielded[0]
+                if parked is not None:
+                    self._send(f"BSTOP {parked}")
             finally:
                 if holding:
                     self.ctl.release()
@@ -1921,17 +1933,9 @@ class Service:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
         be read (then nothing is refused)."""
         try:
-            if getattr(self, "backend", None) == "hip":
-                from serve.telemetry import free_vram_mib
-                return free_vram_mib(int(getattr(self, "gpu_index", 0) or 0), amd=True)
-            from serve.telemetry import _Nvml
-            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
-            if not nv.ok():
-                return None
-            m = nv.Mem()
-            if nv.lib.nvmlDeviceGetMemoryInfo(nv.dev, ctypes.byref(m)) != 0:
-                return None
-            return int(m.free >> 20)
+            from serve.telemetry import free_vram_mib
+            return free_vram_mib(int(getattr(self, "gpu_index", 0) or 0),
+                                 amd=getattr(self, "backend", None) == "hip")
         except Exception:
             return None
 
@@ -3877,6 +3881,14 @@ class Server(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets a second server bind a port that is already serving, and requests then land on
     # either one (a forgotten second start of run-<model>.bat).  Without it the second start fails loudly instead.
     allow_reuse_address = os.name != "nt"
+    telemetry = None
+
+    def server_close(self):
+        try:
+            super().server_close()
+        finally:
+            if self.telemetry is not None:
+                self.telemetry.close()
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
@@ -4060,9 +4072,14 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
-    svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        svc.start_telemetry()
+        httpd.telemetry = svc.telemetry
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    except BaseException:
+        httpd.server_close()
+        raise
     return httpd
 
 
@@ -4421,8 +4438,8 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
-                   hub.close if hub is not None else None]
+        closers = [httpd.shutdown, httpd.server_close, getattr(engine, "close", None),
+                   vision.close if vision else None, hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
                 close()

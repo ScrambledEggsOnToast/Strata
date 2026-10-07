@@ -441,6 +441,14 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+The Monitor sampler belongs to the HTTP server, not the native engine. On a normal server stop (Ctrl+C or
+SIGTERM), the HTTP server stops first, then its sampler finishes any current reading and closes every GPU
+reader, before the native engine is asked to exit. Each NVIDIA reader balances its successful `nvmlInit`
+with `nvmlShutdown`, including a failed device lookup; a one-off free-VRAM check closes its reader immediately.
+AMD and Intel sysfs readers do not initialize NVML. Code embedding `serve()` must call `shutdown()` and then
+`server_close()` on the returned HTTP server; code creating `Telemetry` directly must call its `close()`.
+Model unload alone leaves the HTTP server and its Monitor sampler running so loading again still works.
+
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
 (`"vram_segment_mib"`), and `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much

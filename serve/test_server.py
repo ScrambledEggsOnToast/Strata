@@ -2489,27 +2489,34 @@ class AmdTelemetry(unittest.TestCase):
         from serve import telemetry
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
+            with mock.patch.object(telemetry, "SYSFS", d), \
+                    mock.patch.object(telemetry.ctypes, "CDLL", side_effect=AssertionError("AMD must not load NVML")):
                 self.assertTrue(telemetry.amd_device_dir(0).endswith(os.path.join("renderD129", "device")))
                 self.assertTrue(telemetry.amd_device_dir(1).endswith(os.path.join("renderD128", "device")))
                 self.assertIsNone(telemetry.amd_device_dir(2))
-                g = telemetry.gpu_reader(0, amd=True)
-                self.assertTrue(g.ok())
-                self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
-                self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0})
-                r = telemetry.gpu_reader(1, amd=True).read()
-                self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
+                with contextlib.closing(telemetry.gpu_reader(0, amd=True)) as g:
+                    self.assertTrue(g.ok())
+                    self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
+                    self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
+                                                "power": 85.0, "power_limit": 300.0})
+                self.assertFalse(g.ok())
+                with contextlib.closing(telemetry.gpu_reader(1, amd=True)) as g:
+                    r = g.read()
+                    self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
                 self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
-                t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)
-                s = t.sample()
-                self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
-                self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
-                                 (8 << 30, 68.0, 64.0, 205.0))
+                with contextlib.closing(telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)) as t:
+                    s = t.sample()
+                    self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
+                    self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
+                                     (8 << 30, 68.0, 64.0, 205.0))
+                self.assertFalse(t._thread.is_alive())
+                self.assertTrue(all(not g.ok() for _, g in t.gpus))
         with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
-            with mock.patch.object(telemetry, "SYSFS", d):
-                self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
+            with mock.patch.object(telemetry, "SYSFS", d), \
+                    mock.patch.object(telemetry.ctypes, "CDLL", side_effect=AssertionError("AMD must not load NVML")):
+                with contextlib.closing(telemetry.gpu_reader(0, amd=True)) as g:
+                    self.assertFalse(g.ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
     def test_free_vram_on_hip(self):
@@ -2519,7 +2526,8 @@ class AmdTelemetry(unittest.TestCase):
         svc.backend, svc.gpu_index = "hip", 1
         with tempfile.TemporaryDirectory() as d:
             self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
+            with mock.patch.object(telemetry, "SYSFS", d), \
+                    mock.patch.object(telemetry.ctypes, "CDLL", side_effect=AssertionError("AMD must not load NVML")):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
 
 

@@ -153,7 +153,7 @@ void test_file_backed_demand_is_counted_and_credit_is_bounded() {
     a.name = "CUDA0";
     a.vram.add("weights_canonical", 2 * GiB, "test");
     Scope guest;
-    guest.add("file:ple_table_pages", 20 * GiB, "mmap of the PLE shard");
+    guest.add("file:ple_table_pages", 20 * GiB, "mmap of the PLE shard", ByteMeaning::clean_file);
     guest.add("conversation_parked", 3 * GiB, "test");
     // Usable guest = 24 GiB - 4 GiB reserve = 20 GiB.  No credit: 23 GiB demanded -> refuse, with the
     // file pages counted in full.
@@ -336,8 +336,8 @@ void test_overflow_refuses_in_every_scope_and_request() {
     device.vram.classes.clear();
     device.headroom_bytes = 0;
     Scope ram;
-    ram.add("file:first", largest, "boundary");
-    ram.add("file:second", 1, "boundary");
+    ram.add("file:first", largest, "boundary", ByteMeaning::clean_file);
+    ram.add("file:second", 1, "boundary", ByteMeaning::clean_file);
     auto credited = policy;
     credited.file_cache_credit_bytes = largest;
     require(!admit_configuration({device}, {telemetry}, ram, {}, credited).admitted,
@@ -356,6 +356,37 @@ void test_overflow_refuses_in_every_scope_and_request() {
     require(!admit_request(request, 100).admitted, "negative prompt admitted");
 }
 
+void test_declared_meaning_projects_unknowns_and_bounds_credit() {
+    Scope guest, host;
+    guest.add("renamed-clean", 100, "fixture", ByteMeaning::clean_file);
+    guest.add("file:locked", 40, "fixture", ByteMeaning::locked_file);
+    guest.add("file:anonymous", 20, "fixture");
+    guest.add("measured-guest", 13, "fixture", ByteMeaning::measured);
+    guest.mirror_into(host);
+    host.add("measured-host", 7, "independent fixture", ByteMeaning::measured);
+    auto policy = both_scopes_measured(4 * GiB + 73, 8 * GiB + 47);
+    policy.file_cache_credit_bytes = 1000;
+    DeviceCost device;
+    const auto telemetry = measured("CUDA0", 1024);
+    auto decide = [&] { return admit_configuration({device}, {telemetry}, guest, host, policy); };
+    auto result = decide();
+    require(result.admitted && result.guest_demand_bytes == 73 && result.host_demand_bytes == 47,
+            "declared demand lost independent measurement or credited locked/anonymous bytes");
+    --policy.guest_total_bytes;
+    require(!decide().admitted, "one-byte guest overflow admitted");
+    ++policy.guest_total_bytes;
+    --policy.host_available_bytes;
+    require(!decide().admitted, "one-byte host overflow admitted");
+    ++policy.host_available_bytes;
+    Scope unknown;
+    unknown.add_unknown("renamed-unknown", "fixture", ByteMeaning::clean_file);
+    unknown.mirror_into(host);
+    result = decide();
+    require(!result.admitted && !result.verified && host.first_unknown() &&
+            result.unknown_classes == std::vector<std::string>{"host:renamed-unknown"},
+            "unknown source demand became an admitted zero during projection");
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +402,7 @@ int main() {
         test_explain_or_shrink_comparison();
         test_overflow_refuses_in_every_scope_and_request();
         test_mps_physical_and_residual_gates_are_independent();
+        test_declared_meaning_projects_unknowns_and_bounds_credit();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;

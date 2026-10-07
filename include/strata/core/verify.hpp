@@ -213,6 +213,12 @@ public:
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
+    /// Resident lifecycle preflight. A pending solo commit is drained; owned or
+    /// poisoned scratch refuses before any resident state is copied or rebound.
+    bool context_idle(std::string& err);
+    /// Completion may retire a finished pipeline group while an unrelated group
+    /// runs. It must not publish reuse while this slot still has a consumer.
+    bool slot_consumers_idle(int slot, bool expert_pending, std::string& err);
     /// Bind/rebind an idle resident slot at admission. IDs must be nonzero and
     /// distinct across slots. History stays alive until rebind; do not mutate it
     /// while an operation owns scratch. Also forwards to chained stages.
@@ -313,13 +319,13 @@ private:
         ~ScratchGuard();
     };
     bool acquire_scratch(std::string& err);
-    bool context_idle(std::string& err);
     bool fail_operation(std::string& err);
     bool reserve_batch_key(uint64_t key, std::string& err);
     bool observe_committed_rows(int count, std::string& err);
     void* h_route_trace_ = nullptr;
     void* m_route_trace_ = nullptr;
     uint64_t observed_rows_ = 0;
+    uint64_t observation_limit_ = 256; // opt-in extended lifecycle vehicle: at most 544, still 16 rows/file
     std::FILE* row_trace_ = nullptr;
     uint64_t request_id_ = 0, canary_epoch_ = 0;
     uint64_t slot_request_id_[8] = {};

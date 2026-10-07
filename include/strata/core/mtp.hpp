@@ -112,6 +112,8 @@ public:
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
     }
+    /// Lifecycle preflight: unlike idle(), also rejects an owned/poisoned lease.
+    bool context_idle(std::string& err);
 
     // Resident requests share immutable MTP weights and serialized operation
     // scratch, never K/V. Allocate/capture once before requests are admitted.

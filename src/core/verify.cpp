@@ -561,6 +561,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: canary initialization failed"; return false;
     }
     if (env_on("STRATA_SESSION_ROWS")) {
+        if (const char* limit = std::getenv("STRATA_SESSION_ROWS_MAX")) {
+            if (std::strcmp(limit, "544") != 0 && std::strcmp(limit, "256") != 0) {
+                err = "verify: session rows maximum must be the bounded 256 or 544 envelope"; return false;
+            }
+            observation_limit_ = std::strcmp(limit, "544") == 0 ? 544 : 256;
+        }
         // Diagnostic-only mapped routing transcript: actual IDs AND weights for every layer/row.
         // The admission gate always charges the 256-KiB host diagnostic envelope, including readback stack.
         if (g.n_layers > 48 || ss.k > 64 ||
@@ -602,7 +608,7 @@ bool Verifier::observe_committed_rows(int count, std::string& err) {
     if (next_ || lb_ != 0 || !last_stage()) {
         err = "verify: exact row observation requires the qualified single-device layout"; return false;
     }
-    if (count < 1 || count > last_t_ || observed_rows_ + count > 256) {
+    if (count < 1 || count > last_t_ || observed_rows_ + count > observation_limit_) {
         err = "verify: committed row observation bound exceeded"; return false;
     }
     std::array<float, 16384> buffer;
@@ -1564,11 +1570,25 @@ bool Verifier::fail_operation(std::string& err) {
 }
 
 bool Verifier::context_idle(std::string& err) {
+    if (!g_ || !ss_) { err = "verify: request context before initialization"; return false; }
     if (!wait_commit(err)) return false;
     if (released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle) {
         err = "verify: request context requires idle, unpoisoned operation scratch"; return false;
     }
     return true;
+}
+
+bool Verifier::slot_consumers_idle(int slot, bool expert_pending, std::string& err) {
+    if (!wait_commit(err)) return false;
+    const auto phase = scratch_.phase();
+    if (phase == VerifyScratchOwnership::Phase::idle && !expert_pending) return true;
+    if (phase != VerifyScratchOwnership::Phase::idle && phase != VerifyScratchOwnership::Phase::poisoned && last_batch_) {
+        bool used = false;
+        for (int row = 0; row < last_t_; ++row) used = used || last_rows_[row] == slot;
+        if (!used) return true;
+    }
+    err = "verify: resident slot still has an operation consumer";
+    return false;
 }
 
 bool Verifier::set_request_id(uint64_t request_id, std::string& err) {

@@ -16,12 +16,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <charconv>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using strata::plan::DeviceCost;
 using strata::plan::DeviceTelemetry;
+using strata::plan::ByteMeaning;
 
 namespace {
 
@@ -80,23 +82,32 @@ struct Cli {
         telemetry.push_back(t);
         return true;
     }
-    // `DEV:NAME=BYTES` for devices, `NAME=BYTES` for guest/host scopes
+    // `DEV:NAME=BYTES` for devices, `MEANING:NAME=BYTES` for guest/host scopes.
     bool add_class(const std::string& spec, const std::string& prefix) {
         const size_t eq = spec.rfind('=');
         if (eq == std::string::npos || eq + 1 >= spec.size()) return false;
         const std::string left = spec.substr(0, eq);
-        char* end = nullptr;
-        const uint64_t bytes = std::strtoull(spec.c_str() + eq + 1, &end, 10);
-        if (end == nullptr || *end != '\0') return false;
+        const std::string value = spec.substr(eq + 1);
+        const bool unknown = value == "unknown";
+        uint64_t bytes = 0;
+        if (!unknown) {
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) return false;
+        }
         if (prefix == "device") {
             const size_t colon = left.find(':');
-            if (colon == std::string::npos) return false;
+            if (colon == std::string::npos || colon == 0 || colon + 1 == left.size()) return false;
             DeviceCost* d = device(left.substr(0, colon), true);
-            d->vram.add(left.substr(colon + 1), bytes, "CLI --device-class");
-        } else if (prefix == "guest") {
-            guest.add(left, bytes, "CLI --guest-class");
+            if (unknown) d->vram.add_unknown(left.substr(colon + 1), "CLI --device-class");
+            else d->vram.add(left.substr(colon + 1), bytes, "CLI --device-class");
         } else {
-            host.add(left, bytes, "CLI --host-class");
+            const size_t colon = left.find(':');
+            ByteMeaning meaning;
+            if (colon == std::string::npos || colon + 1 == left.size() ||
+                !parse_byte_meaning(left.substr(0, colon), meaning)) return false;
+            auto& scope = prefix == "guest" ? guest : host;
+            if (unknown) scope.add_unknown(left.substr(colon + 1), "CLI --" + prefix + "-class", meaning);
+            else scope.add(left.substr(colon + 1), bytes, "CLI --" + prefix + "-class", meaning);
         }
         return true;
     }
@@ -117,10 +128,12 @@ int usage() {
         "  --device-class DEV:NAME=B       a byte class one device must hold (repeatable)\n"
         "  --headroom [DEV:]B              explicit headroom H in the memory equation (per device or all)\n"
         "  --guest-total B                 the measured guest allocation\n"
-        "  --guest-class NAME=B            guest RAM demand (file-backed: prefix the name with \"file:\")\n"
+        "  --guest-class MEANING:NAME=B    guest RAM demand with explicit meaning (repeatable)\n"
         "  --guest-reserve B               >= 4 GiB; smaller values are floored to the design default\n"
         "  --host-available B              measured physical-host MemAvailable (incremental host scope)\n"
-        "  --host-class NAME=B             host RAM demand (same \"file:\" convention)\n"
+        "  --host-class MEANING:NAME=B     independent physical-host RAM demand\n"
+        "                                  meanings: anonymous, clean-file, locked-file, measured, measured-clean\n"
+        "                                  class B may be 'unknown'; unknown always refuses admission\n"
         "  --host-reserve B                >= 8 GiB; smaller values are floored to the design default\n"
         "  --file-cache-credit B           the ONLY discount for file-backed demand: the clean-cache bytes\n"
         "                                  measured through the cgroup-v2 counters (never shared/dirty)\n"
