@@ -999,6 +999,8 @@ of the first 72 bytes), the payload
 count), the payload hash and the end marker `STRSEND\x01`. The hash is a 64-bit function with xxHash64-style rounds,
 not the standard XXH64 stream; it detects accidental corruption and does not authenticate a file: restore only files
 this engine wrote. An unknown version is refused; a new format gets a new version number.
+Streaming hash updates with zero bytes are no-ops, including empty state arrays;
+they do not require a non-null payload pointer or alter the file checksum.
 
 The header's frontend digest and namespace (HET-042) bind the file to the tokenizer/template identity and the
 authorization namespace of the request that saved it. A restore carries the requesting request's own identity (the

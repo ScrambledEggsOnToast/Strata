@@ -334,7 +334,7 @@ int main() {
         const char a[] = "abcdefghijklmnopqrstuvwxyz0123456789", b[] = "bacdefghijklmnopqrstuvwxyz0123456789";
         check(session_hash64(a, sizeof a, 0) != session_hash64(b, sizeof b, 0), "hash sees swapped bytes");
         check(session_hash64(a, sizeof a, 0) != session_hash64(a, sizeof a, 1), "hash sees the seed");
-        SessionHasher h; h.update(a, 5); h.update(a + 5, sizeof a - 5);
+        SessionHasher h; h.update(a, 5); h.update(nullptr, 0); h.update(a + 5, sizeof a - 5);
         check(h.digest() == session_hash64(a, sizeof a, 0), "streaming hash equals one-shot hash");
     }
     // model fingerprint: changes with content at the head of a file and with the file list

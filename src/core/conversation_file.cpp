@@ -839,6 +839,7 @@ void SessionHasher::block(const uint8_t* p) {
 }
 
 void SessionHasher::update(const void* data, size_t n) {
+    if (n == 0) return;
     const uint8_t* p = static_cast<const uint8_t*>(data);
     total_ += n;
     if (npending_) {
