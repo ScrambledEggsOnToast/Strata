@@ -111,6 +111,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <set>
 #include <vector>
 
@@ -1093,7 +1094,9 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
 
 // Fixed-width lowercase hex as the serving frontend sends it (16 digits = one value, 32 = two, high words
 // first).  false on any other character: an identity key that is not exactly the agreed width is no identity.
-bool hex_identity(const char* s, size_t digits, uint64_t& a, uint64_t* b = nullptr) {
+bool hex_identity(std::string_view value, size_t digits, uint64_t& a, uint64_t* b = nullptr) {
+    if (value.size() != digits) return false;
+    const char* s = value.data();
     auto one = [&s](uint64_t& out) {
         uint64_t v = 0;
         for (size_t i = 0; i < 16; ++i, ++s) {
@@ -6377,8 +6380,8 @@ int main(int argc, char **argv) try {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "tenant")
-                        tenant_ok = hex_identity(tok.c_str() + eq + 1, 32, req_tenant_lo, &req_tenant_hi);
-                    else if (key == "frontend") frontend_ok = hex_identity(tok.c_str() + eq + 1, 16, req_frontend);
+                        tenant_ok = hex_identity(std::string_view(tok).substr(eq + 1), 32, req_tenant_lo, &req_tenant_hi);
+                    else if (key == "frontend") frontend_ok = hex_identity(std::string_view(tok).substr(eq + 1), 16, req_frontend);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }

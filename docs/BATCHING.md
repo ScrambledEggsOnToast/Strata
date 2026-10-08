@@ -134,6 +134,27 @@ until completion, but a revoked owner cannot publish reusable state even if the
 configuration returns to its original value. Tenant-only switches preserve each
 owner's isolated cache; exact yielded continuation also requires the same identity.
 
+The native and SYCL protocol parsers accept `tenant=` only as exactly 32 lowercase
+hexadecimal digits and `frontend=` only as exactly 16. Short values, uppercase,
+non-hex characters and trailing characters (including another hexadecimal digit)
+make the request unidentified: it must recompute from token zero with no cache
+reuse. Tenant words retain their existing high-word-first protocol ordering.
+Native `RESTORE` uses the same checks on the separate tenant/frontend value slices
+of its exact-length ` tenant=<32 hex> frontend=<16 hex>` suffix; a valid suffix
+continues to bind the restored session to the requested namespace.
+
+Identity-boundary qualification must drive the actual engine with a populated
+cache, not a mocked parser: for both `GEN` and `BGEN`, prime an exact valid
+identity, then independently vary tenant lengths 31/33 and frontend lengths
+15/17, append hex and non-hex junk to each valid value, and try uppercase and
+missing values. Every malformed request must report zero reused tokens and match
+cache-disabled tokens and model-state hashes. Exact valid controls must still
+reuse a compatible prefix; use distinct tenant words to detect ordering changes.
+Also qualify native `RESTORE` with the valid suffix and malformed boundaries.
+The existing resident-model tests operate on already-parsed identities, and the
+server identity tests operate on frontend-generated keys; neither exercises this
+private protocol parser. These full-model consumer checks remain required.
+
 `STATE_RETAINED` reports restored private bytes while batch resources are released;
 its zero canary explicitly means no live batch-graph validation. `STATE_RESOURCES`
 marks successful release/re-init boundaries, and re-init uploads and validates
