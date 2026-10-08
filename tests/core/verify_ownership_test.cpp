@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 using namespace strata::core;
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
@@ -70,6 +71,25 @@ int main() {
     REQUIRE(!verify_canary_matches(observed, expected, 2));
     ++expected.epoch; // identical request/token/position, stale previous output
     REQUIRE(!verify_canary_matches(observed, expected, 1));
+    // Unequal contiguous groups: cancelled member yields no records; survivor keeps its
+    // accepted speculative prefix, not the rejected tail or a later same-slot group.
+    const int rows[] = {2, 2, 2, 5, 5, 2, 2};
+    int keep[8] = {}; keep[2] = 2;
+    std::vector<int> selected;
+    REQUIRE(for_each_committed_batch_row(rows, 7, keep, [&](int row) {
+        selected.push_back(row); return true;
+    }));
+    REQUIRE((selected == std::vector<int>{0, 1, 5, 6}));
+    selected.clear();
+    REQUIRE(for_each_committed_batch_row(rows, 7, nullptr, [&](int row) {
+        selected.push_back(row); return true;
+    }));
+    REQUIRE((selected == std::vector<int>{0, 1, 2, 3, 4, 5, 6}));
+    selected.clear();
+    REQUIRE(!for_each_committed_batch_row(rows, 7, keep, [&](int row) {
+        selected.push_back(row); return row != 1;
+    }));
+    REQUIRE((selected == std::vector<int>{0, 1}));
     static_assert(kVerifyCanaryDeviceBytes == 720 && kVerifyCanaryHostBytes == 1552);
     static_assert(kVerifyBatchGraphKeys == 32);
     std::puts("verify ownership CPU seams: passed");

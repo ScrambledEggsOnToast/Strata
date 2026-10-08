@@ -728,25 +728,16 @@ bool Verifier::observe_committed_rows(int count, std::string& err, const int* ke
     if (next_ || lb_ != 0 || !last_stage()) {
         err = "verify: exact row observation requires the qualified single-device layout"; return false;
     }
-    int accepted = count;
-    if (keep) {
-        accepted = 0;
-        for (int t = 0; t < count && t < last_t_; ++t) {
-            int first = t;
-            while (first > 0 && last_rows_[first - 1] == last_rows_[t]) --first;
-            accepted += t - first < keep[last_rows_[t]];
-        }
+    if (count < 1 || count > last_t_) {
+        err = "verify: committed row observation bound exceeded"; return false;
     }
-    if (count < 1 || count > last_t_ || observed_rows_ + accepted > observation_limit_) {
+    int accepted = 0;
+    for_each_committed_batch_row(last_rows_, count, keep, [&](int) { ++accepted; return true; });
+    if (observed_rows_ + accepted > observation_limit_) {
         err = "verify: committed row observation bound exceeded"; return false;
     }
     std::array<float, 16384> buffer;
-    for (int t = 0; t < count; ++t) {
-        if (keep) {
-            int first = t;
-            while (first > 0 && last_rows_[first - 1] == last_rows_[t]) --first;
-            if (t - first >= keep[last_rows_[t]]) continue;
-        }
+    if (!for_each_committed_batch_row(last_rows_, count, keep, [&](int t) {
         if (observed_rows_ % 16 == 0) {
             if (row_trace_ && std::fclose(row_trace_) != 0) {
                 row_trace_ = nullptr; err = "verify: closing row observation failed"; return false;
@@ -785,7 +776,8 @@ bool Verifier::observe_committed_rows(int count, std::string& err, const int* ke
             }
         }
         ++observed_rows_;
-    }
+        return true;
+    })) return false;
     if (std::fflush(row_trace_) != 0) { err = "verify: flushing row observations failed"; return false; }
     return true;
 }

@@ -82,6 +82,12 @@ weight leases remain owned until every consumer drains. Cancellation controls do
 not cross a queued new request; a control arriving after the boundary check takes
 effect at the next safe boundary. `BSTOP` remains a retained scheduling release
 for the solo continuation and normal EOS cleanup.
+Committed-row observations use the same contiguous-slot accepted-prefix selector in
+`verify_ownership.hpp` for both capacity preflight and record publication. Null-prefix
+selection retains the solo/all-rows path; a failed record consumer stops immediately.
+The synthetic shared-helper oracle exercises this observation-selection seam after
+successful helper drainage; model-state commit and actual token delivery remain
+separate full-model obligations.
 The parent project's HET-036 evidence records the tested envelope; implementation
 alone does not qualify HTTP concurrency, latency, or fairness.
 

@@ -28,6 +28,22 @@ inline constexpr int kVerifyCanaryRows = 8;
 inline constexpr int kVerifySoloOwner = 8;
 inline constexpr unsigned kVerifyBatchGraphKeys = 32;
 
+// Select each contiguous slot group's accepted prefix after the operation drains.
+// Null keep is the solo/all-rows path. Callers validate row/count/slot bounds before
+// selection; returning false from the consumer stops publication immediately.
+template<class Consumer>
+bool for_each_committed_batch_row(const int* slots, int count, const int* keep, Consumer&& consume) {
+    for (int first = 0; first < count;) {
+        int end = first + 1;
+        while (end < count && slots[end] == slots[first]) ++end;
+        const int accepted = keep ? keep[slots[first]] : end - first;
+        for (int row = first; row < end && row - first < accepted; ++row)
+            if (!consume(row)) return false;
+        first = end;
+    }
+    return true;
+}
+
 // Bound at admission, independently of the per-operation mapped row staging.
 struct VerifyCanaryOwner {
     uint64_t request_id = 0;
