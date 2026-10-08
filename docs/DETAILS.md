@@ -1609,7 +1609,7 @@ waiting for the engine's serialized control owner. A first token is a native gen
 is an end-of-turn marker or buffered by structured output rather than visible to the client.
 
 Cancellation during admission sends `STOP` and consumes `DONE`/`BADM`; an active resident slot receives
-`BSTOP` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned
+`BCANCEL` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned
 through that drain. Missing acknowledgements or ambiguous native admission errors end the engine rather
 than return a potentially live slot to the queue. Existing consumers must retire before restart. This
 fail-closed path can fail other active requests; it must not silently mutate or complete them with another
@@ -1625,7 +1625,7 @@ Keep all raw HTTP bodies, lifecycle snapshots, native scheduler traces and exact
    verify class FIFO/three-foreground admission bound. A fifth outstanding request with queue limit 2 must
    receive 429. The queued request's TTFT/completion must include its measured wait.
 3. Cancel a queued request through the private API; require no BGEN for it. Cancel a decoding request;
-   require BSTOP followed by BDONE before slot reuse and compare its unaffected peer with isolation.
+   require BCANCEL followed by BDONE before slot reuse and compare its unaffected peer with isolation.
 4. Disconnect streaming and non-streaming clients during prefill and decode, then retry with different
    prompts. Check ownership/drain order, correct outputs, zero leaked admission reservations, and no stale
    tokens. Repeat on each slot, including reuse with the opposite priority.

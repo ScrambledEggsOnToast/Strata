@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -347,6 +348,21 @@ inline ExpertGroupPlan analyze_expert_groups(const int64_t* positions, const int
     return ExpertGroupPlan::per_span;
 }
 
+// HET-038: one helper's dispatch-wait cost estimate, measured by the scheduler at its own
+// submission and completion boundaries for the operation in flight (reset by every begin).
+// `submit_us` is the begin call's wall: the submission itself plus any synchronous transfer.
+// `queue_service_us` is the wall from the submission's return to the worker's completion
+// (finish, or the cancel that drained it): the queued delay plus the device service the
+// dispatch thread actually waited through. The two intervals are adjacent and disjoint, so
+// together they account for the dispatch's helper wait exactly once; overlapping CPU-pool
+// work is contained in the wall, never added to it as a second term. A per-worker estimate,
+// not an isolated queue-vs-device-service measurement: only the worker could split those.
+struct ExpertWorkerCost {
+    uint64_t submit_us = 0;
+    uint64_t queue_service_us = 0;
+    uint64_t submissions = 0;
+};
+
 // Ordered, non-owning helper dispatch. Construct once, outside dispatch; workers
 // and any active ledger must outlive this module. One helper operation may be
 // active at a time. The caller owns ledger.begin(), CPU/primary/peer claims and
@@ -418,6 +434,12 @@ public:
         count_ = (size_t) count;
         completion_ = &completion;
         active_ = true;
+        for (auto& state : workers_) {   // the estimate is this operation's, not a lifetime total
+            state.submit_us = 0;
+            state.queue_service_us = 0;
+            state.submissions = 0;
+            state.began = false;
+        }
         for (size_t i = 0; i < workers_.size(); ++i) {
             auto& state = workers_[i];
             state.version = state.worker->residency_version();
@@ -425,7 +447,14 @@ public:
             state.pending = true; // A failed begin may already have launched work.
             ExpertWork submitted = work;
             submitted.weights.residency_version = state.version;
+            const auto submit_t0 = std::chrono::steady_clock::now();
             if (!state.worker->begin(submitted, error_)) return fail("helper begin failed");
+            const auto submitted_at = std::chrono::steady_clock::now();
+            state.submit_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                submitted_at - submit_t0).count();
+            state.began = true;
+            state.busy_since = submitted_at;   // the queue+service wall starts when submission returns
+            ++state.submissions;
             if (state.worker->residency_version() != state.version)
                 return fail("helper residency changed during submission");
             for (size_t row = 0; row < count_; ++row) {
@@ -453,6 +482,9 @@ public:
             if (state.worker->residency_version() != state.version)
                 return fail("helper residency changed before completion");
             if (!state.worker->finish(output, error_)) return fail("helper finish failed");
+            if (state.began && state.pending)   // the wall ends at this completion (once per submission)
+                state.queue_service_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - state.busy_since).count();
             state.pending = false;
             completion_->drain_submission(operation_);
             if (state.worker->residency_version() != state.version)
@@ -474,6 +506,14 @@ public:
 
     bool active() const { return active_; }
     const std::string& error() const { return error_; }
+    /// HET-038: this operation's cost estimate for helper `index` (reset by every begin; final
+    /// once finish/cancel drained it). An index past the configured helpers reads as zero.
+    ExpertWorkerCost worker_cost(size_t index) const {
+        if (index >= workers_.size()) return {};
+        const State& state = workers_[index];
+        return {state.submit_us, state.queue_service_us, state.submissions};
+    }
+    size_t worker_count() const { return workers_.size(); }
     size_t storage_bytes() const {
         return workers_.capacity() * sizeof(State) + error_.capacity() + 1 + drain_error_.capacity() + 1;
     }
@@ -486,6 +526,12 @@ private:
         ExpertWorker* worker = nullptr;
         uint64_t version = 0;
         bool pending = false;
+        // This operation's measured cost; see ExpertWorkerCost.
+        uint64_t submit_us = 0;
+        uint64_t queue_service_us = 0;
+        uint64_t submissions = 0;
+        bool began = false;
+        std::chrono::steady_clock::time_point busy_since{};
     };
     uint32_t owner_id(size_t index) const { return first_owner_ + (uint32_t) index; }
     bool helper_owner(uint32_t owner) const {
@@ -514,6 +560,9 @@ private:
                 }
                 state.pending = false;
                 completion_->drain_submission(operation_);
+                if (state.began)   // the drain's wait is queue+service the dispatch consumed too
+                    state.queue_service_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - state.busy_since).count();
             }
             // Also covers finish succeeding before detecting a stale version.
             completion_->drained(operation_, owner_id(i));

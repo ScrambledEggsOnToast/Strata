@@ -55,8 +55,11 @@ as a share of measured prompt work. Both bounds are scheduling policy, not measu
 rejected-draft, discarded and committed counts separately. Discarded positions include
 termination/length boundaries and are not all speculative rejections. `TOKEN_MARK` records
 each committed token's engine emission time on the steady clock, including tokens emitted
-in one verification burst; it is not a separate compute-completion timestamp. Aggregate
-rates count committed tokens over the common wall interval, including intervening admissions.
+in one verification burst; it is not a separate compute-completion timestamp. Service aggregate
+rates count all committed `T`/`BT` tokens over the common arrival-to-completion wall interval,
+including admissions and queueing. The native batch-window summary counts `BT` only from the
+first batch window; later admissions contribute elapsed time, but admission `T` tokens are
+excluded. It is a diagnostic rate, not the service aggregate.
 
 ### Resident multiplexing without compute batching
 
@@ -71,9 +74,15 @@ No full conversation image is copied to alternate decode turns. Priority must be
 set before each admission; the default is foreground. Multi-device pipelines are
 not supported by this mode.
 
-At a drained non-pipelined boundary, `BSTOP` completes cancellation without
-executing another token for that row. Other resident requests continue. The
-parent project's HET-036 evidence records the tested envelope; implementation
+At a drained non-pipelined boundary, `BCANCEL` discards the cancelled member's
+pending output and invalidates its retention; other resident requests commit normally.
+The verifier retires the window with a zero accepted prefix for that member, so it
+does not publish a committed token or committed-logit row. Speculative scratch and
+weight leases remain owned until every consumer drains. Cancellation controls do
+not cross a queued new request; a control arriving after the boundary check takes
+effect at the next safe boundary. `BSTOP` remains a retained scheduling release
+for the solo continuation and normal EOS cleanup.
+The parent project's HET-036 evidence records the tested envelope; implementation
 alone does not qualify HTTP concurrency, latency, or fairness.
 
 ### Explicit rows and idle resource diagnostics
@@ -152,7 +161,7 @@ for request/config fields, private lifecycle/cancellation endpoints, budgets and
 This is an opt-in qualification surface, not measured acceptance or a reason to enable public concurrency.
 The multiplex service path explicitly refuses images; concurrent image-encoder work is not qualified.
 
-Cancellation keeps the HTTP admission reservation through synchronous `STOP`/`BADM` or `BSTOP`/`BDONE`
+Cancellation keeps the HTTP admission reservation through synchronous `STOP`/`BADM` or `BCANCEL`/`BDONE`
 draining. Slots and embeddings cannot be freed by a background timer while the engine may still consume
 them. A missing boundary or ambiguous native admission refusal fails the process closed. Reused state is
 resident; this service adds no per-token state swaps. Native metadata compaction, operation ownership and
@@ -189,7 +198,7 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   a client that drops the reply's thinking from the history (the checkpoint matches up to the new turn). A new
   conversation takes an empty slot, else the one used longest ago.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
-- A client that disconnects stops its slot (`BSTOP`); the others go on.
+- A client that disconnects cancels its slot (`BCANCEL`); the others go on.
 
 ## Exactness
 
@@ -246,6 +255,22 @@ CPU/GPU kernel launches. Report deltas; never infer kernel savings or weight reu
 `EXPERT_GROUP_TOTAL` emits cumulative successful-dispatch counters under the diagnostic gate;
 `cpu_jobs` counts actual distinct-expert CPU job formations. Compare matched arm deltas to
 measure their reduction, separately from derived dispatch savings and logical payload volume.
+
+Worker queue time is a documented per-worker cost term, not an unmeasured overhead. Under the
+worker contract the scheduler measures each helper at its own submission and completion
+boundaries: `submit_us` (the begin call's wall: submission plus synchronous transfer) and
+`queue_service_us` (from the submission's return to the worker's completion, so a helper queued
+behind other work increases the estimate). The dispatch sums these into
+`helper_worker_submit_us`/`helper_worker_queue_service_us`, reported by `EXPERT_GROUP_TOTAL`.
+For each worker the intervals are adjacent and disjoint: submission plus queue+service
+covers its scheduler-observed outstanding interval exactly once. Summed worker
+intervals may overlap and are not the dispatch wall or isolated device service.
+CPU-pool work overlapping those intervals must not be added to them. `helper_busy_us`
+stays the separately labelled dispatch-observed window wall (the
+CPU pool's work overlaps it) and `helper_submit_us` the dispatch-timed submission cost; no two
+labels are ever added together. None of these isolate queued delay from device service - only
+the worker could split those - and the contract tests pin the estimate against a controlled
+delayed mock helper.
 
 Formation uses fixed eight-row/128-entry tables and one global CPU pool. Unsupported merge bounds
 select per-span CPU jobs within the same ownership envelope; unrepresentable window extents refuse.
@@ -371,7 +396,8 @@ On top of `GEN` / `GENI`:
 | `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
 | `BT <slot> <id>` | out | a token of that slot |
 | `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
-| `BSTOP <slot>` | in | retire an active slot at the next safe boundary with BDONE, without another token; for an inactive yielded slot, end continuation ownership without BDONE |
+| `BSTOP <slot>` | in | retained scheduling release at the next safe boundary; for an inactive yielded slot, end continuation ownership without BDONE |
+| `BCANCEL <slot>` | in | client cancellation; non-pipelined windows drain all grouped consumers before discarding this member's pending output and cache retention, leaving survivor commits unchanged |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |

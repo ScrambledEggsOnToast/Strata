@@ -207,7 +207,7 @@ public:
     /// Keep every row of the last batch window: 
     bool commit_slots(std::string& err);
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
-    /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
+    /// one entry per slot (indexed by slot ID), each in 0..that slot's group length; zero discards cancellation.
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// An operator may tighten the priced 32-key bound, never enlarge it or request an unbounded cache.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n == 0 ? kVerifyBatchGraphKeys : std::min<size_t>(n, kVerifyBatchGraphKeys); }

@@ -1034,7 +1034,7 @@ class StrataEngine:
         born = self.gen
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held
         if self.alive():
-            self._send(f"BSTOP {slot}")
+            self._send(f"{'BCANCEL' if stream is None else 'BSTOP'} {slot}")
         end = time.monotonic() + 600.0
         tail = list(stream or [])
         while True:
@@ -1043,7 +1043,7 @@ class StrataEngine:
                 break
             left = end - time.monotonic()
             if left <= 0:
-                raise self._silent("the engine did not acknowledge BSTOP within 600 s")
+                raise self._silent("the engine did not acknowledge the slot release within 600 s")
             try:
                 line = q.get(timeout=min(1.0, left))
             except queue.Empty:
@@ -1140,7 +1140,7 @@ class StrataEngine:
         are taken one request at a time - and a long prompt read gives way at a chunk boundary to a waiting request
         with a much shorter prompt (#656: `BYIELD <slot>`; the part read waits in a slot and the read goes on after).
         A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
-        admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+        admission to its BADM, a slot is BCANCELled and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
@@ -1312,7 +1312,7 @@ class StrataEngine:
                             phase = "none"
                             raise EngineDied("the engine stopped during this batch request")
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
+                            self._send(f"BCANCEL {slot}")
                             stop_sent = True
                         yield None
                         continue
@@ -1325,7 +1325,7 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}")
+                                self._send(f"BCANCEL {slot}")
                                 stop_sent = True
                             continue
                         yield t
@@ -1340,7 +1340,7 @@ class StrataEngine:
                             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 and not cancel.is_set() else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -1391,7 +1391,7 @@ class StrataEngine:
                 slot_used[slot] = time.time()
                 if phase == "slot" and self.gen == born:
                     slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                    stream = None if cancel.is_set() else list(prompt) + out[gen0 if gen0 is not None else max(0, len(out) - 1):]
                     self._release_slot_when_done(slot, stream)    # admission held until BDONE
                 else:
                     with self.slot_cv:

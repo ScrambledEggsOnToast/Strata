@@ -425,6 +425,13 @@ struct ExpertDispatch {
     // and payload counts the bytes the grouped path itself moved (blob reads, quantized input, CPU result
     // rows, PCIe staging).  Helper cost is explicit: the submission's own cost and the worker queue+service
     // wall from submission to completion, timed by the dispatch thread in both the contract and legacy arms.
+    // The contract arm additionally consumes the scheduler's per-worker estimate (ExpertWorkerCost): each
+    // helper's submission/transfer wall and its queued-delay+service wall, measured between the scheduler's
+    // own begin and completion boundaries, summed over the helpers into the helper_worker_* fields for
+    // EXPERT_GROUP_TOTAL.  Queued delay is part of the documented per-worker cost, not an unmeasured
+    // overhead.  Every label here is reported separately and never added together: helper_busy_us stays
+    // the dispatch-observed window wall (the CPU pool's work overlaps it), the estimate the scheduler's
+    // own boundaries, and the CPU pool's time its own measurement.
     ExpertGroupSpan group_spans[8];    ///< the window's request spans, rebuilt every dispatch call
     int32_t group_span_count = 0;      ///< spans found in the current window (0 before the first call)
     int64_t group_windows = 0;         ///< dispatched windows that merged more than one request span
@@ -437,6 +444,8 @@ struct ExpertDispatch {
     uint64_t helper_submit_us = 0;     ///< worker submission cost, dispatch thread, both arms
     uint64_t helper_busy_us = 0;       ///< worker queue+service wall, submission to completion, both arms
     uint64_t helper_submissions = 0;   ///< timed worker submissions
+    uint64_t helper_worker_submit_us = 0;        ///< per-worker submission/transfer estimate, summed over helpers
+    uint64_t helper_worker_queue_service_us = 0; ///< per-worker queued-delay+service estimate, summed over helpers
 
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the

@@ -9013,6 +9013,34 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // Client cancellation differs from BSTOP's retained scheduling release.
+        // Consume only leading cancellations: never cross a queued new request,
+        // so a slot's successor cannot be cancelled out of wire order.
+        bool discard_member[8] = {};
+        auto cancel_member = [&](int b) {
+            if (b < 0 || (size_t) b >= bs.size() || !bs[(size_t) b].active) return;
+            discard_member[b] = !(o.batch_groups > 1 && !stages.empty());
+            resident.cancel(b);
+        };
+        auto cancel_command = [&](const std::string& command) {
+            char* end = nullptr;
+            errno = 0;
+            const char* start = command.c_str() + 8;
+            const long b = std::strtol(start, &end, 10);
+            if (errno || end == start || *end != '\0' || b < 0 || (size_t) b >= bs.size()) {
+                std::printf("ERR BCANCEL: expected slot\n");
+                std::fflush(stdout);
+                return;
+            }
+            cancel_member((int) b);
+        };
+        auto apply_member_cancels = [&] {
+            std::lock_guard<std::mutex> lk(in_mu);
+            while (!in_lines.empty() && in_lines.front().rfind("BCANCEL ", 0) == 0) {
+                cancel_command(in_lines.front());
+                in_lines.pop_front();
+            }
+        };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
@@ -9022,11 +9050,13 @@ int main(int argc, char** argv) {
             int32_t tok[8] = {};
             int64_t pos[8] = {};
             int first[8] = {}, active[8] = {}, A = 0;
+            apply_member_cancels();
             for (int b = 0; b < (int) bs.size(); ++b) {
                 const BSlot& sl = bs[(size_t) b];
                 if (!sl.active || !sl.stop) continue;
                 // The previous operation has drained. Cancellation must not execute another row.
-                if (!resident.finish(b, true, err)) return false;
+                if (!resident.finish(b, !discard_member[b], err)) return false;
+                discard_member[b] = false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                 std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
             }
@@ -9103,6 +9133,10 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
+            // run_slot_rows has drained every CUDA/helper consumer. Keep their
+            // versioned input/output storage until here, then discard only the
+            // cancelled member's host publication; survivors still commit.
+            apply_member_cancels();
             const Clock::time_point w1 = Clock::now();
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             int keep[8] = {};
@@ -9116,7 +9150,9 @@ int main(int argc, char** argv) {
                 if (batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] != tok[i + 1])
                     ++rejected_drafts;
             }
-            if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
+            if (!batch_mtp) for (int t = 0; t < S; ++t) keep[rows[t]] = 1;
+            for (size_t b = 0; b < bs.size(); ++b) if (discard_member[b]) keep[b] = 0;
+            if (!ver.commit_slot_prefixes(keep, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
@@ -9130,6 +9166,13 @@ int main(int argc, char** argv) {
             for (int t = 0; t < (batch_mtp ? A : S); ++t) {
                 const int b = batch_mtp ? active[t] : rows[t];
                 const auto& sl = bs[(size_t) b];
+                if (discard_member[b]) {
+                    if (!resident.finish(b, false, err)) return false;
+                    discard_member[b] = false;
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                    std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
+                    continue;
+                }
                 const int start = batch_mtp ? first[t] : t;
                 const int accepted = batch_mtp ? keep[b] : 1;
                 const float* last_residual = nullptr;
@@ -9179,8 +9222,8 @@ int main(int argc, char** argv) {
                 const double L = (double) g.n_layers;
                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
-                                     "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f committed tokens/s over %.0f ms of wall time "
-                                     "(admissions included)\n",
+                                     "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f batch-window committed tokens/s over %.0f ms "
+                                     "from first batch window (later admissions included; admission tokens excluded)\n",
                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
@@ -9413,6 +9456,10 @@ int main(int argc, char** argv) {
                     resident.priority((int) b, std::strcmp(end, " foreground") == 0);
                     if ((size_t) b == resident_cursor) resident_credit = 0;
                 }
+                continue;
+            }
+            if (line.rfind("BCANCEL ", 0) == 0) {
+                cancel_command(line);
                 continue;
             }
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -10671,10 +10718,17 @@ int main(int argc, char** argv) {
                     int ys = -1;
                     {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
                         std::lock_guard<std::mutex> lk(in_mu);
+                        bool cancel_ordered = true;
                         for (auto it = in_lines.begin(); it != in_lines.end();) {
+                            if (it->rfind("BGEN ", 0) == 0 || it->rfind("BGENI ", 0) == 0 ||
+                                it->rfind("GEN ", 0) == 0 || it->rfind("GENI ", 0) == 0 || *it == "QUIT")
+                                cancel_ordered = false;
                             if (it->rfind("BSTOP ", 0) == 0) {
                                 const int b = std::atoi(it->c_str() + 6);
                                 resident.cancel(b);
+                                it = in_lines.erase(it);
+                            } else if (cancel_ordered && it->rfind("BCANCEL ", 0) == 0) {
+                                cancel_command(*it);
                                 it = in_lines.erase(it);
                             } else if (it->rfind("BYIELD ", 0) == 0) {
                                 ys = std::atoi(it->c_str() + 7);

@@ -76,7 +76,7 @@ while True:
         break
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
-    if line.startswith("BSTOP "):
+    if line.startswith(("BSTOP ", "BCANCEL ")):
         b = int(line.split()[1])
         if b in active:
             active[b][1] = 0
@@ -206,8 +206,9 @@ class PickSlot(unittest.TestCase):
         e = self.engine(3)
         e.slot_held = [[1, 2, 3], [], [1, 2, 3, 4, 5]]
         e.slot_used = [5.0, 0.0, 9.0]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5, 6]), 2)       # the longest held start
-        self.assertEqual(e.pick_slot([1, 2, 3, 9]), 0)
+        e.slot_tenant = ['owner', None, 'owner']
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5, 6], 'owner'), 2)       # the longest held start
+        self.assertEqual(e.pick_slot([1, 2, 3, 9], 'owner'), 0)
         self.assertEqual(e.pick_slot([7, 8]), 1)                    # no match: the empty slot first
         e.slot_busy[1] = True
         self.assertEqual(e.pick_slot([7, 8]), 0)                    # then the one used longest ago
@@ -267,6 +268,30 @@ class ParallelService(unittest.TestCase):
     def get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=10) as r:
             return json.loads(r.read().decode())
+
+    def test_normal_close_at_admission_first_token_retains_owner_prefix(self):
+        self.start(2, slot_cache=True)
+        # Reserve the other slot so this request enters BGEN rather than solo GEN.
+        self.engine.slot_busy[1] = True
+        prompt = [11, 12, 13]
+        generated = self.engine.generate_batched(prompt, 8,
+            {"_strata_cache": ("owner", "frontend")}, threading.Event())
+        first = next(token for token in generated if token is not None)
+        self.assertEqual(first, ord("o"))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with self.engine.lines.mutex:
+                admitted = any(line and line.startswith("BADM 0 1") for line in self.engine.lines.queue)
+            if admitted:
+                break
+            time.sleep(0.001)
+        self.assertTrue(admitted, "native admission must hand off before ordinary frontend close")
+        generated.close()  # ordinary stop sequence/consumer close, not client cancellation
+        self.assertFalse(self.engine.slot_busy[0])
+        self.assertEqual(self.engine.slot_held[0][:len(prompt)], prompt)
+        self.assertGreater(len(self.engine.slot_held[0]), len(prompt))
+        self.assertEqual(self.engine.slot_held[0][len(prompt)], first)
+        self.assertEqual(self.engine.pick_slot(prompt + [first, 999], "owner"), 0)
 
     def test_requested_capacity_is_refused_when_only_fewer_slots_fit(self):
         with self.assertRaisesRegex(RuntimeError, "requested.*4.*effective.*2"):

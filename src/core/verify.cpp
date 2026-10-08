@@ -2743,7 +2743,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                   0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
-                    native_qsa_indexer_commit(commitb_ + (size_t) rows[first] * CB + 2,
+                    native_qsa_indexer_commit(pos_ + (size_t) first * g.n_head,
                                               commitb_ + (size_t) rows[first] * CB, ib, cs_);
                 }
                 ++qsa_index;
@@ -3084,7 +3084,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         const int first = t;
         while (t < S && last_rows_[t] == last_rows_[first]) ++t;
         const int n = keep[last_rows_[first]];
-        if (n < 1 || n > t - first) {
+        if (n < 0 || n > t - first) {
             err = "verify: accepted prefix is outside its slot group";
             return false;
         }

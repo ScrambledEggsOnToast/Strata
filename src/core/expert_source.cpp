@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_formation.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -2829,6 +2830,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // HET-038: the workers' cost is explicit.  `helper_submit_us` is the submission's own cost;
     // `helper_busy_us` is the queue+service wall from submission to completion as the dispatch thread sees
     // it (the CPU pool's work overlaps it; the two are reported separately, never added together).
+    // `helper_worker_submit_us`/`helper_worker_queue_service_us` carry the scheduler's per-worker estimate
+    // on top of that: the queued-delay term of the documented per-worker cost, measured at the scheduler's
+    // own boundaries and consumed after a successful finish below - equally never added to anything else.
     const auto helper_t0 = std::chrono::steady_clock::now();
     if (!d.workers.empty()) {
         static thread_local std::string remote_error;
@@ -2958,29 +2962,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
                 ++d.cache_refused;
                 int16_t& jo = d.job_of[(size_t) e];
-                if (jo < 0 || d.jobs_multi[(size_t) jo].nt == MAXT) {
-                    const uint8_t* b = d.src->blob(d.layers, e);
-                    if (b == nullptr) {
-                        d.failed = true;
-                        d.fail = "the expert source could not produce a blob";
-                        d.fail_layer = d.layers;
-                        d.fail_expert = e;
-                        ++d.missing;
-                        if (d.worker_contract) drain_failed_workers(d);
-                        return;
-                    }
-                    d.group_payload_bytes += lay.blob_bytes(d.layers);   // HET-038: the bytes this launch reads
-                    jo = (int16_t) njobs++;
-                    ++d.group_cpu_jobs;
-                    ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                    nj.blob = b;
-                    nj.nt = 0;
+                bool created = false;
+                if (!append_expert_row(d.jobs_multi.data(), jo, njobs, MAXT, &d.act_multi[(size_t) t],
+                        native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr, row,
+                        [&] { return d.src->blob(d.layers, e); }, created)) {
+                    d.failed = true;
+                    d.fail = "the expert source could not produce a blob";
+                    d.fail_layer = d.layers;
+                    d.fail_expert = e;
+                    ++d.missing;
+                    if (d.worker_contract) drain_failed_workers(d);
+                    return;
                 }
-                ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-                jb.act[jb.nt] = &d.act_multi[(size_t) t];
-                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-                jb.out[jb.nt] = row;
-                ++jb.nt;
+                if (created) {
+                    d.group_payload_bytes += lay.blob_bytes(d.layers);
+                    ++d.group_cpu_jobs;
+                }
                 ++d.multi_entries;
                 ++span_entries;
             }
@@ -3080,6 +3077,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     std::chrono::steady_clock::now() - helper_t0).count();
                 d.failed = true; d.fail = d.helper_scheduler->error().c_str(); d.fail_layer = d.layers; return;
             }
+            // HET-038: the per-worker queue+service estimate, measured by the scheduler between its own
+            // submission and completion boundaries, consumed into the dispatch-cost report here.
+            for (size_t helper = 0; helper < d.helper_scheduler->worker_count(); ++helper) {
+                const ExpertWorkerCost cost = d.helper_scheduler->worker_cost(helper);
+                d.helper_worker_submit_us += cost.submit_us;
+                d.helper_worker_queue_service_us += cost.queue_service_us;
+            }
             d.helper_busy_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - helper_t0).count();
         } else {
@@ -3127,13 +3131,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::fprintf(stderr, "EXPERT_GROUP_TOTAL layer=%lld requests=%d merged_windows=%lld "
                              "cpu_jobs=%llu reuse_entries=%lld logical_payload_bytes=%lld "
                              "dispatch_formations_avoided_derived=%lld formation_us=%llu "
-                             "fallback_windows=%llu helper_submit_us=%llu helper_queue_service_us=%llu helper_submissions=%llu\n",
+                             "fallback_windows=%llu helper_submit_us=%llu helper_queue_service_us=%llu helper_submissions=%llu "
+                             "helper_worker_submit_us=%llu helper_worker_queue_service_us=%llu\n",
                      (long long) d.layers - 1, d.group_span_count, (long long) d.group_windows,
                      (unsigned long long) d.group_cpu_jobs, (long long) d.group_reuse_entries,
                      (long long) d.group_payload_bytes, (long long) d.group_launches_avoided,
                      (unsigned long long) d.group_formation_us, (unsigned long long) d.group_fallback_windows,
                      (unsigned long long) d.helper_submit_us, (unsigned long long) d.helper_busy_us,
-                     (unsigned long long) d.helper_submissions);
+                     (unsigned long long) d.helper_submissions,
+                     (unsigned long long) d.helper_worker_submit_us,
+                     (unsigned long long) d.helper_worker_queue_service_us);
     d.experts += n_tok * k;
 }
 

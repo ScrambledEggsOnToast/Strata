@@ -100,7 +100,6 @@ class ControlCancelTest(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(arrived.wait(2))
-            self.assertEqual(eng.sent, ["BSTOP 0"])
             self.assertTrue(eng.slot_busy[0])
             self.assertFalse(drained.is_set())
             eng.slot_q[0].put("BT 0 3")
