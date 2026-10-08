@@ -148,12 +148,14 @@ int64_t session_phase_limit_s(uint64_t bytes);
 
 // Optional knobs of a write.
 struct SessionWriteOptions {
-    // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
-    // write starts.  Not a reservation: other writers can take the space afterwards.
+    // The free-space PREFLIGHT: refused when the disk has less than the padded temporary peak plus this many
+    // bytes free before the write starts. Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
-    // The caller's own admission, asked ONCE with the new file's exact total bytes (header + payload + trailer)
-    // before the temporary file is created: false refuses the write before anything is on disk (HET-042's
-    // storage tier prices and evicts here, so the tier never transiently holds more than its budget).
+    // The caller's admission, asked ONCE with the new file's total bytes (header + payload + trailer) rounded
+    // up to 4096, before the temporary is created. This bounds its direct-I/O peak before truncation (also
+    // conservatively priced for buffered I/O); an unrepresentable peak is refused before admission or I/O.
+    // false refuses the write before anything is on disk. The storage tier evicts here to make room for the
+    // peak; later failure does not undo those evictions. Returned `bytes` and published files remain exact.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
     SessionProgress progress;

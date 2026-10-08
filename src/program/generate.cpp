@@ -8068,11 +8068,11 @@ int main(int argc, char** argv) {
                 if (!stored && disk_cache.enabled() && image.identity.known() &&
                     (int64_t) image.live.ids.size() >= o.conversation_cache_disk_min_tokens) {
                     // The storage tier: the image did not fit (or was refused by) the RAM budget.  The writer
-                    // asks this tier's admission with the file's EXACT total bytes before its temporary file is
-                    // created (SessionWriteOptions.admit): the tier evicts oldest-first then, or refuses - so
-                    // the transient footprint (the tier's files, the new file and its temporary) never exceeds
-                    // the budget while the bytes are on disk.  The writer's 16 MiB staging is priced against
-                    // the physical-RAM floor first, on top of the captured image and everything held.
+                    // asks this tier's admission with the padded temporary peak before its file is created
+                    // (SessionWriteOptions.admit): the tier evicts oldest-first then, or refuses, so retained
+                    // files plus the temporary never exceed the budget. Evictions are not rolled back if
+                    // writing fails later. The writer's 16 MiB staging is priced against the physical-RAM
+                    // floor first, on top of the captured image and everything held.
                     const std::string name = "park-" + std::to_string(++disk_seq) + ".bin";
                     const std::string path = disk_cache.dir() + "/" + name;
                     strata::core::ConversationDiskCache::Entry disk_entry{
@@ -8106,7 +8106,7 @@ int main(int argc, char** argv) {
                         strata::core::progress_at("request");
                         strata::core::progress_allow(0);
                         if (wrote || st.published) {   // published: the file is complete, only the folder flush failed
-                            // Exact prewrite admission already reserved the footprint.
+                            // Peak prewrite admission made room; charge only the exact published footprint.
                             disk_entry.file_bytes = (uint64_t) file_bytes;
                             disk_cache.admit(std::move(disk_entry));
                             std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to storage "

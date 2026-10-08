@@ -415,6 +415,32 @@ int main() {
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
     }
+#if SIZE_MAX == UINT64_MAX
+    // A representable exact total can still overflow when padded: reject in the real writer's sizing pass.
+    {
+        SavedConversation meta;
+        std::vector<SessionKvSource> sources(1);
+        size_t overhead = 0;
+        const fs::path baseline = dir / "peak-overhead.bin";
+        check(session_file_write(baseline.string(), meta, sources, id, overhead, error) &&
+              overhead > 0 && overhead < 4096, "peak overflow: measure a small streamed file's exact overhead");
+        sources[0].sizes[0] = SIZE_MAX - overhead;   // final total is UINT64_MAX, whose aligned peak cannot fit
+        bool admitted = false, transferred = false, source_read = false;
+        sources[0].read = [&](size_t, size_t, void*, size_t) { source_read = true; return false; };
+        SessionWriteOptions opt;
+        opt.admit = [&](uint64_t, std::string&) { admitted = true; return false; };
+        opt.progress = [&](uint64_t, uint64_t) { transferred = true; };
+        const fs::path p = dir / "peak-overflow.bin";
+        SessionStatus st;
+        written = 0;
+        check(!session_file_write(p.string(), meta, sources, id, written, error, opt, &st) &&
+              st.error == SessionError::invalid && !st.published && written == 0 &&
+              error.find("too large") != std::string::npos,
+              "peak overflow: an unrepresentable padded extent refuses instead of wrapping");
+        check(!admitted && !transferred && !source_read && !fs::exists(p) && no_temp(dir),
+              "peak overflow: refusal precedes admission, source reads and temporary creation");
+    }
+#endif
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
     {

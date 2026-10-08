@@ -4,10 +4,12 @@
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <cerrno>
 #include <cstdio>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -74,6 +76,93 @@ int main() {
     check(first.make_room(bytes), "the file fits the budget");
     first.admit({t1, true, img.live.ids, img.live.imgs, (uint64_t) bytes, "park-1.bin"});
     check(first.bytes() == bytes && first.size() == 1, "the record charges its file's bytes");
+
+    // The writer prices its padded temporary peak BEFORE writing, but the tier records only published bytes.
+    {
+        ConversationDiskCache tier;
+        check(tier.open(parent.string(), error), "peak admission tier opens");
+        const fs::path kept = fs::path(tier.dir()) / "kept.bin";
+        const fs::path incoming = fs::path(tier.dir()) / "incoming.bin";
+        size_t kept_bytes = 0;
+        check(session_file_write(kept.string(), img, bound, kept_bytes, error), "peak admission seed writes");
+        check(kept_bytes < 4096 && kept_bytes % 4096 != 0, "the small image needs final-block padding");
+        tier.admit({t1, true, img.live.ids, img.live.imgs, (uint64_t) kept_bytes, "kept.bin"});
+
+        uint64_t asked = 0, budget = 0;
+        size_t admissions = 0, transfers = 0, faults = 0;
+        SessionWriteOptions opt;
+        opt.admit = [&](uint64_t need, std::string& why) {
+            asked = need;
+            ++admissions;
+            for (const auto& e : fs::directory_iterator(tier.dir()))
+                check(e.path().extension() != ".tmp", "admission precedes temporary creation");
+            if (tier.make_room(need)) return true;
+            why = "the storage tier cannot hold the write peak";
+            return false;
+        };
+        opt.progress = [&](uint64_t done, uint64_t total) {
+            ++transfers;
+            check(done <= total, "transfer progress counts exact serialized bytes");
+            uint64_t footprint = 0;
+            for (const auto& e : fs::directory_iterator(tier.dir())) footprint += e.file_size();
+            check(footprint <= budget, "real temporary and retained files stay within the admitted budget");
+        };
+        opt.fault = [&](const char*) { ++faults; return 0; };
+        for (uint64_t limit : {uint64_t(kept_bytes), uint64_t(4095)}) {
+            budget = limit;
+            tier.set_budget(budget);
+            admissions = transfers = faults = 0;
+            size_t incoming_bytes = 0;
+            SessionStatus st;
+            check(!session_file_write(incoming.string(), img, bound, incoming_bytes, error, opt, &st) &&
+                  st.error == SessionError::storage && !st.published && incoming_bytes == 0,
+                  "a budget fitting the final file but not the padded peak refuses the real writer");
+            check(admissions == 1 && asked == 4096 && transfers == 0 && faults == 0,
+                  "peak refusal happens before temporary creation or any write step");
+            check(!fs::exists(incoming) && fs::file_size(kept) == kept_bytes &&
+                  tier.size() == 1 && tier.bytes() == kept_bytes && tier.evictions() == 0 &&
+                  std::distance(fs::directory_iterator(tier.dir()), fs::directory_iterator()) == 1,
+                  "an over-budget peak writes nothing and does not evict a retained conversation");
+        }
+
+        budget = kept_bytes + 4096;
+        tier.set_budget(budget);
+        admissions = transfers = 0;
+        size_t incoming_bytes = 0;
+        SessionStatus st;
+        check(session_file_write(incoming.string(), img, bound, incoming_bytes, error, opt, &st) &&
+              st.published && admissions == 1 && asked == 4096 && transfers == 2,
+              "the retained file plus the exact padded peak fits at equality");
+        check(incoming_bytes == kept_bytes && fs::file_size(incoming) == kept_bytes,
+              "the published file and returned bytes exclude temporary padding");
+        tier.admit({t1, true, img.live.ids, img.live.imgs, (uint64_t) incoming_bytes, "incoming.bin"});
+        check(tier.bytes() == 2 * kept_bytes && tier.evictions() == 0,
+              "the index charges only exact published bytes, not the admitted peak");
+
+        // Admission may evict first; a later write failure does not roll those evictions back.
+        budget = 4096;
+        tier.set_budget(budget);
+        opt.fault = [](const char* step) { return std::string(step) == "rename" ? EIO : 0; };
+        const fs::path failed = fs::path(tier.dir()) / "failed.bin";
+        check(!session_file_write(failed.string(), img, bound, incoming_bytes, error, opt, &st) &&
+              st.error == SessionError::io && !st.published && tier.evictions() == 2 &&
+              tier.size() == 0 && tier.bytes() == 0 &&
+              fs::directory_iterator(tier.dir()) == fs::directory_iterator(),
+              "post-admission failure cleans its temporary but does not restore evicted entries");
+
+        SavedConversation aligned = img;
+        aligned.live.gdn.resize(aligned.live.gdn.size() + 4096 - kept_bytes, 7);
+        opt.fault = {};
+        admissions = transfers = 0;
+        const fs::path boundary = fs::path(tier.dir()) / "boundary.bin";
+        check(session_file_write(boundary.string(), aligned, bound, incoming_bytes, error, opt, &st) &&
+              st.published && admissions == 1 && asked == 4096 && incoming_bytes == 4096 &&
+              fs::file_size(boundary) == 4096 && transfers == 2,
+              "an already aligned file is admitted at its exact boundary without another page");
+        tier.admit({t1, true, aligned.live.ids, aligned.live.imgs, (uint64_t) incoming_bytes, "boundary.bin"});
+        check(tier.bytes() == budget, "the aligned publication charges exactly its budget");
+        tier.close();
+    }
 
     // Selection: identity and the exact token prefix, from the index alone.
     const std::vector<int64_t> prompt = {1, 2, 3, 4, 5};

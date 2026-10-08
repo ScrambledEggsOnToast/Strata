@@ -5563,6 +5563,9 @@ int main(int argc, char **argv) try {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!session_ident.known() || (ident_seen &&
+                (session_ident.model != seen_model || session_ident.config != seen_config ||
+                 session_ident.frontend != seen_frontend))) return true;
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse(session_ident);   // the retained K/V described this conversation
             size_t estimate = 0;
@@ -6562,6 +6565,13 @@ int main(int argc, char **argv) try {
                 (!ident_seen || req_ident.model != seen_model || req_ident.config != seen_config ||
                  req_ident.frontend != seen_frontend)) {
                 const size_t gone = conversations.invalidate_except(req_ident);
+                // Revocation applies to the live owner too: parking must not republish
+                // its old frontend after invalidate_except removed the parked copies.
+                // Clearing the identity also prevents its checkpoint chain from reviving
+                // if that frontend returns later. Tenant-only switches keep their owners.
+                if (session_ident.known() && (session_ident.model != req_ident.model ||
+                    session_ident.config != req_ident.config || session_ident.frontend != req_ident.frontend))
+                    session_ident = {};
                 ident_seen = true;
                 seen_model = req_ident.model;
                 seen_config = req_ident.config;

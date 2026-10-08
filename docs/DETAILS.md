@@ -936,6 +936,12 @@ nothing and reads from the start. Another principal's entries are kept for their
 owner, never offered across namespaces even for byte-identical prompts; a model,
 config or frontend change discards the entries it invalidates outright. The
 engine log reports invalidations and, for storage-tier restores, their traffic.
+The SYCL frontend uses process-fixed model/config identities (zero is valid for
+those fields) and requires known frontend and tenant identities. A frontend
+change revokes the outgoing live owner's cache identity before any parking or
+checkpoint reuse, so returning to an earlier frontend cannot resurrect it.
+Tenant-only switches preserve isolated owners. This is a source-level policy;
+SYCL runtime coverage must be reported separately from native CUDA evidence.
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not

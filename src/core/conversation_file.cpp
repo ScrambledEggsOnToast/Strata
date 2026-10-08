@@ -1051,12 +1051,20 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         return false;
     }
     const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    // Direct I/O pads the last block before truncating it. Price that peak even for buffered writes: the
+    // I/O mode is known only after opening the temporary, and this preflight must precede its creation.
+    const uint64_t padding = (kAlign - total % kAlign) % kAlign;
+    if (total > UINT64_MAX - padding) {
+        error = "session file: the state is too large for this build";
+        return false;
+    }
+    const uint64_t peak = total + padding;
     st.error = SessionError::io;
-    // The caller's own admission (HET-042's storage tier), asked with the file's exact total bytes BEFORE the
-    // temporary file is created: a refusal here writes nothing and leaves nothing to clean up.
+    // The caller's own admission (HET-042's storage tier), asked with the padded temporary peak BEFORE the
+    // temporary file is created: a refusal here writes nothing. The published file still holds exactly total.
     if (opt.admit) {
         std::string aw;
-        if (!opt.admit(total, aw)) {
+        if (!opt.admit(peak, aw)) {
             st.error = SessionError::storage;
             error = "session file: not admitted where it is written" + (aw.empty() ? std::string() : ": " + aw);
             return false;
@@ -1065,9 +1073,9 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
         if (!free_space(path, avail)) { error = "session file: cannot read the free disk space for " + path; return false; }
-        if (avail < total || avail - total < opt.min_free_bytes) {
+        if (avail < peak || avail - peak < opt.min_free_bytes) {
             st.error = SessionError::storage;
-            error = "session file: not enough disk space (" + std::to_string(total >> 20) + " MiB plus a reserve of " +
+            error = "session file: not enough disk space (" + std::to_string(peak >> 20) + " MiB write peak plus a reserve of " +
                     std::to_string(opt.min_free_bytes >> 20) + " MiB needed, " + std::to_string(avail >> 20) +
                     " MiB free)";
             return false;
