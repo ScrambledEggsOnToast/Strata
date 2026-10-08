@@ -126,6 +126,14 @@ allocated identity. Released batch scratch still permits cached solo restoration
 resident admission waits for re-init, which never revives failed contexts. No
 full-session copying is added to per-token scheduling.
 
+Changing model/configuration or tokenizer/template identity revokes reusable live,
+checkpoint and resident cache leases as well as parked RAM/storage entries. The
+outgoing old-identity session cannot be parked again after invalidation. Active
+and yielded owners retain their request identity, sampling sequence and histories
+until completion, but a revoked owner cannot publish reusable state even if the
+configuration returns to its original value. Tenant-only switches preserve each
+owner's isolated cache; exact yielded continuation also requires the same identity.
+
 `STATE_RETAINED` reports restored private bytes while batch resources are released;
 its zero canary explicitly means no live batch-graph validation. `STATE_RESOURCES`
 marks successful release/re-init boundaries, and re-init uploads and validates

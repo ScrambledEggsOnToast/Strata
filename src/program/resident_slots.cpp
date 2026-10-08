@@ -39,7 +39,7 @@ namespace {
 bool same_request(const ResidentRequest& a, const ResidentRequest& b) {
     const auto& x = a.sampling;
     const auto& y = b.sampling;
-    return a.max_new == b.max_new && a.steering == b.steering && a.images == b.images &&
+    return a.identity == b.identity && a.max_new == b.max_new && a.steering == b.steering && a.images == b.images &&
            a.pcie_fraction == b.pcie_fraction && a.spec_min_probability == b.spec_min_probability &&
            x.top_k == y.top_k && x.top_p == y.top_p && x.min_p == y.min_p &&
            x.temperature == y.temperature && x.min_keep == y.min_keep &&
@@ -67,6 +67,7 @@ bool ResidentSlots::begin(int destination, const std::vector<int64_t>& prompt,
         next.request = slot.request;
         next.sampling = slot.sampling;
         next.resume_slot = (int) b;
+        next.cache_eligible = slot.cache_eligible;
         break;
     }
     if (!next.request) {
@@ -131,6 +132,18 @@ void ResidentSlots::cancel(int slot) {
 
 void ResidentSlots::priority(int slot, bool foreground) {
     if (slot >= 0 && (size_t) slot < slots_.size()) slots_[(size_t) slot].foreground = foreground;
+}
+
+void ResidentSlots::invalidate_cache_identity(const core::ConversationIdentity& current) {
+    for (auto& slot : slots_) {
+        if (!slot.identity.known() || (slot.identity.model == current.model &&
+            slot.identity.config == current.config && slot.identity.frontend == current.frontend)) continue;
+        slot.cache_eligible = false;
+        if (!slot.active && !slot.partial) slot.cached = false;
+    }
+    if (input_.identity.known() && (input_.identity.model != current.model ||
+        input_.identity.config != current.config || input_.identity.frontend != current.frontend))
+        working_.cache_eligible = false;
 }
 
 bool ResidentSlots::idle(std::string& error) {
@@ -281,6 +294,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.sampling = working_.sampling;
     state.request = working_.request;
     state.identity = input_.identity;   // the cached conversation stays this request's identity's property
+    state.cache_eligible = working_.cache_eligible;
     state.x = request.next_token;
     state.p = (int64_t) prefix.size();
     state.produced = parked ? 0 : 1;
@@ -357,7 +371,10 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
     }
     working_failed_ = false;
     residency("resume", slot);
-    if (working_.resume_slot == slot) slots_[(size_t) slot].partial = false;
+    if (working_.resume_slot == slot) {
+        slots_[(size_t) slot].partial = false;
+        if (!slots_[(size_t) slot].cache_eligible) slots_[(size_t) slot].cached = false;
+    }
     return true;
 }
 
@@ -429,7 +446,7 @@ bool ResidentSlots::finish(int slot, bool keep_cache, std::string& error, bool d
     }
     state.active = false;
     residency("pause", slot);
-    state.cached = keep_cache && cache_ && !state.img;
+    state.cached = keep_cache && cache_ && !state.img && state.cache_eligible;
     return true;
 }
 

@@ -32,6 +32,7 @@ struct ResidentWorking {
     uint64_t request = 0;
     kernels::SamplerParams sampling;
     int resume_slot = -1;
+    bool cache_eligible = true;
 };
 
 // Read-only to the scheduler. The vector objects and graph-referenced sessions
@@ -50,6 +51,7 @@ struct ResidentSlot {
     int original_slot = -1;
     bool cached = false, cvec = true, img = false;
     core::ConversationIdentity identity;   // the request this slot's cached conversation belongs to
+    bool cache_eligible = true;   // a configuration transition revokes reuse, not in-flight ownership
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
     bool failed = false;
@@ -85,6 +87,8 @@ public:
     bool available(int slot) const;
     void cancel(int slot);
     void priority(int slot, bool foreground);
+    // Revoke old configuration cache leases without touching active/partial owner state.
+    void invalidate_cache_identity(const core::ConversationIdentity& current);
     bool init_resources(std::string& error);
     bool release_resources(std::string& error);
     bool admit(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request, std::string& error);

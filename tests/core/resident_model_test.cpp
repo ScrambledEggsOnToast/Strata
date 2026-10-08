@@ -46,6 +46,7 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         const std::vector<int32_t> prefix{11, 22};
         program::ResidentRequest request;
         request.max_new = 8;
+        request.identity = {1, 2, 3, 4, 5};
         request.sampling.seed = 0; // chosen seed must survive repeated yields
         request.sampling.penalty_last_n = 2;
         require(!owner.init_resources(error), "repeated init refuses");
@@ -77,6 +78,23 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(owner.resume(0, nullptr, error), "restore same yielded solo while scratch is released");
         require(owner.init_resources(error), "reinitialize retained contexts");
         require(owner.park(0, prefix, admission, true, error), "retain solo continuation before promotion");
+        auto other_identity = request.identity;
+        other_identity.tenant_lo = 9;
+        owner.invalidate_cache_identity(other_identity);
+        require(owner.slots()[0].cache_eligible, "tenant-only change preserves owner's cache lease");
+        other_identity.frontend = 6;
+        owner.invalidate_cache_identity(other_identity);
+        owner.invalidate_cache_identity(request.identity);
+        require(owner.slots()[0].partial && owner.slots()[0].cached &&
+                !owner.slots()[0].cache_eligible && owner.slots()[0].request == aid &&
+                owner.slots()[0].sampling.seed == seed && owner.slots()[0].ids == prefix,
+                "A-B-A revokes partial reuse without destroying continuation state");
+        auto foreign_request = request;
+        foreign_request.identity.tenant_lo = 9;
+        require(owner.begin(-1, prompt, foreign_request, error) && owner.working().request != aid,
+                "another tenant cannot adopt a partial request identity");
+        require(owner.begin(-1, prompt, request, error) && owner.working().request == aid &&
+                !owner.working().cache_eligible, "exact partial continuation retains revoked cache lease");
         require(owner.begin(1, prompt, request, error) && owner.working().request != aid &&
                 owner.working().resume_slot == -1, "different physical destination cannot claim parked identity");
         auto altered_request = request;
@@ -119,6 +137,16 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(owner.slots()[0].request == cid && owner.slots()[0].ids == prefix &&
                 !owner.available(0) && owner.init_resources(error),
                 "solo restoration retains C without making batch admission ready");
+        require(owner.begin(1, prompt, request, error) && owner.admit(1, prefix, admission, error),
+                "start active owner for invalidation boundary");
+        const auto invalidated_owner = owner.slots()[1].request;
+        owner.invalidate_cache_identity(other_identity);
+        owner.invalidate_cache_identity(request.identity);
+        require(owner.slots()[1].active && owner.slots()[1].request == invalidated_owner &&
+                owner.slots()[1].ids == prefix && !owner.slots()[1].cache_eligible && !owner.slots()[0].cached,
+                "configuration transition revokes inactive reuse and preserves active history");
+        require(owner.finish(1, true, error) && !owner.slots()[1].cached,
+                "active owner cannot republish revoked cache after A-B-A");
         require(owner.begin(1, prompt, request, error), "begin independent B");
         require(owner.admit(1, prefix, admission, error), "admit B");
         const auto bid = owner.slots()[1].request;

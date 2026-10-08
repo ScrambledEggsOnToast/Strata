@@ -7905,6 +7905,7 @@ int main(int argc, char** argv) {
         // matches nothing (reuse off, recompute as usual).
         strata::core::ConversationIdentity cache_identity;
         strata::core::ConversationIdentity session_ident;   // who the live session's conversation belongs to
+        bool session_cache_eligible = true;   // revoked on configuration change, never revived for this owner
         uint64_t seen_model = 0, seen_config = 0, seen_frontend = 0;   // one-time invalidation on a change
         bool ident_seen = false;
         int64_t disk_seq = 0;
@@ -7943,6 +7944,9 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if ((!conversations.enabled() && !disk_cache.enabled()) || !live_ok || live.empty()) return true;
+            if (!session_cache_eligible || !session_ident.known() || (ident_seen &&
+                (session_ident.model != seen_model || session_ident.config != seen_config ||
+                 session_ident.frontend != seen_frontend))) return true;
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, session_ident))
@@ -9759,6 +9763,7 @@ int main(int argc, char** argv) {
                     session_ident.tenant_lo = id.tenant_lo;
                     session_ident.tenant_hi = id.tenant_hi;
                     if (!f_identified) session_ident = {};
+                    session_cache_eligible = true;   // a newly validated explicit restore, not old cache resurrection
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
@@ -9855,6 +9860,10 @@ int main(int argc, char** argv) {
                  req_ident.frontend != seen_frontend)) {
                 const size_t gone = conversations.invalidate_except(req_ident);
                 const size_t gone_disk = disk_cache.invalidate_except(req_ident);
+                if (session_ident.known() && (session_ident.model != req_ident.model ||
+                    session_ident.config != req_ident.config || session_ident.frontend != req_ident.frontend))
+                    session_cache_eligible = false;
+                resident.invalidate_cache_identity(req_ident);
                 ident_seen = true;
                 seen_model = req_ident.model;
                 seen_config = req_ident.config;
@@ -10063,7 +10072,7 @@ int main(int argc, char** argv) {
             // one identity: only a request with the same KNOWN identity continues it.  Zero never matches zero
             // (default-deny, AC-2): an unidentified request always reads from the start.
             if (o.prompt_cache > 0 && want_cvec == cvec_cached && req_ident.known() &&
-                session_ident.known() && req_ident == session_ident) {
+                session_cache_eligible && session_ident.known() && req_ident == session_ident) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -10083,8 +10092,8 @@ int main(int argc, char** argv) {
                     // A slot's cached conversation stays its owner's property: another namespace/frontend (or an
                     // unidentified request, or a slot without a known identity - zero never matches zero) never
                     // reads from it, it would only overwrite it.
-                    if (sl.active || !sl.cached || sl.cvec != want_cvec || !sl.identity.known() ||
-                        !(sl.identity == req_ident)) continue;
+                    if (sl.active || sl.partial || !sl.cached || !sl.cache_eligible || sl.cvec != want_cvec ||
+                        !sl.identity.known() || !(sl.identity == req_ident)) continue;
                     if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
@@ -10197,6 +10206,7 @@ int main(int argc, char** argv) {
             // From here the session is becoming THIS request's conversation (parked above under its own
             // identity, or continued as the same one).  Until a request completes, live_ok says so.
             session_ident = req_ident;
+            session_cache_eligible = resident.working().cache_eligible;
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 if (!resident.resume(slot_source, slot_ck, err)) {
