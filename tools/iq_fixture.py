@@ -1,6 +1,6 @@
 """tools/iq_fixture.py - deterministic i-quant fixtures for src/kernels/iq_parity.cpp (TODO 24).
 
-For each of the ten types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
+For each of the eleven types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
 rows, cols - then the raw GGUF block bytes) and `<out>/<name>.f32` (rows*cols float32 reference values,
 dequantized by the same library the comparison treats as ground truth):
 
@@ -49,8 +49,9 @@ except ImportError as e:  # a missing numpy or vendored gguf-py must be explicit
 QT = gguf.GGMLQuantizationType
 # name -> (block values, block bytes, the fp16 scale offsets inside a block).  The layouts mirror
 # gguf-py's dequantize_blocks implementations: every one of these formats keeps its half-precision
-# scale(s) at fixed offsets (IQ*_X*: offset 0; Q3_K: after the 32-byte hmask, 64-byte qs and the
-# 12 scale bytes) - the rest of the block is indices and sub-scales, which are seeded random bytes.
+# scale(s) at fixed offsets (IQ*_X*, IQ4_* and Q8_0: offset 0; Q3_K: after the 32-byte hmask, 64-byte
+# qs and the 12 scale bytes) - the rest of the block is indices and sub-scale bytes, which are seeded
+# random (Q8_0's are the codes themselves: every byte is a valid int8 code).
 LAYOUT = {   # (block values, block bytes) == the vendored gguf-py's GGML_QUANT_SIZES == the kernels' sizes
     "IQ2_XXS": (256,  66),
     "IQ2_XS":  (256,  74),
@@ -61,6 +62,7 @@ LAYOUT = {   # (block values, block bytes) == the vendored gguf-py's GGML_QUANT_
     "IQ4_NL":   (32,  18),
     "IQ4_XS":  (256, 136),
     "Q3_K":    (256, 110),
+    "Q8_0":     (32,  34),
 }
 HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00: a tame, exactly-representable scale
 
@@ -68,10 +70,10 @@ HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00: a tame, exactly-repr
 def repair_scales(name: str, raw: np.ndarray) -> None:
     """Overwrite the fp16 scale bits of every block with a sane value, in place.  The index and
     sub-scale bytes stay seeded-random (their values are bounded by construction).  Layouts mirror
-    gguf-py's dequantize_blocks: IQ*_X* and IQ4_* keep the fp16 scale at block offset 0; Q3_K keeps
-    it after the 32-byte hmask, 64-byte qs and 12 scale bytes; IQ1_M is "the only one which stores
-    the f16 scale in multiple parts" - the fp16 bits are the HIGH NIBBLES of the four uint16s at
-    bytes 48..56, so a 1.0 scale is nibbles 3, C, 0, 0 on bytes 49, 51, 54, 55."""
+    gguf-py's dequantize_blocks: IQ*_X*, IQ4_* and Q8_0 keep the fp16 scale at block offset 0; Q3_K
+    keeps it after the 32-byte hmask, 64-byte qs and 12 scale bytes; IQ1_M is "the only one which
+    stores the f16 scale in multiple parts" - the fp16 bits are the HIGH NIBBLES of the four uint16s
+    at bytes 48..56, so a 1.0 scale is nibbles 3, C, 0, 0 on bytes 49, 51, 54, 55."""
     if name == "Q3_K":
         raw[:, 108:110] = np.frombuffer(HALF_ONE, dtype=np.uint8)
         return
@@ -83,7 +85,7 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
 # name -> (the KERNEL type id written into the .bin header, identical to the gguf-py enum id)
 KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
-              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
+              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11, "Q8_0": 8}
 
 
 def build(name: str, rows: int, cols: int, seed: int):

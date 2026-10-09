@@ -5,15 +5,19 @@
 //     (gate/up, SwiGLU, down), and
 //   - the MMQ path in prefill.cpp's sequence (gather_native into 16-expert groups, q8_1 of the slots' activations,
 //     gate/up, SwiGLU, q8_1 of H, down).
-// Both round the activations and H to int8 per 32 values, differently, so this is not a bitwise test: the fused
-// path's error against the reference has to be comparable to MMQ's own (at most 1.5x its RMS and 2x its worst row).
+// Both round the activations and H to int8 per 32 values, differently, so this is not a bitwise test:
+// the fused path's error against the reference has to be comparable to MMQ's own (at most 1.5x its RMS and 2x its worst row).
 // The pairs cover every format the kernels take: gate/up IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL.
+// --mmq-only runs the pairs' MMQ expert path ALONE (no fused launch at all, so it runs below sm_80 - V100's sm_70
+// included - where MMQ's dp4a path works but the fused int8 kernels do not exist), against an independent
+// double-precision reference at the engine's FF/H (640/2560) on a compact deterministic routing; see mmq_only_part.
 // Part 1 (reference), per pair: 256 tokens over 64 experts, skewed routing - experts with 0 rows, with one, with
 // several 64-row tiles - an all-zero token, per-expert blobs at unrelated (2-byte aligned) addresses, three launches of
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
 // common layers, with the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing,
 // --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device of sm_80 or newer.
+#include "strata/platform/protected_test.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
@@ -27,10 +31,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -59,6 +66,17 @@ struct Pair {
 };
 // MMQ covers this pair (the HIP build has no Q4_K / Q5_K / Q5_1 MMQ: those pairs are checked against the reference only)
 bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
+
+// the pairs of both modes: the fused kernels' formats, plus (HIP only) UD-Q4_K_XL's Q4_K / Q5_K / Q5_1 / Q8_0
+const std::vector<Pair>& native_pairs() {
+    static const std::vector<Pair> pairs = {
+        {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
+        {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
+        {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
+        {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
+        {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"}};
+    return pairs;
+}
 
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
@@ -628,6 +646,322 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     delete mbp;
     if (efm.rms > 0.05) throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
+
+// ---- --mmq-only: the MMQ expert path alone, on any sm_70+ device (the fused comparison needs sm_80) ----
+
+// Independent D4 layout decoder and quantizer check. The pinned quantize.cu stores
+// four FP32 scales followed by 128 signed codes; blocks are transposed over rows.
+// CUDA 12.4 fast division's <=2 ULP error plus multiplication rounding is covered
+// by the 8u multiplier interval and 12u two-reciprocal scale interval (u=2^-24).
+// Half-away endpoint rounding admits only codes possible inside that interval.
+constexpr double kUnitRoundoff = 0x1p-24;
+void normal_or_zero(double value, const char* stage) {
+    if (!std::isfinite(value) || (value != 0 &&
+        (std::fabs(value) < std::numeric_limits<float>::min() ||
+         std::fabs(value) > std::numeric_limits<float>::max())))
+        throw std::runtime_error(std::string(stage) + ": outside the finite normal-domain contract");
+}
+std::vector<double> checked_d4(const Dev& device, const std::vector<float>& input,
+                               const std::vector<int32_t>& sources, int cols, int rows) {
+    const int padded = (cols + 511) / 512 * 512;
+    std::vector<uint8_t> raw((size_t) rows * padded / 128 * 144);
+    ck(cudaMemcpy(raw.data(), device.p, raw.size(), cudaMemcpyDeviceToHost), "D4 download");
+    std::vector<double> decoded((size_t) rows * cols);
+    for (int row = 0; row < rows; ++row) {
+        const int src = sources.empty() ? row : sources[(size_t) row];
+        for (int b = 0; b < padded; b += 32) {
+            double am = 0;
+            for (int j = 0; j < 32 && b + j < cols; ++j) {
+                const double x = input[(size_t) src * cols + b + j];
+                normal_or_zero(x, "quantizer input");
+                am = std::max(am, std::fabs(x));
+            }
+            const size_t offset = ((size_t) (b / 128) * rows + row) * 144;
+            float scale;
+            std::memcpy(&scale, raw.data() + offset + (size_t) ((b % 128) / 32) * 4, 4);
+            normal_or_zero(scale, "quantizer scale");
+            const double ideal_scale = am / 127.0;
+            if (am > 0) {
+                normal_or_zero(ideal_scale, "reference scale");
+                normal_or_zero(127.0 / am, "reference reciprocal");
+            }
+            if (scale < 0 || std::fabs((double) scale - ideal_scale) > 12 * kUnitRoundoff * ideal_scale)
+                throw std::runtime_error("D4 scale differs from independent quantizer");
+            for (int j = 0; j < 32; ++j) {
+                int8_t code;
+                std::memcpy(&code, raw.data() + offset + 16 + b % 128 + j, 1);
+                const double x = b + j < cols ? input[(size_t) src * cols + b + j] : 0.0;
+                const double ideal = am > 0 ? x * (127.0 / am) : 0;
+                const double radius = 8 * kUnitRoundoff * std::fabs(ideal);
+                const int low = (int) std::round(ideal - radius), high = (int) std::round(ideal + radius);
+                if (code < -127 || code < low || code > high || (am == 0 && code != 0))
+                    throw std::runtime_error("D4 code differs from half-away quantizer interval");
+                if (b + j < cols) {
+                    const double value = (double) code * scale;
+                    normal_or_zero(value, "decoded activation");
+                    decoded[(size_t) row * cols + b + j] = value;
+                }
+            }
+        }
+    }
+    return decoded;
+}
+
+// At most four FP32 roundings per scalar contribution cover scale formation,
+// multiplication, accumulation and stream-K fixups; integer partial sums are exact.
+// Use the full scalar K, not block count. The absolute term-mass bound remains
+// meaningful under cancellation. Host summation/products use FP64.
+double checked_dot(const float* weights, const double* input, int count, float got, const char* stage) {
+    double sum = 0, mass = 0;
+    for (int k = 0; k < count; ++k) {
+        normal_or_zero(weights[k], "decoded weight");
+        const double product = (double) weights[k] * input[k];
+        normal_or_zero(product, "reference dot product");
+        sum += product;
+        mass += std::fabs(product);
+    }
+    normal_or_zero(sum, "reference dot output");
+    normal_or_zero(got, stage);
+    const double nu = (4 * count + 16) * kUnitRoundoff;
+    const double bound = nu / (1 - nu) * mass;
+    const double error = std::fabs((double) got - sum);
+    if (!(error <= bound)) {
+        std::printf("%s: got %.9g reference %.17g abs error %.3e bound %.3e\n", stage, got, sum, error, bound);
+        throw std::runtime_error(std::string(stage) + ": term-mass bound exceeded");
+    }
+    return bound > 0 ? error / bound : 0;
+}
+
+// Fixed normal-range acceptance policy, retained without loosening. CUDA 12.4's
+// current table uses 1.173, not the historical 1.16 coefficient below: this is
+// a stricter policy, not a proved worst-case envelope from that table.
+// This checks the epilogue on independently validated observed gate/up, not on
+// an ideal hidden value that would wrongly assume continuous requantization.
+struct SwigluReferenceDomain : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+void swiglu_reference_domain(double value, const char* stage) {
+    try { normal_or_zero(value, stage); }
+    catch (const std::runtime_error& e) { throw SwigluReferenceDomain(e.what()); }
+}
+double checked_swiglu(float g, float up, float got) {
+    normal_or_zero(g, "SwiGLU gate");
+    normal_or_zero(up, "SwiGLU up");
+    normal_or_zero(got, "SwiGLU output");
+    const double ex = std::exp(-(double) g);
+    swiglu_reference_domain(ex, "exp(-gate)");
+    const double exp_error = (3 + std::floor(1.16 * std::fabs((double) g))) *
+                             std::ldexp(1.0, std::ilogb(ex) - 23);
+    const double denominator = 1 + ex;
+    const double denominator_error = exp_error + kUnitRoundoff * (denominator + exp_error);
+    if (!(denominator - denominator_error > 0) || denominator + denominator_error >= 0x1p126)
+        throw SwigluReferenceDomain("SwiGLU denominator outside fast-division domain");
+    const double quotient = (double) g / denominator;
+    const double quotient_error = std::fabs((double) g) * denominator_error /
+        (denominator * (denominator - denominator_error)) +
+        4 * kUnitRoundoff * std::fabs((double) g) / (denominator - denominator_error);
+    const double reference = quotient * up;
+    swiglu_reference_domain(quotient, "SwiGLU quotient");
+    swiglu_reference_domain(reference, "SwiGLU reference");
+    const double bound = std::fabs((double) up) * quotient_error +
+                         kUnitRoundoff * std::fabs((double) up) * (std::fabs(quotient) + quotient_error);
+    const double error = std::fabs((double) got - reference);
+    if (!(error <= bound)) throw std::runtime_error("SwiGLU independent epilogue bound exceeded");
+    return bound > 0 ? error / bound : 0;
+}
+
+// the compact routing: K distinct experts per token, fully deterministic; experts 12..15 unrouted (equal
+// bounds), expert 11 exactly one row (token 0 alone reaches it), the rest several; tokens 2..5 route randomly
+// over 0..10
+std::vector<int32_t> make_ids_small(int T, int E, std::mt19937& rng) {
+    std::vector<int32_t> ids((size_t) T * K);
+    std::uniform_int_distribution<int> any(0, E - 6);
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < K; ++k) {
+            int e;
+            bool dup;
+            do {
+                e = t == 0 ? 2 + k : t == 1 ? k : any(rng);
+                dup = false;
+                for (int j = 0; j < k; ++j) dup |= ids[(size_t) t * K + j] == e;
+            } while (dup);
+            ids[(size_t) t * K + k] = e;
+        }
+    return ids;
+}
+
+struct SwigluCensus {
+    std::unique_ptr<FILE, decltype(&std::fclose)> file{nullptr, &std::fclose};
+    size_t tuples = 0, refused = 0;
+    explicit SwigluCensus(const char* path) {
+        if (!path) return;
+        file.reset(std::fopen(path, "wx"));
+        if (!file) throw std::runtime_error("Cannot create new SwiGLU census");
+        if (std::fprintf(file.get(), "gate_type,down_type,expert,row,feature,g_bits,up_bits,h_bits,reference_domain\n") < 0)
+            throw std::runtime_error("Cannot write SwiGLU census header");
+    }
+    void record(const Pair& p, int expert, int row, int feature, float g, float up, float h,
+                const char* domain) {
+        uint32_t gb, ub, hb;
+        std::memcpy(&gb, &g, sizeof(gb));
+        std::memcpy(&ub, &up, sizeof(ub));
+        std::memcpy(&hb, &h, sizeof(hb));
+        if (std::fprintf(file.get(), "%d,%d,%d,%d,%d,%08x,%08x,%08x,%s\n",
+                         (int) p.gu, (int) p.d, expert, row, feature, gb, ub, hb, domain) < 0)
+            throw std::runtime_error("Cannot write SwiGLU census row");
+        ++tuples;
+    }
+};
+
+void mmq_only_part(const Pair& p, cudaStream_t s, SwigluCensus& census) {
+    constexpr int T = 6, E = 16, ZERO = 0;
+    const Geo geo(p);
+    std::mt19937 rng(236 + (unsigned) p.gu * 7 + (unsigned) p.d);
+    std::vector<std::vector<uint8_t>> host((size_t) E);
+    std::vector<std::unique_ptr<Dev>> dev;
+    std::vector<const uint8_t*> blob((size_t) E);
+    for (int e = 0; e < E; ++e) {
+        host[(size_t) e] = make_blob(p, geo, rng);
+        dev.push_back(std::make_unique<Dev>(geo.bytes + 4096 * (size_t) (e % 3) + 64));
+        uint8_t* q = dev.back()->as<uint8_t>() + 256 * (size_t) (e % 3) + 2 * (size_t) (e % 2);   // 2-byte aligned
+        ck(cudaMemcpy(q, host[(size_t) e].data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
+        blob[(size_t) e] = q;
+    }
+    const std::vector<float> x = make_x(T, rng, ZERO);   // outliers + the all-zero token
+    const std::vector<int32_t> ids = make_ids_small(T, E, rng);
+    const int64_t rows = (int64_t) T * K;
+    const Routing r = sort_rows(ids, E);
+    std::printf("%s - mmq-only: %d tokens, top %d over %d experts, %lld rows; rows per expert: max %d, experts "
+                "without rows %d, with one row %d\n", p.name, T, K, E, (long long) rows,
+                *std::max_element(r.cnt.begin(), r.cnt.end()), (int) std::count(r.cnt.begin(), r.cnt.end(), 0),
+                (int) std::count(r.cnt.begin(), r.cnt.end(), 1));
+
+    Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
+    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    ck(cudaDeviceSynchronize(), "uploads");
+    mmq::Context ctx;
+    MmqBufs mb(p, rows, E);
+    ck(cudaMemset(mb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
+    run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
+    ck(cudaStreamSynchronize(s), "sync");
+    const std::vector<float> y = download(mb.dm, (size_t) rows * N);
+
+    // With E=16 this fixture has one gathered group, so H's packed row base is
+    // zero. Check every boundary independently before consuming it downstream.
+    const auto xq = checked_d4(mb.xq, x, r.src, N, (int) rows);
+    const auto got_gu = download(mb.gu, (size_t) rows * 2 * FF);
+    const auto got_h = download(mb.h, (size_t) rows * FF);
+    double max_gu = 0, max_epilogue = 0, max_down = 0;
+    std::vector<float> gu, dn;
+    for (int e = 0; e < E; ++e) {
+        if (r.cnt[(size_t) e] == 0) continue;
+        dequant(p, geo, host[(size_t) e], gu, dn);
+        for (int row = r.off[(size_t) e]; row < r.off[(size_t) e] + r.cnt[(size_t) e]; ++row) {
+            for (int f = 0; f < 2 * FF; ++f)
+                max_gu = std::max(max_gu, checked_dot(gu.data() + (size_t) f * N,
+                    xq.data() + (size_t) row * N, N, got_gu[(size_t) row * 2 * FF + f], "gate/up"));
+            for (int f = 0; f < FF; ++f) {
+                const float g = got_gu[(size_t) row * 2 * FF + f];
+                const float up = got_gu[(size_t) row * 2 * FF + FF + f];
+                const float h = got_h[(size_t) row * FF + f];
+                try {
+                    max_epilogue = std::max(max_epilogue, checked_swiglu(g, up, h));
+                    if (census.file) census.record(p, e, row, f, g, up, h, "supported");
+                } catch (const SwigluReferenceDomain& ex) {
+                    if (!census.file) throw;
+                    // Diagnostic refusal, never a pass. All other checks remain fatal.
+                    census.record(p, e, row, f, g, up, h, ex.what());
+                    if (census.refused++ == 0)
+                        std::fprintf(stderr, "First original reference refusal: %s expert=%d row=%d feature=%d g=%a up=%a h=%a: %s\n",
+                                     p.name, e, row, f, (double) g, (double) up, (double) h, ex.what());
+                }
+            }
+        }
+    }
+    const auto hq = checked_d4(mb.hq, got_h, {}, FF, (int) rows);
+    for (int e = 0; e < E; ++e) {
+        if (r.cnt[(size_t) e] == 0) continue;
+        dequant(p, geo, host[(size_t) e], gu, dn);
+        for (int row = r.off[(size_t) e]; row < r.off[(size_t) e] + r.cnt[(size_t) e]; ++row)
+            for (int o = 0; o < N; ++o)
+                max_down = std::max(max_down, checked_dot(dn.data() + (size_t) o * FF,
+                    hq.data() + (size_t) row * FF, FF, y[(size_t) row * N + o], "down"));
+    }
+    std::printf("  independent quantizers exact/interval-valid; supported-domain error/bound: gate/up %.3e SwiGLU %.3e down %.3e\n",
+                max_gu, max_epilogue, max_down);
+    for (int k = 0; k < K; ++k) {
+        const float* row = y.data() + (size_t) r.row_of[(size_t) ZERO * K + k] * N;
+        for (int o = 0; o < N; ++o)
+            if (row[o] != 0.0f) throw std::runtime_error(std::string(p.name) + ": the all-zero token's MMQ outputs are not zero");
+    }
+}
+
+// --mmq-only's main: no fused kernel is touched (below sm_80 there is none - that is the point), the pairs run
+// wherever this build's MMQ covers them and the GPU has a tile (mmq::fits, the engine's own gate).  Returns the
+// process exit code.
+int mmq_only_main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
+    // These weight formats all use D4 activations in the pinned ggml MMQ.
+    try {
+        cudaDeviceProp prop{};
+        int dev = 0;
+        ck(cudaGetDevice(&dev), "device");
+        ck(cudaGetDeviceProperties(&prop, dev), "props");
+        std::printf("prefill fused MoE (native formats) parity --mmq-only: %s sm_%d%d (%d SMs)\n", prop.name,
+                    prop.major, prop.minor, prop.multiProcessorCount);
+        const char* only = nullptr;
+        bool pack_pairs = false;
+        const char* census_path = nullptr;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
+            if (std::strcmp(argv[i], "--pack-pairs") == 0) pack_pairs = true;
+            if (std::string_view(argv[i]).starts_with("--swiglu-census="))
+                census_path = argv[i] + sizeof("--swiglu-census=") - 1;
+        }
+        if (pack_pairs && only) throw std::runtime_error("--pack-pairs must run the complete seven-pair inventory");
+        if (census_path && !pack_pairs) throw std::runtime_error("SwiGLU census requires unchanged complete --pack-pairs fixture");
+        SwigluCensus census(census_path);
+        constexpr Pair single[] = {{GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"}};
+        constexpr Pair mixed[] = {
+            {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},
+            {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
+            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},
+            {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"}};
+        const std::span<const Pair> pairs = pack_pairs ? std::span<const Pair>(mixed) : std::span<const Pair>(single);
+        cudaStream_t s = nullptr;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        int run = 0;
+        for (const Pair& p : pairs) {
+            if (only && std::string(p.name).find(only) == std::string::npos) continue;
+            if (!mmq_ok(p))
+                throw std::runtime_error(std::string(p.name) + ": no MMQ for a selected pair");
+            if (!mmq::fits((int) p.gu, 1280) || !mmq::fits((int) p.d, N))
+                throw std::runtime_error(std::string(p.name) + ": selected pair needs independent non-MMQ fallback coverage");
+            mmq_only_part(p, s, census);
+            ++run;
+        }
+        ck(cudaStreamDestroy(s), "destroy");
+        if (run == 0) throw std::runtime_error("--mmq-only: no pair ran (a silent skip would be a false pass)");
+        if (pack_pairs && run != 7) throw std::runtime_error("--pack-pairs: incomplete inventory");
+        if (census.file) {
+            if (std::fflush(census.file.get()) != 0) throw std::runtime_error("Cannot flush SwiGLU census");
+            if (std::fclose(census.file.release()) != 0) throw std::runtime_error("Cannot close SwiGLU census");
+            if (census.tuples != 7 * 60 * 640) throw std::runtime_error("SwiGLU census incomplete");
+            std::printf("SwiGLU diagnostic census: %zu tuples, %zu reference-domain refusals; NOT QUALIFIED\n",
+                        census.tuples, census.refused);
+            return 2;  // A diagnostic never qualifies the operator, even with no refusals.
+        }
+        std::printf("prefill MMQ (native formats) parity passed (--mmq-only, %d pairs)\n", run);
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "prefill MMQ (native formats) parity failed (--mmq-only): %s\n", e.what());
+        return 1;
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -640,15 +974,18 @@ int main(int argc, char** argv) {
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+        bool mmq_only = false;   // --mmq-only: the MMQ expert path alone (no fused comparison: any sm_70+ device)
+        bool census_requested = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--mmq-only") == 0) mmq_only = true;
+            if (std::string_view(argv[i]).starts_with("--swiglu-census=")) census_requested = true;
+        }
+        if (census_requested && !mmq_only)
+            throw std::runtime_error("SwiGLU census requires --mmq-only");
+        if (!mmq_only && !fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
-        const std::vector<Pair> pairs = {
-            {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
-            {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
-            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
-            // (HIP only) UD-Q4_K_XL's: 47 layers Q4_K / Q5_1, 4 Q4_K / Q8_0, and the one Q5_K layer
-            {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
-            {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"}};
+        if (mmq_only) return mmq_only_main(argc, argv);
+        const std::vector<Pair>& pairs = native_pairs();
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;

@@ -19,6 +19,10 @@
 //      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
+//
+// The fused reads are held to the same standard: `fused_gr_read` and `fused_gr_read_multi` are compared with
+// the very `reference` transcription below (in the fused FP32-activation contract, same BF16-valued weights,
+// the same order-aware bound), not merely with each other.
 #include "strata/platform/protected_test.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -273,7 +277,9 @@ int scalar_activation_contract() {
 }
 
 int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
-                           const uint16_t* d_inject, float eps) {
+                           const uint16_t* d_inject, float eps, const std::vector<float>& h_norm,
+                           const std::vector<float>& h_down, const std::vector<float>& h_up,
+                           const std::vector<float>& h_inject) {
     using namespace strata::kernels;
     constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
     std::mt19937 rng(0x6f8a);
@@ -370,6 +376,80 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     if (!same(multi, single)) {
         std::printf("  fused GR multi max-T differs from single-token calls\n");
         ++bad;
+    }
+
+    // ---- the independent leg: the fused read and the multi read against the SAME host transcription of
+    // `ref/gr.py::gr_read` that judges gr_read itself, in the fused read's own FP32-activation contract,
+    // with the same BF16-valued weights main hands gr_read. FP32 activations remain unrounded;
+    // unlike the BF16-activation leg, products need not be exactly representable in FP32.
+    // Reuse the existing FP32-activation 1e-4 bound, not a value calibrated from these outputs. The pending
+    // half's write is folded on the host exactly as `gr_write` defines it: R' = R + bo * 2*sigmoid(inj/hc).
+    {
+        Opts fused_contract;
+        fused_contract.round_activation = false;
+        struct Want {
+            std::vector<float> mixed, inject, rs, r_out;
+        };
+        std::vector<Want> want(T);
+        for (int t = 0; t < T; ++t) {
+            Want& w = want[t];
+            w.r_out.resize((size_t) D);
+            for (int c = 0; c < HC; ++c) {
+                const float gw = 2.0f / (1.0f + std::exp(-(float) (inj[(size_t) t * HC + c] / (float) HC)));
+                for (int d = 0; d < N; ++d)
+                    w.r_out[(size_t) (c * N + d)] =
+                        r[(size_t) t * D + (size_t) (c * N + d)] + bo[(size_t) t * N + d] * gw;
+            }
+            reference(w.r_out, h_norm, h_down, h_up, h_inject, eps, N, HC, LR, fused_contract, w.mixed, w.inject);
+            w.rs.assign((size_t) HC, 0.0f);
+            for (int c = 0; c < HC; ++c) {
+                double ms = 0;
+                for (int d = 0; d < N; ++d)
+                    ms += (double) w.r_out[(size_t) (c * N + d)] * (double) w.r_out[(size_t) (c * N + d)];
+                w.rs[(size_t) c] = (float) (1.0 / std::sqrt(ms / (double) N + (double) eps));
+            }
+        }
+        const Snapshot* snaps[2] = {&single, &multi};
+        auto finite_all = [](const Snapshot& s) {
+            auto ok = [](const std::vector<float>& v) {
+                for (float x : v)
+                    if (!std::isfinite(x)) return false;
+                return true;
+            };
+            return ok(s.r_out) && ok(s.rs) && ok(s.inject) && ok(s.mixed);
+        };
+        int ref_bad = 0;
+        double worst = 0.0;
+        for (int si = 0; si < 2 && ref_bad == 0; ++si) {
+            const Snapshot& s = *snaps[si];
+            if (!finite_all(s)) {
+                std::printf("  fused GR %s read: nonfinite output\n", si ? "multi" : "single-token");
+                ++ref_bad;
+                break;
+            }
+            for (int t = 0; t < T && ref_bad == 0; ++t) {
+                const double r_mixed = rel_diff(want[t].mixed, std::vector<float>(s.mixed.begin() + (size_t) t * N,
+                                                                                  s.mixed.begin() + (size_t) (t + 1) * N));
+                const double r_inject = rel_diff(want[t].inject,
+                                                 std::vector<float>(s.inject.begin() + (size_t) t * HC,
+                                                                    s.inject.begin() + (size_t) (t + 1) * HC));
+                const double r_rs = rel_diff(want[t].rs, std::vector<float>(s.rs.begin() + (size_t) t * HC,
+                                                                            s.rs.begin() + (size_t) (t + 1) * HC));
+                const double r_rout = rel_diff(want[t].r_out, std::vector<float>(s.r_out.begin() + (size_t) t * D,
+                                                                                 s.r_out.begin() + (size_t) (t + 1) * D));
+                worst = std::max(worst, r_mixed);
+                if (!(r_mixed <= 1e-4 && r_inject <= 1e-4 && r_rs <= 1e-4 && r_rout <= 1e-4)) {
+                    std::printf("  fused GR %s read token %d vs gr_read reference: mixed %.3e inject %.3e rs %.3e R' %.3e\n",
+                                si ? "multi" : "single-token", t, r_mixed, r_inject, r_rs, r_rout);
+                    ++ref_bad;
+                }
+            }
+        }
+        if (ref_bad)
+            bad += ref_bad;
+        else
+            std::printf("  fused GR single+multi reads vs gr_read reference (FP32 contract, T=%d): pass (worst mixed %.3e)\n",
+                        T, worst);
     }
 
     cudaGraph_t graph = nullptr;
@@ -807,7 +887,7 @@ int main(int argc, char** argv) {
                         activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
-        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
+        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps, rnorm, rdown, rup, rinj);
         select_activation_mode(0);
         cudaFree(rws_raw);
         cudaFree(dR); cudaFree(dN); cudaFree(dD); cudaFree(dU); cudaFree(dJ); cudaFree(dM); cudaFree(dI);
