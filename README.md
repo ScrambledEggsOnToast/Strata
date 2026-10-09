@@ -13,6 +13,16 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+### Protected serving in this fork
+
+With the trusted supervisor's inherited `STRATA_SUPERVISED=1`, the text frontend starts eagerly and consumes
+one engine lifetime. Lazy loading, vision and idle unloading are refused. Engine death returns unavailable;
+recovery requires a new manually started supervised action, not a replacement CUDA client inside the old action.
+HTTP profile/settings, model load/unload, VRAM, MCP and slot-file mutations return 403, as do generation-carried
+`strata_tune` and `experimental_speed_projection` overrides. Normal inference sampling, request cancellation
+and health/status remain available. Without that supervisor role, ordinary upstream
+loading and restart behavior is unchanged. The external supervisor remains the permission and safety boundary.
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
