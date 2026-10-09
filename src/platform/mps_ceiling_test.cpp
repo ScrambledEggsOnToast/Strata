@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -183,9 +184,9 @@ void test_runtime_holds() {
 
 #if defined(__linux__)
 struct FixtureDirectory {
-    char path[64] = "/tmp/strata-mps-ceiling-XXXXXX";
-    bool valid = mkdtemp(path) != nullptr;
-    ~FixtureDirectory() { if (valid) rmdir(path); }
+    std::string path = (std::filesystem::temp_directory_path() / "strata-mps-ceiling-XXXXXX").string();
+    bool valid = mkdtemp(path.data()) != nullptr;
+    ~FixtureDirectory() { if (valid) rmdir(path.c_str()); }
 };
 
 MpsCeiling declaration(const char* pipe) {
@@ -212,24 +213,24 @@ void test_pipe_identity() {
     FixtureDirectory root;
     check(root.valid, "pipe fixture directory created");
     if (!root.valid) return;
-    auto ceiling = declaration(root.path);
+    auto ceiling = declaration(root.path.c_str());
     std::string err;
     check(mps_ceiling_pipe_identity(ceiling, err), "owned directory passes identity check");
-    const std::string link = std::string(root.path) + "/link";
-    check(symlink(root.path, link.c_str()) == 0, "symlink fixture created");
+    const std::string link = root.path + "/link";
+    check(symlink(root.path.c_str(), link.c_str()) == 0, "symlink fixture created");
     ceiling.pipe_directory = link;
     check(!mps_ceiling_pipe_identity(ceiling, err), "symlink refuses");
     ceiling.pipe_directory += "/";
     check(!mps_ceiling_pipe_identity(ceiling, err), "trailing slash cannot hide a symlink");
     unlink(link.c_str());
-    const std::string file = std::string(root.path) + "/file";
+    const std::string file = root.path + "/file";
     const int fd = open(file.c_str(), O_CREAT | O_WRONLY | O_EXCL, 0600);
     check(fd >= 0, "regular-file fixture created");
     if (fd >= 0) close(fd);
     ceiling.pipe_directory = file;
     check(!mps_ceiling_pipe_identity(ceiling, err), "regular file refuses");
     unlink(file.c_str());
-    ceiling.pipe_directory = std::string(root.path) + "/missing";
+    ceiling.pipe_directory = root.path + "/missing";
     check(!mps_ceiling_pipe_identity(ceiling, err), "missing pipe refuses");
 }
 
@@ -280,7 +281,7 @@ void test_before_readback() {
     FixtureDirectory root;
     check(root.valid, "pre-context fixture created");
     if (!root.valid) return;
-    const auto ceiling = declaration(root.path);
+    const auto ceiling = declaration(root.path.c_str());
     std::string err;
     MpsVerification receipt;
     Replies replies;
@@ -335,7 +336,7 @@ void test_before_readback() {
 
     // Unequal caps and residuals on two devices: every readback and envelope is per device,
     // and the query seam retains the selected UUID for each device.
-    const auto two = declaration2(root.path);
+    const auto two = declaration2(root.path.c_str());
     replies = Replies{};
     replies.calls = 0;
     replies.queried_uuids.clear();
@@ -362,7 +363,7 @@ void test_before_readback() {
     check(!detail::verify_before(two, 64 * kMiB, receipt, err, Replies::run, &replies),
           "a mismatched cap on one device refuses even when the other device matches");
     // A duplicated UUID in the declaration cannot be keyed.
-    MpsCeiling duplicated = declaration2(root.path);
+    MpsCeiling duplicated = declaration2(root.path.c_str());
     duplicated.devices[1].gpu_uuid = kUuid;
     replies = Replies{};
     check(!detail::verify_before(duplicated, 64 * kMiB, receipt, err, Replies::run, &replies) &&
@@ -373,7 +374,7 @@ void test_after_readback() {
     FixtureDirectory root;
     check(root.valid, "post-context fixture created");
     if (!root.valid) return;
-    const auto ceiling = declaration(root.path);
+    const auto ceiling = declaration(root.path.c_str());
     MpsVerification before, receipt;
     std::string err;
     Replies replies;
@@ -444,7 +445,7 @@ void test_after_readback() {
 
     // Two devices: each device's server-limit query retains its own full GPU UUID, and one
     // mismatched device refuses the whole attachment.
-    const auto two = declaration2(root.path);
+    const auto two = declaration2(root.path.c_str());
     replies = Replies{};
     check(detail::verify_before(two, 64 * kMiB, before, err, Replies::run, &replies),
           "two-device fixture has a valid pre-context receipt");

@@ -637,6 +637,9 @@ allowances, the physical timepoint and per-device `device_caps=[...]` readback r
 single-device fields are retained for existing inspectors); native and Python decision JSON
 expose the same fields. The standalone `mps_ceiling_smoke` target exercises
 the actual module under the protected supervisor only; it is deliberately not a GPU CTest.
+The CPU-only `mps_ceiling_test` uses the platform temporary directory (`TMPDIR` on
+Linux), so protected builds can keep `/tmp` read-only and create fixtures in the
+job workspace. It neither starts an MPS daemon nor opens CUDA devices.
 
 `--windowed-experts --adapt-swaps 0` selects a fixed one-layer direct-I/O source ring for
 canonical/native `experts.bin` or native GGUF planes. No buffered fallback is used. Raw expert
