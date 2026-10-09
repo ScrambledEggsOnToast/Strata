@@ -4130,6 +4130,11 @@ int main(int argc, char** argv) {
             }
             external = {local_available, limit, limit, (uint64_t) o.host_reserve_mib << 20,
                         (uint64_t) o.guest_reserve_mib << 20, limit};
+            // Direct host operation has no VM: `allocation`, `resident` and `worker_limit` are all
+            // the enclosing cgroup's finite memory.max, so the guest scope is the launcher unit's
+            // headroom and "guest_unbacked_allocation" is zero by construction. Anonymous demand is
+            // host RAM here, so the host scope mirrors every class (mirror_all_into below) and the
+            // full peak must close against `local_available - host_reserve`.
             external_measured = true;
 #else
             std::fprintf(stderr, "strata generate: --host-native requires Linux\n");
@@ -4173,8 +4178,14 @@ int main(int argc, char** argv) {
         }
         for (const auto& c : startup_only.classes) startup.classes.push_back(c);
         strata::plan::Scope startup_host = host;
-        startup.mirror_into(startup_host);
-        guest.mirror_into(host);
+        if (o.host_native) {
+            // The launcher's cgroup is not a VM: every byte the process allocates is host RAM.
+            startup.mirror_all_into(startup_host);
+            guest.mirror_all_into(host);
+        } else {
+            startup.mirror_into(startup_host);
+            guest.mirror_into(host);
+        }
         if (source_measured) {
             const std::string source = "measured physical-host page-cache growth of the direct-read payload "
                                        "(protected identity-verified receipt)";
