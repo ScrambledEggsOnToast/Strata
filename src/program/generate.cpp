@@ -657,6 +657,7 @@ struct Options {
     int64_t guest_reserve_mib = 4096;
     int64_t host_reserve_mib = 8192;
     bool host_reserve_explicit = false;
+    bool host_native = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -1016,6 +1017,7 @@ void usage() {
                  "  --guest-reserve-mib N  admission's guest RAM floor; >= 4096 (the docs/02 default, which is\n"
                  "                       also the floor - smaller values are refused, not clamped)\n"
                  "  --host-reserve-mib N   admission's host RAM floor; >= 8192 (same rule)\n"
+                 "  --host-native         Linux host RAM telemetry with finite cgroup memory.max\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -1912,6 +1914,7 @@ int main(int argc, char** argv) {
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
         else if (a == "--guest-opaque-allowance-bytes") o.guest_opaque_allowance_bytes = bytes_flag(next("--guest-opaque-allowance-bytes"), "--guest-opaque-allowance-bytes");
+        else if (a == "--host-native") o.host_native = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
         else if (a == "--stage-timing") o.stage_timing = true;
@@ -3891,6 +3894,11 @@ int main(int argc, char** argv) {
                              (unsigned long long) source_receipt.guest_pages_bytes,
                              (unsigned long long) source_receipt.reader_overhead_bytes,
                              (unsigned long long) source_receipt.host_payload_bytes);
+            } else if (o.host_native) {
+                // The local source requires O_DIRECT and refuses buffered fallback.
+                ram("expert_source_ring", byte_mul(lanes, ring), "per-stage conservative direct-only ring");
+                ram("expert_source_runtime_storage", o.guest_opaque_allowance_bytes,
+                    "host cgroup-bounded reader metadata/stacks allowance");
             } else {
                 ram("expert_source_ring", byte_mul(lanes, ring),
                     "one WindowedExpertSource conservative ring bound per prefill stage, including aligned scratch");
@@ -4093,7 +4101,41 @@ int main(int argc, char** argv) {
         uint64_t local_available = 0;
         const bool local_measured = strata::core::available_memory_bytes(local_available);
         HostAdmissionSnapshot external;
-        const bool external_measured = read_host_admission(external);
+        bool external_measured = read_host_admission(external);
+        if (o.host_native) {
+#if defined(__linux__)
+            std::ifstream cgroups("/proc/self/cgroup");
+            std::string line;
+            uint64_t limit = UINT64_MAX;
+            while (std::getline(cgroups, line)) {
+                if (line.rfind("0::/", 0) != 0) continue;
+                auto path = std::filesystem::path("/sys/fs/cgroup") / line.substr(4);
+                while (true) {
+                    std::ifstream input(path / "memory.max");
+                    std::string text;
+                    if (input >> text && text != "max") {
+                        uint64_t value = 0;
+                        auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+                        if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size())
+                            limit = std::min(limit, value);
+                    }
+                    if (path == "/sys/fs/cgroup") break;
+                    path = path.parent_path();
+                }
+            }
+            if (!local_measured || limit == UINT64_MAX || limit < (4ull << 30) ||
+                !o.windowed_experts || !o.guest_opaque_allowance_bytes) {
+                std::fprintf(stderr, "strata generate: --host-native requires local memory telemetry, finite memory.max, windowed experts and opaque allowance\n");
+                return 1;
+            }
+            external = {local_available, limit, limit, (uint64_t) o.host_reserve_mib << 20,
+                        (uint64_t) o.guest_reserve_mib << 20, limit};
+            external_measured = true;
+#else
+            std::fprintf(stderr, "strata generate: --host-native requires Linux\n");
+            return 1;
+#endif
+        }
         if (admission_prefill || requested_slots) {
             if (o.guest_opaque_allowance_bytes != 0 && external_measured && external.worker_limit != 0) {
                 ram(admission_prefill ? "prefill_runtime_storage" : "resident_runtime_storage", o.guest_opaque_allowance_bytes,
