@@ -75,10 +75,14 @@ observed error. These small cases are operator checks, not whole-model equivalen
 
 `--mmq-only --pack-pairs` selects the seven gate/down format pairs observed in
 the mixed native pack. It refuses unsupported selected pairs instead of skipping
-them. This expanded fixture remains unqualified: its SwiGLU reference currently
-refuses exponential saturation and flush-to-zero domains. The retained normal
-bound is a fixed stricter acceptance policy; its historical 1.16 coefficient must
-not be cited as CUDA 12.4's documented 1.173 exponential-error coefficient.
+them. Its host SwiGLU reference preserves the fixed normal bound and independently
+encloses tail arithmetic with nearest-even FP32 rounding, overflow saturation,
+and quotient/product flush-to-zero. The tail behaviour is an explicitly approved
+project acceptance requirement, **not** a proved CUDA 12.4 exponential guarantee.
+The historical 1.16 normal-bound coefficient is a fixed stricter policy, not the
+documented 1.173 coefficient. `swiglu_reference_test` checks the host rounding and
+domain boundaries without a GPU. Each card still needs the unchanged protected
+seven-pair replay; a host test or replay of an old diagnostic is not qualification.
 
 For bounded diagnosis, add `--swiglu-census=PATH` to that complete MMQ-only command.
 It exclusively creates a CSV of exact gate/up/output bits and domain refusals,

@@ -20,6 +20,7 @@
 #include "strata/platform/protected_test.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "swiglu_reference.hpp"
 
 #include "ggml.h"
 
@@ -44,6 +45,10 @@
 namespace {
 namespace mmq = strata::prefill::mmq;
 namespace fused = strata::prefill::fused;
+using swiglu_reference::checked_swiglu;
+using swiglu_reference::kUnitRoundoff;
+using swiglu_reference::normal_or_zero;
+using swiglu_reference::SwigluReferenceDomain;
 
 constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
 
@@ -654,13 +659,6 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
 // CUDA 12.4 fast division's <=2 ULP error plus multiplication rounding is covered
 // by the 8u multiplier interval and 12u two-reciprocal scale interval (u=2^-24).
 // Half-away endpoint rounding admits only codes possible inside that interval.
-constexpr double kUnitRoundoff = 0x1p-24;
-void normal_or_zero(double value, const char* stage) {
-    if (!std::isfinite(value) || (value != 0 &&
-        (std::fabs(value) < std::numeric_limits<float>::min() ||
-         std::fabs(value) > std::numeric_limits<float>::max())))
-        throw std::runtime_error(std::string(stage) + ": outside the finite normal-domain contract");
-}
 std::vector<double> checked_d4(const Dev& device, const std::vector<float>& input,
                                const std::vector<int32_t>& sources, int cols, int rows) {
     const int padded = (cols + 511) / 512 * 512;
@@ -732,43 +730,6 @@ double checked_dot(const float* weights, const double* input, int count, float g
     return bound > 0 ? error / bound : 0;
 }
 
-// Fixed normal-range acceptance policy, retained without loosening. CUDA 12.4's
-// current table uses 1.173, not the historical 1.16 coefficient below: this is
-// a stricter policy, not a proved worst-case envelope from that table.
-// This checks the epilogue on independently validated observed gate/up, not on
-// an ideal hidden value that would wrongly assume continuous requantization.
-struct SwigluReferenceDomain : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-void swiglu_reference_domain(double value, const char* stage) {
-    try { normal_or_zero(value, stage); }
-    catch (const std::runtime_error& e) { throw SwigluReferenceDomain(e.what()); }
-}
-double checked_swiglu(float g, float up, float got) {
-    normal_or_zero(g, "SwiGLU gate");
-    normal_or_zero(up, "SwiGLU up");
-    normal_or_zero(got, "SwiGLU output");
-    const double ex = std::exp(-(double) g);
-    swiglu_reference_domain(ex, "exp(-gate)");
-    const double exp_error = (3 + std::floor(1.16 * std::fabs((double) g))) *
-                             std::ldexp(1.0, std::ilogb(ex) - 23);
-    const double denominator = 1 + ex;
-    const double denominator_error = exp_error + kUnitRoundoff * (denominator + exp_error);
-    if (!(denominator - denominator_error > 0) || denominator + denominator_error >= 0x1p126)
-        throw SwigluReferenceDomain("SwiGLU denominator outside fast-division domain");
-    const double quotient = (double) g / denominator;
-    const double quotient_error = std::fabs((double) g) * denominator_error /
-        (denominator * (denominator - denominator_error)) +
-        4 * kUnitRoundoff * std::fabs((double) g) / (denominator - denominator_error);
-    const double reference = quotient * up;
-    swiglu_reference_domain(quotient, "SwiGLU quotient");
-    swiglu_reference_domain(reference, "SwiGLU reference");
-    const double bound = std::fabs((double) up) * quotient_error +
-                         kUnitRoundoff * std::fabs((double) up) * (std::fabs(quotient) + quotient_error);
-    const double error = std::fabs((double) got - reference);
-    if (!(error <= bound)) throw std::runtime_error("SwiGLU independent epilogue bound exceeded");
-    return bound > 0 ? error / bound : 0;
-}
 
 // the compact routing: K distinct experts per token, fully deterministic; experts 12..15 unrouted (equal
 // bounds), expert 11 exactly one row (token 0 alone reaches it), the rest several; tokens 2..5 route randomly
