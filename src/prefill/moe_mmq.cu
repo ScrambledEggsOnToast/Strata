@@ -178,13 +178,17 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+bool device_config(int ordinal, int& cc, int& sms, uint64_t& shared_bytes) {
+    const auto& info = ggml_cuda_info();
+    if (ordinal < 0 || ordinal >= info.device_count) return false;
+    cc = info.devices[ordinal].cc; sms = info.devices[ordinal].nsm; shared_bytes = info.devices[ordinal].smpbo;
+    return cc > 0 && sms > 0 && shared_bytes > 0;
+}
+
 bool device_config(int& cc, int& sms, uint64_t& shared_bytes) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    const auto& info = ggml_cuda_info();
-    if (dev < 0 || dev >= info.device_count) return false;
-    cc = info.devices[dev].cc; sms = info.devices[dev].nsm; shared_bytes = info.devices[dev].smpbo;
-    return cc > 0 && sms > 0 && shared_bytes > 0;
+    return device_config(dev, cc, sms, shared_bytes);
 }
 
 bool workspace_bytes(int cc, int sms, uint64_t shared_bytes, uint64_t& bytes) {

@@ -29,6 +29,7 @@ namespace {
 
 constexpr const char* kLimitVariable = "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT";
 constexpr const char* kPipeVariable = "CUDA_MPS_PIPE_DIRECTORY";
+constexpr const char* kVisibleVariable = "CUDA_VISIBLE_DEVICES";
 constexpr uint64_t kMiB = 1024ull * 1024;
 
 bool whitespace(char c) {
@@ -104,22 +105,36 @@ bool valid_declaration(const MpsCeiling& ceiling, std::string& err) {
     err = "an MPS ceiling cannot be enforced on this platform (Linux required)";
     return false;
 #else
-    if (ceiling.device != 0 || ceiling.cap_bytes == 0 || !gpu_uuid(ceiling.gpu_uuid) ||
-        trim(ceiling.pipe_directory).empty() || ceiling.pipe_directory.find('\0') != std::string::npos) {
-        err = "MPS requires one device-0 positive ceiling, a pipe directory and a complete GPU UUID";
+    if (ceiling.devices.empty() || trim(ceiling.pipe_directory).empty() ||
+        ceiling.pipe_directory.find('\0') != std::string::npos) {
+        err = "MPS requires at least one device ceiling, a pipe directory and complete GPU UUIDs";
         return false;
+    }
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        const MpsDeviceCeiling& d = ceiling.devices[i];
+        if (d.device != (int) i || d.cap_bytes == 0 || !gpu_uuid(d.gpu_uuid)) {
+            err = "MPS requires one positive ceiling and a complete GPU UUID per visible device, "
+                  "ordered by CUDA_VISIBLE_DEVICES ordinal";
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (same_uuid(d.gpu_uuid, ceiling.devices[j].gpu_uuid)) {
+                err = "MPS requires distinct GPU UUIDs: CUDA_VISIBLE_DEVICES names one device twice";
+                return false;
+            }
+        }
     }
     return true;
 #endif
 }
 
-bool physical_envelope(const MpsCeiling& ceiling, uint64_t outside, uint64_t free,
+bool physical_envelope(uint64_t cap_bytes, uint64_t outside, uint64_t free_bytes,
                        std::string& err) {
     if (outside == 0) {
         err = "MPS requires a positive explicit outside-client allowance";
         return false;
     }
-    if (ceiling.cap_bytes > free || outside > free - ceiling.cap_bytes) {
+    if (cap_bytes > free_bytes || outside > free_bytes - cap_bytes) {
         err = "MPS full client ceiling plus outside-client allowance exceeds pre-context physical free memory";
         return false;
     }
@@ -170,14 +185,14 @@ bool pid_list(std::string_view output, std::array<int, N>& pids, size_t& count,
 }
 
 bool query(mps_detail::QueryRunner runner, void* context, mps_detail::Query kind,
-           const MpsCeiling& ceiling, int pid, mps_detail::Deadline deadline,
-           std::string& output, std::string& err) {
+           const MpsCeiling& ceiling, int pid, const std::string& uuid,
+           mps_detail::Deadline deadline, std::string& output, std::string& err) {
     output.clear();
     if (std::chrono::steady_clock::now() >= deadline) {
         err = "MPS verification exceeded its total query deadline";
         return false;
     }
-    if (!runner(context, kind, ceiling, pid, deadline, output, err)) return false;
+    if (!runner(context, kind, ceiling, pid, uuid, deadline, output, err)) return false;
     if (std::chrono::steady_clock::now() >= deadline || output.size() > mps_detail::kMaxQueryOutput) {
         err = "MPS verification exceeded its query deadline or output bound";
         return false;
@@ -199,12 +214,13 @@ bool limit_reply(const std::string& output, uint64_t expected, uint64_t& measure
 }
 
 bool production_query(void*, mps_detail::Query kind, const MpsCeiling& ceiling,
-                      int pid, mps_detail::Deadline deadline, std::string& output,
+                      int pid, const std::string& uuid,
+                      mps_detail::Deadline deadline, std::string& output,
                       std::string& err) {
 #if defined(__linux__)
-    return mps_detail::run_query(kind, ceiling, pid, deadline, output, err);
+    return mps_detail::run_query(kind, ceiling, pid, uuid, deadline, output, err);
 #else
-    (void)kind; (void)ceiling; (void)pid; (void)deadline; (void)output;
+    (void)kind; (void)ceiling; (void)pid; (void)uuid; (void)deadline; (void)output;
     err = "MPS queries require Linux";
     return false;
 #endif
@@ -212,19 +228,36 @@ bool production_query(void*, mps_detail::Query kind, const MpsCeiling& ceiling,
 
 }  // namespace
 
-bool mps_parse_limit(const std::string& text, int wanted_device, uint64_t& bytes, std::string& err) {
-    bytes = 0;
+bool mps_parse_limit(const std::string& text, std::vector<uint64_t>& caps, std::string& err) {
+    caps.clear();
     err.clear();
     const auto value = trim(text);
-    const size_t equals = value.find('=');
-    uint64_t parsed = 0;
-    if (wanted_device != 0 || equals == std::string_view::npos ||
-        trim(value.substr(0, equals)) != "0" || value.find(',') != std::string_view::npos ||
-        !parse_number(value.substr(equals + 1), parsed) || parsed == 0) {
-        err = "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT requires exactly one positive 0=<limit> declaration";
-        return false;
+    std::vector<uint64_t> parsed_caps;
+    size_t at = 0;
+    int expected_ordinal = 0;
+    for (;;) {
+        const size_t comma = value.find(',', at);
+        const auto entry = trim(value.substr(at, comma == std::string_view::npos
+                                                 ? std::string_view::npos : comma - at));
+        const size_t equals = entry.find('=');
+        const auto ordinal_text = equals == std::string_view::npos
+                                      ? std::string_view() : trim(entry.substr(0, equals));
+        uint64_t parsed = 0;
+        // "00" is not the ordinal 0: the daemon's list form names each device once, plainly.
+        if (equals == std::string_view::npos || ordinal_text.empty() ||
+            (ordinal_text.front() == '0' && ordinal_text.size() != 1) ||
+            !decimal(ordinal_text, parsed) || parsed != (uint64_t) expected_ordinal ||
+            !parse_number(entry.substr(equals + 1), parsed) || parsed == 0) {
+            err = "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT requires the full contiguous ordered list "
+                  "0=<limit>[,1=<limit>...] of positive byte counts (got \"" + text + "\")";
+            return false;
+        }
+        parsed_caps.push_back(parsed);
+        ++expected_ordinal;
+        if (comma == std::string_view::npos) break;
+        at = comma + 1;
     }
-    bytes = parsed;
+    caps = std::move(parsed_caps);
     return true;
 }
 
@@ -238,18 +271,46 @@ bool mps_ceiling_from_environment(MpsCeiling& out, std::string& err) {
         err = "MPS ceiling declared incompletely: limit and pipe must both be nonempty";
         return false;
     }
-    const char* uuid = std::getenv("CUDA_VISIBLE_DEVICES");
-    if (uuid == nullptr || !gpu_uuid(uuid)) {
-        err = "MPS ceiling requires CUDA_VISIBLE_DEVICES to be one complete GPU UUID";
+    // CUDA_VISIBLE_DEVICES is the ordered selection: one complete GPU UUID, or a list with
+    // exactly one complete UUID per selected device. The declaration needs one cap each.
+    std::vector<std::string> uuids;
+    {
+        const char* visible = std::getenv(kVisibleVariable);
+        std::string_view rest = visible == nullptr ? std::string_view() : visible;
+        for (;;) {
+            const size_t comma = rest.find(',');
+            const auto entry = rest.substr(0, comma == std::string_view::npos
+                                                 ? std::string_view::npos : comma);
+            if (!gpu_uuid(entry)) {
+                err = "MPS ceiling requires CUDA_VISIBLE_DEVICES to be one complete GPU UUID, or an "
+                      "ordered list of complete GPU UUIDs with exactly one cap each";
+                return false;
+            }
+            for (const std::string& prior : uuids) {
+                if (same_uuid(prior, entry)) {
+                    err = "MPS ceiling requires distinct GPU UUIDs: CUDA_VISIBLE_DEVICES names one device twice";
+                    return false;
+                }
+            }
+            uuids.emplace_back(entry);
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+    }
+    std::vector<uint64_t> caps;
+    if (!mps_parse_limit(limit, caps, err)) return false;
+    if (caps.size() != uuids.size()) {
+        err = "MPS ceiling requires exactly one cap per selected device: CUDA_VISIBLE_DEVICES names " +
+              std::to_string(uuids.size()) + ", the limit list names " + std::to_string(caps.size());
         return false;
     }
     MpsCeiling parsed;
-    if (!mps_parse_limit(limit, 0, parsed.cap_bytes, err)) return false;
     parsed.declared = true;
-    parsed.device = 0;
     parsed.pipe_directory = pipe;
-    parsed.gpu_uuid = uuid;
     parsed.limit_from_environment = true;
+    parsed.devices.resize(uuids.size());
+    for (size_t i = 0; i < uuids.size(); ++i)
+        parsed.devices[i] = MpsDeviceCeiling{static_cast<int>(i), caps[i], uuids[i]};
     if (!valid_declaration(parsed, err)) return false;
     out = std::move(parsed);
     return true;
@@ -314,41 +375,91 @@ bool verify_before(const MpsCeiling& ceiling, uint64_t outside, MpsVerification&
     receipt = MpsVerification{};
     err.clear();
     if (!ceiling.declared) return true;
-    receipt.outside_client_allowance_bytes = outside;
     if (!valid_declaration(ceiling, err) || outside == 0) {
         if (err.empty()) err = "MPS requires a positive explicit outside-client allowance";
         return false;
     }
     if (!mps_ceiling_pipe_identity(ceiling, err)) return false;
+    // One finite deadline is shared by every query of this phase: the whole readback stays
+    // bounded no matter how many devices the declaration names.
     const Deadline deadline = std::chrono::steady_clock::now() + kQueryBudget;
     std::string output;
-    if (!query(runner, context, Query::default_limit, ceiling, 0, deadline, output, err) ||
-        !limit_reply(output, ceiling.cap_bytes, receipt.default_cap_bytes, err)) return false;
-    if (!query(runner, context, Query::physical_free, ceiling, 0, deadline, output, err) ||
-        !physical_row(output, ceiling.gpu_uuid, receipt.physical_free_bytes, err)) return false;
-    receipt.physical_free_measured = true;
-    return physical_envelope(ceiling, outside, receipt.physical_free_bytes, err);
+    receipt.devices.resize(ceiling.devices.size());
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        const MpsDeviceCeiling& d = ceiling.devices[i];
+        MpsDeviceVerification& row = receipt.devices[i];
+        row.device = d.device;
+        row.gpu_uuid = d.gpu_uuid;
+        row.cap_bytes = d.cap_bytes;
+        row.outside_client_allowance_bytes = outside;
+        // The daemon's device operand IS the full GPU UUID: the control commands accept a
+        // UUID string or an ordinal without translating between them, and the MPS server
+        // remaps device visibility, so no ordinal of any enumeration is ever assumed.
+        if (!query(runner, context, Query::default_limit, ceiling, 0, d.gpu_uuid,
+                   deadline, output, err) ||
+            !limit_reply(output, d.cap_bytes, row.default_cap_bytes, err)) return false;
+        if (!query(runner, context, Query::physical_free, ceiling, 0, d.gpu_uuid,
+                   deadline, output, err) ||
+            !physical_row(output, d.gpu_uuid, row.physical_free_bytes, err)) return false;
+        row.physical_free_measured = true;
+        if (i == 0) {
+            // The retained single-device fields mirror the front row as it verifies, so a
+            // later device's refusal still leaves the measured first-device sample intact.
+            receipt.physical_free_bytes = row.physical_free_bytes;
+            receipt.physical_free_measured = row.physical_free_measured;
+            receipt.default_cap_bytes = row.default_cap_bytes;
+            receipt.outside_client_allowance_bytes = outside;
+        }
+        if (!physical_envelope(d.cap_bytes, outside, row.physical_free_bytes, err)) return false;
+    }
+    return true;
 }
 
-bool verify_after(const MpsCeiling& ceiling, const std::string& actual_uuid, uint64_t free,
-                  MpsVerification& receipt, std::string& err, QueryRunner runner, void* context) {
+bool verify_after(const MpsCeiling& ceiling, const std::vector<std::string>& actual_uuids,
+                  uint64_t primary_residual, MpsVerification& receipt,
+                  std::string& err, QueryRunner runner, void* context) {
     err.clear();
+    if (!ceiling.declared) return true;
+    if (!valid_declaration(ceiling, err)) return false;
+    // A refused attachment must not leave a receipt behind: attachment fields clear on entry
+    // and fill only after every check holds.
     receipt.server_pid = 0;
     receipt.client_pid = 0;
     receipt.server_cap_bytes = 0;
-    if (!ceiling.declared) return true;
-    if (!valid_declaration(ceiling, err)) return false;
-    if (!receipt.physical_free_measured || receipt.default_cap_bytes != ceiling.cap_bytes) {
+    for (auto& row : receipt.devices) {
+        row.server_cap_bytes = 0;
+        row.residual_free_bytes = 0;
+    }
+    if (actual_uuids.size() != ceiling.devices.size()) {
+        err = "post-context verification requires the actual CUDA UUID of every declared device";
+        return false;
+    }
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        if (!gpu_uuid(actual_uuids[i])) {
+            err = "the actual CUDA identity of device " + std::to_string(i) +
+                  " is not a complete GPU UUID";
+            return false;
+        }
+        if (!same_uuid(ceiling.devices[i].gpu_uuid, actual_uuids[i])) {
+            err = "CUDA device " + std::to_string(i) +
+                  " UUID differs from the protected MPS GPU identity";
+            return false;
+        }
+    }
+    if (receipt.devices.size() != ceiling.devices.size()) {
         err = "MPS post-context verification requires successful pre-context readback";
         return false;
     }
-    if (!physical_envelope(ceiling, receipt.outside_client_allowance_bytes,
-                           receipt.physical_free_bytes, err)) return false;
-    if (!same_uuid(ceiling.gpu_uuid, actual_uuid)) {
-        err = "CUDA device 0 UUID differs from the protected MPS GPU identity";
-        return false;
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        const MpsDeviceVerification& row = receipt.devices[i];
+        if (!row.physical_free_measured || row.default_cap_bytes != ceiling.devices[i].cap_bytes) {
+            err = "MPS post-context verification requires successful pre-context readback";
+            return false;
+        }
+        if (!physical_envelope(ceiling.devices[i].cap_bytes, receipt.outside_client_allowance_bytes,
+                               row.physical_free_bytes, err)) return false;
     }
-    if (!mps_ceiling_holds(free, ceiling.cap_bytes, err)) return false;
+    if (!mps_ceiling_holds(primary_residual, ceiling.devices.front().cap_bytes, err)) return false;
 #if defined(__linux__)
     const int own_pid = static_cast<int>(getpid());
 #else
@@ -358,13 +469,14 @@ bool verify_after(const MpsCeiling& ceiling, const std::string& actual_uuid, uin
     std::string output;
     std::array<int, kMaxServers> servers;
     size_t server_count = 0;
-    if (!query(runner, context, Query::servers, ceiling, 0, deadline, output, err) ||
+    if (!query(runner, context, Query::servers, ceiling, 0, std::string(), deadline, output, err) ||
         !pid_list(output, servers, server_count, err)) return false;
     int matched_server = 0;
     std::array<int, kMaxClients> clients;
     for (size_t i = 0; i < server_count; ++i) {
         size_t client_count = 0;
-        if (!query(runner, context, Query::clients, ceiling, servers[i], deadline, output, err) ||
+        if (!query(runner, context, Query::clients, ceiling, servers[i], std::string(),
+                   deadline, output, err) ||
             !pid_list(output, clients, client_count, err)) return false;
         for (size_t j = 0; j < client_count; ++j) {
             if (clients[j] != own_pid) continue;
@@ -379,10 +491,24 @@ bool verify_after(const MpsCeiling& ceiling, const std::string& actual_uuid, uin
         err = "this process is absent from every MPS server client list";
         return false;
     }
-    if (!query(runner, context, Query::server_limit, ceiling, matched_server, deadline, output, err) ||
-        !limit_reply(output, ceiling.cap_bytes, receipt.server_cap_bytes, err)) return false;
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        MpsDeviceVerification& row = receipt.devices[i];
+        // The matched server's own per-device readback is keyed by the device's full GPU
+        // UUID, never by an ordinal assumed from the client's visible order.
+        if (!query(runner, context, Query::server_limit, ceiling, matched_server, row.gpu_uuid,
+                   deadline, output, err) ||
+            !limit_reply(output, ceiling.devices[i].cap_bytes, row.server_cap_bytes, err)) return false;
+        row.residual_free_bytes = i == 0 ? primary_residual : 0;
+        row.gpu_uuid = actual_uuids[i];
+    }
     receipt.server_pid = matched_server;
     receipt.client_pid = own_pid;
+    // Retained single-device receipt fields mirror the front row.
+    receipt.server_cap_bytes = receipt.devices.front().server_cap_bytes;
+    receipt.physical_free_bytes = receipt.devices.front().physical_free_bytes;
+    receipt.outside_client_allowance_bytes = receipt.devices.front().outside_client_allowance_bytes;
+    receipt.physical_free_measured = receipt.devices.front().physical_free_measured;
+    receipt.default_cap_bytes = receipt.devices.front().default_cap_bytes;
     return true;
 }
 
@@ -429,26 +555,43 @@ bool transport_error(std::string& err, const char* what, int code) {
 
 }  // namespace
 
-bool run_query(Query kind, const MpsCeiling& ceiling, int server_pid, Deadline deadline,
+bool run_query(Query kind, const MpsCeiling& ceiling, int server_pid,
+               const std::string& device_uuid, Deadline deadline,
                std::string& output, std::string& err, const char* test_executable) {
     output.clear();
     std::string input;
+    int ordinal = -1;
+    if (kind == Query::default_limit || kind == Query::server_limit) {
+        for (const auto& device : ceiling.devices)
+            if (same_uuid(device.gpu_uuid, device_uuid)) ordinal = device.device;
+        if (ordinal < 0) {
+            err = "MPS control query names no declared device";
+            return false;
+        }
+    }
     switch (kind) {
-        case Query::default_limit: input = "get_default_device_pinned_mem_limit 0\n"; break;
+        case Query::default_limit:
+            // The protected daemon has the same explicit UUID order as this client.
+            // Driver 550 accepts only ordinal operands, not UUID strings.
+            input = "get_default_device_pinned_mem_limit " + std::to_string(ordinal) + "\n";
+            break;
         case Query::servers: input = "get_server_list\n"; break;
         case Query::clients: input = "get_client_list " + std::to_string(server_pid) + "\n"; break;
         case Query::server_limit:
-            input = "get_device_pinned_mem_limit " + std::to_string(server_pid) + " 0\n"; break;
+            input = "get_device_pinned_mem_limit " + std::to_string(server_pid) + " " +
+                    std::to_string(ordinal) + "\n";
+            break;
         case Query::physical_free: break;
         default: err = "unsupported MPS read-only query"; return false;
     }
     const bool physical = kind == Query::physical_free;
     const char* executable = test_executable ? test_executable :
         (physical ? "/usr/bin/nvidia-smi" : "/usr/bin/nvidia-cuda-mps-control");
-    std::string id = physical ? "--id=" + ceiling.gpu_uuid : std::string{};
+    // The physical sample selects the exact GPU by its full UUID.
+    std::string id = physical ? "--id=" + device_uuid : std::string{};
     char* argv[] = {const_cast<char*>(executable), physical ? id.data() : nullptr,
-                    physical ? const_cast<char*>("--query-gpu=uuid,memory.free") : nullptr,
-                    physical ? const_cast<char*>("--format=csv,noheader,nounits") : nullptr, nullptr};
+                    const_cast<char*>("--query-gpu=uuid,memory.free"),
+                    const_cast<char*>("--format=csv,noheader,nounits"), nullptr};
     // Pin the queried daemon to the supplied declaration, not a mutable ambient value.
     std::string pipe_env = std::string(kPipeVariable) + "=" + ceiling.pipe_directory;
     char locale[] = "LC_ALL=C";
@@ -592,9 +735,11 @@ bool mps_verify_before_cuda(const MpsCeiling& ceiling, uint64_t outside,
     return mps_detail::verify_before(ceiling, outside, receipt, err, production_query, nullptr);
 }
 
-bool mps_verify_after_cuda(const MpsCeiling& ceiling, const std::string& actual_uuid,
-                           uint64_t free, MpsVerification& receipt, std::string& err) {
-    return mps_detail::verify_after(ceiling, actual_uuid, free, receipt, err, production_query, nullptr);
+bool mps_verify_after_cuda(const MpsCeiling& ceiling, const std::vector<std::string>& actual_uuids,
+                           uint64_t primary_residual_free_bytes, MpsVerification& receipt,
+                           std::string& err) {
+    return mps_detail::verify_after(ceiling, actual_uuids, primary_residual_free_bytes, receipt,
+                                    err, production_query, nullptr);
 }
 
 }  // namespace strata::platform

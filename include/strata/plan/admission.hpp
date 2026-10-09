@@ -46,6 +46,24 @@ inline uint64_t saturating_multiply(uint64_t a, uint64_t b) {
     return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
 
+// ---- explicit-split per-stage expert-cache budget (host arithmetic seam) ---------------------
+//
+// An explicit layer split must commit its later stages' expert caches BEFORE allocation: the
+// budget is what that device's residual ceiling can fund after every fixed demand class and
+// the explicit headroom, floored to the expert-blob granularity so the runtime's per-blob
+// sizing can never step past it, and capped by the stage's own profiled-pair bound. The
+// runtime consumer may open fewer slots, never more: the admitted budget, not a free-memory
+// guess taken after the weights land, is the ceiling.
+inline uint64_t split_stage_cache_budget(uint64_t residual_ceiling_bytes,
+                                         uint64_t fixed_demand_bytes, uint64_t headroom_bytes,
+                                         uint64_t blob_bytes, uint64_t profile_bound_bytes) {
+    if (blob_bytes == 0) return 0;
+    const uint64_t committed = saturating_add(fixed_demand_bytes, headroom_bytes);
+    if (residual_ceiling_bytes <= committed) return 0;
+    const uint64_t budget = (residual_ceiling_bytes - committed) / blob_bytes * blob_bytes;
+    return profile_bound_bytes < budget ? profile_bound_bytes : budget;
+}
+
 // ---- one accounted byte class -------------------------------------------------------------------------------
 //
 // `unknown` is the load-bearing flag: `bytes == 0 && !unknown` is a measured/derived zero, while

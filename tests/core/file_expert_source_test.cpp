@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <future>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -497,6 +498,27 @@ void test_windowed_direct_canonical() {
     require(fresh != nullptr, "the first fetch of the recycled epoch failed");
     want_blob(0, 0, want);
     require(std::memcmp(fresh, want.data(), want.size()) == 0, "a recycled slot served stale bytes");
+
+    // A later prefill stage can change its own epoch while the primary stage
+    // still consumes its retained pointers. No source may recycle another's ring.
+    WindowedExpertSource later;
+    open_windowed(later, dir.path, layers, experts, cfg, err);
+    auto changing_epoch = std::async(std::launch::async, [&] {
+        for (int64_t layer : {1, 0, 1}) {
+            later.begin_layer(layer, nullptr, 0);
+            std::vector<char> expected;
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                const uint8_t* bytes = later.blob(layer, expert);
+                want_blob(layer, expert, expected);
+                require(bytes && std::memcmp(bytes, expected.data(), expected.size()) == 0,
+                        "independent source lane served another epoch's bytes");
+            }
+        }
+    });
+    require(std::memcmp(fresh, want.data(), want.size()) == 0, "another lane invalidated a live primary blob");
+    changing_epoch.get();
+    require(std::memcmp(fresh, want.data(), want.size()) == 0, "another lane overwrote the primary ring");
+    later.close();
 
     // Refusals must latch and name themselves; on a SECOND source so the main one stays usable.
     WindowedExpertSource bad;
