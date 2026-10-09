@@ -561,9 +561,11 @@ host scope charges unbacked guest allocation plus retained filesystem-source mir
 credit. Advisory release, unmap and close cannot reduce these envelopes. All derived byte arithmetic
 and class totals refuse on overflow.
 
-The guest and available-host envelopes retain their reserve floors (4 GiB and 8 GiB;
-`--guest-reserve-mib` / `--host-reserve-mib` cannot go lower). Unpriced classes or unavailable telemetry
-refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts currently refuse by name
+The guest envelope retains its 4 GiB reserve floor. The physical-host reserve defaults to 8 GiB;
+a fresh authenticated root-owned supervisor snapshot supplies the operator-approved host reserve,
+including zero for an explicitly approved dedicated campaign. An explicit `--host-reserve-mib`
+still cannot go below 8 GiB and only tightens the supervisor reserve. Unpriced classes or unavailable
+telemetry refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts refuse by name
 because their allocation budgets are not knowable at this gate; they are not silently priced as zero.
 CUDA graph executable/capture storage and opaque prefill driver/cuBLAS/runtime storage remain
 unqualified and refuse by name. Explicit prefill device buffers now share checked sizing with the

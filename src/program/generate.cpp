@@ -302,7 +302,7 @@ bool read_host_admission(HostAdmissionSnapshot& snapshot) {
     const uint64_t ns = (uint64_t) now.tv_sec * 1000000000ull + (uint64_t) now.tv_nsec;
     if (fields[0] != 1 || ns < fields[1] || ns - fields[1] > 5000000000ull) return false;
     for (size_t i = 2; i < 8; ++i) if (fields[i] > (1ull << 50)) return false;
-    if (fields[3] < (4ull << 30) || fields[4] > fields[3] || fields[5] < (8ull << 30) ||
+    if (fields[3] < (4ull << 30) || fields[4] > fields[3] ||
         fields[6] < (4ull << 30) || fields[7] < (32ull << 20) || fields[7] > fields[3]) return false;
     snapshot = {fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]};
     return true;
@@ -666,11 +666,12 @@ struct Options {
     /// configuration before the first model allocation when a device cannot hold its own share, when the
     /// guest/host envelope does not close, or when an allocation exists that the accounting cannot size.
     /// Headroom defaults to `vram_reserve_mib` (the same reserve the auto cache already honours); the
-    /// guest/host reserves floor at the docs/02 design defaults - 4 GiB inside the guest, 8 GiB on the
-    /// host - and the parser refuses smaller values, so no flag can plan the reserves away.
+    /// Guest reserve retains the 4 GiB floor. Host reserve defaults to 8 GiB unless a
+    /// protected controller supplies its approved reserve; an explicit CLI reserve only tightens it.
     int admission_headroom_mib = -1;   ///< < 0: default to `vram_reserve_mib`
     int64_t guest_reserve_mib = 4096;
     int64_t host_reserve_mib = 8192;
+    bool host_reserve_explicit = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -1947,6 +1948,7 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--host-reserve-mib") {
             o.host_reserve_mib = std::atoll(next("--host-reserve-mib"));
+            o.host_reserve_explicit = true;
             if (o.host_reserve_mib < 8192) {
                 std::fprintf(stderr, "strata generate: --host-reserve-mib %lld is below the 8 GiB design "
                                      "default (docs/02) - admission never plans the reserves away\n",
@@ -3844,7 +3846,8 @@ int main(int argc, char** argv) {
         if (external_measured) {
             policy.guest_total_bytes = std::min(policy.guest_total_bytes, external.allocation);
             policy.guest_reserve_bytes = std::max(policy.guest_reserve_bytes, external.guest_reserve);
-            policy.host_reserve_bytes = std::max(policy.host_reserve_bytes, external.host_reserve);
+            policy.host_reserve_bytes = o.host_reserve_explicit
+                ? std::max(policy.host_reserve_bytes, external.host_reserve) : external.host_reserve;
             policy.host_available_measured = true;
             policy.host_available_bytes = external.available;
             host.add("guest_unbacked_allocation", external.allocation - external.resident,
