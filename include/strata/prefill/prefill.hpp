@@ -177,8 +177,11 @@ public:
 
     // ---- FORK (HET-017): the admission gate's entry points, priced from the facts above ----
     /// Snapshot the same runtime switches init uses. Queries device properties, allocates no device memory.
+    /// `device_ordinal` < 0 reads the CURRENT device; otherwise that visible device's own MMQ hardware
+    /// inputs (cc/SMs/shared memory) are snapshotted, so a layer split prices each stage's own workspace.
     static bool allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
-                                  AllocationConfig& out, std::string& err, bool kv_hybrid = false);
+                                  AllocationConfig& out, std::string& err, bool kv_hybrid = false,
+                                  int device_ordinal = -1);
     /// The dynamic stager's fixed job bound for a stage: the stage's layer range times n_expert - the most
     /// expert-layer pairs a chunk's plan can hold - checked against the claim word's 16-bit job field (refuse,
     /// never clamp; this also rules out any product overflow).

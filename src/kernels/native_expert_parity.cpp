@@ -10,6 +10,7 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 // The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
+#include "strata/platform/protected_test.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -534,6 +535,7 @@ int main(int argc, char** argv) {
                              "       native_expert_parity --bf16-embd\n");
         return 2;
     }
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     // #152's width check tests the opt-in rule (the multi-token kernels from one token on)
     if (std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
 #ifdef _WIN32

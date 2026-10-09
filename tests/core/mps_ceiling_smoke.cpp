@@ -9,6 +9,22 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
+
+namespace {
+void format_uuid(char (&out)[41], const cudaDeviceProp& prop) {
+    std::memcpy(out, "GPU-", 4);
+    size_t at = 4;
+    constexpr char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[at++] = '-';
+        const auto byte = static_cast<unsigned char>(prop.uuid.bytes[i]);
+        out[at++] = hex[byte >> 4];
+        out[at++] = hex[byte & 15];
+    }
+    out[at] = '\0';
+}
+}  // namespace
 
 int main() {
     const char* supervised = std::getenv("STRATA_SUPERVISED");
@@ -26,7 +42,7 @@ int main() {
         return 1;
     }
     MpsCeiling mismatch = ceiling;
-    --mismatch.cap_bytes;
+    for (auto& d : mismatch.devices) --d.cap_bytes;
     if (mps_verify_before_cuda(mismatch, outside, receipt, error)) {
         std::fprintf(stderr, "mismatched daemon cap was accepted\n");
         return 1;
@@ -43,9 +59,13 @@ int main() {
         std::fprintf(stderr, "before CUDA: %s\n", error.c_str());
         return 1;
     }
-    if (mps_verify_after_cuda(ceiling, ceiling.gpu_uuid, 0, receipt, error)) {
-        std::fprintf(stderr, "unattached own PID was accepted\n");
-        return 1;
+    {
+        std::vector<std::string> declared_uuids;
+        for (const auto& d : ceiling.devices) declared_uuids.push_back(d.gpu_uuid);
+        if (mps_verify_after_cuda(ceiling, declared_uuids, 0, receipt, error)) {
+            std::fprintf(stderr, "unattached own PID was accepted\n");
+            return 1;
+        }
     }
     std::printf("NEGATIVE unattached_own_pid refused=%s\n", error.c_str());
     error.clear();
@@ -64,28 +84,36 @@ int main() {
         std::fprintf(stderr, "context: %s\n", cudaGetErrorString(status));
         return 1;
     }
-    char uuid[41] = "GPU-";
-    size_t at = 4;
-    constexpr char hex[] = "0123456789abcdef";
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) uuid[at++] = '-';
-        const auto byte = static_cast<unsigned char>(properties.uuid.bytes[i]);
-        uuid[at++] = hex[byte >> 4];
-        uuid[at++] = hex[byte & 15];
+    // Every declared device's actual CUDA identity, before the first allocation.
+    std::vector<std::string> actual_uuids;
+    for (size_t i = 0; i < ceiling.devices.size(); ++i) {
+        cudaDeviceProp device_properties{};
+        if (cudaGetDeviceProperties(&device_properties, (int) i) != cudaSuccess) {
+            std::fprintf(stderr, "device %zu properties: %s\n", i,
+                         cudaGetErrorString(cudaGetLastError()));
+            return 1;
+        }
+        char uuid[41];
+        format_uuid(uuid, device_properties);
+        actual_uuids.emplace_back(uuid);
     }
-    if (!mps_verify_after_cuda(ceiling, uuid, free_bytes, receipt, error)) {
+    if (!mps_verify_after_cuda(ceiling, actual_uuids, free_bytes, receipt, error)) {
         std::fprintf(stderr, "after CUDA: %s\n", error.c_str());
         return 1;
     }
     const MpsVerification verified = receipt;
-    if (mps_verify_after_cuda(ceiling, "GPU-00000000-0000-0000-0000-000000000000", free_bytes, receipt, error)) {
-        std::fprintf(stderr, "wrong CUDA UUID was accepted\n");
-        return 1;
+    {
+        std::vector<std::string> foreign(ceiling.devices.size(),
+                                         "GPU-00000000-0000-0000-0000-000000000000");
+        if (mps_verify_after_cuda(ceiling, foreign, free_bytes, receipt, error)) {
+            std::fprintf(stderr, "wrong CUDA UUID was accepted\n");
+            return 1;
+        }
     }
     std::printf("NEGATIVE wrong_cuda_uuid refused=%s\n", error.c_str());
     receipt = verified;
     error.clear();
-    if (mps_verify_after_cuda(ceiling, uuid, ceiling.cap_bytes + 1, receipt, error)) {
+    if (mps_verify_after_cuda(ceiling, actual_uuids, ceiling.devices.front().cap_bytes + 1, receipt, error)) {
         std::fprintf(stderr, "residual above declared cap was accepted\n");
         return 1;
     }
@@ -102,11 +130,14 @@ int main() {
     }
     std::printf("MPS_MODULE_SMOKE uuid=%s client_pid=%d server_pid=%d cap_bytes=%llu "
                 "default_cap_bytes=%llu server_cap_bytes=%llu physical_free_bytes=%llu "
-                "outside_client_allowance_bytes=%llu residual_free_bytes=%llu negative_controls=5 allocated_bytes=67108864 failures=0\n",
-                uuid, verified.client_pid, verified.server_pid, (unsigned long long)ceiling.cap_bytes,
+                "outside_client_allowance_bytes=%llu residual_free_bytes=%llu devices=%zu "
+                "negative_controls=5 allocated_bytes=67108864 failures=0\n",
+                actual_uuids.front().c_str(), verified.client_pid, verified.server_pid,
+                (unsigned long long)ceiling.devices.front().cap_bytes,
                 (unsigned long long)verified.default_cap_bytes, (unsigned long long)verified.server_cap_bytes,
                 (unsigned long long)verified.physical_free_bytes,
-                (unsigned long long)verified.outside_client_allowance_bytes, (unsigned long long)free_bytes);
+                (unsigned long long)verified.outside_client_allowance_bytes, (unsigned long long)free_bytes,
+                ceiling.devices.size());
     std::fflush(stdout);
     std::this_thread::sleep_for(std::chrono::seconds(6)); // supervisor observes the real own-PID attachment
     return 0;

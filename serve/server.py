@@ -571,6 +571,12 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
+        if os.environ.get("STRATA_SUPERVISED") == "1":
+            if lazy:
+                raise ValueError("protected engine requires eager startup")
+            if self.__dict__.get("_protected_started", False):
+                raise EngineDied("protected engine lifetime consumed; start a new supervised action")
+            self._protected_started = True
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.resident_multiplex = "--resident-multiplex" in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -779,6 +785,8 @@ class StrataEngine:
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
+        if os.environ.get("STRATA_SUPERVISED") == "1":
+            raise EngineDied("protected engine restart is disabled; start a new supervised action")
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
@@ -2232,6 +2240,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.supervised = os.environ.get("STRATA_SUPERVISED") == "1"
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -2537,6 +2546,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if self.supervised:
+            raise EngineDied("protected engine is unavailable; start a new supervised action")
         with self.status_lock:
             current = getattr(self.lifecycle_local, "record", None)
             others = [r for r in self.admission_active.values() if r is not current]
@@ -2613,7 +2624,9 @@ class Service:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        print(f"[strata] {e}. {note} The next request starts the engine again."
+        recovery = ("Start a new supervised action." if self.supervised else
+                    "The next request starts the engine again.")
+        print(f"[strata] {e}. {note} {recovery}"
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
@@ -2858,7 +2871,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "loaded": self.loaded(), "auto_load": not self.supervised and hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -4098,7 +4111,7 @@ def make_handler(svc: Service):
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
-                                                          "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                                                          "loaded": svc.loaded(), "auto_load": not svc.supervised and hasattr(svc.engine, "restart")})
                 return
             if path == "/settings":
                 if self._authorized():
@@ -4182,6 +4195,11 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if svc.supervised and (path in ("/config", "/settings", "/load", "/unload", "/v1/load", "/v1/unload",
+                                           "/v1/vram", "/mcp") or path.startswith("/slots/")):
+                self._json(403, {"error": {"type": "permission_error",
+                                          "message": "protected profile controls require the operator"}})
+                return
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():
@@ -4217,6 +4235,11 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if svc.supervised and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    if any(key in req for key in ("strata_tune", "experimental_speed_projection")):
+                        self._json(403, {"error": {"type": "permission_error",
+                                                  "message": "protected execution tuning requires the operator"}})
+                        return
                 if path == "/api/lifecycle/cancel":
                     if self._lifecycle_allowed():
                         request_id = req.get("id")
@@ -4310,7 +4333,8 @@ def make_handler(svc: Service):
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                message = str(e) if svc.supervised else f"{e}; the next request restarts it"
+                self._json(503, {"error": {"type": "server_error", "message": message}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -4358,7 +4382,8 @@ def make_handler(svc: Service):
             params["n_predict"] = svc.shared.get("max_tokens", -1)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
-                     "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
+                     "modalities": {"vision": svc.vision is not None},
+                     "models_autoload": not svc.supervised and hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
@@ -4575,7 +4600,8 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                message = str(e) if svc.supervised else f"{e}; the next request restarts it"
+                err = {"error": {"type": "server_error", "message": message}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -4623,8 +4649,8 @@ def make_handler(svc: Service):
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
                 except EngineDied as e:
-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
-                                                                code="server_error"))
+                    message = str(e) if svc.supervised else f"{e}; the next request restarts it"
+                    return self._json(503, responses_error_body(message, "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -4654,7 +4680,8 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                message = str(e) if svc.supervised else f"{e}; the next request restarts it"
+                self._responses_failed(asm, message, "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -4756,7 +4783,8 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                message = str(e) if svc.supervised else f"{e}; the next request restarts it"
+                err = {"type": "error", "error": {"type": "api_error", "message": message}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -5169,6 +5197,9 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        if os.environ.get("STRATA_SUPERVISED") == "1" and (
+                lazy or cfg.get("vision") or a.idle_unload or cfg.get("idle_unload_s")):
+            ap.error("protected serving requires eager startup, text-only execution and no idle unload")
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):

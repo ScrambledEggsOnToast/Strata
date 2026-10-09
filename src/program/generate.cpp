@@ -20,6 +20,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/platform/mps_ceiling.hpp"
 #include "strata/plan/admission.hpp"
+#include "strata/plan/source_receipt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -302,7 +303,7 @@ bool read_host_admission(HostAdmissionSnapshot& snapshot) {
     const uint64_t ns = (uint64_t) now.tv_sec * 1000000000ull + (uint64_t) now.tv_nsec;
     if (fields[0] != 1 || ns < fields[1] || ns - fields[1] > 5000000000ull) return false;
     for (size_t i = 2; i < 8; ++i) if (fields[i] > (1ull << 50)) return false;
-    if (fields[3] < (4ull << 30) || fields[4] > fields[3] || fields[5] < (8ull << 30) ||
+    if (fields[3] < (4ull << 30) || fields[4] > fields[3] ||
         fields[6] < (4ull << 30) || fields[7] < (32ull << 20) || fields[7] > fields[3]) return false;
     snapshot = {fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]};
     return true;
@@ -321,13 +322,10 @@ bool read_host_admission(HostAdmissionSnapshot& snapshot) {
 /// file's size, inode, device and mtime must equal the file this process is about to read - which
 /// is what binds the measurement to the bytes whose residency it claims. Nothing here decides that
 /// the measurement is adequate; it decides that the measurement is of these bytes.
-struct SourceResidencyReceipt {
-    uint64_t expert_bytes = 0, expert_inode = 0, expert_device = 0, expert_mtime_ns = 0;
-    uint64_t ring_bytes = 0, guest_pages_bytes = 0, reader_overhead_bytes = 0, host_payload_bytes = 0;
-};
+using strata::plan::SourceResidencyReceipt;
 
 /// 0 = absent (charge the conservative envelope), 1 = accepted, -1 = present but invalid (refused).
-int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_path) {
+int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_path, uint64_t expected_lanes) {
 #if defined(__linux__)
     const char* value = std::getenv("STRATA_SOURCE_RECEIPT");
     if (!value || !*value) return 0;
@@ -350,36 +348,20 @@ int read_source_receipt(SourceResidencyReceipt& out, const std::string& expert_p
     const ssize_t size = protected_file ? read(fd, buffer, sizeof buffer) : -1;
     close(fd);
     if (size <= 0 || size > 512 || size != st.st_size) return -1;
-    const char* cursor = buffer;
-    const char* end = buffer + size;
-    uint64_t fields[9]{};
-    for (auto& field : fields) {
-        while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
-        auto result = std::from_chars(cursor, end, field);
-        if (result.ec != std::errc{} || result.ptr == cursor) return -1;
-        cursor = result.ptr;
-        if (cursor < end && *cursor != ' ' && *cursor != '\n') return -1;
-    }
-    while (cursor < end && (*cursor == ' ' || *cursor == '\n')) ++cursor;
-    if (cursor != end) return -1;
-    if (fields[0] != 1) return -1;
-    // Only the byte counts carry the 2^50 ceiling the snapshot uses: field 4 is a nanosecond
-    // timestamp, which is legitimately larger (about 1.8e18 today) and would otherwise reject
-    // every valid record.
-    for (size_t i = 5; i < 9; ++i) if (fields[i] > (1ull << 50)) return -1;
+    SourceResidencyReceipt parsed;
+    if (!strata::plan::parse_source_receipt(std::string_view(buffer, size), expected_lanes, parsed)) return -1;
     struct stat expert{};
     if (stat(expert_path.c_str(), &expert) || !S_ISREG(expert.st_mode)) return -1;
     const uint64_t mtime_ns = (uint64_t) expert.st_mtim.tv_sec * 1000000000ull +
                               (uint64_t) expert.st_mtim.tv_nsec;
-    if ((uint64_t) expert.st_size != fields[1] || (uint64_t) expert.st_ino != fields[2] ||
-        (uint64_t) expert.st_dev != fields[3] || mtime_ns != fields[4]) return -1;
-    if (fields[5] == 0 || fields[5] > (uint64_t) expert.st_size) return -1;
-    if (fields[6] == 0 || fields[7] == 0) return -1;
-    out = {fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8]};
+    if ((uint64_t) expert.st_size != parsed.expert_bytes || (uint64_t) expert.st_ino != parsed.expert_inode ||
+        (uint64_t) expert.st_dev != parsed.expert_device || mtime_ns != parsed.expert_mtime_ns) return -1;
+    out = parsed;
     return 1;
 #else
     (void) out;
     (void) expert_path;
+    (void) expected_lanes;
     return 0;
 #endif
 }
@@ -548,10 +530,13 @@ struct Options {
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
     /// the finite allowances the operator commits for the two classes that have no size API.
-    /// The declared cap and outside-client allowance are explicit. Opaque-class allowances
+    /// The declared caps and outside-client allowance are explicit. Opaque-class allowances
     /// stay unknown unless that cap is verified; physical headroom is a separate gate,
     /// never funding for the client's automatic expert cache.
-    uint64_t mps_cap_bytes = 0;                     // --mps-cap-bytes
+    /// --mps-cap-bytes: one byte count for a single visible device, or an ordered comma
+    /// list matching one value per CUDA_VISIBLE_DEVICES UUID. A scalar names one device
+    /// only; it never broadcasts to the other visible devices.
+    std::vector<uint64_t> mps_cap_bytes;             // --mps-cap-bytes (one per visible device)
     uint64_t mps_outside_client_allowance_bytes = 0; // --mps-outside-client-allowance-bytes
     uint64_t graph_capture_allowance_bytes = 0;     // --graph-capture-allowance-bytes
     uint64_t prefill_library_allowance_bytes = 0;   // --prefill-library-allowance-bytes
@@ -666,11 +651,12 @@ struct Options {
     /// configuration before the first model allocation when a device cannot hold its own share, when the
     /// guest/host envelope does not close, or when an allocation exists that the accounting cannot size.
     /// Headroom defaults to `vram_reserve_mib` (the same reserve the auto cache already honours); the
-    /// guest/host reserves floor at the docs/02 design defaults - 4 GiB inside the guest, 8 GiB on the
-    /// host - and the parser refuses smaller values, so no flag can plan the reserves away.
+    /// Guest reserve retains the 4 GiB floor. Host reserve defaults to 8 GiB unless a
+    /// protected controller supplies its approved reserve; an explicit CLI reserve only tightens it.
     int admission_headroom_mib = -1;   ///< < 0: default to `vram_reserve_mib`
     int64_t guest_reserve_mib = 4096;
     int64_t host_reserve_mib = 8192;
+    bool host_reserve_explicit = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -1003,8 +989,12 @@ void usage() {
                  "                       slots/layer and 70.4%% at 64.\n"
                  "  --expert-worker-contract  enable bounded expert-row ownership and device-independent helpers\n"
                  "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
-                 "  --mps-cap-bytes N    issue #60: the enforced MPS client ceiling this run is launched under;\n"
-                 "                       must match the verified declaration in this process's environment\n"
+                 "  --mps-cap-bytes N[,N..]  issue #60: the enforced MPS client ceiling this run is\n"
+                 "                       launched under: one byte count for a single visible device,\n"
+                 "                       or an ordered comma list with one value per visible device\n"
+                 "                       (matching CUDA_VISIBLE_DEVICES order); must match the verified\n"
+                 "                       declaration in this process's environment. A scalar names one\n"
+                 "                       device only and never applies to the other visible devices\n"
                  "  --mps-outside-client-allowance-bytes N  positive separate allowance for MPS/server device\n"
                  "                       costs outside the client cap; cap + allowance must fit physical free\n"
                  "                       memory measured before this client's context (not a reservation)\n"
@@ -1886,7 +1876,38 @@ int main(int argc, char** argv) {
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
-        else if (a == "--mps-cap-bytes") o.mps_cap_bytes = bytes_flag(next("--mps-cap-bytes"), "--mps-cap-bytes");
+        else if (a == "--mps-cap-bytes") {
+            // One byte count per visible device, in CUDA_VISIBLE_DEVICES order: a scalar for
+            // a single-device declaration, a comma list for several. Every element parses in
+            // full under the same rule as bytes_flag - a typo is an error, never "absent".
+            const std::string value = next("--mps-cap-bytes");
+            std::vector<uint64_t> caps;
+            size_t at = 0;
+            bool bad = value.empty();
+            while (!bad) {
+                const size_t comma = value.find(',', at);
+                const std::string item = value.substr(at, comma == std::string::npos
+                                                          ? std::string::npos : comma - at);
+                if (item.empty()) { bad = true; break; }
+                char* end = nullptr;
+                const unsigned long long parsed = std::strtoull(item.c_str(), &end, 10);
+                if (item[0] < '0' || item[0] > '9' || end == nullptr || *end != '\0' ||
+                    parsed > (1ull << 48)) {
+                    bad = true;
+                    break;
+                }
+                caps.push_back((uint64_t) parsed);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            if (bad) {
+                std::fprintf(stderr, "strata generate: --mps-cap-bytes needs one byte count per visible "
+                                     "device (a scalar, or an ordered comma list), got '%s'\n",
+                             value.c_str());
+                return 2;
+            }
+            o.mps_cap_bytes = std::move(caps);
+        }
         else if (a == "--mps-outside-client-allowance-bytes") o.mps_outside_client_allowance_bytes = bytes_flag(next("--mps-outside-client-allowance-bytes"), "--mps-outside-client-allowance-bytes");
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
@@ -1947,6 +1968,7 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--host-reserve-mib") {
             o.host_reserve_mib = std::atoll(next("--host-reserve-mib"));
+            o.host_reserve_explicit = true;
             if (o.host_reserve_mib < 8192) {
                 std::fprintf(stderr, "strata generate: --host-reserve-mib %lld is below the 8 GiB design "
                                      "default (docs/02) - admission never plans the reserves away\n",
@@ -2168,9 +2190,10 @@ int main(int argc, char** argv) {
     // prompt path (each stage's prompt path has its own buffers).
     // --pcie-frac given: that one share is every stage's (the stages' own link probes are skipped), so a split over
     // a fast and a slow link cannot set the two apart from the command line (#485)
-    // Validate the complete single-device MPS declaration before any CUDA call. Daemon
-    // readback and the independent physical sample follow immediately before context
+    // Validate the complete per-device MPS declaration before any CUDA call. Daemon
+    // readback and the independent physical samples follow immediately before context
     // creation; own-PID attachment is then verified before the first planned allocation.
+    // One pipe and one server serve every declared device, and one client PID owns them.
     strata::platform::MpsCeiling mps_ceiling;
     strata::platform::MpsVerification mps_verification;
     {
@@ -2187,24 +2210,39 @@ int main(int argc, char** argv) {
 #endif
             if (!o.layer_split.empty() || !o.split_device.empty() || o.peer_device >= 1 ||
                 o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {
-                std::fprintf(stderr, "strata generate: MPS ceiling verification supports one CUDA device only; "
-                                     "layer splits, remote caches and peer devices are unsupported\n");
-                return 2;
+                // Remote expert caches and peer devices stay refused: their cross-device
+                // transfers are not accounted inside the per-device client ceilings.
+                if (o.peer_device >= 1 || o.expert_cache_remote[0] > 0 ||
+                    o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {
+                    std::fprintf(stderr, "strata generate: MPS ceiling verification supports one client per "
+                                         "device ceiling; remote expert caches and peer devices are unaccounted "
+                                         "and unsupported\n");
+                    return 2;
+                }
+                // An explicit split prices every stage before allocation (below); an auto
+                // split places its K after the weights load and has no pre-placement price.
+                if (o.layer_split == "auto") {
+                    std::fprintf(stderr, "strata generate: a declared MPS ceiling prices explicit --layer-split K "
+                                         "stages before allocation; --layer-split auto has no pre-placement price\n");
+                    return 2;
+                }
             }
             if (o.mps_outside_client_allowance_bytes == 0) {
                 std::fprintf(stderr, "strata generate: a declared MPS ceiling requires a positive "
                                      "--mps-outside-client-allowance-bytes commitment\n");
                 return 2;
             }
+            std::fprintf(stderr, "strata generate: MPS client ceiling declared: %zu device(s), pipe %s\n",
+                         mps_ceiling.devices.size(), mps_ceiling.pipe_directory.c_str());
+            for (const auto& d : mps_ceiling.devices)
+                std::fprintf(stderr, "strata generate: MPS device %d: cap %llu B, uuid %s\n",
+                             d.device, (unsigned long long) d.cap_bytes, d.gpu_uuid.c_str());
         }
-        if (mps_ceiling.declared)
-            std::fprintf(stderr, "strata generate: MPS client ceiling declared: device %d, %llu B, pipe %s\n",
-                         mps_ceiling.device, (unsigned long long) mps_ceiling.cap_bytes,
-                         mps_ceiling.pipe_directory.c_str());
     }
 #ifdef STRATA_RESIDENCY_MODEL_TEST
-    if (!mps_ceiling.declared || mps_ceiling.cap_bytes != (10ull << 30)) {
-        std::fprintf(stderr, "residency regression requires the protected 10 GiB MPS client ceiling\n");
+    if (mps_ceiling.devices.size() != 1 || !mps_ceiling.declared ||
+        mps_ceiling.devices.front().cap_bytes != (10ull << 30)) {
+        std::fprintf(stderr, "residency regression requires the protected 10 GiB MPS client ceiling on one device\n");
         return 2;
     }
 #endif
@@ -2213,22 +2251,33 @@ int main(int argc, char** argv) {
     // against must be the one this process was launched with. Partial commitments refuse.
     const bool any_allowance = o.graph_capture_allowance_bytes != 0 || o.prefill_library_allowance_bytes != 0 ||
                                o.mps_outside_client_allowance_bytes != 0;
-    if (any_allowance || o.mps_cap_bytes != 0) {
-        if (o.mps_cap_bytes == 0) {
+    if (any_allowance || !o.mps_cap_bytes.empty()) {
+        if (o.mps_cap_bytes.empty()) {
             std::fprintf(stderr, "strata generate: an opaque-class allowance needs --mps-cap-bytes: the "
                                  "allowance is only meaningful inside an enforced ceiling\n");
             return 2;
         }
         if (!mps_ceiling.declared) {
-            std::fprintf(stderr, "strata generate: --mps-cap-bytes %llu was given but no MPS ceiling is declared "
-                                 "in this process's environment; the ceiling must be enforced at creation\n",
-                         (unsigned long long) o.mps_cap_bytes);
+            std::fprintf(stderr, "strata generate: --mps-cap-bytes was given but no MPS ceiling is declared "
+                                 "in this process's environment; the ceiling must be enforced at creation\n");
             return 2;
         }
-        if (o.mps_cap_bytes != mps_ceiling.cap_bytes) {
-            std::fprintf(stderr, "strata generate: --mps-cap-bytes %llu does not match the verified declaration %llu\n",
-                         (unsigned long long) o.mps_cap_bytes, (unsigned long long) mps_ceiling.cap_bytes);
+        // One value per visible device, in order: a scalar names the single device and is
+        // never broadcast to the other visible devices.
+        if (o.mps_cap_bytes.size() != mps_ceiling.devices.size()) {
+            std::fprintf(stderr, "strata generate: --mps-cap-bytes names %zu value(s) for %zu visible "
+                                 "device(s); give exactly one byte count per CUDA_VISIBLE_DEVICES UUID\n",
+                         o.mps_cap_bytes.size(), mps_ceiling.devices.size());
             return 2;
+        }
+        for (size_t i = 0; i < o.mps_cap_bytes.size(); ++i) {
+            if (o.mps_cap_bytes[i] != mps_ceiling.devices[i].cap_bytes) {
+                std::fprintf(stderr, "strata generate: --mps-cap-bytes entry %zu (%llu) does not match the "
+                                     "verified declaration for device %d (%llu)\n",
+                             i, (unsigned long long) o.mps_cap_bytes[i], mps_ceiling.devices[i].device,
+                             (unsigned long long) mps_ceiling.devices[i].cap_bytes);
+                return 2;
+            }
         }
     }
     const bool pcie_given = o.pcie_frac >= 0.0;
@@ -2264,6 +2313,14 @@ int main(int argc, char** argv) {
                                  "(--split-device 0); disable parking with --conversation-cache-mib 0\n");
             return 2;
         }
+        // A same-GPU split opens a second expert cache on the one already-capped device; the
+        // per-stage budget model prices one cache per distinct device, so it stays refused.
+        if (split_same && mps_ceiling.declared) {
+            std::fprintf(stderr, "strata generate: a declared MPS ceiling supports one expert cache per device; "
+                                 "--layer-split with --split-device 0 would open a second cache on the capped "
+                                 "device without a price\n");
+            return 2;
+        }
         if (ok && split_auto && split_devs.empty()) {
             std::fprintf(stderr, "strata generate: --layer-split auto: one GPU visible, so no split\n");
             o.layer_split.clear();
@@ -2288,11 +2345,21 @@ int main(int argc, char** argv) {
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.windowed_experts) {
         if (o.mmap_experts || !o.shared_expert_arena.empty() || o.resident_cpu_experts ||
-            !o.layer_split.empty() || o.adapt_swaps > 0 || o.expert_cache_remote[0] > 0 ||
+            o.adapt_swaps > 0 || o.expert_cache_remote[0] > 0 ||
             o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
             (o.expert_cache != 0 && o.expert_profile.empty())) {
-            std::fprintf(stderr, "strata generate: --windowed-experts requires one driver, no mmap/resident/shared arena, "
+            std::fprintf(stderr, "strata generate: --windowed-experts requires no mmap/resident/shared arena, "
                                  "no adaptive/remote caches, and a static --expert-profile when caching experts\n");
+            return 2;
+        }
+        if (o.pipeline_windows > 0 || o.peer_device >= 1) {
+            std::fprintf(stderr, "strata generate: --windowed-experts cannot share source epochs with "
+                                 "pipeline-windows or a prefill peer\n");
+            return 2;
+        }
+        if (!o.layer_split.empty() && (split_auto || split_same || split_devs.size() > 2)) {
+            std::fprintf(stderr, "strata generate: windowed layer splits require two or three distinct devices "
+                                 "and explicit boundaries; each prefill stage owns its own measured source lane\n");
             return 2;
         }
         const char* ring = std::getenv("STRATA_PREFILL_RING");
@@ -2783,8 +2850,9 @@ int main(int argc, char** argv) {
             return 2;
         }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-        // cudaSetDevice may itself create the context. The physical sample above must
-        // precede it, while all allocations (including the PCIe probe) must follow this check.
+        // cudaSetDevice may itself create the context. The physical samples above must
+        // precede it, while all allocations (including the PCIe probe) must follow the
+        // post-context verification below.
         cudaDeviceProp properties{};
         size_t free_b = 0, total_b = 0;
         cudaError_t status = cudaSetDevice(0);
@@ -2796,28 +2864,73 @@ int main(int argc, char** argv) {
                          cudaGetErrorString(status));
             return 2;
         }
-        char actual_uuid[41] = "GPU-";
-        size_t at = 4;
-        constexpr char hex[] = "0123456789abcdef";
-        for (int i = 0; i < 16; ++i) {
-            if (i == 4 || i == 6 || i == 8 || i == 10) actual_uuid[at++] = '-';
-            const auto byte = static_cast<unsigned char>(properties.uuid.bytes[i]);
-            actual_uuid[at++] = hex[byte >> 4];
-            actual_uuid[at++] = hex[byte & 15];
+        auto format_uuid = [](char (&out)[41], const cudaDeviceProp& prop) {
+            std::memcpy(out, "GPU-", 4);
+            size_t at = 4;
+            constexpr char hex[] = "0123456789abcdef";
+            for (int i = 0; i < 16; ++i) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) out[at++] = '-';
+                const auto byte = static_cast<unsigned char>(prop.uuid.bytes[i]);
+                out[at++] = hex[byte >> 4];
+                out[at++] = hex[byte & 15];
+            }
+            out[at] = '\0';
+        };
+        // Every declared device's ACTUAL CUDA identity is verified here, before any
+        // allocation: a device query needs no context on the queried device.
+        int visible_devices = 0;
+        if (cudaGetDeviceCount(&visible_devices) != cudaSuccess ||
+            visible_devices < (int) mps_ceiling.devices.size()) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata generate: MPS verification needs %zu visible device(s) before "
+                                 "the first allocation\n", mps_ceiling.devices.size());
+            return 2;
         }
-        if (!strata::platform::mps_verify_after_cuda(mps_ceiling, actual_uuid, free_b, mps_verification, err)) {
+        std::vector<std::string> actual_uuids(mps_ceiling.devices.size());
+        for (size_t i = 0; i < mps_ceiling.devices.size(); ++i) {
+            cudaDeviceProp device_properties{};
+            const cudaError_t query_status = cudaGetDeviceProperties(&device_properties, (int) i);
+            if (query_status != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: cannot query CUDA device %zu's identity: %s\n",
+                             i, cudaGetErrorString(query_status));
+                return 2;
+            }
+            char uuid[41];
+            format_uuid(uuid, device_properties);
+            actual_uuids[i] = uuid;
+        }
+        if (!strata::platform::mps_verify_after_cuda(mps_ceiling, actual_uuids, free_b,
+                                                     mps_verification, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 2;
         }
-        std::fprintf(stderr, "strata MPS verified: uuid=%s client_pid=%d server_pid=%d cap_bytes=%llu "
-                             "default_cap_bytes=%llu server_cap_bytes=%llu residual_free_bytes=%llu "
-                             "physical_free_bytes=%llu outside_client_allowance_bytes=%llu precontext=1\n",
-                     actual_uuid, mps_verification.client_pid, mps_verification.server_pid,
-                     (unsigned long long) mps_ceiling.cap_bytes,
-                     (unsigned long long) mps_verification.default_cap_bytes,
-                     (unsigned long long) mps_verification.server_cap_bytes, (unsigned long long) free_b,
-                     (unsigned long long) mps_verification.physical_free_bytes,
-                     (unsigned long long) mps_verification.outside_client_allowance_bytes);
+        if (mps_ceiling.devices.size() == 1) {
+            // Retained single-device inspector line.
+            std::fprintf(stderr, "strata MPS verified: uuid=%s client_pid=%d server_pid=%d cap_bytes=%llu "
+                                 "default_cap_bytes=%llu server_cap_bytes=%llu residual_free_bytes=%llu "
+                                 "physical_free_bytes=%llu outside_client_allowance_bytes=%llu precontext=1\n",
+                         actual_uuids[0].c_str(), mps_verification.client_pid, mps_verification.server_pid,
+                         (unsigned long long) mps_ceiling.devices[0].cap_bytes,
+                         (unsigned long long) mps_verification.default_cap_bytes,
+                         (unsigned long long) mps_verification.server_cap_bytes, (unsigned long long) free_b,
+                         (unsigned long long) mps_verification.physical_free_bytes,
+                         (unsigned long long) mps_verification.outside_client_allowance_bytes);
+        } else {
+            std::fprintf(stderr, "strata MPS verified: client_pid=%d server_pid=%d device_caps=[",
+                         mps_verification.client_pid, mps_verification.server_pid);
+            for (size_t i = 0; i < mps_verification.devices.size(); ++i) {
+                const auto& row = mps_verification.devices[i];
+                std::fprintf(stderr, "%s{device=%d,gpu_uuid=%s,cap_bytes=%llu,default_cap_bytes=%llu,"
+                                     "server_cap_bytes=%llu,residual_free_bytes=%llu,physical_free_bytes=%llu,"
+                                     "physical_free_measured=%d,outside_client_allowance_bytes=%llu}",
+                             i == 0 ? "" : ",", row.device, row.gpu_uuid.c_str(),
+                             (unsigned long long) row.cap_bytes, (unsigned long long) row.default_cap_bytes,
+                             (unsigned long long) row.server_cap_bytes, (unsigned long long) row.residual_free_bytes,
+                             (unsigned long long) row.physical_free_bytes, row.physical_free_measured ? 1 : 0,
+                             (unsigned long long) row.outside_client_allowance_bytes);
+            }
+            std::fprintf(stderr, "] precontext=1\n");
+        }
 #endif
     }
 #ifdef STRATA_RESIDENCY_MODEL_TEST
@@ -3065,11 +3178,29 @@ int main(int argc, char** argv) {
     const int64_t kDrafterMib = 1000;
     const bool admission_auto_cache = o.expert_cache < 0 || (o.expert_cache == 0 && !o.expert_profile.empty());
     uint64_t admitted_cache_bytes = 0;
+    // Explicit layer splits: the per-stage expert-cache budgets admission committed, in
+    // split_devs order. The runtime stage caches may open fewer slots, never more.
+    std::vector<uint64_t> split_stage_cache_bytes;
+    std::vector<uint64_t> split_stage_pool_bytes;
     uint64_t pool_bytes = 0;
     strata::prefill::AllocationBytes admitted_prefill;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
+    }
+    if (multi_gpu && !split_auto) {
+        split_stage_pool_bytes.assign(split_devs.size(), pool_bytes);
+        if (stage_trim) {
+            for (size_t i = 0; i < split_devs.size(); ++i) {
+                std::set<std::string> stage_skip = skip_base;
+                const int64_t le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
+                add_foreign(split_at[i], le, stage_skip, false);
+                if (!strata::core::WeightTable::pool_bytes(o.pack, split_stage_pool_bytes[i], err, &stage_skip)) {
+                    std::fprintf(stderr, "strata generate: stage weight pricing: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+        }
     }
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
@@ -3263,7 +3394,7 @@ int main(int argc, char** argv) {
                        "NativeEmbed::load: full native embedding if mapped pinned allocation fails");
             else v0.add_unknown("embedding_vram_fallback", "native embedding tensor unreadable");
         }
-        if (!o.native_head_gguf.empty()) {
+        if (!o.native_head_gguf.empty() && !split_real) {
             if (head_bytes) v0.add("weights_native_head", byte_add(head_bytes, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1)),
                                    "output.weight GGUF block bytes + NativeHead Q8_1 scratch");
             else v0.add_unknown("weights_native_head", "--native-head-gguf tensor unreadable");
@@ -3381,7 +3512,7 @@ int main(int argc, char** argv) {
         // Layer-split stage devices: their own weight arena (every stage loads the full pool), their
         if (o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
             v0.add_unknown("late_remote_tiers", "CUDA2/3 telemetry deferred until after model allocations; preflight required");
-        if (multi_gpu)
+        if (multi_gpu && split_auto)
             v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
         // session share (upper-bounded by the full range until the split search has placed it) and the
         // stage_room reserves.  The last stage carries the MTP drafter.
@@ -3389,9 +3520,41 @@ int main(int argc, char** argv) {
             const size_t last = split_devs.size() - 1;
             for (size_t i = 0; i < split_devs.size(); ++i) {
                 strata::plan::DeviceCost& ds = add_device("CUDA" + std::to_string(split_devs[i]));
-                ds.vram.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (each stage loads the pool)");
-                ds.vram.add("session_state", (uint64_t) session_full,
-                            "session_bytes upper bound until the split search places the ranges");
+                const int64_t layer_begin = split_auto ? 0 : split_at[i];
+                const int64_t layer_end = !split_auto && i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
+                ds.vram.add("weights_canonical", split_auto ? pool_bytes : split_stage_pool_bytes[i],
+                            "WeightTable::pool_bytes for this stage's actual skip set");
+                if (!o.native_dense_gguf.empty()) {
+                    uint64_t dense_bytes = 0;
+                    // The loader's global range also carries its PLE-everywhere exception.
+                    // Price under that same range, then restore CUDA0's pending load range.
+                    if (stage_trim) strata::core::NativeDense::set_layer_range((int) layer_begin, (int) layer_end);
+                    const bool dense_priced = strata::core::NativeDense::planned_bytes(
+                        o.native_dense_gguf, o.native_ple_key, dense_bytes, err);
+                    if (stage_trim) strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
+                    if (!dense_priced) {
+                        std::fprintf(stderr, "strata generate: stage native dense pricing: %s\n", err.c_str());
+                        return 1;
+                    }
+                    ds.vram.add("weights_native_dense", dense_bytes, "NativeDense::planned_bytes for this stage's layer range");
+                }
+                if (!o.native_head_gguf.empty() && i == last) {
+                    if (head_bytes)
+                        ds.vram.add("weights_native_head", byte_add(head_bytes,
+                            strata::kernels::native_q8_1_bytes((int) g.n_embd, 1)), "last-stage native output head and Q8_1 scratch");
+                    else ds.vram.add_unknown("weights_native_head", "last-stage native output tensor unreadable");
+                }
+                if (split_auto)
+                    ds.vram.add("session_state", (uint64_t) session_full,
+                                "session_bytes upper bound until the split search places the ranges");
+                else {
+                    // An explicit split knows its placement: price this stage's own carve,
+                    // the same arithmetic the carve allocates after the search would run.
+                    const int64_t lb = split_at[i];
+                    const int64_t le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
+                    ds.vram.add("session_state", (uint64_t) strata::core::session_bytes(g, o.max_context, K, lb, le),
+                                "session_bytes of this stage's own layer range (explicit split)");
+                }
                 if (requested_slots) {
                     ds.vram.add("resident_session_device", resident.session_device, "requested slots; full session bound before split placement");
                     ds.vram.add("resident_verifier_device", resident.verifier_device, "per-stage resident controls");
@@ -3401,8 +3564,14 @@ int main(int argc, char** argv) {
                     ds.vram.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "per-stage verifier ownership records");
                 ds.vram.add("operation_canary_device", 2 * strata::core::kOperationCanaryDeviceBytes,
                             "bounded prefill/MTP scratch owner tables, conservatively per stage");
-                if (o.spec > 0 && i > 0)
-                    ds.vram.add("verify_windows", (uint64_t) kWindowMib << 20, "generate.cpp kWindowMib");
+                if (o.spec > 0) {
+                    const uint64_t windows = strata::core::Verifier::planned_device_bytes(
+                        g, o.max_context, n_vocab, std::max(o.spec, o.batch));
+                    if (windows == UINT64_MAX)
+                        ds.vram.add_unknown("verify_windows", "stage verifier arena geometry unavailable");
+                    else ds.vram.add("verify_windows", std::max(windows, (uint64_t) kWindowMib << 20),
+                                     "each stage's actual verifier arena, at least the conservative window envelope");
+                }
                 if (!o.mtp.empty() && i == last) {
                     const uint64_t dense_b = file_bytes(o.mtp + "/dense.bin");
                     const uint64_t experts_b = file_bytes(o.mtp + "/experts.bin");
@@ -3420,7 +3589,27 @@ int main(int argc, char** argv) {
                     else
                         ds.vram.add_unknown("graph_capture_storage", "split verifier/session graph capture storage not qualified");
                 if (admission_prefill) {
-                    ds.vram.add_unknown("prefill_allocator_bound", "split-device preallocation configuration requires each device's MMQ hardware inputs");
+                    // Each stage's own prefill price, from that device's own MMQ hardware
+                    // inputs: the workspace differs per cc/SMs/shared memory, so the
+                    // primary's price cannot stand in for the stage's.
+                    strata::prefill::AllocationConfig stage_config;
+                    strata::prefill::AllocationBytes stage_prefill;
+                    const int stage_kv_mode = o.kv_resident > 0 && o.max_context > o.kv_resident ? 1 : 0;
+                    if (!strata::prefill::Prefill::allocation_config(
+                            o.max_context, o.prefill_chunk, stage_kv_mode, o.kv == "int8", o.kv == "q4_0",
+                            stage_config, err, o.kv == "k8v4", split_devs[i]) ||
+                        !strata::prefill::Prefill::allocation_needed(
+                            g, stage_config, strata::kernels::cpu::expert_layout(), stage_prefill, err)) {
+                        std::fprintf(stderr, "strata generate: admission refused: CUDA%d prefill price: %s\n",
+                                     split_devs[i], err.c_str());
+                        return 1;
+                    }
+                    ds.vram.add("prefill_buffers", stage_prefill.standalone_device,
+                                "Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)");
+                    if (o.prefill_library_allowance_bytes != 0)
+                        ds.vram.add("prefill_library_storage", o.prefill_library_allowance_bytes,
+                                    "per-device opaque cuBLAS/first-use allowance inside the enforced ceiling");
+                    else ds.vram.add_unknown("prefill_library_storage", "stage-local opaque prefill library storage is unpriced");
                 }
                 if (residency_table)
                     ds.vram.add("device_residency_table", byte_mul(byte_mul((uint64_t) g.n_layers,
@@ -3452,14 +3641,25 @@ int main(int argc, char** argv) {
         SourceResidencyReceipt source_receipt;
         bool source_measured = false;
         uint64_t measured_source_host_bytes = 0;
-        int visible = 1;
-        if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 1) visible = 1;
-        cudaGetLastError();
+        int visible = 0;
+        if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 1) {
+            std::fprintf(stderr, "strata generate: admission refused: CUDA visibility query failed\n");
+            return 2;
+        }
         auto measure = [&](const std::string& name, int ordinal) {
             strata::plan::DeviceTelemetry t;
             t.name = name;
-            if (ordinal < visible) {
-                const strata::core::OnDevice on(ordinal);
+            int previous = -1;
+            if (ordinal >= 0 && ordinal < visible && cudaGetDevice(&previous) == cudaSuccess &&
+                cudaSetDevice(ordinal) == cudaSuccess && cudaFree(nullptr) == cudaSuccess) {
+                int current = -1;
+                if (cudaGetDevice(&current) != cudaSuccess || current != ordinal) {
+                    std::fprintf(stderr, "strata generate: admission refused: CUDA%d context identity differs\n", ordinal);
+                    ceiling_failure = true;
+                    if (previous >= 0) (void) cudaSetDevice(previous);
+                    tels.push_back(t);
+                    return;
+                }
                 size_t free_b = 0, total_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
                     t.measured = true;
@@ -3468,20 +3668,33 @@ int main(int argc, char** argv) {
                     // budget, independent of the retained pre-context physical sample.
                     t.free_bytes = free_b;
                     if (mps_ceiling.declared) {
-                        std::string ceiling_error;
-                        if (!strata::platform::mps_ceiling_holds(free_b, mps_ceiling.cap_bytes,
-                                                                 ceiling_error)) {
-                            std::fprintf(stderr, "strata generate: %s\n", ceiling_error.c_str());
+                        const strata::platform::MpsDeviceCeiling* declared =
+                            mps_ceiling.find_device(ordinal);
+                        const strata::platform::MpsDeviceVerification* verified = nullptr;
+                        for (const auto& row : mps_verification.devices)
+                            if (row.device == ordinal) { verified = &row; break; }
+                        if (declared == nullptr || verified == nullptr) {
+                            std::fprintf(stderr, "strata generate: CUDA%d has no declared MPS ceiling entry; "
+                                                 "the declaration must cover every measured device\n", ordinal);
                             ceiling_failure = true;
+                        } else {
+                            std::string ceiling_error;
+                            if (!strata::platform::mps_ceiling_holds(free_b, declared->cap_bytes,
+                                                                     ceiling_error)) {
+                                std::fprintf(stderr, "strata generate: CUDA%d: %s\n", ordinal,
+                                             ceiling_error.c_str());
+                                ceiling_failure = true;
+                            }
+                            t.cap_declared = true;
+                            t.enforced_cap_bytes = declared->cap_bytes;
+                            t.physical_free_measured = verified->physical_free_measured;
+                            t.physical_free_bytes = verified->physical_free_bytes;
+                            t.outside_client_allowance_bytes = verified->outside_client_allowance_bytes;
                         }
-                        t.cap_declared = true;
-                        t.enforced_cap_bytes = mps_ceiling.cap_bytes;
-                        t.physical_free_measured = mps_verification.physical_free_measured;
-                        t.physical_free_bytes = mps_verification.physical_free_bytes;
-                        t.outside_client_allowance_bytes = mps_verification.outside_client_allowance_bytes;
                     }
-                }
-            }
+                } else ceiling_failure = true;
+            } else ceiling_failure = true;
+            if (previous >= 0 && cudaSetDevice(previous) != cudaSuccess) ceiling_failure = true;
             tels.push_back(t);
         };
         measure("CUDA0", 0);
@@ -3489,6 +3702,59 @@ int main(int argc, char** argv) {
         if (split_real)
             for (int d : split_devs) measure("CUDA" + std::to_string(d), d);
         if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) measure("CUDA1", 1);
+        if (ceiling_failure) {
+            std::fprintf(stderr, "strata generate: admission refused: selected-device context or telemetry failed\n");
+            return 2;
+        }
+        // An explicit split commits each later stage's expert cache BEFORE allocation: that
+        // device's residual ceiling, minus every fixed class and the explicit headroom,
+        // floored to the blob granularity and bounded by the stage's profiled pairs. The
+        // runtime may open fewer slots, never more (the stage loop holds this budget).
+        if (split_real && !split_auto) {
+            std::vector<std::pair<int32_t, int32_t>> ranked;
+            if (!o.expert_profile.empty()) {
+                int64_t ranked_slots = 0;
+                if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert,
+                                                       ranked, ranked_slots, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            split_stage_cache_bytes.assign(split_devs.size(), 0);
+            for (size_t i = 0; i < split_devs.size(); ++i) {
+                const std::string stage_name = "CUDA" + std::to_string(split_devs[i]);
+                strata::plan::DeviceCost* stage_dev = nullptr;
+                strata::plan::DeviceTelemetry* stage_tel = nullptr;
+                for (auto& d : devs) if (d.name == stage_name) stage_dev = &d;
+                for (auto& t : tels) if (t.name == stage_name) stage_tel = &t;
+                if (stage_dev == nullptr || stage_tel == nullptr || !stage_tel->measured)
+                    continue;   // missing telemetry refuses below; nothing is priced from a guess
+                const uint64_t residual_ceiling = std::min(stage_tel->total_bytes, stage_tel->free_bytes);
+                const int64_t lb = split_at[i];
+                const int64_t le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
+                uint64_t profile_bound = 0;
+                for (const auto& pr : ranked)
+                    if (pr.first >= lb && pr.first < le) profile_bound = byte_add(profile_bound, blob_gate);
+                const uint64_t fixed_demand = stage_dev->vram.known_bytes();
+                const uint64_t budget = strata::plan::split_stage_cache_budget(
+                    residual_ceiling, fixed_demand, stage_dev->headroom_bytes, blob_gate, profile_bound);
+                if (budget < blob_gate) {
+                    std::fprintf(stderr, "strata generate: admission refused: CUDA%d requires a nonempty expert cache; "
+                                         "fixed demand/headroom/profile leave less than one expert blob\n", split_devs[i]);
+                    return 1;
+                }
+                split_stage_cache_bytes[i] = budget;
+                stage_dev->vram.add("split_expert_caches", budget,
+                                    "admitted per-stage budget: floor((residual - fixed classes - headroom)/max_blob), "
+                                    "bounded by this stage's profiled pairs; the runtime cache cannot exceed it");
+                std::fprintf(stderr, "strata generate: layer split admission: CUDA%d expert cache budget %llu B "
+                                     "(residual ceiling %llu B, fixed %llu B, headroom %llu B, profile bound %llu B)\n",
+                             split_devs[i], (unsigned long long) budget, (unsigned long long) residual_ceiling,
+                             (unsigned long long) fixed_demand,
+                             (unsigned long long) stage_dev->headroom_bytes,
+                             (unsigned long long) profile_bound);
+            }
+        }
         // Auto commits a real byte budget before allocation; runtime may shrink, never grow it.
         if (admission_auto_cache && !tels.empty() && tels.front().measured && blob_gate > 0) {
             const uint64_t ceiling = std::min(tels.front().total_bytes, tels.front().free_bytes);
@@ -3586,6 +3852,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (o.windowed_experts) {
+            const uint64_t lanes = multi_gpu ? split_devs.size() + 1 : 1;
             const uint64_t ring = strata::core::WindowedExpertSource::planned_bytes({}, layout, err);
             if (!ring) {
                 std::fprintf(stderr, "strata generate: admission refused: %s\n", err.c_str());
@@ -3598,11 +3865,11 @@ int main(int argc, char** argv) {
             // source's own opaque storage is priced by the same measurement instead of staying
             // unknown - so nothing is called free, it is charged at what was measured. Without the
             // receipt the conservative envelope and the unknown stand exactly as before.
-            const int source_state = from_gguf ? 0 : read_source_receipt(source_receipt, o.pack + "/experts.bin");
+            const int source_state = from_gguf ? 0 : read_source_receipt(source_receipt, o.pack + "/experts.bin", lanes);
             if (source_state < 0) {
                 std::fprintf(stderr, "strata generate: admission refused: STRATA_SOURCE_RECEIPT is present but "
                                      "does not verify against %s/experts.bin (path, protection, format or "
-                                     "identity)\n", o.pack.c_str());
+                                     "identity or live source-owner count)\n", o.pack.c_str());
                 return 1;
             }
             if (source_state == 1) {
@@ -3625,8 +3892,8 @@ int main(int argc, char** argv) {
                              (unsigned long long) source_receipt.reader_overhead_bytes,
                              (unsigned long long) source_receipt.host_payload_bytes);
             } else {
-                ram("expert_source_ring", ring,
-                    "WindowedExpertSource conservative ring bound including aligned read scratch");
+                ram("expert_source_ring", byte_mul(lanes, ring),
+                    "one WindowedExpertSource conservative ring bound per prefill stage, including aligned scratch");
                 const uint64_t source_envelope = from_gguf
                     ? byte_add(source_pages(layout.total), byte_mul(3ull * (uint64_t) g.n_layers, 2 * source_page))
                     : source_pages(layout.total);
@@ -3844,7 +4111,9 @@ int main(int argc, char** argv) {
         if (external_measured) {
             policy.guest_total_bytes = std::min(policy.guest_total_bytes, external.allocation);
             policy.guest_reserve_bytes = std::max(policy.guest_reserve_bytes, external.guest_reserve);
-            policy.host_reserve_bytes = std::max(policy.host_reserve_bytes, external.host_reserve);
+            policy.host_reserve_bytes = o.host_reserve_explicit
+                ? std::max(policy.host_reserve_bytes, external.host_reserve) : external.host_reserve;
+            policy.host_reserve_controller_approved = true;
             policy.host_available_measured = true;
             policy.host_available_bytes = external.available;
             host.add("guest_unbacked_allocation", external.allocation - external.resident,
@@ -3939,15 +4208,31 @@ int main(int argc, char** argv) {
         }
         // One line on stdout either way: the harness's predicted-vs-observed hook (the observed half is
         // the INFO line's vram_free_mib and the run's peak telemetry).
-        if (o.mps_cap_bytes != 0)
-            std::printf("PLAN mps_cap_bytes=%llu graph_capture_allowance_bytes=%llu prefill_library_allowance_bytes=%llu "
-                        "physical_free_measured=%d physical_free_bytes=%llu outside_client_allowance_bytes=%llu\n",
-                        (unsigned long long) o.mps_cap_bytes,
+        if (!o.mps_cap_bytes.empty()) {
+            std::printf("PLAN mps_cap_bytes=");
+            for (size_t i = 0; i < o.mps_cap_bytes.size(); ++i)
+                std::printf("%s%llu", i == 0 ? "" : ",", (unsigned long long) o.mps_cap_bytes[i]);
+            std::printf(" graph_capture_allowance_bytes=%llu prefill_library_allowance_bytes=%llu "
+                        "physical_free_measured=%d physical_free_bytes=%llu outside_client_allowance_bytes=%llu "
+                        "device_caps=[",
                         (unsigned long long) o.graph_capture_allowance_bytes,
                         (unsigned long long) o.prefill_library_allowance_bytes,
                         mps_verification.physical_free_measured ? 1 : 0,
                         (unsigned long long) mps_verification.physical_free_bytes,
                         (unsigned long long) mps_verification.outside_client_allowance_bytes);
+            for (size_t i = 0; i < mps_verification.devices.size(); ++i) {
+                const auto& row = mps_verification.devices[i];
+                std::printf("%s{device=%d,gpu_uuid=%s,cap_bytes=%llu,default_cap_bytes=%llu,"
+                            "server_cap_bytes=%llu,physical_free_bytes=%llu,"
+                            "outside_client_allowance_bytes=%llu}",
+                            i == 0 ? "" : ",", row.device, row.gpu_uuid.c_str(),
+                            (unsigned long long) row.cap_bytes, (unsigned long long) row.default_cap_bytes,
+                            (unsigned long long) row.server_cap_bytes,
+                            (unsigned long long) row.physical_free_bytes,
+                            (unsigned long long) row.outside_client_allowance_bytes);
+            }
+            std::printf("]\n");
+        }
         std::printf("PLAN admit=%d variant=%s devices=%zu", admission.admitted ? 1 : 0,
                     admission.variant.c_str(), admission.devices.size());
         for (size_t i = 0; i < admission.devices.size(); ++i) {
@@ -4344,6 +4629,11 @@ int main(int argc, char** argv) {
     }
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
+    // Declared before the GPU stages so every stage drains/destroys its Prefill
+    // before its pageable expert pointers can lose their owning source.
+    strata::core::WindowedExpertSource windowed_src;
+    std::vector<std::unique_ptr<strata::core::WindowedExpertSource>> stage_sources;
+    uint64_t windowed_resident_bytes = 0;
     std::vector<std::unique_ptr<GpuStage>> stages;
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
@@ -5111,7 +5401,6 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::ArenaExpertSource arena_src;
-    strata::core::WindowedExpertSource windowed_src;
     strata::core::ExpertSource* srcp = nullptr;
     if (o.windowed_experts) {
         windowed_src.set_gguf(o.native_preset);
@@ -5124,6 +5413,22 @@ int main(int argc, char** argv) {
                      (unsigned long long) windowed_src.residency_bytes(), (long long) windowed_src.slots(),
                      (unsigned long long) windowed_src.source_bytes(), windowed_src.reader_threads());
         srcp = &windowed_src;
+        // No source lane is shared by concurrently prefilling stages. Decode and
+        // blocking startup/refill use lane zero only after prefill has drained.
+        windowed_resident_bytes = windowed_src.residency_bytes();
+        stage_sources.reserve(stages.size());
+        for (const auto& st : stages) {
+            auto source = std::make_unique<strata::core::WindowedExpertSource>();
+            source->set_gguf(o.native_preset);
+            if (!source->open(o.pack, g.n_layers, g.n_expert, err)) {
+                std::fprintf(stderr, "strata generate: CUDA%d expert source: %s\n", st->dev, err.c_str());
+                return 1;
+            }
+            windowed_resident_bytes += source->residency_bytes();
+            stage_sources.push_back(std::move(source));
+        }
+        std::fprintf(stderr, "strata generate: windowed expert sources: %zu independent lanes, %llu B total rings\n",
+                     stage_sources.size() + 1, (unsigned long long) windowed_resident_bytes);
     } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
@@ -5570,12 +5875,28 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    size_t split_stage_index = 0;
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, false);
+        int64_t room = stage_room(st.dev, true, false);
+        // An explicit split's admitted per-stage budget is the ceiling this cache may not
+        // exceed, even when the device's free memory would fund more: admission priced
+        // this cache before any allocation, and the runtime can only shrink it.
+        uint64_t committed_budget = 0;
+        bool budget_armed = split_stage_index < split_stage_cache_bytes.size();
+        if (budget_armed) {
+            committed_budget = split_stage_cache_bytes[split_stage_index];
+            if (committed_budget < (uint64_t) room) {
+                std::fprintf(stderr, "strata generate: layer split, CUDA%d: expert cache held to the admitted "
+                                     "%llu B budget (free-memory room was %lld B)\n",
+                             st.dev, (unsigned long long) committed_budget, (long long) room);
+                room = (int64_t) committed_budget;
+            }
+        }
+        ++split_stage_index;
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
@@ -5590,6 +5911,14 @@ int main(int argc, char** argv) {
             if (used + b > room) break;
             used += b;
             sized.push_back((int64_t) lay.blob_bytes(pr.first));
+        }
+        // Fail closed if the sized cache would exceed the admitted budget: the consumer's
+        // protection is the budget, not a free-memory guess taken after the weights land.
+        if (budget_armed && (uint64_t) used > committed_budget) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: sized expert cache %lld B exceeds the "
+                                 "admitted %llu B budget\n", st.dev, (long long) used,
+                         (unsigned long long) committed_budget);
+            return 1;
         }
         // #841: a stage's cache can fail to open with the VRAM free (the card's allocation is also charged to the
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
@@ -5630,6 +5959,11 @@ int main(int argc, char** argv) {
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
+            return 1;
+        }
+        if (o.windowed_experts && st.cache.resident() != st.cache.slots()) {
+            std::fprintf(stderr, "strata generate: CUDA%d windowed source requires a fully populated static cache\n",
+                         st.dev);
             return 1;
         }
         std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
@@ -7314,7 +7648,8 @@ int main(int argc, char** argv) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
-                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+                strata::core::ExpertSource* stage_source = o.windowed_experts ? stage_sources[i].get() : srcp;
+                if (!st.sp.init(st.wt, g, st.ss, stage_source, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -8671,7 +9006,7 @@ int main(int argc, char** argv) {
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) ((o.windowed_experts ? windowed_src.residency_bytes() :
+                        (long long) ((o.windowed_experts ? windowed_resident_bytes :
                             o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,

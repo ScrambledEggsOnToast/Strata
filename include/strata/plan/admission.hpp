@@ -46,6 +46,24 @@ inline uint64_t saturating_multiply(uint64_t a, uint64_t b) {
     return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
 
+// ---- explicit-split per-stage expert-cache budget (host arithmetic seam) ---------------------
+//
+// An explicit layer split must commit its later stages' expert caches BEFORE allocation: the
+// budget is what that device's residual ceiling can fund after every fixed demand class and
+// the explicit headroom, floored to the expert-blob granularity so the runtime's per-blob
+// sizing can never step past it, and capped by the stage's own profiled-pair bound. The
+// runtime consumer may open fewer slots, never more: the admitted budget, not a free-memory
+// guess taken after the weights land, is the ceiling.
+inline uint64_t split_stage_cache_budget(uint64_t residual_ceiling_bytes,
+                                         uint64_t fixed_demand_bytes, uint64_t headroom_bytes,
+                                         uint64_t blob_bytes, uint64_t profile_bound_bytes) {
+    if (blob_bytes == 0) return 0;
+    const uint64_t committed = saturating_add(fixed_demand_bytes, headroom_bytes);
+    if (residual_ceiling_bytes <= committed) return 0;
+    const uint64_t budget = (residual_ceiling_bytes - committed) / blob_bytes * blob_bytes;
+    return profile_bound_bytes < budget ? profile_bound_bytes : budget;
+}
+
 // ---- one accounted byte class -------------------------------------------------------------------------------
 //
 // `unknown` is the load-bearing flag: `bytes == 0 && !unknown` is a measured/derived zero, while
@@ -151,9 +169,8 @@ struct DeviceTelemetry {
     uint64_t outside_client_allowance_bytes = 0;
 };
 
-/// Budget policy.  The reserves carry the docs/02 design defaults; an operator may RAISE them through the
-/// engine's flags but the defaults here are the floor - the admission code never accepts a reserve below
-/// them (see `clamp_reserves`), so no flag can plan away the host or guest.
+/// Budget policy. Guest reserve retains its design floor. The host floor applies unless
+/// the caller authenticated a protected controller's operator-approved reserve.
 struct GuestHostPolicy {
     bool guest_total_measured = false;
     uint64_t guest_total_bytes = 0;        // the VM allocation, driver/hypervisor-visible
@@ -161,6 +178,7 @@ struct GuestHostPolicy {
     bool host_available_measured = false;
     uint64_t host_available_bytes = 0;     // physical-host MemAvailable; incremental host demand
     uint64_t host_reserve_bytes = 8ull << 30;
+    bool host_reserve_controller_approved = false;
     /// Bounded clean-file-cache credit (AC-4): the ONLY way file-backed bytes are ever discounted, capped
     /// at the file bytes and at what the caller measured as clean/reclaimable.  Zero credits nothing.
     uint64_t file_cache_credit_bytes = 0;
@@ -172,7 +190,8 @@ struct GuestHostPolicy {
     void clamp_reserves() {
         const uint64_t kMinGuest = 4ull << 30, kMinHost = 8ull << 30;
         guest_reserve_bytes = std::max(guest_reserve_bytes, kMinGuest);
-        host_reserve_bytes = std::max(host_reserve_bytes, kMinHost);
+        if (!host_reserve_controller_approved)
+            host_reserve_bytes = std::max(host_reserve_bytes, kMinHost);
     }
 };
 

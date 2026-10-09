@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -55,23 +57,37 @@ struct Environment {
 };
 
 void test_parse() {
-    uint64_t bytes = 0;
+    std::vector<uint64_t> caps;
     std::string err;
-    for (const char* value : {"0=1024M", "0=1G", "0=1073741824", " 0 = 1GiB "})
-        check(mps_parse_limit(value, 0, bytes, err) && bytes == kGiB, "single ordinal-0 binary limit parses");
-    check(mps_parse_limit("0=18446744073709551615", 0, bytes, err) && bytes == UINT64_MAX,
-          "the maximum byte count parses without truncation");
-    for (const char* value : {"1=4G,0=1024M", "0=1G,1=4G", "0=1G,garbage", "0=1G,",
+    check(mps_parse_limit("0=1024M", caps, err) && caps.size() == 1 && caps[0] == kGiB,
+          "single ordinal-0 binary limit parses");
+    for (const char* value : {"0=1G", "0=1073741824", " 0 = 1GiB "}) {
+        caps = {7};
+        check(mps_parse_limit(value, caps, err) && caps.size() == 1 && caps[0] == kGiB,
+              "single limit spellings parse identically");
+    }
+    check(mps_parse_limit("0=18446744073709551615", caps, err) && caps.size() == 1 &&
+          caps[0] == UINT64_MAX, "the maximum byte count parses without truncation");
+    caps = {7};
+    check(mps_parse_limit("0=10240M,1=10240M", caps, err) && caps.size() == 2 &&
+          caps[0] == (10240ull * kMiB) && caps[1] == (10240ull * kMiB),
+          "the full contiguous two-device list parses in order");
+    check(mps_parse_limit("0=1G,1=2G,2=3G", caps, err) && caps.size() == 3 &&
+          caps[0] == kGiB && caps[1] == 2 * kGiB && caps[2] == 3 * kGiB,
+          "three ordered devices parse with their own caps");
+    check(mps_parse_limit("0=1G, 1=2G ,2=3G", caps, err) && caps.size() == 3 && caps[2] == 3 * kGiB,
+          "surrounding whitespace is not identity");
+    for (const char* value : {"1=4G,0=1024M", "0=1G,1=4G,1=2G", "0=1G,garbage", "0=1G,",
                               ",0=1G", "0=1G,0=1G", "1=4G", "0=nonsense", "0=", "0=0",
                               "x=1G", "=1G", "1G", "0=1G\nerror 12", "0=1i", "0=1iiB",
                               "0=18446744073709551616", "0=18014398509481984K",
                               "4294967296=1G", "2147483648=1G", "-0=1G", "+0=1G", "00=1G",
-                              "0=-1G", "0=+1G", "0=1.5G", "0=1 G", "0=1=G"}) {
-        bytes = 123;
-        check(!mps_parse_limit(value, 0, bytes, err) && bytes == 0 && !err.empty(),
-              "malformed, ambiguous, overflowing or unsupported full declarations refuse");
+                              "0=1G,01=2G", "0=1G,2=2G", "0=-1G", "0=+1G", "0=1.5G", "0=1 G",
+                              "0=1=G", "0=1G,,1=2G"}) {
+        caps = {9, 9};
+        check(!mps_parse_limit(value, caps, err) && caps.empty() && !err.empty(),
+              "malformed, gapped, duplicated, overflowing or unsupported full declarations refuse");
     }
-    check(!mps_parse_limit("0=1G", 1, bytes, err), "unsupported wanted ordinal refuses");
 }
 
 void test_declaration() {
@@ -87,7 +103,7 @@ void test_declaration() {
           "no declaration leaves ordinary CUDA visibility alone");
     check(mps_ceiling_pipe_identity(ceiling, err), "an absent declaration needs no pipe");
     check(mps_verify_before_cuda(ceiling, 0, receipt, err) &&
-          mps_verify_after_cuda(ceiling, "", UINT64_MAX, receipt, err), "no declaration avoids all queries");
+          mps_verify_after_cuda(ceiling, {}, UINT64_MAX, receipt, err), "no declaration avoids all queries");
     check(mps_device_ceiling(4096, 1024, false) == 4096, "no declaration preserves driver total");
     set_value(limit.name, "0=1024M");
     check(!mps_ceiling_from_environment(ceiling, err), "a missing pipe refuses");
@@ -100,14 +116,16 @@ void test_declaration() {
                               "GPU-12345678-1234-abcd-9876-123456789abc,0"}) {
         set_value(uuid.name, value);
         check(!mps_ceiling_from_environment(ceiling, err) && !ceiling.declared,
-              "missing, partial, malformed and multi-device GPU identities refuse");
+              "missing, partial, malformed and non-identity GPU entries refuse");
     }
     set_value(uuid.name, nullptr);
     check(!mps_ceiling_from_environment(ceiling, err), "unset GPU identity refuses");
     set_value(uuid.name, kUuid);
 #if defined(__linux__)
-    check(mps_ceiling_from_environment(ceiling, err) && ceiling.declared && ceiling.device == 0 &&
-          ceiling.cap_bytes == kGiB && ceiling.gpu_uuid == kUuid && ceiling.limit_from_environment,
+    check(mps_ceiling_from_environment(ceiling, err) && ceiling.declared &&
+          ceiling.devices.size() == 1 && ceiling.devices[0].device == 0 &&
+          ceiling.devices[0].cap_bytes == kGiB && ceiling.devices[0].gpu_uuid == kUuid &&
+          ceiling.limit_from_environment && ceiling.find_device(0) != nullptr,
           "complete single-device declaration preserves its identity");
 #else
     check(!mps_ceiling_from_environment(ceiling, err), "declared MPS refuses on non-Linux");
@@ -117,8 +135,42 @@ void test_declaration() {
     set_value(limit.name, "0=1G,broken");
     check(!mps_ceiling_from_environment(ceiling, err) && !ceiling.declared,
           "a trailing malformed entry is not ignored");
+    // The ordered multi-device form: one complete UUID per entry, one cap per UUID.
+    set_value(limit.name, "0=1G,1=2G");
+    set_value(uuid.name, (std::string(kUuid) + "," + kOtherUuid).c_str());
+#if defined(__linux__)
+    check(mps_ceiling_from_environment(ceiling, err) && ceiling.declared &&
+          ceiling.devices.size() == 2 && ceiling.devices[0].device == 0 &&
+          ceiling.devices[0].cap_bytes == kGiB && ceiling.devices[0].gpu_uuid == kUuid &&
+          ceiling.devices[1].device == 1 && ceiling.devices[1].cap_bytes == 2 * kGiB &&
+          ceiling.devices[1].gpu_uuid == kOtherUuid && ceiling.pipe_directory == "/tmp/strata-mps-test-pipe",
+          "the ordered two-device declaration keeps every identity and its own cap");
+    check(ceiling.find_device(1) != nullptr && ceiling.find_device(1)->cap_bytes == 2 * kGiB &&
+          ceiling.find_device(2) == nullptr, "ordinal lookup is exact and refuses unknown ordinals");
+#endif
+    for (const auto& [limit_text, uuid_text] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"0=1G", std::string(kUuid) + "," + kOtherUuid},
+             {"0=1G,1=2G,2=3G", std::string(kUuid) + "," + kOtherUuid},
+             {"0=1G,1=2G", kUuid},
+             {"0=1G", std::string(kUuid) + ",0"},
+             {"0=1G,1=2G", std::string(kUuid) + ","},
+             {"0=1G,1=2G", std::string(kUuid) + "," + kUuid},
+             {"0=1G,1=2G", "GPU-12345678-1234-abcd-9876-123456789abc,GPU-12345678-1234-abcd-9876-123456789abz"}}) {
+        set_value(limit.name, limit_text.c_str());
+        set_value(uuid.name, uuid_text.c_str());
+        check(!mps_ceiling_from_environment(ceiling, err) && !ceiling.declared,
+              "cap counts, identity lists, duplicates and malformed entries must match exactly");
+    }
+    set_value(limit.name, "0=1G,1=2G");
+    set_value(uuid.name, (std::string(kOtherUuid) + "," + kUuid).c_str());
+    check(mps_ceiling_from_environment(ceiling, err) && ceiling.devices.size() == 2 &&
+          ceiling.devices[0].gpu_uuid == kOtherUuid && ceiling.devices[0].cap_bytes == kGiB &&
+          ceiling.devices[1].gpu_uuid == kUuid && ceiling.devices[1].cap_bytes == 2 * kGiB,
+          "reordered UUIDs keep caps positional in the client visibility order");
     set_value(limit.name, " ");
     set_value(pipe.name, " ");
+    set_value(uuid.name, kUuid);
     check(!mps_ceiling_from_environment(ceiling, err), "present-but-empty declarations are not absence");
 }
 
@@ -132,19 +184,28 @@ void test_runtime_holds() {
 
 #if defined(__linux__)
 struct FixtureDirectory {
-    char path[64] = "/tmp/strata-mps-ceiling-XXXXXX";
-    bool valid = mkdtemp(path) != nullptr;
-    ~FixtureDirectory() { if (valid) rmdir(path); }
+    std::string path = (std::filesystem::temp_directory_path() / "strata-mps-ceiling-XXXXXX").string();
+    bool valid = mkdtemp(path.data()) != nullptr;
+    ~FixtureDirectory() { if (valid) rmdir(path.c_str()); }
 };
 
 MpsCeiling declaration(const char* pipe) {
     MpsCeiling ceiling;
     ceiling.declared = true;
-    ceiling.device = 0;
-    ceiling.cap_bytes = kGiB;
-    ceiling.gpu_uuid = kUuid;
     ceiling.pipe_directory = pipe;
     ceiling.limit_from_environment = true;
+    ceiling.devices.push_back(MpsDeviceCeiling{0, kGiB, kUuid});
+    return ceiling;
+}
+
+// An unequal two-device declaration: the second card's cap, UUID and readbacks differ.
+MpsCeiling declaration2(const char* pipe) {
+    MpsCeiling ceiling;
+    ceiling.declared = true;
+    ceiling.pipe_directory = pipe;
+    ceiling.limit_from_environment = true;
+    ceiling.devices.push_back(MpsDeviceCeiling{0, kGiB, kUuid});
+    ceiling.devices.push_back(MpsDeviceCeiling{1, 2 * kGiB, kOtherUuid});
     return ceiling;
 }
 
@@ -152,51 +213,65 @@ void test_pipe_identity() {
     FixtureDirectory root;
     check(root.valid, "pipe fixture directory created");
     if (!root.valid) return;
-    auto ceiling = declaration(root.path);
+    auto ceiling = declaration(root.path.c_str());
     std::string err;
     check(mps_ceiling_pipe_identity(ceiling, err), "owned directory passes identity check");
-    const std::string link = std::string(root.path) + "/link";
-    check(symlink(root.path, link.c_str()) == 0, "symlink fixture created");
+    const std::string link = root.path + "/link";
+    check(symlink(root.path.c_str(), link.c_str()) == 0, "symlink fixture created");
     ceiling.pipe_directory = link;
     check(!mps_ceiling_pipe_identity(ceiling, err), "symlink refuses");
     ceiling.pipe_directory += "/";
     check(!mps_ceiling_pipe_identity(ceiling, err), "trailing slash cannot hide a symlink");
     unlink(link.c_str());
-    const std::string file = std::string(root.path) + "/file";
+    const std::string file = root.path + "/file";
     const int fd = open(file.c_str(), O_CREAT | O_WRONLY | O_EXCL, 0600);
     check(fd >= 0, "regular-file fixture created");
     if (fd >= 0) close(fd);
     ceiling.pipe_directory = file;
     check(!mps_ceiling_pipe_identity(ceiling, err), "regular file refuses");
     unlink(file.c_str());
-    ceiling.pipe_directory = std::string(root.path) + "/missing";
+    ceiling.pipe_directory = root.path + "/missing";
     check(!mps_ceiling_pipe_identity(ceiling, err), "missing pipe refuses");
 }
 
 struct Replies {
-    std::string default_limit = "1024M\n";
+    std::string default_limit = "1024M\n";       // device 0's default readback
+    std::string second_default_limit = "2G\n";   // device 1's default readback
     std::string physical = std::string(kUuid) + ", 1088\n";
+    std::string second_physical = std::string(kOtherUuid) + ", 2200\n";
     std::string servers = "101\n";
     std::string first_clients = std::to_string(getpid()) + "\n";
     std::string other_clients = "\n";
-    std::string server_limit = "1G\n";
+    std::string server_limit = "1G\n";           // matched server, kUuid
+    std::string second_server_limit = "2G\n";    // matched server, kOtherUuid
     bool unavailable = false;
     bool deadlines_equal = true;
     int calls = 0;
     int queried_server = 0;
+    std::vector<std::string> queried_uuids;
     detail::Deadline deadline{};
     static bool run(void* opaque, detail::Query query, const MpsCeiling&, int server,
-                    detail::Deadline until, std::string& output, std::string& err) {
+                    const std::string& uuid, detail::Deadline until, std::string& output,
+                    std::string& err) {
         auto& self = *static_cast<Replies*>(opaque);
         if (self.calls++ == 0) self.deadline = until;
         else self.deadlines_equal = self.deadlines_equal && self.deadline == until;
         if (self.unavailable) { err = "fixture: unavailable daemon"; return false; }
         switch (query) {
-            case detail::Query::default_limit: output = self.default_limit; break;
-            case detail::Query::physical_free: output = self.physical; break;
+            case detail::Query::default_limit:
+                output = uuid == kOtherUuid ? self.second_default_limit : self.default_limit;
+                self.queried_uuids.push_back(uuid);
+                break;
+            case detail::Query::physical_free:
+                output = uuid == kOtherUuid ? self.second_physical : self.physical;
+                break;
             case detail::Query::servers: output = self.servers; break;
             case detail::Query::clients: output = server == 101 ? self.first_clients : self.other_clients; break;
-            case detail::Query::server_limit: output = self.server_limit; self.queried_server = server; break;
+            case detail::Query::server_limit:
+                output = uuid == kOtherUuid ? self.second_server_limit : self.server_limit;
+                self.queried_server = server;
+                self.queried_uuids.push_back(uuid);
+                break;
         }
         return true;
     }
@@ -206,17 +281,24 @@ void test_before_readback() {
     FixtureDirectory root;
     check(root.valid, "pre-context fixture created");
     if (!root.valid) return;
-    const auto ceiling = declaration(root.path);
+    const auto ceiling = declaration(root.path.c_str());
     std::string err;
     MpsVerification receipt;
     Replies replies;
     const auto before = [&](uint64_t outside = 64 * kMiB) {
         replies.calls = 0;
+        replies.queried_uuids.clear();
         return detail::verify_before(ceiling, outside, receipt, err, Replies::run, &replies);
     };
     check(before() && receipt.physical_free_measured && receipt.physical_free_bytes == 1088 * kMiB &&
           receipt.outside_client_allowance_bytes == 64 * kMiB && receipt.default_cap_bytes == kGiB &&
-          replies.calls == 2 && replies.deadlines_equal, "physical-envelope equality admits with a shared query deadline");
+          receipt.devices.size() == 1 && receipt.devices[0].device == 0 &&
+          receipt.devices[0].gpu_uuid == kUuid && receipt.devices[0].cap_bytes == kGiB &&
+          receipt.devices[0].physical_free_bytes == 1088 * kMiB &&
+          receipt.devices[0].default_cap_bytes == kGiB &&
+          replies.calls == 2 && replies.deadlines_equal &&
+          replies.queried_uuids == std::vector<std::string>{kUuid},
+          "physical-envelope equality admits with a shared deadline and the full-UUID operand");
     check(!before(64 * kMiB + 1) && receipt.physical_free_measured,
           "one byte beyond physical envelope refuses but preserves measured sample");
     check(!before(UINT64_MAX), "outside plus cap cannot wrap into an admission");
@@ -226,7 +308,7 @@ void test_before_readback() {
     replies = Replies{};
     replies.unavailable = true;
     check(!before() && !receipt.physical_free_measured, "missing daemon refuses without verified physical data");
-    replies.unavailable = false;
+    replies = Replies{};
     for (const char* output : {"", "2G\n", "0\n", "unknown device 0\n", "1G\n1G\n", "-1G\n",
                                "18446744073709551616", "18014398509481984K", "1G trailing", "1.0G"}) {
         replies.default_limit = output;
@@ -251,13 +333,48 @@ void test_before_readback() {
     }
     replies.physical.assign(detail::kMaxQueryOutput + 1, '1');
     check(!before(), "oversized readback refuses at the production query seam");
+
+    // Unequal caps and residuals on two devices: every readback and envelope is per device,
+    // and the query seam retains the selected UUID for each device.
+    const auto two = declaration2(root.path.c_str());
+    replies = Replies{};
+    replies.calls = 0;
+    replies.queried_uuids.clear();
+    check(detail::verify_before(two, 64 * kMiB, receipt, err, Replies::run, &replies) &&
+          receipt.devices.size() == 2 &&
+          receipt.devices[0].cap_bytes == kGiB && receipt.devices[0].default_cap_bytes == kGiB &&
+          receipt.devices[0].physical_free_bytes == 1088 * kMiB &&
+          receipt.devices[1].cap_bytes == 2 * kGiB && receipt.devices[1].default_cap_bytes == 2 * kGiB &&
+          receipt.devices[1].physical_free_bytes == 2200 * kMiB &&
+          receipt.physical_free_bytes == receipt.devices[0].physical_free_bytes &&
+          receipt.default_cap_bytes == receipt.devices[0].default_cap_bytes &&
+          replies.calls == 4 && replies.deadlines_equal &&
+          replies.queried_uuids == std::vector<std::string>{kUuid, kOtherUuid},
+          "unequal two-device readbacks verify per device by UUID and mirror the front row");
+    // The second device's own envelope is enforced on its own numbers.
+    replies.second_physical = std::string(kOtherUuid) + ", 2048\n";   // below 2 GiB + allowance
+    check(!detail::verify_before(two, 64 * kMiB, receipt, err, Replies::run, &replies) &&
+          receipt.devices.size() == 2 && receipt.devices[0].physical_free_measured &&
+          receipt.devices[1].physical_free_measured && receipt.devices[1].physical_free_bytes == 2048 * kMiB,
+          "the second device's physical envelope refuses on its own sample without erasing the first");
+    // One device's default readback mismatch refuses; the other device's numbers never stand in.
+    replies = Replies{};
+    replies.second_default_limit = "1G\n";
+    check(!detail::verify_before(two, 64 * kMiB, receipt, err, Replies::run, &replies),
+          "a mismatched cap on one device refuses even when the other device matches");
+    // A duplicated UUID in the declaration cannot be keyed.
+    MpsCeiling duplicated = declaration2(root.path.c_str());
+    duplicated.devices[1].gpu_uuid = kUuid;
+    replies = Replies{};
+    check(!detail::verify_before(duplicated, 64 * kMiB, receipt, err, Replies::run, &replies) &&
+          replies.calls == 0, "a declared duplicate UUID refuses before any query");
 }
 
 void test_after_readback() {
     FixtureDirectory root;
     check(root.valid, "post-context fixture created");
     if (!root.valid) return;
-    const auto ceiling = declaration(root.path);
+    const auto ceiling = declaration(root.path.c_str());
     MpsVerification before, receipt;
     std::string err;
     Replies replies;
@@ -265,19 +382,26 @@ void test_after_readback() {
           "post-context fixture has a valid pre-context receipt");
     const auto after = [&](const std::string& uuid = kUuid, uint64_t residual = kGiB - kMiB) {
         replies.calls = 0;
+        replies.queried_uuids.clear();
         receipt = before;
-        return detail::verify_after(ceiling, uuid, residual, receipt, err, Replies::run, &replies);
+        return detail::verify_after(ceiling, {uuid}, residual, receipt, err, Replies::run, &replies);
     };
     check(after() && receipt.server_pid == 101 && receipt.client_pid == getpid() &&
           receipt.server_cap_bytes == kGiB && receipt.physical_free_bytes == before.physical_free_bytes &&
-          replies.queried_server == 101 && replies.calls == 3 && replies.deadlines_equal,
-          "own PID, matched server device cap and preserved physical sample verify");
+          receipt.devices.size() == 1 && receipt.devices[0].server_cap_bytes == kGiB &&
+          receipt.devices[0].residual_free_bytes == kGiB - kMiB &&
+          receipt.devices[0].gpu_uuid == kUuid &&
+          replies.queried_server == 101 && replies.calls == 3 && replies.deadlines_equal &&
+          replies.queried_uuids == std::vector<std::string>{kUuid},
+          "own PID, matched server's UUID-keyed device cap and preserved physical sample verify");
     check(after("GPU-12345678-1234-ABCD-9876-123456789ABC"), "UUID hex case does not alter device identity");
     check(!after(kOtherUuid) && replies.calls == 0, "actual CUDA UUID mismatch refuses before queries");
     check(!after("GPU-12345678") && replies.calls == 0, "partial actual CUDA UUID refuses");
     check(!after(kUuid, kGiB + 1) && replies.calls == 0, "reported residual above cap refuses");
+    check(!detail::verify_after(ceiling, {}, 0, receipt, err, Replies::run, &replies),
+          "a missing actual UUID row refuses before queries");
     MpsVerification absent;
-    check(!detail::verify_after(ceiling, kUuid, 0, absent, err, Replies::run, &replies),
+    check(!detail::verify_after(ceiling, {kUuid}, 0, absent, err, Replies::run, &replies),
           "missing pre-context receipt refuses even when residual is small");
     replies = Replies{};
     replies.unavailable = true;
@@ -318,6 +442,38 @@ void test_after_readback() {
         check(!after() && receipt.client_pid == 0 && receipt.server_pid == 0,
               "missing, malformed, overflowing and mismatched matched-server caps refuse");
     }
+
+    // Two devices: each device's server-limit query retains its own full GPU UUID, and one
+    // mismatched device refuses the whole attachment.
+    const auto two = declaration2(root.path.c_str());
+    replies = Replies{};
+    check(detail::verify_before(two, 64 * kMiB, before, err, Replies::run, &replies),
+          "two-device fixture has a valid pre-context receipt");
+    const auto after2 = [&](const std::vector<std::string>& uuids, uint64_t residual = kGiB - kMiB) {
+        replies.calls = 0;
+        replies.queried_uuids.clear();
+        receipt = before;
+        return detail::verify_after(two, uuids, residual, receipt, err, Replies::run, &replies);
+    };
+    check(after2({kUuid, kOtherUuid}) && receipt.server_pid == 101 && receipt.client_pid == getpid() &&
+          receipt.devices.size() == 2 && receipt.devices[0].server_cap_bytes == kGiB &&
+          receipt.devices[1].server_cap_bytes == 2 * kGiB &&
+          receipt.devices[0].residual_free_bytes == kGiB - kMiB &&
+          receipt.devices[1].residual_free_bytes == 0 &&
+          replies.queried_uuids == std::vector<std::string>{kUuid, kOtherUuid},
+          "both devices' server caps verify under their own UUID operands; only the primary's residual is read");
+    check(after2({"GPU-12345678-1234-ABCD-9876-123456789ABC", kOtherUuid}),
+          "case-insensitive identity holds for every declared device");
+    check(!after2({kUuid, kUuid}) && replies.calls == 0,
+          "the second device's actual UUID mismatch refuses before queries");
+    check(!after2({kUuid}) && replies.calls == 0,
+          "a missing per-device UUID row refuses before queries");
+    check(!after2({kUuid, kOtherUuid}, 2 * kGiB) && replies.calls == 0,
+          "the primary's residual above its own cap refuses before queries");
+    replies = Replies{};
+    replies.second_server_limit = "1G\n";   // kOtherUuid's readback does not match its 2 GiB cap
+    check(!after2({kUuid, kOtherUuid}) && receipt.client_pid == 0 && receipt.server_pid == 0,
+          "one device's mismatched server cap refuses the whole attachment with no receipt");
 }
 
 // Invoked only by this test executable's private transport override. Real production
@@ -361,6 +517,19 @@ int child_fixture(int argc, char** argv) {
         std::printf("%s, 1088\n", kUuid);
         return 0;
     }
+    if (std::strcmp(mode, "legacy-limit") == 0) {
+        char command[64];
+        int first = -1, second = -1;
+        char input[256];
+        if (!std::fgets(input, sizeof(input), stdin)) return 1;
+        const int fields = std::sscanf(input, "%63s %d %d", command, &first, &second);
+        const bool server = std::strcmp(command, "get_device_pinned_mem_limit") == 0;
+        const int ordinal = server ? second : first;
+        if ((server && (fields != 3 || first != 101)) || (!server && fields != 2) ||
+            ordinal < 0 || ordinal > 1) return 0; // the installed parser's empty refusal
+        std::printf("%dM\n", ordinal == 0 ? 1024 : 2048);
+        return 0;
+    }
     if (std::strcmp(mode, "echo") == 0) {
         char buffer[256];
         for (;;) {
@@ -379,19 +548,29 @@ int child_fixture(int argc, char** argv) {
 
 void test_transport() {
     Environment fixture("STRATA_MPS_QUERY_FIXTURE"), pipe("CUDA_MPS_PIPE_DIRECTORY"), locale("LC_ALL");
-    auto ceiling = declaration("/tmp/the-declared-daemon");
+    auto ceiling = declaration2("/tmp/the-declared-daemon");
     std::string output, err;
     const auto run = [&](detail::Query kind = detail::Query::default_limit,
+                         const std::string& uuid = kUuid,
                          std::chrono::milliseconds budget = std::chrono::milliseconds(1000)) {
-        return detail::run_query(kind, ceiling, 101, std::chrono::steady_clock::now() + budget,
+        return detail::run_query(kind, ceiling, 101, uuid,
+                                 std::chrono::steady_clock::now() + budget,
                                  output, err, "/proc/self/exe");
     };
+    set_value(fixture.name, "legacy-limit");
+    check(run() && output == "1024M\n", "legacy control grammar prices the first declared UUID");
+    check(run(detail::Query::default_limit, kOtherUuid) && output == "2048M\n",
+          "legacy control grammar prices the second declared UUID independently");
+    std::swap(ceiling.devices[0].gpu_uuid, ceiling.devices[1].gpu_uuid);
+    check(run() && output == "2048M\n", "control ordinal follows the declared UUID order after reversal");
+    std::swap(ceiling.devices[0].gpu_uuid, ceiling.devices[1].gpu_uuid);
+    check(run(detail::Query::server_limit, kOtherUuid) && output == "2048M\n",
+          "server cap uses the selected device in the same daemon order");
+    check(!run(detail::Query::default_limit, "GPU-00000000-0000-0000-0000-000000000000"),
+          "an undeclared UUID cannot select a default ordinal");
     set_value(fixture.name, "echo");
-    check(run() && output == "get_default_device_pinned_mem_limit 0\n", "fixed default query reaches child stdin");
     check(run(detail::Query::servers) && output == "get_server_list\n", "fixed server-list command is read-only");
     check(run(detail::Query::clients) && output == "get_client_list 101\n", "fixed client-list command carries selected PID");
-    check(run(detail::Query::server_limit) && output == "get_device_pinned_mem_limit 101 0\n",
-          "server device-0 readback uses the matched server PID");
     set_value(fixture.name, "physical");
     check(run(detail::Query::physical_free) && output == std::string(kUuid) + ", 1088\n",
           "physical query has only fixed read-only argv and exact UUID selector");
@@ -410,14 +589,15 @@ void test_transport() {
     for (const char* mode : {"timeout", "eof-timeout"}) {
         set_value(fixture.name, mode);
         const auto started = std::chrono::steady_clock::now();
-        check(!run(detail::Query::default_limit, std::chrono::milliseconds(50)),
+        check(!run(detail::Query::default_limit, kUuid, std::chrono::milliseconds(50)),
               "non-terminating query times out even after closing all output");
         check(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
               "timeout remains finite including kill and reap");
     }
-    check(!detail::run_query(detail::Query::servers, ceiling, 0, std::chrono::steady_clock::now(), output, err,
+    check(!detail::run_query(detail::Query::servers, ceiling, 0, std::string(),
+                             std::chrono::steady_clock::now(), output, err,
                              "/proc/self/exe"), "already expired shared deadline refuses without launching");
-    check(!detail::run_query(detail::Query::servers, ceiling, 0,
+    check(!detail::run_query(detail::Query::servers, ceiling, 0, std::string(),
                              std::chrono::steady_clock::now() + std::chrono::seconds(1), output, err,
                              "/proc/self/no-such-executable"), "missing control executable refuses at the real transport seam");
     int status = 0;
@@ -432,7 +612,8 @@ void test_transport() {
         const bool success = run();
         dup2(saved, STDIN_FILENO);
         close(saved);
-        check(success && output == "get_default_device_pinned_mem_limit 0\n", "closed parent stdin does not break spawn descriptor wiring");
+        check(success && output == "get_default_device_pinned_mem_limit 0\n",
+              "closed parent stdin does not break spawn descriptor wiring");
     }
 }
 #else

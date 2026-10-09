@@ -561,9 +561,11 @@ host scope charges unbacked guest allocation plus retained filesystem-source mir
 credit. Advisory release, unmap and close cannot reduce these envelopes. All derived byte arithmetic
 and class totals refuse on overflow.
 
-The guest and available-host envelopes retain their reserve floors (4 GiB and 8 GiB;
-`--guest-reserve-mib` / `--host-reserve-mib` cannot go lower). Unpriced classes or unavailable telemetry
-refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts currently refuse by name
+The guest envelope retains its 4 GiB reserve floor. The physical-host reserve defaults to 8 GiB;
+a fresh authenticated root-owned supervisor snapshot supplies the operator-approved host reserve,
+including zero for an explicitly approved dedicated campaign. An explicit `--host-reserve-mib`
+still cannot go below 8 GiB and only tightens the supervisor reserve. Unpriced classes or unavailable
+telemetry refuse before loading. Layer-split automatic caches and late CUDA2/3 contexts refuse by name
 because their allocation budgets are not knowable at this gate; they are not silently priced as zero.
 CUDA graph executable/capture storage and opaque prefill driver/cuBLAS/runtime storage remain
 unqualified and refuse by name. Explicit prefill device buffers now share checked sizing with the
@@ -589,19 +591,31 @@ hypothetical future capacities that are reported but never admitted - as the doc
 ### A declared MPS client ceiling
 
 When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes the
-creation-time device budget with `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=<positive limit>` and
-names `CUDA_MPS_PIPE_DIRECTORY`. A declaration also requires exactly one complete GPU UUID
-in `CUDA_VISIBLE_DEVICES`. Missing, malformed or multi-device declarations refuse; neither
-limit nor pipe present leaves ordinary non-MPS behavior unchanged. MPS split, remote-cache,
-peer-device and HIP execution are unsupported and refuse before CUDA.
+creation-time per-device budgets with `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=<limit>[,1=<limit>...]`
+(the full contiguous ordered list: every selected device has exactly one cap, with no missing,
+duplicate or extra identifiers) and names `CUDA_MPS_PIPE_DIRECTORY`. A declaration also
+requires `CUDA_VISIBLE_DEVICES` to be one complete GPU UUID, or an ordered list of complete
+GPU UUIDs with exactly one cap each. Missing, malformed, gapped or count-mismatched
+declarations refuse; neither limit nor pipe present leaves ordinary non-MPS behavior
+unchanged. One pipe and one server serve every declared device, and one client PID owns the
+whole lifetime: client exit revokes it, never replaces it. Under a declared ceiling,
+remote-cache, peer-device and HIP execution stay refused; an EXPLICIT `--layer-split K[,K2..]`
+is admitted once every stage is priced before allocation (per-stage expert-cache budgets and
+each device's own prefill price), while `--layer-split auto` has no pre-placement price and
+refuses.
 
-`src/platform/mps_ceiling.cpp` checks pipe identity/ownership and current daemon default
-readback, then queries that exact UUID's physical free memory **before this client's context**.
-The full cap plus positive `--mps-outside-client-allowance-bytes` must fit that snapshot.
-After CUDA0 context creation, and before even the default native PCIe allocation probe,
-the engine verifies the actual CUDA UUID, its own PID in exactly one daemon server's client
-list, that server's device-0 cap, and `cudaMemGetInfo` residual <= declared cap. Fixed read-only
-control queries have a three-second total deadline per phase and bounded output/PID lists.
+`src/platform/mps_ceiling.cpp` checks pipe identity/ownership and each device's current daemon
+default readback. The installed driver550 control grammar accepts integer device operands;
+the supervisor therefore pins daemon and client to the same explicit UUID order and queries
+ordinals within that order (never an assumed physical index). It then queries each
+exact UUID's physical free memory **before this client's context**. Each device's full cap
+plus the positive `--mps-outside-client-allowance-bytes` must fit that device's snapshot.
+After CUDA0 context creation, and before even the default native PCIe allocation probe, the
+engine verifies the actual CUDA UUID of EVERY declared device, its own PID in exactly one
+daemon server's client list, that server's per-device cap, and device 0's `cudaMemGetInfo`
+residual <= its declared cap (later stages' residuals are checked as their contexts appear).
+Fixed read-only control queries share one three-second total deadline per phase and bounded
+output/PID lists.
 
 `cudaMemGetInfo` inside MPS reports the **remaining client budget**, not physical free memory.
 Planned demand plus headroom must independently fit `min(driver_total, residual_client_free)`;
@@ -616,9 +630,16 @@ These are trusted-client checks, not an immutable numeric-cap query: current def
 limits configure future clients. Residual <= cap alone cannot prove attachment on a busy GPU.
 The pre-context physical sample is not a reservation, and all allowances remain explicit
 planning commitments rather than measured peaks. External exclusivity and safety monitoring
-remain necessary. `PLAN` prints the cap, named allowances and physical timepoint; native and
-Python decision JSON expose the same fields. The standalone `mps_ceiling_smoke` target exercises
+remain necessary. `--mps-cap-bytes` takes one byte count for a single visible device or an
+ordered comma list matching one value per CUDA_VISIBLE_DEVICES UUID; a scalar names one
+device only and never broadcasts to the others. `PLAN` prints the cap list, the named
+allowances, the physical timepoint and per-device `device_caps=[...]` readback rows (the
+single-device fields are retained for existing inspectors); native and Python decision JSON
+expose the same fields. The standalone `mps_ceiling_smoke` target exercises
 the actual module under the protected supervisor only; it is deliberately not a GPU CTest.
+The CPU-only `mps_ceiling_test` uses the platform temporary directory (`TMPDIR` on
+Linux), so protected builds can keep `/tmp` read-only and create fixtures in the
+job workspace. It neither starts an MPS daemon nor opens CUDA devices.
 
 `--windowed-experts --adapt-swaps 0` selects a fixed one-layer direct-I/O source ring for
 canonical/native `experts.bin` or native GGUF planes. No buffered fallback is used. Raw expert

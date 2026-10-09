@@ -18,6 +18,12 @@
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
+//
+// Sections 1-4 judge the split kernels against this file's own host transcriptions; section 5 pins the
+// verify-window multi kernels to the single-token FUSED kernels bit for bit, which leaves the fused
+// operators' arithmetic unjudged.  Section 6 closes that: fused_gdn_conv_l2, fused_gdn_ab,
+// fused_gdn_step_norm and the multi kernels' outputs/state are run against the same independent fixture
+// logic (host double, reference layout) at the artifact's real geometry.
 #include "strata/platform/protected_test.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -520,6 +526,335 @@ int main(int argc, char** argv) {
         std::printf("\n  %-42s %s (%d cases)\n", "gdn_ab_multi T=1..8 == fused_gdn_ab", ab_bad ? "*** NO ***" : "bitwise", ab_n);
         std::printf("  %-42s %s (%d cases)\n", "gdn_step_norm_multi T=1..8 == single-token", sn_bad ? "*** NO ***" : "bitwise", sn_n);
         bad += ab_bad + sn_bad;
+    }
+
+    // ================= 6. the FUSED operators against the independent fixture =================
+    // Section 5 pins multi == fused bitwise; neither half of that comparison judges the fused operators'
+    // ARITHMETIC.  Here each fused path is judged against the same host double transcription the split
+    // kernels are judged against above, with the fused step's own scale placement (1/sqrt(S) applied AFTER
+    // the readout dot, as the runtime's fused_pre path does).  One representative fixture at the artifact's
+    // real geometry (S=128, h_k=16, h_v=48, n_embd=2560; the conv leg's 10240 channels and 2*h_k normalised
+    // heads exactly as layer.cpp's fused_pre call) - no sweeps.  Every comparison is the aggregate L1
+    // relative to the reference magnitude with the 1e-30 floor of rel_l1 - never a per-element division, so
+    // a near-zero element cannot manufacture a failure - and every kernel output is scanned for nonfinite
+    // values, which fail on their own before any relative bound is applied.
+    {
+        const int qk = S * h_k, vd = S * h_v, conv_ch = 2 * qk + vd;
+        const int n_embd = 2560;
+        const float eps = 1e-6f;
+        std::mt19937 frng(20261);
+        int fbad = 0;
+        auto dev = [&](size_t bytes) {
+            void* p = nullptr;
+            check(cudaMalloc(&p, bytes), "m6");
+            return p;
+        };
+        auto up = [&](const void* h, size_t bytes) {
+            void* p = dev(bytes);
+            check(cudaMemcpy(p, h, bytes, cudaMemcpyHostToDevice), "u6");
+            return p;
+        };
+        auto all_finite = [](const std::vector<float>& v) {
+            for (float x : v)
+                if (!std::isfinite(x)) return false;
+            return true;
+        };
+
+        // ---- fused_gdn_conv_l2: the 4-tap conv + SiLU over all channels, then the L2 norm of the first
+        // 2*h_k 128-channel heads (q then k; v is NOT normalised), eps on the SUM of squares.
+        {
+            std::vector<float> hist((size_t) conv_ch * 3), qkv((size_t) conv_ch), cw((size_t) conv_ch * 4);
+            for (auto& x : hist) x = gauss(frng) * 0.5f;
+            for (auto& x : qkv) x = gauss(frng);
+            for (auto& x : cw) x = gauss(frng) * 0.5f;
+            auto conv_reference = [&](const std::vector<float>& before, const float* input,
+                                      std::vector<float>& output, std::vector<float>& after) {
+                output.resize((size_t) conv_ch);
+                after.resize(before.size());
+                std::vector<double> activated((size_t) conv_ch), head_ss((size_t) 2 * h_k, 0.0);
+                for (int c = 0; c < conv_ch; ++c) {
+                    double sum = 0.0;
+                    for (int tap = 0; tap < 3; ++tap)
+                        sum += (double) before[(size_t) c * 3 + tap] * cw[(size_t) c * 4 + tap];
+                    sum += (double) input[c] * cw[(size_t) c * 4 + 3];
+                    activated[(size_t) c] = sum / (1.0 + std::exp(-sum));
+                    after[(size_t) c * 3] = before[(size_t) c * 3 + 1];
+                    after[(size_t) c * 3 + 1] = before[(size_t) c * 3 + 2];
+                    after[(size_t) c * 3 + 2] = input[c];
+                    if (c / S < 2 * h_k)
+                        head_ss[(size_t) (c / S)] += activated[(size_t) c] * activated[(size_t) c];
+                }
+                for (int c = 0; c < conv_ch; ++c)
+                    output[(size_t) c] = (float) (c / S < 2 * h_k
+                        ? activated[(size_t) c] / std::sqrt(head_ss[(size_t) (c / S)] + (double) eps)
+                        : activated[(size_t) c]);
+            };
+            std::vector<float> want_h, want_hist;
+            conv_reference(hist, qkv.data(), want_h, want_hist);
+            auto d_hist = (float*) up(hist.data(), hist.size() * 4);
+            auto d_qkv = (float*) up(qkv.data(), qkv.size() * 4);
+            auto d_w = (float*) up(cw.data(), cw.size() * 4);
+            auto d_h = (float*) dev((size_t) conv_ch * 4);
+            strata::kernels::fused_gdn_conv_l2(d_hist, d_qkv, d_w, d_h, conv_ch, 2 * h_k, eps, nullptr);
+            std::vector<float> got_h((size_t) conv_ch), got_hist(hist.size());
+            check(cudaMemcpy(got_h.data(), d_h, got_h.size() * 4, cudaMemcpyDeviceToHost), "c6h");
+            check(cudaMemcpy(got_hist.data(), d_hist, got_hist.size() * 4, cudaMemcpyDeviceToHost), "c6s");
+            const bool fin = all_finite(got_h) && all_finite(got_hist);
+            const double rel_h = rel_l1(want_h, got_h), rel_hist = rel_l1(want_hist, got_hist);
+            std::printf("\n  %-42s rel %.3e (hist %.3e)\n", "fused conv_l2 vs reference", rel_h, rel_hist);
+            if (!fin) { std::printf("    *** fused conv_l2: nonfinite output ***\n"); ++fbad; }
+            // the same arithmetic the split conv and l2_norm legs pin at 1e-6, plus silu's __expf (<= 5e-7
+            // relative at these magnitudes) - a wrong head grouping, tap order or missing SiLU is orders above
+            if (!(rel_h <= 1e-6)) { std::printf("    *** fused conv_l2 output over 1e-6 ***\n"); ++fbad; }
+            if (!(rel_hist <= 1e-6)) { std::printf("    *** fused conv_l2 history slide over 1e-6 ***\n"); ++fbad; }
+
+            // The actual verifier reads four tokens without changing history,
+            // then commits only an accepted prefix (including zero).
+            constexpr int CT = 4;
+            std::vector<float> inputs((size_t) CT * conv_ch), want((size_t) CT * conv_ch);
+            for (auto& x : inputs) x = gauss(frng);
+            std::vector<std::vector<float>> histories(CT + 1);
+            histories[0] = hist;
+            for (int t = 0; t < CT; ++t) {
+                std::vector<float> row;
+                conv_reference(histories[t], inputs.data() + (size_t) t * conv_ch, row, histories[t + 1]);
+                std::copy(row.begin(), row.end(), want.begin() + (size_t) t * conv_ch);
+            }
+            auto d_inputs = (float*) up(inputs.data(), inputs.size() * 4);
+            auto d_outputs = (float*) dev(want.size() * 4);
+            check(cudaMemcpy(d_hist, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice), "conv verify reset");
+            strata::kernels::gdn_conv_l2_multi(d_hist, d_inputs, d_w, d_outputs, conv_ch, 2 * h_k,
+                                               eps, CT, nullptr);
+            std::vector<float> observed(want.size());
+            check(cudaMemcpy(observed.data(), d_outputs, observed.size() * 4, cudaMemcpyDeviceToHost), "conv verify output");
+            check(cudaMemcpy(got_hist.data(), d_hist, hist.size() * 4, cudaMemcpyDeviceToHost), "conv verify history");
+            const double multi_rel = rel_l1(want, observed);
+            const bool untouched = std::memcmp(hist.data(), got_hist.data(), hist.size() * 4) == 0;
+            std::printf("  gdn_conv_l2_multi vs reference: rel %.3e, history unchanged %s\n",
+                        multi_rel, untouched ? "yes" : "NO");
+            if (!all_finite(observed) || !(multi_rel <= 1e-6) || !untouched) ++fbad;
+            auto d_keep = (int32_t*) dev(sizeof(int32_t));
+            for (int32_t kept : {0, 1, 2, CT}) {
+                check(cudaMemcpy(d_hist, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice), "conv commit reset");
+                check(cudaMemcpy(d_keep, &kept, sizeof kept, cudaMemcpyHostToDevice), "conv keep");
+                strata::kernels::gdn_conv_commit(d_hist, d_inputs, conv_ch, d_keep, nullptr);
+                check(cudaMemcpy(got_hist.data(), d_hist, hist.size() * 4, cudaMemcpyDeviceToHost), "conv commit history");
+                const bool equal = std::memcmp(histories[kept].data(), got_hist.data(), hist.size() * 4) == 0;
+                std::printf("  gdn_conv_commit keep %d: history %s\n", kept, equal ? "exact" : "FAIL");
+                if (!equal) ++fbad;
+            }
+            cudaFree(d_hist); cudaFree(d_qkv); cudaFree(d_w); cudaFree(d_h);
+            cudaFree(d_inputs); cudaFree(d_outputs); cudaFree(d_keep);
+        }
+
+        // ---- fused_gdn_ab and gdn_ab_multi: the BF16 projections against the FP32 activation plus the
+        // gate/beta epilogues, against the same double transcription in f64.
+        {
+            const int T = strata::kernels::kVerifyMaxT;
+            auto trunc16 = [](float f) {
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                return (uint16_t) (u >> 16);
+            };
+            auto bits_f32 = [](uint16_t b) {
+                const uint32_t u = (uint32_t) b << 16;
+                float f;
+                std::memcpy(&f, &u, 4);
+                return f;
+            };
+            std::vector<uint16_t> wa((size_t) h_v * n_embd), wb((size_t) h_v * n_embd);
+            std::vector<float> waf(wa.size()), wbf(wb.size());
+            for (size_t i = 0; i < wa.size(); ++i) { wa[i] = trunc16(gauss(frng) * 0.05f); waf[i] = bits_f32(wa[i]); }
+            for (size_t i = 0; i < wb.size(); ++i) { wb[i] = trunc16(gauss(frng) * 0.05f); wbf[i] = bits_f32(wb[i]); }
+            std::vector<float> dt((size_t) h_v), ssm_a((size_t) h_v);
+            for (auto& x : dt) x = gauss(frng);
+            for (auto& x : ssm_a) x = -(0.1f + (float) (frng() % 100) / 50.0f);
+            std::vector<float> x((size_t) T * n_embd);
+            for (auto& v : x) v = gauss(frng);
+            std::vector<float> g_want((size_t) T * h_v), b_want((size_t) T * h_v);
+            for (int t = 0; t < T; ++t)
+                for (int r = 0; r < h_v; ++r) {
+                    double a = 0, b = 0;
+                    for (int i = 0; i < n_embd; ++i) {
+                        a += (double) x[(size_t) t * n_embd + i] * (double) waf[(size_t) r * n_embd + i];
+                        b += (double) x[(size_t) t * n_embd + i] * (double) wbf[(size_t) r * n_embd + i];
+                    }
+                    const double v = a + (double) dt[(size_t) r];
+                    g_want[(size_t) t * h_v + r] =
+                        (float) ((v > 20.0 ? v : std::log1p(std::exp(v))) * (double) ssm_a[(size_t) r]);
+                    b_want[(size_t) t * h_v + r] = (float) (1.0 / (1.0 + std::exp(-b)));
+                }
+            auto d_x = (float*) up(x.data(), x.size() * 4);
+            auto d_wa = (uint16_t*) up(wa.data(), wa.size() * 2);
+            auto d_wb = (uint16_t*) up(wb.data(), wb.size() * 2);
+            auto d_dt = (float*) up(dt.data(), dt.size() * 4);
+            auto d_sa = (float*) up(ssm_a.data(), ssm_a.size() * 4);
+            auto d_g1 = (float*) dev((size_t) T * h_v * 4), d_b1 = (float*) dev((size_t) T * h_v * 4);
+            auto d_gm = (float*) dev((size_t) T * h_v * 4), d_bm = (float*) dev((size_t) T * h_v * 4);
+            for (int t = 0; t < T; ++t)
+                strata::kernels::fused_gdn_ab(d_x + (size_t) t * n_embd, d_wa, d_wb, d_dt, d_sa,
+                                              d_g1 + (size_t) t * h_v, d_b1 + (size_t) t * h_v, n_embd, h_v, nullptr);
+            strata::kernels::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, d_gm, d_bm, n_embd, h_v, T, nullptr);
+            std::vector<float> g1((size_t) T * h_v), b1(g1.size()), gm(g1.size()), bm(g1.size());
+            check(cudaMemcpy(g1.data(), d_g1, g1.size() * 4, cudaMemcpyDeviceToHost), "c6g1");
+            check(cudaMemcpy(b1.data(), d_b1, b1.size() * 4, cudaMemcpyDeviceToHost), "c6b1");
+            check(cudaMemcpy(gm.data(), d_gm, gm.size() * 4, cudaMemcpyDeviceToHost), "c6gm");
+            check(cudaMemcpy(bm.data(), d_bm, bm.size() * 4, cudaMemcpyDeviceToHost), "c6bm");
+            cudaFree(d_x); cudaFree(d_wa); cudaFree(d_wb); cudaFree(d_dt); cudaFree(d_sa);
+            cudaFree(d_g1); cudaFree(d_b1); cudaFree(d_gm); cudaFree(d_bm);
+            const bool fin = all_finite(g1) && all_finite(b1) && all_finite(gm) && all_finite(bm);
+            const double rg1 = rel_l1(g_want, g1), rb1 = rel_l1(b_want, b1);
+            const double rgm = rel_l1(g_want, gm), rbm = rel_l1(b_want, bm);
+            std::printf("  %-42s fused gate %.3e beta %.3e, multi gate %.3e beta %.3e\n",
+                        "fused_gdn_ab + gdn_ab_multi vs reference", rg1, rb1, rgm, rbm);
+            if (!fin) { std::printf("    *** fused_gdn_ab: nonfinite output ***\n"); ++fbad; }
+            // the 2560-term f32 dot contributes ~1e-6 of the term mass and the __expf epilogue <= 2e-6
+            // absolute per element against a mean |gate| near 2; a swapped row, a dropped softplus/sigmoid or
+            // an alpha/beta mix-up is at 1e-2 and up
+            if (!(rg1 <= 1e-5 && rb1 <= 1e-5 && rgm <= 1e-5 && rbm <= 1e-5)) {
+                std::printf("    *** fused_gdn_ab over 1e-5 ***\n");
+                ++fbad;
+            }
+        }
+
+        // ---- fused_gdn_step_norm, plus the verify-window multi's outputs and state, against the double
+        // chain: ref_step per token (modulo pairing, decay before the update) and the fused readout
+        // o = (S^T q)/sqrt(S), y = rmsnorm(o) * gamma * sigmoid(z).
+        {
+            const int T = strata::kernels::kVerifyMaxT;
+            std::vector<float> st0((size_t) S * h_v * S);
+            for (auto& x : st0) x = gauss(frng) * 0.1f;
+            std::vector<float> q((size_t) h_k * S), k((size_t) h_k * S), v((size_t) h_v * S);
+            for (auto& x : q) x = gauss(frng) * 0.1f;
+            for (auto& x : k) x = gauss(frng) * 0.1f;
+            for (auto& x : v) x = gauss(frng);
+            std::vector<float> hbuf((size_t) T * conv_ch), gate((size_t) T * h_v), beta((size_t) T * h_v),
+                z((size_t) T * vd), gamma((size_t) S);
+            for (auto& x : hbuf) x = gauss(frng) * 0.1f;
+            // token 0 IS the standalone fixture, so the fused single-token run and the chain's first step
+            // consume the same q|k|v and the comparison below is like for like
+            std::memcpy(&hbuf[0], q.data(), q.size() * 4);
+            std::memcpy(&hbuf[qk], k.data(), k.size() * 4);
+            std::memcpy(&hbuf[2 * qk], v.data(), v.size() * 4);
+            for (auto& x : gate) x = -(2.0f + 4.0f * (float) (frng() % 100) / 100.0f);   // dec in (0.0025, 0.135]
+            for (auto& x : beta) x = (float) (frng() % 100) / 100.0f;
+            for (auto& x : z) x = gauss(frng);
+            for (auto& x : gamma) x = 1.0f + 0.1f * gauss(frng);
+
+            // n tokens through `st` (reference layout, mutated), y for every token out.
+            auto chain = [&](std::vector<double>& st, int n, std::vector<float>& y_out) {
+                y_out.assign((size_t) n * vd, 0.0f);
+                for (int t = 0; t < n; ++t) {
+                    const float* qt = &hbuf[(size_t) t * conv_ch];
+                    std::vector<float> o_t;
+                    ref_step(st, std::vector<float>(qt, qt + qk), std::vector<float>(qt + qk, qt + 2 * qk),
+                             std::vector<float>(qt + 2 * qk, qt + conv_ch),
+                             std::vector<float>(&gate[(size_t) t * h_v], &gate[(size_t) t * h_v] + h_v),
+                             std::vector<float>(&beta[(size_t) t * h_v], &beta[(size_t) t * h_v] + h_v),
+                             S, h_k, h_v, o_t, true, true);
+                    std::vector<double> oc((size_t) S);
+                    for (int h = 0; h < h_v; ++h) {
+                        double ss = 0;
+                        for (int j = 0; j < S; ++j) {
+                            oc[(size_t) j] = (double) o_t[(size_t) (h * S + j)] * (1.0 / std::sqrt((double) S));
+                            ss += oc[(size_t) j] * oc[(size_t) j];
+                        }
+                        const double scale = 1.0 / std::sqrt(ss / (double) S + (double) eps);
+                        for (int j = 0; j < S; ++j)
+                            y_out[(size_t) t * vd + (size_t) h * S + j] =
+                                (float) (oc[(size_t) j] * scale * (double) gamma[(size_t) j] *
+                                         (1.0 / (1.0 + std::exp(-(double) z[(size_t) (t * vd + h * S + j)]))));
+                    }
+                }
+            };
+            std::vector<double> st_init((size_t) S * S * h_v);
+            for (int i = 0; i < S; ++i)
+                for (int j = 0; j < S; ++j)
+                    for (int h = 0; h < h_v; ++h)
+                        st_init[(size_t) (i * S + j) * h_v + h] = st0[(size_t) (i * h_v + h) * S + j];
+            std::vector<double> st_chain = st_init, st_one = st_init;
+            std::vector<float> y_chain, y_one;
+            chain(st_chain, T, y_chain);
+            chain(st_one, 1, y_one);
+            auto state_rel = [&](const std::vector<float>& got, const std::vector<double>& want) {
+                double d = 0, m = 0;
+                for (int i = 0; i < S; ++i)
+                    for (int j = 0; j < S; ++j)
+                        for (int h = 0; h < h_v; ++h) {
+                            const size_t di = (size_t) (i * h_v + h) * S + j;
+                            d += std::fabs(want[(size_t) (i * S + j) * h_v + h] - (double) got[di]);
+                            m += std::fabs(want[(size_t) (i * S + j) * h_v + h]);
+                        }
+                return d / (m > 1e-30 ? m : 1e-30);
+            };
+
+            auto d_st = (float*) up(st0.data(), st0.size() * 4);
+            auto d_q = (float*) up(q.data(), q.size() * 4);
+            auto d_k = (float*) up(k.data(), k.size() * 4);
+            auto d_v = (float*) up(v.data(), v.size() * 4);
+            auto d_g = (float*) up(gate.data(), gate.size() * 4);
+            auto d_b = (float*) up(beta.data(), beta.size() * 4);
+            auto d_z = (float*) up(z.data(), z.size() * 4);
+            auto d_gm2 = (float*) up(gamma.data(), gamma.size() * 4);
+            auto d_h = (float*) up(hbuf.data(), hbuf.size() * 4);
+            auto d_y = (float*) dev((size_t) T * vd * 4);
+
+            // the single-token fused kernel, token 0
+            strata::kernels::fused_gdn_step_norm(d_st, d_q, d_k, d_v, d_g, d_b, d_z, d_gm2, eps, d_y, h_k, h_v,
+                                                 nullptr);
+            std::vector<float> got_y((size_t) vd), got_st(st0.size());
+            check(cudaMemcpy(got_y.data(), d_y, got_y.size() * 4, cudaMemcpyDeviceToHost), "c6y1");
+            check(cudaMemcpy(got_st.data(), d_st, got_st.size() * 4, cudaMemcpyDeviceToHost), "c6s1");
+            const bool fin1 = all_finite(got_y) && all_finite(got_st);
+            const double rel_y1 = rel_l1(y_one, got_y), rel_st1 = state_rel(got_st, st_one);
+            std::printf("  %-42s y %.3e state %.3e\n", "fused_gdn_step_norm vs reference", rel_y1, rel_st1);
+            if (!fin1) { std::printf("    *** fused_gdn_step_norm: nonfinite output ***\n"); ++fbad; }
+            if (!(rel_y1 <= 1e-5 && rel_st1 <= 1e-5)) {
+                std::printf("    *** fused_gdn_step_norm over 1e-5 ***\n");
+                ++fbad;
+            }
+
+            // the multi: the verify half must leave the state untouched and still produce every token's y;
+            // the commit half must produce the same y AND the state after T tokens
+            const int32_t keep = T;
+            auto d_st2 = (float*) up(st0.data(), st0.size() * 4);
+            auto d_y2 = (float*) dev((size_t) T * vd * 4);
+            auto d_nk = (int32_t*) up(&keep, 4);
+            strata::kernels::gdn_step_norm_multi(d_st2, d_h, conv_ch, d_g, d_b, d_z, d_gm2, eps, d_y2, h_k, h_v, T,
+                                                 nullptr, nullptr, 0);
+            std::vector<float> vy((size_t) T * vd), vst(st0.size());
+            check(cudaMemcpy(vy.data(), d_y2, vy.size() * 4, cudaMemcpyDeviceToHost), "c6yv");
+            check(cudaMemcpy(vst.data(), d_st2, vst.size() * 4, cudaMemcpyDeviceToHost), "c6sv");
+            const bool finv = all_finite(vy) && all_finite(vst);
+            const double rel_yv = rel_l1(y_chain, vy);
+            const bool untouched = std::memcmp(vst.data(), st0.data(), st0.size() * 4) == 0;
+            std::printf("  %-42s y %.3e, state untouched %s\n", "gdn_step_norm_multi verify vs reference",
+                        rel_yv, untouched ? "yes" : "*** NO ***");
+            if (!finv) { std::printf("    *** gdn_step_norm_multi verify: nonfinite output ***\n"); ++fbad; }
+            if (!(rel_yv <= 1e-5) || !untouched) { std::printf("    *** multi verify over 1e-5 or state written ***\n"); ++fbad; }
+
+            check(cudaMemcpy(d_st2, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "s6c");
+            check(cudaMemset(d_y2, 0, (size_t) T * vd * 4), "y6c");
+            strata::kernels::gdn_step_norm_multi(d_st2, d_h, conv_ch, d_g, d_b, d_z, d_gm2, eps, d_y2, h_k, h_v, T,
+                                                 d_nk, nullptr, 0);
+            std::vector<float> cy((size_t) T * vd), cst(st0.size());
+            check(cudaMemcpy(cy.data(), d_y2, cy.size() * 4, cudaMemcpyDeviceToHost), "c6yc");
+            check(cudaMemcpy(cst.data(), d_st2, cst.size() * 4, cudaMemcpyDeviceToHost), "c6sc");
+            const bool finc = all_finite(cy) && all_finite(cst);
+            const double rel_yc = rel_l1(y_chain, cy), rel_stc = state_rel(cst, st_chain);
+            std::printf("  %-42s y %.3e state %.3e\n", "gdn_step_norm_multi commit vs reference", rel_yc, rel_stc);
+            if (!finc) { std::printf("    *** gdn_step_norm_multi commit: nonfinite output ***\n"); ++fbad; }
+            if (!(rel_yc <= 1e-5 && rel_stc <= 1e-5)) {
+                std::printf("    *** multi commit over 1e-5 ***\n");
+                ++fbad;
+            }
+            cudaFree(d_st); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_g); cudaFree(d_b);
+            cudaFree(d_z); cudaFree(d_gm2); cudaFree(d_h); cudaFree(d_y); cudaFree(d_st2); cudaFree(d_y2);
+            cudaFree(d_nk);
+        }
+
+        std::printf("\n  %-42s %d\n", "fused operators vs independent fixture, failures", fbad);
+        bad += fbad;
     }
 
     std::printf("\ngdn: %d failures\n", bad);

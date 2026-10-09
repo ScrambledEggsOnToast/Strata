@@ -64,6 +64,9 @@ bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, voi
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
+bool workspace_bytes(int, int, uint64_t, uint64_t&) { return false; }
+bool device_config(int, int&, int&, uint64_t&) { return false; }
+bool device_config(int&, int&, uint64_t&) { return false; }
 }  // namespace strata::prefill::mmq
 #endif
 #ifndef STRATA_PREFILL_FUSED

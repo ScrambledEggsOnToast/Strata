@@ -36,7 +36,8 @@ uint64_t owned_bytes(uint64_t payload) {
 }  // namespace
 
 bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, bool kv_int8, bool kv_q4,
-                                AllocationConfig& out, std::string& err, bool kv_hybrid) {
+                                AllocationConfig& out, std::string& err, bool kv_hybrid,
+                                int device_ordinal) {
     out = {};
     err.clear();
     // The artifact's fixed geometry gives its own bounds; these are the admission-side index limits: every
@@ -63,8 +64,15 @@ bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, b
     out.stager_ring = stager_ring_env();
     const char* env = std::getenv("STRATA_PREFILL_MMQ");
     out.mmq = env == nullptr || std::atoi(env) != 0;
-    if (mmq::built() && !mmq::device_config(out.device_cc, out.device_sms, out.device_shared_bytes)) {
-        err = "prefill: device properties unavailable for MMQ qualification";
+    if (mmq::built() &&
+        !(device_ordinal < 0
+              ? mmq::device_config(out.device_cc, out.device_sms, out.device_shared_bytes)
+              : mmq::device_config(device_ordinal, out.device_cc, out.device_sms,
+                                   out.device_shared_bytes))) {
+        err = device_ordinal < 0
+            ? "prefill: device properties unavailable for MMQ qualification"
+            : "prefill: visible device " + std::to_string(device_ordinal) +
+                  " has no usable MMQ hardware configuration for the admission price";
         return false;
     }
     return true;

@@ -2453,6 +2453,95 @@ class UnloadableEngine(MockEngine):
         self.starts += 1
 
 
+class ProtectedServing(unittest.TestCase):
+    """A protected frontend cannot replace its admitted client or mutate its profile."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.engine = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        with mock.patch.dict(os.environ, {"STRATA_SUPERVISED": "1"}):
+            self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        request = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def test_dead_engine_requests_remain_unavailable(self):
+        self.engine.unload()
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+        for _ in range(2):
+            status, reply = self.post("/v1/chat/completions", body)
+            self.assertEqual(status, 503, reply)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_operator_mutations_refused_but_generation_works(self):
+        for path in ("/config", "/settings", "/load", "/unload", "/v1/load", "/v1/unload", "/v1/vram",
+                     "/mcp", "/slots/0?action=restore"):
+            with self.subTest(path=path):
+                status, reply = self.post(path, {})
+                self.assertEqual(status, 403, reply)
+        status, reply = self.post("/v1/chat/completions", {
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20})
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "ok")
+
+
+    def test_generation_cannot_override_protected_execution(self):
+        for path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+            for override in ({"strata_tune": {"pcie_frac": 0.0}}, {"experimental_speed_projection": False}):
+                with self.subTest(path=path, override=override):
+                    status, reply = self.post(path, {
+                        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 20, "stream": True, **override})
+                    self.assertEqual(status, 403, reply)
+        status, reply = self.post("/v1/chat/completions", {
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 20, "temperature": 0.7, "seed": 42})
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "ok")
+
+    def test_native_restart_refusal_preserves_original_process(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as directory:
+            script, gate = Path(directory) / "fake_strata.py", Path(directory) / "ready"
+            script.write_text(FAKE_STRATA, encoding="utf-8")
+            gate.touch()
+            real = server.subprocess.Popen
+            with mock.patch.dict(os.environ, {"STRATA_SUPERVISED": "1"}), \
+                 mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                engine = StrataEngine("strata", ["--gate", str(gate)])
+                original = engine.proc
+                try:
+                    with self.assertRaises(EngineDied):
+                        engine.restart()
+                    self.assertIs(engine.proc, original)
+                    self.assertTrue(engine.alive())
+                    with self.assertRaises(EngineDied):
+                        engine.__init__("strata", ["--gate", str(gate)])
+                    self.assertIs(engine.proc, original)
+                    original.kill()
+                    original.wait(timeout=10)
+                    with self.assertRaises(EngineDied):
+                        engine.restart()
+                    self.assertIs(engine.proc, original)
+                finally:
+                    engine.close()
+
+
 class SharingTheGpu(unittest.TestCase):
     """Idle unload, POST /unload and /load, the free-VRAM guard and the before_load hook (all off by default)."""
 

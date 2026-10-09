@@ -108,6 +108,30 @@ void test_guest_is_a_real_limit_and_reserves_cannot_be_planned_away() {
     require(clamped.applied_host_reserve_bytes == 8 * GiB, "host reserve was not floored at 8 GiB");
 }
 
+void test_controller_host_reserve_does_not_lower_other_bounds() {
+    GuestHostPolicy p = both_scopes_measured(8 * GiB, 3 * GiB);
+    p.host_reserve_bytes = 0;
+    Scope host;
+    host.add("source-mirror", 2 * GiB, "fixture");
+    DeviceCost device;
+    device.name = "CUDA0";
+    const std::vector<DeviceCost> devices{device};
+    const std::vector<DeviceTelemetry> telemetry{measured("CUDA0", 24 * GiB)};
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "unapproved zero host reserve bypassed the default floor");
+    p.host_reserve_controller_approved = true;
+    auto allowed = admit_configuration(devices, telemetry, {}, host, p);
+    require(allowed.admitted && allowed.applied_host_reserve_bytes == 0,
+            "authenticated controller reserve was clamped back to the default");
+    require(allowed.applied_guest_reserve_bytes == 4 * GiB, "guest floor changed");
+    p.host_available_bytes = 2 * GiB - 1;
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "controller exception ignored actual host demand");
+    p.host_available_measured = false;
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "controller exception admitted missing host telemetry");
+}
+
 // AC-2, telemetry half: an unmeasured guest (or host, or device) refuses.  Unknown is not zero, and a
 // guard that never fires because telemetry is absent is exactly the false-pass the convention forbids.
 void test_missing_telemetry_fails_closed() {
@@ -320,6 +344,92 @@ void test_mps_physical_and_residual_gates_are_independent() {
     require(decide().admitted, "non-MPS unexpectedly required physical telemetry");
 }
 
+// HET-015: per-device MPS ceilings are per-device facts. Two devices with unequal caps must
+// each close on their own numbers: one device's envelope violation refuses while the other's
+// slack cannot rescue it, and both fitting admits with the receipts carried per line.
+void test_unequal_per_device_caps_and_envelopes_refuse_independently() {
+    DeviceCost primary;
+    primary.name = "CUDA0";
+    primary.vram.add("weights_canonical", 6 * GiB, "test");
+    primary.headroom_bytes = 1 * GiB;
+    DeviceCost stage;
+    stage.name = "CUDA1";
+    stage.vram.add("weights_canonical", 4 * GiB, "test");
+    stage.vram.add("split_expert_caches", 2 * GiB, "admitted per-stage budget");
+    stage.headroom_bytes = 1 * GiB;
+    auto telemetry = [&](uint64_t cap0, uint64_t free0, uint64_t physical0,
+                         uint64_t cap1, uint64_t free1, uint64_t physical1) {
+        DeviceTelemetry a;
+        a.name = "CUDA0";
+        a.measured = true;
+        a.total_bytes = 24 * GiB;
+        a.free_bytes = free0;
+        a.cap_declared = true;
+        a.enforced_cap_bytes = cap0;
+        a.physical_free_measured = true;
+        a.physical_free_bytes = physical0;
+        a.outside_client_allowance_bytes = 1 * GiB;
+        DeviceTelemetry b = a;
+        b.name = "CUDA1";
+        b.free_bytes = free1;
+        b.enforced_cap_bytes = cap1;
+        b.physical_free_bytes = physical1;
+        return std::vector<DeviceTelemetry>{a, b};
+    };
+    const auto both_fit = admit_configuration({primary, stage},
+        telemetry(10 * GiB, 9 * GiB, 12 * GiB, 8 * GiB, 7 * GiB, 20 * GiB), {}, {}, both_scopes_measured(64 * GiB, 64 * GiB));
+    require(both_fit.admitted && both_fit.verified, "unequal caps that each fit must admit");
+    require(both_fit.devices[0].enforced_cap_bytes == 10 * GiB &&
+            both_fit.devices[1].enforced_cap_bytes == 8 * GiB &&
+            both_fit.devices[0].physical_free_bytes == 12 * GiB &&
+            both_fit.devices[1].physical_free_bytes == 20 * GiB,
+            "per-device receipts must not be cross-contaminated");
+    // The second device's physical envelope is its own: 8 + 1 > 8.5 refuses even though the
+    // first device has 5 GiB of slack its ceiling never shares.
+    const auto second_overfull = admit_configuration({primary, stage},
+        telemetry(10 * GiB, 9 * GiB, 12 * GiB, 8 * GiB, 7 * GiB, (8 * GiB + 1 * GiB) / 2), {}, {},
+        both_scopes_measured(64 * GiB, 64 * GiB));
+    require(!second_overfull.admitted && second_overfull.devices[0].fits &&
+            !second_overfull.devices[1].fits,
+            "one device's physical envelope violation must refuse without touching the other");
+    require(second_overfull.limiting_term == "mps:CUDA1",
+            "the limiting term must name the offending device: " + second_overfull.limiting_term);
+    // A residual above ITS OWN cap on the first device refuses with the second still fitting.
+    const auto first_residual = admit_configuration({primary, stage},
+        telemetry(10 * GiB, 11 * GiB, 12 * GiB, 8 * GiB, 7 * GiB, 20 * GiB), {}, {},
+        both_scopes_measured(64 * GiB, 64 * GiB));
+    require(!first_residual.admitted && first_residual.limiting_term == "mps:CUDA0" &&
+            first_residual.devices[1].fits,
+            "a residual above its own declared cap refuses on that device alone");
+}
+
+// The explicit-split per-stage expert-cache budget: the host arithmetic the runtime cache is
+// held to. Rejection, the one-blob minimum, blob-granularity flooring and the profiled-pair
+// bound are the consumer-visible risks of the admission seam.
+void test_split_stage_cache_budget_boundaries() {
+    const uint64_t blob = 2 * GiB;
+    // Nothing after fixed demand plus headroom: no budget, never a negative or a guess.
+    require(split_stage_cache_budget(8 * GiB, 8 * GiB, 1 * GiB, blob, 64 * GiB) == 0,
+            "an over-committed stage priced a cache from nothing");
+    require(split_stage_cache_budget(8 * GiB, 9 * GiB, 0, blob, 64 * GiB) == 0,
+            "fixed demand above the residual priced a cache");
+    // The minimum: residual - fixed - headroom funds exactly one blob.
+    require(split_stage_cache_budget(11 * GiB, 8 * GiB, 1 * GiB, blob, 64 * GiB) == blob,
+            "the one-blob minimum was not the floor");
+    // One byte short of one blob floors to zero: the granularity is never rounded up.
+    require(split_stage_cache_budget(11 * GiB, 8 * GiB + 1, 1 * GiB, blob, 64 * GiB) == 0,
+            "a sub-granularity remainder was rounded up into a blob");
+    // The floor drops the remainder: 2.5 blobs of room prices 2 blobs.
+    require(split_stage_cache_budget(14 * GiB, 8 * GiB, 1 * GiB, blob, 64 * GiB) == 2 * blob,
+            "the budget was not floored to the blob granularity");
+    // The stage's profiled pairs bound the budget: unbounded VRAM cannot buy unprofiled slots.
+    require(split_stage_cache_budget(64 * GiB, 8 * GiB, 1 * GiB, blob, 3 * blob) == 3 * blob,
+            "the profile bound did not cap the budget");
+    // Zero blob geometry refuses everything rather than dividing by zero.
+    require(split_stage_cache_budget(64 * GiB, 0, 0, 0, 64 * GiB) == 0,
+            "a zero blob geometry produced a budget");
+}
+
 void test_overflow_refuses_in_every_scope_and_request() {
     const uint64_t largest = UINT64_MAX;
     DeviceCost device;
@@ -393,6 +503,7 @@ int main() {
     try {
         test_single_overfull_device_refuses_despite_aggregate();
         test_guest_is_a_real_limit_and_reserves_cannot_be_planned_away();
+        test_controller_host_reserve_does_not_lower_other_bounds();
         test_missing_telemetry_fails_closed();
         test_unknown_class_blocks_admission();
         test_file_backed_demand_is_counted_and_credit_is_bounded();
@@ -403,6 +514,8 @@ int main() {
         test_overflow_refuses_in_every_scope_and_request();
         test_mps_physical_and_residual_gates_are_independent();
         test_declared_meaning_projects_unknowns_and_bounds_credit();
+        test_unequal_per_device_caps_and_envelopes_refuse_independently();
+        test_split_stage_cache_budget_boundaries();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;

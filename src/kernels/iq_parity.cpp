@@ -11,7 +11,10 @@
 // bitwise equality is not claimed and not required; on the generated fixtures it measures 0.00e+00.  The
 // MMVQ dot (q8_1 activations) must match the float matrix-vector product over that reference within the
 // activation rounding (a few 1e-3 relative), for 1 to 8 columns, every column of a multi-column call bitwise
-// equal to a one-column call on it.
+// equal to a one-column call on it.  Q8_0 (MTP's native_mmvq down type) is checked by the same contract: the
+// fixtures' gguf-py reference and the GPU dequantizer both decode d * code exactly, and its dot carries the
+// same q8_1 activation rounding.  Every downloaded device result (dequant and dot) is finite-checked besides.
+#include "strata/platform/protected_test.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -25,8 +28,9 @@
 #include <vector>
 
 int main(int argc, char** argv) {
+    if (!strata::platform::acknowledge_protected_test()) return 2;
     const std::string dir = argc > 1 ? argv[1] : "logs/iq_fixture";
-    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K"};
+    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K", "Q8_0"};
     int failures = 0, missing = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -58,12 +62,17 @@ int main(int argc, char** argv) {
         cudaMalloc(&dq, ref.size() * 4);
         cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
         double dq_err = 0.0;
+        bool dq_finite = true;
         if (strata::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
             strata::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
             std::vector<float> got(ref.size());
             cudaMemcpy(got.data(), dq, got.size() * 4, cudaMemcpyDeviceToHost);
             double num = 0, den = 0;
-            for (size_t i = 0; i < ref.size(); ++i) { num += std::fabs(got[i] - ref[i]); den += std::fabs(ref[i]); }
+            for (size_t i = 0; i < ref.size(); ++i) {
+                if (!std::isfinite(got[i])) dq_finite = false;   // the GPU dequantizer wrote a NaN/Inf: a failure of its own
+                num += std::fabs(got[i] - ref[i]);
+                den += std::fabs(ref[i]);
+            }
             dq_err = num / (den + 1e-30);
         }
         // the dot, ncols 1..8: each column of an ncols call bitwise equal to a one-column call on it (the
@@ -101,17 +110,20 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) { std::printf("%-8s mmvq: %s\n", nm, e.what()); ++failures; continue; }
         double num = 0, den = 0;
+        bool dot_finite = true;
         for (int c = 0; c < MC; ++c)
             for (int r = 0; r < rows; ++r) {
+                if (!std::isfinite(y[(size_t) c * rows + r])) dot_finite = false;
                 double acc = 0;
                 for (int k = 0; k < cols; ++k) acc += (double) ref[(size_t) r * cols + k] * x[(size_t) c * cols + k];
                 num += std::fabs(y[(size_t) c * rows + r] - acc);
                 den += std::fabs(acc);
             }
         const double mm_err = num / (den + 1e-30);
-        const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;
-        std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e (ncols 1..%d)  %s\n", nm, type, rows, cols,
-                    dq_err, mm_err, MC, ok ? "ok" : "FAIL");
+        const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0 && dq_finite && dot_finite;
+        std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e (ncols 1..%d)%s%s  %s\n", nm, type,
+                    rows, cols, dq_err, mm_err, MC, dq_finite ? "" : "  DEQUANT NON-FINITE",
+                    dot_finite ? "" : "  DOT NON-FINITE", ok ? "ok" : "FAIL");
         if (!ok) ++failures;
         cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(xq); cudaFree(dy);
     }

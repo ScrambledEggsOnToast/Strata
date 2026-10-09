@@ -63,6 +63,40 @@ CUDA_VISIBLE_DEVICES=0 ./build/qsa_prompt_attn_parity 32768 2048 5     # synthet
 It compares the tensor-core attention with the FP32 kernel and an FP64 host reference and times both. The Q4_0 cases are skipped below
 sm_80.
 
+The fork's bounded independent fixtures also cover the fused paths used by native
+Flash-Next: `gdn_parity --selftest` checks convolution, normalization, recurrence,
+verification and history commitment against host references; `gr_parity --selftest`
+checks fused single/multi-token hyperconnections. `gemm_bf16_parity --smoke` checks
+three beta-zero products/strides against FP64 products of the BF16 storage values.
+`prefill_fused_iq_test --mmq-only --only=IQ3_S` exercises the SM70-compatible MMQ
+path without requiring the SM80 fused fast path. Its independent quantizer intervals
+and stagewise arithmetic bounds are fixed in the fixture, not fitted to a device's
+observed error. These small cases are operator checks, not whole-model equivalence.
+
+`--mmq-only --pack-pairs` selects the seven gate/down format pairs observed in
+the mixed native pack. It refuses unsupported selected pairs instead of skipping
+them. Its host SwiGLU reference preserves the fixed normal bound and independently
+encloses tail arithmetic with nearest-even FP32 rounding, overflow saturation,
+and quotient/product flush-to-zero. The tail behaviour is an explicitly approved
+project acceptance requirement, **not** a proved CUDA 12.4 exponential guarantee.
+The historical 1.16 normal-bound coefficient is a fixed stricter policy, not the
+documented 1.173 coefficient. `swiglu_reference_test` checks the host rounding and
+domain boundaries without a GPU. Each card still needs the unchanged protected
+seven-pair replay; a host test or replay of an old diagnostic is not qualification.
+
+For bounded diagnosis, add `--swiglu-census=PATH` to that complete MMQ-only command.
+It exclusively creates a CSV of exact gate/up/output bits and domain refusals,
+continues only reference-domain omissions, and keeps numerical mismatches and
+quantizer/downstream failures fatal. Completion always exits 2 and says
+`NOT QUALIFIED`; a census is not an independent tail oracle or a passing check.
+
+Generate independent IQ references with `tools/iq_fixture.py`; `iq_parity` includes
+Q8_0 for MTP as well as the native IQ formats. For real-weight decode, pass an
+explicit layer to `native_expert_parity SHARD LAYER` and record the printed tensor
+types: a pack's filename does not establish every layer's quantization. Protected
+MPS fixture clients acknowledge their own CUDA client PID before exiting, allowing
+the external supervisor to verify the ceiling and collect actual cleanup evidence.
+
 ## Limits
 
 - A layer split over two V100 was not measured with this kernel. The cards work in turn on a single request, so a split adds expert-cache room, not prompt speed.

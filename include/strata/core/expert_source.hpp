@@ -830,11 +830,11 @@ private:
 ///     until the chunk's stager drains, which no bounded ring can honour and this class cannot detect.
 ///     A run combining this source with `--prefill-chunk >= 1024` must set `STRATA_PREFILL_RING=8` or
 ///     `STRATA_PREFILL_STREAM_MIN` above the chunk, or refuse at startup.
-///   * SINGLE DRIVER THREAD: the thread that calls `blob`/`begin_layer` owns every returned pointer until the
-///     next epoch boundary.  An internal mutex keeps the state machine itself from corrupting under a race,
-///     but returned pointers ESCAPE it - another thread may advance the epoch and overwrite a slot while the
-///     first still reads its blob.  Cross-thread sharing is therefore unsupported, and the driver refuses the
-///     combinations that could do it (splits, remote tiers) rather than relying on this class.
+///   * ONE IN-FLIGHT OWNER PER INSTANCE: the thread that calls `blob`/`begin_layer` owns every returned pointer
+///     until the next epoch boundary. An internal mutex protects the state machine, not pointers that escape
+///     it. Concurrent prefill stages therefore require independent source instances. Serialized startup,
+///     blocking cache refill and decode may reuse the primary instance after public Prefill::run has drained
+///     every stage. Remote tiers and overlapping verification windows cannot share that primary instance.
 ///
 /// A refused open is named and costs nothing (the ring is allocated only after every check passes); there is
 /// no fallback to buffered IO and no silent downgrade.
