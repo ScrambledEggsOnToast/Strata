@@ -3848,6 +3848,7 @@ int main(int argc, char** argv) {
             policy.guest_reserve_bytes = std::max(policy.guest_reserve_bytes, external.guest_reserve);
             policy.host_reserve_bytes = o.host_reserve_explicit
                 ? std::max(policy.host_reserve_bytes, external.host_reserve) : external.host_reserve;
+            policy.host_reserve_controller_approved = true;
             policy.host_available_measured = true;
             policy.host_available_bytes = external.available;
             host.add("guest_unbacked_allocation", external.allocation - external.resident,

@@ -151,9 +151,8 @@ struct DeviceTelemetry {
     uint64_t outside_client_allowance_bytes = 0;
 };
 
-/// Budget policy.  The reserves carry the docs/02 design defaults; an operator may RAISE them through the
-/// engine's flags but the defaults here are the floor - the admission code never accepts a reserve below
-/// them (see `clamp_reserves`), so no flag can plan away the host or guest.
+/// Budget policy. Guest reserve retains its design floor. The host floor applies unless
+/// the caller authenticated a protected controller's operator-approved reserve.
 struct GuestHostPolicy {
     bool guest_total_measured = false;
     uint64_t guest_total_bytes = 0;        // the VM allocation, driver/hypervisor-visible
@@ -161,6 +160,7 @@ struct GuestHostPolicy {
     bool host_available_measured = false;
     uint64_t host_available_bytes = 0;     // physical-host MemAvailable; incremental host demand
     uint64_t host_reserve_bytes = 8ull << 30;
+    bool host_reserve_controller_approved = false;
     /// Bounded clean-file-cache credit (AC-4): the ONLY way file-backed bytes are ever discounted, capped
     /// at the file bytes and at what the caller measured as clean/reclaimable.  Zero credits nothing.
     uint64_t file_cache_credit_bytes = 0;
@@ -172,7 +172,8 @@ struct GuestHostPolicy {
     void clamp_reserves() {
         const uint64_t kMinGuest = 4ull << 30, kMinHost = 8ull << 30;
         guest_reserve_bytes = std::max(guest_reserve_bytes, kMinGuest);
-        host_reserve_bytes = std::max(host_reserve_bytes, kMinHost);
+        if (!host_reserve_controller_approved)
+            host_reserve_bytes = std::max(host_reserve_bytes, kMinHost);
     }
 };
 

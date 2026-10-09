@@ -108,6 +108,30 @@ void test_guest_is_a_real_limit_and_reserves_cannot_be_planned_away() {
     require(clamped.applied_host_reserve_bytes == 8 * GiB, "host reserve was not floored at 8 GiB");
 }
 
+void test_controller_host_reserve_does_not_lower_other_bounds() {
+    GuestHostPolicy p = both_scopes_measured(8 * GiB, 3 * GiB);
+    p.host_reserve_bytes = 0;
+    Scope host;
+    host.add("source-mirror", 2 * GiB, "fixture");
+    DeviceCost device;
+    device.name = "CUDA0";
+    const std::vector<DeviceCost> devices{device};
+    const std::vector<DeviceTelemetry> telemetry{measured("CUDA0", 24 * GiB)};
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "unapproved zero host reserve bypassed the default floor");
+    p.host_reserve_controller_approved = true;
+    auto allowed = admit_configuration(devices, telemetry, {}, host, p);
+    require(allowed.admitted && allowed.applied_host_reserve_bytes == 0,
+            "authenticated controller reserve was clamped back to the default");
+    require(allowed.applied_guest_reserve_bytes == 4 * GiB, "guest floor changed");
+    p.host_available_bytes = 2 * GiB - 1;
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "controller exception ignored actual host demand");
+    p.host_available_measured = false;
+    require(!admit_configuration(devices, telemetry, {}, host, p).admitted,
+            "controller exception admitted missing host telemetry");
+}
+
 // AC-2, telemetry half: an unmeasured guest (or host, or device) refuses.  Unknown is not zero, and a
 // guard that never fires because telemetry is absent is exactly the false-pass the convention forbids.
 void test_missing_telemetry_fails_closed() {
@@ -393,6 +417,7 @@ int main() {
     try {
         test_single_overfull_device_refuses_despite_aggregate();
         test_guest_is_a_real_limit_and_reserves_cannot_be_planned_away();
+        test_controller_host_reserve_does_not_lower_other_bounds();
         test_missing_telemetry_fails_closed();
         test_unknown_class_blocks_admission();
         test_file_backed_demand_is_counted_and_credit_is_bounded();
