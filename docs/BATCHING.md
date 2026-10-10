@@ -28,8 +28,9 @@ With a layer split, the engine options go into the config's `args`:
 
 | Option | What it does |
 | --- | --- |
-| `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. |
-| `--batch-groups G` | with a layer split: the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
+| `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
+| `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
+| `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
 The fork's admission gate prices the **requested** count before allocation, including private main-model and
@@ -219,7 +220,8 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
-- `--batch-groups` needs every stage on its own GPU; a pipelined slot is not kept as a conversation cache.
+- `--batch-groups` needs every stage on its own GPU. A finished pipelined slot is **not** kept as a conversation cache here: the fork's resident lifecycle clears it (`resident.finish(slot, keep_cache=false)`), where upstream 0.1.41 makes a pipelined slot a cache again — its #857 rule ships with the pad-row invalidation that this fork's compacted group window does not have. Carrying that rule is a batching-lane port item, not a re-pin change.
+- The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 - Additional resident slots require fully resident FP16 KV; each requested slot is charged before allocation.
 
 ### Allocation and optional upstream modes
@@ -313,6 +315,14 @@ python3 tools/batch_interleave_test.py --exe engine/strata --config strata-<mode
 python3 tools/parking_test.py --exe engine/strata --config strata-<model>.json \
     --extra "--layer-split 12,24,36 --conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0"
 STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
+```
+
+For single-GPU `--batch-mtp`, use a model with `rt/draft_vocab.bin` to exercise admission with a
+shared draft-vocabulary head. This compares both slots' output against solo decoding:
+
+```
+python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 2 --n 2 --max-new 64 \
+    --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
 
 ## Engine protocol (`--serve`)

@@ -115,6 +115,16 @@ struct Scope {
             host.classes.push_back(std::move(mirrored));
         }
     }
+    /// Direct host operation: inference and the host are the same machine, so every class this
+    /// process allocates - anonymous staging and pinned buffers included - is host RAM demand and
+    /// must close against the host reserve, not just the file-backed mirror.
+    void mirror_all_into(Scope& host) const {
+        for (const auto& c : classes) {
+            auto mirrored = c;
+            mirrored.source = "same-machine physical host RAM: " + c.source;
+            host.classes.push_back(std::move(mirrored));
+        }
+    }
     uint64_t credit_eligible_bytes() const {
         uint64_t bytes = 0;
         for (const auto& c : classes)
