@@ -3517,8 +3517,21 @@ int main(int argc, char** argv) {
             v0.add("mtp_drafter_buffers", (uint64_t) kDrafterMib << 20,
                    "generate.cpp kDrafterMib: the drafter plus head envelope (839 MiB measured)");
         }
-        v0.add("session_state", (uint64_t) session_full,
-               "session_bytes(geometry, --max-context, K); a split's per-stage shares are upper-bounded by it");
+        // #149: CUDA0's session charge.  An explicit split gives it layers [0, split_at[0]) and the carve sizes
+        // its arena to exactly that range (the same `SessionOwner::init(..., 0, hi0)` the other stages use), so
+        // charging it the whole-model bound withheld expert cache from the 3090 for state it never allocates.
+        // Without a split, and for an auto split before the search places the ranges, the bound stands.
+        const bool split_explicit = split_real && !split_auto;
+        const int64_t session_primary = (int64_t) strata::core::primary_session_bytes(
+            g, o.max_context, K, split_explicit ? split_at[0] : 0);
+        if (session_primary <= 0) {
+            std::fprintf(stderr, "strata generate: admission refused: invalid primary session accounting\n");
+            return 1;
+        }
+        v0.add("session_state", (uint64_t) session_primary,
+               split_explicit
+                   ? "session_bytes of CUDA0's own layer range (explicit split; the carve allocates only those layers)"
+                   : "session_bytes(geometry, --max-context, K); the unsplit whole-model bound");
         if (requested_slots) {
             v0.add("resident_session_device", resident.session_device, "requested resident SessionOwner arenas before runtime fallback");
             v0.add("resident_verifier_device", resident.verifier_device, "bounded per-slot commit/indexer/steering/penalty controls");

@@ -116,6 +116,20 @@ int main(int argc, char** argv) {
           "suffix without QSA retains one bounded primary");
     check(!session_allocation_bytes(g, 65, 10, range, 9, 9) && range.device == 0,
           "empty range rejected and output cleared");
+    // #149 AC-1: the primary carries its own carve in an explicit split and the whole-model bound without one.
+    // A split gives CUDA0 layers [0, split_at[0]) and the carve sizes its arena to that range alone, so the
+    // admission charge must match it instead of withholding expert cache for state the primary never allocates.
+    const uint64_t session_bound = primary_session_bytes(g, 65, 10, 0);
+    check(session_bound == session_bytes(g, 65, 10),
+          "an unsplit (or auto split) primary keeps the whole-model session bound");
+    const uint64_t session_primary = primary_session_bytes(g, 65, 10, 4);
+    check(session_primary == session_bytes(g, 65, 10, 0, 4),
+          "an explicit split charges the primary exactly its own layer range");
+    check(session_primary < session_bound, "the primary's own carve is smaller than the whole-model bound");
+    check(primary_session_bytes(g, 65, 10, g.n_layers) == session_bound,
+          "a boundary at the model end is the whole model");
+    check(primary_session_bytes(g, 65, 10, g.n_layers + 1) == session_bound,
+          "a boundary past the model falls back to the bound instead of pricing nothing");
     check(!session_allocation_bytes(g, std::numeric_limits<int64_t>::max(), 10, range), "context overflow refused");
     check(!session_allocation_bytes(g, 65, 0, range), "invalid expert count refused");
     g.qsa_interval = 0;

@@ -101,6 +101,12 @@ struct SessionState {
 /// Returns 0 for invalid ranges or inputs outside session_allocation_bytes' bounded geometry contract.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
+/// What the PRIMARY (CUDA0) device is charged for session state.  An explicit split runs CUDA0 on layers
+/// `[0, split_boundary)` and carves its arena to exactly that range, so it carries that range's bytes plus the
+/// whole-model buffers `session_bytes` adds for any range - the same treatment every other stage already gets.
+/// `split_boundary <= 0` means no split has placed the ranges: the whole-model bound stands, as it does for an
+/// unsplit run and for an auto split.  Pure arithmetic, safe before any allocation.
+uint64_t primary_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t split_boundary);
 /// Carves caller-owned `base` (DEVICE memory) into a fresh `s`. Returns bytes used, or 0 on failure with
 /// secondary allocations already released. The caller ALWAYS retains ownership of `base`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,

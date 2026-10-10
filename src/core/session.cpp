@@ -122,6 +122,13 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
+uint64_t primary_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t split_boundary) {
+    // The primary carves the same way every stage does (`SessionOwner::init(..., 0, split_boundary)`), so an
+    // explicit split prices it by that range; without a placement the whole-model bound is the honest charge.
+    if (split_boundary <= 0 || split_boundary > g.n_layers) return session_bytes(g, max_cells, k, 0, -1);
+    return session_bytes(g, max_cells, k, 0, split_boundary);
+}
+
 bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
                               SessionAllocationBytes& out, int64_t layer_lo, int64_t layer_hi) {
     out = {};
