@@ -667,6 +667,14 @@ is startup-only. PLE direct cache/inflight storage or full mmap/locked GGUF page
 prefill staging and request handoffs are named separately. Locked PLE is still filesystem-backed and
 has a physical-host source-cache mirror; it is not eligible for clean-cache credit.
 
+Session pinned demand comes from `session_allocation_bytes` before allocation. It includes both QSA
+upload staging and the complete page-rounded host K/V backing selected by `--kv-resident`; FP16
+streaming changes placement, not the stored values. An explicit layer split sums the actual stage
+ranges instead of charging the whole model once per stage. A stage without a QSA layer still charges
+the allocator's fallback QSA state. Unsplit and unresolved automatic splits retain their conservative
+bound. Streamed K/V is not an additional unknown class: its allocator already supplies this price.
+Admission still refuses when the resulting pinned demand exceeds the host budget.
+
 Physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
 not physical-host telemetry. Already-resident QEMU backing is reflected in host MemAvailable, so the
 host scope charges unbacked guest allocation plus retained filesystem-source mirrors, without sharing

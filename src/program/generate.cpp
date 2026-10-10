@@ -3897,7 +3897,25 @@ int main(int argc, char** argv) {
             uploads.add(name, bytes, source, ByteMeaning::clean_file);
         };
         const uint64_t stage_count = split_real ? split_devs.size() + 1 : 1;
-        ram("session_host_pinned", byte_mul(stage_count, session_allocation.host_pinned), "SessionAllocationBytes per-stage QSA mapped staging bound");
+        uint64_t session_host_pinned = session_allocation.host_pinned;
+        if (split_real && !split_auto) {
+            session_host_pinned = 0;
+            int64_t lo = 0;
+            for (size_t stage = 0; stage < stage_count; ++stage) {
+                const int64_t hi = stage < split_at.size() ? split_at[stage] : g.n_layers;
+                strata::core::SessionAllocationBytes allocation;
+                if (!strata::core::session_allocation_bytes(g, o.max_context, K, allocation, lo, hi)) {
+                    std::fprintf(stderr, "strata generate: cannot price split stage's pinned session state\n");
+                    return 1;
+                }
+                session_host_pinned = byte_add(session_host_pinned, allocation.host_pinned);
+                lo = hi;
+            }
+        } else {
+            session_host_pinned = byte_mul(stage_count, session_host_pinned);
+        }
+        ram("session_host_pinned", session_host_pinned,
+            "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
             (uint64_t) g.n_qsa_layers() * strata::plan::kResidentQsaBytes), "ABI-checked owner/QSA envelopes");
         startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
@@ -4153,9 +4171,6 @@ int main(int argc, char** argv) {
                     byte_mul(byte_mul((uint64_t) g.n_embd, 4), stages - 1)),
                     "two Prefill mapped handoff buffers per stage boundary");
         }
-        if (o.kv_resident > 0 && o.max_context > o.kv_resident)
-            ram_unknown("streamed_kv_pinned",
-                "authoritative host K/V allocator size unavailable before qsa construction");
         ram("host_logits", n_vocab > 0 ? byte_mul((uint64_t) n_vocab, 4) : 0, "host logits vector");
         const char* grouped_env = std::getenv("STRATA_BATCH_MTP");
         const bool grouped_requested = o.batch_mtp || (grouped_env && grouped_env[0] && grouped_env[0] != '0');

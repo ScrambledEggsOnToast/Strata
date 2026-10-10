@@ -106,6 +106,24 @@ int main(int argc, char** argv) {
     qsa_set_kv_q4(false);
     qsa_set_kv_hybrid(false);
     qsa_set_kv_int8(false);
+    qsa_set_kv_resident(1);  // the allocator floors the requested residency to 20480 cells
+    ModelGeometry streamed;
+    SessionAllocationBytes stream_whole, stream_a, stream_b, stream_c;
+    check(session_allocation_bytes(streamed, 20480, 10, stream_whole) &&
+          stream_whole.host_pinned == 1392,
+          "context fitting the minimum residency allocates only QSA staging");
+    check(session_allocation_bytes(streamed, 20481, 10, stream_whole) &&
+          stream_whole.host_pinned == 503428464,
+          "first streamed cell charges twelve page-rounded FP16 copies and pinned staging");
+    check(session_allocation_bytes(streamed, 20481, 10, stream_a, 0, 13) &&
+          session_allocation_bytes(streamed, 20481, 10, stream_b, 13, 31) &&
+          session_allocation_bytes(streamed, 20481, 10, stream_c, 31, 48) &&
+          stream_a.host_pinned + stream_b.host_pinned + stream_c.host_pinned == stream_whole.host_pinned,
+          "split pinned demand covers each allocated QSA exactly once");
+    check(session_allocation_bytes(streamed, 20481, 10, stream_a, 0, 1) &&
+          stream_a.host_pinned == 41952372,
+          "stage without attention still charges its fallback QSA allocation");
+    qsa_set_kv_resident(0);
     SessionAllocationBytes whole, range;
     check(session_allocation_bytes(g, 65, 10, whole), "price without CUDA initialization");
     check(whole.device == session_bytes(g, 65, 10), "owner and external arena use identical pricing");
