@@ -830,7 +830,9 @@ void test_host_memory() {
     put("fs/box/memory.stat", "active_file 0\ninactive_file " + std::to_string(4 * GiB) +
                                   "\nfile " + std::to_string(4 * GiB) +
                                   "\nshmem 0\nunevictable 0\nfile_dirty 0\nfile_writeback 0\n");
-    require(probe("0::/box\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB, "v2 limit");
+    require(probe("0::/box\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB &&
+            m.physical_available == 100 * GiB,
+            "v2 worker headroom must not replace the physical-host availability reading");
     // and the same group with the counters the rule needs missing: refused, not credited from the three keys
     // the pre-merge fixture wrote
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
@@ -850,7 +852,8 @@ void test_host_memory() {
     put("fs/memory/memory.limit_in_bytes", "9223372036854771712\n");   // the root: unlimited
     put("fs/memory/memory.usage_in_bytes", std::to_string(50 * GiB) + "\n");
     require(probe("12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n1:name=systemd:/docker/abc\n") &&
-            m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "v1 limit");
+            m.available == 22 * GiB && m.cgroup_limit == 32 * GiB && m.physical_available == 100 * GiB,
+            "v1 worker headroom must not replace physical-host availability");
     put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
     // a v1 group not visible here (another namespace): MemAvailable alone

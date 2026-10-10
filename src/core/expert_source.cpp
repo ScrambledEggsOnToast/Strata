@@ -293,6 +293,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
+    m.physical_available = m.available;
     m.commit = (uint64_t) status.ullAvailPageFile;
     return m.available > 0;
 #elif defined(__linux__)
@@ -308,6 +309,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
+    m.physical_available = bytes;
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -379,6 +381,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     if (pages <= 0 || page_bytes <= 0 ||
         (uint64_t) pages > std::numeric_limits<uint64_t>::max() / (uint64_t) page_bytes) return false;
     m.available = (uint64_t) pages * (uint64_t) page_bytes;
+    m.physical_available = m.available;
     return m.available > 0;
 #endif
 }
@@ -388,11 +391,12 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
 // The header's `available_memory_bytes` (device.hpp of the admission gate keeps calling this name): one
 // host-RAM probe, upstream's #633 `detail::host_available_memory`, at this file's enclosing namespace so the
 // declared definition is the only one in scope.
-bool available_memory_bytes(uint64_t& bytes, uint64_t* commit) {
+bool available_memory_bytes(uint64_t& bytes, uint64_t* commit, uint64_t* physical_available) {
     detail::HostMemory m;
     if (!detail::host_available_memory(m)) return false;
     bytes = m.available;
     if (commit != nullptr) *commit = m.commit;
+    if (physical_available != nullptr) *physical_available = m.physical_available;
     return bytes > 0;
 }
 

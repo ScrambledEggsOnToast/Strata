@@ -54,7 +54,8 @@ struct LoadStats;
 /// MemAvailable clamped by the tightest finite cgroup-v2 ancestor after bounded clean-cache reclaim.
 /// Missing required counters fail closed. Explicit artifact working sets must still be budgeted by
 /// startup admission; this available-memory figure does not make mmap or shared allocations free.
-bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr);
+/// Optional physical_available reports the same probe's unclamped physical reading, not worker headroom.
+bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr, uint64_t* physical_available = nullptr);
 
 namespace detail {
 
@@ -83,6 +84,7 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
 /// and its ancestors, or v1 memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
 struct HostMemory {
     uint64_t available = 0;
+    uint64_t physical_available = 0;   ///< physical MemAvailable before any cgroup clamp
     uint64_t cgroup_limit = ~uint64_t{0};
     uint64_t commit = ~uint64_t{0};   ///< available Windows commit capacity; ~0 when not reported
 };

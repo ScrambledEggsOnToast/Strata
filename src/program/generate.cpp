@@ -4227,8 +4227,9 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        uint64_t local_available = 0;
-        const bool local_measured = strata::core::available_memory_bytes(local_available);
+        uint64_t local_available = 0, physical_available = 0;
+        const bool local_measured = strata::core::available_memory_bytes(
+            local_available, nullptr, o.host_native ? &physical_available : nullptr);
         HostAdmissionSnapshot external;
         bool external_measured = read_host_admission(external);
         if (o.host_native) {
@@ -4252,18 +4253,19 @@ int main(int argc, char** argv) {
                     path = path.parent_path();
                 }
             }
-            if (!local_measured || limit == UINT64_MAX || limit < (4ull << 30) ||
+            if (!local_measured || physical_available == 0 || limit == UINT64_MAX || limit < (4ull << 30) ||
                 !o.windowed_experts || !o.guest_opaque_allowance_bytes) {
                 std::fprintf(stderr, "strata generate: --host-native requires local memory telemetry, finite memory.max, windowed experts and opaque allowance\n");
                 return 1;
             }
-            external = {local_available, limit, limit, (uint64_t) o.host_reserve_mib << 20,
+            external = {physical_available, limit, limit, (uint64_t) o.host_reserve_mib << 20,
                         (uint64_t) o.guest_reserve_mib << 20, limit};
             // Direct host operation has no VM: `allocation`, `resident` and `worker_limit` are all
             // the enclosing cgroup's finite memory.max, so the guest scope is the launcher unit's
             // headroom and "guest_unbacked_allocation" is zero by construction. Anonymous demand is
             // host RAM here, so the host scope mirrors every class (mirror_all_into below) and the
-            // full peak must close against `local_available - host_reserve`.
+            // full peak must close against physical MemAvailable minus the host reserve. The
+            // separate local_available and worker-limit checks retain cgroup headroom and its reserve.
             external_measured = true;
 #else
             std::fprintf(stderr, "strata generate: --host-native requires Linux\n");

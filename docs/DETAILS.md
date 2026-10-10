@@ -677,7 +677,13 @@ slots: the maximum of allocator-derived main/ring prices bounds its staging and 
 host K/V copy, including independent main/ring placement overrides. Streamed K/V is not an additional
 unknown class. Admission still refuses when the resulting pinned demand exceeds the host budget.
 
-Physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
+On Linux `--host-native`, worker and physical-host ceilings are distinct. One memory probe retains
+both cgroup-clamped headroom and physical `MemAvailable`: the worker gate keeps its finite
+`memory.max` and local reserve, while the physical-host gate subtracts the host reserve from the
+unclamped physical reading. A process limit is not the machine's available RAM. Missing counters
+still refuse, and neither reserve nor enforced ceiling changes.
+
+In VM mode, physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
 not physical-host telemetry. Already-resident QEMU backing is reflected in host MemAvailable, so the
 host scope charges unbacked guest allocation plus retained filesystem-source mirrors, without sharing
 credit. Advisory release, unmap and close cannot reduce these envelopes. All derived byte arithmetic
