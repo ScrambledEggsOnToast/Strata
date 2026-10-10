@@ -3308,6 +3308,9 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
+    // slots' draft-KV copies use this one too
+    static const strata::core::ModelGeometry draft_geometry{};
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -3916,6 +3919,14 @@ int main(int argc, char** argv) {
         }
         ram("session_host_pinned", session_host_pinned,
             "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
+        if (!o.mtp.empty() && o.spec >= 2) {
+            // The working drafter is not a SessionOwner or a resident batch slot. Bound both
+            // main-mode and ring-mode placement, including their independent environment overrides.
+            ram("mtp_host_pinned", std::max(
+                strata::core::qsa_state_host_bytes(draft_geometry, o.max_context),
+                strata::core::qsa_state_host_bytes(draft_geometry, o.max_context, 1)),
+                "working MTP QSA staging and possible full-context pinned backing; allocator-derived bound");
+        }
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
             (uint64_t) g.n_qsa_layers() * strata::plan::kResidentQsaBytes), "ABI-checked owner/QSA envelopes");
         startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
@@ -5745,9 +5756,6 @@ int main(int argc, char** argv) {
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
-    // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
-    // slots' draft-KV copies use this one too
-    static const strata::core::ModelGeometry draft_geometry{};
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");

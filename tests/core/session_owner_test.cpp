@@ -123,6 +123,11 @@ int main(int argc, char** argv) {
     check(session_allocation_bytes(streamed, 20481, 10, stream_a, 0, 1) &&
           stream_a.host_pinned == 41952372,
           "stage without attention still charges its fallback QSA allocation");
+    qsa_set_kv_resident(65536);
+    check(qsa_state_host_bytes(streamed, 65536) == 116 &&
+          qsa_state_host_bytes(streamed, 65536, 32848) == 134218868 &&
+          qsa_state_host_bytes(streamed, 65536, 1) == 134218868,
+          "drafter ring charges full-context pinned backing even when main K/V is resident");
     qsa_set_kv_resident(0);
     SessionAllocationBytes whole, range;
     check(session_allocation_bytes(g, 65, 10, whole), "price without CUDA initialization");

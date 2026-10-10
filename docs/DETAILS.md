@@ -672,8 +672,10 @@ upload staging and the complete page-rounded host K/V backing selected by `--kv-
 streaming changes placement, not the stored values. An explicit layer split sums the actual stage
 ranges instead of charging the whole model once per stage. A stage without a QSA layer still charges
 the allocator's fallback QSA state. Unsplit and unresolved automatic splits retain their conservative
-bound. Streamed K/V is not an additional unknown class: its allocator already supplies this price.
-Admission still refuses when the resulting pinned demand exceeds the host budget.
+bound. The working MTP drafter is charged separately from those sessions and from resident batch
+slots: the maximum of allocator-derived main/ring prices bounds its staging and possible full-context
+host K/V copy, including independent main/ring placement overrides. Streamed K/V is not an additional
+unknown class. Admission still refuses when the resulting pinned demand exceeds the host budget.
 
 Physical-host ceilings require a protected fresh supervisor snapshot; local guest MemAvailable is
 not physical-host telemetry. Already-resident QEMU backing is reflected in host MemAvailable, so the
