@@ -220,7 +220,7 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
-- `--batch-groups` needs every stage on its own GPU. A pipelined slot is a conversation cache again (0.1.41): a request left alone in its slot goes back to the solo path with its drafts, as on one GPU.
+- `--batch-groups` needs every stage on its own GPU. A finished pipelined slot is **not** kept as a conversation cache here: the fork's resident lifecycle clears it (`resident.finish(slot, keep_cache=false)`), where upstream 0.1.41 makes a pipelined slot a cache again — its #857 rule ships with the pad-row invalidation that this fork's compacted group window does not have. Carrying that rule is a batching-lane port item, not a re-pin change.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 - Additional resident slots require fully resident FP16 KV; each requested slot is charged before allocation.
 

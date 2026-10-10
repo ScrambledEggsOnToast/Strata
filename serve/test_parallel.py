@@ -373,21 +373,28 @@ class ParallelService(unittest.TestCase):
 
     def test_a_burst_of_connections_is_not_reset(self):
         """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
-        server listens with a deep backlog (STRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
+        server listens with a deep backlog (STRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers.
+        This fork admits a bounded number of requests at once, so an answer may be a 429 refusal: what the deep
+        backlog has to deliver is that every connection is answered rather than reset or left hanging."""
         import serve.server as server
         self.assertGreaterEqual(server.Server.request_queue_size, 64)
         self.start(2)
-        errs, ok = [], []
+        errs, ok, refused = [], [], []
         def one(i):
             try:
                 self.chat(f"burst {i}", max_tokens=8)
                 ok.append(i)
+            except urllib.error.HTTPError as e:
+                refused.append(e.code)
             except Exception as e:                      # noqa: BLE001
                 errs.append(repr(e))
         th = [threading.Thread(target=one, args=(i,)) for i in range(60)]
         for t in th: t.start()
         for t in th: t.join()
-        self.assertEqual((len(ok), errs[:2]), (60, []))
+        self.assertEqual(errs[:2], [])
+        self.assertEqual(len(ok) + len(refused), 60)
+        self.assertLessEqual(set(refused), {429}, refused)   # only the fork's bounded admission may refuse
+        self.assertGreater(len(ok), 0, 'a burst is still served, not only refused')
 
     def test_stop_strings_in_a_batch_slot(self):
         """#454: a stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""

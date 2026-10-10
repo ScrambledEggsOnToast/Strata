@@ -172,6 +172,7 @@ class QuietWaitPolicy(unittest.TestCase):
         engine.proc.stdin = io.StringIO()
         engine.lines = mock.Mock()
         engine.can_stop, engine.silence_s, engine.log_path = True, 10, None
+        engine.wlock = threading.Lock()     # _send writes under the engine's write lock (this instance skips __init__)
         now = [0.0]
 
         def clock():
@@ -218,7 +219,11 @@ class QuietWaitPolicy(unittest.TestCase):
                     heartbeats = list(gen)
                 self.assertEqual(heartbeats, [None, None], 'a quiet 21 seconds emits two heartbeats, not 42')
                 self.assertTrue(all(0 < wait <= .5 for wait in waits), 'cancellation uses bounded blocking waits')
-                engine._send.assert_not_called()
+                # The request itself goes out through _send (this fork's serialized write path) where upstream wrote
+                # the line raw: exactly that one announcement is expected, and nothing at all on the control-only
+                # path.  Heartbeats above are the generator's yields, never writes.
+                self.assertEqual(engine._send.call_args_list,
+                                 [mock.call('GEN 1 1')] if not control else [], 'polling writes nothing of its own')
                 self.assertNotIn('STOP', engine.proc.stdin.getvalue())
 
 

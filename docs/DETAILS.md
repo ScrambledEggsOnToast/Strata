@@ -572,7 +572,6 @@ AMD and Intel sysfs readers do not initialize NVML. Code embedding `serve()` mus
 `server_close()` on the returned HTTP server; code creating `Telemetry` directly must call its `close()`.
 Model unload alone leaves the HTTP server and its Monitor sampler running so loading again still works.
 
-**Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU).** With `"vram_elastic": true`
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
 [VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments

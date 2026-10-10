@@ -4537,13 +4537,10 @@ def make_handler(svc: Service):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
-            length = int(self.headers.get("Content-Length", 0))
-            if not 0 <= length <= svc.request_body_bytes:
-                raise AdmissionError("request body exceeds request_body_bytes", 413)
             self.body_read = True
             limit = body_limit()
             if self._chunked():
-                return self._read_chunked(limit)
+                return self._read_chunked(min(limit, svc.request_body_bytes))
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except ValueError:
@@ -4554,6 +4551,8 @@ def make_handler(svc: Service):
                 self.close_connection = True               # the body is not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
+            if length > svc.request_body_bytes:
+                raise AdmissionError("request body exceeds request_body_bytes", 413)
             timeout = self.connection.gettimeout()
             try:
                 self.connection.settimeout(svc.request_timeout_s)
