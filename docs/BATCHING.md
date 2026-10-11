@@ -360,9 +360,47 @@ two long conversations alternating through the HTTP server: the first turns took
 
 ## Testing
 
-In the Strata engine project, run GPU/model checks only through the protected external supervisor. The parent
-repository's `tools/het035-session/USAGE.txt` describes the bounded qualification vehicle and retained evidence.
-The scripts below document upstream interfaces; they do not authorize direct unsupervised GPU workloads.
+The parent project controls authorization and resource bounds for GPU/model checks. Its current host-only
+policy uses bounded normal-user runs with enforced memory ceilings; see `docs/03_BUILD_AND_BRINGUP.md`
+and ADR 0002 in the parent repository. The older `tools/het035-session/USAGE.txt` protected vehicle and its
+retained evidence describe historical qualification, not a requirement to restore VM-era infrastructure.
+
+### Mixed-residency lifecycle fixtures
+
+`conversation_snapshot_test` requires a CUDA device, but no model. It covers FP16, INT8, Q4_0 and
+K8V4 in resident, sparse-streamed and ring fixtures, including genuinely provisioned hybrid host
+K codes, K scales and V codes. It rejects each missing authoritative hybrid run before capture.
+The ring fixture exercises the raw hybrid allocator/mover contract; the process's MTP draft format
+under K8V4 remains whole INT8.
+
+The whole-session cases restore resident → streamed and streamed → resident snapshots into independent
+owners, compare every recurrent/indexer/main/draft payload, and compare authoritative fingerprints.
+Streamed destinations begin with empty maps; a second restore invalidates a deliberately primed outgoing
+map. Native allocator cases release and re-initialize the same arena for every format/residency pair,
+checking secondary handles, pinned accounting, fresh owner identity and restoration after re-init.
+
+`conversation_validation_test` and `conversation_transfer_test` need no GPU: their CUDA boundary wrappers
+exercise invalid images and failed transfers using host storage. They are not model execution evidence.
+
+The opt-in `STRATA_TEST_MIXED_RESIDENCY=1` block in `strata-resident-test` needs the full model, real MTP
+weights, a CUDA device and admitted two-slot startup with `--kv k8v4 --kv-resident 0
+--slot-kv-window 20480 --max-context 32768 --batch 2`. It temporarily binds the resident working session and
+one streamed slot as two stable, independent `Verifier` row owners. Real graph capture and replay are
+compared byte-for-byte against separate one-owner controls, including changed replay inputs, committed
+residuals, picks and GPU request canaries. Padding/finished/cancelled peers and all-inert windows must
+leave private state unchanged. Releasing/re-initializing batch graphs cannot free either owner's state.
+
+That fixture also marks all four real INT8 draft code/scale runs, saves to a host-backed ring, overwrites
+the resident working draft, and restores it without changing the peer draft. Its existing one-shot
+`cudaMemcpy` fault is injected after a real GDN transfer but before PLE completes: the failed target stays
+unavailable, the other owner stays byte-identical, and failed working restoration prevents further reuse.
+Run with a bounded deadline and the parent project's enforced host/GPU ceilings. The legacy
+`STRATA_SUPERVISED` test gate does not itself establish protected-supervisor evidence.
+
+`kv_stream_parity` remains supporting **single-sequence** kernel evidence. It does not qualify mixed
+row owners, independent requests, lifecycle transitions or concurrent HTTP serving.
+
+### Protocol-driving checks
 
 Four scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
 tests the server's side with a scripted engine (no GPU).

@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/program/session_fingerprint.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -58,8 +59,14 @@ struct Fixture {
         if (fmt==3) {
             sizes = {rows*per, rows*kv_q4_bytes_per_head((int)g.head_dim), rows*(g.head_dim/64)*2, 0,
                      (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
-            alloc(st.k_q,sizes[0]); alloc(st.v_q4,sizes[1]); alloc(st.k_scale,sizes[2]);
-            sources[0]=st.k_q; sources[1]=st.v_q4; sources[2]=st.k_scale;
+            alloc(st.k_q,slot_rows*per); alloc(st.v_q4,slot_rows*kv_q4_bytes_per_head((int)g.head_dim));
+            alloc(st.k_scale,slot_rows*(g.head_dim/64)*2);
+            if (mode) {
+                alloc(st.host.k_q,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);
+                alloc(st.host.k_scale,sizes[2],true);
+            }
+            sources[0]=mode?st.host.k_q:st.k_q; sources[1]=mode?st.host.v_q4:st.v_q4;
+            sources[2]=mode?st.host.k_scale:st.k_scale;
         } else if (fmt==kKvQ4) {
             alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
             if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
@@ -85,8 +92,13 @@ struct Fixture {
             m.page_table=st.page_table; m.n_blocks=st.n_pages; m.n_slots=st.n_slots;
             alloc(m.slot_block,st.n_slots*4); alloc(m.slot_stamp,st.n_slots*4); alloc(m.slot_ref,st.n_slots*4);
             alloc(m.miss_block,st.n_slots*4); alloc(m.miss_slot,st.n_slots*4); alloc(m.ctl,kKvCtlInts*4);
+            kv_stream_reset(m,nullptr);
         } else if (mode==2) {
             kv_ring_table(st.page_table,st.n_pages,st.n_slots,nullptr);
+        } else {
+            std::vector<int32_t> table(st.n_pages);
+            for (int32_t i=0;i<st.n_pages;++i) table[i]=i;
+            cuda_check(cudaMemcpy(st.page_table,table.data(),table.size()*4,cudaMemcpyHostToDevice));
         }
     }
     void fill(uint8_t salt) {
@@ -108,6 +120,57 @@ struct Fixture {
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
+}
+
+bool empty_map(const QsaState& st) {
+    std::vector<int32_t> table(st.n_pages), slots(st.n_slots);
+    cuda_check(cudaMemcpy(table.data(),st.map.page_table,table.size()*4,cudaMemcpyDeviceToHost));
+    cuda_check(cudaMemcpy(slots.data(),st.map.slot_block,slots.size()*4,cudaMemcpyDeviceToHost));
+    const auto counters=kv_stream_counters(st.map);
+    return std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}) &&
+           std::all_of(slots.begin(),slots.end(),[](int32_t x){return x==-1;}) &&
+           counters.calls==0 && counters.lookups==0 && counters.misses==0 && counters.overflow==0;
+}
+
+void release_reinit(int fmt, int mode) {
+    Fixture source(fmt,0);
+    source.fill(37);
+    const bool index=mode!=2;
+    std::string err;
+    ConversationKv image;
+    check(conversation_kv_save(image,source.state,source.g,9,index,err),"capture native release/re-init reference");
+    const int64_t cells=20484;
+    const auto placement=strata::plan::qsa_resolve_placement(qsa_real_shapes(),cells,mode?20480:0,mode==2?16:0,fmt);
+    const uint64_t bytes=qsa_state_bytes(source.g,cells,true,0,&placement);
+    const uint64_t pinned_before=qsa_kv_host_bytes();
+    void* arena=nullptr;
+    cuda_check(cudaMalloc(&arena,bytes));
+    QsaState state;
+    check(qsa_state_init(source.g,cells,arena,state,nullptr,0,&placement,bytes)==bytes,"real allocator initializes requested residency");
+    check(state.kv_mode==mode && qsa_kv_format(state)==fmt,"native main/ring format and residency match placement");
+    const uint64_t first_owner=state.allocation_id;
+    uint64_t fingerprint=0;
+    check(conversation_kv_restore(image,state,source.g,9,index,err) &&
+          conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"native owner restores all authoritative and ring bytes");
+    cuda_check(cudaDeviceSynchronize());
+    qsa_state_release(state);
+    check(!state.allocation_id && !state.host_allocation && !state.host_step && !state.host_pos &&
+          !state.host.present() && !state.max_cells && !state.map.page_table,"release clears all secondary allocations and map handles");
+    check(qsa_kv_host_bytes()==pinned_before,"release returns native pinned KV accounting");
+    qsa_state_release(state);
+    check(qsa_kv_host_bytes()==pinned_before,"repeated release is accounting-neutral");
+    check(qsa_state_init(source.g,cells,arena,state,nullptr,0,&placement,bytes)==bytes &&
+          state.allocation_id!=first_owner,"same arena re-initializes with a new owner");
+    qsa_state_zero(state,source.g,nullptr);
+    cuda_check(cudaDeviceSynchronize());
+    if (mode==1) check(empty_map(state),"re-initialized streamed owner starts with an empty map");
+    check(!conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"fresh owner does not inherit released payload");
+    check(conversation_kv_restore(image,state,source.g,9,index,err) &&
+          conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"saved state survives release and re-initialization");
+    cuda_check(cudaDeviceSynchronize());
+    qsa_state_release(state);
+    cuda_check(cudaFree(arena));
+    check(qsa_kv_host_bytes()==pinned_before,"re-initialized owner releases without a pinned leak");
 }
 
 void full_session(int fmt, int mode, int experts) {
@@ -149,6 +212,51 @@ void full_session(int fmt, int mode, int experts) {
     SavedConversation a,b,restored;
     check(conversation_snapshot_save(a,view,ss,g,draft.state,err),"capture complete A");
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
+    {
+        // Whole-session residency migration in both directions, including the
+        // process's actual draft format (INT8, not K8V4, for a hybrid main).
+        Fixture destination(fmt,1-mode), destination_draft(fmt==3?kKvInt8:fmt,mode?0:2);
+        destination.g=g;
+        SessionState target;
+        target.max_cells=ss.max_cells; target.qsa_states=&destination.state;
+        target.layer_hi=ss.layer_hi; target.gdn_alloc=ss.gdn_alloc; target.qsa_alloc=ss.qsa_alloc;
+        destination.alloc(target.gdn_state,sizes.gdn); destination.alloc(target.ple_hist,sizes.ple);
+        destination.alloc(destination.state.idx_tail,sizes.tail); destination.alloc(destination.state.idx_dead,sizes.dead);
+        destination.alloc(destination.state.idx_block_pos,sizes.block_pos);
+        destination.fill(177); destination_draft.fill(177);
+        for (const auto& [p,n] : std::array<std::pair<void*,size_t>,5>{
+                 {{target.gdn_state,sizes.gdn},{target.ple_hist,sizes.ple},{destination.state.idx_tail,sizes.tail},
+                  {destination.state.idx_dead,sizes.dead},{destination.state.idx_block_pos,sizes.block_pos}}})
+            cuda_check(cudaMemset(p,177,n));
+        if (!mode) check(empty_map(destination.state),"resident-to-streamed destination map is initially empty");
+        check(conversation_snapshot_restore(a,target,g,destination_draft.state,err)==ConversationRestore::restored,
+              mode?"streamed-to-resident complete snapshot":"resident-to-streamed complete snapshot");
+        SavedConversation migrated;
+        check(conversation_snapshot_save(migrated,view,target,g,destination_draft.state,err),"capture migrated complete session and draft");
+        check(migrated.live.gdn==a.live.gdn && migrated.live.ple==a.live.ple && migrated.live.tails==a.live.tails &&
+              migrated.live.dead==a.live.dead && migrated.live.block_pos==a.live.block_pos &&
+              equal(migrated.kv[0],a.kv[0]) && equal(migrated.kv.back(),a.kv.back()),
+              "residency migration preserves all main, recurrence, indexer and draft payloads");
+        uint64_t hash=0;
+        check(conversation_kv_verify(a.kv.back(),destination_draft.state,g,65,false,hash,err),
+              "draft migration verifies authoritative bytes and every restored ring run");
+        strata::program::SessionFingerprint before,after;
+        check(strata::program::session_fingerprint(ss,draft.state,g,65,before,err) &&
+              strata::program::session_fingerprint(target,destination_draft.state,g,65,after,err),
+              "fingerprint both sides of a residency migration");
+        check(before.gdn==after.gdn && before.ple==after.ple && before.tail==after.tail && before.dead==after.dead &&
+              before.kv==after.kv && before.pooled==after.pooled && before.pooled_full==after.pooled_full &&
+              before.draft==after.draft && before.stale==after.stale,"fingerprint reads each role's authoritative pools");
+        if (!mode) {
+            check(empty_map(destination.state),"restoring into an empty map leaves no stale resident pages");
+            const int32_t zero=0;
+            cuda_check(cudaMemcpy(destination.state.map.page_table,&zero,4,cudaMemcpyHostToDevice));
+            cuda_check(cudaMemcpy(destination.state.map.slot_block,&zero,4,cudaMemcpyHostToDevice));
+            check(!empty_map(destination.state),"outgoing destination map really has a resident page");
+            check(conversation_snapshot_restore(a,target,g,destination_draft.state,err)==ConversationRestore::restored &&
+                  empty_map(destination.state),"restore invalidates an outgoing destination residency map");
+        }
+    }
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
     {
@@ -275,17 +383,29 @@ int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
-        if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);
         if (fmt==3) {
+            // Keep the under-provisioned rejection checks, separately from the
+            // correctly backed hybrid owners exercised by the format/mode matrix.
             std::string err;
             ConversationKv invalid;
+            const auto backed=f.state.host;
+            f.state.host={};
             for (int unsupported : {1,2}) {
                 f.state.kv_mode=unsupported;
-                check(conversation_kv_bytes(f.state,f.g,9,true)==0,"hybrid streaming/ring rejected without block-mover abort");
-                check(!conversation_kv_save(invalid,f.state,f.g,9,true,err),"hybrid streaming/ring capture fails closed");
+                check(conversation_kv_bytes(f.state,f.g,9,true)==0,"hybrid streaming/ring rejected without authoritative backing");
+                check(!conversation_kv_save(invalid,f.state,f.g,9,true,err),"unbacked hybrid streaming/ring capture fails closed");
             }
-            f.state.kv_mode=0;
+            f.state.kv_mode=mode;
+            f.state.host=backed;
+            if (mode) for (int part : {0,1,2}) {
+                auto missing=f.state;
+                if (part==0) missing.host.k_q=nullptr;
+                if (part==1) missing.host.v_q4=nullptr;
+                if (part==2) missing.host.k_scale=nullptr;
+                check(conversation_kv_bytes(missing,f.g,9,mode!=2)==0,"hybrid missing host run is rejected before capture allocation");
+                check(!conversation_kv_save(invalid,missing,f.g,9,mode!=2,err),"hybrid capture requires each authoritative host run");
+            }
         }
         {
             std::string err;
@@ -342,8 +462,8 @@ int main() {
                 const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
                 const size_t block=kv_block_bytes(s,fmt)/2;
                 // Codes and scales are separate in INT8; check code bytes here.
-                const size_t code_block=fmt==kKvInt8 ? s.page_size*s.n_head_kv*s.head_dim : block;
-                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
+                const size_t code_block=(fmt==kKvInt8 || fmt==3) ? s.page_size*s.n_head_kv*s.head_dim : block;
+                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:(fmt==kKvInt8 || fmt==3)?(void*)f.state.k_q:(void*)f.state.k_pool;
                 std::vector<uint8_t> got(code_block);
                 for (int64_t page=b0;page<b1;++page) {
                     cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
@@ -373,6 +493,7 @@ int main() {
     }
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
-    for (int experts : {256,512}) full_session(3,0,experts);
+    for (int mode : {0,1}) for (int experts : {256,512}) full_session(3,mode,experts);
+    for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvHybrid}) for (int mode : {0,1,2}) release_reinit(fmt,mode);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

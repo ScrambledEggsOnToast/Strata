@@ -27,8 +27,8 @@ bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
 
 bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
     if (!valid_extent(st, upto, error)) return false;
-    if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
-        error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
+    if (st.kv_hybrid && (st.kv_q4 || st.kv_int8)) {
+        error = "conversation snapshot: hybrid K8V4 needs distinct format flags";
         return false;
     }
     const auto s = strata::kernels::qsa_real_shapes();
@@ -44,7 +44,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // Include the moving spare row, not only completed blocks. The checkpoint
     // restore reconstructs that row when rewinding to an earlier prefix.
     const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
-    // Format 3 identifies snapshot K8V4 only; never pass it to the block movers.  Rotated INT8 K/V (#293,
+    // Format 3 identifies snapshot K8V4 and the block movers' three-run hybrid layout. Rotated INT8 K/V (#293,
     // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
@@ -101,11 +101,19 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
         }
     }
     if (st.kv_mode == 2 && (!st.page_table ||
-        (st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
-                                                    : !st.k_pool || !st.v_pool))) {
+        (st.kv_hybrid ? !st.k_q || !st.v_q4 || !st.k_scale :
+         st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
+                                                                   : !st.k_pool || !st.v_pool))) {
         error = "conversation snapshot: invalid draft ring";
         return false;
     }
+    const auto authoritative = pools(st);
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !authoritative[i]) {
+            error = "conversation snapshot: missing authoritative state buffer";
+            return false;
+        }
     return true;
 }
 

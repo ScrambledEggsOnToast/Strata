@@ -131,7 +131,8 @@
 #ifdef STRATA_RESIDENT_MODEL_TEST
 int resident_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
                           const strata::core::ModelGeometry&, strata::core::SessionState&,
-                          strata::core::SessionState&, strata::core::SessionState&, strata::core::MtpDrafter&);
+                          strata::core::SessionState&, strata::core::SessionState&, strata::core::MtpDrafter&,
+                          strata::core::Verifier&, strata::core::PoolMultiFn, void*);
 #endif
 #ifdef STRATA_RESIDENCY_MODEL_TEST
 #include "strata/platform/protected_test.hpp"
@@ -9035,7 +9036,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "resident model tests require protected single-device two-slot startup\n");
             return 1;
         }
-        return resident_model_checks(resident, drive.d, g, ss, bslot_ss[0][0]->state(), bslot_ss[0][1]->state(), mtp);
+        ver.set_split(o.spec_split);
+        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        return resident_model_checks(resident, drive.d, g, ss, bslot_ss[0][0]->state(), bslot_ss[0][1]->state(),
+                                     mtp, ver, &drive_pool_multi, &drive);
 #endif
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();

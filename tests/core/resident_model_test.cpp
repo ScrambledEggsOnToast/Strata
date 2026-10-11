@@ -7,13 +7,25 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
 #include <cuda_runtime.h>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 void* fail_destination = nullptr;
 bool transfer_failed = false;
+
+bool same_snapshot(const strata::core::SavedConversation& a, const strata::core::SavedConversation& b) {
+    if (a.live.ids!=b.live.ids || a.live.gdn!=b.live.gdn || a.live.ple!=b.live.ple ||
+        a.live.tails!=b.live.tails || a.live.dead!=b.live.dead || a.live.block_pos!=b.live.block_pos ||
+        a.kv.size()!=b.kv.size()) return false;
+    for (size_t i=0;i<a.kv.size();++i)
+        if (a.kv[i].k!=b.kv[i].k || a.kv[i].v!=b.kv[i].v || a.kv[i].k_scale!=b.kv[i].k_scale ||
+            a.kv[i].v_scale!=b.kv[i].v_scale || a.kv[i].pooled!=b.kv[i].pooled) return false;
+    return true;
+}
 }
 extern "C" cudaError_t __real_cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size, cudaMemcpyKind kind) {
@@ -28,7 +40,8 @@ extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size
 int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
                           const strata::core::ModelGeometry& geometry, strata::core::SessionState& main,
                           strata::core::SessionState& a, strata::core::SessionState& b,
-                          strata::core::MtpDrafter& draft) {
+                          strata::core::MtpDrafter& draft, strata::core::Verifier& verifier,
+                          strata::core::PoolMultiFn pool, void* pool_user) {
     using namespace strata;
     std::string error;
     int checks = 0;
@@ -37,6 +50,197 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
     };
     try {
+        if (std::getenv("STRATA_TEST_MIXED_RESIDENCY")) {
+            // Exercise the production Verifier, not a single-sequence parity
+            // kernel or a hand-written imitation of its row compaction.
+            require(main.qsa_alloc>0 && main.qsa_states[main.qsa_primary()].kv_mode==0 &&
+                    a.qsa_states[a.qsa_primary()].kv_mode==1 && b.qsa_states[b.qsa_primary()].kv_mode==1,
+                    "mixed fixture needs resident working state and streamed slots");
+            const std::vector<int32_t> prefix{11,22};
+            const std::vector<core::ConversationImageKey> images;
+            const std::vector<core::ConversationCheckpoint> checkpoints;
+            auto capture = [&](core::SessionState& state, const std::vector<int32_t>& ids) {
+                core::SavedConversation saved;
+                require(core::conversation_snapshot_save(saved,{ids,images,checkpoints,true},state,geometry,nullptr,error),
+                        "capture complete real mixed-owner state");
+                return saved;
+            };
+            std::array<core::SavedConversation,2> opening{capture(main,prefix),capture(a,prefix)};
+            const std::array<int32_t,2> previous{main.ple_prev[0],main.ple_prev[1]};
+            const auto old_plan=dispatch.plan;
+            const auto old_generation=dispatch.request_generation;
+            const std::array<uint64_t,2> old_requests{dispatch.slot_requests[0],dispatch.slot_requests[1]};
+            require(owner.release_resources(error),"release original batch bindings before mixed-owner binding");
+            require(verifier.init_slots({&main,&a},error),"bind resident and streamed owners in one real verifier");
+            kernels::SamplerParams sampling;
+            sampling.greedy=true; sampling.temperature=0; sampling.penalty_last_n=0; sampling.seed=17;
+            auto bind = [&] {
+                for (int slot=0;slot<2;++slot) {
+                    dispatch.slot_requests[slot]=1000+slot;
+                    require(verifier.set_slot_context(slot,dispatch.slot_requests[slot],sampling,&prefix,true,error),
+                            "bind independent real mixed-row identities");
+                }
+                dispatch.request_generation=1000;
+                dispatch.plan=verifier.plan_sink();
+            };
+            bind();
+            auto reset = [&] {
+                require(verifier.context_idle(error),"drain mixed window before restoring its opening state");
+                require(core::conversation_snapshot_restore(opening[0],main,geometry,nullptr,error)==core::ConversationRestore::restored &&
+                        core::conversation_snapshot_restore(opening[1],a,geometry,nullptr,error)==core::ConversationRestore::restored,
+                        "restore both mixed owners independently");
+            };
+            struct Observed {
+                std::array<core::SavedConversation,2> state;
+                std::array<std::vector<float>,2> residual;
+                std::array<int32_t,2> picks{-1,-1};
+            };
+            auto window = [&](const std::vector<int>& slots, const std::array<int32_t,2>& tokens,
+                              core::BatchRowMask other_mask) {
+                core::BatchRow rows[2];
+                int32_t output[2]={-7,-7};
+                std::array<bool,2> active{};
+                for (size_t t=0;t<slots.size();++t) {
+                    const int slot=slots[t];
+                    auto& row=rows[t];
+                    row.slot=slot; row.state=slot?&a:&main; row.request_id=1000+slot;
+                    row.cancellation_generation=row.request_id; row.token=tokens[slot];
+                    row.position=2; row.sequence_end=3; row.output_offset=(int)t;
+                    row.mask=core::BatchRowMask::active;
+                    active[slot]=true;
+                }
+                int count=(int)slots.size();
+                if (count==1) {
+                    rows[1].slot=1-slots[0]; rows[1].state=slots[0]?&main:&a;
+                    rows[1].mask=other_mask; rows[1].output_offset=1; count=2;
+                }
+                if (!count) {
+                    for (int slot=0;slot<2;++slot) {
+                        rows[slot].slot=slot; rows[slot].state=slot?&a:&main;
+                        rows[slot].mask=other_mask; rows[slot].output_offset=slot;
+                    }
+                    count=2;
+                }
+                require(verifier.run_slot_rows(rows,count,pool,pool_user,output,error) &&
+                        verifier.commit_slots(error) && verifier.context_idle(error) && !dispatch.failed,
+                        "bounded production mixed window executes and commits");
+                Observed observed;
+                for (int slot=0;slot<2;++slot) {
+                    auto ids=prefix;
+                    if (active[slot]) ids.push_back(tokens[slot]);
+                    observed.state[slot]=capture(slot?a:main,ids);
+                }
+                for (size_t t=0;t<slots.size();++t) {
+                    const int slot=slots[t];
+                    observed.picks[slot]=output[t];
+                    observed.residual[slot].resize((size_t)geometry.hc*geometry.n_embd);
+                    require(cudaMemcpy(observed.residual[slot].data(),verifier.final_R((int)t),
+                                       observed.residual[slot].size()*4,cudaMemcpyDeviceToHost)==cudaSuccess,
+                            "read the actual committed row residual");
+                    require(verifier.validated_slot_request_id(slot)==1000+(uint64_t)slot,
+                            "GPU commit canary validates the mixed row's owner");
+                }
+                if (slots.size()==1) require(output[1]==-1,"inactive or cancelled row never produces an output");
+                if (slots.empty()) require(output[0]==-1 && output[1]==-1,"all-inert mixed window produces no outputs");
+                return observed;
+            };
+            auto matches = [&](const Observed& got, const Observed& expected, int slot) {
+                require(same_snapshot(got.state[slot],expected.state[slot]) &&
+                        got.picks[slot]==expected.picks[slot] && got.residual[slot]==expected.residual[slot],
+                        "mixed graph agrees byte-for-byte with the independent owner window");
+            };
+            const std::array<int32_t,2> first{33,44}, second{55,66};
+            reset();
+            const auto solo0=window({0},first,core::BatchRowMask::padding);
+            require(same_snapshot(solo0.state[1],opening[1]),"unselected streamed owner stays unchanged");
+            reset();
+            const auto solo1=window({1},first,core::BatchRowMask::padding);
+            require(same_snapshot(solo1.state[0],opening[0]),"unselected resident owner stays unchanged");
+            reset();
+            const size_t before=verifier.batch_resources().graph_keys;
+            const auto captured=window({1,0},first,core::BatchRowMask::padding);
+            const size_t captured_keys=verifier.batch_resources().graph_keys;
+            require(captured_keys==before+1,"mixed row order captures exactly one new window/commit key");
+            matches(captured,solo0,0); matches(captured,solo1,1);
+            require(captured.residual[0]!=captured.residual[1],"distinct owners/tokens yield distinct actual residuals");
+            reset();
+            const auto replayed=window({1,0},first,core::BatchRowMask::padding);
+            require(verifier.batch_resources().graph_keys==captured_keys,"second mixed window replays the retained graph");
+            matches(replayed,captured,0); matches(replayed,captured,1);
+            reset();
+            const auto next0=window({0},second,core::BatchRowMask::padding);
+            reset();
+            const auto next1=window({1},second,core::BatchRowMask::padding);
+            reset();
+            const auto changed=window({1,0},second,core::BatchRowMask::padding);
+            require(verifier.batch_resources().graph_keys==captured_keys,"changed tokens reuse the same mixed graph");
+            matches(changed,next0,0); matches(changed,next1,1);
+            require(changed.residual[0]!=captured.residual[0] && changed.residual[1]!=captured.residual[1],
+                    "replay reads new row inputs rather than capture-time tokens");
+            for (auto mask : {core::BatchRowMask::padding,core::BatchRowMask::finished,core::BatchRowMask::cancelled})
+                for (int active : {0,1}) {
+                    reset();
+                    const auto inert=window({active},first,mask);
+                    matches(inert,active?solo1:solo0,active);
+                    require(same_snapshot(inert.state[1-active],opening[1-active]),
+                            "inactive/finished/cancelled peer keeps every private running and KV byte");
+                }
+            for (auto mask : {core::BatchRowMask::padding,core::BatchRowMask::finished,core::BatchRowMask::cancelled}) {
+                reset();
+                const size_t keys=verifier.batch_resources().graph_keys;
+                const auto inert=window({},first,mask);
+                require(same_snapshot(inert.state[0],opening[0]) && same_snapshot(inert.state[1],opening[1]) &&
+                        verifier.batch_resources().graph_keys==keys,"all-inert mixed window neither mutates owners nor captures a graph");
+            }
+            reset();
+            require(verifier.release_batch_resources(error),"release real mixed-owner graphs and scratch");
+            require(verifier.n_slots()==0 && verifier.batch_resources().graph_keys==0 &&
+                    verifier.batch_resources().device_bytes==0 && verifier.batch_resources().pinned_bytes==0,
+                    "release retires every mixed graph and batch allocation");
+            require(same_snapshot(capture(main,prefix),opening[0]) && same_snapshot(capture(a,prefix),opening[1]),
+                    "batch release preserves both residency owners' private state");
+            require(verifier.init_slots({&main,&a},error),"re-initialize the same stable mixed owners");
+            bind();
+            const auto reinitialized=window({1,0},first,core::BatchRowMask::padding);
+            matches(reinitialized,captured,0); matches(reinitialized,captured,1);
+            reset();
+            require(verifier.release_batch_resources(error),"retire temporary mixed owner bindings");
+            dispatch.plan=old_plan; dispatch.request_generation=old_generation;
+            dispatch.slot_requests[0]=old_requests[0]; dispatch.slot_requests[1]=old_requests[1];
+            main.ple_prev[0]=previous[0]; main.ple_prev[1]=previous[1];
+            require(owner.init_resources(error),"rebind original resident lifecycle owner");
+            std::printf("MIXED_RESIDENCY_WINDOWS capture=1 replay=2 inactive=2 finished=2 cancelled=2 all_inert=3 reinitialized=1 failures=0\n");
+            require(draft.slot_state(0) && draft.slot_state(1) && draft.kv_state().kv_mode==0 &&
+                    draft.slot_state(0)->kv_mode==2 && draft.kv_state().kv_int8 && draft.slot_state(0)->kv_int8,
+                    "hybrid process uses actual resident and ring INT8 draft states");
+            core::ConversationKv original,peer,marker,changed_draft;
+            require(core::conversation_kv_save(original,draft.kv_state(),geometry,2,false,error) &&
+                    core::conversation_kv_save(peer,*draft.slot_state(1),geometry,2,false,error),"capture real working and independent peer draft");
+            marker=original;
+            for (auto* part : {&marker.k,&marker.v,&marker.k_scale,&marker.v_scale})
+                require(part->visit(0,part->size(),[](uint8_t* p,size_t n,size_t){std::memset(p,0x3c,n);return true;}),
+                        "mark each real draft payload run");
+            require(core::conversation_kv_restore(marker,draft.kv_state(),geometry,2,false,error) &&
+                    draft.save_slot(0,2,error),"save marked working draft into host-backed slot ring");
+            uint64_t hash=0;
+            require(core::conversation_kv_verify(marker,*draft.slot_state(0),geometry,2,false,hash,error),
+                    "real draft save refills both codes and both scale runs of the ring");
+            changed_draft=marker;
+            for (auto* part : {&changed_draft.k,&changed_draft.v,&changed_draft.k_scale,&changed_draft.v_scale})
+                require(part->visit(0,part->size(),[](uint8_t* p,size_t n,size_t){std::memset(p,0x5a,n);return true;}),
+                        "replace working draft with distinct outgoing bytes");
+            require(core::conversation_kv_restore(changed_draft,draft.kv_state(),geometry,2,false,error) &&
+                    !core::conversation_kv_verify(marker,draft.kv_state(),geometry,2,false,hash,error),
+                    "draft restore fixture really overwrites the working payload");
+            require(draft.restore_slot(0,2,error) &&
+                    core::conversation_kv_verify(marker,draft.kv_state(),geometry,2,false,hash,error),
+                    "restore the saved ring draft over the overwritten resident working draft");
+            require(core::conversation_kv_verify(peer,*draft.slot_state(1),geometry,2,false,hash,error),
+                    "draft save/restore cannot alter the independent peer's payload");
+            require(core::conversation_kv_restore(original,draft.kv_state(),geometry,2,false,error) &&
+                    draft.save_slot(0,2,error),"restore original draft before resident lifecycle regressions");
+            std::puts("DRAFT_RESIDENCY_ROUNDTRIP working=resident slot=ring format=int8 failures=0");
+        }
         const uint64_t w4 = core::Verifier::planned_device_bytes(geometry, main.max_cells, 150000, 4);
         const uint64_t w8 = core::Verifier::planned_device_bytes(geometry, main.max_cells, 150000, 8);
         require(w4 > 0 && w8 > w4 && w8 != UINT64_MAX, "full eight-row verifier uses bounded actual arena sequence");
