@@ -667,6 +667,14 @@ is startup-only. PLE direct cache/inflight storage or full mmap/locked GGUF page
 prefill staging and request handoffs are named separately. Locked PLE is still filesystem-backed and
 has a physical-host source-cache mirror; it is not eligible for clean-cache credit.
 
+With `--trim-stage-weights`, native and canonical **device** allocations use each stage's
+layer subset, but host upload source pages cover the union of all stages. Shared PLE
+source tensors are counted once, not once per GPU. `NativeDense::planned_bytes` reports
+that whole-model payload union through its optional `source_bytes` output while its
+device-byte result remains stage-local; the independent GGUF-span consistency check
+still applies. Canonical source accounting likewise uses the pre-trim skip set, rather
+than treating the primary stage's subset as the whole process's upload demand.
+
 Session pinned demand comes from `session_allocation_bytes` before allocation. It includes both QSA
 upload staging and the complete page-rounded host K/V backing selected by `--kv-resident`; FP16
 streaming changes placement, not the stored values. An explicit layer split sums the actual stage
