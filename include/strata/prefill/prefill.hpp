@@ -194,6 +194,19 @@ public:
     /// Includes explicit CUDA allocations, not opaque driver/cuBLAS handle internals (price those separately).
     static bool allocation_needed(const core::ModelGeometry& g, const AllocationConfig& config,
                                   const kernels::cpu::ExpertLayout& experts, AllocationBytes& out, std::string& err);
+    /// FORK (HET-022): the exact device and pinned-host bytes ONE resident prompt helper needs for a chunk of
+    /// `chunk` tokens, from the same term sequence `set_prompt_helpers` allocates (the allocator checks itself
+    /// against this price, so a change to one cannot leave the other behind).  `p2p` selects the route the
+    /// declaration will get and `helper_device` the owner's own MMQ workspace (the same `mmq::device_config` /
+    /// `mmq::workspace_bytes` pair the allocator binds); `cap_rows` is the rows route's cap (the `!p2p` bound is
+    /// the chunk's own routing).  Charges no allocation and reads no SessionState, so admission can price the
+    /// helper before anything is created. Includes device and mapped-host bounds for one compact group per
+    /// expert; pageable grouping vectors stay within the caller's named per-owner runtime allowance.
+    /// The MMQ geometry is the current device's (the plan prices stages with their own device current).
+    static bool helper_allocation(const core::ModelGeometry& g, int64_t chunk, int64_t cap_rows, bool p2p,
+                                  int helper_device, bool resident_only, uint64_t& device_bytes,
+                                  uint64_t& host_bytes, std::string& err);
+
     /// `bytes_needed`'s body, callable without a session: one implementation, two callers.  `ring_slots_override`
     /// >= 0 prices that many ring slots instead of the engine's own choice, so admission can price the ring a
     /// configuration names (`allocation_config` snapshots it from ring_slots_for).
@@ -224,10 +237,41 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
-    /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
-    /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
-    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
+    /// The CUDA device this prompt path's buffers live on (-1 before `init`), for callers that price or route
+    /// work per stage.
+    int device() const;
+
+    /// FORK (HET-022): one RESIDENT EXPERT OWNER's geometry, as the prompt path needs it - the CUDA device its
+    /// cache lives on, that cache, and its (layer, expert) -> slot table.  A cache-backed descriptor, not a class:
+    /// core::PeerExperts (--peer-device) and core::RemoteExperts (--expert-cache-device1..3) both render it, so one
+    /// prompt path serves every resident owner.  `residency[l * n_expert + e]` is that cache's slot or -1.
+    struct PromptHelper {
+        int device = -1;
+        const core::ExpertCache* cache = nullptr;
+        const int32_t* residency = nullptr;
+        // Dedicated resident ownership: FP32 weighted partials, no weight streaming.
+        // False retains the existing peer tier's experimental transfer defaults.
+        bool resident_only = false;
+        // The owner must already have enabled access in both directions.
+        bool p2p_enabled = false;
+    };
+
+    /// multi-GPU (HET-022): listed owners compute each chunk's routed rows for the experts their cache holds.
+    /// Empty helpers means unassisted execution; a matched native helper-off control instead retains the owners
+    /// with execute=false. This stage's authoritative ids/weights/slot/src tables decide every routed row.
+    /// Resident owners apply those weights once and return FP32 partial sums for
+    /// the primary's final combine. Their expert weights remain in their own VRAM.
+    /// Dedicated remote owners use portable mapped host transport; a peer tier may
+    /// use P2P only when its owner has already enabled access in both directions.
+    /// One owner serves a layer at a time (the static residency decides which); several owners therefore serve
+    /// different layers, and every helper GPU among them does prompt expert work.  Buffers are allocated for
+    /// chunks of up to init's `chunk` tokens; call after `init` (the same allocator's sizes, not estimates).
+    /// execute=false records ownership for the matched native-grouped control
+    /// without allocating or launching helper work.
+    /// The caches/residency tables must remain valid and static until reset or replacement.
+    bool set_prompt_helpers(const std::vector<PromptHelper>& helpers, int64_t cap_rows, bool execute, std::string& err);
+    /// Read only after loading the native layout: this freezes the prompt's quantization plan on first use.
+    static bool native_grouped_enabled();
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
@@ -296,6 +340,9 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+    /// FORK (HET-022): allocate one resident owner's prompt helper (streams, events, compact MMQ buffers, mapped
+    /// host crossings) on its device and append it to the engaged set; false with `err` set when it cannot serve.
+    bool add_prompt_helper(const PromptHelper& owner, int64_t cap_rows, std::string& err);
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
 
     std::string next_err_;

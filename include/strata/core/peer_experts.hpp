@@ -51,6 +51,11 @@ public:
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
 
+    /// FORK (HET-022): the tier's cache and its residency table, so a prompt path can serve the experts the tier
+    /// holds through the same cache-backed descriptor as core::RemoteExperts (no per-use weight transfer).
+    const ExpertCache& cache() const { return cache_; }
+    const int32_t* residency() const { return res_.empty() ? nullptr : res_.data(); }
+
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
         const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];

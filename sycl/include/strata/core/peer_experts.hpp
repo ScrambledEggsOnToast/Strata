@@ -48,6 +48,8 @@ public:
     void close();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
+    const ExpertCache& cache() const { return cache_; }
+    const int32_t* residency() const { return res_.data(); }
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }

@@ -56,6 +56,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <charconv>
+#include <limits>
+#include <new>
 #include <type_traits>
 #include <immintrin.h>
 
@@ -277,6 +280,470 @@ const int64_t g_test_stall = [] {
 }();
 }  // namespace
 
+// HET-033 is a bounded observation of an existing serial window, not a helper
+// scheduler. Raw GPU clocks stay raw; consumers must use BOTH measured brackets.
+namespace {
+constexpr size_t kCausalDevices = 8, kCausalBusy = 48 * kCausalDevices;
+char g_causal_uuid[kCausalDevices][41] = {};
+bool g_causal_helper[kCausalDevices] = {};
+int g_causal_devices = 0;
+bool g_causal_registry = false;
+bool g_causal_complete = false;
+thread_local Verifier* g_causal_current = nullptr;
+
+bool causal_integer(const char* name, uint64_t& value) {
+    const char* text = std::getenv(name);
+    if (!text || !*text) return false;
+    const auto p = std::from_chars(text, text + std::strlen(text), value);
+    return p.ec == std::errc{} && *p.ptr == '\0' && value > 0 && value <= INT64_MAX;
+}
+void causal_json_string(FILE* f, const char* text) {
+    std::fputc('"', f);
+    for (const unsigned char* p = (const unsigned char*) text; *p; ++p) {
+        if (*p == '"' || *p == '\\') std::fputc('\\', f);
+        if (*p < 32) std::fprintf(f, "\\u%04x", *p);
+        else std::fputc(*p, f);
+    }
+    std::fputc('"', f);
+}
+struct CausalScope {
+    Verifier* previous;
+    explicit CausalScope(Verifier* current) : previous(g_causal_current) { g_causal_current = current; }
+    ~CausalScope() { g_causal_current = previous; }
+};
+}
+
+struct Verifier::CausalCapture {
+    char prefix[512] = {};
+    uint64_t request = 0, window = 0, replay_limit_ns = 0;
+    int T = 0;
+    bool selected = false, finished = false, written = false, invalid_helper = false;
+    int64_t host_start = 0, host_end = 0, observation_end = 0;
+    int64_t preparation_start = 0, preparation_end = 0;
+    bool preparation_warm = false;
+    struct Correlation { int64_t before = 0, after = 0; unsigned long long gpu = 0; } correlation[2];
+    struct Busy {
+        int device = -1;
+        int64_t layer = 0, tokens = 0, entries = 0, start = 0, end = 0;
+    } busy[kCausalBusy];
+    bool helper_seen[48][kCausalDevices] = {};
+    size_t n_busy = 0;
+    struct Operation {
+        const char* name = nullptr;
+        int64_t start = 0, end = 0, layer = -1;
+        int previous = -1, gpu_completion_stamp = -1;
+        bool blocking = false;
+    } operations[48 * 8 + 32];
+    size_t n_operations = 0;
+};
+
+uint64_t Verifier::planned_causal_host_bytes(const ModelGeometry& g, int64_t k) {
+    if (g.n_layers <= 0 || g.n_layers > 48 || g.n_embd <= 0 || g.n_embd > 8192 || k <= 0 || k > 64)
+        return UINT64_MAX;
+    // Route storage is charged here even when it reuses the session-row observer.
+    // One fixed record array and bounded paths/stdio workspace; no per-window growth.
+    return (uint64_t) g.n_layers * strata::kernels::kVerifyMaxT *
+               ((uint64_t) g.n_embd * sizeof(float) + (uint64_t) k * 8) +
+           sizeof(CausalCapture) + (64ull << 10);
+}
+
+bool Verifier::configure_causal_helpers(const int* devices, size_t count, std::string& err) {
+    if (!std::getenv("STRATA_CROSS_HELP_CAPTURE")) return true;
+#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
+    err = "cross-help capture: CUDA GPU globaltimer/UUID correlation is required";
+    return false;
+#else
+    if (count > kCausalDevices || (count && !devices) ||
+        cudaGetDeviceCount(&g_causal_devices) != cudaSuccess ||
+        g_causal_devices <= 0 || g_causal_devices > (int) kCausalDevices) {
+        err = "cross-help capture: visible GPU/helper inventory exceeds the bounded eight-device surface";
+        return false;
+    }
+    for (int d = 0; d < g_causal_devices; ++d) {
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, d) != cudaSuccess) {
+            err = "cross-help capture: actual device UUID is unavailable"; return false;
+        }
+        char* p = g_causal_uuid[d];
+        std::memcpy(p, "GPU-", 4); p += 4;
+        for (int i = 0; i < 16; ++i) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) *p++ = '-';
+            std::snprintf(p, 3, "%02x", (unsigned char) properties.uuid.bytes[i]); p += 2;
+        }
+        *p = '\0';
+        g_causal_helper[d] = false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (devices[i] < 0 || devices[i] >= g_causal_devices || g_causal_helper[devices[i]]) {
+            err = "cross-help capture: helper registry has an invalid or duplicate device"; return false;
+        }
+        g_causal_helper[devices[i]] = true;
+    }
+    g_causal_registry = true;
+    return true;
+#endif
+}
+
+bool Verifier::causal_capture_complete() { return g_causal_complete; }
+
+bool Verifier::causal_observation_active() {
+    return g_causal_current && g_causal_current->causal_ && g_causal_current->causal_->selected &&
+           !g_causal_current->causal_->finished;
+}
+
+void Verifier::observe_helper_busy(int device, int64_t layer, int64_t tokens, int64_t entries,
+                                  int64_t start_ns, int64_t end_ns) {
+    if (!causal_observation_active()) return;
+    auto& c = *g_causal_current->causal_;
+    if (device < 0 || device >= g_causal_devices || !g_causal_helper[device] ||
+        c.n_busy == kCausalBusy || entries < 0 || tokens != c.T ||
+        layer < g_causal_current->lb_ || layer >= g_causal_current->le_ || start_ns <= 0 || end_ns < start_ns) {
+        c.invalid_helper = true; return;
+    }
+    c.helper_seen[(size_t) layer][device] = true;
+    if (!entries) return;
+    c.busy[c.n_busy++] = {device, layer, tokens, entries, start_ns, end_ns};
+}
+
+int64_t Verifier::causal_now() const {
+    return causal_ && causal_->selected && !causal_->written ? trace_now_ns() : 0;
+}
+
+void Verifier::causal_operation(const char* name, int64_t start, int64_t end, int64_t layer,
+                                bool blocking, int gpu_completion_stamp) {
+    if (!start || !causal_ || !causal_->selected || causal_->written) return;
+    auto& c = *causal_;
+    if (end < start || c.n_operations >= sizeof(c.operations) / sizeof(c.operations[0])) {
+        c.invalid_helper = true; return;
+    }
+    const int previous = c.n_operations ? (int) c.n_operations - 1 : -1;
+    c.operations[c.n_operations++] = {name, start, end, layer, previous, gpu_completion_stamp, blocking};
+}
+
+bool Verifier::causal_correlate(int which, std::string& err) {
+    auto& b = causal_->correlation[which];
+    const int at = (int) (g_->n_layers * kProfPer + 2);
+    b.before = trace_now_ns();
+    strata::kernels::gpu_stamp(prof_, at, cs_);
+    const cudaError_t launch = cudaGetLastError();
+    const cudaError_t sync = launch == cudaSuccess ? cudaStreamSynchronize(cs_) : launch;
+    b.after = trace_now_ns();
+    causal_operation(which ? "clock-bracket-after" : "clock-bracket-before", b.before, b.after, -1, true);
+    const int64_t readback_start = causal_now();
+    const cudaError_t copied = sync == cudaSuccess
+        ? cudaMemcpy(&b.gpu, prof_ + at, sizeof b.gpu, cudaMemcpyDeviceToHost) : sync;
+    causal_operation("clock-anchor-readback", readback_start, causal_now());
+    if (sync != cudaSuccess || copied != cudaSuccess || b.gpu == 0 || b.gpu > INT64_MAX || b.after < b.before) {
+        err = "cross-help capture: measured GPU-to-host monotonic correlation failed"; return false;
+    }
+    return true;
+}
+
+bool Verifier::causal_begin(int T, std::string& err) {
+    if (causal_ && causal_->selected && !causal_->written) {
+        err = "cross-help capture: an earlier selected window was not completely emitted; restart the engine";
+        return false; // never mix a later request's buffers with the failed window's stamps/binding
+    }
+    if (!causal_ || causal_->written || !head_sampling_ || request_id_ != causal_->request) return true;
+    if (++causal_request_windows_ != causal_->window) return true;
+    if (!g_causal_registry || !prof_on_ || !h_route_trace_ || !causal_x_h_ || split_ || batch_rec_ ||
+        !slots_.empty() || ext_stream_) {
+        err = "cross-help capture: complete serial stamps, routing, input and helper observations are required";
+        return false;
+    }
+    auto& c = *causal_;
+    c.selected = true; c.T = T; c.n_busy = 0; c.invalid_helper = false;
+    causal_operation("prepare-stage", c.preparation_start, c.preparation_end, -1, true);
+    const int64_t reset_start = causal_now();
+    const cudaError_t reset = cudaMemsetAsync(prof_, 0, planned_profile_bytes(*g_), cs_);
+    causal_operation("profile-reset-submit", reset_start, causal_now());
+    if (reset != cudaSuccess) { err = "cross-help capture: profile reset submission failed"; return false; }
+    if (!causal_correlate(0, err)) return false;
+    // Sentinels are refusals if any real row is not subsequently overwritten.
+    const int64_t clear_start = causal_now();
+    std::memset(h_route_trace_, 0xff, (size_t) g_->n_layers * strata::kernels::kVerifyMaxT * ss_->k * 8);
+    std::memset(causal_x_h_, 0xff, (size_t) (le_ - lb_) * max_t_ * g_->n_embd * sizeof(float));
+    causal_operation("capture-row-reset", clear_start, causal_now());
+    c.host_start = trace_now_ns();
+    return true;
+}
+
+bool Verifier::causal_finish(std::string& err) {
+    if (!causal_ || !causal_->selected || causal_->finished) return true;
+    auto& c = *causal_;
+    c.host_end = trace_now_ns();
+    const int64_t readback_start = causal_now();
+    const cudaError_t copied = cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+    causal_operation("profile-readback", readback_start, causal_now());
+    if (c.invalid_helper || copied != cudaSuccess || !causal_correlate(1, err)) {
+        if (err.empty()) err = "cross-help capture: helper observation or timestamp readback is incomplete";
+        return false;
+    }
+    c.observation_end = trace_now_ns();
+    const auto& a = c.correlation[0]; const auto& b = c.correlation[1];
+    const int64_t lo = std::max(a.before - (int64_t) a.gpu, b.before - (int64_t) b.gpu);
+    const int64_t hi = std::min(a.after - (int64_t) a.gpu, b.after - (int64_t) b.gpu);
+    if (lo > hi || b.gpu <= a.gpu) {
+        err = "cross-help capture: the two measured clock brackets have no common ns-rate offset"; return false;
+    }
+    auto stamp = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+    unsigned long long prev = stamp(g_->n_layers, 3);
+    if (!prev) { err = "cross-help capture: GPU window start is missing"; return false; }
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (!ar_on()) for (int d = 0; d < g_causal_devices; ++d) {
+            if (g_causal_helper[d] && !c.helper_seen[(size_t) l][d]) {
+                err = "cross-help capture: a configured helper lacks dispatch/drain observation for this layer";
+                return false;
+            }
+        }
+        for (int i : {0, 25, 17, 18, 19, 20, 24}) {
+            const auto value = stamp(l, i);
+            if (!value || value < prev || value > INT64_MAX) {
+                err = "cross-help capture: required layer stamp is absent or out of stream order"; return false;
+            }
+            prev = value;
+        }
+        for (int t = 0; t < c.T; ++t) {
+            const auto* ids = (const int32_t*) h_route_trace_ + (size_t) (l * strata::kernels::kVerifyMaxT + t) * ss_->k * 2;
+            const auto* weights = (const float*) (ids + ss_->k);
+            double weight_sum = 0;
+            for (int64_t k = 0; k < ss_->k; ++k) {
+                if (ids[k] < 0 || ids[k] >= g_->n_expert || !std::isfinite(weights[k]) || weights[k] < 0) {
+                    err = "cross-help capture: actual routed IDs/weights are incomplete"; return false;
+                }
+                weight_sum += weights[k];
+                for (int64_t j = 0; j < k; ++j) if (ids[k] == ids[j]) {
+                    err = "cross-help capture: actual routing contains duplicate expert IDs"; return false;
+                }
+            }
+            if (!std::isfinite(weight_sum) || weight_sum <= 0) {
+                err = "cross-help capture: actual routed weights have no positive finite mass"; return false;
+            }
+            const float* x = causal_x_h_ + (size_t) ((l - lb_) * max_t_ + t) * g_->n_embd;
+            for (int64_t j = 0; j < g_->n_embd; ++j) if (!std::isfinite(x[j])) {
+                err = "cross-help capture: actual MoE input row is missing or nonfinite"; return false;
+            }
+        }
+    }
+    if (ar_on() && ss_->ple.ready() && ple_stage()) {
+        const auto released = stamp(g_->n_layers, 5);
+        if (!released || released < stamp(1, 0) || released > stamp(1, 25)) {
+            err = "cross-help capture: actual PLE release stamp is absent or out of order";
+            return false;
+        }
+    }
+    if (le_ == g_->n_layers) {
+        for (int i : {0, 1}) {
+            const auto value = stamp(g_->n_layers, i);
+            if (!value || value < prev) { err = "cross-help capture: head stamps are incomplete"; return false; }
+            prev = value;
+        }
+    }
+    const auto end = stamp(g_->n_layers, 4);
+    if (!end || end < prev || end > INT64_MAX) { err = "cross-help capture: GPU window end is missing"; return false; }
+    c.finished = true;
+    return true;
+}
+
+bool Verifier::causal_write_window(std::string& err) {
+    if (!causal_ || !causal_->selected || causal_->written || lb_ != 0) return true;
+    const int64_t phase_end = trace_now_ns();
+    bool observed_devices[kCausalDevices] = {};
+    for (Verifier* v = this; v; v = v->next_) {
+        if (!v->causal_ || !v->causal_->finished || v->causal_->invalid_helper || v->causal_->T != causal_->T ||
+            v->causal_->request != causal_->request || v->causal_->window != causal_->window ||
+            v->device_ < 0 || v->device_ >= g_causal_devices || observed_devices[v->device_]) {
+            err = "cross-help capture: a serial stage did not observe the bound window"; return false;
+        }
+        observed_devices[v->device_] = true;
+    }
+    char path[640];
+    Verifier* previous_stage = nullptr;
+    for (Verifier* v = this; v; v = v->next_) {
+        const auto& c = *v->causal_;
+        const auto& g = *v->g_;
+        const int32_t header[] = {(int32_t) v->lb_, (int32_t) v->le_, c.T, (int32_t) v->ss_->k, (int32_t) g.n_embd};
+        std::snprintf(path, sizeof path, "%s.%s.inputs.bin", c.prefix, g_causal_uuid[v->device_]);
+        FILE* inputs = std::fopen(path, "wbx");
+        if (!inputs) { err = "cross-help capture: input destination exists or cannot be created"; return false; }
+        bool ok = std::fwrite("SCH03301", 8, 1, inputs) == 1 &&
+                  std::fwrite(&c.request, 8, 1, inputs) == 1 && std::fwrite(&c.window, 8, 1, inputs) == 1 &&
+                  std::fwrite(&v->last_pos0_, 8, 1, inputs) == 1 && std::fwrite(header, sizeof header, 1, inputs) == 1;
+        for (int64_t l = v->lb_; l < v->le_ && ok; ++l) {
+            const auto& fmt = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            const int32_t shape[] = {(int32_t) l, (int32_t) fmt.n_ff, fmt.gu_type, fmt.d_type};
+            const uint64_t expert_bytes = fmt.bytes;
+            ok = std::fwrite(shape, sizeof shape, 1, inputs) == 1 &&
+                 std::fwrite(&expert_bytes, sizeof expert_bytes, 1, inputs) == 1 &&
+                 std::fwrite(v->causal_x_h_ + (size_t) (l - v->lb_) * v->max_t_ * g.n_embd,
+                             (size_t) c.T * g.n_embd * sizeof(float), 1, inputs) == 1;
+        }
+        ok = std::fclose(inputs) == 0 && ok;
+        if (!ok) { err = "cross-help capture: actual input write failed"; return false; }
+        std::snprintf(path, sizeof path, "%s.%s.routing.bin", c.prefix, g_causal_uuid[v->device_]);
+        FILE* routing = std::fopen(path, "wbx");
+        if (!routing) { err = "cross-help capture: routing destination exists or cannot be created"; return false; }
+        for (int64_t l = v->lb_; l < v->le_ && ok; ++l) for (int t = 0; t < c.T && ok; ++t) {
+            const int32_t rec[] = {(int32_t) l, (int32_t) v->ss_->k};
+            const auto* row = (const uint8_t*) v->h_route_trace_ + (size_t) (l * strata::kernels::kVerifyMaxT + t) * v->ss_->k * 8;
+            ok = std::fwrite(rec, sizeof rec, 1, routing) == 1 && std::fwrite(row, (size_t) v->ss_->k * 8, 1, routing) == 1;
+        }
+        ok = std::fclose(routing) == 0 && ok;
+        if (!ok) { err = "cross-help capture: complete routing write failed"; return false; }
+        std::snprintf(path, sizeof path, "%s.%s.json", c.prefix, g_causal_uuid[v->device_]);
+        FILE* f = std::fopen(path, "wx");
+        if (!f) { err = "cross-help capture: stage destination exists or cannot be created"; return false; }
+        std::fprintf(f, "{\"version\":1,\"source\":\"strata-causal-serial-window\",\"request\":\"%llu\","
+                        "\"window\":%llu,\"phase\":\"verify\",\"batch_width\":%d,\"verify_width\":%d,"
+                        "\"position\":%lld,\"device\":\"%s\",\"layer_begin\":%lld,\"layer_end\":%lld,"
+                        "\"n_layers\":%lld,\"stamps_per_layer\":%d,\"replay_limit_ns\":%llu,"
+                        "\"host_start_ns\":%lld,\"host_end_ns\":%lld,\"observation_end_ns\":%lld,"
+                        "\"clock\":\"gpu-globaltimer-ns\",\"host_clock\":\"host-monotonic-ns\","
+                        "\"correlations\":[",
+                     (unsigned long long) c.request, (unsigned long long) c.window, c.T, c.T,
+                     (long long) v->last_pos0_, g_causal_uuid[v->device_], (long long) v->lb_, (long long) v->le_,
+                     (long long) g.n_layers, kProfPer, (unsigned long long) c.replay_limit_ns,
+                     (long long) c.host_start, (long long) c.host_end, (long long) c.observation_end);
+        for (int i = 0; i < 2; ++i)
+            std::fprintf(f, "%s{\"host_before_ns\":%lld,\"gpu_ns\":%llu,\"host_after_ns\":%lld}",
+                         i ? "," : "", (long long) c.correlation[i].before,
+                         c.correlation[i].gpu, (long long) c.correlation[i].after);
+        std::fprintf(f, "],\"stamps\":[");
+        for (size_t i = 0; i < v->prof_h_.size(); ++i) std::fprintf(f, "%s%llu", i ? "," : "", v->prof_h_[i]);
+        std::fprintf(f, "],\"expected_routing_rows\":%lld,\"layers\":[", (long long) ((v->le_ - v->lb_) * c.T));
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        for (int64_t l = v->lb_; l < v->le_; ++l) {
+            const auto& fmt = layout.fmt[(size_t) l];
+            std::fprintf(f, "%s{\"layer\":%lld,\"kind\":\"%s\",\"n_embd\":%lld,\"n_ff\":%lld,"
+                            "\"k\":%lld,\"gate_up_format\":%d,\"down_format\":%d,\"expert_bytes\":%zu,"
+                            "\"routing_begin\":%lld,\"routing_end\":%lld}",
+                         l == v->lb_ ? "" : ",", (long long) l, is_qsa_layer(g, l) ? "QSA" : "GDN",
+                         (long long) fmt.n_embd, (long long) fmt.n_ff, (long long) v->ss_->k,
+                         fmt.gu_type, fmt.d_type, fmt.bytes, (long long) ((l - v->lb_) * c.T),
+                         (long long) ((l - v->lb_ + 1) * c.T));
+        }
+        const bool observed_ple_wait = v->ar_on() && v->ss_->ple.ready() && v->ple_stage();
+        std::fprintf(f, "],\"execution\":{\"all_resident_device_plan\":%s,"
+                        "\"shared_fork\":false,\"dense_fork\":false,"
+                        "\"native_head_type\":%d,\"native_embed_type\":%d,"
+                        "\"preparation_warm\":%s,\"ple_active\":%s,\"ple_release_stamp\":%lld,"
+                        "\"ple_table_format\":",
+                     v->ar_on() ? "true" : "false",
+                     v->head_ && v->head_->loaded() ? v->head_->type() : -1,
+                     native_embed() ? native_embed()->type() : -1,
+                     c.preparation_warm ? "true" : "false",
+                     v->ss_->ple.ready() && v->ple_stage() ? "true" : "false",
+                     observed_ple_wait ? (long long) (g.n_layers * kProfPer + 5) : -1ll);
+        if (v->ss_->ple.ready() && v->ple_stage()) causal_json_string(f, v->ss_->ple.table->format());
+        else std::fprintf(f, "null");
+        std::fprintf(f, "},\"runtime_weight_refs\":[");
+        // Runtime registry, not a claim that every resident reference was used by
+        // every operation. Preserve native overrides and canonical forms together.
+        bool first_weight = true;
+        for (const auto& [name, weight] : v->wt_->all()) {
+            if (!weight.data && !weight.native_data && !weight.hc_q8) continue;
+            if (name.starts_with("blk.")) {
+                int layer = -1;
+                const char* begin = name.data() + 4;
+                const auto parsed = std::from_chars(begin, name.data() + name.size(), layer);
+                if (parsed.ec != std::errc{} || parsed.ptr == name.data() + name.size() ||
+                    *parsed.ptr != '.' || layer < v->lb_ || layer >= v->le_) continue;
+            }
+            if (!first_weight) std::fputc(',', f);
+            first_weight = false;
+            std::fprintf(f, "{\"name\":");
+            causal_json_string(f, name.c_str());
+            std::fprintf(f, ",\"canonical_present\":%s,\"canonical_kind\":%d,"
+                            "\"code_bits\":%d,\"code_bias\":%d,\"group_elems\":%d,"
+                            "\"codebook_iq4nl\":%s,\"has_offset\":%s,\"act_kind\":%d,"
+                            "\"native_present\":%s,\"native_type\":%d,\"hc_q8\":%s}",
+                         weight.data ? "true" : "false", (int) weight.kind,
+                         weight.code_bits, weight.code_bias, weight.group_elems,
+                         weight.codebook_iq4nl ? "true" : "false",
+                         weight.has_offset ? "true" : "false", weight.act_kind,
+                         weight.native_data ? "true" : "false", weight.native_type,
+                         weight.hc_q8 ? "true" : "false");
+        }
+        std::fprintf(f, "],\"helper_registry_complete\":true,\"helper_observations\":[");
+        bool first_helper = true;
+        for (int d = 0; d < g_causal_devices; ++d) if (g_causal_helper[d]) {
+            std::fprintf(f, "%s{\"device\":\"%s\",\"bypassed_all_resident\":%s,\"layers\":[",
+                         first_helper ? "" : ",", g_causal_uuid[d], v->ar_on() ? "true" : "false");
+            first_helper = false;
+            bool first_layer = true;
+            for (int64_t l = v->lb_; l < v->le_; ++l) if (c.helper_seen[(size_t) l][d]) {
+                std::fprintf(f, "%s%lld", first_layer ? "" : ",", (long long) l); first_layer = false;
+            }
+            std::fprintf(f, "]}");
+        }
+        std::fprintf(f, "],\"helper_busy\":[");
+        for (size_t i = 0; i < c.n_busy; ++i) {
+            const auto& b = c.busy[i];
+            std::fprintf(f, "%s{\"device\":\"%s\",\"layer\":%lld,\"batch_width\":%lld,\"entries\":%lld,"
+                            "\"start_ns\":%lld,\"end_ns\":%lld,\"clock\":\"host-monotonic-ns\","
+                            "\"method\":\"dispatch-through-drain-envelope\"}",
+                         i ? "," : "", g_causal_uuid[b.device], (long long) b.layer, (long long) b.tokens,
+                         (long long) b.entries, (long long) b.start, (long long) b.end);
+        }
+        std::fprintf(f, "],\"host_operations\":[");
+        for (size_t i = 0; i < c.n_operations; ++i) {
+            const auto& op = c.operations[i];
+            std::fprintf(f, "%s{\"id\":%zu,\"name\":\"%s\",\"start_ns\":%lld,\"end_ns\":%lld,"
+                            "\"layer\":%lld,\"previous_host_operation\":%d,\"blocking\":%s,"
+                            "\"gpu_completion_stamp\":%d,\"clock\":\"host-monotonic-ns\"}",
+                         i ? "," : "", i, op.name, (long long) op.start, (long long) op.end,
+                         (long long) op.layer, op.previous, op.blocking ? "true" : "false", op.gpu_completion_stamp);
+        }
+        std::fprintf(f, "],\"stage_predecessor\":");
+        if (previous_stage) {
+            const auto& prior = *previous_stage->causal_;
+            const size_t handoff = prior.n_operations - 1; // normal path appends the containing call last
+            std::fprintf(f, "{\"device\":\"%s\",\"gpu_completion_stamp\":%lld,"
+                            "\"host_handoff_operation\":%zu,\"host_preceding_operation\":%d,"
+                            "\"handoff\":\"containing next-stage call, not exclusive work; predecessor completes before child preparation\"}",
+                         g_causal_uuid[previous_stage->device_], (long long) (g.n_layers * kProfPer + 4),
+                         handoff, prior.operations[handoff].previous);
+        } else std::fprintf(f, "null");
+        previous_stage = v;
+        std::fprintf(f, ",\"routing_ready_slot\":25,\"host_operation_notes\":"
+                        "\"actual timed calls only; blocking durations overlap GPU/helper work and are NOT exclusive "
+                        "compute costs; previous_host_operation is host program order, not an inferred time bridge; "
+                        "unobserved gaps remain replay residual\","
+                        "\"observation_overhead\":\"serial profile stamps; actual routing/input copies; "
+                        "host readback and bracketed correlation (not serving-speed evidence)\"}\n");
+        ok = !std::ferror(f); ok = std::fclose(f) == 0 && ok;
+        if (!ok) { err = "cross-help capture: stage observation write failed"; return false; }
+    }
+    std::snprintf(path, sizeof path, "%s.window.json", causal_->prefix);
+    FILE* f = std::fopen(path, "wx");
+    if (!f) { err = "cross-help capture: containing-window destination exists or cannot be created"; return false; }
+    std::fprintf(f, "{\"version\":1,\"request\":\"%llu\",\"window\":%llu,\"phase\":\"verify\","
+                    "\"batch_width\":%d,\"verify_width\":%d,\"start_ns\":%lld,\"end_ns\":%lld,"
+                    "\"clock\":\"host-monotonic-ns\",\"replay_limit_ns\":%llu,"
+                    "\"helper_registry_complete\":true,\"devices\":[",
+                 (unsigned long long) causal_->request, (unsigned long long) causal_->window, causal_->T, causal_->T,
+                 (long long) causal_->host_start, (long long) phase_end, (unsigned long long) causal_->replay_limit_ns);
+    for (int d = 0; d < g_causal_devices; ++d)
+        std::fprintf(f, "%s{\"ordinal\":%d,\"device\":\"%s\",\"helper\":%s,\"visible_only_idle_observed\":false}",
+                     d ? "," : "", d, g_causal_uuid[d], g_causal_helper[d] ? "true" : "false");
+    std::fprintf(f, "],\"stages\":[");
+    bool first = true;
+    for (Verifier* v = this; v; v = v->next_) {
+        if (!first) std::fputc(',', f);
+        first = false;
+        std::snprintf(path, sizeof path, "%s.%s.json", causal_->prefix, g_causal_uuid[v->device_]);
+        causal_json_string(f, path);
+    }
+    std::fprintf(f, "],\"note\":\"independently observed containing serial verification span; "
+                    "helper idle may only be conservatively derived from the complete registered dispatches; "
+                    "no idle assertion for visible-only devices or unobserved external processes\"}\n");
+    bool ok = !std::ferror(f); ok = std::fclose(f) == 0 && ok;
+    if (!ok) { err = "cross-help capture: containing-window write failed"; return false; }
+    for (Verifier* v = this; v; v = v->next_) v->causal_->written = true;
+    g_causal_complete = true;
+    return true;
+}
+
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     scratch_.poison();
@@ -393,6 +860,9 @@ Verifier::~Verifier() {
         if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
     if (row_trace_ && std::fclose(row_trace_) != 0) std::terminate();
     if (h_route_trace_) cudaFreeHost(h_route_trace_);
+    if (causal_x_h_) cudaFreeHost(causal_x_h_);
+    if (prof_) cudaFree(prof_);
+    delete causal_;
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
@@ -627,11 +1097,40 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         std::fprintf(stderr, "strata verify trace (#649): on\n");
 #endif
     }
-    prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    if (const char* prefix = std::getenv("STRATA_CROSS_HELP_CAPTURE")) {
+        if (!*prefix || std::strlen(prefix) >= 512 || !g_causal_registry ||
+            planned_causal_host_bytes(g, ss.k) == UINT64_MAX || !strata::kernels::cpu::expert_layout().native) {
+            err = "cross-help capture: bounded native geometry, helper registry and a nonempty prefix are required";
+            return false;
+        }
+        causal_ = new (std::nothrow) CausalCapture;
+        if (!causal_ ||
+            !causal_integer("STRATA_CROSS_HELP_REQUEST", causal_->request) ||
+            !causal_integer("STRATA_CROSS_HELP_WINDOW", causal_->window) ||
+            !causal_integer("STRATA_CROSS_HELP_REPLAY_LIMIT_NS", causal_->replay_limit_ns) ||
+            causal_->window > 1024) {
+            err = "cross-help capture: positive request, window (1..1024) and pre-fixed residual limit are required";
+            return false;
+        }
+        std::memcpy(causal_->prefix, prefix, std::strlen(prefix) + 1);
+        if (!mapped((size_t) (le_ - lb_) * max_t * (size_t) g.n_embd * sizeof(float),
+                    (void**) &causal_x_h_, (void**) &causal_x_m_)) {
+            err = "cross-help capture: admitted actual input storage allocation failed"; return false;
+        }
+    }
+    prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_ != nullptr;
     if (prof_on_) {
-        const size_t np = (size_t) g.n_layers * kProfPer + 4;
-        if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
-        else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
+        const uint64_t bytes = planned_profile_bytes(g);
+        if (bytes == UINT64_MAX) { err = "verify: profile geometry is not priceable"; return false; }
+        const size_t np = (size_t) (bytes / sizeof(unsigned long long));
+        if (cudaMalloc((void**) &prof_, bytes) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
+        if (!prof_) {
+            if (causal_) { err = "cross-help capture: admitted profile storage allocation failed"; return false; }
+        } else {
+            cudaMemset(prof_, 0, bytes);
+            prof_h_.assign(np, 0);
+            if (prof_h_.capacity() > np) { err = "verify: profile host array exceeds its admitted bound"; return false; }
+        }
     }
     layout_arena(g, ss.qsa_states[ss.qsa_primary()].max_cells, n_vocab_, max_t, this);
     {
@@ -742,7 +1241,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cudaMemset(canary_, 0, kVerifyCanaryDeviceBytes) != cudaSuccess) {
         err = "verify: canary initialization failed"; return false;
     }
-    if (env_on("STRATA_SESSION_ROWS")) {
+    if (env_on("STRATA_SESSION_ROWS") || causal_) {
         if (const char* limit = std::getenv("STRATA_SESSION_ROWS_MAX")) {
             if (std::strcmp(limit, "544") != 0 && std::strcmp(limit, "256") != 0) {
                 err = "verify: session rows maximum must be the bounded 256 or 544 envelope"; return false;
@@ -786,7 +1285,7 @@ bool Verifier::read_logits_rows(int t0, int t1, float* dst, std::string& err) {
 }
 
 bool Verifier::observe_committed_rows(int count, std::string& err, const int* keep) {
-    if (!h_route_trace_ || !head_sampling_) return true; // prompt-only read_windows commits emit no token
+    if (!env_on("STRATA_SESSION_ROWS") || !h_route_trace_ || !head_sampling_) return true;
     if (next_ || lb_ != 0 || !last_stage()) {
         err = "verify: exact row observation requires the qualified single-device layout"; return false;
     }
@@ -885,6 +1384,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
+    if (causal_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 3), cs);
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
@@ -994,6 +1494,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (l == 1 && ple_on) {
             if (grp == 0) {
                 if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
+                if (causal_ && ar_on())
+                    gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 5), cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
@@ -1495,6 +1997,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        if (causal_x_m_ &&
+            cudaMemcpyAsync(causal_x_m_ + (size_t) ((l - lb_) * max_t_ + tb) * N, xm,
+                            (size_t) n * N * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            err = "cross-help capture: capturing actual MoE input failed"; return false;
+        }
         if (m_route_trace_) {
             for (int t = tb; t < te; ++t) {
                 auto* row = static_cast<uint8_t*>(m_route_trace_) + (size_t) (l * kVerifyMaxT + t) * K * 8;
@@ -1504,6 +2011,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
         }
+        if (causal_) stamp(l, 25, grp); // actual routing/input ready, BEFORE the CPU doorbell or device plan
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1711,6 +2219,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
         copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
         record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);
+        if (causal_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs);
         return true;
     }
 
@@ -1808,6 +2317,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
     stamp(g.n_layers, 1, 0);
     record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);
+    if (causal_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs);
     return true;
 }
 
@@ -2165,6 +2675,7 @@ bool Verifier::set_request_id(uint64_t request_id, std::string& err) {
     if (!context_idle(err)) return false;
     if (next_ && !next_->set_request_id(request_id, err)) return false;
     const OnDevice on_device(device_);
+    if (request_id_ != request_id) causal_request_windows_ = 0;
     request_id_ = request_id;
     h_owner_[kVerifySoloOwner] = {request_id, 0, 0};
     if (cudaMemcpyAsync(owner_ + kVerifySoloOwner, h_owner_ + kVerifySoloOwner, sizeof(VerifyCanaryOwner),
@@ -2291,6 +2802,9 @@ bool Verifier::acquire_scratch(std::string& err) {
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
+    const bool observe_next = causal_ && !causal_->written && head_sampling_ &&
+        request_id_ == causal_->request && causal_request_windows_ + 1 == causal_->window;
+    const int64_t preparation_start = observe_next ? trace_now_ns() : 0;
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -2299,13 +2813,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (pos0 < 0 || pos0 > ss.qsa_states[ss.qsa_primary()].max_cells - T) {
         err = "verify: the window runs past the context"; return false;
     }
+    if (observe_next) {
+        bool commits_idle = true;
+        for (const Verifier* stage = this; stage; stage = stage->next_)
+            commits_idle = commits_idle && !stage->commit_pending_ && !stage->commit_live_ &&
+                stage->scratch_.phase() == VerifyScratchOwnership::Phase::idle;
+        causal_->preparation_warm = commits_idle;
+    }
     if (!acquire_scratch(err)) return false;
     ScratchGuard guard{*this};
     last_batch_ = false;
     refresh_ar();
+    if (observe_next)
+        causal_->preparation_warm = causal_->preparation_warm &&
+            (ar_off_ ? exec_nr_[T] : exec_[T]) != nullptr && commit_exec_ != nullptr;
     if (!capture(T, err) || !capture_commit(err)) return false;
+    if (observe_next) {
+        causal_->preparation_start = preparation_start;
+        causal_->preparation_end = trace_now_ns();
+    }
+    if (!causal_begin(T, err)) return false;
+    CausalScope causal_scope(causal_ && causal_->selected && !causal_->written ? this : nullptr);
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
+    const int64_t stage_start = causal_now();
     stage_inputs(T, tokens, pos0);
     stage_canaries(nullptr, T, tokens, nullptr, pos0);
     const bool do_ple = ss.ple.ready() && ple_stage();
@@ -2323,14 +2854,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    causal_operation("stage-inputs-and-ple-prefetch", stage_start, causal_now());
     VDBG("staged; launching\n");
     if (released_.load()) { err = "verify: watchdog released window before launch"; return false; }
     guard.launched = true;
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    const int64_t submit_start = causal_now();
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    causal_operation("graph-submit", submit_start, causal_now());
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    const int64_t flush_start = causal_now();
     (void) cudaStreamQuery(cs_);
+    causal_operation("graph-submit-flush", flush_start, causal_now());
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -2339,16 +2875,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (ar_on() && !test_stall) {
+        int64_t flags_start = 0;
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
+            const int64_t gather_start = causal_now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            causal_operation("ple-gather", gather_start, causal_now());
+            flags_start = causal_now();
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
             ms_host += ms_since(tp);
         } else {
+            flags_start = causal_now();
             *flag = 1;
         }
+        causal_operation("all-resident-flag-publish", flags_start, causal_now());
     } else
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
@@ -2388,12 +2930,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
         const Clock::time_point b = Clock::now();
+        if (causal_now()) causal_operation("doorbell-wait",
+            std::chrono::duration_cast<std::chrono::nanoseconds>(a.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(b.time_since_epoch()).count(),
+            l, true, (int) (l * kProfPer + 25));
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        const int64_t dispatch_start = causal_now();
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         for (int t = 0; t < n; ++t) worker_positions_[t] = pos0 + tb + t;
         if (pool != nullptr &&
@@ -2406,9 +2953,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
         if (remote_opt_) remote_opt_->end();
+        causal_operation("expert-pool-dispatch-through-drain", dispatch_start, causal_now(), l, true,
+                          (int) (l * kProfPer + 25));
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
                               (int64_t) ms_since(b));   // aux: ms the CPU experts took
+        const int64_t plan_start = causal_now();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2422,18 +2972,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
+        causal_operation("fallback-plan-publish", plan_start, causal_now(), l);
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
         if (k == 0 && do_ple) {
             const Clock::time_point tp = Clock::now();
+            const int64_t gather_start = causal_now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            causal_operation("ple-gather", gather_start, causal_now(), l);
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             ms_host += ms_since(tp);
         }
+        const int64_t flag_start = causal_now();
         if (!(test_stall && k + 1 == steps)) *flag = want;
+        causal_operation("expert-consumer-flag-publish", flag_start, causal_now(), l);
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
@@ -2445,7 +3000,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
     // beside the expert workers).
     trace_ev("SYNC", -1, -1, 0);
+    const int64_t sync_start = causal_now();
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    causal_operation("graph-sync", sync_start, causal_now(), -1, true, (int) (g.n_layers * kProfPer + 4));
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
@@ -2455,30 +3012,48 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     commit_pending_ = false;
     if (released_.load()) { err = "verify: window released by watchdog"; return false; }
+    const int64_t canary_start = causal_now();
     if (!check_canaries(false, err)) return false;
+    causal_operation("canary-check", canary_start, causal_now());
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
+        const int64_t copy_sync_start = causal_now();
         const cudaError_t copied = cudaStreamSynchronize(copy_);
+        causal_operation("expert-copy-sync", copy_sync_start, causal_now(), -1, true);
         if (copied != cudaSuccess) { err = std::string("verify copies: ") + cudaGetErrorString(copied); return false; }
         copy_used_ = false;
     }
+    const int64_t acknowledge_start = causal_now();
     if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss.k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
         released_.store(true); err = "verify: expert completion failed"; return false;
     }
-    if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
+    causal_operation("expert-final-consumer-acknowledge", acknowledge_start, causal_now());
+    if (!causal_finish(err)) return false;
+    const int64_t profile_sum_start = causal_now();
+    if (prof_on_ && G == 1) {
+        if (causal_ && causal_->selected && !causal_->written) accumulate_profile(prof_h_.data());
+        else collect_profile();
+    }
+    causal_operation("profile-accumulate", profile_sum_start, causal_now());
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        if (next_ && !next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
+        if (next_) {
+            const int64_t handoff_start = causal_now();
+            if (!next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
+            causal_operation("next-stage-handoff-wait", handoff_start, causal_now(), -1, true);
+        }
         if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
+        if (!causal_write_window(err)) return false;
         guard.keep = true;
         return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+        const int64_t sampling_submit_start = causal_now();
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
@@ -2505,12 +3080,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         spec_nq_ = 0;
         if (judged) ++spec_windows;
         else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        causal_operation("sampling-submit", sampling_submit_start, causal_now());
+        const int64_t sampling_sync_start = causal_now();
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
+        causal_operation("sampling-sync", sampling_sync_start, causal_now(), -1, true);
     }
+    const int64_t picks_start = causal_now();
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    causal_operation("picks-readback", picks_start, causal_now());
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -2532,6 +3112,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
+    if (!causal_write_window(err)) return false;
     guard.keep = true;
     return true;
 }

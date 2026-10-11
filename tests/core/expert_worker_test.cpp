@@ -426,11 +426,55 @@ void graph_worker_requires_matching_consumer() {
     require(!primary.finish(nullptr, error), "duplicate primary completion accepted");
 }
 
+void split_stage_consumers_cannot_release_other_lanes() {
+    using namespace strata::core;
+    std::array<GraphExpertWorker, 4> primary;
+    std::array<ExpertCompletion, 4> completion{
+        ExpertCompletion(3), ExpertCompletion(3), ExpertCompletion(3), ExpertCompletion(3)};
+    std::array<ExpertOperation, 4> operation;
+    int32_t ids[] = {3, 7, 3}, assigned[] = {0, -1, 1};
+    std::string error;
+    for (size_t lane = 0; lane < 2; ++lane) {
+        for (size_t group = 0; group < 2; ++group) {
+            const size_t index = 2 * lane + group;
+            auto work = make_work(ids, assigned, 1, 3);
+            work.operation.layer = lane == 0 ? 3 : 19;
+            work.operation.first_position += (int64_t) group;
+            operation[index] = work.operation;
+            require(completion[index].begin(work.operation, 3) &&
+                    primary[index].begin(work, error), "split ownership lane did not start");
+            require(completion[index].claim(0, 2, 1) && completion[index].claim(2, 2, 1) &&
+                    completion[index].claim(1, 1, 1) && completion[index].complete(work.operation, 1, 1),
+                    "split CPU/primary claims did not conserve rows");
+        }
+    }
+    // Equal request/position/generation is not an acknowledgement from the other
+    // stage. Both primary graphs may still own rows after the shared helpers drain.
+    for (size_t group = 0; group < 2; ++group) {
+        require(!primary[group].consumed(operation[2 + group]) &&
+                !completion[group].complete(operation[2 + group], 2, 1) &&
+                !completion[group].release(operation[group]),
+                "later stage consumer released an earlier stage's rows");
+        require(primary[2 + group].consumed(operation[2 + group]) &&
+                primary[2 + group].finish(nullptr, error) &&
+                completion[2 + group].complete(operation[2 + group], 2, 1) &&
+                completion[2 + group].release(operation[2 + group]),
+                "later stage could not release its own matching rows");
+        require(!primary[group].finish(nullptr, error) && primary[group].owns(0),
+                "later stage completion drained earlier stage primary work");
+        require(primary[group].consumed(operation[group]) && primary[group].finish(nullptr, error) &&
+                completion[group].complete(operation[group], 2, 1) &&
+                completion[group].release(operation[group]),
+                "earlier stage could not release its own matching rows");
+    }
+}
+
 } // namespace
 
 int main() {
     using namespace strata::core;
     graph_worker_requires_matching_consumer();
+    split_stage_consumers_cannot_release_other_lanes();
     distinct_workers_preserve_rows_and_metadata();
     ordered_overlap_prefers_first_worker();
     out_of_order_helpers_wait_for_publication();

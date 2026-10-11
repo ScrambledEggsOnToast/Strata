@@ -65,6 +65,15 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_SYCL) && !defined(__HIPCC__) && !defined(DPCT_COMPAT_RT_VERSION)
+/// HET-033 CUDA-only operator diagnostic: compact expert rows are in original router
+/// order, `original[row]` is token*k+route and weights are the actual router weights.
+/// Return a full-window FP32 weighted subset, starting at zero and using FMA in
+/// original route order (the existing remote weighted-subset contract). No shared
+/// expert, allocation, copy or synchronization; this is not a serving helper path.
+void expert_weighted_subset(const float* parts, const int32_t* original, const float* weights,
+                            float* output, int width, int k, int tokens, int entries, void* stream);
+#endif
 /// dst[r][0, w) = src[r][0, w) for `rows` rows of source stride `src_w` floats (the query half of each q/gate head
 /// pair): the strided device-to-device cudaMemcpy2DAsync as a kernel, so the window's chain stays kernel to kernel.
 /// w and src_w multiples of 4 floats, both pointers 16-byte aligned.

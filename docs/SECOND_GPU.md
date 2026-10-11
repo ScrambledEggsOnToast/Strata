@@ -70,8 +70,9 @@ slots without recompiling, edit the values after `--expert-cache-device1`,
 Compare identical requests at one, two and four GPUs, preferably with several
 repeats. VRAM use alone does not show useful offload: compare the per-request
 CUDA1–3 counts and tokens per second. More GPU contexts and synchronization
-may lower the speed. Prompt prefill still uses CUDA0; secondary GPUs serve
-decode, including MTP verification. No peer-to-peer access is required.
+may lower the speed. Without a layer split, prompt prefill uses CUDA0 unless
+resident-owner prefill is explicitly enabled below. Secondary GPUs otherwise
+serve decode, including MTP verification. No peer-to-peer access is required.
 
 Longer contexts reserve more KV/state memory on CUDA0, which reduces its
 automatic expert cache. On a 64 GB PC `setup.py` limits IQ3_XXS to 128K even
@@ -171,3 +172,121 @@ not yet combined with the peer's rows. Mapped host buffers gain
 context write them. The tier size is manual for now (`--peer-reserve-mib`,
 `--peer-slots`); automatic sizing on small cards wants the buffer lending of
 #216 and is a follow-up.
+
+## Static two-stage plus decode-helper composition (experimental, HET-032)
+
+The engine admits an explicit two-stage split with a static decode helper on a
+visible GPU that runs **no stage**. Helper flags name tier ordinals, not CUDA
+ordinals: with the visible order `3090, x8 V100, x4 V100`,
+`--split-device 1 --expert-cache-device1 N` puts the later stage on CUDA1 and
+the helper on CUDA2; `--split-device 2 --expert-cache-device1 N` reverses those
+two V100 roles. CUDA0 runs the early layers. The existing last-stage output-head
+and MTP placement is unchanged; the helper owns no attention, recurrent or draft
+state.
+
+Both layouts require `--serve`, an explicit `--layer-split K` and
+`--split-device`, a static expert profile, numeric helper slots,
+`--adapt-swaps 0`, `--expert-worker-contract` and the CPU expert pool. Under
+MPS, admission measures and prices each actual device independently: the
+stage keeps its existing stage costs/cache budget, while the helper pays its
+aligned cache bound, `RemoteExperts::allocation_bytes` buffers and headroom.
+An unpriced shared stage/helper device, optimized/weighted remote decode,
+automatic helper slots, adaptive peer/refill, pipelined windows, split-skip and
+`--prefill-helpers` with a split remain refused.
+
+`--host-native --windowed-experts` retains the required finite host/device
+ceilings and `STRATA_PREFILL_RING=8`. Each prompt stage owns a separate source
+lane; blocking helper startup fills use lane zero and retain no source pointer.
+All decode stages share one helper registry, which drains before the next
+dispatch, with two independently accounted ownership groups per stage.
+Long prefill executes on the stage GPUs; the decode helper is idle then.
+`STRATA_PREFILL_NATIVE_GROUPED=1` may select native arithmetic on each stage
+without installing the no-split resident-owner control or prompt-helper buffers.
+No-split native helper-on/off ownership bookkeeping is unchanged.
+
+This is an opt-in execution/accounting composition, not a validated profile or
+a speed/concurrency claim. Retain neither V100 role assignment without matched
+real-model quality/state, memory and decode/prefill measurements; link width
+alone is not evidence about its HBM-local arithmetic.
+
+## Resident-owner prefill (experimental, HET-022)
+
+The opt-in native-grouped path has built with inspected SM70/SM86 device code
+and exercised both V100 owners on tiny and fresh4K/16K requests. At chunk4096,
+matched helper-off/on full first-logit rows are byte-identical at the unchanged
+0.01 limit, including held-out tagged retrieval and subsequent fresh recovery;
+the exercised GDN/PLE/KV/draft rollback fingerprints also match.
+The bounded chunk512 screen answers the objective checks but fails the fixed
+cross-chunk first-row limit (maxabs1.2867/1.4495 against chunk4096 on held-out
+4K/16K). It is not qualified, and this comparison does not attribute the
+difference to helper execution versus inherited chunk arithmetic. Final review
+remains; this is not a daily recommendation, an unexercised-context claim or a
+128K qualification.
+
+`--prefill-helpers` enables prompt expert work on the static
+`--expert-cache-device1..3` owners, with the primary retaining attention, routing
+and recurrent state. It requires `--serve`, a positive explicit `--prefill`,
+`--expert-cache-remote-placement layer`, and `STRATA_PREFILL_NATIVE_GROUPED=1`.
+It does not compose with `--layer-split`, `--peer-device` or optimized remote
+decode. The mixed-architecture MMQ helper path failed its numerical comparisons
+and is not an available resident-helper default. The qualified experiment uses
+fixed residency (`--adapt-swaps 0`) and `STRATA_PREFILL_CPU_SHARE=0`.
+For the matched off arm, retain the same native-grouped environment, caches and
+decode ownership, omitting only `--prefill-helpers`.
+
+Each layer has at most one remote owner. Overlapping owner layers are rejected,
+not silently staged back onto the primary. The owner reads its resident expert
+weights, applies the primary's authoritative router weights, and returns
+**FP32 weighted partial sums** for the primary's final combine. The native mode
+uses the existing native grouped operator on both architectures and reduces
+helper rows in router-k order. Its off control computes the same local/owner
+partials on the primary and combines them identically. This is an explicitly
+different arithmetic configuration from MMQ, not a retroactive pass for failed
+MMQ comparisons. It does not stream additional helper weights or use FP16 transport.
+Disabling `STRATA_PF_PEER_SUMS` or enabling `STRATA_PF_PEER_STREAM` /
+`STRATA_PF_PEER_F16` is rejected. The separate peer tier retains its defaults
+and its optional primary-only prompt fallback.
+
+Dedicated remote owners use portable mapped host transport. The existing peer
+tier supplies its already-enabled P2P state, including its no-P2P setting:
+hardware capability alone never authorizes primary kernels to dereference a
+remote cache. The current host's 3090/V100 links have no P2P access.
+
+The owner takes every routed row it holds, bounded by `chunk * 10`. Its FP32
+partial-sum return buffer is `chunk * 2560 * 4` bytes, plus activation, routing
+and grouping metadata buffers. These pinned-host bytes are charged to the
+worker budget, not just reported.
+
+Admission prices every configured remote device's aligned cache bound, base
+decode buffers, prompt buffers, MMQ workspace, headroom and explicit opaque
+allowances before model allocation. Under MPS it requires explicit cache counts
+and independently checks each declared device ceiling. Unpriceable workspaces
+refuse. The helper allocator checks its explicit device and pinned-host payloads
+against the same counting function; this is not evidence that opaque allocations
+or end-to-end peak memory have already been qualified.
+
+Per-prompt helper counters separately report activation, routing/grouping
+metadata, result and staged-weight payload bytes, plus device, layers, routed
+rows, experts and over-cap work. They count logical payload, not aggregate
+bus transactions or cache-line amplification across the two host legs.
+The dedicated route must show zero helper-staged weight bytes. Count actual
+helper exposure and primary/helper row conservation; do not infer these from
+cache size or treat zero helper staging as proof of zero primary uploads.
+
+Both device-specific MMQ tile selection and helper partial-sum reduction can
+change arithmetic. Runtime acceptance still needs the existing independent
+real-format operator checks, independent weighted-reduction checks,
+same-prefix full-model/state and request-isolation checks, and a matched useful
+gain. No tolerance is qualified by this implementation or fitted to a candidate's
+observed error. The proposed Q8-only parity fixture was removed rather than
+presented as coverage of the real native pack.
+
+`native_prefill_reduce_test` checks the native canonical reduction independently
+against an exact dyadic CPU oracle at H2560/K10: shuffled partial routing,
+assisted/unassisted combination and reused empty helper scratch. This is a
+bounded reduction check, not quantized expert-product or full-model acceptance;
+the latter still requires the separate matched runtime evidence above.
+
+`STRATA_PREFILL_HELP` / `Prefill::set_stage_helper` is a different mechanism:
+it streams non-resident experts into an idle layer-split stage. It remains off
+by default and is not evidence for this resident-owner route.

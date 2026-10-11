@@ -12,10 +12,14 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace {
 // The allocator's one rounding rule, documented on AllocationBytes: every payload costs
@@ -26,9 +30,58 @@ int failures = 0;
 void check(bool ok, const char* what) {
     if (!ok) { std::fprintf(stderr, "%s\n", what); ++failures; }
 }
+
+// Run in its own process: the prompt MMQ plan freezes the loaded artifact on first use.
+int native_bounds_regression() {
+    using namespace strata;
+    if (!prefill::mmq::built() || !kernels::cpu::native_experts_available()) return 77;
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("strata-native-bounds-" + std::to_string(stamp));
+    if (!std::filesystem::create_directory(directory)) return 1;
+    struct Fixture {
+        std::filesystem::path path;
+        ~Fixture() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } fixture{directory};
+    const std::string path = directory.string();
+    core::ModelGeometry g;
+    kernels::cpu::NativeFmt fmt;
+    std::string err;
+    if (!kernels::cpu::native_fmt(21, 20, 2560, 640, fmt, err)) return 1;
+    {
+        std::ofstream out(path + "/native_experts.txt");
+        for (int64_t layer = 0; layer < g.n_layers; ++layer)
+            out << layer << " 21 20 " << (uint64_t) layer * g.n_expert * fmt.bytes << ' ' << fmt.bytes << '\n';
+        if (!out) return 1;
+    }
+    if (!kernels::cpu::expert_layout_load(path, g.n_layers, g.n_expert, err)) return 1;
+#if defined(_WIN32)
+    if (_putenv_s("STRATA_PREFILL_MMQ", "1") != 0) return 1;
+#else
+    if (setenv("STRATA_PREFILL_MMQ", "1", 1) != 0) return 1;
+#endif
+    prefill::PrefillFacts facts;
+    facts.max_cells = 4097;
+    facts.n_pages = (facts.max_cells + 3) / 4;
+    core::ModelGeometry small = g;
+    small.n_expert = 16;
+    // At this small chunk the attention workspace dominates both router sizes, isolating the fixed bounds.
+    const uint64_t full_price = prefill::Prefill::bytes_needed_from(g, facts, 64, 8, fmt.bytes, 0);
+    const uint64_t small_price = prefill::Prefill::bytes_needed_from(small, facts, 64, 8, fmt.bytes, 0);
+    const uint64_t full_bounds = ((uint64_t) g.n_expert + 1 + (uint64_t) g.n_expert * 17) * 4;
+    const uint64_t small_bounds = ((uint64_t) small.n_expert + 1 + (uint64_t) small.n_expert * 17) * 4;
+    check(full_price != UINT64_MAX && small_price != UINT64_MAX && full_price >= small_price &&
+          full_price - small_price >= allocation(full_bounds) - allocation(small_bounds),
+          "native MMQ admission covers one row-limited compact group per expert");
+    return failures ? 1 : 0;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--native-bounds") return native_bounds_regression();
     using namespace strata;
     core::ModelGeometry g;                       // the artifact's fixed geometry (validated inside)
     kernels::cpu::ExpertLayout experts;          // canonical pack: default max_blob, no native tables

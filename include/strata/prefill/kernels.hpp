@@ -93,6 +93,24 @@ void moe_combine(const float* D, const int32_t* slot, const float* w, const floa
 /// may be mapped host memory.
 void moe_combine_peer(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                       const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream);
+/// Native grouped metadata is captured by value at launch, not read later from
+/// a mutable host pointer table. The blobs must remain live through the products.
+struct NativeGroupPointers {
+    const uint8_t* blob[16] = {};
+    int32_t bounds[17] = {};
+    int32_t count = 0;
+};
+void native_group_pointers(NativeGroupPointers group, unsigned long long* pointers, int32_t* count,
+                           int32_t* bounds, void* stream);
+/// Resident helper partials in the router's k order. pair[r] identifies the
+/// original routed pair; inverse has T*10 entries and is reset on every call.
+void peer_reduce_k_order(const float* rows, const int32_t* pair, const float* weights, int64_t n_rows,
+                         int32_t* inverse, float* sum, int64_t T, void* stream);
+/// Matched unassisted control for the native grouped helper arithmetic: compute
+/// the local and resident-owner partials separately in k order, then combine in
+/// the same order as moe_combine_peer. One resident owner covers this layer.
+void moe_combine_native_reference(const float* D, const int32_t* slot, const int32_t* ids, const uint8_t* resident,
+                                  const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream);
 /// sum[t, :] += wk[p] * rows[r, :] with p = pair[r], t = p / 10 (the routed pair's token), for n rows of ONE expert
 /// (no token twice: launches in a fixed expert order make the sums repeatable).  After eddoursul/Strata's
 /// moe_scatter_add (f8de703).

@@ -923,6 +923,7 @@ int mmq_only_main(int argc, char** argv) {
         return 1;
     }
 }
+
 }  // namespace
 
 int main(int argc, char** argv) {

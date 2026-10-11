@@ -102,6 +102,24 @@ public:
               const NativeHead* head, int max_t, std::string& err);
     /// Device arena only; same allocation sequence as init, no allocation or GPU work.
     static uint64_t planned_device_bytes(const ModelGeometry& g, int64_t context, int64_t vocab, int max_t);
+    /// One optional timestamp array's payload, on device and independently on host.
+    /// Serial capture uses one pair per stage; pipelined copies are priced separately.
+    static uint64_t planned_profile_bytes(const ModelGeometry& g) {
+        if (g.n_layers <= 0 || g.n_layers > 1024) return UINT64_MAX;
+        return ((uint64_t) g.n_layers * kProfPer + 6) * sizeof(unsigned long long);
+    }
+
+    /// Opt-in, one serial serving verification window (HET-033). The environment
+    /// names an explicit request/window and a residual limit fixed before capture.
+    /// Host payload includes actual FP32 MoE inputs, actual routing and bounded
+    /// helper dispatch-through-drain observations; no cost is inferred from counters.
+    static uint64_t planned_causal_host_bytes(const ModelGeometry& g, int64_t k);
+    static bool configure_causal_helpers(const int* devices, size_t count, std::string& err);
+    static bool causal_observation_active();
+    static void observe_helper_busy(int device, int64_t layer, int64_t tokens, int64_t entries,
+                                    int64_t start_ns, int64_t end_ns);
+    /// Serving QUIT/EOF refuses if the explicitly requested observation was not emitted.
+    static bool causal_capture_complete();
 
     /// Boot/calibration only: capture/upload every width 1..max_t and commit, without launch
     /// or state mutation. Set all capture-affecting configuration first. Chained stages follow
@@ -342,6 +360,17 @@ public:
     std::string profile_report();
 
 private:
+    struct CausalCapture;
+    CausalCapture* causal_ = nullptr;
+    float *causal_x_h_ = nullptr, *causal_x_m_ = nullptr;
+    uint64_t causal_request_windows_ = 0;
+    bool causal_begin(int T, std::string& err);
+    bool causal_finish(std::string& err);
+    bool causal_write_window(std::string& err);
+    bool causal_correlate(int which, std::string& err);
+    int64_t causal_now() const;
+    void causal_operation(const char* name, int64_t start, int64_t end, int64_t layer = -1,
+                          bool blocking = false, int gpu_completion_stamp = -1);
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
@@ -479,7 +508,7 @@ private:
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
-    unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
+    unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 6 stamps
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
