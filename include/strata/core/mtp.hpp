@@ -48,7 +48,7 @@ public:
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768);
+              int64_t window = 32768, const strata::plan::QsaPlacement* placement = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -164,7 +164,8 @@ public:
 
     // Resident requests share immutable MTP weights and serialized operation
     // scratch, never K/V. Allocate/capture once before requests are admitted.
-    bool init_slots(const std::vector<SessionState*>& sessions, std::string& err);
+    bool init_slots(const std::vector<SessionState*>& sessions, std::string& err,
+                    const strata::plan::QsaPlacement* placement = nullptr);
     bool save_slot(int slot, int64_t cells, std::string& err);
     bool restore_slot(int slot, int64_t cells, std::string& err);
     bool advance_slot(int slot, const float* residual, int32_t next_token,
@@ -237,6 +238,7 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
+    strata::plan::QsaPlacement state_placement_; // finalized before capture; default slots inherit it
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     bool hnorm_stream_ = false;

@@ -100,11 +100,12 @@ struct SessionState {
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
 /// Returns 0 for invalid ranges or inputs outside session_allocation_bytes' bounded geometry contract.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
-/// Carves caller-owned `base` (DEVICE memory) into a fresh `s`. Returns bytes used, or 0 on failure with
-/// secondary allocations already released. The caller ALWAYS retains ownership of `base`.
+                       int64_t layer_hi = -1, const strata::plan::QsaPlacement* placement = nullptr);
+/// Carves caller-owned `base` (DEVICE memory) into a fresh `s`. Returns the priced extent (including
+/// reserved padding), or 0 on failure with secondary allocations already released. Caller retains `base`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1,
+                      const strata::plan::QsaPlacement* placement = nullptr, uint64_t arena_bytes = 0);
 /// Drains the initialization device, releases pinned QSA storage/registrations and the QSA struct array,
 /// then clears the view. Idempotent; NEVER frees the externally allocated device arena. Stop submitting
 /// work and retire graph/prefill/MTP borrowers first. A failed device selection/drain terminates rather
@@ -123,12 +124,13 @@ struct SessionAllocationBytes {
     uint64_t host_heap = 0;          ///< owner object plus globally indexed QsaState array
     uint64_t host_transient = 0;
 };
-/// Pure preallocation pricing with the current, frozen process KV settings. False/zero output on invalid
-/// inputs or unsupported geometry: positive dimensions no larger than the artifact's ModelGeometry defaults,
+/// Pure preallocation pricing with one resolved placement (null: frozen process KV settings).
+/// False/zero output on invalid inputs or unsupported geometry: positive dimensions no larger than defaults,
 /// context and KV-resident cells <= INT32_MAX, k in [1,64]. Call before allocating ANY resident slots.
 /// Excludes weights, verifier/prefill/MTP scratch, request containers and allocator/driver overhead.
 bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
-                              SessionAllocationBytes& out, int64_t layer_lo = 0, int64_t layer_hi = -1);
+                              SessionAllocationBytes& out, int64_t layer_lo = 0, int64_t layer_hi = -1,
+                              const strata::plan::QsaPlacement* placement = nullptr);
 
 /// Owns one stable-address session and its arena, on the device current at init. No copying or moving:
 /// graph nodes and PLE token/history pointers may point into state(). The process dispatch is serial;
@@ -143,7 +145,8 @@ public:
     SessionOwner(SessionOwner&&) = delete;
     SessionOwner& operator=(SessionOwner&&) = delete;
     bool init(const ModelGeometry& g, int64_t max_cells, int64_t k, std::string& err,
-              int64_t layer_lo = 0, int64_t layer_hi = -1);
+              int64_t layer_lo = 0, int64_t layer_hi = -1,
+              const strata::plan::QsaPlacement* placement = nullptr);
     void reset() noexcept;
     /// Rebind this surviving working session's immutable RoPE table after resident setup/unwind,
     /// before graph capture. All borrowers must retire before this owner; dispatch remains serial.

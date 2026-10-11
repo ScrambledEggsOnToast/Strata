@@ -10,37 +10,38 @@ static_assert(sizeof(SessionOwner) <= strata::plan::kResidentOwnerBytes,
               "increase resident owner ABI envelope in native and Python planner");
 static_assert(sizeof(QsaState) <= strata::plan::kResidentQsaBytes,
               "increase resident QSA ABI envelope in native and Python planner");
-// The drafter's load/init_slots select a whole format, never hybrid K8V4.
-// Preserve the process settings while invoking the same state sizing path.
+// Use the drafter's whole format without temporarily mutating process dispatch.
 inline strata::plan::ResidentPayload resident_draft_payload(const ModelGeometry& g, int64_t cells,
-                                                           int64_t ring_cells = -1) {
-    struct RestoreFormat {
-        bool hybrid = qsa_kv_hybrid(), int8 = qsa_kv_int8(), q4 = qsa_kv_q4();
-        ~RestoreFormat() { qsa_set_kv_q4(q4); qsa_set_kv_int8(int8); qsa_set_kv_hybrid(hybrid); }
-    } restore;
-    const int fmt = strata::plan::qsa_draft_format(
-        strata::plan::qsa_state_format(restore.hybrid, restore.q4, restore.int8, -1));
-    qsa_set_kv_hybrid(fmt == strata::kernels::kKvHybrid);
-    qsa_set_kv_int8(fmt == strata::kernels::kKvInt8);
-    qsa_set_kv_q4(fmt == strata::kernels::kKvQ4);
-    return {qsa_state_bytes(g, cells, false, ring_cells), qsa_state_host_bytes(g, cells, ring_cells)};
+                                                           int64_t ring_cells = -1,
+                                                           const strata::plan::QsaPlacement* placement = nullptr) {
+    const auto resolved = placement ? *placement : qsa_state_placement(g, cells, ring_cells, -1, true);
+    return {qsa_state_bytes(g, cells, false, ring_cells, &resolved),
+            qsa_state_host_bytes(g, cells, ring_cells, &resolved)};
 }
 
 // FP16 fully resident scope matches the dry-run planner. Do not silently price a
 // streamed/quantized configuration as zero; caller must emit an unknown class or refuse.
 inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int64_t k,
                                       int requested_slots, bool mtp,
-                                      strata::plan::ResidentBytes& out) {
+                                      strata::plan::ResidentBytes& out,
+                                      const strata::plan::QsaRolePlacements* placements = nullptr) {
     out = {};
     if (requested_slots < 0 || qsa_kv_resident() != 0 || qsa_kv_int8() || qsa_kv_q4() || qsa_kv_hybrid())
         return false;
-    SessionAllocationBytes base;
-    if (!session_allocation_bytes(g, cells, k, base)) return false;
+    SessionAllocationBytes working, slot;
+    if (!session_allocation_bytes(g, cells, k, working, 0, -1,
+                                  placements ? &placements->working_main : nullptr) ||
+        !session_allocation_bytes(g, cells, k, slot, 0, -1,
+                                  placements ? &placements->slot_main : nullptr)) return false;
     const auto shape = strata::kernels::qsa_real_shapes();
-    const strata::plan::ResidentPayload main{base.device, base.host_pinned};
-    const auto draft = mtp ? resident_draft_payload(g, cells) : strata::plan::ResidentPayload{};
+    const strata::plan::ResidentPayload main{working.device, working.host_pinned};
+    const strata::plan::ResidentPayload slot_main{slot.device, slot.host_pinned};
+    const auto draft = mtp ? resident_draft_payload(g, cells, -1,
+        placements ? &placements->working_draft : nullptr) : strata::plan::ResidentPayload{};
+    const auto slot_draft = mtp ? resident_draft_payload(g, cells, -1,
+        placements ? &placements->slot_draft : nullptr) : strata::plan::ResidentPayload{};
     return strata::plan::resident_bytes((uint64_t) requested_slots, (uint64_t) cells,
         (uint64_t) g.n_qsa_layers(), (uint64_t) (shape.idx_block - 1) * g.idx_key_dim,
-        main, main, base.host_transient, draft, draft, mtp, out);
+        main, slot_main, std::max(working.host_transient, slot.host_transient), draft, slot_draft, mtp, out);
 }
 } // namespace strata::core

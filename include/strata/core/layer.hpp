@@ -34,6 +34,7 @@
 
 #include "strata/core/layout.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/plan/qsa_memory.hpp"
 
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -282,7 +283,14 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// A supplied placement is frozen across sizing/init; null resolves today's process policy.
+strata::plan::QsaPlacement qsa_state_placement(const ModelGeometry& g, int64_t max_cells,
+                                             int64_t ring_cells = 0, int64_t resident_cells = -1,
+                                             bool draft = false);
+strata::plan::QsaRolePlacements qsa_role_placements(const ModelGeometry& g, int64_t max_cells,
+                                                   int64_t slot_window, int64_t draft_window, int64_t max_t);
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         const strata::plan::QsaPlacement* placement = nullptr);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -332,14 +340,16 @@ inline int qsa_kv_format(const QsaState& st) {
 /// Initialize a fresh state, never a live owner's copy. Failure releases acquired secondary allocations;
 /// kv_mode alone is retained for the drafter's resident fallback. The device arena remains caller-owned.
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        const strata::plan::QsaPlacement* placement = nullptr, uint64_t arena_bytes = 0);
 /// Releases only allocations outside the caller's device arena (pinned KV and token staging), and the
 /// owned RoPE registration. Caller must first drain the owning device and retire graph/prefill borrowers.
 /// Safe for partial initialization and repeated calls; never cudaFree's an arena or a borrowed RoPE table.
 void qsa_state_release(QsaState& st) noexcept;
 /// Exact persistent pinned payload for one state under the current KV settings; excludes driver metadata.
 /// Like qsa_state_bytes, requires validated geometry/positive context and ring capacity (or -1 resident).
-uint64_t qsa_state_host_bytes(const ModelGeometry& g, int64_t max_cells, int64_t ring_cells = 0);
+uint64_t qsa_state_host_bytes(const ModelGeometry& g, int64_t max_cells, int64_t ring_cells = 0,
+                              const strata::plan::QsaPlacement* placement = nullptr);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

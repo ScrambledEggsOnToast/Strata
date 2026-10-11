@@ -61,8 +61,7 @@ bool allocation_shape(const ModelGeometry& g, int64_t cells, int64_t k, int64_t&
         &ModelGeometry::n_expert, &ModelGeometry::n_ff
     };
     for (auto d : dimensions) if (g.*d <= 0 || g.*d > limit.*d) return false;
-    if (g.qsa_interval <= 0 || cells <= 0 || cells > INT32_MAX || k < 1 || k > 64 ||
-        qsa_kv_resident() > INT32_MAX) return false;
+    if (g.qsa_interval <= 0 || cells <= 0 || cells > INT32_MAX || k < 1 || k > 64) return false;
     if (hi < 0 || hi > g.n_layers) hi = g.n_layers;
     if (lo < 0) lo = 0;
     return lo < hi;
@@ -102,8 +101,10 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                        const strata::plan::QsaPlacement* placement) {
     if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return 0;
+    const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
     const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
     const int64_t q_lo = layer_lo / I, q_hi = layer_hi / I;
@@ -113,8 +114,12 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
-    if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+    if (g.n_qsa_layers() > 0) {
+        const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, &resolved);
+        const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, &resolved);
+        if (!first || !rest) return 0;
+        n += first + (uint64_t) (q_n - 1) * rest;
+    }
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -123,14 +128,17 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 }
 
 bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
-                              SessionAllocationBytes& out, int64_t layer_lo, int64_t layer_hi) {
+                              SessionAllocationBytes& out, int64_t layer_lo, int64_t layer_hi,
+                              const strata::plan::QsaPlacement* placement) {
     out = {};
     if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return false;
+    const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
     const int64_t nq = g.n_qsa_layers();
     const int64_t count = std::max<int64_t>(layer_hi / g.qsa_interval - layer_lo / g.qsa_interval, nq ? 1 : 0);
     SessionAllocationBytes b;
-    b.device = session_bytes(g, max_cells, k, layer_lo, layer_hi);
-    b.host_pinned = (uint64_t) count * qsa_state_host_bytes(g, max_cells);
+    b.device = session_bytes(g, max_cells, k, layer_lo, layer_hi, &resolved);
+    if (!b.device) return false;
+    b.host_pinned = (uint64_t) count * qsa_state_host_bytes(g, max_cells, 0, &resolved);
     b.host_heap = sizeof(SessionOwner) + (uint64_t) nq * sizeof(QsaState);
     if (count) {
         const auto shape = strata::kernels::qsa_real_shapes();
@@ -148,13 +156,14 @@ bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t
 SessionOwner::~SessionOwner() noexcept { reset(); }
 
 bool SessionOwner::init(const ModelGeometry& g, int64_t max_cells, int64_t k, std::string& err,
-                        int64_t layer_lo, int64_t layer_hi) {
+                        int64_t layer_lo, int64_t layer_hi, const strata::plan::QsaPlacement* placement) {
     err.clear();
     if (arena_) { err = "session: owner already initialized"; return false; }
     static std::atomic<uint64_t> next_id{0};
     allocation_id_ = ++next_id;
     SessionAllocationBytes bytes;
-    if (!session_allocation_bytes(g, max_cells, k, bytes, layer_lo, layer_hi)) {
+    const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
+    if (!session_allocation_bytes(g, max_cells, k, bytes, layer_lo, layer_hi, &resolved)) {
         err = "session: invalid allocation geometry/configuration";
         return false;
     }
@@ -179,8 +188,10 @@ bool SessionOwner::init(const ModelGeometry& g, int64_t max_cells, int64_t k, st
         std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=allocate device=%d bytes=%llu\n",
                      (unsigned long long) allocation_id_, device_, (unsigned long long) memory_.device);
     try {
-        if (session_init(g, max_cells, k, arena_, state_, layer_lo, layer_hi) != 0) return true;
-        err = "session: QSA initialization failed";
+        const uint64_t used = session_init(g, max_cells, k, arena_, state_, layer_lo, layer_hi,
+                                           &resolved, bytes.device);
+        if (used == bytes.device) return true;
+        err = used ? "session: priced/carved extent mismatch" : "session: QSA initialization or extent check failed";
     } catch (...) {
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "STATE_ALLOCATION owner=%llu phase=failure device=%d bytes=%llu\n",
@@ -220,9 +231,13 @@ void SessionOwner::reset() noexcept {
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi,
+                      const strata::plan::QsaPlacement* placement, uint64_t arena_bytes) {
     if (!base || s.allocation_device >= 0 || s.qsa_states ||
         !allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return 0;
+    const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
+    const uint64_t priced = session_bytes(g, max_cells, k, layer_lo, layer_hi, &resolved);
+    if (!priced || (arena_bytes && arena_bytes < priced)) return 0;
     if (cudaGetDevice(&s.allocation_device) != cudaSuccess) { s.allocation_device = -1; return 0; }
     struct InitGuard {
         SessionState& state;
@@ -231,9 +246,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     } guard{s};
     uint8_t* p = (uint8_t*) base;
     uint64_t used = 0;
-    auto take = [&](uint64_t bytes) {
+    auto take = [&](uint64_t bytes) -> uint8_t* {
+        if (used > priced || bytes > priced - used) return nullptr;
+        const uint64_t next = align_up(used + bytes, SESSION_STATE_ALIGN);
+        if (next > priced) return nullptr;
         uint8_t* r = p + used;
-        used = align_up(used + bytes, SESSION_STATE_ALIGN);
+        used = next;
         return r;
     };
 
@@ -249,16 +267,21 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
 
-    gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
+    void* gdn_arena = take(gdn_buffers_bytes(g));
+    if (!gdn_arena) return 0;
+    gdn_buffers_init(g, gdn_arena, s.gdn);
     s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
+    if (!s.gdn_state) return 0;
 
     // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, &resolved);
+    const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, &resolved);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
+    if (!s.qsa_state_arena) return 0;
     s.qsa_states = g.n_qsa_layers() ? new (std::nothrow) QsaState[(size_t) g.n_qsa_layers()]() : nullptr;
     if (g.n_qsa_layers() && !s.qsa_states) return 0;
     s.qsa_heap_bytes = (uint64_t) g.n_qsa_layers() * sizeof(QsaState);
@@ -266,26 +289,37 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
         std::fprintf(stderr, "STATE_SESSION_HEAP owner=%llu phase=allocate bytes=%llu\n",
                      (unsigned long long) s.allocation_id, (unsigned long long) s.qsa_heap_bytes);
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
+    if (!s.qsa_buf_arena) return 0;
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t j = 0; j < s.qsa_alloc; ++j)
-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        const uint64_t expected = j == 0 ? first : rest;
+        const uint64_t carved = qsa_state_init(g, max_cells,
+            qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
+            s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0],
+            0, &resolved, expected);
+        if (carved != expected) {
+            std::fprintf(stderr, "strata session: QSA priced/carved extent mismatch or initialization failure\n");
             return 0;
+        }
+    }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
+    if (!s.moe_arena) return 0;
     moe_buffers_init(g, k, s.moe_arena, s.moe);
     s.block_arena = take(block_buffers_bytes(g));
+    if (!s.block_arena) return 0;
     block_buffers_init(g, s.block_arena, s.block);
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());
+    if (!s.ple_hist) return 0;
     s.R = s.block.R;
     guard.complete = true;
-    return used;
+    return priced; // includes the unchanged session alignment/slack reservation
 }
 
 void session_release(SessionState& s) {

@@ -510,6 +510,9 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    // Absence inherits --kv-resident; explicit 0/positive overrides additional slots only.
+    // Never set the process policy from this: working main/draft keep --kv-resident.
+    std::optional<int64_t> slot_kv_window;
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -838,6 +841,10 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --slot-kv-window N   cells per QSA layer for additional --batch slots only; absent: inherit\n"
+                 "                       --kv-resident. 0: fully resident; positive: pinned host backing, min 20480\n"
+                 "                       and enough for one streamed call. Working main/draft keep --kv-resident;\n"
+                 "                       slot drafts follow N (must hold --mtp-window plus lookahead). Format stays global\n"
                  "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
                  "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
                  "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
@@ -1957,6 +1964,25 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--slot-kv-window") {
+            const char* value = next("--slot-kv-window");
+            int64_t cells = 0;
+            const auto parsed_cells = std::from_chars(value, value + std::strlen(value), cells);
+            if (parsed_cells.ec != std::errc{} || *parsed_cells.ptr != '\0') {
+                std::fprintf(stderr, "strata generate: --slot-kv-window needs an integer cell count, got '%s'\n", value);
+                return 2;
+            }
+            // Pure option validation before any artifact/device work. The 20480-cell
+            // engine floor is distinct from one call's block capacity and CUDA's RT guard.
+            const auto s = strata::kernels::qsa_real_shapes();
+            if (const char* why = strata::plan::qsa_slot_window_error(s, cells,
+                    strata::kernels::kVerifyMaxT,
+                    strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s))) {
+                std::fprintf(stderr, "strata generate: %s (requested %lld cells)\n", why, (long long) cells);
+                return 2;
+            }
+            o.slot_kv_window = cells;
+        }
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -2729,6 +2755,20 @@ int main(int argc, char** argv) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         o.spec = std::max(o.spec, std::min(o.mtp_max_t + o.lookup_chain, 8));   // kVerifyMaxT
     }
+    // The finalized speculative width determines the existing dense-draft lookahead.
+    // Reject an undersized slot ring here too, still before any device allocation.
+    if (o.slot_kv_window && *o.slot_kv_window > 0 && !o.mtp.empty() && o.spec >= 2 && o.batch > 0) {
+        const auto s = strata::kernels::qsa_real_shapes();
+        const int64_t draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int64_t draft_live = strata::plan::qsa_draft_live_cells(o.max_context, o.mtp_window, draft_rows);
+        if ((*o.slot_kv_window + s.page_size - 1) / s.page_size <
+            (draft_live + s.page_size - 1) / s.page_size) {
+            std::fprintf(stderr, "strata generate: --slot-kv-window is below the MTP live-window capacity "
+                                 "(--mtp-window plus lookahead; need %lld cells, requested %lld)\n",
+                         (long long) draft_live, (long long) *o.slot_kv_window);
+            return 2;
+        }
+    }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         try {
@@ -3409,6 +3449,11 @@ int main(int argc, char** argv) {
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
+    // One startup resolution for every owner role. Captured graph keys omit residency;
+    // these values feed both admission prices and fresh-owner carves, never live rebinding.
+    const int draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+    const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
+        o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -3565,13 +3610,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: admission refused: expert geometry exceeds allocator/kernel limits\n");
             return 1;
         }
-        const int64_t session_full = strata::core::session_bytes(g, o.max_context, K, 0, -1);
+        const int64_t session_full = strata::core::session_bytes(g, o.max_context, K, 0, -1, &kv_roles.working_main);
         const int requested_slots = std::clamp(o.batch, 0, strata::kernels::kVerifyMaxT);
         strata::plan::ResidentBytes resident;
         strata::core::SessionAllocationBytes session_allocation;
-        if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation) ||
+        if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation, 0, -1,
+                                                   &kv_roles.working_main) ||
             (requested_slots && !strata::core::resident_allocation_bytes(
-                g, o.max_context, K, requested_slots, !o.mtp.empty(), resident))) {
+                g, o.max_context, K, requested_slots, !o.mtp.empty(), resident, &kv_roles))) {
             std::fprintf(stderr, "strata generate: admission refused: resident ownership pricing requires fully resident FP16 KV\n");
             return 1;
         }
@@ -3786,7 +3832,8 @@ int main(int argc, char** argv) {
                     // the same arithmetic the carve allocates after the search would run.
                     const int64_t lb = split_at[i];
                     const int64_t le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
-                    ds.vram.add("session_state", (uint64_t) strata::core::session_bytes(g, o.max_context, K, lb, le),
+                    ds.vram.add("session_state", (uint64_t) strata::core::session_bytes(g, o.max_context, K, lb, le,
+                                                                                     &kv_roles.working_main),
                                 "session_bytes of this stage's own layer range (explicit split)");
                 }
                 if (requested_slots) {
@@ -4081,7 +4128,8 @@ int main(int argc, char** argv) {
             for (size_t stage = 0; stage < stage_count; ++stage) {
                 const int64_t hi = stage < split_at.size() ? split_at[stage] : g.n_layers;
                 strata::core::SessionAllocationBytes allocation;
-                if (!strata::core::session_allocation_bytes(g, o.max_context, K, allocation, lo, hi)) {
+                if (!strata::core::session_allocation_bytes(g, o.max_context, K, allocation, lo, hi,
+                                                           &kv_roles.working_main)) {
                     std::fprintf(stderr, "strata generate: cannot price split stage's pinned session state\n");
                     return 1;
                 }
@@ -4094,12 +4142,12 @@ int main(int argc, char** argv) {
         ram("session_host_pinned", session_host_pinned,
             "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
         if (!o.mtp.empty() && o.spec >= 2) {
-            // The working drafter is not a SessionOwner or a resident batch slot. Bound both
-            // main-mode and ring-mode placement, including their independent environment overrides.
-            ram(requested_slots ? "resident_working_draft_pinned" : "mtp_host_pinned", requested_slots ?
-                resident.working_draft.pinned : std::max(
-                strata::core::resident_draft_payload(draft_geometry, o.max_context, 0).pinned,
-                strata::core::resident_draft_payload(draft_geometry, o.max_context, 1).pinned),
+            ram(requested_slots ? "resident_working_draft_pinned" : "mtp_host_pinned",
+                requested_slots ? resident.working_draft.pinned :
+                (o.slot_kv_window ? strata::core::resident_draft_payload(draft_geometry, o.max_context, 0,
+                    &kv_roles.working_draft).pinned : std::max(
+                    strata::core::resident_draft_payload(draft_geometry, o.max_context, 0).pinned,
+                    strata::core::resident_draft_payload(draft_geometry, o.max_context, 1).pinned)),
                 "working MTP QSA staging and possible full-context pinned backing; allocator-derived bound");
         }
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
@@ -4981,7 +5029,8 @@ int main(int argc, char** argv) {
                 pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
+            const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers,
+                                                                         &kv_roles.working_main);
             const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
             cudaDeviceProp dp{};
@@ -5290,7 +5339,8 @@ int main(int argc, char** argv) {
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         // what stage i has left for experts if it runs [lb, le): its room, minus its session and (a later stage) its weights
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
-            return cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
+            return cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le,
+                                                                         &kv_roles.working_main) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
         };
         std::vector<double> layer_ms((size_t) ns);
@@ -5442,23 +5492,16 @@ int main(int argc, char** argv) {
         //
         // chunk_bytes uses a no-alloc fake SessionState.  qsa_state_init is NOT used: with base=nullptr it would
         // cudaMemcpy a null page table and kv_stream_reset a null map (CUDA "invalid argument") on a streamed
-        // state.  bytes_needed only reads max_cells and kv_mode/n_pages/kv_int8/kv_q4/kv_hybrid, so we set those
-        // fields directly, replicating kv_plan's arithmetic (layer.cpp:634) with the public getters.
+        // state. Preserve the legacy working-policy staging estimate (including its
+        // no-env A/B estimate); a slot override never retargets prefill or changes its price.
         auto chunk_bytes = [&](int64_t lb, int64_t c) -> uint64_t {
-            strata::core::qsa_set_kv_resident(o.kv_resident);
-            strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-            s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
-            s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
-            const int64_t pages = (o.max_context + s.page_size - 1) / s.page_size;
-            int mode = 0;
-            const int64_t kv_res = strata::core::qsa_kv_resident();
-            if (kv_res > 0) {
-                const int64_t r = (std::max(kv_res, strata::core::qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
-                if (r < pages) mode = 1;
-            }
-            const bool q4 = strata::core::qsa_kv_q4();
-            const bool hyb = strata::core::qsa_kv_hybrid();
-            const bool i8 = strata::core::qsa_kv_int8() && !q4;
+            const auto working_kv = strata::plan::qsa_memory_layout(strata::kernels::qsa_real_shapes(),
+                                                                    o.max_context, o.kv_resident, 0);
+            const int64_t pages = working_kv.pages;
+            const int mode = working_kv.mode;
+            const bool q4 = kv_roles.working_main.format == strata::kernels::kKvQ4;
+            const bool hyb = kv_roles.working_main.format == strata::kernels::kKvHybrid;
+            const bool i8 = kv_roles.working_main.format == strata::kernels::kKvInt8;
             std::vector<strata::core::QsaState> qs((size_t) g.n_qsa_layers());
             for (int64_t j = 0; j < g.n_qsa_layers(); ++j) {
                 qs[(size_t) j].max_cells = o.max_context;
@@ -5802,7 +5845,7 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (!session_owner.init(g, o.max_context, K, err, 0, hi0)) {
+        if (!session_owner.init(g, o.max_context, K, err, 0, hi0, &kv_roles.working_main)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -5832,7 +5875,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
-        if (!st.session_owner.init(g, o.max_context, K, err, st.lb, st.le)) {
+        if (!st.session_owner.init(g, o.max_context, K, err, st.lb, st.le, &kv_roles.working_main)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
@@ -5910,11 +5953,16 @@ int main(int argc, char** argv) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, &kv_roles.slot_main);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionOwner>();
-                if (!u->init(g, o.max_context, K, err, lo, hi)) {
+                if (!u->init(g, o.max_context, K, err, lo, hi, &kv_roles.slot_main)) {
+                    if (o.slot_kv_window) {
+                        std::fprintf(stderr, "strata generate: --slot-kv-window cannot be honoured for slot %d "
+                                             "on CUDA%d: %s\n", b, dev, err.c_str());
+                        return 1; // no silent shrink, disable or resident fallback for an explicit policy
+                    }
                     cudaGetLastError();
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
@@ -5976,12 +6024,15 @@ int main(int argc, char** argv) {
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err,
+                                      o.mtp_window, &kv_roles.working_draft)) {
+            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1;
+        }
         mtp.set_ple_session(&ss);
         if (o.batch > 0 && !o.mtp.empty()) {
             std::vector<strata::core::SessionState*> ptrs;
             for (auto& u : bslot_ss.back()) ptrs.push_back(&u->state());
-            if (!mtp.init_slots(ptrs, err)) {
+            if (!mtp.init_slots(ptrs, err, o.slot_kv_window ? &kv_roles.slot_draft : nullptr)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
             }
         }
@@ -6415,7 +6466,7 @@ int main(int argc, char** argv) {
             const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib =
-                (int64_t) (strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);
+                (int64_t) (strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers, &kv_roles.working_main) >> 20);
             const std::string reserve_tip =
                 o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +

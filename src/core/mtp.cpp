@@ -320,7 +320,8 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 }
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window) {
+                      int64_t window, const strata::plan::QsaPlacement* placement) {
+    if (g_ || state_arena_) { err = "mtp: drafter already initialized"; return false; }
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
@@ -394,34 +395,31 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
-    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
-    // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
-    // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
-    const bool kv_hybrid_was = qsa_kv_hybrid();
-    const bool kv_int8_was = qsa_kv_int8();
-    struct RestoreKvFormat {
-        bool hybrid, int8;
-        ~RestoreKvFormat() { qsa_set_kv_int8(int8); qsa_set_kv_hybrid(hybrid); }
-    } restore_format{kv_hybrid_was, kv_int8_was};
-    qsa_set_kv_hybrid(false);
-    if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
-    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+    const int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    // Resolve whole-format draft storage without rebinding the process-wide main format.
+    state_placement_ = placement ? *placement : qsa_state_placement(g, max_cells, ring, -1, true);
+    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring, &state_placement_);
+    if (!sb) { err = "mtp: invalid resolved K/V placement"; return false; }
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
-        if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+    uint64_t used = qsa_state_init(g, max_cells, state_arena_, st_,
+        &ss.qsa_states[ss.qsa_primary()], ring, &state_placement_, sb);
+    if (used != sb) {
+        if (used || st_.kv_mode == 0) { err = "mtp: state init or priced/carved extent check failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
         qsa_state_release(st_);
         cudaFree(state_arena_);
         state_arena_ = nullptr;
         st_ = QsaState{};
-        ring = -1;   // fully resident
-        sb = qsa_state_bytes(g, max_cells, false, ring);
+        // Existing, explicit startup fallback; never rebind a live/captured owner.
+        state_placement_.kv = strata::plan::qsa_memory_layout(s, max_cells, 0, -1);
+        sb = qsa_state_bytes(g, max_cells, false, -1, &state_placement_);
         if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()],
+                           -1, &state_placement_, sb) != sb) {
+            err = "mtp: state init or priced/carved extent check failed"; return false;
+        }
     }
-    qsa_set_kv_int8(kv_int8_was);
-    qsa_set_kv_hybrid(kv_hybrid_was);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -1096,21 +1094,20 @@ bool finish_capture(const GraphCaptureProbe& probe, cudaStream_t cs, bool ok, cu
 }
 }  // namespace
 
-bool MtpDrafter::init_slots(const std::vector<SessionState*>& sessions, std::string& err) {
+bool MtpDrafter::init_slots(const std::vector<SessionState*>& sessions, std::string& err,
+                            const strata::plan::QsaPlacement* placement) {
     if (!g_ || !cs_ || !slots_.empty() || sessions.empty() || sessions.size() > 8) {
         err = "mtp: invalid resident slot initialization"; return false;
     }
     const OnDevice on_device(device_);
     Operation operation(*this, err);
     if (!operation) return false;
-    struct RestoreFormat {
-        bool hybrid = qsa_kv_hybrid(), int8 = qsa_kv_int8();
-        ~RestoreFormat() { qsa_set_kv_int8(int8); qsa_set_kv_hybrid(hybrid); }
-    } restore;
-    qsa_set_kv_hybrid(false);
-    qsa_set_kv_int8(st_.kv_int8);
-    const int64_t ring = st_.kv_mode == 2 ? st_.n_slots * shapes_of(*g_).page_size : -1;
-    const uint64_t bytes = qsa_state_bytes(*g_, st_.max_cells, false, ring);
+    const auto resolved = placement ? *placement : state_placement_;
+    if (resolved.format != qsa_kv_format(st_) || resolved.rotate != state_placement_.rotate) {
+        err = "mtp: slot residency cannot change the draft format"; return false;
+    }
+    const uint64_t bytes = qsa_state_bytes(*g_, st_.max_cells, false, 0, &resolved);
+    if (!bytes) { err = "mtp: invalid resolved slot K/V placement"; return false; }
     slots_.resize(sessions.size());
     for (size_t i = 0; i < sessions.size(); ++i) {
         auto& slot = slots_[i];
@@ -1122,7 +1119,7 @@ bool MtpDrafter::init_slots(const std::vector<SessionState*>& sessions, std::str
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "STATE_DRAFT_ALLOCATION slot=%zu phase=allocate bytes=%llu\n",
                          i, (unsigned long long) bytes);
-        if (qsa_state_init(*g_, st_.max_cells, slot.arena, slot.state, &st_, ring) == 0) {
+        if (qsa_state_init(*g_, st_.max_cells, slot.arena, slot.state, &st_, 0, &resolved, bytes) != bytes) {
             err = "mtp: resident request K/V initialization failed"; return false;
         }
         qsa_state_zero(slot.state, *g_, cs_);
