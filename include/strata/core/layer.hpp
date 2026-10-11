@@ -220,8 +220,8 @@ struct QsaState {
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
-    /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
-    /// ring state stays plain INT8, so the block movers never see the hybrid layout.
+    /// Uses k_q/k_scale + v_q4 for resident or streamed main states. The MTP drafter instead uses plain INT8
+    /// under this process setting, whether its state is a ring or fully resident.
     bool kv_hybrid = false;
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)

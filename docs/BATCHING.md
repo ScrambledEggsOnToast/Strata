@@ -116,6 +116,15 @@ supports fully resident FP16 KV only. Quantized/streamed KV is not qualified for
 the single-session path is unchanged. Native and Python HET-017 accounting charge these payloads before the
 automatic expert-cache grant, even if a later runtime fallback reduces the active slot count.
 
+The CUDA-free payload contract names four roles: `working_main`, `slot_main`, `working_draft` and
+`slot_draft`, each with device and pinned bytes. Working owners are charged once; slot terms multiply the
+requested count. Histories/checkpoints and serial transfer bounds remain separate, and shared drafter/head
+storage is not charged twice. `plan/qsa_memory.hpp` shares format and pool arithmetic with the actual
+allocator: a hybrid main state's host backing costs 3264 B/page, and its draft uses whole INT8 at 1056 B/cell
+rather than hybrid's 816 B/cell. FP16 drafts remain FP16. These are source-derived payload prices pinned by
+the project's hermetic planner/partner tests, not GPU allocation or concurrency qualification. The
+FP16-only resident admission predicate is unchanged.
+
 The upstream setup heuristic recommends `"parallel"` where experts mostly fit in VRAM. It is a recommendation,
 not an admission calculation or evidence for this fork. The historical measurements below show why slots can
 reduce waiting while slowing a request alone: their private state reduces the expert cache. Use the emitted

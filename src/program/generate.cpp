@@ -3627,15 +3627,19 @@ int main(int argc, char** argv) {
                 v0.add("mtp_weights", byte_add(dense_b, experts_b), "file sizes of the MTP rt dense.bin + experts.bin");
             else
                 v0.add_unknown("mtp_weights", "--mtp rt files unreadable");
-            v0.add("mtp_drafter_buffers", (uint64_t) kDrafterMib << 20,
-                   "generate.cpp kDrafterMib: the drafter plus head envelope (839 MiB measured)");
+            const uint64_t working_draft = requested_slots ? resident.working_draft.device : 0;
+            const uint64_t envelope = (uint64_t) kDrafterMib << 20;
+            if (requested_slots)
+                v0.add("resident_working_draft_device", working_draft, "one working draft KV owner, not multiplied by slots");
+            v0.add("mtp_drafter_buffers", working_draft < envelope ? envelope - working_draft : 0,
+                   "remaining shared drafter/head envelope after named working KV");
         }
-        v0.add("session_state", (uint64_t) session_full,
+        v0.add("session_state", requested_slots ? resident.working_main.device : (uint64_t) session_full,
                "session_bytes(geometry, --max-context, K); a split's per-stage shares are upper-bounded by it");
         if (requested_slots) {
-            v0.add("resident_session_device", resident.session_device, "requested resident SessionOwner arenas before runtime fallback");
+            v0.add("resident_slot_main_device", resident.slot_main.device, "requested resident SessionOwner arenas before runtime fallback");
             v0.add("resident_verifier_device", resident.verifier_device, "bounded per-slot commit/indexer/steering/penalty controls");
-            if (mtp_here) v0.add("resident_mtp_device", resident.mtp_device, "one private QSA draft state per requested slot");
+            if (mtp_here) v0.add("resident_slot_draft_device", resident.slot_draft.device, "one private QSA draft state per requested slot");
         }
         if (o.spec > 0 || !o.mtp.empty() || requested_slots)
             v0.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "shared verifier ownership records and device owner table");
@@ -3775,7 +3779,7 @@ int main(int argc, char** argv) {
                     else ds.vram.add_unknown("weights_native_head", "last-stage native output tensor unreadable");
                 }
                 if (split_auto)
-                    ds.vram.add("session_state", (uint64_t) session_full,
+                    ds.vram.add("session_state", requested_slots ? resident.working_main.device : (uint64_t) session_full,
                                 "session_bytes upper bound until the split search places the ranges");
                 else {
                     // An explicit split knows its placement: price this stage's own carve,
@@ -3786,9 +3790,9 @@ int main(int argc, char** argv) {
                                 "session_bytes of this stage's own layer range (explicit split)");
                 }
                 if (requested_slots) {
-                    ds.vram.add("resident_session_device", resident.session_device, "requested slots; full session bound before split placement");
+                    ds.vram.add("resident_slot_main_device", resident.slot_main.device, "requested slots; full session bound before split placement");
                     ds.vram.add("resident_verifier_device", resident.verifier_device, "per-stage resident controls");
-                    if (i == last) ds.vram.add("resident_mtp_device", resident.mtp_device, "draft slot state on final stage");
+                    if (i == last) ds.vram.add("resident_slot_draft_device", resident.slot_draft.device, "draft slot state on final stage");
                 }
                 if (o.spec > 0 || !o.mtp.empty() || requested_slots)
                     ds.vram.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "per-stage verifier ownership records");
@@ -3816,7 +3820,12 @@ int main(int argc, char** argv) {
                         ds.vram.add("mtp_weights", byte_add(dense_b, experts_b), "MTP rt file sizes (last stage)");
                     else
                         ds.vram.add_unknown("mtp_weights", "--mtp rt files unreadable");
-                    ds.vram.add("mtp_drafter_buffers", (uint64_t) kDrafterMib << 20, "generate.cpp kDrafterMib");
+                    const uint64_t working_draft = requested_slots ? resident.working_draft.device : 0;
+                    const uint64_t envelope = (uint64_t) kDrafterMib << 20;
+                    if (requested_slots)
+                        ds.vram.add("resident_working_draft_device", working_draft, "one working draft KV owner on final stage");
+                    ds.vram.add("mtp_drafter_buffers", working_draft < envelope ? envelope - working_draft : 0,
+                                "remaining shared drafter/head envelope after named working KV");
                 }
                 ds.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
                 if (graph_capable)
@@ -4065,7 +4074,7 @@ int main(int argc, char** argv) {
             uploads.add(name, bytes, source, ByteMeaning::clean_file);
         };
         const uint64_t stage_count = split_real ? split_devs.size() + 1 : 1;
-        uint64_t session_host_pinned = session_allocation.host_pinned;
+        uint64_t session_host_pinned = requested_slots ? resident.working_main.pinned : session_allocation.host_pinned;
         if (split_real && !split_auto) {
             session_host_pinned = 0;
             int64_t lo = 0;
@@ -4087,9 +4096,10 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty() && o.spec >= 2) {
             // The working drafter is not a SessionOwner or a resident batch slot. Bound both
             // main-mode and ring-mode placement, including their independent environment overrides.
-            ram("mtp_host_pinned", std::max(
-                strata::core::qsa_state_host_bytes(draft_geometry, o.max_context),
-                strata::core::qsa_state_host_bytes(draft_geometry, o.max_context, 1)),
+            ram(requested_slots ? "resident_working_draft_pinned" : "mtp_host_pinned", requested_slots ?
+                resident.working_draft.pinned : std::max(
+                strata::core::resident_draft_payload(draft_geometry, o.max_context, 0).pinned,
+                strata::core::resident_draft_payload(draft_geometry, o.max_context, 1).pinned),
                 "working MTP QSA staging and possible full-context pinned backing; allocator-derived bound");
         }
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
@@ -4100,14 +4110,14 @@ int main(int argc, char** argv) {
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
         if (requested_slots) {
-            ram("resident_session_pinned", byte_mul(stage_count, resident.session_pinned), "private QSA staging per requested slot/stage");
-            ram("resident_session_owner", byte_mul(stage_count, resident.session_owner), "ABI-checked resident owner envelopes");
+            ram("resident_slot_main_pinned", byte_mul(stage_count, resident.slot_main.pinned), "private QSA staging per requested slot/stage");
+            ram("resident_slot_main_owner", byte_mul(stage_count, resident.slot_main_owner), "ABI-checked resident owner envelopes");
             ram("resident_histories", resident.histories, "three context-bounded token histories per requested slot");
             ram("resident_checkpoints", byte_mul(stage_count, resident.checkpoints), "one retained checkpoint per slot, full session envelope");
             ram("resident_verifier_pinned", byte_mul(stage_count, resident.verifier_pinned), "mapped slot commit controls");
             ram("resident_verifier_history", byte_mul(stage_count, resident.verifier_history), "4096 int32 history entries per slot");
-            ram("resident_mtp_pinned", resident.mtp_pinned, "private draft QSA mapped staging");
-            ram("resident_mtp_owner", resident.mtp_owner, "draft slot owner envelope, weights and scratch shared");
+            ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "private draft QSA mapped staging");
+            ram("resident_slot_draft_owner", resident.slot_draft_owner, "draft slot owner envelope, weights and scratch shared");
             ram("resident_transfer_transient", resident.transfer_transient, "serial checkpoint and one-layer QSA transfer envelope");
         }
         if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)

@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/plan/qsa_memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -197,13 +198,7 @@ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slot
 }  // namespace
 
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
-    const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
-    if (fmt == kKvHybrid)
-        return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
-               rows * kv_q4_bytes_per_head((int) s.head_dim);
-    if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
-    return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
-                : rows * (uint64_t) s.head_dim * 2 * 2;
+    return strata::plan::kv_page_bytes(s, fmt);
 }
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {

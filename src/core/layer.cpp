@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/plan/qsa_memory.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -627,73 +628,34 @@ uint64_t qsa_kv_elastic_full_bytes() {
 }
 namespace {
 
-/// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
-struct KvPlan {
-    int mode = 0;
-    int64_t pages = 0, slots = 0, pooled_rows = 0;
-};
-KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
-    KvPlan p;
-    p.pages = (max_cells + s.page_size - 1) / s.page_size;
-    p.slots = p.pages;
-    p.pooled_rows = max_cells / s.idx_block + 2;
-    if (g_kv_resident <= 0 || ring_cells < 0) return p;   // ring_cells < 0: always fully resident
-    // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
+strata::plan::QsaMemoryLayout kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
+    if (g_kv_resident <= 0 || ring_cells < 0)
+        return strata::plan::qsa_memory_layout(s, max_cells, g_kv_resident, ring_cells);
+    // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers.
     static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
     static const bool main_off = std::getenv("STRATA_KV_MAIN_OFF") != nullptr;
-    if (ring_cells > 0 ? ring_off : main_off) return p;
-    if (ring_cells > 0) {
-        const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
-        if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; }   // the drafter has no indexer
-    } else {
-        const int64_t r = (std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
-        if (r < p.pages) { p.mode = 1; p.slots = r; }
-    }
-    return p;
-}
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
-    if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
-        const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
-        return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
-               rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
-    }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
-    return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
-                : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
+    return strata::plan::qsa_memory_layout(s, max_cells, g_kv_resident, ring_cells,
+                                         ring_cells > 0 ? ring_off : main_off);
 }
 }  // namespace
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
-int64_t qsa_kv_resident_min() { return 20480; }
+int64_t qsa_kv_resident_min() { return strata::plan::kQsaResidentMinCells; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
-    uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
-    n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
-    n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
-    n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
-    n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
-    n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
-    n += (uint64_t) s.n_head * 4;                                              // pos_dev
-    return align_up16(n) + 256;
+    const auto p = kv_plan(s, max_cells, ring_cells);
+    const int fmt = strata::plan::qsa_state_format(g_kv_hybrid, g_kv_q4, g_kv_int8, ring_cells);
+    return strata::plan::qsa_device_bytes(s, max_cells, p, fmt, with_rope, g_kv_elastic);
 }
 
 uint64_t qsa_state_host_bytes(const ModelGeometry& g, int64_t max_cells, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
-    const int fmt = g_kv_q4 ? strata::kernels::kKvQ4
-                          : (g_kv_int8 || g_kv_hybrid) ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
-    return strata::kernels::qsa_step_bytes() + sizeof(int32_t) + (uint64_t) s.n_head * sizeof(int32_t) +
-           (p.mode == 0 ? 0 : (uint64_t) p.pages * strata::kernels::kv_block_bytes(s, fmt) + 4 * 256);
+    const auto p = kv_plan(s, max_cells, ring_cells);
+    const int fmt = strata::plan::qsa_state_format(g_kv_hybrid, g_kv_q4, g_kv_int8, ring_cells);
+    return strata::plan::qsa_pinned_bytes(s, p, fmt);
 }
 
 namespace {
@@ -746,18 +708,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         }
     } guard{st};
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const auto p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
-    st.kv_q4 = g_kv_q4;
-    // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
-    // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
-    if (g_kv_hybrid && ring_cells <= 0) {
-        st.kv_hybrid = true;
-        st.kv_int8 = false;
-        st.kv_q4 = false;
-    }
+    const int fmt = strata::plan::qsa_state_format(g_kv_hybrid, g_kv_q4, g_kv_int8, ring_cells);
+    st.kv_hybrid = fmt == strata::kernels::kKvHybrid;
+    st.kv_int8 = fmt == strata::kernels::kKvInt8;
+    st.kv_q4 = fmt == strata::kernels::kKvQ4;
     st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
