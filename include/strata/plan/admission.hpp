@@ -195,6 +195,16 @@ struct Scope {
             if (c.unknown) return &c;
         return nullptr;
     }
+    const Accounted* first_over_budget(uint64_t ceiling, uint64_t credit = 0) const {
+        uint64_t running = 0;
+        for (const auto& c : classes) {
+            const uint64_t discount = c.clean_credit() && !c.unknown ? std::min(credit, c.bytes) : 0;
+            credit -= discount;
+            running = saturating_add(running, c.bytes - discount);
+            if (running > ceiling) return &c;
+        }
+        return nullptr;
+    }
 };
 
 // ---- inputs -----------------------------------------------------------------
@@ -271,7 +281,7 @@ struct AdmissionDecision {
     std::string variant = "cold";  // cold | warm | resident - a LABEL on how file-backed pages were treated
     std::vector<std::string> reasons;
     std::vector<std::string> unknown_classes;
-    std::string limiting_term;     // "CUDA0:expert_cache" / "guest" / "host" / "telemetry:CUDA1" / ""
+    std::string limiting_term;     // "CUDA0:expert_cache" / "guest:class" / "host:class" / "telemetry:CUDA1" / ""
     std::vector<DeviceLine> devices;
 
     bool guest_known = false, guest_fits = false;
@@ -477,11 +487,13 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
             if (d.limiting_term.empty()) d.limiting_term = "telemetry:guest";
         } else if (d.guest_demand_bytes > d.guest_ceiling_bytes) {
             d.guest_fits = false;
+            const auto* crossed = guest_demand.first_over_budget(d.guest_ceiling_bytes, guest_credit);
+            const std::string limiting_class = crossed ? crossed->name : "reserve";
             d.reasons.push_back("guest overfull: demand " + std::to_string(d.guest_demand_bytes) +
                                 " B (after clean-cache credit " + std::to_string(guest_credit) +
                                 " B) > guest " + std::to_string(p.guest_total_bytes) + " B - reserve " +
-                                std::to_string(p.guest_reserve_bytes) + " B");
-            if (d.limiting_term.empty()) d.limiting_term = "guest";
+                                std::to_string(p.guest_reserve_bytes) + " B (limiting class " + limiting_class + ")");
+            if (d.limiting_term.empty()) d.limiting_term = "guest:" + limiting_class;
         } else {
             d.guest_fits = true;
         }
@@ -507,17 +519,22 @@ AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
             if (d.limiting_term.empty()) d.limiting_term = "telemetry:host";
         } else if (d.host_demand_bytes > d.host_ceiling_bytes) {
             d.host_fits = false;
+            const auto* crossed = host_demand.first_over_budget(d.host_ceiling_bytes, host_credit);
+            const std::string limiting_class = crossed ? crossed->name : "reserve";
             d.reasons.push_back("host overfull: demand " + std::to_string(d.host_demand_bytes) +
                                 " B (after clean-cache credit " + std::to_string(host_credit) +
                                 " B) > available " + std::to_string(p.host_available_bytes) +
-                                " B - reserve " + std::to_string(p.host_reserve_bytes) + " B");
-            if (d.limiting_term.empty()) d.limiting_term = "host";
+                                " B - reserve " + std::to_string(p.host_reserve_bytes) +
+                                " B (limiting class " + limiting_class + ")");
+            if (d.limiting_term.empty()) d.limiting_term = "host:" + limiting_class;
         } else {
             d.host_fits = true;
         }
     } else {
         d.host_fits = true;
     }
+    if (d.limiting_term.empty() && !d.unknown_classes.empty())
+        d.limiting_term = d.unknown_classes.front();
 
     d.verified = d.unknown_classes.empty() && !all_hypothetical;
     for (const DeviceLine& line : d.devices)

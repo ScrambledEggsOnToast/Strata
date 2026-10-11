@@ -3335,19 +3335,6 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        const auto embed_t0 = std::chrono::steady_clock::now();
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        strata::core::set_native_embed(&native_embed);
-        std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
-                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
-                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
@@ -3455,6 +3442,7 @@ int main(int argc, char** argv) {
     const int draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
+    const bool batch_requested = o.batch > 0; // keep admission intent even if runtime eligibility disables it
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -3616,10 +3604,16 @@ int main(int argc, char** argv) {
         strata::plan::ResidentBytes resident;
         strata::core::SessionAllocationBytes session_allocation;
         if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation, 0, -1,
-                                                   &kv_roles.working_main) ||
-            (requested_slots && !strata::core::resident_allocation_bytes(
-                g, o.max_context, K, requested_slots, !o.mtp.empty(), resident, &kv_roles))) {
-            std::fprintf(stderr, "strata generate: admission refused: resident ownership pricing requires fully resident FP16 KV\n");
+                                                   &kv_roles.working_main)) {
+            std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA0:session_state "
+                                 "reason=working-session pricing failed\n");
+            return 1;
+        }
+        const char* unpriced_class = nullptr;
+        if (requested_slots && !strata::core::resident_allocation_bytes(
+                g, o.max_context, K, requested_slots, !o.mtp.empty(), kv_roles, resident, unpriced_class)) {
+            std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA0:%s "
+                                 "reason=resolved resident-role pricing failed\n", unpriced_class);
             return 1;
         }
         const uint64_t blob_gate = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
@@ -4159,15 +4153,16 @@ int main(int argc, char** argv) {
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
         if (requested_slots) {
-            ram("resident_slot_main_pinned", byte_mul(stage_count, resident.slot_main.pinned), "private QSA staging per requested slot/stage");
+            ram("resident_slot_main_pinned", byte_mul(stage_count, resident.slot_main.pinned),
+                "requested slot QSA staging and full logical streamed KV backing; stage-count upper bound");
             ram("resident_slot_main_owner", byte_mul(stage_count, resident.slot_main_owner), "ABI-checked resident owner envelopes");
             ram("resident_histories", resident.histories, "three context-bounded token histories per requested slot");
             ram("resident_checkpoints", byte_mul(stage_count, resident.checkpoints), "one retained checkpoint per slot, full session envelope");
             ram("resident_verifier_pinned", byte_mul(stage_count, resident.verifier_pinned), "mapped slot commit controls");
             ram("resident_verifier_history", byte_mul(stage_count, resident.verifier_history), "4096 int32 history entries per slot");
-            ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "private draft QSA mapped staging");
+            ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "requested draft QSA staging and full logical ring backing");
             ram("resident_slot_draft_owner", resident.slot_draft_owner, "draft slot owner envelope, weights and scratch shared");
-            ram("resident_transfer_transient", resident.transfer_transient, "serial checkpoint and one-layer QSA transfer envelope");
+            ram("resident_transfer_transient", resident.transfer_transient, "serial slot checkpoint plus larger working/slot main and draft image in either direction");
         }
         if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)
             ram("verify_profile_host", byte_mul(split_devs.size() + 1, profile_bytes),
@@ -4613,7 +4608,9 @@ int main(int argc, char** argv) {
             admission.admitted = false;
             if (!local_measured) admission.verified = false;
             admission.guest_fits = false;
-            if (admission.limiting_term.empty() || admission.limiting_term == "none")
+            if (admission.limiting_term.empty() || admission.limiting_term == "none" ||
+                std::find(admission.unknown_classes.begin(), admission.unknown_classes.end(),
+                          admission.limiting_term) != admission.unknown_classes.end())
                 admission.limiting_term = local_measured ? "guest:cgroup_or_available" : "telemetry:guest_available";
             admission.reasons.push_back("guest phase peak plus 4 GiB-or-higher guest reserve exceeds local MemAvailable/tightest finite cgroup headroom, or counters unavailable");
         }
@@ -4621,7 +4618,9 @@ int main(int argc, char** argv) {
             guest_peak > external.worker_limit - std::min(external.worker_limit, policy.guest_reserve_bytes))) {
             admission.admitted = false;
             admission.guest_fits = false;
-            if (admission.limiting_term.empty() || admission.limiting_term == "none")
+            if (admission.limiting_term.empty() || admission.limiting_term == "none" ||
+                std::find(admission.unknown_classes.begin(), admission.unknown_classes.end(),
+                          admission.limiting_term) != admission.unknown_classes.end())
                 admission.limiting_term = "guest:worker_cgroup";
             admission.reasons.push_back("guest phase peak plus guest reserve exceeds protected worker MemoryMax");
         }
@@ -4687,15 +4686,30 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         if (!admission.admitted) {
             for (const auto& r : admission.reasons)
-                std::fprintf(stderr, "strata generate: admission refused: %s\n", r.c_str());
+                std::fprintf(stderr, "strata generate: admission refused: limiting=%s %s\n",
+                             admission.limiting_term.c_str(), r.c_str());
             std::fprintf(stderr,
                          "strata generate: the configuration is refused BEFORE any model allocation - "
                          "lower --expert-cache / --max-context, or fix the accounting named above\n");
             return 1;
         }
     }
-    // (the native pack's embedding was loaded above, with upstream's shard-aware preset handling: the fork's own
-    // copy of that block is gone - one load, one place.)
+    // NativeEmbed may fall back to device memory: load only after every scope admits.
+    if (native_pack) {
+        const strata::core::ModelGeometry g0;
+        const auto embed_t0 = std::chrono::steady_clock::now();
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
+                               248320, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        strata::core::set_native_embed(&native_embed);
+        std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
+                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
+                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
+                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
+    }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
@@ -5959,10 +5973,10 @@ int main(int argc, char** argv) {
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionOwner>();
                 if (!u->init(g, o.max_context, K, err, lo, hi, &kv_roles.slot_main)) {
-                    if (o.slot_kv_window) {
-                        std::fprintf(stderr, "strata generate: --slot-kv-window cannot be honoured for slot %d "
+                    if (o.slot_kv_window || kv_roles.slot_main.kv.mode != 0) {
+                        std::fprintf(stderr, "strata generate: --batch slot placement cannot be honoured for slot %d "
                                              "on CUDA%d: %s\n", b, dev, err.c_str());
-                        return 1; // no silent shrink, disable or resident fallback for an explicit policy
+                        return 1; // no silent shrink or fallback for explicit or streamed slot intent
                     }
                     cudaGetLastError();
                     size_t fb = 0, tb = 0;
@@ -6026,7 +6040,8 @@ int main(int argc, char** argv) {
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err,
-                                      o.mtp_window, &kv_roles.working_draft)) {
+                                      o.mtp_window, &kv_roles.working_draft,
+                                      batch_requested ? (o.host_native ? "host" : "guest") : nullptr)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1;
         }
         mtp.set_ple_session(&ss);

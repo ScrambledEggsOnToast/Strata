@@ -320,7 +320,8 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 }
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window, const strata::plan::QsaPlacement* placement) {
+                      int64_t window, const strata::plan::QsaPlacement* placement,
+                      const char* streamed_fallback_refusal_scope) {
     if (g_ || state_arena_) { err = "mtp: drafter already initialized"; return false; }
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
@@ -405,6 +406,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         &ss.qsa_states[ss.qsa_primary()], ring, &state_placement_, sb);
     if (used != sb) {
         if (used || st_.kv_mode == 0) { err = "mtp: state init or priced/carved extent check failed"; return false; }
+        // Requested streamed batch payloads must refuse outright, not turn a
+        // pinned-allocation failure into an unpriced resident arena/slot fallback.
+        // Solo callers leave the scope null and retain the existing logged fallback.
+        if (streamed_fallback_refusal_scope) {
+            err = std::string("admission refused: limiting=") + streamed_fallback_refusal_scope +
+                  ":resident_working_draft_pinned reason=streamed draft pinned allocation failed; "
+                  "requested batch placement forbids resident fallback";
+            return false;
+        }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
         qsa_state_release(st_);

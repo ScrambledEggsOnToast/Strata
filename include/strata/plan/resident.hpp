@@ -1,5 +1,6 @@
 // HET-035/HET-017 resident-slot payload contract. No CUDA dependencies.
 #pragma once
+#include "strata/plan/qsa_memory.hpp"
 #include <algorithm>
 #include <cstdint>
 
@@ -20,6 +21,28 @@ struct ResidentBytes {
     uint64_t verifier_device = 0, verifier_pinned = 0, verifier_history = 0;
     uint64_t transfer_transient = 0, init_transient = 0;
 };
+// Format is shared by main roles; only residency may differ. Unknown layouts or
+// elastic growth must not become a zero payload in the admission adapter.
+inline const char* resident_role_unpriced(const strata::kernels::QsaShapes& s, int64_t cells,
+                                          const QsaRolePlacements& roles, bool mtp) {
+    const auto main_valid = [&](const QsaPlacement& p) {
+        return qsa_placement_matches(s, cells, p) && p.kv.mode != 2;
+    };
+    if (roles.working_main.elastic || roles.slot_main.elastic ||
+        (mtp && (roles.working_draft.elastic || roles.slot_draft.elastic)))
+        return "elastic_kv_growth";
+    if (!main_valid(roles.working_main)) return "session_state";
+    if (!main_valid(roles.slot_main) || roles.slot_main.format != roles.working_main.format ||
+        roles.slot_main.rotate != roles.working_main.rotate) return "resident_slot_main_device";
+    if (mtp) {
+        const int fmt = qsa_draft_format(roles.working_main.format);
+        if (!qsa_placement_matches(s, cells, roles.working_draft) || roles.working_draft.format != fmt)
+            return "resident_working_draft_device";
+        if (!qsa_placement_matches(s, cells, roles.slot_draft) || roles.slot_draft.format != fmt ||
+            roles.slot_draft.rotate != roles.working_draft.rotate) return "resident_slot_draft_device";
+    }
+    return nullptr;
+}
 // slots is the REQUESTED --batch count, additional to the main working session.
 // Never replace it with a count trimmed by a later runtime fallback. Calls are serial;
 // weights, verifier/MTP scratch and opaque graph allowance are shared, not multiplied.

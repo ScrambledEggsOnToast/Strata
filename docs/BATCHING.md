@@ -111,10 +111,10 @@ result does not establish those capabilities or V100 runtime support.
 
 Each resident slot owns a `SessionOwner` (GDN recurrence/convolution, QSA KV/indexer and PLE history), a private
 MTP KV arena, sampling/steering settings, token history and bounded checkpoint. Mutable verifier, MTP and prefill
-scratch is serialized under operation ownership; immutable weights remain shared. Resident admission's
-process-policy predicate still supports FP16 with `--kv-resident 0` only. Quantized KV and a global streamed
-intent remain refused; the single-session path is unchanged. A separate per-slot residency override is priced
-as described below. Requested payloads are charged before the automatic expert-cache grant.
+scratch is serialized under operation ownership; immutable weights remain shared. Admission prices the
+resolved working-main, slot-main, working-draft and slot-draft placements, including fully resident
+FP16/INT8/Q4_0/K8V4 pools and streamed slot intent. Unknown layouts and elastic K/V growth still refuse,
+never count as zero. Requested payloads are charged before the automatic expert-cache grant.
 
 The CUDA-free payload contract names four roles: `working_main`, `slot_main`, `working_draft` and
 `slot_draft`, each with device and pinned bytes. Working owners are charged once; slot terms multiply the
@@ -122,8 +122,17 @@ requested count. Histories/checkpoints and serial transfer bounds remain separat
 storage is not charged twice. `plan/qsa_memory.hpp` shares format and pool arithmetic with the actual
 allocator: a hybrid main state's host backing costs 3264 B/page, and its draft uses whole INT8 at 1056 B/cell
 rather than hybrid's 816 B/cell. FP16 drafts remain FP16. These are source-derived payload prices pinned by
-the project's hermetic planner/partner tests, not GPU allocation or concurrency qualification. The
-FP16-only resident admission predicate is unchanged.
+the project's hermetic planner/partner tests, not GPU allocation or concurrency qualification.
+
+Streamed slots' full logical backing enters the existing guest/physical-host gate. With `--host-native`,
+every process allocation is physical-host demand; VM mode counts unbacked guest allocation plus file-cache
+mirrors without adding already-backed anonymous pages twice. Device, guest and host scopes, and startup
+and runtime phases, each have to fit independently. A refusal reports `limiting=<scope>:<byte_class>`
+(for example `host:resident_slot_main_pinned`) before any model allocation and before the runtime slot-fit
+loop. Streamed slot allocation failure refuses rather than shrinking the requested set. Requested batches
+also forbid an unpriced resident fallback when a working draft's pinned backing fails; solo retains its
+existing logged fallback. Prefill remains bound to the working session, and solo promotion stays enabled:
+the named `resident_transfer_transient` bounds the checkpoint and main/draft images in either direction.
 
 `--slot-kv-window N` sets residency, in cells per attention layer, for the **additional** `--batch` slots.
 Absent, slots inherit `--kv-resident` exactly as before. Explicit `0` makes those slots fully resident;
@@ -134,8 +143,8 @@ process-global for main owners because the shared batch transforms use the worki
 
 Placement is resolved once at startup and passed to both role pricing and owner initialization. No live owner's
 residency is rebound: captured row graphs retain its addresses and their keys omit residency. A slot draft
-inherits the finalized working draft when the option is absent (including its existing logged resident fallback);
-explicit `0` makes it resident, and a positive override gives it a ring of that window. The window must hold the
+inherits the resolved working draft when the option is absent; batching cannot silently change that placement.
+Explicit `0` makes it resident, and a positive override gives it a ring of that window. The window must hold the
 existing `--mtp-window` plus `4 * max_t + 64` lookahead cells, capped by the context; an unwindowed draft must
 hold the full context. Draft format selection is unchanged (whole INT8 under a hybrid process, not K8V4).
 The four resolved role prices feed `working_main`, `slot_main`, `working_draft` and `slot_draft`; draft weights
@@ -281,8 +290,8 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - Admissions are one at a time: two new long prompts are read one after the other.
 - `--batch-groups` needs every stage on its own GPU. A finished pipelined slot is **not** kept as a conversation cache here: the fork's resident lifecycle clears it (`resident.finish(slot, keep_cache=false)`), where upstream 0.1.41 makes a pipelined slot a cache again — its #857 rule ships with the pad-row invalidation that this fork's compacted group window does not have. Carrying that rule is a batching-lane port item, not a re-pin change.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
-- Additional resident slots still require the FP16/global-resident process policy; `--slot-kv-window`
-  can override only their placement. Each requested role is charged before allocation.
+- Each requested role, including full streamed host backing, is charged before allocation.
+  Unpriceable combinations and elastic K/V growth remain refused.
 
 ### Allocation and optional upstream modes
 

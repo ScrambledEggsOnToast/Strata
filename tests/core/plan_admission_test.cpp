@@ -10,6 +10,8 @@
 //   +     unknown classes refuse; missing telemetry refuses; hypothetical devices never admit;
 //         the explain-or-shrink rule blocks enlargement on an unexplained overshoot.
 #include "strata/plan/admission.hpp"
+#include "strata/plan/resident.hpp"
+#include "strata/plan/qsa_memory.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -85,11 +87,11 @@ void test_guest_is_a_real_limit_and_reserves_cannot_be_planned_away() {
     a.vram.add("weights_canonical", 2 * GiB, "test");
     Scope guest;
     guest.add("conversation_parked", 6 * GiB, "test");   // anon demand, no file credit applies
-    // 8 GiB guest, 4 GiB floor reserve -> 4 GiB usable < 6 GiB demanded: refuse, limiting term "guest".
+    // 8 GiB guest - 4 GiB reserve cannot hold 6 GiB: name the scope and crossing class.
     const AdmissionDecision refused =
         admit_configuration({a}, {measured("CUDA0", 24 * GiB)}, guest, {}, both_scopes_measured(8 * GiB, 0));
     require(!refused.admitted, "guest demand above the reserved envelope was admitted");
-    require(refused.limiting_term == "guest", "limiting term was not the guest: " + refused.limiting_term);
+    require(refused.limiting_term == "guest:conversation_parked", "guest refusal omitted its class: " + refused.limiting_term);
 
     // The same demand fits once the guest really has the room (16 GiB - 4 GiB reserve = 12 GiB usable).
     const AdmissionDecision fits =
@@ -519,6 +521,72 @@ void test_declared_meaning_projects_unknowns_and_bounds_credit() {
             "unknown source demand became an admitted zero during projection");
 }
 
+void test_streamed_slot_host_budget_refuses_before_allocation() {
+    using namespace strata::kernels;
+    const auto s = qsa_real_shapes();
+    const auto roles = qsa_resolve_roles(s, 262144, kKvHybrid, 0, 20480, 32768, 8);
+    const uint64_t pinned = 2 * 12 * qsa_pinned_bytes(s, roles.slot_main.kv, roles.slot_main.format);
+    require(pinned == 5133855456ull, "streamed hybrid slots do not charge full logical backing");
+    Scope guest, host;
+    guest.add("resident_slot_main_pinned", pinned, "resolved requested slot backing");
+    guest.mirror_all_into(host); // direct host operation, not VM backing duplication
+    DeviceCost device;
+    device.vram.add("resident_slot_main_device", 2 * 12 * qsa_device_bytes(
+        s, 262144, roles.slot_main.kv, roles.slot_main.format, false), "resolved slot windows");
+    auto policy = both_scopes_measured(64 * GiB, 8 * GiB + pinned);
+    policy.file_cache_credit_bytes = UINT64_MAX; // pinned memory is not clean cache
+    const auto tel = measured("CUDA0", 24 * GiB);
+    const auto admitted = admit_configuration({device}, {tel}, guest, host, policy);
+    require(admitted.admitted && admitted.host_demand_bytes == pinned,
+            "exact-fit streamed slots refused or received clean-cache credit");
+    --policy.host_available_bytes;
+    const auto refused = admit_configuration({device}, {tel}, guest, host, policy);
+    require(!refused.admitted && refused.devices[0].fits && refused.guest_fits && !refused.host_fits,
+            "device/guest slack rescued one-byte streamed host overflow");
+    require(refused.limiting_term == "host:resident_slot_main_pinned",
+            "streamed host refusal did not name its byte class: " + refused.limiting_term);
+    require(refused.reasons.front().find("limiting class resident_slot_main_pinned") != std::string::npos,
+            "streamed host refusal message omitted its byte class");
+    Scope vm_host;
+    guest.mirror_into(vm_host);
+    require(vm_host.known_bytes() == 0, "pinned guest backing counted twice in VM host projection");
+}
+
+void test_role_aware_priceability_keeps_unknown_combinations_closed() {
+    using namespace strata::kernels;
+    const auto s = qsa_real_shapes();
+    for (int fmt : {kKvF16, kKvInt8, kKvQ4, kKvHybrid}) {
+        for (int64_t window : {int64_t{-1}, int64_t{0}, int64_t{65536}}) {
+            const auto roles = qsa_resolve_roles(s, 262144, fmt, 0, window, 32768, 8);
+            require(!resident_role_unpriced(s, 262144, roles, true),
+                    "quantized resident or streamed roles are still refused");
+        }
+    }
+    auto roles = qsa_resolve_roles(s, 262144, kKvHybrid, 20480, -1, 32768, 8);
+    require(!resident_role_unpriced(s, 262144, roles, true), "inherited global stream refused");
+    roles.slot_main.format = kKvF16;
+    require(std::string(resident_role_unpriced(s, 262144, roles, true)) == "resident_slot_main_device",
+            "per-role main format drift admitted");
+    roles = qsa_resolve_roles(s, 262144, kKvHybrid, 0, 65536, 32768, 8);
+    roles.slot_draft.format = kKvHybrid;
+    require(std::string(resident_role_unpriced(s, 262144, roles, true)) == "resident_slot_draft_device",
+            "hybrid slot draft silently priced despite whole-INT8 allocation");
+    roles = qsa_resolve_roles(s, 262144, kKvHybrid, 0, 65536, 32768, 8);
+    roles.slot_main.kv.pages += 1;
+    require(resident_role_unpriced(s, 262144, roles, false) != nullptr,
+            "unpriceable frozen layout admitted");
+    roles = qsa_resolve_roles(s, 262144, kKvHybrid, 0, 65536, 32768, 8);
+    roles.working_main.elastic = true;
+    require(std::string(resident_role_unpriced(s, 262144, roles, true)) == "elastic_kv_growth",
+            "elastic batch placement widened into a known zero");
+    DeviceCost device;
+    device.vram.add_unknown("elastic_kv_growth", "unpriced VMM growth with requested batch slots");
+    const auto refused = admit_configuration({device}, {measured("CUDA0", 24 * GiB)},
+                                            {}, {}, both_scopes_measured(64 * GiB, 64 * GiB));
+    require(!refused.admitted && !refused.verified && refused.limiting_term == "CUDA0:elastic_kv_growth",
+            "elastic batch demand admitted or refusal lost its scope/class");
+}
+
 }  // namespace
 
 int main() {
@@ -539,6 +607,8 @@ int main() {
         test_unequal_per_device_caps_and_envelopes_refuse_independently();
         test_split_stage_cache_budget_boundaries();
         test_remote_device_mapping_excludes_every_stage_and_helper();
+        test_streamed_slot_host_budget_refuses_before_allocation();
+        test_role_aware_priceability_keeps_unknown_combinations_closed();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;

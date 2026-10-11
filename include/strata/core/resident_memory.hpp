@@ -19,29 +19,35 @@ inline strata::plan::ResidentPayload resident_draft_payload(const ModelGeometry&
             qsa_state_host_bytes(g, cells, ring_cells, &resolved)};
 }
 
-// FP16 fully resident scope matches the dry-run planner. Do not silently price a
-// streamed/quantized configuration as zero; caller must emit an unknown class or refuse.
+// Price the frozen role placements used by the allocator, including quantized
+// pools and authoritative streamed backing. Unknown demand still fails closed.
 inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int64_t k,
                                       int requested_slots, bool mtp,
-                                      strata::plan::ResidentBytes& out,
-                                      const strata::plan::QsaRolePlacements* placements = nullptr) {
+                                      const strata::plan::QsaRolePlacements& placements,
+                                      strata::plan::ResidentBytes& out, const char*& unpriced_class) {
     out = {};
-    if (requested_slots < 0 || qsa_kv_resident() != 0 || qsa_kv_int8() || qsa_kv_q4() || qsa_kv_hybrid())
-        return false;
-    SessionAllocationBytes working, slot;
-    if (!session_allocation_bytes(g, cells, k, working, 0, -1,
-                                  placements ? &placements->working_main : nullptr) ||
-        !session_allocation_bytes(g, cells, k, slot, 0, -1,
-                                  placements ? &placements->slot_main : nullptr)) return false;
     const auto shape = strata::kernels::qsa_real_shapes();
+    unpriced_class = "resident_slot_count";
+    if (requested_slots < 0 || requested_slots > (int) strata::plan::kResidentMaxSlots) return false;
+    unpriced_class = strata::plan::resident_role_unpriced(shape, cells, placements, mtp);
+    if (unpriced_class) return false;
+    SessionAllocationBytes working, slot;
+    unpriced_class = "session_state";
+    if (!session_allocation_bytes(g, cells, k, working, 0, -1, &placements.working_main)) return false;
+    unpriced_class = "resident_slot_main_device";
+    if (!session_allocation_bytes(g, cells, k, slot, 0, -1, &placements.slot_main)) return false;
     const strata::plan::ResidentPayload main{working.device, working.host_pinned};
     const strata::plan::ResidentPayload slot_main{slot.device, slot.host_pinned};
-    const auto draft = mtp ? resident_draft_payload(g, cells, -1,
-        placements ? &placements->working_draft : nullptr) : strata::plan::ResidentPayload{};
-    const auto slot_draft = mtp ? resident_draft_payload(g, cells, -1,
-        placements ? &placements->slot_draft : nullptr) : strata::plan::ResidentPayload{};
-    return strata::plan::resident_bytes((uint64_t) requested_slots, (uint64_t) cells,
+    const auto draft = mtp ? resident_draft_payload(g, cells, -1, &placements.working_draft)
+                           : strata::plan::ResidentPayload{};
+    const auto slot_draft = mtp ? resident_draft_payload(g, cells, -1, &placements.slot_draft)
+                                : strata::plan::ResidentPayload{};
+    unpriced_class = "resident_ownership_payload";
+    if (!strata::plan::resident_bytes((uint64_t) requested_slots, (uint64_t) cells,
         (uint64_t) g.n_qsa_layers(), (uint64_t) (shape.idx_block - 1) * g.idx_key_dim,
-        main, slot_main, std::max(working.host_transient, slot.host_transient), draft, slot_draft, mtp, out);
+        main, slot_main, std::max(working.host_transient, slot.host_transient), draft, slot_draft, mtp, out))
+        return false;
+    unpriced_class = nullptr;
+    return true;
 }
 } // namespace strata::core
