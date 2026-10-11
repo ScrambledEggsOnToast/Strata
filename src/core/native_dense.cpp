@@ -99,6 +99,10 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+bool serves(const strata::TensorInfo& tensor, bool include_ple_key) {
+    return eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+           tensor.shape.size() == 2;
+}
 /// The one place a native matrix's inclusion is decided, so pricing (`planned_bytes`) and loading (`load`)
 /// cannot drift apart: an eligible name, a kernel-supported type, a 2-D shape, the stage's layer range
 /// (`layer_hi >= 0`: only `blk.<l>` with `layer_lo <= l < layer_hi`, the PLE tensors everywhere) and the
@@ -106,16 +110,16 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
 /// The #326 case (a `blk.1.ple_key.weight` the canonical pack serves from the arena) is deliberately NOT here:
 /// it needs the canonical pack's own answer, which only `load` has.  A price that includes it is the safe
 /// direction (it can refuse a configuration, never under-price one) until the pricing call site can answer it.
-bool selects(const strata::TensorInfo& tensor, bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
-    if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported(tensor.type) ||
-        tensor.shape.size() != 2)
-        return false;
+bool in_stage(const strata::TensorInfo& tensor, int64_t layer_lo, int64_t layer_hi) {
     if (layer_hi >= 0) {   // the loader's `outside`
         const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
         if (l < layer_lo || l >= layer_hi) return false;
     }
     // the loader's global range, and its exception: every `ple` tensor loads on every stage
     return in_range(tensor.name) || tensor.name.find("ple") != std::string::npos;
+}
+bool selects(const strata::TensorInfo& tensor, bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+    return serves(tensor, include_ple_key) && in_stage(tensor, layer_lo, layer_hi);
 }
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
@@ -134,8 +138,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                if (serves(tensor, include_ple_key))
                     out.insert(tensor.name);
         }
         return true;
@@ -152,11 +155,13 @@ bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool inc
     try {
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0;
+        uint64_t total = 0, source_total = 0;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
-                if (!selects(tensor, include_ple_key, layer_lo, layer_hi)) continue;
+                if (!serves(tensor, include_ple_key)) continue;
+                const bool selected = in_stage(tensor, layer_lo, layer_hi);
+                if (!selected && !source_bytes) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name;
                     return false;
@@ -168,15 +173,17 @@ bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool inc
                 }
                 const uint64_t weight = strata::kernels::native_mmvq_weight_bytes(tensor.type,
                     (int) tensor.shape[0], (int) tensor.shape[1]);
-                if (!weight || total > UINT64_MAX - weight) {
+                if (!weight || source_total > UINT64_MAX - weight || total > UINT64_MAX - weight) {
                     err = "native dense: weight byte count overflow";
                     return false;
                 }
+                source_total += weight;
+                if (!selected) continue;
                 total += weight;
                 max_in = std::max(max_in, (int) tensor.shape[0]);
             }
         }
-        if (source_bytes) *source_bytes = total;
+        if (source_bytes) *source_bytes = source_total;
         if (total > 0) {
             const uint64_t scratch = strata::kernels::native_q8_1_bytes(max_in);
             if (total > UINT64_MAX - scratch) {

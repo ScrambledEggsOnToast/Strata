@@ -32,7 +32,9 @@ public:
     /// dense tier with the same arithmetic the loader allocates with.  `layer_lo`/`layer_hi` are the same
     /// stage bounds `load` takes (hi < 0 = every layer), and the same selection predicate decides both, so a
     /// stage's price is the stage's upload.
-    /// Optional source_bytes receives just the tensor payload working set read during upload (no scratch).
+    /// Optional source_bytes receives the whole model's native tensor payload working set (no scratch),
+    /// independent of either layer range. Host source pages are shared across stages, so admission needs
+    /// their union, not one device's subset or the sum of duplicated PLE uploads.
     static bool planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
                               uint64_t& bytes, std::string& err, uint64_t* source_bytes = nullptr,
                               int64_t layer_lo = 0, int64_t layer_hi = -1);
