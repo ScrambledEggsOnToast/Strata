@@ -41,7 +41,11 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
-print("READY 4096 stop", flush=True)
+if "--says-residency" in args:
+    for info in args[args.index("--says-residency") + 1].splitlines():
+        print("INFO " + info, flush=True)
+ctx = int(args[args.index("--says-context") + 1]) if "--says-context" in args else 4096
+print(f"READY {ctx} stop", flush=True)
 LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
     ids = [int(x) for x in ids]
@@ -251,6 +255,22 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(v[0]["generated"], 4)
         self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
 
+    def test_slots_view_keeps_reported_residency_while_decoding(self):
+        e = self.engine(2)
+        e.info.update(slot_0_kv_mode="streamed", slot_0_kv_window=65536,
+                      slot_0_draft_kv_mode="resident", slot_0_draft_kv_window=262144,
+                      slot_1_kv_mode="resident", slot_1_kv_window=262144,
+                      slot_1_draft_kv_mode="off", slot_1_draft_kv_window=0)
+        e.slot_live[0] = {"state": "decoding", "prompt_tokens": 9, "generated": 4,
+                          "started": time.time() - 2, "first_token": time.time() - 1}
+        view = e.slots_view()
+        self.assertEqual((view[0]["kv_mode"], view[0]["kv_window"],
+                          view[0]["draft_kv_mode"], view[0]["draft_kv_window"]),
+                         ("streamed", 65536, "resident", 262144))
+        self.assertEqual(view[1], {"slot": 1, "state": "idle", "held_tokens": 0,
+                                  "kv_mode": "resident", "kv_window": 262144,
+                                  "draft_kv_mode": "off", "draft_kv_window": 0})
+
 
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
@@ -307,6 +327,61 @@ class ParallelService(unittest.TestCase):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+
+    def test_native_info_reports_each_effective_slot_and_its_draft(self):
+        """Scripted INFO -> HTTP reporting only, not proof of native K/V allocation or execution."""
+        info = ("working_kv_mode=resident working_kv_window=262144 "
+                "working_draft_kv_mode=resident working_draft_kv_window=262144\n"
+                "slot_0_kv_mode=streamed slot_0_kv_window=65536 "
+                "slot_0_draft_kv_mode=streamed slot_0_draft_kv_window=65536\n"
+                "slot_1_kv_mode=streamed slot_1_kv_window=65536 "
+                "slot_1_draft_kv_mode=resident slot_1_draft_kv_window=262144")
+        self.start(4, fit=2, more=("--slot-kv-window", "65533", "--says-context", "262144",
+                                   "--says-residency", info))
+        expected = [{"slot": 0, "state": "idle", "held_tokens": 0,
+                     "kv_mode": "streamed", "kv_window": 65536,
+                     "draft_kv_mode": "streamed", "draft_kv_window": 65536},
+                    {"slot": 1, "state": "idle", "held_tokens": 0,
+                     "kv_mode": "streamed", "kv_window": 65536,
+                     "draft_kv_mode": "resident", "draft_kv_window": 262144}]
+        metrics = self.get("/metrics")
+        self.assertEqual(metrics["live"]["slots"], expected)
+        self.assertEqual(metrics["engine"]["working_kv_mode"], "resident")
+        self.assertEqual(metrics["engine"]["working_draft_kv_mode"], "resident")
+        self.assertEqual(metrics["engine"]["slot_0_kv_window"], 65536)
+        self.assertEqual(self.get("/v1/status")["slots"], expected)
+        self.assertEqual(self.get("/slots"),
+                         [{"id": 0, "n_ctx": 262144, "is_processing": False, "n_prompt_tokens": 0,
+                           "kv_mode": "streamed", "kv_window": 65536,
+                           "draft_kv_mode": "streamed", "draft_kv_window": 65536},
+                          {"id": 1, "n_ctx": 262144, "is_processing": False, "n_prompt_tokens": 0,
+                           "kv_mode": "streamed", "kv_window": 65536,
+                           "draft_kv_mode": "resident", "draft_kv_window": 262144}])
+
+    def test_reported_resident_context_and_absent_draft_override_requested_window(self):
+        info = ("slot_0_kv_mode=resident slot_0_kv_window=4096 "
+                "slot_0_draft_kv_mode=off slot_0_draft_kv_window=0\n"
+                "slot_1_kv_mode=resident slot_1_kv_window=4096 "
+                "slot_1_draft_kv_mode=off slot_1_draft_kv_window=0")
+        self.start(2, more=("--slot-kv-window", "65536", "--says-residency", info))
+        for path in ("/slots", "/metrics", "/v1/status"):
+            with self.subTest(path=path):
+                reply = self.get(path)
+                slots = reply if path == "/slots" else reply["live"]["slots"] if path == "/metrics" else reply["slots"]
+                for slot in slots:
+                    self.assertEqual((slot["kv_mode"], slot["kv_window"],
+                                      slot["draft_kv_mode"], slot["draft_kv_window"]),
+                                     ("resident", 4096, "off", 0))
+
+    def test_legacy_info_leaves_status_unchanged(self):
+        self.start(2)
+        self.assertEqual(self.get("/slots"),
+                         [{"id": 0, "n_ctx": 4096, "is_processing": False, "n_prompt_tokens": 0},
+                          {"id": 1, "n_ctx": 4096, "is_processing": False, "n_prompt_tokens": 0}])
+        self.assertEqual(self.get("/metrics")["live"]["slots"],
+                         [{"slot": 0, "state": "idle", "held_tokens": 0},
+                          {"slot": 1, "state": "idle", "held_tokens": 0}])
+        self.assertNotIn("slots", self.get("/v1/status"))
 
     def test_multiplex_requires_native_acknowledgement(self):
         self.start(2)

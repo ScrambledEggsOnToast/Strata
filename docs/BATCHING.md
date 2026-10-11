@@ -146,13 +146,39 @@ a window unable to hold one streamed call's `n_q * (cap / page_size + 2)` distin
 draft ring. These are named option errors before device allocation, not the separate CUDA `RT = 1024`
 clock-sweep guard or a later `ctl[3]` overflow. Explicit per-slot allocation failure also refuses rather than
 silently shrinking the requested slots or switching their residency. Hermetic tests pin prices and bounded
-carves; mixed-residency GPU execution/lifecycle qualification and service-status reporting are separate tickets.
+carves; mixed-residency GPU execution/lifecycle qualification is separate from status reporting below.
 
 
 The upstream setup heuristic recommends `"parallel"` where experts mostly fit in VRAM. It is a recommendation,
 not an admission calculation or evidence for this fork. The historical measurements below show why slots can
 reduce waiting while slowing a request alone: their private state reduces the expert cache. Use the emitted
 admission plan for the actual context/slot count, not those historical per-slot memory estimates.
+
+### Observing K/V placement
+
+With `--slot-kv-window` set (including explicit `0`), startup emits additional `INFO` records for the working
+session and each **effective** slot. `working_kv_mode` / `working_kv_window` and
+`working_draft_kv_mode` / `working_draft_kv_window` describe the working owners; slot `N` uses
+`slot_N_kv_mode` / `slot_N_kv_window` and `slot_N_draft_kv_mode` / `slot_N_draft_kv_window`.
+Modes are `resident` (the whole K/V pool is in VRAM), `streamed` (a sparse main window or host-backed draft
+ring), or `off` (no initialized state, normally no drafter). Windows are the actual page-rounded VRAM pool
+capacity in cells per attention layer, including the full pool capacity for resident states; `off` has zero.
+
+These records read initialized `SessionOwner::state()`, `MtpDrafter::kv_state()` and `slot_state()`, not the
+option value or a predicted placement. A context that fits the window reports `resident`; a working draft
+that used its existing resident fallback also reports `resident`. Without the per-slot option, the startup
+protocol and frontend status fields are unchanged.
+
+The frontend retains the native keys in JSON `/metrics.engine` and adds `kv_mode`, `kv_window`,
+`draft_kv_mode` and `draft_kv_window` to each `/metrics.live.slots`, `/slots`, and `/v1/status.slots` entry.
+`/v1/status.slots` is present only when the engine reports per-slot placement. The web About view labels the
+working and each slot's main/draft placement separately, so a resident working session cannot make streamed
+slots look resident. `STATE_RESIDENCY` is a request-retention diagnostic, not this K/V status source.
+
+`kv_residency_info_test` checks the engine's CUDA-free serialization with supplied initialized-state fields.
+`python3 -m unittest serve.test_server serve.test_parallel -v` exercises scripted INFO parsing and HTTP
+reporting, including legacy field absence. These CPU checks do not prove native allocation, mixed-placement
+execution, or GPU lifecycle correctness.
 
 ## Private resident multiplexing qualification
 

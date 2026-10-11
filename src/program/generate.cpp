@@ -70,6 +70,7 @@
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/kv_residency_info.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -10242,6 +10243,23 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
                                        " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0)).c_str() : "");
+            // Opt-in status extension: owners may initialize resident when their context fits,
+            // and the working draft can take its existing resident fallback.
+            if (o.slot_kv_window) {
+                const int64_t page_size = strata::kernels::qsa_real_shapes().page_size;
+                const auto& working = session_owner.state();
+                strata::program::write_kv_residency_info(stdout, "working",
+                    working.qsa_states ? &working.qsa_states[working.qsa_primary()] : nullptr,
+                    o.mtp.empty() ? nullptr : &mtp.kv_state(), page_size);
+                for (int b = 0; b < o.batch; ++b) {
+                    const auto& slot = bslot_ss.front()[(size_t) b]->state();
+                    char role[32];
+                    std::snprintf(role, sizeof(role), "slot_%d", b);
+                    strata::program::write_kv_residency_info(stdout, role,
+                        slot.qsa_states ? &slot.qsa_states[slot.qsa_primary()] : nullptr,
+                        mtp.slot_state(b), page_size);
+                }
+            }
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the

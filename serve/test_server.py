@@ -2772,6 +2772,30 @@ class WebApp(unittest.TestCase):
         self.assertEqual(slots, [{"id": 0, "n_ctx": CTX, "is_processing": True, "n_prompt_tokens": 500},
                                  {"id": 1, "n_ctx": CTX, "is_processing": False, "n_prompt_tokens": 77}])
 
+    def test_slots_keep_native_kv_residency(self):
+        """Native INFO placement survives the llama.cpp /slots projection and the other status endpoints."""
+        engine = self.svc.engine
+        engine.batch, engine.max_context = 2, CTX
+        views = [{"slot": 0, "state": "decoding", "prompt_tokens": 500,
+                  "kv_mode": "streamed", "kv_window": 65536,
+                  "draft_kv_mode": "resident", "draft_kv_window": CTX},
+                 {"slot": 1, "state": "idle", "held_tokens": 77,
+                  "kv_mode": "resident", "kv_window": CTX,
+                  "draft_kv_mode": "off", "draft_kv_window": 0}]
+        engine.slots_view = lambda: views
+        try:
+            self.assertEqual(json.loads(self.get("/slots")[2]),
+                             [{"id": 0, "n_ctx": CTX, "is_processing": True, "n_prompt_tokens": 500,
+                               "kv_mode": "streamed", "kv_window": 65536,
+                               "draft_kv_mode": "resident", "draft_kv_window": CTX},
+                              {"id": 1, "n_ctx": CTX, "is_processing": False, "n_prompt_tokens": 77,
+                               "kv_mode": "resident", "kv_window": CTX,
+                               "draft_kv_mode": "off", "draft_kv_window": 0}])
+            self.assertEqual(json.loads(self.get("/metrics")[2])["live"]["slots"], views)
+            self.assertEqual(json.loads(self.get("/v1/status")[2])["slots"], views)
+        finally:
+            del engine.batch, engine.slots_view
+
     def test_the_endpoints_keep_the_context_while_the_engine_restarts(self):
         """#351: max_context is 0 until READY; the endpoints report the last known one."""
         engine = self.svc.engine

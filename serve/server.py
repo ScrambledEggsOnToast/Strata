@@ -1538,17 +1538,20 @@ class StrataEngine:
                                         bool(self.slot_held[b]), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
-        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        """Each batch slot's activity and, when INFO reports it, initialized main/draft K/V placement."""
         now, view = time.time(), []
         for b in range(self.batch):
             r = self.slot_live[b]
+            residency = {key: self.info[f"slot_{b}_{key}"]
+                         for key in ("kv_mode", "kv_window", "draft_kv_mode", "draft_kv_window")
+                         if f"slot_{b}_{key}" in self.info}
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]), **residency})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None, **residency})
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -3343,6 +3346,7 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        slots = self.engine.slots_view() if getattr(self.engine, "batch", 0) and hasattr(self.engine, "slots_view") else []
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": not self.supervised and hasattr(self.engine, "restart"),
@@ -3355,6 +3359,7 @@ class Service:
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
+            **({"slots": slots} if any("kv_mode" in slot for slot in slots) else {}),
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
@@ -4883,7 +4888,9 @@ def make_handler(svc: Service):
                         # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
                         n_ctx = svc.reported_ctx()
                         slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
-                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
+                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0),
+                                  **{key: s[key] for key in ("kv_mode", "kv_window", "draft_kv_mode", "draft_kv_window")
+                                     if key in s}}
                                  for s in svc.engine.slots_view()]
                     else:
                         slots = [{"id": 0, "n_ctx": svc.reported_ctx(), "is_processing": busy,

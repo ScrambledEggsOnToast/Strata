@@ -368,11 +368,23 @@ function projectionText(c) {
 }
 function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const placement = (mode, window) => mode === "off" ? "off" : mode === "streamed"
+    ? `streamed: ${fmt(window)} positions per layer in VRAM, the rest in RAM` : "resident, all in VRAM";
+  const slotFacts = [];
+  for (let b = 0; b < (eng.batch_slots || 0); ++b) {
+    const prefix = `slot_${b}_`;
+    if (eng[`${prefix}kv_mode`] != null) {
+      slotFacts.push([`Slot ${b} KV`, placement(eng[`${prefix}kv_mode`], eng[`${prefix}kv_window`])],
+                     [`Slot ${b} draft KV`, placement(eng[`${prefix}draft_kv_mode`], eng[`${prefix}draft_kv_window`])]);
+    }
+  }
   facts($("facts-engine"), [
     ["Model", eng.model],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+    ["KV cache", kv ? `${kv}${eng.working_kv_mode != null ? `, working: ${placement(eng.working_kv_mode, eng.working_kv_window)}` : eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+    ["Working draft KV", eng.working_draft_kv_mode != null ? placement(eng.working_draft_kv_mode, eng.working_draft_kv_window) : null],
+    ...slotFacts,
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
