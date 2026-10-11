@@ -430,6 +430,28 @@ void test_split_stage_cache_budget_boundaries() {
             "a zero blob geometry produced a budget");
 }
 
+void test_remote_device_mapping_excludes_every_stage_and_helper() {
+    std::array<int, 3> devices{-1, -1, -1};
+    std::string error;
+    require(remote_expert_devices(3, {1}, {512, 0, 0}, devices, error) && devices[0] == 2,
+            "CUDA1 stage did not put tier one on CUDA2");
+    require(remote_expert_devices(3, {2}, {512, 0, 0}, devices, error) && devices[0] == 1,
+            "CUDA2 stage did not put tier one on CUDA1");
+    require(remote_expert_devices(6, {2}, {512, 256, 128}, devices, error) &&
+            devices == std::array<int, 3>{1, 3, 4}, "multiple helpers shared a stage or helper device");
+    const auto retained = devices;
+    for (const auto& stages : {std::vector<int>{1, 2}, std::vector<int>{1, 1},
+                              std::vector<int>{0}, std::vector<int>{3}}) {
+        require(!remote_expert_devices(3, stages, {512, 0, 0}, devices, error) &&
+                !error.empty() && devices == retained,
+                "unavailable/overlapping stage layout changed the admitted helper mapping");
+    }
+    require(!remote_expert_devices(3, {}, {0, 512, 0}, devices, error) && devices == retained,
+            "a missing earlier helper tier was accepted");
+    require(!remote_expert_devices(3, {}, {-1, 0, 0}, devices, error) && devices == retained,
+            "a negative helper budget was accepted");
+}
+
 void test_overflow_refuses_in_every_scope_and_request() {
     const uint64_t largest = UINT64_MAX;
     DeviceCost device;
@@ -516,6 +538,7 @@ int main() {
         test_declared_meaning_projects_unknowns_and_bounds_credit();
         test_unequal_per_device_caps_and_envelopes_refuse_independently();
         test_split_stage_cache_budget_boundaries();
+        test_remote_device_mapping_excludes_every_stage_and_helper();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;

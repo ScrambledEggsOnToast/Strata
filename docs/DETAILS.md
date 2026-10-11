@@ -1274,6 +1274,35 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 
 **Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
 
+**Forced draft changes (`--spec-corrupt N`, diagnostic).** CLI generate and serial serving change every
+Nth offered draft to `(token + 1) % vocabulary_size`, never the window head. Serving resets the counter
+for each request, including after cancellation or prefix reuse. Mutation happens after MTP/lookup/chain
+selection and before penalty-history staging. Rejected drafts still count as offered.
+
+Corrupted windows use existing target exact-match verification, even with `STRATA_SPEC_PROB=1`;
+unchanged MTP proposal probabilities must not judge modified tokens. Only the accepted prefix and the
+first mismatch's target pick are committed; rejected state is restored. Changing a draft does not
+guarantee rejection or selected lookup: require actual exposure in `STRATA_LOOKUP_TRACE` and same-prefix
+rollback evidence, not merely matching final text.
+
+Serving refuses this diagnostic with batch slots, pipelined decode (`--pipeline-windows 2`, or a debug
+pipeline switch file), CLI-only oracle/follow/window-hash diagnostics, `--spec < 2`, or no draft source.
+Serial layer splits and `--pipeline-windows 1` prompt overlap remain supported subject to ordinary gates.
+This is not qualification of unsupported native target-only or graph-off configurations.
+
+**Committed logit rows (serial serving diagnostic).** Set
+`STRATA_DUMP_COMMITTED_LOGITS=/absolute/create-only-prefix` to write every emitted
+predictor row after commit and before draft execution can overwrite the head.
+Each `PREFIX.REQUEST.POSITION` file is the existing little-endian logit format:
+int32 vocabulary size, int32 row count, then row-major FP32 logits. A
+`COMMITTED_LOGITS` record gives the request generation, first predictor position,
+row count and emitted token IDs. It includes the initial and terminal windows,
+but never uncommitted speculative rows. Files are create-only; nonfinite rows,
+write failures and a process-total1GiB disk budget refuse the diagnostic.
+It reuses the already-priced host row buffer, supports serial layer splits by
+reading the final head stage, and refuses batch slots or pipelined decode.
+It is a same-prefix observer, not a claim of unsupported full-state coverage.
+
 ---
 
 ### The Responses API and Codex CLI

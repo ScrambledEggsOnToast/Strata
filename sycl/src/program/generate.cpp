@@ -1606,6 +1606,10 @@ int main(int argc, char **argv) try {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (std::getenv("STRATA_CROSS_HELP_CAPTURE")) {
+        std::fprintf(stderr, "strata generate: causal cross-help capture is CUDA-only; SYCL is unsupported\n");
+        return 2;
+    }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -6771,7 +6775,9 @@ int main(int argc, char **argv) try {
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, err)) {
+            const std::vector<strata::prefill::Prefill::PromptHelper> owners{
+                {peer.device(), &peer.cache(), peer.residency(), false, peer.p2p()}};
+            if (!sp.set_prompt_helpers(owners, rows, true, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
             }

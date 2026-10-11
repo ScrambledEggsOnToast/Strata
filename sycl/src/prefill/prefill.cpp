@@ -516,7 +516,14 @@ struct Stager {
 // primary would (gathered from its own slots), and copies the result rows back into the primary's Dm rows - the rows
 // are laid out local-first, so the peer's are one contiguous block at the end.
 struct PeerPrefill {
-    core::PeerExperts* peer = nullptr;
+    Prefill::PromptHelper owner;
+    bool has(int64_t layer, int64_t expert) const {
+        return owner.residency && owner.residency[(size_t)(layer * NE + expert)] >= 0;
+    }
+    const uint8_t* slot_ptr(int64_t layer, int64_t expert) const {
+        if (!has(layer, expert)) return nullptr;
+        return owner.cache->device_slot(owner.residency[(size_t)(layer * NE + expert)]);
+    }
     int dev = -1;
     int64_t cap_rows = 0, T_max = 0;
     dpct::queue_ptr s = &dpct::get_in_order_queue();
@@ -713,7 +720,7 @@ struct Prefill::Impl {
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
-    std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+    std::unique_ptr<PeerPrefill> pp;         // multi-GPU: one peer GPU's expert share
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
@@ -1506,7 +1513,7 @@ bool Prefill::set_stage_helper(Prefill *helper, std::string &err) try {
     const Impl& h = *helper->impl_;
     if (m.device < 0 || h.device < 0 || h.device == m.device || !mmq_plan().any) return true;
     auto pp = std::make_unique<PeerPrefill>();
-    pp->peer = nullptr;   // stream-only: it holds no experts, it streams a share of this stage's
+    // Stream-only: the default owner is empty; it streams this stage's expert share.
     pp->compact = true;
     pp->p2p = false;      // the mapped host route, whether or not the cards could reach each other (measured there)
     pp->out_pipe = true;
@@ -1657,14 +1664,23 @@ bool Prefill::bind_stage_helper(int64_t T) {
     return true;
 }
 
-bool Prefill::set_peer(core::PeerExperts *peer, int64_t cap_rows,
-                       std::string &err) try {
+bool Prefill::set_prompt_helpers(const std::vector<PromptHelper>& helpers, int64_t cap_rows,
+                                bool execute, std::string& err) try {
     Impl& m = *impl_;
-    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    if (!peer->p2p()) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
+    if (helpers.empty() || !execute) { m.pp.reset(); return true; }
+    if (helpers.size() != 1 || helpers.front().resident_only) {
+        err = "prefill helpers: SYCL supports one peer tier, not resident-only remote owners";
+        return false;
+    }
+    const auto& owner = helpers.front();
+    if (owner.device < 0 || !owner.cache || !owner.residency) {
+        err = "prefill peer: invalid cache-backed owner";
+        return false;
+    }
+    if (!owner.p2p_enabled) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     auto pp = std::make_unique<PeerPrefill>();
-    pp->peer = peer;
+    pp->owner = owner;
     pp->T_max = m.T_max;
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, m.T_max * K));
     const int64_t R = pp->cap_rows;
@@ -1674,7 +1690,7 @@ bool Prefill::set_peer(core::PeerExperts *peer, int64_t cap_rows,
     }
     int prev = 0;
     prev = dpct::get_current_device_id();
-    pp->dev = peer->device();
+    pp->dev = owner.device;
     /*
     DPCT1093: The "pp->dev" device may be not the one intended for use.
     Adjust the selected device if needed.
@@ -2499,7 +2515,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (m.pp && m.pp->has(l, e)) continue;   // computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (gsrc != nullptr) {   // read by the stager's thread when its turn comes (see Stager::Job)
@@ -3194,7 +3210,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-                    // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
+                    // --peer-device: MMQ only, whether or not helper setup accepts the peer, as
                     // fused_ring() sized the ring and the buffers for it
                     const bool no_peer = !core::peer_portable();
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
@@ -3336,7 +3352,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     continue;
                                 }
                                 if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                                    !m.pp->peer || !m.pp->peer->has(l, e))
+                                    !m.pp->has(l, e))
                                     continue;
                                 if (rows_peer + c > m.pp->cap_rows) { ++m.pp->over_cap; continue; }
                                 on_peer[(size_t) e] = 1;
@@ -3567,7 +3583,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                             bd = P.pstage[(size_t) psl];
                                             ++P.ps_experts;
                                         } else {
-                                            bd = P.peer->slot_ptr(l, e);
+                                            bd = P.slot_ptr(l, e);
                                         }
                                         const size_t q = j - j0;
                                         if (lay.native)
@@ -3672,7 +3688,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 const auto& f = lay.fmt[(size_t) l];
                                 for (size_t j = 0; j < n; ++j) {
                                     const int32_t e = order_peer[j];
-                                    const uint8_t* bd = P.peer->slot_ptr(l, e);
+                                    const uint8_t* bd = P.slot_ptr(l, e);
                                     const size_t q = j % MMQ_GROUP;
                                     if (lay.native)
                                         mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
@@ -4050,7 +4066,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                           : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
+                                                           : (m.pp ? m.pp->slot_ptr(l, e) : nullptr);   // over the cap: P2P
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;
                                     if (!compute(j, bp, -1)) return false;

@@ -29,6 +29,7 @@
 #include "strata/plan/plan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -62,6 +63,46 @@ inline uint64_t split_stage_cache_budget(uint64_t residual_ceiling_bytes,
     if (residual_ceiling_bytes <= committed) return 0;
     const uint64_t budget = (residual_ceiling_bytes - committed) / blob_bytes * blob_bytes;
     return profile_bound_bytes < budget ? profile_bound_bytes : budget;
+}
+
+// Helper tier ordinals are not CUDA ordinals when a layer split occupies a card.
+// Resolve once before admission/allocation; the same device IDs price and open
+// the caches. CUDA0 and every later stage are excluded, and no helper shares a
+// device with another helper. Failure leaves the caller's mapping unchanged.
+inline bool remote_expert_devices(int visible_devices, const std::vector<int>& stage_devices,
+                                  const std::array<int, 3>& slots, std::array<int, 3>& devices,
+                                  std::string& error) {
+    error.clear();
+    if (visible_devices < 1) {
+        error = "remote expert caches require visible CUDA devices";
+        return false;
+    }
+    for (size_t i = 0; i < stage_devices.size(); ++i) {
+        const int device = stage_devices[i];
+        if (device <= 0 || device >= visible_devices ||
+            std::find(stage_devices.begin(), stage_devices.end(), device) != stage_devices.begin() + i) {
+            error = "remote expert caches require distinct visible non-primary stage devices";
+            return false;
+        }
+    }
+    std::array<int, 3> mapped{1, 2, 3};
+    int next = 1;
+    for (size_t r = 0; r < slots.size(); ++r) {
+        if (slots[r] < 0 || (r > 0 && slots[r] > 0 && slots[r - 1] == 0)) {
+            error = "remote expert caches require positive slot counts in tier order";
+            return false;
+        }
+        if (slots[r] == 0) continue;
+        while (next < visible_devices &&
+               std::find(stage_devices.begin(), stage_devices.end(), next) != stage_devices.end()) ++next;
+        if (next >= visible_devices) {
+            error = "remote expert caches need a distinct visible GPU that runs no layer stage";
+            return false;
+        }
+        mapped[r] = next++;
+    }
+    devices = mapped;
+    return true;
 }
 
 // ---- one accounted byte class -------------------------------------------------------------------------------

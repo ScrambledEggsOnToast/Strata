@@ -26,6 +26,15 @@ public:
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
+    struct AllocationBytes {
+        uint64_t device = 0;
+        uint64_t host_pinned = 0;
+        uint64_t host_metadata = 0;
+        uint64_t scratch = 0;
+        uint64_t metadata = 0;
+    };
+    /// Base decode buffers and bounded setup/cache metadata; excludes cache VRAM and RemoteExpertOpt.
+    static AllocationBytes allocation_bytes(int64_t layers, int64_t experts, int64_t slots);
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
@@ -42,6 +51,11 @@ public:
     bool owns(int64_t index) const override { return index >= 0 && (size_t) index < owned_.size() && owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
     bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+
+    /// FORK (HET-022): this helper's device and cache, so a prompt path can serve the experts it holds resident
+    /// through the same cache-backed descriptor as core::PeerExperts - its own VRAM, no per-use weight transfer.
+    int device() const { return device_; }
+    const ExpertCache& cache() const { return cache_; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     bool finish(float* out, std::string& err) override;
     bool cancel(std::string& err) override;
@@ -68,6 +82,9 @@ private:
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
+    // HET-033: optional host dispatch-through-drain envelope. No GPU allocations,
+    // clock assumptions or per-kernel timing sums; only the bound window records it.
+    int64_t causal_start_ns_ = 0, causal_layer_ = 0, causal_tokens_ = 0, causal_entries_ = 0;
     ExpertCache cache_;
     cudaStream_t stream_ = nullptr;
     float* h_x_ = nullptr;

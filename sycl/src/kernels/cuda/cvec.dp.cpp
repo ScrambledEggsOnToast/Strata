@@ -92,13 +92,13 @@ cvec_kernel(float *__restrict__ R, const float *__restrict__ dir,
             const float *__restrict__ s_l, const int *__restrict__ on, int mode,
             int64_t layer, int n, int hc, int64_t r_ld,
             const float *__restrict__ bo, int64_t bo_ld,
-            const float *__restrict__ inj, int64_t inj_ld, int write) {
+            const float *__restrict__ inj, int64_t inj_ld, int write, int row_flags) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int c = item_ct1.get_group(2);
     const int64_t t = item_ct1.get_group(1);
     float* r = R + t * r_ld + (int64_t) c * n;
     const float s = s_l[layer];
-    const bool steer = *on != 0 && s != 0.0f;   // uniform over the block
+    const bool steer = on[row_flags ? t : 0] != 0 && s != 0.0f;   // uniform over the block
     if (!steer && !write) return;
     const float* v = dir + layer * n;
     const float w = write ? 2.0f * sigmoidf_(inj[t * inj_ld + c] / (float) hc) : 0.0f;
@@ -266,7 +266,7 @@ bool cvec_tables(const float** dir, const float** s, const int** on) {
 
 void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
                 const float *bo, int64_t bo_ld, const float *inj,
-                int64_t inj_ld, bool write, void *stream) try {
+                int64_t inj_ld, bool write, void *stream, const int *row_enabled) try {
     if (!g_cvec.loaded() || T < 1) return;
     const DevTables& t = g_dev[cur_device()];
     if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
@@ -287,10 +287,10 @@ void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
                     exp_props,
                     [=](sycl::nd_item<3> item_ct1)
                         [[sycl::reqd_sub_group_size(32)]] {
-                            cvec_kernel(R, t.dir, t.s, t.on, g_cvec_mode_ct4,
+                            cvec_kernel(R, t.dir, t.s, row_enabled ? row_enabled : t.on, g_cvec_mode_ct4,
                                         layer, g_cvec_n_embd_ct6, g_cvec_hc_ct7,
                                         r_ld, bo, bo_ld, inj, inj_ld,
-                                        write ? 1 : 0);
+                                        write ? 1 : 0, row_enabled ? 1 : 0);
                         });
             });
     }

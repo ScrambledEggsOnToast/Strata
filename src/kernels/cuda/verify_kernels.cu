@@ -1330,6 +1330,35 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     else gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_SYCL) && !defined(__HIPCC__) && !defined(DPCT_COMPAT_RT_VERSION)
+namespace {
+__global__ void expert_weighted_subset_kernel(const float* parts, const int32_t* original,
+    const float* weights, float* output, int width, int k, int entries) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x, token = blockIdx.y;
+    if (column >= width) return;
+    float sum = 0.0f;
+    // Output rows were compacted in increasing token*k+route order before the
+    // grouped launch. Read only this token's selected rows, never rescale counts.
+    for (int row = 0; row < entries; ++row)
+        if (original[row] / k == token)
+            sum = fmaf(weights[row], parts[(size_t) row * width + column], sum);
+    output[(size_t) token * width + column] = sum;
+}
+}
+
+void expert_weighted_subset(const float* parts, const int32_t* original, const float* weights,
+                            float* output, int width, int k, int tokens, int entries, void* stream) {
+    if (!parts || !original || !weights || !output || !stream || width <= 0 || k <= 0 ||
+        tokens <= 0 || tokens > kVerifyMaxT || entries <= 0 || entries > tokens * k) {
+        std::fprintf(stderr, "expert_weighted_subset: invalid bounded diagnostic geometry\n");
+        std::exit(1);
+    }
+    expert_weighted_subset_kernel<<<dim3((width + 255) / 256, tokens), 256, 0, (cudaStream_t) stream>>>(
+        parts, original, weights, output, width, k, entries);
+    check("expert_weighted_subset");
+}
+#endif
+
 namespace {
 __global__ void copy_rows_strided_kernel(float4* __restrict__ dst, const float4* __restrict__ src, long long rows,
                                          int w4, int src_w4) {

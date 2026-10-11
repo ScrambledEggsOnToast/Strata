@@ -2059,6 +2059,46 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     check("gather_rows16");
 }
 namespace {
+__global__ void native_group_pointers_kernel(NativeGroupPointers group, unsigned long long* pointers,
+                                             int32_t* count, int32_t* bounds) {
+    const int i = threadIdx.x;
+    if (i < group.count) pointers[i] = reinterpret_cast<unsigned long long>(group.blob[i]);
+    if (i <= group.count) bounds[i] = group.bounds[i];
+    if (i == 0) *count = group.count;
+}
+__global__ void peer_inverse_kernel(const int32_t* pair, int32_t* inverse, int64_t rows) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) inverse[pair[r]] = (int32_t) r;
+}
+__global__ void peer_reduce_k_order_kernel(const float* rows, const int32_t* inverse, const float* weights,
+                                          float* sum, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = inverse[t * 10 + k];
+        if (r >= 0) s = fmaf(weights[t * 10 + k], rows[(int64_t) r * N + d], s);
+    }
+    sum[i] = s;
+}
+__global__ void moe_combine_native_reference_kernel(const float* D, const int32_t* slot, const int32_t* ids,
+                                                    const uint8_t* resident, const float* w, const float* shared,
+                                                    const float* sg, float* bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float local = 0.0f, peer = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t p = t * 10 + k;
+        const float value = D[(int64_t) slot[p] * N + d];
+        if (resident[ids[p]]) peer = fmaf(w[p], value, peer);
+        else local = fmaf(w[p], value, local);
+    }
+    bo[i] = (local + peer) + shared[i] * sigm(sg[t]);
+}
 __global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,
                                         const float* __restrict__ sg, const float* __restrict__ peer, int64_t rows_local,
@@ -2156,6 +2196,29 @@ void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, cons
     moe_combine_peer_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer, rows_local,
                                                                                     bo, T);
     check("moe_combine_peer");
+}
+void native_group_pointers(NativeGroupPointers group, unsigned long long* pointers, int32_t* count,
+                           int32_t* bounds, void* stream) {
+    native_group_pointers_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(group, pointers, count, bounds);
+    check("native_group_pointers");
+}
+void peer_reduce_k_order(const float* rows, const int32_t* pair, const float* weights, int64_t n_rows,
+                         int32_t* inverse, float* sum, int64_t T, void* stream) {
+    const cudaError_t e = cudaMemsetAsync(inverse, 0xff, (size_t) T * 10 * sizeof(int32_t), (cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill peer inverse reset: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (n_rows > 0)
+        peer_inverse_kernel<<<blocks_for(n_rows), 256, 0, (cudaStream_t) stream>>>(pair, inverse, n_rows);
+    peer_reduce_k_order_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(rows, inverse, weights, sum, T);
+    check("peer_reduce_k_order");
+}
+void moe_combine_native_reference(const float* D, const int32_t* slot, const int32_t* ids, const uint8_t* resident,
+                                  const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_combine_native_reference_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+        D, slot, ids, resident, w, shared, sg, bo, T);
+    check("moe_combine_native_reference");
 }
 void peer_scatter_add(float* sum, const float* rows, const float* wk, const int32_t* pair, int64_t n, void* stream) {
     if (n <= 0) return;

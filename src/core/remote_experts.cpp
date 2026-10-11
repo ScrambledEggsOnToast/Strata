@@ -1,5 +1,6 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/remote_expert_opt.hpp"
+#include "strata/core/verify.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -26,6 +27,11 @@ struct RemoteMeta {
     int32_t tok[CAP];
     int32_t count;
 };
+
+int64_t causal_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct DeviceScope {
     int previous = -1;
@@ -63,6 +69,25 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
 } // namespace
 
 RemoteExperts::~RemoteExperts() { close(); }
+
+RemoteExperts::AllocationBytes RemoteExperts::allocation_bytes(int64_t layers, int64_t experts, int64_t slots) {
+    AllocationBytes bytes;
+    bytes.scratch = std::max<uint64_t>(strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
+                                      strata::kernels::native_expert_scratch_bytes(CAP, FF));
+    bytes.metadata = sizeof(RemoteMeta);
+    const uint64_t row_bytes = (uint64_t) CAP * H * sizeof(float);
+    bytes.device = 2 * row_bytes + (uint64_t) CAP * (H / 32) * (36 + sizeof(float)) +
+                   bytes.scratch + bytes.metadata;
+    bytes.host_pinned = 2 * row_bytes + bytes.metadata;
+    // Ranking/selected/picked vectors coexist during open; charge their capacity growth,
+    // compact slot offsets, the cache's residency table and bounded per-window helper vectors.
+    const uint64_t pairs = (uint64_t) layers * (uint64_t) experts;
+    bytes.host_metadata = sizeof(RemoteExperts) + pairs * (4 * sizeof(std::pair<int32_t, int32_t>) + 5) +
+                          4 * (uint64_t) slots * (sizeof(std::pair<int32_t, int32_t>) + sizeof(int64_t)) +
+                          (uint64_t) layers * 5 + (uint64_t) CAP * (1 + 6 * sizeof(int32_t) + sizeof(uint64_t)) +
+                          sizeof(int32_t) + (64ull << 10);
+    return bytes;
+}
 
 bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     int count = 0;
@@ -190,10 +215,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         close(); return false;
     }
 
-    const size_t scratch = std::max<size_t>(
-        (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-        strata::kernels::native_expert_scratch_bytes(CAP, FF));
-    const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
+    const AllocationBytes allocation = allocation_bytes(layers, experts, (int64_t) selected.size());
+    const size_t scratch = (size_t) allocation.scratch;
+    const size_t meta_bytes = (size_t) allocation.metadata + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
     const bool allocated =
         check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device) &&
         check(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&
@@ -299,9 +323,15 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return false;
     }
+    causal_start_ns_ = Verifier::causal_observation_active() ? causal_now_ns() : 0;
+    causal_layer_ = layer; causal_tokens_ = n_tok; causal_entries_ = 0;
     std::fill(owned_.begin(), owned_.begin() + n, 0);
     group_id_.clear(); ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); original_row_.clear();
-    if (!layers_present_[(size_t) layer]) return true;
+    if (!layers_present_[(size_t) layer]) {
+        if (causal_start_ns_) Verifier::observe_helper_busy(device_, layer, n_tok, 0, causal_start_ns_, causal_now_ns());
+        causal_start_ns_ = 0;
+        return true;
+    }
     std::fill(group_of_.begin(), group_of_.begin() + n, -1);
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];
@@ -321,7 +351,11 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         group_of_[(size_t) i] = group;
         ++computed_;
     }
-    if (group_id_.empty()) return true;
+    if (group_id_.empty()) {
+        if (causal_start_ns_) Verifier::observe_helper_busy(device_, layer, n_tok, 0, causal_start_ns_, causal_now_ns());
+        causal_start_ns_ = 0;
+        return true;
+    }
     for (size_t g = 0; g < group_id_.size(); ++g) {
         start_.push_back((int32_t) dst_.size());
         for (int64_t i = 0; i < n; ++i) if (group_of_[(size_t) i] == (int32_t) g) {
@@ -333,6 +367,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         }
     }
     start_.push_back((int32_t) dst_.size());
+    causal_entries_ = (int64_t) dst_.size();
     // Private pinned buffers survive until this GPU has consumed them. The CPU
     // pool can write other output rows without a cross-device race.
     std::memcpy(h_x_, x, (size_t) n_tok * H * sizeof(float));
@@ -384,9 +419,20 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
     in_flight_ = false;
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
-    if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
+    if (remote_opt_ && remote_opt_->active()) {
+        remote_opt_->accumulate(*this);
+        if (causal_start_ns_)
+            Verifier::observe_helper_busy(device_, causal_layer_, causal_tokens_, causal_entries_,
+                                          causal_start_ns_, causal_now_ns());
+        causal_start_ns_ = 0;
+        return true;
+    }
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
+    if (causal_start_ns_)
+        Verifier::observe_helper_busy(device_, causal_layer_, causal_tokens_, causal_entries_,
+                                      causal_start_ns_, causal_now_ns());
+    causal_start_ns_ = 0;
     return true;
 }
 

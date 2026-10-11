@@ -613,6 +613,7 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
+    bool prefill_helpers = false; ///< opt-in resident remote owners, FP32 partial sums, layer placement
     /// The PLE gather's prefetch, as an A/B arm.  The gather measured 2.10-2.61 ms/token because its sixteen
     /// row reads are sixteen SEPARATE page faults into a 26.8 GB mapping; see `ple_prefetch_enable`.
     bool no_ple_prefetch = false;
@@ -686,7 +687,7 @@ struct Options {
     std::string dump_final_r;
     /// Plan v0.3 P6: speculative decoding with a verify window of this many tokens (the last accepted token and
     /// spec-1 drafts); 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for
-    /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
+    /// the exactness test); `spec_corrupt` N > 0 changes every Nth draft token (never the window head).
     int spec = 0;
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
@@ -927,6 +928,8 @@ void usage() {
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
+                 "  --spec-corrupt N     diagnostic: change every Nth draft token (0 = off); --serve resets per request,\n"
+                 "                       uses exact-match verification; no batch slots or pipelined decode\n"
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
                  "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
@@ -985,6 +988,7 @@ void usage() {
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
+                 "                       With an explicit layer split, tiers use visible non-stage GPUs in order.\n"
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
@@ -996,6 +1000,8 @@ void usage() {
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
+                 "  --prefill-helpers    let resident remote expert owners execute prompt rows (serve, layer placement;\n"
+                 "                       FP32 weighted partials, no layer split; off by default)\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -1003,6 +1009,7 @@ void usage() {
                  "                       slots/layer and 70.4%% at 64.  On a native pack, N is still the budget of N\n"
                  "                       largest blobs; each layer's slots are that layer's own blob.\n"
                  "  --expert-worker-contract  enable bounded expert-row ownership and device-independent helpers\n"
+                 "                       Required for static two-stage/helper composition (--adapt-swaps 0).\n"
                  "  --admission-headroom-mib N  HET-017: headroom the pre-allocation admission gate holds back on\n"
                  "  --mps-cap-bytes N[,N..]  issue #60: the enforced MPS client ceiling this run is\n"
                  "                       launched under: one byte count for a single visible device,\n"
@@ -1239,6 +1246,7 @@ bool drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     }
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
+    if (lane != st) return false; // a stage cannot publish into another stage's ownership ledger
     Drive& d = *s->base;
     d.d.plan = s->plan[st];
     d.d.cache_base = s->cache_base[st];
@@ -2222,6 +2230,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
+        else if (a == "--prefill-helpers") o.prefill_helpers = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
@@ -2275,6 +2284,69 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-multiplex requires single-device --serve --batch >= 2 and one group\n");
         return 2;
     }
+    if (o.serve && o.spec_corrupt > 0) {
+        const char* why = o.batch > 0 ? "not with --batch/--slots (including resident multiplexing and batch MTP)"
+                        : o.pipeline_windows >= 2 ? "not with --pipeline-windows 2"
+                        : o.pipeline_windows > 0 && pipe_dbg_env("STRATA_PIPELINE_SWITCH") != nullptr
+                            ? "not with STRATA_PIPELINE_SWITCH (it can enable pipelined decode)"
+                        : !o.spec_oracle.empty() || !o.spec_follow.empty() || !o.window_hashes.empty()
+                            ? "--spec-oracle, --spec-follow and --window-hashes are CLI-only diagnostics"
+                        : o.spec < 2 ? "it needs --spec T (T >= 2)"
+                        : o.suffix_draft == 0 && o.lookup_chain == 0 && (o.mtp.empty() || o.mtp_max_t == 1)
+                            ? "it needs MTP drafts, --suffix-draft or --lookup-chain"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata serve: --spec-corrupt refused: %s\n", why);
+            return 2;
+        }
+    }
+    const char* causal_prefix = std::getenv("STRATA_CROSS_HELP_CAPTURE");
+    const bool causal_requested = causal_prefix != nullptr;
+    if (causal_requested) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
+        std::fprintf(stderr, "strata cross-help capture: this opt-in causal measurement surface requires CUDA\n");
+        return 2;
+#endif
+        auto positive = [](const char* name, uint64_t maximum) {
+            const char* text = std::getenv(name);
+            if (!text || !*text) return false;
+            uint64_t value = 0;
+            const auto p = std::from_chars(text, text + std::strlen(text), value);
+            return p.ec == std::errc{} && *p.ptr == '\0' && value > 0 && value <= maximum;
+        };
+        if (!*causal_prefix || std::strlen(causal_prefix) >= 512 ||
+            !std::filesystem::path(causal_prefix).is_absolute() || !o.serve || o.spec < 2 ||
+            o.batch > 0 || o.pipeline_windows > 0 || o.spec_split || o.no_pool || o.no_capture ||
+            o.peer_device >= 1 || o.adapt_async || !o.mtp.empty() ||
+            !positive("STRATA_CROSS_HELP_REQUEST", INT64_MAX) ||
+            !positive("STRATA_CROSS_HELP_WINDOW", 1024) ||
+            !positive("STRATA_CROSS_HELP_REPLAY_LIMIT_NS", INT64_MAX)) {
+            std::fprintf(stderr, "strata serve: cross-help capture needs an absolute create-only prefix, "
+                                 "serial --serve --spec >= 2, the real expert pool, no batch/pipeline/spec-split/"
+                                 "peer/adapt-async/loaded-MTP, and explicit positive request/window (<=1024)/pre-fixed residual\n");
+            return 2;
+        }
+    }
+    const char* committed_logit_prefix = std::getenv("STRATA_DUMP_COMMITTED_LOGITS");
+    if (committed_logit_prefix != nullptr &&
+        (!o.serve || o.batch > 0 || o.pipeline_windows > 0 ||
+         !std::filesystem::path(committed_logit_prefix).is_absolute())) {
+        std::fprintf(stderr, "strata serve: STRATA_DUMP_COMMITTED_LOGITS needs an absolute create-only prefix, "
+                             "serial --serve, no batch slots and no pipelined windows\n");
+        return 2;
+    }
+    const char* native_grouped_env = std::getenv("STRATA_PREFILL_NATIVE_GROUPED");
+    const bool native_grouped_requested = native_grouped_env && std::atoi(native_grouped_env) != 0;
+    if (o.prefill_helpers && !native_grouped_requested) {
+        std::fprintf(stderr, "strata serve: resident prefill helpers require STRATA_PREFILL_NATIVE_GROUPED=1; "
+                             "the mixed-architecture MMQ helper path is not numerically qualified\n");
+        return 2;
+    }
+    if (native_grouped_requested && o.expert_cache_remote[0] > 0 && o.adapt_swaps != 0) {
+        std::fprintf(stderr, "strata serve: native resident-owner prefill requires --adapt-swaps 0 "
+                             "for both helper-on and its static-residency reference\n");
+        return 2;
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -2322,17 +2394,15 @@ int main(int argc, char** argv) {
 #endif
             if (!o.layer_split.empty() || !o.split_device.empty() || o.peer_device >= 1 ||
                 o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {
-                // Remote expert caches and peer devices stay refused: their cross-device
-                // transfers are not accounted inside the per-device client ceilings.
-                if (o.peer_device >= 1 || o.expert_cache_remote[0] > 0 ||
-                    o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {
-                    std::fprintf(stderr, "strata generate: MPS ceiling verification supports one client per "
-                                         "device ceiling; remote expert caches and peer devices are unaccounted "
-                                         "and unsupported\n");
+                const bool remote = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                               [](int slots) { return slots > 0; });
+                if (o.peer_device >= 1 || (remote && (o.remote_expert_opt ||
+                        std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
+                                    [](bool automatic) { return automatic; })))) {
+                    std::fprintf(stderr, "strata generate: MPS remote tiers require explicit slot counts, "
+                                         "base unweighted decode and no adaptive peer tier\n");
                     return 2;
                 }
-                // An explicit split prices every stage before allocation (below); an auto
-                // split places its K after the weights load and has no pre-placement price.
                 if (o.layer_split == "auto") {
                     std::fprintf(stderr, "strata generate: a declared MPS ceiling prices explicit --layer-split K "
                                          "stages before allocation; --layer-split auto has no pre-placement price\n");
@@ -2457,18 +2527,19 @@ int main(int argc, char** argv) {
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.windowed_experts) {
         if (o.mmap_experts || !o.shared_expert_arena.empty() || o.resident_cpu_experts ||
-            o.adapt_swaps > 0 || o.expert_cache_remote[0] > 0 ||
-            o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
+            o.adapt_swaps > 0 ||
             (o.expert_cache != 0 && o.expert_profile.empty())) {
             std::fprintf(stderr, "strata generate: --windowed-experts requires no mmap/resident/shared arena, "
-                                 "no adaptive/remote caches, and a static --expert-profile when caching experts\n");
+                                 "no adaptive caches, and a static --expert-profile when caching experts\n");
             return 2;
         }
         if (o.pipeline_windows > 0 || o.peer_device >= 1) {
             std::fprintf(stderr, "strata generate: --windowed-experts cannot share source epochs with "
-                                 "pipeline-windows or a prefill peer\n");
+                                 "pipeline-windows or an adaptive peer tier\n");
             return 2;
         }
+        // Static remote owners retain no source pointers: their blocking startup
+        // fills finish before prefill/decode, and prompt rows read their own VRAM.
         if (!o.layer_split.empty() && (split_auto || split_same || split_devs.size() > 2)) {
             std::fprintf(stderr, "strata generate: windowed layer splits require two or three distinct devices "
                                  "and explicit boundaries; each prefill stage owns its own measured source lane\n");
@@ -2489,17 +2560,42 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
     }
-    const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-                               o.expert_cache_remote[2] > 0;
+    const size_t helper_count = (size_t) std::count_if(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                                    [](int slots) { return slots > 0; });
+    const bool remote_caches = helper_count != 0;
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     if (o.resident_cpu_experts && remote_caches) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
         return 2;
     }
+    if (remote_caches && !o.layer_split.empty() &&
+        (!multi_gpu || split_auto || split_at.size() != 1 || split_devs.size() != 1 ||
+         o.split_device.empty() || o.split_skip_if_fits || o.adapt_swaps != 0 || o.adapt_async ||
+         o.pipeline_windows > 0 || o.peer_device >= 1 || o.remote_expert_opt || o.prefill_helpers ||
+         !o.expert_worker_contract || o.no_pool ||
+         std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
+                     [](bool automatic) { return automatic; }))) {
+        std::fprintf(stderr, "strata generate: split/helper composition requires two distinct stages with explicit "
+                             "--layer-split/--split-device, numeric helper slots, --adapt-swaps 0 and "
+                             "--expert-worker-contract; no split-skip, adaptive/peer/optimized tiers, pipeline "
+                             "windows or prefill helpers\n");
+        return 2;
+    }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
-    int remote_dev[3] = {1, 2, 3};
+    std::array<int, 3> remote_dev{1, 2, 3};
+    if (remote_caches) {
+        int n_vis = 1;
+        if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
+        cudaGetLastError();
+        std::string mapping_error;
+        if (!strata::plan::remote_expert_devices(n_vis, split_devs, o.expert_cache_remote,
+                                                remote_dev, mapping_error)) {
+            std::fprintf(stderr, "strata generate: %s\n", mapping_error.c_str());
+            return 2;
+        }
+    }
     if (multi_gpu) {
         if (o.expert_profile.empty()) {
             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
@@ -2558,21 +2654,6 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: layer split: the prompt paths borrow from the caches (%s)\n",
                              why.c_str());
             }
-        }
-        int n_vis = 1;
-        if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
-        cudaGetLastError();
-        int next_free = 1;
-        for (int r = 0; r < 3; ++r) {
-            if (o.expert_cache_remote[(size_t) r] <= 0) continue;
-            while (next_free < n_vis &&
-                   std::find(split_devs.begin(), split_devs.end(), next_free) != split_devs.end()) ++next_free;
-            if (next_free >= n_vis) {
-                std::fprintf(stderr, "strata generate: --expert-cache-remote with a layer split needs a GPU that runs no "
-                                     "stage (%d visible, %zu used by the split)\n", n_vis, split_devs.size() + 1);
-                return 2;
-            }
-            remote_dev[r] = next_free++;
         }
         std::string devs;
         for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
@@ -2814,6 +2895,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
     }
+    if (o.prefill_helpers) {
+        const auto enabled = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && std::atof(value) != 0.0;
+        };
+        const char* sums = std::getenv("STRATA_PF_PEER_SUMS");
+        if (!o.serve || o.prefill_chunk <= 0 || o.expert_cache_remote[0] <= 0 ||
+            !o.layer_split.empty() || o.peer_device >= 1 || o.remote_expert_opt ||
+            o.expert_cache_remote_placement != "layer" || o.peer_prefill_rows == 0 ||
+            (sums && std::atof(sums) != 1.0) || enabled("STRATA_PF_PEER_F16") ||
+            enabled("STRATA_PF_PEER_STREAM")) {
+            std::fprintf(stderr, "strata generate: --prefill-helpers requires --serve, a positive prefill chunk, "
+                                 "resident remote tiers with layer placement, no layer split/peer/remote optimization, "
+                                 "and weighted FP32 partials without weight streaming\n");
+            return 2;
+        }
+    }
     if (o.expert_worker_contract && o.remote_expert_opt) {
         std::fprintf(stderr, "strata generate: --expert-worker-contract requires unweighted helper rows; --remote-expert-opt changes reduction order\n");
         return 2;
@@ -3046,7 +3144,7 @@ int main(int argc, char** argv) {
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
     const char* early_env = std::getenv("STRATA_EARLY_REMOTE_CONTEXTS");
-    const bool early_remote = early_env && early_env[0] == '1';
+    const bool early_remote = mps_ceiling.declared || o.prefill_helpers || (early_env && early_env[0] == '1');
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 && (r == 0 || early_remote)) {
         // Keep CUDA1's proven startup order: initialise its context before
         // allocating GPU0 weights or mapping the large host expert arena.
@@ -3320,11 +3418,9 @@ int main(int argc, char** argv) {
     // allocation is the point: one overfull device must die at startup with its limiting term named,
     // not at token 4000 (plan.hpp's DoesNotClose rationale, enforced per device).
     //
-    // Scope note: the primary device, every layer-split stage device and the first remote-tier device
-    // are measured here.  Remote CUDA2/3 keep their existing per-device preflight refusals (they are
-    // cache-only tiers whose contexts are deliberately NOT created early except under
-    // STRATA_EARLY_REMOTE_CONTEXTS, and creating them sooner would change WSL2's pinned-host budget
-    // behavior - the reason that env var exists).
+    // Scope note: the primary, every stage and every configured static helper
+    // are measured before model allocation. Helper tier ordinals never substitute
+    // for their resolved CUDA device IDs when measuring or pricing.
     strata::plan::AdmissionDecision admission;
     uint64_t admitted_resident_bytes = UINT64_MAX;
     {
@@ -3445,6 +3541,20 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        std::array<uint64_t, 3> helper_prompt_device{}, helper_prompt_host{};
+        if (o.prefill_helpers) {
+            const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K;
+            for (size_t r = 0; r < helper_prompt_device.size(); ++r) {
+                if (o.expert_cache_remote[r] <= 0) continue;
+                if (!strata::prefill::Prefill::helper_allocation(
+                        g, o.prefill_chunk, rows,
+                        false, remote_dev[r], true,
+                        helper_prompt_device[r], helper_prompt_host[r], err)) {
+                    std::fprintf(stderr, "strata generate: prompt helper admission refused: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+        }
         const int64_t headroom_mib =
             o.admission_headroom_mib >= 0 ? o.admission_headroom_mib : o.vram_reserve_mib;
         const bool split_real = multi_gpu;      // distinct stage devices
@@ -3553,8 +3663,19 @@ int main(int argc, char** argv) {
                 v0.add_unknown(std::string("optional_workspace:") + feature,
                                "additional device copies and host conversion/registry peaks lack qualified pricing");
         }
-        if (std::getenv("STRATA_VERIFY_PROFILE"))
-            v0.add_unknown("verify_profile_storage", "optional device timestamps and host profile storage lack qualified pricing");
+        const bool profile_requested = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_requested;
+        const uint64_t profile_bytes = profile_requested ? strata::core::Verifier::planned_profile_bytes(g) : 0;
+        const uint64_t causal_host_bytes = causal_requested
+            ? strata::core::Verifier::planned_causal_host_bytes(g, K) : 0;
+        if (causal_host_bytes == UINT64_MAX)
+            v0.add_unknown("verify_causal_host_storage", "bounded actual routing/input observation geometry is unavailable");
+        if (profile_requested) {
+            if (profile_bytes == UINT64_MAX || o.pipeline_windows > 0 || o.batch > 0)
+                v0.add_unknown("verify_profile_storage", "profile geometry or concurrent copies lack qualified pricing");
+            else
+                v0.add("verify_profile_storage", profile_bytes,
+                       "Verifier::planned_profile_bytes: one device timestamp array for serial captured windows");
+        }
         if (graph_capable) {
             if (o.graph_capture_allowance_bytes != 0)
                 v0.add("graph_capture_storage", o.graph_capture_allowance_bytes,
@@ -3619,12 +3740,12 @@ int main(int argc, char** argv) {
         d0.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
 
         // Layer-split stage devices: their own weight arena (every stage loads the full pool), their
-        if (o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
-            v0.add_unknown("late_remote_tiers", "CUDA2/3 telemetry deferred until after model allocations; preflight required");
         if (multi_gpu && split_auto)
             v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
         // session share (upper-bounded by the full range until the split search has placed it) and the
         // stage_room reserves.  The last stage carries the MTP drafter.
+        uint64_t prefill_host_payload = admitted_prefill.host_payload;
+        uint64_t prefill_host_dynamic = admitted_prefill.host_dynamic;
         if (split_real) {
             const size_t last = split_devs.size() - 1;
             for (size_t i = 0; i < split_devs.size(); ++i) {
@@ -3681,6 +3802,13 @@ int main(int argc, char** argv) {
                     else ds.vram.add("verify_windows", std::max(windows, (uint64_t) kWindowMib << 20),
                                      "each stage's actual verifier arena, at least the conservative window envelope");
                 }
+                if (profile_requested) {
+                    if (profile_bytes == UINT64_MAX || o.pipeline_windows > 0 || o.batch > 0)
+                        ds.vram.add_unknown("verify_profile_storage", "profile geometry or concurrent copies lack qualified pricing");
+                    else
+                        ds.vram.add("verify_profile_storage", profile_bytes,
+                                    "Verifier::planned_profile_bytes: this stage's serial device timestamp array");
+                }
                 if (!o.mtp.empty() && i == last) {
                     const uint64_t dense_b = file_bytes(o.mtp + "/dense.bin");
                     const uint64_t experts_b = file_bytes(o.mtp + "/experts.bin");
@@ -3713,6 +3841,8 @@ int main(int argc, char** argv) {
                                      split_devs[i], err.c_str());
                         return 1;
                     }
+                    prefill_host_payload = byte_add(prefill_host_payload, stage_prefill.host_payload);
+                    prefill_host_dynamic = byte_add(prefill_host_dynamic, stage_prefill.host_dynamic);
                     ds.vram.add("prefill_buffers", stage_prefill.standalone_device,
                                 "Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)");
                     if (o.prefill_library_allowance_bytes != 0)
@@ -3729,15 +3859,47 @@ int main(int argc, char** argv) {
             }
         }
 
-        // The first remote tier shares its device with nothing: cache slots plus the usual reserve.
-        // (When a layer split already runs its first stage on CUDA1, that device's classes above carry
-        // the whole card - adding the remote tier again would check one ceiling twice, not once.)
-        const bool remote1_is_split_stage =
-            std::find(split_devs.begin(), split_devs.end(), 1) != split_devs.end();
-        if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) {
-            strata::plan::DeviceCost& dr = add_device("CUDA1");
-            dr.vram.add("expert_cache_remote", byte_mul((uint64_t) o.expert_cache_remote[0], blob_gate),
-                        "--expert-cache-device1 * expert_layout().max_blob");
+        // Dedicated resident expert owners use the same resolved device IDs as open().
+        // A helper never shares CUDA0, a stage device or another helper's allocation.
+        for (size_t r = 0; r < o.expert_cache_remote.size(); ++r) {
+            if (o.expert_cache_remote[r] <= 0) continue;
+            const int device = remote_dev[r];
+            bool overlap = device == 0 || std::find(split_devs.begin(), split_devs.end(), device) != split_devs.end();
+            for (size_t prior = 0; prior < r; ++prior)
+                overlap = overlap || (o.expert_cache_remote[prior] > 0 && remote_dev[prior] == device);
+            if (overlap) {
+                v0.add_unknown("remote_device_overlap", "static helper/stage or helper/helper overlap lacks joint device pricing");
+                continue;
+            }
+            auto& dr = add_device("CUDA" + std::to_string(device));
+            const auto decode = strata::core::RemoteExperts::allocation_bytes(
+                g.n_layers, g.n_expert, o.expert_cache_remote[r]);
+            uint64_t cache_bound = byte_mul((uint64_t) o.expert_cache_remote[r], blob_gate);
+            if (o.expert_cache_remote_placement == "layer" && o.expert_cache_remote[1] > 0) {
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                const size_t owners = (size_t) std::count_if(o.expert_cache_remote.begin(),
+                    o.expert_cache_remote.end(), [](int slots) { return slots > 0; });
+                uint64_t layer_bound = 0;
+                for (int64_t l = (int64_t) r; l < g.n_layers; l += (int64_t) owners) {
+                    const uint64_t blob = layout.native ?
+                        byte_mul(byte_add((uint64_t) layout.blob_bytes(l), 255) / 256, 256) : blob_gate;
+                    layer_bound = byte_add(layer_bound, byte_mul((uint64_t) g.n_expert, blob));
+                }
+                cache_bound = std::min(cache_bound, layer_bound);
+            }
+            dr.vram.add("expert_cache_remote", cache_bound,
+                        "remote slot maximum bounded by its layer-owned, aligned expert blobs");
+            dr.vram.add("remote_decode_buffers", decode.device, "RemoteExperts::allocation_bytes base allocator");
+            if (o.remote_expert_opt)
+                dr.vram.add_unknown("remote_optimized_decode", "optional reduction/metadata workspace is unqualified");
+            if (o.prefill_helpers) {
+                dr.vram.add("remote_prefill_buffers", helper_prompt_device[r], "Prefill::helper_allocation");
+                if (o.prefill_library_allowance_bytes)
+                    dr.vram.add("remote_prefill_library_storage", o.prefill_library_allowance_bytes,
+                                "finite per-owner driver/library allowance within the enforced device ceiling");
+                else
+                    dr.vram.add_unknown("remote_prefill_library_storage", "helper driver/library storage needs an allowance");
+            }
             dr.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
         }
 
@@ -3810,7 +3972,10 @@ int main(int argc, char** argv) {
         if (ceiling_failure) return 2;   // declared but not enforced: refuse rather than plan against it
         if (split_real)
             for (int d : split_devs) measure("CUDA" + std::to_string(d), d);
-        if (o.expert_cache_remote[0] > 0 && !remote1_is_split_stage) measure("CUDA1", 1);
+        for (size_t r = 0; r < o.expert_cache_remote.size(); ++r)
+            if (o.expert_cache_remote[r] > 0 &&
+                std::find(split_devs.begin(), split_devs.end(), remote_dev[r]) == split_devs.end())
+                measure("CUDA" + std::to_string(remote_dev[r]), remote_dev[r]);
         if (ceiling_failure) {
             std::fprintf(stderr, "strata generate: admission refused: selected-device context or telemetry failed\n");
             return 2;
@@ -3945,6 +4110,13 @@ int main(int argc, char** argv) {
             ram("resident_mtp_owner", resident.mtp_owner, "draft slot owner envelope, weights and scratch shared");
             ram("resident_transfer_transient", resident.transfer_transient, "serial checkpoint and one-layer QSA transfer envelope");
         }
+        if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)
+            ram("verify_profile_host", byte_mul(split_devs.size() + 1, profile_bytes),
+                "one independently allocated Verifier host timestamp array per serial stage; object metadata already counted");
+        if (causal_requested && causal_host_bytes != UINT64_MAX)
+            ram("verify_causal_host_storage", byte_mul(stage_count, causal_host_bytes),
+                "Verifier::planned_causal_host_bytes: actual eight-row FP32 inputs/routing per layer, "
+                "fixed helper records and bounded observation I/O workspace per serial stage");
 #ifdef STRATA_RESIDENCY_MODEL_TEST
         // One mapped hand-off plus control/candidate copies; all Verifier arenas are serial.
         ram("residency_regression_host", byte_add(byte_mul(8ull * sizeof(float),
@@ -3958,14 +4130,29 @@ int main(int argc, char** argv) {
         if (o.serve)
             ram("penalty_history_host", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
                 "serving hist_stage vector payload");
-        ram("expert_worker_ownership", 2 * (split_devs.size() + 1) *
-            (strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity) +
-             sizeof(strata::core::ExpertCompletion) + sizeof(strata::core::ExpertOperation) + sizeof(strata::core::GraphExpertWorker)),
-            "two bounded group ledgers per verifier lane, including retained metadata vectors");
+        ram("expert_worker_ownership", byte_mul(2 * (split_devs.size() + 1),
+            strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity) +
+            sizeof(strata::core::ExpertCompletion) + sizeof(strata::core::ExpertOperation) + sizeof(strata::core::GraphExpertWorker)),
+            "two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes");
         static_assert(sizeof(void*) == 8, "update worker helper pointer accounting together");
-        ram("expert_worker_helpers", 6 * sizeof(void*), "two setup-only lists of at most three configured helper pointers");
+        ram("expert_worker_helpers", byte_mul(2 * helper_count, sizeof(void*)),
+            "two setup-only registries of exactly the configured helper count, shared by all stages");
         ram("expert_worker_scheduler", sizeof(strata::core::ExpertHelperScheduler) +
-            strata::core::ExpertHelperScheduler::planned_bytes(3), "bounded ordered helper scheduler and diagnostic storage");
+            strata::core::ExpertHelperScheduler::planned_bytes(helper_count),
+            "one bounded ordered helper scheduler and diagnostic storage, drained before the next stage dispatch");
+        for (size_t r = 0; r < o.expert_cache_remote.size(); ++r) {
+            if (o.expert_cache_remote[r] <= 0) continue;
+            const auto decode = strata::core::RemoteExperts::allocation_bytes(
+                g.n_layers, g.n_expert, o.expert_cache_remote[r]);
+            const std::string tier = std::to_string(remote_dev[r]);
+            ram(("remote_decode_pinned:" + tier).c_str(), decode.host_pinned, "RemoteExperts base mapped input/result and metadata");
+            ram(("remote_decode_metadata:" + tier).c_str(), decode.host_metadata, "bounded cache/ranking/helper vector peak");
+            if (o.prefill_helpers) {
+                ram(("remote_prefill_pinned:" + tier).c_str(), helper_prompt_host[r], "Prefill::helper_allocation mapped crossings");
+                ram(("remote_prefill_runtime:" + tier).c_str(), o.guest_opaque_allowance_bytes,
+                    "per-owner bounded CUDA handles, events, registration and host metadata within worker ceiling");
+            }
+        }
         if (!source_page) ram_unknown("source_page_size", "cannot bound filesystem source pages without OS page size");
         const auto& layout = strata::kernels::cpu::expert_layout();
         if (layout.n_layers != g.n_layers || layout.n_expert != g.n_expert ||
@@ -3987,7 +4174,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (o.windowed_experts) {
-            const uint64_t lanes = multi_gpu ? split_devs.size() + 1 : 1;
+            const uint64_t lanes = stage_count; // static helper startup shares lane zero, retaining no source pointers
+            ram("expert_source_lanes", byte_add(byte_mul(lanes, sizeof(strata::core::WindowedExpertSource)),
+                byte_mul(lanes - 1, sizeof(std::unique_ptr<strata::core::WindowedExpertSource>))),
+                "one source owner per prefill stage plus its setup-only registry; no helper source lane");
             const uint64_t ring = strata::core::WindowedExpertSource::planned_bytes({}, layout, err);
             if (!ring) {
                 std::fprintf(stderr, "strata generate: admission refused: %s\n", err.c_str());
@@ -4171,10 +4361,10 @@ int main(int argc, char** argv) {
                 byte_add(byte_mul(byte_mul(chunk, (uint64_t) K), 32),
                          byte_mul(chunk, strata::kernels::kStepCount * sizeof(int32_t))))))),
                 "Prefill::init stager ring, two PLE row buffers, host routing and step tables");
-            ram("prefill_host_payload", byte_mul(stages, admitted_prefill.host_payload),
-                "Prefill::allocation_needed: token staging, routing counts, mapped/MMQ bounds and pinned flags");
-            ram("prefill_host_dynamic", byte_mul(stages, admitted_prefill.host_dynamic),
-                "Prefill::allocation_needed: counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
+            ram("prefill_host_payload", prefill_host_payload,
+                "Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags");
+            ram("prefill_host_dynamic", prefill_host_dynamic,
+                "per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
             // prefill_runtime_storage is added below, once the supervisor's measured worker limit is
             // known: the operator allowance is only admissible inside an enforced cgroup ceiling.
             if (split_real)
@@ -5941,6 +6131,10 @@ int main(int argc, char** argv) {
         // blocking startup/refill use lane zero only after prefill has drained.
         windowed_resident_bytes = windowed_src.residency_bytes();
         stage_sources.reserve(stages.size());
+        if (stage_sources.capacity() > stages.size()) {
+            std::fprintf(stderr, "strata generate: source lane registry exceeds its admitted bound\n");
+            return 1;
+        }
         for (const auto& st : stages) {
             auto source = std::make_unique<strata::core::WindowedExpertSource>();
             source->set_gguf(o.native_preset);
@@ -6779,8 +6973,8 @@ int main(int argc, char** argv) {
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
-    drive.d.remote.reserve(3);
-    drive.d.workers.reserve(3);
+    drive.d.remote.reserve(helper_count);
+    drive.d.workers.reserve(helper_count);
     const size_t ownership_groups = 2 * (split_devs.size() + 1);
     drive.d.completion.reserve(ownership_groups);
     drive.d.operation.resize(ownership_groups);
@@ -6790,7 +6984,7 @@ int main(int argc, char** argv) {
     const bool oversized_ledger = std::any_of(drive.d.completion.begin(), drive.d.completion.end(),
         [](const auto& completion) { return completion.storage_bytes() >
             strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity); });
-    if (drive.d.remote.capacity() > 3 || drive.d.workers.capacity() > 3 || oversized_ledger ||
+    if (drive.d.remote.capacity() > helper_count || drive.d.workers.capacity() > helper_count || oversized_ledger ||
         drive.d.completion.capacity() > ownership_groups || drive.d.operation.capacity() > ownership_groups ||
         drive.d.primary_workers.capacity() > ownership_groups) {
         std::fprintf(stderr, "strata generate: helper list allocation exceeds the admitted bound\n");
@@ -6806,11 +7000,23 @@ int main(int argc, char** argv) {
             if (remote->holds(l, e)) return true;
         return false;
     };
+    // SplitDrive changes only this layer's stage plan/cache/PCIe share. Every
+    // stage sees this same helper registry; dispatch drains the helper before
+    // returning, while primary consumers retain their own 2*stage+group ledger.
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote.push_back(&remote_experts[(size_t) r]);
     for (auto* worker : drive.d.remote) drive.d.workers.push_back(worker);
+    if (causal_requested) {
+        int observed_helpers[3] = {};
+        size_t count = 0;
+        for (const auto* remote : drive.d.remote) observed_helpers[count++] = remote->device();
+        if (!strata::core::Verifier::configure_causal_helpers(observed_helpers, count, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 2;
+        }
+    }
     drive.d.helper_scheduler = std::make_unique<strata::core::ExpertHelperScheduler>(drive.d.workers);
-    if (drive.d.helper_scheduler->storage_bytes() > strata::core::ExpertHelperScheduler::planned_bytes(3)) {
+    if (drive.d.helper_scheduler->storage_bytes() > strata::core::ExpertHelperScheduler::planned_bytes(helper_count)) {
         std::fprintf(stderr, "strata generate: helper scheduler exceeds admitted storage\n");
         return 1;
     }
@@ -8084,6 +8290,7 @@ int main(int argc, char** argv) {
                      dropped ? "is closed" : "stays open", why.c_str());
     }
     if (o.serve) {
+        uint64_t committed_logit_bytes = 0;
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
@@ -8478,11 +8685,32 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (peer.valid() && o.peer_prefill_rows != 0) {
-            const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, err)) {
-                std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
-                err.clear();
+        // Resident remote owners are opt-in for prefill; omission is the matched
+        // off arm with the same caches and decode ownership.
+        {
+            // Native grouped selects each stage's arithmetic independently.
+            // Its no-split resident-owner control must not bind helpers to only
+            // the first stage of a split (or allocate unpriced prompt helpers).
+            const bool native_control = strata::prefill::Prefill::native_grouped_enabled() && !multi_gpu;
+            std::vector<strata::prefill::Prefill::PromptHelper> owners;
+            if (o.prefill_helpers || native_control || (peer.valid() && o.peer_prefill_rows != 0)) owners.reserve(3);
+            if (peer.valid() && o.peer_prefill_rows != 0)
+                owners.push_back({peer.device(), &peer.cache(), peer.residency(), false, peer.p2p()});
+            if (o.prefill_helpers || native_control)
+                for (size_t r = 0; r < o.expert_cache_remote.size(); ++r)
+                    if (o.expert_cache_remote[r] > 0)
+                        owners.push_back({remote_experts[r].device(), &remote_experts[r].cache(), nullptr, true});
+            if (!owners.empty()) {
+                const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows
+                                                             : std::max<int64_t>(1, o.prefill_chunk * K / 2);
+                std::string herr;
+                if (!sp.set_prompt_helpers(owners, rows, o.prefill_helpers || !native_control, herr)) {
+                    if (o.prefill_helpers || native_control) {
+                        std::fprintf(stderr, "strata serve: prompt helpers: %s\n", herr.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", herr.c_str());
+                }
             }
         }
         // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the
@@ -11881,6 +12109,7 @@ int main(int argc, char** argv) {
                              (size_t) o.max_context + 4096);
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            int64_t corrupt_counter = 0;   // request-local, including after cancellation or prefix reuse
             const float* last_committed_residual = nullptr;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
@@ -12581,6 +12810,10 @@ int main(int argc, char** argv) {
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                // As in CLI generate: corrupt drafts only, after proposal selection, before history staging.
+                for (int i = 1; o.spec_corrupt > 0 && i < T; ++i)
+                    if ((++corrupt_counter % o.spec_corrupt) == 0)
+                        window[(size_t) i] = (window[(size_t) i] + 1) % (int32_t) n_vocab;
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -12613,8 +12846,10 @@ int main(int argc, char** argv) {
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
-                // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
-                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                // Lookup and corrupted windows use point-mass/exact-match verification, as in CLI generate.
+                // Unchanged MTP q must never judge a modified draft token.
+                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0)
+                    ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -12666,6 +12901,48 @@ int main(int argc, char** argv) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                if (committed_logit_prefix != nullptr) {
+                    // Commit leaves the verified head rows intact. Read the final
+                    // stage before MTP can overwrite it, and only the emitted prefix.
+                    // Reuse the already-priced host logits row: no window-sized buffer.
+                    auto write_committed = [&]() -> bool {
+                        const uint64_t bytes = 8 + (uint64_t) keep * (uint64_t) n_vocab * sizeof(float);
+                        if (n_vocab > INT32_MAX || bytes > (uint64_t{1} << 30) - committed_logit_bytes) {
+                            err = "committed logit diagnostic exceeds int32 dimensions or its 1GiB process budget";
+                            return false;
+                        }
+                        LogitsDump dump;
+                        dump.path = std::string(committed_logit_prefix) + "." +
+                            std::to_string(drive.d.request_generation) + "." + std::to_string(p);
+                        dump.n_vocab = n_vocab;
+                        dump.expected_rows = keep;
+                        dump.f = std::fopen(dump.path.c_str(), "wx");
+                        if (dump.f == nullptr) { err = "cannot create committed logit dump: " + dump.path; return false; }
+                        const int32_t header[2] = {(int32_t) n_vocab, keep};
+                        if (std::fwrite(header, sizeof(int32_t), 2, dump.f) != 2) {
+                            err = "cannot write committed logit header"; return false;
+                        }
+                        for (int t = 0; t < keep; ++t) {
+                            if (!ver.read_logits_rows(t, t + 1, logits.data(), err)) return false;
+                            for (float value : logits)
+                                if (!std::isfinite(value)) { err = "nonfinite committed logit row"; return false; }
+                            if (!dump.write_row(logits.data(), p + t)) { err = "cannot write committed logit row"; return false; }
+                        }
+                        if (!dump.finish()) { err = "cannot finish committed logit dump"; return false; }
+                        committed_logit_bytes += bytes;
+                        std::fprintf(stderr, "COMMITTED_LOGITS request=%llu position=%lld rows=%d tokens=",
+                            (unsigned long long) drive.d.request_generation, (long long) p, keep);
+                        for (int t = 0; t < keep; ++t)
+                            std::fprintf(stderr, "%s%d", t == 0 ? "" : ",", (int) outv[(size_t) t]);
+                        std::fprintf(stderr, " vocab=%lld path=%s\n", (long long) n_vocab, dump.path.c_str());
+                        return true;
+                    };
+                    if (!write_committed()) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
                 }
                 // Only the emitted prefix is now committed; the final pick is next x.
                 for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
@@ -12963,7 +13240,7 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
-                                     "waiting for it in this request\n", r + 1,
+                                     "waiting for it in this request\n", remote_dev[r],
                              (long long) (remote_experts[(size_t) r].computed() - remote_before[(size_t) r]),
                              (long long) (remote_experts[(size_t) r].launched_layers() - launches_before[(size_t) r]),
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
@@ -12972,6 +13249,11 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {
+            std::fprintf(stderr, "strata cross-help capture REFUSED: the requested request/window was not "
+                                 "completely observed and emitted before serving QUIT/EOF\n");
+            return 1;
+        }
         return 0;
     }
 
@@ -14037,7 +14319,7 @@ int main(int argc, char** argv) {
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
-                        r + 1, (long long) remote_experts[(size_t) r].computed());
+                        remote_dev[r], (long long) remote_experts[(size_t) r].computed());
         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
         // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
         // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`
