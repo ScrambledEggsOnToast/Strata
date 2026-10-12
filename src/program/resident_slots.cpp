@@ -101,8 +101,10 @@ bool ResidentSlots::begin(int destination, const std::vector<int64_t>& prompt,
 ResidentSlots::~ResidentSlots() {
     // The resource owners outlive us. Drain before histories borrowed by a
     // verifier are destroyed, including on a failed transition/early return.
-    if (touched_) for (const auto& stage : stages_)
-        if (!stage.verifier->release_gpu_waits(5000)) std::terminate();
+    if (touched_) for (const auto& stage : stages_) {
+        if (!stage.verifier->release_gpu_waits(5000) ||
+            (stage.batch_peer && !stage.batch_peer->release_gpu_waits(5000))) std::terminate();
+    }
     if (touched_) for (const auto& stage : stages_) {
         const core::OnDevice on(stage.device);
         if (cudaDeviceSynchronize() != cudaSuccess) std::terminate();
@@ -146,7 +148,8 @@ bool ResidentSlots::idle(std::string& error) {
         error = "resident transition: expert consumers still own an operation"; return false;
     }
     for (const auto& stage : stages_)
-        if (!stage.verifier->context_idle(error)) return false;
+        if (!stage.verifier->context_idle(error) ||
+            (stage.batch_peer && !stage.batch_peer->context_idle(error))) return false;
     return draft_.context_idle(error) && prompt_.context_idle(error);
 }
 
@@ -155,7 +158,11 @@ bool ResidentSlots::slot_idle(int slot, std::string& error) {
         bool expert_pending = false;
         for (size_t group = 2 * k; group < std::min(2 * k + 2, dispatch_.completion.size()); ++group)
             expert_pending = expert_pending || dispatch_.completion[group].active();
-        if (!stages_[k].verifier->slot_consumers_idle(slot, expert_pending, error)) return false;
+        const auto& stage = stages_[k];
+        if (!stage.verifier->slot_consumers_idle(slot, expert_pending &&
+                (!stage.batch_peer || stage.verifier->batch_busy()), error) ||
+            (stage.batch_peer && !stage.batch_peer->slot_consumers_idle(slot,
+                expert_pending && stage.batch_peer->batch_busy(), error))) return false;
     }
     // A pipelined operation for other rows may continue. Its snapshots don't
     // borrow this slot's history and its stage reports no consumer for this row.
@@ -167,15 +174,17 @@ bool ResidentSlots::init_resources(std::string& error) {
         error = "resident resources: release idle resources before initialization"; return false;
     }
     if (!idle(error)) return false;
-    for (const auto& stage : stages_) if (stage.verifier->n_slots() != 0) {
-        error = "resident resources: verifier already has slot bindings"; return false;
-    }
+    for (const auto& stage : stages_)
+        if (stage.verifier->n_slots() != 0 || (stage.batch_peer && stage.batch_peer->n_slots() != 0)) {
+            error = "resident resources: verifier already has slot bindings"; return false;
+        }
     // Failed partial allocation must still drain before borrowed histories die.
     touched_ = true;
     resources_ = Resources::failed;
     for (const auto& stage : stages_) {
         const core::OnDevice on(stage.device);
-        if (!stage.verifier->init_slots(stage.slots, error)) {
+        if (!stage.verifier->init_slots(stage.slots, error) ||
+            (stage.batch_peer && !stage.batch_peer->init_slots(stage.slots, error))) {
             resources_ = Resources::failed; return false;
         }
     }
@@ -183,7 +192,9 @@ bool ResidentSlots::init_resources(std::string& error) {
         const auto& slot = slots_[b];
         if (!slot.request || slot.failed) continue;
         if (!stages_[0].verifier->set_slot_context((int) b, slot.request, slot.sampling,
-                                                  &slot.ids, slot.cvec, error)) {
+                                                  &slot.ids, slot.cvec, error) ||
+            (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context((int) b, slot.request,
+                                                  slot.sampling, &slot.ids, slot.cvec, error))) {
             resources_ = Resources::failed; return false;
         }
     }
@@ -197,7 +208,8 @@ bool ResidentSlots::release_resources(std::string& error) {
         error = "resident resources: release requires initialized idle requests"; return false;
     }
     if (!idle(error)) return false;
-    if (!stages_[0].verifier->release_batch_resources(error)) {
+    if (!stages_[0].verifier->release_batch_resources(error) ||
+        (stages_[0].batch_peer && !stages_[0].batch_peer->release_batch_resources(error))) {
         resources_ = Resources::failed; return false;
     }
     resources_ = Resources::released;
@@ -301,6 +313,8 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
                                                 state.draft, error)) return fail(slot);
     if (!stages_[0].verifier->set_slot_context(slot, working_.request, state.sampling,
                                               &state.ids, state.cvec, error) ||
+        (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(slot, working_.request,
+                                              state.sampling, &state.ids, state.cvec, error)) ||
         !observe(continuing ? "resume" : "admit", slot, (int64_t) prefix.size(), error)) {
         // Retain a continuing identity for balanced failure/release receipts.
         // A new request has not published its start yet.

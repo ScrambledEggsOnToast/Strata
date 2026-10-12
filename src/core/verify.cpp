@@ -3981,10 +3981,11 @@ bool Verifier::sample_rows(int S, std::string& err) {
     return true;
 }
 
-bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos,
+                            std::string& err, BatchCommit commit) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    for (int t = 1; t < S; ++t)
+    for (int t = 1; commit == BatchCommit::eager && t < S; ++t)
         if (rows[t] == rows[t - 1]) {
             err = "verify: speculative slot rows require deferred accepted-prefix commit";
             return false;
@@ -3993,10 +3994,12 @@ bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tok
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (le == cudaSuccess && commit == BatchCommit::eager)
+        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     b_running_ = true;
+    b_deferred_ = commit == BatchCommit::deferred;
     b_k_ = 0;
     b_steps_ = ar_on() ? 0 : le_ - lb_;
     b_last_ = Clock::now();
@@ -4080,8 +4083,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (pool != nullptr && !pool(user, nullptr, nullptr, 0, ss_->k, nullptr, -1, nullptr, nullptr, -1, worker_lane_)) {
         released_.store(true); err = "verify batch: expert completion failed"; b_running_ = false; return -1;
     }
-    if (!check_canaries(false, err) || !check_canaries(true, err)) { b_running_ = false; return -1; }
-    if (!observe_committed_rows(S, err)) { b_running_ = false; return -1; }
+    if (!check_canaries(false, err) || (!b_deferred_ && !check_canaries(true, err))) { b_running_ = false; return -1; }
+    if (!b_deferred_ && !observe_committed_rows(S, err)) { b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -4089,13 +4092,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     }
     ++windows;
     b_running_ = false;
-    if (ple_stage())
+    if (!b_deferred_ && ple_stage())
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) last_rows_[t]];
             sx.ple_prev[0] = sx.ple_prev[1];
             sx.ple_prev[1] = last_tokens_[t];
         }
-    if (!scratch_.finish_batch()) { err = "verify: batch ownership was poisoned"; return -1; }
+    if (!(b_deferred_ ? scratch_.ready() : scratch_.finish_batch())) { err = "verify: batch ownership was poisoned"; return -1; }
     guard.keep = true;
     progress_beat();
     return 1;

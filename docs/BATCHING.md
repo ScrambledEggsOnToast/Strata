@@ -462,6 +462,14 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
   A proposal is kept only when the independently sampled target equals it; target Philox counters and per-row
   penalty histories remain request-local. This is not coupled draft sampling. Admission prices the eight-row
   verifier arena on every split stage; the synchronous schedule adds no retained rollback buffers.
+  Separately, `--batch-mtp --batch-mtp-pipeline --batch-groups 2` retains **both** group pipelines on a
+  distinct-device layer split with two or four resident slots; other shapes refuse. Each group owns a verifier
+  arena, row metadata, sampling/history controls and canary lease on every stage until the same recursive
+  accepted-prefix commit completes. Four slots use four compute rows per owner and disjoint physical mapped
+  handoff regions `[0,4)` and `[4,8)`, independent of active-slot compaction. Session and draft KV remain private
+  per request, not duplicated per group. Engine status reports `batch_schedule=pipelined` and effective groups=2.
+  A completed group waits for host-served expert graphs on other stages to drain before a synchronous prefix
+  commit could strand their doorbells; fully resident stages retain continuous group overlap.
 - Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
   beyond the bound refuses before capture; live graphs are not evicted.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
@@ -486,9 +494,11 @@ Both prices use the same facts counter as the actual allocation sequence.
 New allocation-bearing opt-ins remain off by default. Elastic KV growth, pipelined windows, asynchronous
 adaptive refill, MTP Q4 conversion, and quantization-fusion workspace report unknown admission demand and
 refuse until their allocation peaks are qualified. Their upstream implementation is retained; refusal is not
-permission to silently fall back to a different requested mode. Batch-MTP prices its full eight-row verifier
-arena through the same layout routine used by `Verifier::init`, in addition to private slot resources and
-the existing opaque graph-storage allowance. Kernel exactness/performance still require parent-project
+permission to silently fall back to a different requested mode. Batch-MTP prices its schedule-sized verifier
+arenas through the same layout routine used by `Verifier::init`, in addition to private slot resources.
+The pipelined mode additionally prices the second arena, resident controls and canary on every device,
+per-stage mapped/history/diagnostic host staging and another finite graph-storage allowance inside the enforced
+MPS ceiling. An unknown or over-budget plan refuses. Kernel exactness/performance still require parent-project
 qualification; source integration is not runtime evidence.
 
 
@@ -619,6 +629,11 @@ For CUDA split batch-MTP, `BDONE` also carries `draft_accepted` and `draft_offer
 `--require-rejection` to the protocol-driving check to require a rejected proposal; retain and compare
 the committed token sequences, not only its acceptance rate. `STRATA_STATE_HASH=1` additionally logs each
 split proposal, independently sampled target, and committed prefix length for diagnostic runs.
+Use the additional `--batch-mtp-pipeline --batch-groups 2` flags for the separately retained two-group path.
+Run long greedy and independently seeded sampled requests against drafting-off controls and require rejection
+in both modes. Keep state/token tracing in correctness captures only: unset **both** `STRATA_STATE_HASH` and
+`STRATA_BATCH_TRACE` in every timing arm. Record the actual environment per arm and use native `BDONE`
+request clocks or the engine's committed-window accounting, never shared frontend `last` statistics.
 
 ## Engine protocol (`--serve`)
 

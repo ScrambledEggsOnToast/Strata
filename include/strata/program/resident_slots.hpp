@@ -17,6 +17,8 @@ struct ResidentStage {
     core::Verifier* verifier = nullptr;
     std::vector<core::SessionState*> slots;
     int device = -1;
+    // Optional second group owner: the same private slot states, distinct retained replay scratch.
+    core::Verifier* batch_peer = nullptr;
 };
 
 struct ResidentRequest {

@@ -711,6 +711,7 @@ struct Options {
     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
+    bool batch_mtp_pipeline = false; ///< separate opt-in: two group-owned replay chains on a layer split
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
@@ -930,6 +931,8 @@ void usage() {
                  "  --background-share F  minimum prefill/control share under contention (0.01..0.99, default 0.25)\n"
                  "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal; layer splits retain one synchronous quantum (no group pipeline)\n"
+                 "  --batch-mtp-pipeline --batch-mtp with a layer split: retain both groups' replay arenas (2/4 slots,\n"
+                 "                       --batch-groups 2); target equality and accepted-prefix commit still apply\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -2171,6 +2174,7 @@ int main(int argc, char** argv) {
             else o.batch_groups = std::atoi(bgv);
         }
         else if (a == "--batch-mtp") o.batch_mtp = true;
+        else if (a == "--batch-mtp-pipeline") o.batch_mtp_pipeline = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
@@ -3806,14 +3810,26 @@ int main(int argc, char** argv) {
         }
         const char* batch = std::getenv("STRATA_BATCH_MTP");
         const bool grouped_draft = o.batch_mtp || (batch && batch[0] && batch[0] != '0');
+        const int grouped_rows = o.batch_mtp_pipeline ? std::max(o.spec, o.batch) : strata::kernels::kVerifyMaxT;
         if (o.spec > 0) {
             const uint64_t windows = grouped_draft
-                ? strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, strata::kernels::kVerifyMaxT)
+                ? strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows)
                 : (uint64_t) kWindowMib << 20;
             if (windows == UINT64_MAX) v0.add_unknown("verify_windows", "bounded verifier arena geometry unavailable");
             else v0.add("verify_windows", std::max(windows, (uint64_t) kWindowMib << 20),
-                        grouped_draft ? "eight-row actual verifier arena sequence, at least existing conservative window envelope"
+                        grouped_draft ? "schedule-sized actual verifier arena, at least existing conservative window envelope"
                                       : "generate.cpp kWindowMib: verify-window envelope (75 MiB measured)");
+        }
+        if (o.batch_mtp_pipeline) {
+            const uint64_t replay = strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows);
+            if (replay == UINT64_MAX) v0.add_unknown("batch_mtp_pipeline_replay", "second verifier arena geometry unavailable");
+            else v0.add("batch_mtp_pipeline_replay", byte_add(replay,
+                        byte_add(resident.verifier_device, strata::core::kVerifyCanaryDeviceBytes)),
+                        "second group owns an exact verifier arena, resident controls and independent canary owner");
+            if (o.graph_capture_allowance_bytes)
+                v0.add("batch_mtp_pipeline_graph", o.graph_capture_allowance_bytes,
+                       "second group's bounded graph cache: another finite operator allowance inside the enforced MPS ceiling");
+            else v0.add_unknown("batch_mtp_pipeline_graph", "second group's opaque retained graph storage needs a finite allowance");
         }
         if (n_vocab > 0)
             v0.add("logits", byte_mul((uint64_t) n_vocab, 4), "pack index output.weight ne1 * sizeof(float)");
@@ -3907,11 +3923,23 @@ int main(int argc, char** argv) {
                             "bounded prefill/MTP scratch owner tables, conservatively per stage");
                 if (o.spec > 0) {
                     const uint64_t windows = strata::core::Verifier::planned_device_bytes(
-                        g, o.max_context, n_vocab, grouped_draft ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch));
+                        g, o.max_context, n_vocab, grouped_draft ? grouped_rows : std::max(o.spec, o.batch));
                     if (windows == UINT64_MAX)
                         ds.vram.add_unknown("verify_windows", "stage verifier arena geometry unavailable");
                     else ds.vram.add("verify_windows", std::max(windows, (uint64_t) kWindowMib << 20),
                                      "each stage's actual verifier arena, at least the conservative window envelope");
+                }
+                if (o.batch_mtp_pipeline) {
+                    const uint64_t replay = strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows);
+                    if (replay == UINT64_MAX)
+                        ds.vram.add_unknown("batch_mtp_pipeline_replay", "second stage verifier arena geometry unavailable");
+                    else ds.vram.add("batch_mtp_pipeline_replay", byte_add(replay,
+                                    byte_add(resident.verifier_device, strata::core::kVerifyCanaryDeviceBytes)),
+                                    "second group owns this stage's exact arena, resident controls and canary");
+                    if (o.graph_capture_allowance_bytes)
+                        ds.vram.add("batch_mtp_pipeline_graph", o.graph_capture_allowance_bytes,
+                                    "second group's finite graph allowance, inside the enforced MPS ceiling");
+                    else ds.vram.add_unknown("batch_mtp_pipeline_graph", "second stage graph cache lacks a finite allowance");
                 }
                 if (profile_requested) {
                     if (profile_bytes == UINT64_MAX || o.pipeline_windows > 0 || o.batch > 0)
@@ -4470,6 +4498,12 @@ int main(int argc, char** argv) {
             "verify/pool mapped handoffs and metadata: at least the bounded eight-row mapped sequence when batch-MTP requested");
         ram("verifier_diagnostic_host", byte_mul(stage_count, 262144),
             "bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit");
+        if (o.batch_mtp_pipeline)
+            ram("batch_mtp_pipeline_host", byte_mul(stage_count,
+                byte_add(std::max(grouped_host, (uint64_t) kWindowMib << 20),
+                byte_add(resident.verifier_pinned, byte_add(resident.verifier_history,
+                    byte_add(strata::core::kVerifyCanaryHostBytes, 262144))))),
+                "second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging");
         if (o.resident_cpu_experts)
             ram("resident_exchange_staging", byte_mul((uint64_t) std::max(o.adapt_swaps, 0), blob_gate),
                 "FileExpertSource::reserve_exchanges: swaps * max_blob");
@@ -5976,6 +6010,8 @@ int main(int argc, char** argv) {
         }
     }
     const bool split_batch_mtp = batch_mtp && !stages.empty();
+    const bool batch_mtp_pipeline = split_batch_mtp && o.batch_mtp_pipeline;
+    const bool synchronous_batch_mtp = split_batch_mtp && !batch_mtp_pipeline;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -6004,6 +6040,13 @@ int main(int argc, char** argv) {
                      o.batch / best, o.batch / best == 1 ? "" : "s");
     };
     if (o.batch > 0) resolve_groups_auto();
+    if (o.batch_mtp_pipeline) {
+        const char* why = !split_batch_mtp ? "it needs --batch-mtp and a distinct-device layer split"
+                        : (o.batch != 2 && o.batch != 4) ? "only --batch 2 or 4 has bounded two-group handoff ownership"
+                        : o.batch_groups != 2 ? "it needs --batch-groups 2"
+                        : o.resident_multiplex ? "resident multiplexing is a different schedule" : nullptr;
+        if (why) { std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: %s\n", why); return 1; }
+    }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -6066,6 +6109,10 @@ int main(int argc, char** argv) {
                                  "expert cache would otherwise hold\n", o.batch,
                          (double) bytes0 * o.batch / 1073741824.0);
         }
+    }
+    if (batch_mtp_pipeline && (o.batch < 2 || o.batch_groups != 2)) {
+        std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: two supported resident groups did not fit\n");
+        return 1;
     }
     // Resident init, partial failure and stage-count trimming can retire the latest
     // registered table. Bind the longer-lived working owner on every actual device,
@@ -8938,6 +8985,8 @@ int main(int argc, char** argv) {
         // K+1 while stage 1 still reads window K's hand-off
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
         strata::core::Verifier ver_b;
+        auto stage_peer = [&](int st) -> strata::core::Verifier& { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; };
+        const int batch_compute_rows = batch_mtp && !batch_mtp_pipeline ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch);
         SplitDrive split_drive_b;
         cudaStream_t pl_stream[2] = {nullptr, nullptr};
         if (pipe) {
@@ -8974,6 +9023,10 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (batch_mtp_pipeline)
+                    stage_peer(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1],
+                        st + 1 < n_stages ? split_at[(size_t) st] : -1,
+                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -8996,7 +9049,13 @@ int main(int argc, char** argv) {
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     if (batch_mtp) gs.ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_compute_rows, err);
+                    if (ok_s && batch_mtp_pipeline) {
+                        gs.ver_b.set_remote_expert_opt(remote_opt.get());
+                        gs.ver_b.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+                        ok_s = gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
+                                            batch_compute_rows, err);
+                    }
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -9007,6 +9066,8 @@ int main(int argc, char** argv) {
                 }
             }
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
+            if (batch_mtp_pipeline)
+                for (int st = 0; st + 1 < n_stages; ++st) stage_peer(st).set_next(&stage_peer(st + 1), &split_drive_b);
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -9057,10 +9118,18 @@ int main(int argc, char** argv) {
             }
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
+        if (batch_mtp_pipeline) {
+            ver_b.set_remote_expert_opt(remote_opt.get());
+            ver_b.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, batch_compute_rows, err)) {
+                std::fprintf(stderr, "strata serve: --batch-mtp-pipeline: second primary verifier: %s\n", err.c_str());
+                return 1;
+            }
+        }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_compute_rows, err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -9073,6 +9142,7 @@ int main(int argc, char** argv) {
             stage.main = k == 0 ? &ss : &stages[k - 1]->ss;
             stage.verifier = k == 0 ? &ver : &stages[k - 1]->ver;
             stage.device = k == 0 ? 0 : stages[k - 1]->dev;
+            if (batch_mtp_pipeline) stage.batch_peer = &stage_peer((int) k);
             if (k < bslot_ss.size())
                 for (auto& owner : bslot_ss[k]) stage.slots.push_back(&owner->state());
             resident_stages.push_back(std::move(stage));
@@ -9097,10 +9167,19 @@ int main(int argc, char** argv) {
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             stage_ver(st).set_worker_lane(st);
+            if (batch_mtp_pipeline) {
+                stage_peer(st).set_worker_lane(st);
+                stage_peer(st).set_split(o.spec_split);
+                stage_peer(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            }
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
+        }
+        if (batch_mtp_pipeline) {
+            split_drive_b = split_drive;
+            for (int st = 0; st < n_stages; ++st) split_drive_b.plan[st] = stage_peer(st).plan_sink();
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
             split_drive_b = split_drive;
@@ -10402,10 +10481,11 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(split_batch_mtp ? 1 : o.batch_groups) +
+                                       " batch_groups=" + std::to_string(synchronous_batch_mtp ? 1 : o.batch_groups) +
                                        " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0) +
-                                       (split_batch_mtp ? " batch_mtp=1 batch_schedule=synchronous batch_groups_requested=" +
-                                           std::to_string(o.batch_groups) : "")).c_str() : "");
+                                       (split_batch_mtp ? " batch_mtp=1 batch_schedule=" +
+                                           std::string(batch_mtp_pipeline ? "pipelined" : "synchronous") +
+                                           " batch_groups_requested=" + std::to_string(o.batch_groups) : "")).c_str() : "");
             if (o.foreground_budget_ms > 0)
                 std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
                             o.foreground_budget_ms, o.background_share);
@@ -10625,6 +10705,26 @@ int main(int argc, char** argv) {
         struct BatchDraftCounts { uint64_t request = 0; int64_t offered = 0, accepted = 0; };
         BatchDraftCounts batch_drafts[strata::kernels::kVerifyMaxT] = {};
         const bool batch_mtp_trace = split_batch_mtp && std::getenv("STRATA_STATE_HASH");
+        auto record_batch_proposal = [&](int b, int32_t proposal, int32_t target, int keep) {
+            const BSlot& sl = bs[(size_t) b];
+            auto& counts = batch_drafts[b];
+            if (counts.request != sl.request) counts = {sl.request, 0, 0};
+            ++counts.offered;
+            counts.accepted += keep - 1;
+            if (batch_mtp_trace)
+                std::fprintf(stderr, "strata batch MTP: request=%llu slot=%d position=%lld "
+                                     "proposal=%d target=%d keep=%d\n",
+                             (unsigned long long) sl.request, b, (long long) sl.p, proposal, target, keep);
+        };
+        auto print_mtp_done = [&](int b, const char* reason) {
+            const BSlot& sl = bs[(size_t) b];
+            auto& counts = batch_drafts[b];
+            if (counts.request != sl.request) counts = {sl.request, 0, 0};
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
+                        b, (long long) sl.produced, reason, ms,
+                        (long long) counts.accepted, (long long) counts.offered);
+        };
         size_t resident_cursor = 0;
         unsigned resident_credit = 0;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -10659,9 +10759,7 @@ int main(int argc, char** argv) {
                 if (!resident.finish(b, err)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                 if (split_batch_mtp)
-                    std::printf("BDONE %d %lld cancel %.1f draft_accepted=%lld draft_offered=%lld\n",
-                                b, (long long) sl.produced, ms,
-                                (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
+                    print_mtp_done(b, "cancel");
                 else
                     std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
             }
@@ -10747,19 +10845,8 @@ int main(int argc, char** argv) {
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                if (split_batch_mtp) {
-                    auto& counts = batch_drafts[b];
-                    if (counts.request != sl.request) counts = {sl.request, 0, 0};
-                    if (i + 1 < S && rows[i + 1] == b) {
-                        ++counts.offered;
-                        counts.accepted += keep[b] - 1;
-                        if (batch_mtp_trace)
-                            std::fprintf(stderr, "strata batch MTP: request=%llu slot=%d position=%lld "
-                                                 "proposal=%d target=%d keep=%d\n",
-                                         (unsigned long long) sl.request, b, (long long) sl.p,
-                                         tok[i + 1], outb[i], keep[b]);
-                    }
-                }
+                if (split_batch_mtp && i + 1 < S && rows[i + 1] == b)
+                    record_batch_proposal(b, tok[i + 1], outb[i], keep[b]);
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10830,11 +10917,16 @@ int main(int argc, char** argv) {
         };
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
-        const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1 && !split_batch_mtp;
-        if (split_batch_mtp)
+        const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1 && !synchronous_batch_mtp;
+        if (synchronous_batch_mtp)
             std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
                                  "one eight-row quantum retained through target acceptance and prefix commit; "
                                  "--batch-groups %d requested, effective groups=1 (no group pipeline).\n", o.batch_groups);
+        if (batch_mtp_pipeline)
+            std::fprintf(stderr, "strata generate: --batch-mtp-pipeline: two group-owned replay chains, "
+                                 "%d compute rows per owner, physical handoff bases 0/%d; "
+                                 "accepted-prefix commit before either group reuses its owner.\n",
+                                 batch_compute_rows, o.batch);
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         struct PGroup {
             bool inflight = false;
@@ -10958,9 +11050,151 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // Each in-flight group owns a distinct replay/metadata/canary lease on every stage.
+        // Only its slot states are shared, and the two groups' slot sets and handoff ranges are disjoint.
+        auto group_verifier = [&](int stage, int group) -> strata::core::Verifier& {
+            return group == 0 ? stage_verifier(stage) : stage_peer(stage);
+        };
+        auto pump_mtp = [&](bool may_start) -> bool {
+            ++pipe_tick;
+            if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
+            for (int k = 0; k < n_pipe; ++k) {
+                const int gi = stage_group[(size_t) k];
+                if (gi < 0) continue;
+                const int r = group_verifier(k, gi).batch_poll(win_pool_fn,
+                    gi == 0 ? win_pool_user : (void*) &split_drive_b, err);
+                if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
+                if (!r) continue;
+                stage_group[(size_t) k] = -1;
+                pg[(size_t) gi].stage = k + 1;
+                pg[(size_t) gi].since = pipe_tick;
+            }
+            // Prefix commit synchronizes each stage. Do not block the host while an unrelated
+            // doorbell graph still needs it; continue polling that graph and retain both leases.
+            bool host_experts_running = false;
+            for (int k = 0; k < n_pipe; ++k) {
+                const int gi = stage_group[(size_t) k];
+                if (gi >= 0) host_experts_running = host_experts_running ||
+                    group_verifier(k, gi).batch_uses_host_experts();
+            }
+            if (!host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                PGroup& G = pg[(size_t) gi];
+                if (!G.inflight || G.stage != n_pipe) continue;
+                strata::core::Verifier& head = group_verifier(n_pipe - 1, gi);
+                const int32_t* out = head.batch_out();
+                int keep[strata::kernels::kVerifyMaxT] = {};
+                for (int t = 0; t < G.count;) {
+                    const int first = t, b = G.rows[t];
+                    while (t < G.count && G.rows[t] == b) ++t;
+                    const BSlot& sl = bs[(size_t) b];
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out[first]) != o.eos_ids.end();
+                    keep[b] = t - first == 2 && out[first] == G.tok[first + 1] && !eos && !sl.stop &&
+                              sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                    if (t - first == 2) record_batch_proposal(b, G.tok[first + 1], out[first], keep[b]);
+                }
+                if (!group_verifier(0, gi).commit_slot_prefixes(keep, err)) {
+                    std::printf("ERR %s\n", err.c_str()); return false;
+                }
+                for (int t = 0; t < G.count;) {
+                    const int first = t, b = G.rows[t];
+                    while (t < G.count && G.rows[t] == b) ++t;
+                    const BSlot& sl = bs[(size_t) b];
+                    const float* residual = nullptr;
+                    for (int j = 0; j < keep[b]; ++j) {
+                        const int32_t y = out[first + j];
+                        residual = head.final_R(first + j);
+                        if (!resident.committed(b, y, residual, err, batch_mtp_trace)) {
+                            std::printf("ERR %s\n", err.c_str()); return false;
+                        }
+                        std::printf("BT %d %d\n", b, (int) y);
+                        ++bt_tokens;
+                        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        const char* finish = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                           : sl.p + 1 > o.max_context ? "length" : nullptr;
+                        if (finish) {
+                            print_mtp_done(b, finish);
+                            if (!resident.finish(b, err, batch_mtp_trace)) {
+                                std::printf("ERR %s\n", err.c_str()); return false;
+                            }
+                            break;
+                        }
+                    }
+                    if (sl.active && !resident.propose(b, residual, err)) {
+                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
+                    }
+                }
+                std::fflush(stdout);
+                ++bt_windows;
+                bt_rows += G.count;
+                G.inflight = false;
+            }
+            for (int k = n_pipe - 1; k >= 0; --k) {
+                if (stage_group[(size_t) k] >= 0) continue;
+                int pick = -1;
+                if (k > 0) {
+                    for (int gi = 0; gi < (int) pg.size(); ++gi)
+                        if (pg[(size_t) gi].inflight && pg[(size_t) gi].stage == k &&
+                            (pick < 0 || pg[(size_t) gi].since < pg[(size_t) pick].since)) pick = gi;
+                    if (pick < 0) continue;
+                } else {
+                    if (!may_start) continue;
+                    for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
+                        const int gi = (int) ((rr + j) % (int64_t) pg.size());
+                        if (!pg[(size_t) gi].inflight && group_active(gi) &&
+                            (!bounded_round || !pg[(size_t) gi].round_started)) pick = gi;
+                    }
+                    if (pick < 0) continue;
+                    rr = pick + 1;
+                    PGroup& G = pg[(size_t) pick];
+                    G.round_started = bounded_round;
+                    G.count = 0;
+                    for (int t = 0; t < GS; ++t) {
+                        const int b = pick * GS + t;
+                        const BSlot& sl = bs[(size_t) b];
+                        if (!sl.active) continue;
+                        if (sl.stop) {
+                            if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                            print_mtp_done(b, "cancel");
+                            continue;
+                        }
+                        if (sl.draft < 0) { std::printf("ERR batch MTP: live slot has no proposal\n"); return false; }
+                        G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
+                        if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
+                            G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
+                        }
+                    }
+                    if (!G.count) continue;
+                    G.inflight = true;
+                    G.stage = 0;
+                    drive.d.failed = false;
+                    apply_pending(false);
+                }
+                PGroup& G = pg[(size_t) pick];
+                strata::core::Verifier& owner = group_verifier(k, pick);
+                strata::core::progress().busy.store(true);
+                if (!owner.batch_launch(pick * (2 * GS), G.rows, G.count, G.tok, G.pos, err,
+                                        strata::core::Verifier::BatchCommit::deferred)) {
+                    std::printf("ERR %s\n", err.c_str()); return false;
+                }
+                stage_group[(size_t) k] = pick;
+            }
+            if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
+            if (!pipe_inflight() && !batch_on() && bt_windows > 0) {
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                std::fprintf(stderr, "strata batch MTP (pipelined, %d groups of %d): %lld group-steps, "
+                                     "%lld verifier rows, %lld committed tokens in %.0f ms = %.1f committed tok/s "
+                                     "(admissions included)\n",
+                             o.batch_groups, GS, (long long) bt_windows, (long long) bt_rows,
+                             (long long) bt_tokens, wall, 1000.0 * bt_tokens / std::max(wall, 1e-9));
+                bt_windows = bt_rows = bt_tokens = 0;
+                strata::core::progress().busy.store(false);
+            }
+            return true;
+        };
+        auto pipeline_step = [&](bool may_start) { return batch_mtp_pipeline ? pump_mtp(may_start) : pump(may_start); };
         auto pipe_drain = [&]() -> bool {
             while (pipe_inflight())
-                if (!pump(false)) return false;
+                if (!pipeline_step(false)) return false;
             return true;
         };
         strata::program::TimeBudget time_budget(o.foreground_budget_ms, o.background_share);
@@ -10977,7 +11211,7 @@ int main(int argc, char** argv) {
                     for (size_t group = 0; group < pg.size(); ++group)
                         pending = pending || (group_active((int) group) && !pg[group].round_started);
                     if (!pending) break;
-                    if (!pump(true)) { bounded_round = false; return false; }
+                    if (!pipeline_step(true)) { bounded_round = false; return false; }
                 }
                 bounded_round = false;
             } else if (!batch_step()) return false;
@@ -11004,7 +11238,7 @@ int main(int argc, char** argv) {
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(time_budget.enabled() ? decode_round(false) : piped ? pump(true) : batch_step())) return 1;
+                    if (!(time_budget.enabled() ? decode_round(false) : piped ? pipeline_step(true) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
@@ -12446,16 +12680,16 @@ int main(int argc, char** argv) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
-            if (pipe) ver_b.set_sampling(req_sp);
+            if (pipe || batch_mtp_pipeline) ver_b.set_sampling(req_sp);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
-            if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+            if (pipe || batch_mtp_pipeline) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
-            if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            if (pipe || batch_mtp_pipeline) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>

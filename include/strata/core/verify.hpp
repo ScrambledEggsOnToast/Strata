@@ -243,15 +243,18 @@ public:
     /// An operator may tighten the priced 32-key bound, never enlarge it or request an unbounded cache.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n == 0 ? kVerifyBatchGraphKeys : std::min<size_t>(n, kVerifyBatchGraphKeys); }
 
-    // ---- The stages of a layer split as a PIPELINE. A window carries only the active `rows` of a group.
-    // It launches on ONE stage with its commit immediately behind it; the host serves every stage's rings
-    // from one thread (batch_poll does not block). Packed row t uses hand-off row base+t on every stage.
-    // Group hand-off ranges remain disjoint, and inactive resident state is neither read nor committed.
-    bool batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
-    /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
-    /// -1 = an error (err).  Serves every layer that has rung so far.
+    // ---- The stages of a layer split as a PIPELINE. Packed row t uses hand-off base+t on every stage.
+    // Eager windows commit every row before releasing scratch. Deferred windows retain their own
+    // replay arena and lease until commit_slot_prefixes; callers must not reuse that owner beforehand.
+    enum class BatchCommit { eager, deferred };
+    bool batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos,
+                      std::string& err, BatchCommit commit = BatchCommit::eager);
+    /// 1 = this stage's window is done (last-stage picks in batch_out), 0 = running, -1 = error.
+    /// Deferred completion retains scratch; eager completion also finishes its all-row commit.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
+    /// A synchronous prefix commit must not strand another stage at a host-served expert doorbell.
+    bool batch_uses_host_experts() const { return b_running_ && !ar_on(); }
     /// Resident lifecycle preflight. A pending solo commit is drained; owned or
     /// poisoned scratch refuses before any resident state is copied or rebound.
     bool context_idle(std::string& err);
@@ -391,6 +394,7 @@ private:
     }
     // batch_launch / batch_poll
     bool b_running_ = false;
+    bool b_deferred_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
     int32_t b_out_[8] = {};
