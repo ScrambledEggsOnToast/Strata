@@ -3606,14 +3606,16 @@ int main(int argc, char** argv) {
                     }
                     index_accounted = true;
                     if (std::string(name) == "output.weight") n_vocab = ne1;
-                    if (!skip.count(name)) {
+                    if (!skip_base.count(name)) {
                         byte_add(offset, source);
+                        canonical_source_bytes = byte_add(canonical_source_bytes, source_span_pages(source));
+                    }
+                    if (!skip.count(name)) {
                         byte_add(dst_offset, destination);
                         if (skip.empty() && byte_add(dst_offset, destination) > pool_bytes) {
                             index_accounted = false;
                             break;
                         }
-                        canonical_source_bytes = byte_add(canonical_source_bytes, source_span_pages(source));
                         canonical_destination_bytes = byte_add(canonical_destination_bytes,
                             byte_mul(byte_add(destination, index_alignment - 1) / index_alignment, index_alignment));
                     }
@@ -4444,7 +4446,7 @@ int main(int argc, char** argv) {
             "WeightTable CHUNK + 2*CHUNK pinned buffers; cudaFreeHost at end of WeightTable::load");
         if (index_accounted)
             upload("file:canonical_upload", canonical_source_bytes,
-                "index source bytes of non-skipped tensors; clean source cache retained after buffered-reader close");
+                "index source union across all stages; clean source cache retained after buffered-reader close");
         else ram_unknown("file:canonical_upload", "pack index source spans unavailable", ByteMeaning::clean_file);
         if (!o.mtp.empty()) {
             const uint64_t dense = file_bytes(o.mtp + "/dense.bin"), experts = file_bytes(o.mtp + "/experts.bin");
