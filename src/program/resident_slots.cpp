@@ -462,6 +462,27 @@ bool ResidentSlots::observe(const char* phase, int slot, int64_t cells, std::str
         (unsigned long long) id, (long long) cells, (unsigned long long) h.gdn,
         (unsigned long long) fingerprint_ple(h, session), (unsigned long long) fingerprint_kv(h),
         (unsigned long long) h.draft, (unsigned long long) observed);
+    if (stages_.size() > 1) {
+        uint64_t history = SessionFingerprint::basis;
+        const auto& owner = slots_[(size_t) slot];
+        for (int32_t token : owner.ids) history = fingerprint_word(history, (uint32_t) token);
+        for (size_t stage = 0; stage < stages_.size(); ++stage) {
+            const auto& private_state = std::strcmp(phase, "resume") == 0
+                ? *stages_[stage].main : *stages_[stage].slots[(size_t) slot];
+            SessionFingerprint part;
+            const auto& private_draft = stage + 1 != stages_.size() ? empty_draft
+                : std::strcmp(phase, "resume") == 0 ? draft_.kv_state() : *draft;
+            if (!session_fingerprint(private_state, private_draft, geometry_, cells, part, error)) return false;
+            std::fprintf(stderr, "STATE_STAGE phase=%s stage=%zu slot=%d request=%llu cells=%lld "
+                                 "gdn=%016llx ple=%016llx kv=%016llx draft=%016llx history=%016llx "
+                                 "seed=%llu counter=%llu\n", phase, stage, slot, (unsigned long long) id,
+                         (long long) cells, (unsigned long long) part.gdn,
+                         (unsigned long long) fingerprint_ple(part, private_state),
+                         (unsigned long long) fingerprint_kv(part), (unsigned long long) part.draft,
+                         (unsigned long long) history, (unsigned long long) owner.sampling.seed,
+                         (unsigned long long) owner.sampling.counter);
+        }
+    }
     if (residual && std::getenv("STRATA_BATCH_DIAGNOSTICS")) report_batch_state(phase, id, slot, cells, session, h);
     return true;
 }

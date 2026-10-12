@@ -71,6 +71,7 @@
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/kv_residency_info.hpp"
+#include "strata/program/time_budget.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -699,6 +700,8 @@ struct Options {
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
     bool resident_multiplex = false;
+    double foreground_budget_ms = 0; // 0 retains the legacy fixed-share scheduling policy
+    double background_share = 0.25;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -917,6 +920,9 @@ void usage() {
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
+                 "  --foreground-budget-ms N  --serve --batch: measured-cost scheduling at existing chunk boundaries\n"
+                 "                       (0 = legacy policy; positive N <= 60000 is a target, not a latency promise)\n"
+                 "  --background-share F  minimum prefill/control share under contention (0.01..0.99, default 0.25)\n"
                  "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
@@ -2142,6 +2148,16 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--resident-multiplex") o.resident_multiplex = true;
+        else if (a == "--foreground-budget-ms" || a == "--background-share") {
+            const char* value = next(a.c_str());
+            char* end = nullptr;
+            const double parsed_value = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(parsed_value)) {
+                std::fprintf(stderr, "%s needs a finite number\n", a.c_str()); return 2;
+            }
+            if (a == "--foreground-budget-ms") o.foreground_budget_ms = parsed_value;
+            else o.background_share = parsed_value;
+        }
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -2307,6 +2323,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
+        (o.foreground_budget_ms > 0 && (!o.serve || o.batch < 2 || o.prompt_cache <= 0))) {
+        std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
+                             "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
+        return 2;
+    }
+    if (o.foreground_budget_ms > 0 &&
+        ((std::getenv("STRATA_PREFILL_EQUAL") && std::atoi(std::getenv("STRATA_PREFILL_EQUAL")) != 0) ||
+         (std::getenv("STRATA_PREFILL_HELP") && std::atoi(std::getenv("STRATA_PREFILL_HELP")) != 0) ||
+         std::getenv("STRATA_SPLIT_SMALL_OWN"))) {
+        std::fprintf(stderr, "strata scheduling: equal/split-small chunks and stage help need separate "
+                             "resume/arithmetic qualification; unset these experimental overrides\n");
+        return 2;
     }
     if (o.resident_multiplex && (!o.serve || o.batch < 2 || o.batch_groups != 1 || !o.layer_split.empty())) {
         std::fprintf(stderr, "strata generate: --resident-multiplex requires single-device --serve --batch >= 2 and one group\n");
@@ -10274,6 +10304,9 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
                                        " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0)).c_str() : "");
+            if (o.foreground_budget_ms > 0)
+                std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
+                            o.foreground_budget_ms, o.background_share);
             // Opt-in status extension: owners may initialize resident when their context fits,
             // and the working draft can take its existing resident fallback.
             if (o.slot_kv_window) {
@@ -10684,10 +10717,12 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
+            bool round_started = false;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        bool bounded_round = false;
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -10752,11 +10787,13 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                        if (!pg[(size_t) gi].inflight && group_active(gi) &&
+                            (!bounded_round || !pg[(size_t) gi].round_started)) pick = gi;
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
+                    G.round_started = bounded_round;
                     G.count = 0;
                     for (int t = 0; t < GS; ++t) {
                         const int slot = pick * GS + t;
@@ -10799,6 +10836,29 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        strata::program::TimeBudget time_budget(o.foreground_budget_ms, o.background_share);
+        auto last_decode = Clock::now();
+        // A complete round uses the selected scheduler, including pipelined groups,
+        // then drains every consumer before prefill may reuse verifier/cache scratch.
+        auto decode_round = [&](bool charge = true) -> bool {
+            const auto begin = Clock::now();
+            if (piped) {
+                bounded_round = true;
+                for (auto& group : pg) group.round_started = false;
+                for (;;) {
+                    bool pending = pipe_inflight();
+                    for (size_t group = 0; group < pg.size(); ++group)
+                        pending = pending || (group_active((int) group) && !pg[group].round_started);
+                    if (!pending) break;
+                    if (!pump(true)) { bounded_round = false; return false; }
+                }
+                bounded_round = false;
+            } else if (!batch_step()) return false;
+            last_decode = Clock::now();
+            if (time_budget.enabled())
+                time_budget.decoded(std::chrono::duration<double, std::milli>(last_decode - begin).count(), charge);
+            return true;
+        };
         uint64_t working_capacity = 0, resident_capacity = 0;
         for (size_t k = 0; k <= stages.size(); ++k) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
@@ -10817,7 +10877,7 @@ int main(int argc, char** argv) {
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (!(time_budget.enabled() ? decode_round(false) : piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
@@ -12000,11 +12060,9 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-            // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
-            // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
-            // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
+            // Prompt quanta retain the memory-admitted arithmetic partition. A
+            // positive foreground budget replaces the legacy previous-chunk share.
+            // Decode rounds and parking run only after sp.run drains all stages.
             static const double decode_share = [] {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
@@ -12019,13 +12077,33 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (o.batch <= 0 || (!time_budget.enabled() &&
+                    (piped || (!stages.empty() && !batch_on()))))
+                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const auto age = [&] {
+                        return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                    };
+                    if (time_budget.enabled() && batch_on() && time_budget.decode_due(age(), C) &&
+                        time_budget.decode_allowed(0)) {
+                        if (!decode_round()) { batch_fatal = true; e = "a decode round failed"; return false; }
+                    }
+                    const int64_t quantum = time_budget.enabled()
+                        ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
+                        : std::min(C, b0 - q);
+                    const int64_t r = q + quantum;
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (time_budget.enabled()) {
+                        time_budget.prefilled(chunk_wall_ms, quantum / C + (quantum % C != 0), C);
+                        std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
+                                             "estimate_ms=%.3f budget_ms=%.3f%s\n",
+                                     (long long) q, (long long) r, (long long) C, chunk_wall_ms,
+                                     time_budget.chunk_ms(), o.foreground_budget_ms,
+                                     time_budget.chunk_ms() > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
+                    }
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -12076,12 +12154,16 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (!batch_on() || (!time_budget.enabled() && decode_share <= 0.0)) continue;
+                    const double budget = decode_share * chunk_wall_ms;
                     const auto td = Clock::now();
-                    do {
-                        if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
-                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    double decoded_ms = 0;
+                    while (batch_on() && (time_budget.enabled()
+                        ? time_budget.decode_due(age(), C) && time_budget.decode_allowed(0)
+                        : decoded_ms == 0 || decoded_ms < budget)) {
+                        if (!decode_round()) { batch_fatal = true; e = "a decode round failed"; return false; }
+                        decoded_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                    }
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     if (trace) {

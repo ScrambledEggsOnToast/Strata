@@ -215,7 +215,8 @@ class QuietWaitPolicy(unittest.TestCase):
                 engine.lines.get.side_effect = get
                 cancel = threading.Event()
                 with mock.patch.object(server.time, 'monotonic', lambda: now[0]):
-                    gen = engine._control(cancel, lambda t: None) if control else engine.generate([1], 1, {}, cancel)
+                    gen = (engine._control(cancel, lambda t: None) if control else
+                           engine.generate([1], 1, {"_strata_cache_scope": "a" * 64}, cancel))
                     heartbeats = list(gen)
                 self.assertEqual(heartbeats, [None, None], 'a quiet 21 seconds emits two heartbeats, not 42')
                 self.assertTrue(all(0 < wait <= .5 for wait in waits), 'cancellation uses bounded blocking waits')
@@ -223,7 +224,8 @@ class QuietWaitPolicy(unittest.TestCase):
                 # the line raw: exactly that one announcement is expected, and nothing at all on the control-only
                 # path.  Heartbeats above are the generator's yields, never writes.
                 self.assertEqual(engine._send.call_args_list,
-                                 [mock.call('GEN 1 1')] if not control else [], 'polling writes nothing of its own')
+                                 [mock.call('GEN 1 scope=' + 'a' * 64 + ' 1')] if not control else [],
+                                 'polling writes nothing of its own')
                 self.assertNotIn('STOP', engine.proc.stdin.getvalue())
 
 
