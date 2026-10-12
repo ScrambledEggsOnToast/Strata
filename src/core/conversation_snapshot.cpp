@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
+#include "strata/plan/qsa_memory.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -31,43 +32,23 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: hybrid K8V4 needs distinct format flags";
         return false;
     }
-    const auto s = strata::kernels::qsa_real_shapes();
-    const bool int8_keys = st.kv_int8 || st.kv_hybrid;
-    if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||
-        (st.kv_q4 && g.head_dim % 32) || (int8_keys && !st.kv_q4 && g.head_dim % 64)) {
-        error = "conversation snapshot: invalid K/V geometry";
+    auto shape = strata::kernels::qsa_real_shapes();
+    shape.n_head_kv = g.n_head_kv;
+    shape.head_dim = g.head_dim;
+    shape.idx_dim = g.idx_key_dim;
+    const int format = st.kv_hybrid ? strata::kernels::kKvHybrid : qsa_kv_format(st);
+    strata::plan::QsaImageBytes bytes;
+    if (!strata::plan::qsa_image_bytes(shape, upto, format, index, bytes) || bytes.bytes > SIZE_MAX) {
+        error = "conversation snapshot: invalid K/V geometry or byte count overflow";
         return false;
     }
-    const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                              : (size_t) g.head_dim * (int8_keys ? 1 : 2);
-    // Include the moving spare row, not only completed blocks. The checkpoint
-    // restore reconstructs that row when rewinding to an earlier prefix.
-    const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
     // Format 3 identifies snapshot K8V4 and the block movers' three-run hybrid layout. Rotated INT8 K/V (#293,
     // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
-    using conversation_detail::product;
-    if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
-        !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                           int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
-        error = "conversation snapshot: K/V byte count overflow";
-        return false;
-    }
-    l.value_data = l.data;
-    l.value_scales = l.scales;
-    if (st.kv_hybrid) {
-        if (!product(l.value_data, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                                   (uint64_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)})) {
-            error = "conversation snapshot: hybrid V byte count overflow";
-            return false;
-        }
-        l.value_scales = 0;
-    }
+    l = {format + rotated, (int64_t) bytes.cells, (int64_t) bytes.pooled_rows, shape.page_size,
+         (size_t) bytes.k, (size_t) bytes.k_scale, (size_t) bytes.pooled, (size_t) bytes.v, (size_t) bytes.v_scale};
     return true;
 }
 

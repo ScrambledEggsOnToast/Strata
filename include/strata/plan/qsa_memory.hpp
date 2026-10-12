@@ -4,6 +4,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 
 namespace strata::plan {
 inline constexpr int64_t kQsaResidentMinCells = 20480;
@@ -139,6 +140,61 @@ inline uint64_t qsa_device_bytes(const strata::kernels::QsaShapes& s, int64_t ce
 inline uint64_t qsa_pinned_bytes(const strata::kernels::QsaShapes& s, const QsaMemoryLayout& p, int fmt) {
     return strata::kernels::qsa_step_bytes() + sizeof(int32_t) + (uint64_t) s.n_head * sizeof(int32_t) +
            (p.mode == 0 ? 0 : (uint64_t) p.pages * kv_page_bytes(s, fmt) + 4 * 256);
+}
+
+// Checked logical snapshot arithmetic, shared with the actual host copy path.
+// These images contain authoritative K/V and the moving pooled-indexer row,
+// never the device arena's RoPE, page map, running-state tails or scratch.
+struct LogicalBytes {
+    bool valid = true;
+    uint64_t product(std::initializer_list<uint64_t> factors) {
+        uint64_t n = 1;
+        for (uint64_t factor : factors) {
+            if (n && factor > UINT64_MAX / n) { valid = false; return 0; }
+            n *= factor;
+        }
+        return n;
+    }
+    uint64_t sum(std::initializer_list<uint64_t> terms) {
+        uint64_t n = 0;
+        for (uint64_t term : terms) {
+            if (term > UINT64_MAX - n) { valid = false; return 0; }
+            n += term;
+        }
+        return n;
+    }
+};
+struct QsaImageBytes {
+    uint64_t cells = 0, pooled_rows = 0;
+    uint64_t k = 0, v = 0, k_scale = 0, v_scale = 0, pooled = 0, bytes = 0;
+};
+inline bool qsa_image_bytes(const strata::kernels::QsaShapes& s, int64_t upto, int fmt,
+                            bool index, QsaImageBytes& out) {
+    using namespace strata::kernels;
+    out = {};
+    if (upto < 0 || s.page_size <= 0 || s.idx_block <= 0 || s.n_head_kv <= 0 ||
+        s.head_dim <= 0 || s.head_dim > INT32_MAX || s.idx_dim <= 0 ||
+        fmt < kKvF16 || fmt > kKvHybrid || upto > INT64_MAX - (s.page_size - 1) ||
+        (fmt == kKvQ4 && s.head_dim % 32) ||
+        ((fmt == kKvInt8 || fmt == kKvHybrid) && s.head_dim % 64)) return false;
+    LogicalBytes count;
+    QsaImageBytes b;
+    b.cells = count.product({(uint64_t) ((upto + s.page_size - 1) / s.page_size), (uint64_t) s.page_size});
+    b.pooled_rows = index && upto ? (uint64_t) (upto / s.idx_block) + 1 : 0;
+    const bool int8_keys = fmt == kKvInt8 || fmt == kKvHybrid;
+    const uint64_t per = fmt == kKvQ4 ? kv_q4_bytes_per_head((int) s.head_dim)
+                                     : (uint64_t) s.head_dim * (int8_keys ? 1 : 2);
+    b.k = count.product({b.cells, (uint64_t) s.n_head_kv, per});
+    b.k_scale = count.product({b.cells, (uint64_t) s.n_head_kv,
+                              int8_keys ? (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 : 0});
+    b.v = fmt == kKvHybrid ? count.product({b.cells, (uint64_t) s.n_head_kv,
+                                          (uint64_t) kv_q4_bytes_per_head((int) s.head_dim)}) : b.k;
+    b.v_scale = fmt == kKvHybrid ? 0 : b.k_scale;
+    b.pooled = count.product({b.pooled_rows, (uint64_t) s.idx_dim, sizeof(float)});
+    b.bytes = count.sum({b.k, b.v, b.k_scale, b.v_scale, b.pooled});
+    if (!count.valid || b.cells > INT64_MAX || b.pooled_rows > INT64_MAX) return false;
+    out = b;
+    return true;
 }
 
 // Offsets used by the real initializer as well as the hermetic carve test.

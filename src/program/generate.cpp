@@ -3592,7 +3592,8 @@ int main(int argc, char** argv) {
         }
         const char* unpriced_class = nullptr;
         if (requested_slots && !strata::core::resident_allocation_bytes(
-                g, o.max_context, K, requested_slots, !o.mtp.empty(), kv_roles, resident, unpriced_class)) {
+                g, o.max_context, K, requested_slots, !o.mtp.empty(), kv_roles, resident, unpriced_class,
+                split_real ? split_devs.size() + 1 : 1, split_real && !split_auto ? split_at.data() : nullptr)) {
             std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA0:%s "
                                  "reason=resolved resident-role pricing failed\n", unpriced_class);
             return 1;
@@ -4137,13 +4138,13 @@ int main(int argc, char** argv) {
             ram("resident_slot_main_pinned", byte_mul(stage_count, resident.slot_main.pinned),
                 "requested slot QSA staging and full logical streamed KV backing; stage-count upper bound");
             ram("resident_slot_main_owner", byte_mul(stage_count, resident.slot_main_owner), "ABI-checked resident owner envelopes");
-            ram("resident_histories", resident.histories, "three context-bounded token histories per requested slot");
-            ram("resident_checkpoints", byte_mul(stage_count, resident.checkpoints), "one retained checkpoint per slot, full session envelope");
+            ram("resident_histories", resident.histories, "two context-bounded ResidentSlot ids/prompt vectors per requested slot");
+            ram("resident_checkpoints", resident.checkpoints,
+                "state-only stage-local checkpoint vectors and IDs; 12.5% whole-seat payload margin plus 4 KiB per stage");
             ram("resident_verifier_pinned", byte_mul(stage_count, resident.verifier_pinned), "mapped slot commit controls");
             ram("resident_verifier_history", byte_mul(stage_count, resident.verifier_history), "4096 int32 history entries per slot");
             ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "requested draft QSA staging and full logical ring backing");
             ram("resident_slot_draft_owner", resident.slot_draft_owner, "draft slot owner envelope, weights and scratch shared");
-            ram("resident_transfer_transient", resident.transfer_transient, "serial slot checkpoint plus larger working/slot main and draft image in either direction");
         }
         if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)
             ram("verify_profile_host", byte_mul(split_devs.size() + 1, profile_bytes),
@@ -4533,6 +4534,12 @@ int main(int argc, char** argv) {
                 startup.classes.push_back(c);
         }
         for (const auto& c : startup_only.classes) startup.classes.push_back(c);
+        // Slot transfers run after all loaders/init scratch have retired. They
+        // coexist with the retained owners but not startup-only transients;
+        // the contract already takes the maximum across serial stage/layer/MTP copies.
+        if (requested_slots)
+            guest.add("resident_transfer_transient", resident.transfer_transient,
+                "max(one stage checkpoint + one main layer image, later draft image); 12.5% plus 4 KiB margin");
         strata::plan::Scope startup_host = host;
         if (o.host_native) {
             // The launcher's cgroup is not a VM: every byte the process allocates is host RAM.

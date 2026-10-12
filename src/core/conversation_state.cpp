@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
+#include "strata/plan/resident.hpp"
 
 #include <algorithm>
 #include <array>
@@ -108,22 +109,21 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z,
     const auto key = geometry_key(g);
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] < 0 || (i != 1 && key[i] == 0)) return fail(error, "invalid model geometry");
-    size_t recurrence = 0, convolution = 0;
-    if (!product(recurrence, {(uint64_t) g.ssm_state_size, (uint64_t) g.ssm_v_heads, (uint64_t) g.ssm_state_size}) ||
-        !product(convolution, {(uint64_t) g.ssm_conv_channels, (uint64_t) (g.ssm_d_conv - 1)}) ||
-        !add(recurrence, convolution) ||
-        !product(z.gdn, {(uint64_t) g.n_gdn_layers(), recurrence, sizeof(float)}) ||
-        !product(z.ple, {strata::kernels::NG_HIST, strata::kernels::NG_HC_DIM, sizeof(float)}) ||
-        !product(z.tail, {(uint64_t) (strata::kernels::qsa_real_shapes().idx_block - 1),
-                          (uint64_t) g.idx_key_dim, sizeof(float)}) ||
-        !product(z.dead, {(uint64_t) g.idx_key_dim, sizeof(float)}))
+    auto shape = strata::kernels::qsa_real_shapes();
+    shape.idx_dim = g.idx_key_dim;
+    strata::plan::CheckpointStateBytes bytes;
+    if (!strata::plan::checkpoint_state_bytes((uint64_t) g.n_gdn_layers(),
+        (uint64_t) g.ssm_state_size, (uint64_t) g.ssm_v_heads, (uint64_t) g.ssm_conv_channels,
+        (uint64_t) g.ssm_d_conv, shape, bytes))
         return fail(error, "running-state byte count overflow");
-    z.block_pos = sizeof(int32_t);
-    size_t total = 0;
-    if (!product(total, {(uint64_t) g.n_qsa_layers(), z.tail}) ||
-        !product(total, {(uint64_t) g.n_qsa_layers(), z.dead}) ||
-        !product(total, {(uint64_t) g.n_qsa_layers(), z.block_pos}))
+    strata::plan::LogicalBytes count;
+    const uint64_t tails = count.product({(uint64_t) g.n_qsa_layers(), bytes.tail});
+    const uint64_t dead = count.product({(uint64_t) g.n_qsa_layers(), bytes.dead});
+    const uint64_t positions = count.product({(uint64_t) g.n_qsa_layers(), bytes.block_pos});
+    if (!count.valid || std::max({bytes.gdn, bytes.ple, bytes.tail, bytes.dead, bytes.block_pos,
+                                 tails, dead, positions}) > SIZE_MAX)
         return fail(error, "indexer byte count overflow");
+    z = {(size_t) bytes.gdn, (size_t) bytes.ple, (size_t) bytes.tail, (size_t) bytes.dead, (size_t) bytes.block_pos};
     return true;
 }
 
