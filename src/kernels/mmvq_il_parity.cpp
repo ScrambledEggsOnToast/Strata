@@ -29,6 +29,7 @@ using namespace strata::kernels;
 
 struct Cell { int type, T, n_out; double ref; double il[5]; };
 std::vector<Cell> g_cells;
+int g_il_calls = 0, g_fallback_calls = 0;
 struct Case {
     const char* name;
     int type, n_in, n_out, block_elems, block_bytes, scale_at[2];
@@ -38,6 +39,7 @@ const Case CASES[] = {
     {"IQ4_XS 2560x10240", 23, 2560, 10240, 256, 136, {0, -1}},
     {"IQ4_XS 2560x6144", 23, 2560, 6144, 256, 136, {0, -1}},
     {"IQ4_XS 4096x2560", 23, 4096, 2560, 256, 136, {0, -1}},
+    {"IQ4_XS odd rows 2560x2051", 23, 2560, 2051, 256, 136, {0, -1}},
     {"IQ4_XS 2560x512", 23, 2560, 512, 256, 136, {0, -1}},
     {"Q4_K 2560x10240", 12, 2560, 10240, 256, 144, {0, 2}},
     {"Q4_K 4096x2560", 12, 4096, 2560, 256, 144, {0, 2}},
@@ -45,6 +47,7 @@ const Case CASES[] = {
     {"Q5_K 2560x12288", 13, 2560, 12288, 256, 176, {0, 2}},
     {"Q5_K 2560x6144", 13, 2560, 6144, 256, 176, {0, 2}},
     {"Q5_K 4096x2560", 13, 4096, 2560, 256, 176, {0, 2}},
+    {"Q5_K odd rows 2560x2051", 13, 2560, 2051, 256, 176, {0, 2}},
     {"Q5_K head 2560x248320", 13, 2560, 248320, 256, 176, {0, 2}},
     {"Q6_K 2560x12288", 14, 2560, 12288, 256, 210, {208, -1}},
     {"Q6_K 2560x10240", 14, 2560, 10240, 256, 210, {208, -1}},
@@ -63,7 +66,7 @@ bool ck(cudaError_t e, const char* what) {
     return false;
 }
 
-int run_case(const Case& c, bool bench, cudaStream_t s) {
+int run_case(const Case& c, bool bench, cudaStream_t s, int t_first = 2, int t_last = 4) {
     if (c.type == 13 && c.n_out > 100000 && !bench) { /* the head: parity too, just big */ }
     const std::size_t wbytes = native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
     std::mt19937 rng(77u + (unsigned) c.type * 31u + (unsigned) c.n_out);
@@ -87,7 +90,8 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
             return 1;
     }
     int bad = 0;
-    for (int T = 2; T <= 4; ++T) {
+    for (int T = t_first; T <= t_last; ++T) {
+        const bool interleave = T >= 2 && T <= 4;
         std::vector<float> x((std::size_t) T * c.n_in);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto& v : x) v = nd(rng);
@@ -97,12 +101,12 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
         const std::size_t ybytes = (std::size_t) T * c.n_out * 4;
         if (!ck(cudaMalloc(&dx, x.size() * 4), "malloc x") ||
             !ck(cudaMalloc(&xq, native_q8_1_bytes(c.n_in, T)), "malloc xq") ||
-            !ck(cudaMalloc(&xil, native_q8_1_il_bytes(c.n_in, T)), "malloc xil") ||
+            (interleave && !ck(cudaMalloc(&xil, native_q8_1_il_bytes(c.n_in, T)), "malloc xil")) ||
             !ck(cudaMalloc((void**) &yref, ybytes), "malloc yref") || !ck(cudaMalloc((void**) &yil, ybytes), "malloc yil"))
             return 1;
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "copy x");
         quantize_q8_1_rows(dx, T, c.n_in, xq, s);
-        native_q8_1_interleave(xq, xil, c.n_in, T, s);
+        if (interleave) native_q8_1_interleave(xq, xil, c.n_in, T, s);
         native_mmvq(c.type, dw[0], xq, yref, c.n_in, c.n_out, T, s);
         ck(cudaStreamSynchronize(s), "ref");
         std::vector<uint32_t> a((std::size_t) T * c.n_out), b(a.size());
@@ -122,12 +126,13 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
                 if (!std::isfinite(fa)) ++nonfinite;
                 if (a[i] != b[i]) ++diff;
             }
-            const bool used = r != 0 || native_mmvq_il_supported(c.type, T, c.n_out);
+            const bool used = native_mmvq_il_supported(c.type, T, c.n_out);
+            if (used) ++g_il_calls;
+            else ++g_fallback_calls;
             if (diff != 0 || nonfinite != 0) {
                 ++bad;
                 std::printf("FAIL %-26s T=%d rows=%d: %lld bits differ, %lld non-finite of %zu\n", c.name, T, r, diff, nonfinite, a.size());
             }
-            (void) used;
             if (bench && r != 0) {
                 cudaEvent_t e0, e1;
                 cudaEventCreate(&e0);
@@ -231,17 +236,53 @@ int check_tables() {
     }
     return bad;
 }
+
+// Check the real device gate separately from parity: a disabled route can produce equal fallback bits.
+int check_dispatch() {
+    int dev = 0, major = 0, minor = 0;
+    if (!ck(cudaGetDevice(&dev), "device") ||
+        !ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "major") ||
+        !ck(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev), "minor")) return 1;
+    const char* flag = std::getenv("STRATA_SM70_TABLE");
+    const bool enabled = flag != nullptr && std::atoi(flag) != 0;
+    const int cc = major * 10 + minor;
+    const bool arch = major >= 8 || (cc == 70 && enabled);
+    int bad = 0;
+    for (int type : {8, 23, 12, 13, 14, 99})
+        for (int nc = 1; nc <= 8; ++nc)
+            for (int n_out : {512, 2047, 2048, 2051, 4095, 4096, 8191, 8192, 12287, 12288, 248320}) {
+                const bool format = type == 23 || type == 12 || type == 13 || type == 14;
+                const bool expected = arch && format && nc >= 2 && nc <= 4 &&
+                                      native_mmvq_il_rows_for(cc, type, nc, n_out) != 0;
+                if (native_mmvq_il_supported(type, nc, n_out) != expected) {
+                    ++bad;
+                    std::printf("FAIL dispatch: sm_%d flag=%d type=%d ncols=%d n_out=%d expected=%d\n",
+                                cc, enabled, type, nc, n_out, expected);
+                }
+            }
+    std::printf("DISPATCH sm_%d STRATA_SM70_TABLE=%d: %s (eligible/table-zero/unsupported columns and formats)\n",
+                cc, enabled, bad ? "FAIL" : "OK");
+    return bad;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     const bool emit = bench && argc > 2 && std::string(argv[2]) == "--emit-table";
     cudaStream_t s;
-    cudaStreamCreate(&s);
+    if (!ck(cudaStreamCreate(&s), "stream")) return 1;
     int bad = 0;
     bad += check_tables();
+    bad += check_dispatch();
     for (const Case& c : CASES) bad += run_case(c, bench, s);
+    const Case small = {"Q4_K fallback columns 2560x512", 12, 2560, 512, 256, 144, {0, 2}};
+    for (int nc : {1, 5, 8}) bad += run_case(small, false, s, nc, nc);
+    const Case other = {"Q8_0 unsupported IL type 2560x512", 8, 2560, 512, 32, 34, {0, -1}};
+    bad += run_case(other, false, s);
     if (emit) emit_table();
-    std::printf("%s\n", bad ? "mmvq_il_parity: FAIL" : "mmvq_il_parity: OK (every case, T 2-4, rows 1/2/4 and the table, bitwise)");
+    std::printf("PARITY launches: interleaved=%d fallback=%d\n", g_il_calls, g_fallback_calls);
+    std::printf("%s\n", bad ? "mmvq_il_parity: FAIL" :
+                "mmvq_il_parity: OK (dispatch, supported T 2-4/rows 1/2/4/table and unsupported fallback, bitwise)");
+    cudaStreamDestroy(s);
     return bad ? 1 : 0;
 }

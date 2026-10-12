@@ -3324,6 +3324,9 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               block_q8_1* __restrict__ hq) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
     using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
@@ -3386,7 +3389,12 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
             const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            // Match swiglu_q8_1_entries_kernel: round h before q8_1's first sum, even when fused.
+#if defined(__HIPCC__)
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
+#else
+            const float xi = __fmul_rn(gg / (1.0f + __expf(-gg)), uu);
+#endif
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {
