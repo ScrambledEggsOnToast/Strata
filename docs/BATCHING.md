@@ -304,14 +304,13 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   decoding, its tokens and tok/s; `live.running` the requests in flight).
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
   checkpoints included) and produces its first token there; the state is then copied into the slot. Admissions
-  are taken one at a time, and **the slots decode between the prompt's chunks**: after each chunk (`--prefill`,
-  2048-8192 tokens) they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so
-  a long prompt slows the others down instead of stopping them. The chunks are the ones one uninterrupted read
-  takes, so the prompt's arithmetic is unchanged.
+  are taken one at a time. The legacy policy decodes for half the previous chunk's duration
+  (`STRATA_BATCH_DECODE_SHARE`, default 0.5); it bypasses interleaving/yield on pipelined groups and on an
+  initial solo layer-split prefill. Use the time-budget policy below to make those paths schedulable.
 - **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
   half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
   so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
-  same chunks (at most twice per request).
+  same chunks (at most twice per request under the legacy policy; time-budget mode uses bounded service time).
 - **Each slot is a private conversation cache.** After draining its consumers, a completed CUDA slot keeps its
   committed state and turn checkpoint only when prompt caching is enabled, the request permits checkpoints,
   its conversation scope is valid, and it has neither images nor failed state. The next turn must match that
@@ -319,6 +318,56 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   conversation uses the existing empty/LRU/group-spread policy. Request IDs, counters and sampling stay private.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
+
+### Measured time-budget scheduling
+
+Opt in with `--foreground-budget-ms 1000 --background-share 0.25` in the engine arguments.
+The positive millisecond value is a foreground scheduling target, **not** a promised first-token or
+token-gap bound. `0` rolls back to the legacy policy. Share is finite and between `0.01` and `0.99`.
+A positive budget requires serving, at least two admitted slots and prompt caching.
+The existing bounded HTTP queue, context/output gates, `Retry-After` and queue-time metrics are unchanged.
+
+The scheduler measures drained prefill quanta and complete decode rounds with the monotonic wall clock.
+It selects how many **whole, memory-admitted arithmetic chunks** fit before the next decode deadline,
+subtracting the measured decode cost. A cold estimate permits one chunk. A conservative decaying maximum
+adapts to observed costs; it is an estimate, not worst-case execution time.
+Changing the memory-admitted chunk invalidates its timing estimate: a cheap short-request chunk cannot
+train a larger background chunk downward. The new geometry gets one cold indivisible chunk.
+No workspace is enlarged, placement re-resolved, recurrent chunk resized, route changed or draft counted as output. Initial solo
+reads and pipelined groups reach the same parking/interleave path. Each pipeline group runs once per
+bounded decode round, then every stage drains before prompt/verifier scratch is reused.
+
+Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
+An indivisible decode-round overrun remains debt for later quanta. Background control entries get a
+deadline `now + measured_service * (1 - share) / share`, including chunk/park cost:
+due background work precedes newer foreground arrivals; foreground entries otherwise remain FIFO.
+Foreground entries remain in the control queue until a physical slot is available. The bounded HTTP
+queue also publishes a read-only pending-foreground scalar, including admitted but unsubmitted
+requests: background cannot appear alone between decoder retirement and HTTP admission. That same
+signal requests a park even when the foreground request has not reached native control yet.
+Early background progress is work-conserving only when neither existing queue has foreground demand;
+due background still advances under persistent arrivals. HTTP publishes under its existing status lock;
+native control reads the scalar without acquiring that lock. No queue or dispatcher is added.
+Repeated parking does not hit the legacy two-yield cap. Each resumed read must advance before it can
+park again, so sustained arrivals cannot repeatedly restart the same prefix.
+The API's cached-input count is fixed from the first native read, including a zero-output parked leg.
+Later internal prefix reuse does not convert this request's own fresh prefill into cached-input credit.
+Silent control reads also expose cooperative-yield polling every 0.5 s, rather than waiting for the
+legacy ten-second HTTP heartbeat or for a completed `PP` chunk before sending `BYIELD`.
+
+An indivisible chunk may exceed the target; the engine reports `indivisible_over_budget=1`, never silently
+shrinks it or advertises success. Qualify a smaller `--prefill` profile separately if needed: changing
+chunk geometry changes recurrent rounding. `STRATA_PREFILL_EQUAL`, `STRATA_SPLIT_SMALL_OWN` and
+`STRATA_PREFILL_HELP` are refused in time-budget mode pending separate partition/resume qualification.
+Images and the final short tail retain their existing non-preemptible behavior. Saved scopes, identities,
+RNG ownership, sampled-speculation acceptance and completed-slot retention keep their existing owners.
+
+For opt-in evidence, `STRATA_BATCH_TRACE=1` includes host `monotonic_ns` stamps and request-to-slot
+ownership marks. Native `T`/`BT` lines are committed token receipts; they are not draft, device-completion
+or SSE-chunk timestamps. `STRATA_STATE_HASH=1` additionally reports every split stage at admission and
+resume; resume hashes the restored working state (not just the unchanged saved slot), including logical
+GDN/PLE/KV, draft KV on its owning last stage, history and sampling identity/counter. These draining
+diagnostics cost time and remain off by default.
 
 ## Exactness
 

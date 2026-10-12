@@ -566,7 +566,8 @@ _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
 
 def btrace(*a):
     if _BTRACE:
-        print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
+        print("[batch-trace]", threading.get_ident() % 10000, f"ns={time.monotonic_ns()}", *a,
+              file=sys.stderr, flush=True)
 
 
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
@@ -738,6 +739,8 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        self.foreground_budget_s = float(self.info.get("foreground_budget_ms") or 0) / 1000.0
+        self.background_share = float(self.info.get("background_share") or 0.25)
         if self.resident_multiplex and (self.batch < 2 or self.info.get("resident_multiplex") != 1):
             self.close()
             raise RuntimeError("resident_multiplex requires at least two effective slots and INFO resident_multiplex=1")
@@ -1057,7 +1060,7 @@ class StrataEngine:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
-                if time.monotonic() - beat >= 10.0:
+                if getattr(self, "foreground_budget_s", 0) > 0 or time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
                 continue
@@ -1190,12 +1193,32 @@ class StrataEngine:
             self.slot_cv.notify_all()
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
+    def _control_turn(self, now):
+        """The existing control queue: FIFO foreground, deadline-bounded background service."""
+        if not getattr(self, "foreground_budget_s", 0):
+            return self.control_waiters[0]
+        for entry in self.control_waiters:
+            if entry[2] == "background" and entry[3] <= now:
+                return entry
+        return next((entry for entry in self.control_waiters if entry[2] == "foreground"),
+                    self.control_waiters[0])
 
-    def _take_control(self, cancel, plen: int, on_control=None, on_wait=None):
-        """FIFO control ownership; a yielded chunk read rejoins behind already-waiting requests."""
+    def _background_next(self, started):
+        now = time.monotonic()
+        work_s = max(0.0, now - started)
+        return now + work_s * (1 - self.background_share) / self.background_share
+
+    def _can_yield(self, times):
+        return getattr(self, "foreground_budget_s", 0) > 0 or times < self.YIELDS_MAX
+
+
+    def _take_control(self, cancel, plen: int, on_control=None, on_wait=None,
+                      priority="foreground", background_due=None, slot_ready=None, foreground_pending=None):
+        """One control owner; a parked read rejoins without changing request or queue identity."""
         if callable(on_wait):
             on_wait()
-        entry = [plen, object()]
+        due = background_due if background_due is not None else time.monotonic() + getattr(self, "foreground_budget_s", 0)
+        entry = [plen, object(), priority, due]
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1212,14 +1235,21 @@ class StrataEngine:
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
-                    turn = self.control_waiters[0] is entry and not getattr(self, "starting", False)
+                    now = time.monotonic()
+                    turn = self._control_turn(now) is entry and not getattr(self, "starting", False)
+                    if (turn and getattr(self, "foreground_budget_s", 0) and priority == "background" and
+                            now < entry[3] and callable(foreground_pending) and foreground_pending()):
+                        turn = False   # HTTP reservations are bounded: a foreground waiter may not be native yet.
                     if cancel.is_set():
                         return False
-                    if turn and self.ctl.acquire(blocking=False):
+                    if (turn and (not getattr(self, "foreground_budget_s", 0) or slot_ready is None or slot_ready()) and
+                            self.ctl.acquire(blocking=False)):
                         if self.alive():
                             break
                         self.ctl.release()
-                    self.slot_cv.wait(timeout=0.5)
+                    left = entry[3] - time.monotonic()
+                    wait_s = min(0.5, left) if priority == "background" and left > 0 else 0.5
+                    self.slot_cv.wait(timeout=wait_s)
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
@@ -1280,25 +1310,38 @@ class StrataEngine:
         on_control = (sampling or {}).get("_strata_control_ready")
         on_wait = (sampling or {}).get("_strata_native_waiting")
         on_submit = (sampling or {}).get("_strata_submitted")
+        foreground_pending = (sampling or {}).get("_strata_foreground_pending")
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
-        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
+        background_due = None
+        slot = None
+        def slot_ready():
+            return slot is not None or self.pick_slot(prompt, scope) is not None
+        def prefill_waiter():
+            return self._shorter_waiting(len(prompt)) or (
+                getattr(self, "foreground_budget_s", 0) and priority == "background" and
+                callable(foreground_pending) and foreground_pending())
+        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority, background_due,
+                                           slot_ready, foreground_pending)
         if not ok:
             return
+        control_started = time.monotonic()
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
         slot_queues, slot_busy, slot_held = self.slot_q, self.slot_busy, self.slot_held
         slot_live, slot_used = self.slot_live, self.slot_used
         btrace("ctl acquired")
-        slot, gen0, reserved = None, None, None
+        gen0, reserved = None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again = 0, 0
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
+                    ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority,
+                                                       background_due, slot_ready, foreground_pending)
                     if not ok:
                         return
                     holding = True
+                    control_started = time.monotonic()
                     if self.gen != born:
                         raise EngineDied("the engine restarted during this request")
                 with self.slot_cv:
@@ -1320,8 +1363,8 @@ class StrataEngine:
                             out.append(t)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
-                            if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                            if (reserved is None and not out and not embeddings and self._can_yield(yields) and
+                                    prefill_waiter()):
                                 with self.slot_cv:          # the slot the part read will wait in
                                     reserved = self.pick_slot(prompt, scope)
                                     if reserved is not None:
@@ -1331,6 +1374,8 @@ class StrataEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # its DONE is read
+                    if reused0 is None:
+                        reused0 = (self.last or {}).get("reused")  # A zero-output parked leg is still the first read.
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -1347,8 +1392,6 @@ class StrataEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
-                        if reused0 is None:
-                            reused0 = (self.last or {}).get("reused")
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -1374,21 +1417,27 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
+                                ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait,
+                                                                   priority, background_due, slot_ready, foreground_pending)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
+                                control_started = time.monotonic()
                     if self._yielded is not None:           # it gave way: the others waiting then go first
                         phase = "parked"
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
                         yields += 1
+                        if self.foreground_budget_s and priority == "background":
+                            background_due = self._background_next(control_started)
                         self.ctl.release()
                         holding = False
-                        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
+                        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority,
+                                                           background_due, slot_ready, foreground_pending)
                         if not ok:
                             return
                         holding = True
+                        control_started = time.monotonic()
                         if self.gen != born:
                             raise EngineDied("the engine restarted while this request was parked")
                     while not self.slot_q[slot].empty():
@@ -1419,11 +1468,13 @@ class StrataEngine:
                             out.append(t)
                             yield t
                         if x is None:
-                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                            if (not asked and not embeddings and self._can_yield(yields) and
+                                    prefill_waiter()):
                                 self._send(f"BYIELD {slot}")
                                 asked = True
                             yield None
+                    if reused0 is None:
+                        reused0 = (self.last or {}).get("reused")
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     if not cont and self._yielded is not None and self._yielded[0] == slot:
@@ -2798,6 +2849,7 @@ class Service:
         self.admission_waiters = []
         self.admission_active = {}
         self.admission_foreground = 0
+        self._foreground_pending = False
         self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
         self.request_timeout_s = 600.0
         self.request_body_bytes = 4 * 1024 * 1024
@@ -2939,6 +2991,11 @@ class Service:
                 "oldest_wait_s": round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6),
                 "request_timeout_s": self.request_timeout_s}
 
+    def _refresh_foreground_pending(self):
+        """Publish an atomic scalar under status_lock; native control never locks the HTTP queue."""
+        self._foreground_pending = any(r["priority"] == "foreground" for r in self.admission_waiters) or any(
+            r["priority"] == "foreground" and not r.get("_executing") for r in self.admission_active.values())
+
     def register_lifecycle(self, req, cancel):
         priority = req.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
@@ -2962,6 +3019,7 @@ class Service:
             self.lifecycles.append(record)
             self.status["queued"] += 1
             self.lifecycle_local.record = record
+            self._refresh_foreground_pending()
             self.admission_cv.notify_all()
         return record
 
@@ -2969,6 +3027,7 @@ class Service:
         with self.status_lock:
             record.update(values)
             record["state"] = state
+            self._refresh_foreground_pending()
             if len(record["events"]) < 128:
                 record["events"].append({"state": state, "elapsed_s": round(time.perf_counter() - record["_clock"], 6)})
 
@@ -3003,6 +3062,7 @@ class Service:
                 self.admission_waiters.remove(record)
                 self.status["queued"] -= 1
             self.admission_active.pop(record["id"], None)
+            self._refresh_foreground_pending()
             record["completion_s"] = round(time.perf_counter() - record["_clock"], 6)
             if record["state"] == "queued":
                 record["queue_s"] = record["completion_s"]
@@ -3739,11 +3799,13 @@ class Service:
                     self.lifecycle_note(lifecycle, "engine_wait", _executing=False)
                 def submitted(slot):
                     self.lifecycle_note(lifecycle, "prefill", slot=slot, _executing=True)
+                    btrace("owner", lifecycle["id"], "slot", slot)
                 def slot_assigned(slot):
                     self.lifecycle_note(lifecycle, "admitted", slot=slot)
                 sampling = {**(sampling or {}), "_strata_control_ready": control_ready,
                             "_strata_slot": slot_assigned, "_strata_native_waiting": native_waiting,
-                            "_strata_submitted": submitted, "_strata_request_id": lifecycle["id"]}
+                            "_strata_submitted": submitted, "_strata_request_id": lifecycle["id"],
+                            "_strata_foreground_pending": lambda: self._foreground_pending}
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
