@@ -61,6 +61,51 @@ For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complet
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
 and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage and slot request IDs.
 
+### Adaptive solo MTP versus ordinary batches
+
+The default frontend policy is unchanged: alone, use `GEN` (solo MTP when loaded);
+on an arrival, stop and continue through `BGEN`; when left alone, return to `GEN`
+with at least 32 tokens left, at most twice per request. `STRATA_PARALLEL_SOLO=0`
+still disables that return.
+
+`STRATA_SPEC_POLICY=adaptive`, set in the **frontend's environment**, opts into a
+measured policy over those same paths. It needs loaded `--mtp --spec >= 2`,
+effective `--batch >= 2`, `--prompt-cache > 0` and a positive
+`--foreground-budget-ms`. The policy refuses `--batch-mtp` and resident
+multiplexing: its concurrent choice is the existing ordinary independent-request
+batch, including split pipelines. Without loaded MTP it reports itself inactive
+and retains ordinary generation; it adds no target-only command. Unset the
+variable or use `STRATA_SPEC_POLICY=static` for the original policy.
+
+Only received `T`/`BT` frames train the committed-output numerator. `DONE`,
+`BADM`, `BDONE`, drafts and padding add no tokens. Context-length buckets and
+effective load have separate decayed committed-token/wall-time estimates; eight
+commits are required before an estimate can choose a path. Solo timing covers
+`REUSED` through `DONE`, including proposal/verification/rejection/rollback and
+terminal drain. Ordinary-batch timing includes intervening admissions, copies,
+catch-up and zero-output wall time. These are process-local scheduling estimates,
+not throughput evidence or additional reservations; restart discards them.
+
+Unknown costs give waiting requests capacity immediately, as before. A measured
+solo advantage above 10% may retain solo service for **at most one quarter of the
+fixed foreground budget** and only while the existing control-queue deadline
+has room for the observed handoff and a batch service interval. The burst's
+deadline is fixed on first contention, not extended on each token. Due background
+service and foreground HTTP demand not yet in the native queue force handoff.
+When alone again, the predicted remaining-work saving must clear the 10% margin
+and repay the measured first-token restore/catch-up cost before returning to MTP.
+Stale solo costs are remeasured no more often than every eight seconds or eight
+foreground budgets, whichever is longer; the existing per-request return cap
+still applies. No performance gain or latency qualification is claimed before a
+matched real-model run.
+
+The policy changes neither sampler/acceptance nor state transfers, resolved
+placement, admission ceilings, request identity or the native prefill partition.
+The existing 2048-token cuts and tails remain fixed when that chunk is admitted.
+It is not a new distributional guarantee: host acceptance tests establish their
+own mathematical rule, not floating-point equivalence of all native dispatch
+shapes. Sampled support and GPU parity retain their existing qualification bounds.
+
 ### Resident multiplexing without compute batching
 
 `--serve --batch N --resident-multiplex` keeps the resident state allocation but
@@ -304,14 +349,13 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   decoding, its tokens and tok/s; `live.running` the requests in flight).
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
   checkpoints included) and produces its first token there; the state is then copied into the slot. Admissions
-  are taken one at a time, and **the slots decode between the prompt's chunks**: after each chunk (`--prefill`,
-  2048-8192 tokens) they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so
-  a long prompt slows the others down instead of stopping them. The chunks are the ones one uninterrupted read
-  takes, so the prompt's arithmetic is unchanged.
+  are taken one at a time. The legacy policy decodes for half the previous chunk's duration
+  (`STRATA_BATCH_DECODE_SHARE`, default 0.5); it bypasses interleaving/yield on pipelined groups and on an
+  initial solo layer-split prefill. Use the time-budget policy below to make those paths schedulable.
 - **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
   half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
   so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
-  same chunks (at most twice per request).
+  same chunks (at most twice per request under the legacy policy; time-budget mode uses bounded service time).
 - **Each slot is a private conversation cache.** After draining its consumers, a completed CUDA slot keeps its
   committed state and turn checkpoint only when prompt caching is enabled, the request permits checkpoints,
   its conversation scope is valid, and it has neither images nor failed state. The next turn must match that
@@ -319,6 +363,56 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   conversation uses the existing empty/LRU/group-spread policy. Request IDs, counters and sampling stay private.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
+
+### Measured time-budget scheduling
+
+Opt in with `--foreground-budget-ms 1000 --background-share 0.25` in the engine arguments.
+The positive millisecond value is a foreground scheduling target, **not** a promised first-token or
+token-gap bound. `0` rolls back to the legacy policy. Share is finite and between `0.01` and `0.99`.
+A positive budget requires serving, at least two admitted slots and prompt caching.
+The existing bounded HTTP queue, context/output gates, `Retry-After` and queue-time metrics are unchanged.
+
+The scheduler measures drained prefill quanta and complete decode rounds with the monotonic wall clock.
+It selects how many **whole, memory-admitted arithmetic chunks** fit before the next decode deadline,
+subtracting the measured decode cost. A cold estimate permits one chunk. A conservative decaying maximum
+adapts to observed costs; it is an estimate, not worst-case execution time.
+Changing the memory-admitted chunk invalidates its timing estimate: a cheap short-request chunk cannot
+train a larger background chunk downward. The new geometry gets one cold indivisible chunk.
+No workspace is enlarged, placement re-resolved, recurrent chunk resized, route changed or draft counted as output. Initial solo
+reads and pipelined groups reach the same parking/interleave path. Each pipeline group runs once per
+bounded decode round, then every stage drains before prompt/verifier scratch is reused.
+
+Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
+An indivisible decode-round overrun remains debt for later quanta. Background control entries get a
+deadline `now + measured_service * (1 - share) / share`, including chunk/park cost:
+due background work precedes newer foreground arrivals; foreground entries otherwise remain FIFO.
+Foreground entries remain in the control queue until a physical slot is available. The bounded HTTP
+queue also publishes a read-only pending-foreground scalar, including admitted but unsubmitted
+requests: background cannot appear alone between decoder retirement and HTTP admission. That same
+signal requests a park even when the foreground request has not reached native control yet.
+Early background progress is work-conserving only when neither existing queue has foreground demand;
+due background still advances under persistent arrivals. HTTP publishes under its existing status lock;
+native control reads the scalar without acquiring that lock. No queue or dispatcher is added.
+Repeated parking does not hit the legacy two-yield cap. Each resumed read must advance before it can
+park again, so sustained arrivals cannot repeatedly restart the same prefix.
+The API's cached-input count is fixed from the first native read, including a zero-output parked leg.
+Later internal prefix reuse does not convert this request's own fresh prefill into cached-input credit.
+Silent control reads also expose cooperative-yield polling every 0.5 s, rather than waiting for the
+legacy ten-second HTTP heartbeat or for a completed `PP` chunk before sending `BYIELD`.
+
+An indivisible chunk may exceed the target; the engine reports `indivisible_over_budget=1`, never silently
+shrinks it or advertises success. Qualify a smaller `--prefill` profile separately if needed: changing
+chunk geometry changes recurrent rounding. `STRATA_PREFILL_EQUAL`, `STRATA_SPLIT_SMALL_OWN` and
+`STRATA_PREFILL_HELP` are refused in time-budget mode pending separate partition/resume qualification.
+Images and the final short tail retain their existing non-preemptible behavior. Saved scopes, identities,
+RNG ownership, sampled-speculation acceptance and completed-slot retention keep their existing owners.
+
+For opt-in evidence, `STRATA_BATCH_TRACE=1` includes host `monotonic_ns` stamps and request-to-slot
+ownership marks. Native `T`/`BT` lines are committed token receipts; they are not draft, device-completion
+or SSE-chunk timestamps. `STRATA_STATE_HASH=1` additionally reports every split stage at admission and
+resume; resume hashes the restored working state (not just the unchanged saved slot), including logical
+GDN/PLE/KV, draft KV on its owning last stage, history and sampling identity/counter. These draining
+diagnostics cost time and remain off by default.
 
 ## Exactness
 

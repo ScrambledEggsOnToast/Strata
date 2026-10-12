@@ -303,6 +303,35 @@ hits, the router, the head, ...). The GPU profile times every stage with events,
 use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of
 per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
 
+**Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
+`PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one
+per stage chunk, and a containing public `Prefill::run` record after its pipeline drains. Records include
+stage ownership, token position/count, MMQ and host/device-route exposure, mapped readback, deferred shared
+work, borrow status, streamed/DMA/resident expert counts, GPU phase durations, and monotonic host intervals
+for readback submission, the containing route join, direct CPU grouping, enqueue completion, observer fold,
+stage download, successor wait and final chunk join. Resident device layers keep their actual grouping and
+dispatch: rank/scan/scatter boundaries only enqueue events, which fold at the existing chunk drain. The
+instrument inserts no layer synchronization and does not change expert arithmetic or launch geometry.
+It adds events, host accounting and logging: use it for attribution, **not headline latency**.
+
+`prior_gpu_ready_chunk_ms` is the same-device event offset from chunk origin to the completion of previously
+queued work, just before routing readback or resident rank. `route readback` times the mapped-copy/D2H
+envelope separately; `resident rank`, `resident scan` and `resident scatter` identify the new integer work.
+`dispatches`, `dispatch_cap_groups`, `dispatch_max_entries` and `dispatch_grid_groups` distinguish selected
+up-to-16-expert host batches from one device-sized dispatch. Device-layer `experts=-1` is deliberately
+unknown: there is no new per-layer count readback. The existing chunk status supplies total selected groups.
+`dispatches` counts complete expert FFN sequences: one native grouped call, or one MMQ gate/up + down pair.
+MMQ's `dispatch_grid_groups=-1` means the native grid parameter is inapplicable, not an unexecuted group.
+The direct CPU grouping span excludes observer folding and shared-expert submission. The larger
+sync-to-enqueue interval still contains ordinary submission work; neither it nor the raw synchronization
+is a pure removable-CPU estimate. Native FFN envelopes can include metadata/submission gaps, not just kernels.
+Do not add overlapping host waits to GPU durations or add two devices' timelines into wall time. Host
+stamps share a monotonic clock; GPU events do not establish cross-device or host/device clock alignment.
+Invalid event measurements mark records incomplete. The switch is off by default; omit
+`STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
+This observer's layer-record storage supports bounds within `[0,48]`; it explicitly refuses other bounds
+rather than emitting a partial capture. The normal unobserved engine path is unchanged.
+
 Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
 and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
 
@@ -317,6 +346,39 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 [`bench/results/2026-09-28-prefill-speed`](../bench/results/2026-09-28-prefill-speed/README.md). Existing installs
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
+
+**Experimental native-IQ Volta prompt FFN (#195):** `STRATA_PREFILL_IQ_WMMA=1` opts into an additive
+port of jmnargi/Strata-V100 `277a707b58d08b7a089b9c41c4c9610a05a27405`, not a donor merge. It covers
+CUDA SM70 stage-local native experts at embedding/FF widths 2560/640: gate/up IQ3_XXS, IQ3_S,
+IQ2_S and IQ4_XS, down IQ4_NL or Q2_0. Existing host grouping supplies the same IDs/bounds, with
+1–16 experts and at least 16 rows per nonempty expert. That floor is a preregistered screen,
+not a measured crossover. Unsupported formats/shapes/devices, smaller groups, fused/native-grouped
+experts and resident-helper products keep their existing paths. SM86 and decode dispatch are unchanged.
+
+This is an **arithmetic change**, not a bit-exact optimization: packed weights and input activations
+are rounded to FP16, tensor cores accumulate FP32, and FP32 SwiGLU is rounded to FP16 (with the existing
+±65504 saturation) before FP16 down projection. Router selection, every contribution, coefficients,
+output reduction order, shared experts, KV and sampling code remain unchanged. Entirely resident groups
+read raw gate|up/down blobs through a by-value device pointer table; streamed/mixed groups retain their
+existing gathers and staging-slot releases. FP16 intermediates fit in the existing FP32 H allocation and
+the 256-byte pointer table aliases existing Hq scratch. No ring growth or extra workspace is introduced.
+
+The candidate is **default-off and rejected by model-level evidence**. CUDA12.9 SM70+SM86 compile/link
+and the seven-format independent complete-FFN fixture passed (worst FP16-reference relL2 `7.2e-5`);
+the mandatory SM86 refusal/skip gate passed too. In contrast, the matched 48,025-token model first
+predictor has relL2 `0.35648`, max |Δ| `2.59332` and top-20 overlap `0.75`, failing frozen limits
+`0.02`, `0.5` and `0.9`. Identical emitted sentinel words did not pass the arithmetic screen.
+This fixture/model contradiction is not explained away as ordinary FP16 imprecision: the retained
+hypotheses are wrong serving operands/scales/offsets/indirect wiring, mismatched predictor content,
+or changed upstream expert selection. The routing captures were incomplete: control terminal
+payload short 256 bytes; candidate structurally invalid after 1765 complete records. No repair or
+threshold movement was attempted. Parent-project `evidence/native-iq-wmma-20261012/qualification.json`
+retains the results and hypotheses; `contract.json` retains the original bounds.
+Teacher-forced logits are **impossible** for this native IQ3_S serving pack (#57). First/committed
+diagnostics are a **different, weaker check**, not satisfaction of literal AC-3. Observer timing is
+not performance evidence; held-out/performance arms were stopped after the public failure.
+Roll back by leaving `STRATA_PREFILL_IQ_WMMA` unset. No daily-profile change or speedup is claimed.
+
 
 ## Other GPUs (estimated)
 
@@ -1091,6 +1153,46 @@ A one-shot request that no later request continues (a classification call, a pro
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
+
+**Cost-aware continuation (opt-in).** `--prefix-selection cost` considers every valid active,
+resident-slot and parked-RAM live/checkpoint prefix, and fresh recomputation, before taking or
+overwriting any source. It estimates **outgoing park + restore + remaining prefill** in milliseconds.
+A resident source can beat a deeper parked image; a worthwhile deeper image still wins.
+Authorization, token/image equality, steering, snapshot validation, admission and memory ceilings
+are not scores and cannot be overridden by a saving. Exact resends of yielded requests still resume
+their own slot, request identity and sampling sequence without an economic choice.
+
+The process learns from its own completed operations on the resolved placement, not a fixed
+tokens-per-millisecond rule or a new benchmark. Eight recent wall-time observations per copy path
+cover checkpoint restores, resident live/checkpoint host-bounced copies, whole parked restores and
+outgoing captures. Byte extents include the real recurrence/K/V layouts and host checkpoint-chain
+copies (retained unchanged pages are subtracted for parking); rates are separated by device,
+authoritative resident/streamed/ring paths and resident window sizes. Resident migration is
+charged as capture **and** restore, not assumed to be a direct device
+copy. Prediction is limited to 1/4–4 times an observed transfer extent. Prefill learns separate
+batched/window milliseconds per fresh token by power-of-two context bucket, using the same bucket
+or one neighbor and only 1/4–4 times an observed read span, with an eight-observation effective
+averaging horizon. Its request key includes
+the PCIe arithmetic share, steering and image mode. Successful read intervals include lending and
+checkpoint capture, exclude separately timed interleaved decode, and never include an earlier
+park/restore. The estimate predicts existing root/message/turn/pin cuts; it does not repartition
+arithmetic. Transfer timings include synchronization and host metadata overhead, so the byte
+extent is a cost-model input, **not measured PCIe or DRAM traffic**.
+
+Unknown or out-of-bound alternatives never win; if the longest valid source itself is unpriced,
+selection stays longest. Cost ties and gains no larger than `--prefix-min-savings-ms N` (integer
+0–60000, default 0) keep the original longest source and tie order. Observations are bounded to
+4 KiB, charged as `prefix_cost_model` in host admission, and discarded on process exit.
+`STRATA_CKPT_REREAD` and the dynamic test-only `STRATA_PIPELINE_SWITCH` use the longest fallback
+instead of learning across changed arithmetic. The stderr `prefix selection` line records the
+chosen source, longest match, fallback reason and estimated park/restore/prefill costs; `-1` means
+unknown. Existing park/restore wall times and fresh/reused/committed counts remain available.
+
+**Rollback:** `--prefix-selection longest` (the default, or omit the option). No cache format,
+placement, cache budget or frontend protocol changes are needed. `--prompt-cache 0` remains the
+separate **reuse-off** correctness control, not the rollback for this selection policy. Default
+promotion requires a matched full-model and held-out comparison; source/CPU checks alone do not
+establish latency gains or committed-token equality.
 
 **One long document, many questions in one conversation: a pinned prefix (opt-in, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
 A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),

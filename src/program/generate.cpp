@@ -71,6 +71,7 @@
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/kv_residency_info.hpp"
+#include "strata/program/time_budget.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -699,6 +700,8 @@ struct Options {
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
     bool resident_multiplex = false;
+    double foreground_budget_ms = 0; // 0 retains the legacy fixed-share scheduling policy
+    double background_share = 0.25;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -757,6 +760,8 @@ struct Options {
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    bool prefix_cost_selection = false; // opt-in; longest-prefix selection is the rollback
+    int64_t prefix_min_savings_ms = 0;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
@@ -910,6 +915,9 @@ void usage() {
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                 "  --prefix-selection longest|cost  --serve: longest valid prefix (default), or measured park +\n"
+                 "                       restore + remaining-prefill cost; missing observations keep longest\n"
+                 "  --prefix-min-savings-ms N  --serve cost selection: minimum gain over longest (default 0)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -917,6 +925,9 @@ void usage() {
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
+                 "  --foreground-budget-ms N  --serve --batch: measured-cost scheduling at existing chunk boundaries\n"
+                 "                       (0 = legacy policy; positive N <= 60000 is a target, not a latency promise)\n"
+                 "  --background-share F  minimum prefill/control share under contention (0.01..0.99, default 0.25)\n"
                  "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
@@ -2142,6 +2153,16 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--resident-multiplex") o.resident_multiplex = true;
+        else if (a == "--foreground-budget-ms" || a == "--background-share") {
+            const char* value = next(a.c_str());
+            char* end = nullptr;
+            const double parsed_value = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(parsed_value)) {
+                std::fprintf(stderr, "%s needs a finite number\n", a.c_str()); return 2;
+            }
+            if (a == "--foreground-budget-ms") o.foreground_budget_ms = parsed_value;
+            else o.background_share = parsed_value;
+        }
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -2170,6 +2191,24 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--prefix-selection") {
+            const std::string value = next("--prefix-selection");
+            if (value != "longest" && value != "cost") {
+                std::fprintf(stderr, "--prefix-selection needs longest or cost\n");
+                return 2;
+            }
+            o.prefix_cost_selection = value == "cost";
+        }
+        else if (a == "--prefix-min-savings-ms") {
+            const std::string value = next("--prefix-min-savings-ms");
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > 60000) {
+                std::fprintf(stderr, "--prefix-min-savings-ms needs an integer in 0..60000\n");
+                return 2;
+            }
+            o.prefix_min_savings_ms = number;
+        }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
             const std::string value = next(a.c_str());
@@ -2307,6 +2346,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
+        (o.foreground_budget_ms > 0 && (!o.serve || o.batch < 2 || o.prompt_cache <= 0))) {
+        std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
+                             "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
+        return 2;
+    }
+    if (o.foreground_budget_ms > 0 &&
+        ((std::getenv("STRATA_PREFILL_EQUAL") && std::atoi(std::getenv("STRATA_PREFILL_EQUAL")) != 0) ||
+         (std::getenv("STRATA_PREFILL_HELP") && std::atoi(std::getenv("STRATA_PREFILL_HELP")) != 0) ||
+         std::getenv("STRATA_SPLIT_SMALL_OWN"))) {
+        std::fprintf(stderr, "strata scheduling: equal/split-small chunks and stage help need separate "
+                             "resume/arithmetic qualification; unset these experimental overrides\n");
+        return 2;
     }
     if (o.resident_multiplex && (!o.serve || o.batch < 2 || o.batch_groups != 1 || !o.layer_split.empty())) {
         std::fprintf(stderr, "strata generate: --resident-multiplex requires single-device --serve --batch >= 2 and one group\n");
@@ -3424,6 +3477,11 @@ int main(int argc, char** argv) {
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
     const bool batch_requested = o.batch > 0; // keep admission intent even if runtime eligibility disables it
+    // Freeze the pool/default-share choice before ANY prefill price/loan/layout snapshot.
+    // Runtime batch/split fallback must not arm a new, unpriced configuration later.
+    const bool prefill_share_pool = !o.no_pool && (o.serve ? !batch_requested : !multi_gpu);
+    strata::prefill::Prefill::arm_cpu_share(prefill_share_pool,
+        prefill_share_pool && split_devs.empty() && !batch_requested);
     // Known ranges commit exact owner extents. Auto's pre-search bounds are
     // not exact carves and therefore do not arm the runtime equality checks.
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
@@ -3631,11 +3689,12 @@ int main(int argc, char** argv) {
         strata::plan::DeviceCost& d0 = add_device("CUDA0");
         strata::plan::Scope& v0 = d0.vram;
         v0.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (pack index header)");
-        uint64_t native_source_bytes = 0;
+        // Host upload demand is the source union of all priced stages, not CUDA0's trimmed payload.
+        strata::core::NativeDense::SourceSpans native_source_spans;
         if (!o.native_dense_gguf.empty()) {
             uint64_t nb = 0;
             if (!strata::core::NativeDense::planned_bytes(o.native_dense_gguf, o.native_ple_key, nb, err,
-                                                        &native_source_bytes)) {
+                                                        &native_source_spans)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -3786,6 +3845,7 @@ int main(int argc, char** argv) {
             v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
         uint64_t prefill_host_payload = admitted_prefill.host_payload;
         uint64_t prefill_host_dynamic = admitted_prefill.host_dynamic;
+        uint64_t prefill_host_cpu_share = admitted_prefill.host_cpu_share;
         if (split_real) {
             const size_t last = split_devs.size() - 1;
             for (size_t i = 0; i < split_devs.size(); ++i) {
@@ -3800,7 +3860,7 @@ int main(int argc, char** argv) {
                     // Price under that same range, then restore CUDA0's pending load range.
                     if (stage_trim) strata::core::NativeDense::set_layer_range((int) layer_begin, (int) layer_end);
                     const bool dense_priced = strata::core::NativeDense::planned_bytes(
-                        o.native_dense_gguf, o.native_ple_key, dense_bytes, err);
+                        o.native_dense_gguf, o.native_ple_key, dense_bytes, err, &native_source_spans);
                     if (stage_trim) strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
                     if (!dense_priced) {
                         std::fprintf(stderr, "strata generate: stage native dense pricing: %s\n", err.c_str());
@@ -3899,6 +3959,7 @@ int main(int argc, char** argv) {
                     }
                     prefill_host_payload = byte_add(prefill_host_payload, stage_prefill.host_payload);
                     prefill_host_dynamic = byte_add(prefill_host_dynamic, stage_prefill.host_dynamic);
+                    prefill_host_cpu_share = byte_add(prefill_host_cpu_share, stage_prefill.host_cpu_share);
                     ds.vram.add("prefill_buffers", stage_prefill.standalone_device,
                                 "Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)");
                     if (o.prefill_library_allowance_bytes != 0)
@@ -4324,33 +4385,9 @@ int main(int argc, char** argv) {
             } else ram_unknown("embedding_pinned", "GGUF token_embd.weight unavailable");
         }
         uint64_t native_dense_source_pages = 0;
-        if (native_source_bytes) {
-            std::set<std::string> served;
-            if (!strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, served, err)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return 1;
-            }
-            uint64_t checked_native_source_bytes = 0;
-            for (const auto& path : o.native_dense_gguf) {
-                try {
-                    strata::GgufFile gguf(path);
-                    for (const auto& tensor : gguf.tensors()) {
-                        if (!served.count(tensor.name)) continue;
-                        const uint64_t bytes = tensor_payload_bytes(gguf, tensor);
-                        if (!bytes) {
-                            ram_unknown("file:native_dense_upload", "native served source span cannot be bounded", ByteMeaning::clean_file);
-                            continue;
-                        }
-                        checked_native_source_bytes = byte_add(checked_native_source_bytes, bytes);
-                        native_dense_source_pages = byte_add(native_dense_source_pages, source_span_pages(bytes));
-                    }
-                } catch (const std::exception&) {
-                    ram_unknown("file:native_dense_upload", "native GGUF source unavailable during page accounting", ByteMeaning::clean_file);
-                }
-            }
-            if (checked_native_source_bytes != native_source_bytes)
-                ram_unknown("file:native_dense_upload", "native source spans differ from NativeDense::planned_bytes", ByteMeaning::clean_file);
-        }
+        if (!native_source_spans.empty() && !strata::core::NativeDense::source_pages(
+                o.native_dense_gguf, native_source_spans, source_page, native_dense_source_pages, err))
+            ram_unknown("file:native_dense_upload", err.c_str(), ByteMeaning::clean_file);
         upload("file:native_dense_upload", native_dense_source_pages, "each supported native GGUF source span page-rounded; retained after upload/unmap");
         upload("file:native_head_upload", source_span_pages(head_bytes), "native GGUF output.weight source pages retained after upload/unmap");
         startup_only.add("canonical_upload_staging", 24ull << 20,
@@ -4409,6 +4446,8 @@ int main(int argc, char** argv) {
                 "Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags");
             ram("prefill_host_dynamic", prefill_host_dynamic,
                 "per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
+            ram("prefill_cpu_share_buffers", prefill_host_cpu_share,
+                "resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit");
             // prefill_runtime_storage is added below, once the supervisor's measured worker limit is
             // known: the operator allowance is only admissible inside an enforced cgroup ceiling.
             if (split_real)
@@ -4417,6 +4456,9 @@ int main(int argc, char** argv) {
                     "two Prefill mapped handoff buffers per stage boundary");
         }
         ram("host_logits", n_vocab > 0 ? byte_mul((uint64_t) n_vocab, 4) : 0, "host logits vector");
+        if (o.serve)
+            ram("prefix_cost_model", sizeof(strata::program::PrefixCosts),
+                "bounded process-local prefix transfer and context/prefill observations");
         const char* grouped_env = std::getenv("STRATA_BATCH_MTP");
         const bool grouped_requested = o.batch_mtp || (grouped_env && grouped_env[0] && grouped_env[0] != '0');
         // Eight rows of mapped inputs, misses and the two expert-plan halves; retain the existing
@@ -8392,10 +8434,8 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
-        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
-        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu);
+        // The admitted choice remains fixed even if batching/split eligibility fell back during setup.
+        const bool share_pool = prefill_share_pool;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -9180,6 +9220,85 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
+        using strata::program::PrefixTransfer;
+        using strata::program::PrefixWork;
+        strata::program::PrefixCosts prefix_costs;
+        // Transfer extent, not allocation capacity. All rates stay in this process
+        // and are separated by operation and the actual resolved device/K/V paths.
+        auto session_work = [&](int64_t tokens, bool capture, int64_t unchanged = 0) {
+            PrefixWork work;
+            if (!o.prefix_cost_selection) return work;
+            std::string why;
+            auto kv_parts = [&](const strata::core::QsaState& qsa, bool index, int device) {
+                std::array<uint64_t, 5> parts{};
+                if (!strata::core::conversation_kv_part_sizes(qsa, g, tokens, index, parts, why)) return false;
+                work.path(device, qsa.kv_mode);
+                work.path(device, int(qsa.n_slots));
+                const auto shape = strata::kernels::qsa_real_shapes();
+                const uint64_t cells = uint64_t((tokens + shape.page_size - 1) / shape.page_size * shape.page_size);
+                const int64_t keep_tokens = std::max<int64_t>(0, std::min(tokens, unchanged - (index ? 0 : 1)));
+                const uint64_t whole = uint64_t(keep_tokens / shape.page_size * shape.page_size);
+                for (size_t p = 0; p < parts.size(); ++p) {
+                    const uint64_t keep = !capture ? 0 : p == 4
+                        ? (index ? uint64_t(keep_tokens / shape.idx_block) * uint64_t(g.idx_key_dim) * 4 : 0)
+                        : cells ? parts[p] / cells * whole : 0;
+                    if (keep > parts[p]) return false;
+                    work.add(parts[p] - keep);
+                }
+                return true;
+            };
+            for (size_t i = 0; i <= stages.size(); ++i) {
+                const auto& state = i == 0 ? ss : stages[i - 1]->ss;
+                strata::core::ConversationStateSizes z;
+                if (!strata::core::conversation_session_sizes(g, state, z, why)) {
+                    work.bytes = UINT64_MAX; return work;
+                }
+                work.path(state.allocation_device, -1);
+                work.add(z.gdn); work.add(state.ple_hist ? z.ple : 0);
+                for (int64_t j = 0; j < state.qsa_alloc; ++j) {
+                    work.add(z.tail); work.add(z.dead); work.add(z.block_pos);
+                    if (!capture) work.add(z.dead);
+                    const auto& qsa = state.qsa_states[state.qsa_ord0 + j];
+                    if (!kv_parts(qsa, true, state.allocation_device)) {
+                        work.bytes = UINT64_MAX; return work;
+                    }
+                }
+            }
+            if (use_mtp) {
+                if (!kv_parts(mtp.kv_state(), false, mtp.device())) {
+                    work.bytes = UINT64_MAX; return work;
+                }
+            }
+            if (capture) for (const ConvCheckpoint& c : checks) {
+                if (!stages.empty() && c.stage_parts.size() != stages.size()) continue;
+                // The checkpoint chain is copied on the host too; a split first
+                // copies each later stage's IDs, then copies them into its image.
+                for (size_t copy = 0; copy < 1 + 2 * stages.size(); ++copy) {
+                    work.add(uint64_t(c.ids.size()) * sizeof(int32_t));
+                    work.add(uint64_t(c.imgs.size()) * sizeof(ImgKey));
+                }
+                auto payload = [&](const ConvCheckpoint& part) {
+                    for (size_t bytes : {part.gdn.size(), part.ple.size(), part.tails.size(),
+                                         part.dead.size(), part.block_pos.size()}) work.add(bytes);
+                };
+                payload(c);
+                for (const auto& part : c.stage_parts) payload(part);
+            }
+            return work;
+        };
+        auto checkpoint_work = [&](const ConvCheckpoint& checkpoint) {
+            PrefixWork work;
+            if (!o.prefix_cost_selection) return work;
+            auto part = [&](const ConvCheckpoint& c, const strata::core::SessionState& state) {
+                work.path(state.allocation_device, -1);
+                for (size_t n : {c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(),
+                                 c.block_pos.size(), c.dead.size()}) work.add(n);
+            };
+            part(checkpoint, ss);
+            if (checkpoint.stage_parts.size() != stages.size()) { work.bytes = UINT64_MAX; return work; }
+            for (size_t i = 0; i < stages.size(); ++i) part(checkpoint.stage_parts[i], stages[i]->ss);
+            return work;
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -9258,6 +9377,8 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || !live_scope.valid() || live.empty()) return true;
+            const auto park_t0 = Clock::now();
+            PrefixWork park_work = session_work((int64_t) live.size(), true);
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, live_scope))
@@ -9386,7 +9507,13 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // Normalize by the copied extent, not the retained pages we did not transfer.
+                if (park_work.bytes != UINT64_MAX && reused_bytes <= park_work.bytes)
+                    park_work.bytes -= reused_bytes;
                 const bool stored = conversations.put(std::move(image), held);
+                if (o.prefix_cost_selection)
+                    prefix_costs.transfer(PrefixTransfer::park, park_work,
+                        std::chrono::duration<double, std::milli>(Clock::now() - park_t0).count());
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -10274,6 +10401,9 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
                                        " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0)).c_str() : "");
+            if (o.foreground_budget_ms > 0)
+                std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
+                            o.foreground_budget_ms, o.background_share);
             // Opt-in status extension: owners may initialize resident when their context fits,
             // and the working draft can take its existing resident fallback.
             if (o.slot_kv_window) {
@@ -10684,10 +10814,12 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
+            bool round_started = false;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        bool bounded_round = false;
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -10752,11 +10884,13 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                        if (!pg[(size_t) gi].inflight && group_active(gi) &&
+                            (!bounded_round || !pg[(size_t) gi].round_started)) pick = gi;
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
+                    G.round_started = bounded_round;
                     G.count = 0;
                     for (int t = 0; t < GS; ++t) {
                         const int slot = pick * GS + t;
@@ -10799,6 +10933,29 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        strata::program::TimeBudget time_budget(o.foreground_budget_ms, o.background_share);
+        auto last_decode = Clock::now();
+        // A complete round uses the selected scheduler, including pipelined groups,
+        // then drains every consumer before prefill may reuse verifier/cache scratch.
+        auto decode_round = [&](bool charge = true) -> bool {
+            const auto begin = Clock::now();
+            if (piped) {
+                bounded_round = true;
+                for (auto& group : pg) group.round_started = false;
+                for (;;) {
+                    bool pending = pipe_inflight();
+                    for (size_t group = 0; group < pg.size(); ++group)
+                        pending = pending || (group_active((int) group) && !pg[group].round_started);
+                    if (!pending) break;
+                    if (!pump(true)) { bounded_round = false; return false; }
+                }
+                bounded_round = false;
+            } else if (!batch_step()) return false;
+            last_decode = Clock::now();
+            if (time_budget.enabled())
+                time_budget.decoded(std::chrono::duration<double, std::milli>(last_decode - begin).count(), charge);
+            return true;
+        };
         uint64_t working_capacity = 0, resident_capacity = 0;
         for (size_t k = 0; k <= stages.size(); ++k) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
@@ -10817,7 +10974,7 @@ int main(int argc, char** argv) {
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (!(time_budget.enabled() ? decode_round(false) : piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
@@ -11387,7 +11544,12 @@ int main(int argc, char** argv) {
                 if (L < 1 || L > n - 1) return false;
                 for (int64_t i = 0; i < L; ++i)
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
-                return imgs_below(req_imgs, L) == pre_imgs;
+                size_t image = 0;
+                for (const ImgKey& key : req_imgs) {
+                    if (key.start >= L) continue;
+                    if (image >= pre_imgs.size() || !(pre_imgs[image++] == key)) return false;
+                }
+                return image == pre_imgs.size();
             };
             const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
             strata::program::ResidentRequest input;
@@ -11428,49 +11590,173 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            int64_t resume = 0;
-            bool from_live = false;
-            if (o.prompt_cache > 0 && live_scope.matches(req_scope) && want_cvec == cvec_cached) {
-                if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+            enum class PrefixSource { cold, live, checkpoint, resident, parked };
+            struct PrefixCandidate {
+                PrefixSource source = PrefixSource::cold;
+                int64_t tokens = 0;
+                int slot = -1;
+                const ConvCheckpoint* checkpoint = nullptr;
+                strata::core::ConversationCache::Match parked{};
+                PrefixWork work{};
+                PrefixTransfer transfer = PrefixTransfer::checkpoint;
+                std::optional<double> total_ms{}, restore_ms{}, prefill_ms{}, park_ms{};
+            };
+            const int yielded_source = resident.working().resume_slot;
+            const uint64_t prefill_route = uint64_t(std::clamp(int(req_pcie_frac * 256.0 + 0.5), 0, 256)) |
+                (uint64_t(want_cvec) << 16) | (uint64_t(geni) << 17);
+            const bool cost_observations = o.prefix_cost_selection &&
+                std::getenv("STRATA_CKPT_REREAD") == nullptr && pipe_dbg_env("STRATA_PIPELINE_SWITCH") == nullptr;
+            const PrefixWork outgoing_work = yielded_source < 0 && live_ok && live_scope.valid() && conversations.enabled()
+                ? session_work((int64_t) live.size(), true, conversations.unchanged_tokens()) : PrefixWork{};
+            int64_t cost_first_turn = -1, cost_previous_turn = -1, cost_last_turn = -1;
+            if (yielded_source < 0 && cost_observations && o.prompt_cache > 0 && o.turn_token >= 0)
+                for (int64_t i = 1; i < n; ++i) if (ids[(size_t) i] == o.turn_token) {
+                    if (cost_first_turn < 0) cost_first_turn = i;
+                    cost_previous_turn = cost_last_turn;
+                    cost_last_turn = i;
+                }
+            auto remaining_cost = [&](int64_t begin) -> std::optional<double> {
+                if (!cost_observations) return {};
+                // Predict the existing read partitions; this never changes prefill geometry.
+                int64_t turn = cost_last_turn > begin ? cost_last_turn : -1;
+                if (turn > 0 && cost_previous_turn > begin && o.tail_role_token >= 0 &&
+                    ids[(size_t) cost_previous_turn + 1] == o.tail_role_token) turn = cost_previous_turn;
+                const int64_t root = begin == 0 && o.prompt_cache_root > 0 &&
+                    cost_first_turn >= o.prompt_cache_root && cost_first_turn < turn ? cost_first_turn : -1;
+                if (!req_ckpt) turn = -1;
+                const char* message = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+                const int64_t boundary = message && std::atoi(message) != 0 && !multi_gpu && o.prompt_cache > 0
+                    ? strata::program::message_checkpoint_boundary(ids, begin, turn, o.turn_token) : -1;
+                const int64_t pin = req_pin > begin && req_pin < n - 1 && o.prompt_cache >= 3 && req_ckpt
+                    ? req_pin : -1;
+                std::array<int64_t, 5> cuts{root, boundary, turn, pin, n - 1};
+                std::sort(cuts.begin(), cuts.end());
+                double total = 0;
+                for (int64_t end : cuts) {
+                    if (end <= begin) continue;
+                    bool windows = end - begin <= o.short_read;
+                    if (sp.embd_rows) for (int64_t i = begin; windows && i < end; ++i)
+                        windows = sp.embd_rows[i] == nullptr;
+                    const auto ms = prefix_costs.prefill_ms(begin, end, windows, prefill_route);
+                    if (!ms) return {};
+                    total += *ms;
+                    begin = end;
+                }
+                return total;
+            };
+            auto checkpoint_valid = [&](const ConvCheckpoint& c) {
+                std::string why;
+                if (c.stage_parts.size() != stages.size() ||
+                    !strata::core::conversation_checkpoint_validate(c, ss, g, why)) return false;
+                for (size_t i = 0; i < stages.size(); ++i)
+                    if (c.stage_parts[i].ids != c.ids ||
+                        !strata::core::conversation_checkpoint_validate(c.stage_parts[i], stages[i]->ss, g, why))
+                        return false;
+                return true;
+            };
+            strata::program::PrefixChoice choice(o.prefix_cost_selection, double(o.prefix_min_savings_ms));
+            PrefixCandidate longest, cheapest;
+            size_t candidate_id = 0;
+            auto consider = [&](PrefixCandidate candidate, std::optional<double> extra_restore = 0.0) {
+                candidate.restore_ms = prefix_costs.transfer_ms(candidate.transfer, candidate.work);
+                if (!extra_restore) candidate.restore_ms.reset();
+                else if (candidate.restore_ms) *candidate.restore_ms += *extra_restore;
+                const bool pin_sibling = candidate.source == PrefixSource::checkpoint &&
+                    candidate.checkpoint->pinned && req_pin > 0 && req_ckpt && o.prompt_cache >= 3 &&
+                    candidate.tokens == req_pin && live_ok;
+                candidate.park_ms = candidate.source == PrefixSource::live || pin_sibling
+                    ? std::optional<double>(0.0) : prefix_costs.transfer_ms(PrefixTransfer::park, outgoing_work);
+                candidate.prefill_ms = remaining_cost(candidate.tokens);
+                if (candidate.restore_ms && candidate.park_ms && candidate.prefill_ms)
+                    candidate.total_ms = *candidate.restore_ms + *candidate.park_ms + *candidate.prefill_ms;
+                const size_t id = candidate_id++;
+                choice.consider(id, candidate.tokens, candidate.total_ms);
+                if (choice.longest() == id) longest = candidate;
+                if (choice.cheapest() == id) cheapest = candidate;
+            };
+            if (yielded_source < 0) consider(PrefixCandidate{}); // fresh recomputation is a continuation source too
+            if (yielded_source < 0 && o.prompt_cache > 0 && live_scope.matches(req_scope) && want_cvec == cvec_cached) {
+                if (live_ok && starts_with(live, live_imgs))
+                    consider({PrefixSource::live, (int64_t) live.size()});
                 for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
-                        resume = (int64_t) c.ids.size();
-                        from_live = false;
-                    }
+                    if (starts_with(c.ids, c.imgs) && checkpoint_valid(c))
+                        consider({PrefixSource::checkpoint, (int64_t) c.ids.size(), -1, &c, {}, checkpoint_work(c)});
             }
-            // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
-            // source too - its sessions are copied back below, so only the new part is read
-            int slot_source = -1;
-            int64_t slot_tokens = 0;
-            bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
-            const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (yielded_source < 0 && o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (!sl.reusable(req_scope, want_cvec)) continue;
-                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
-                        slot_source = b;
-                        slot_tokens = (int64_t) sl.ids.size();
-                        slot_ck = nullptr;
-                    }
+                    auto slot_candidate = [&](const ConvCheckpoint* c) {
+                        PrefixWork work;
+                        std::string why;
+                        if (!resident.resume_work(b, c, work, why)) return;
+                        consider({PrefixSource::resident, (int64_t) (c ? c->ids.size() : sl.ids.size()), b, c, {},
+                                  work, c ? PrefixTransfer::resident_checkpoint : PrefixTransfer::resident_live});
+                    };
+                    if (starts_with(sl.ids, {})) slot_candidate(nullptr);
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
-                            slot_source = b;
-                            slot_tokens = (int64_t) c.ids.size();
-                            slot_ck = &c;
-                        }
+                        if (starts_with(c.ids, c.imgs)) slot_candidate(&c);
                 }
-            const int yielded_source = resident.working().resume_slot;
+            if (yielded_source < 0) conversations.for_each_match(ids, req_imgs, want_cvec, req_scope,
+                [&](auto match, const strata::core::SavedConversation& image, const ConvCheckpoint& c) {
+                    std::string why;
+                    if (image.stage_images.size() != stages.size() ||
+                        !strata::core::conversation_snapshot_validate(image, ss, g,
+                            use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, why)) return;
+                    PrefixWork rewind;
+                    auto rewind_part = [&](const ConvCheckpoint& part, const strata::core::SessionState& state) {
+                        rewind.path(state.allocation_device, -1);
+                        for (size_t n : {part.gdn.size(), part.ple.size(), part.tails.size(), part.dead.size(),
+                                         part.block_pos.size(), part.dead.size()}) rewind.add(n);
+                    };
+                    if (!match.live) rewind_part(c, ss);
+                    for (size_t i = 0; i < stages.size(); ++i) {
+                        const auto& part = image.stage_images[i];
+                        if (part.live.ids != image.live.ids || part.live.imgs != image.live.imgs ||
+                            !strata::core::conversation_snapshot_validate(part, stages[i]->ss, g,
+                                use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, why)) return;
+                        if (!match.live) {
+                            const auto cp = std::find_if(part.checkpoints.begin(), part.checkpoints.end(),
+                                [&](const ConvCheckpoint& k) { return k.ids == c.ids && k.imgs == c.imgs; });
+                            if (cp == part.checkpoints.end()) return;
+                            rewind_part(*cp, stages[i]->ss);
+                        }
+                    }
+                    consider({PrefixSource::parked, match.tokens, -1, nullptr, match,
+                              session_work((int64_t) image.live.ids.size(), false), PrefixTransfer::parked},
+                             prefix_costs.transfer_ms(PrefixTransfer::checkpoint, rewind));
+                });
+            PrefixCandidate selected = choice.using_cost() ? cheapest : longest;
             if (yielded_source >= 0) {
-                slot_source = yielded_source;
-                slot_tokens = (int64_t) bs[(size_t) slot_source].ids.size();
-                slot_ck = nullptr;
+                // Exact resend of a yielded request is an ownership continuation, never an economic choice.
+                selected = {PrefixSource::resident, (int64_t) bs[(size_t) yielded_source].ids.size(), yielded_source};
+                selected.transfer = PrefixTransfer::resident_live;
+                if (!resident.resume_work(yielded_source, nullptr, selected.work, err)) {
+                    std::printf("ERR restoring yielded prefix: %s\n", err.c_str()); return 1;
+                }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec, req_scope);
+            int64_t resume = selected.source == PrefixSource::checkpoint || selected.source == PrefixSource::live
+                ? selected.tokens : 0;
+            bool from_live = selected.source == PrefixSource::live;
+            int slot_source = selected.source == PrefixSource::resident ? selected.slot : -1;
+            int64_t slot_tokens = slot_source >= 0 ? selected.tokens : 0;
+            const ConvCheckpoint* slot_ck = slot_source >= 0 ? selected.checkpoint : nullptr;
+            bool resumed_from0 = false;
+            const auto parked = selected.parked;
             std::optional<strata::core::SavedConversation> incoming;
-            if (yielded_source < 0 && parked.tokens > std::max(resume, slot_tokens))
-                incoming.emplace(conversations.take(parked.index));
-            if (incoming) slot_source = -1;
+            if (selected.source == PrefixSource::parked) incoming.emplace(conversations.take(parked.index));
+            if (o.prefix_cost_selection)
+                std::fprintf(stderr, "strata serve: prefix selection: source=%s tokens=%lld longest=%lld policy=%s "
+                                     "estimated_ms=%.3f park_ms=%.3f restore_ms=%.3f prefill_ms=%.3f\n",
+                    yielded_source >= 0 ? "yielded" : selected.source == PrefixSource::live ? "live" :
+                    selected.source == PrefixSource::checkpoint ? "checkpoint" :
+                    selected.source == PrefixSource::resident ? "resident" :
+                    selected.source == PrefixSource::parked ? "parked" : "cold",
+                    (long long) selected.tokens, (long long) longest.tokens,
+                    yielded_source >= 0 ? "forced" : choice.using_cost() ? "cost" :
+                    !choice.longest_known() ? "longest-unknown" : "longest-tie-or-margin",
+                    selected.total_ms.value_or(-1), selected.park_ms.value_or(-1),
+                    selected.restore_ms.value_or(-1), selected.prefill_ms.value_or(-1));
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -11543,6 +11829,9 @@ int main(int argc, char** argv) {
                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    if (o.prefix_cost_selection)
+                        prefix_costs.transfer(selected.transfer, selected.work,
+                            std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
@@ -11551,6 +11840,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (incoming) {
+                const PrefixWork restore_work = session_work((int64_t) incoming->live.ids.size(), false);
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
@@ -11605,6 +11895,9 @@ int main(int argc, char** argv) {
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                if (o.prefix_cost_selection)
+                    prefix_costs.transfer(PrefixTransfer::parked, restore_work,
+                        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -11647,6 +11940,7 @@ int main(int argc, char** argv) {
                 }
                 checks.clear();
             } else if (!from_live) {
+                const auto checkpoint_t0 = Clock::now();
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
@@ -11678,6 +11972,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
+                if (o.prefix_cost_selection && reread_to < 0 && c)
+                    prefix_costs.transfer(PrefixTransfer::checkpoint, checkpoint_work(*c),
+                        std::chrono::duration<double, std::milli>(Clock::now() - checkpoint_t0).count());
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
@@ -12000,11 +12297,9 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-            // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
-            // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
-            // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
+            // Prompt quanta retain the memory-admitted arithmetic partition. A
+            // positive foreground budget replaces the legacy previous-chunk share.
+            // Decode rounds and parking run only after sp.run drains all stages.
             static const double decode_share = [] {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
@@ -12019,13 +12314,33 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (o.batch <= 0 || (!time_budget.enabled() &&
+                    (piped || (!stages.empty() && !batch_on()))))
+                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const auto age = [&] {
+                        return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                    };
+                    if (time_budget.enabled() && batch_on() && time_budget.decode_due(age(), C) &&
+                        time_budget.decode_allowed(0)) {
+                        if (!decode_round()) { batch_fatal = true; e = "a decode round failed"; return false; }
+                    }
+                    const int64_t quantum = time_budget.enabled()
+                        ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
+                        : std::min(C, b0 - q);
+                    const int64_t r = q + quantum;
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (time_budget.enabled()) {
+                        time_budget.prefilled(chunk_wall_ms, quantum / C + (quantum % C != 0), C);
+                        std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
+                                             "estimate_ms=%.3f budget_ms=%.3f%s\n",
+                                     (long long) q, (long long) r, (long long) C, chunk_wall_ms,
+                                     time_budget.chunk_ms(), o.foreground_budget_ms,
+                                     time_budget.chunk_ms() > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
+                    }
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -12076,12 +12391,16 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (!batch_on() || (!time_budget.enabled() && decode_share <= 0.0)) continue;
+                    const double budget = decode_share * chunk_wall_ms;
                     const auto td = Clock::now();
-                    do {
-                        if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
-                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    double decoded_ms = 0;
+                    while (batch_on() && (time_budget.enabled()
+                        ? time_budget.decode_due(age(), C) && time_budget.decode_allowed(0)
+                        : decoded_ms == 0 || decoded_ms < budget)) {
+                        if (!decode_round()) { batch_fatal = true; e = "a decode round failed"; return false; }
+                        decoded_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                    }
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     if (trace) {
@@ -12179,6 +12498,9 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
+                const auto cost_t0 = cost_observations ? Clock::now() : Clock::time_point{};
+                const double cost_interleaved_ms = il_ms;
+                const int64_t cost_begin = at;
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -12223,6 +12545,10 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+                if (cost_observations)
+                    prefix_costs.prefill(cost_begin, to, win,
+                        std::chrono::duration<double, std::milli>(Clock::now() - cost_t0).count() -
+                            (il_ms - cost_interleaved_ms), prefill_route);
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -13409,7 +13735,6 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
-    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, !multi_gpu && !o.no_pool && o.batch <= 0);   // before the chunk below sizes the loan
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -13460,7 +13785,7 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (prefill_share_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

@@ -146,9 +146,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool include_ple_key, uint64_t& bytes,
-                                std::string& err, uint64_t* source_bytes, int64_t layer_lo, int64_t layer_hi) {
+                                std::string& err, SourceSpans* source_spans, int64_t layer_lo, int64_t layer_hi) {
     bytes = 0;
-    if (source_bytes) *source_bytes = 0;
     try {
         std::set<std::string> seen;
         int max_in = 0;
@@ -173,10 +172,16 @@ bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool inc
                     return false;
                 }
                 total += weight;
+                if (source_spans) {
+                    const auto [source, inserted] = source_spans->try_emplace(tensor.name, weight);
+                    if (!inserted && source->second != weight) {
+                        err = "native dense: source span changed between stage plans: " + tensor.name;
+                        return false;
+                    }
+                }
                 max_in = std::max(max_in, (int) tensor.shape[0]);
             }
         }
-        if (source_bytes) *source_bytes = total;
         if (total > 0) {
             const uint64_t scratch = strata::kernels::native_q8_1_bytes(max_in);
             if (total > UINT64_MAX - scratch) {
@@ -189,6 +194,72 @@ bool NativeDense::planned_bytes(const std::vector<std::string>& shards, bool inc
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
+bool NativeDense::source_pages(const std::vector<std::string>& shards, const SourceSpans& source_spans,
+                               uint64_t page_size, uint64_t& pages, std::string& err) {
+    pages = 0;
+    err.clear();
+    auto add = [&](uint64_t& total, uint64_t bytes) {
+        if (bytes > UINT64_MAX - total) {
+            err = "native source byte count overflow";
+            return false;
+        }
+        total += bytes;
+        return true;
+    };
+    uint64_t planned_bytes = 0, checked_bytes = 0;
+    for (const auto& [name, bytes] : source_spans)
+        if (!add(planned_bytes, bytes)) return false;
+    try {
+        std::set<std::string> seen;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                const auto source = source_spans.find(tensor.name);
+                if (source == source_spans.end()) continue;
+                if (!seen.insert(tensor.name).second) {
+                    err = "native source tensor duplicated across GGUF shards: " + tensor.name;
+                    return false;
+                }
+                // Deliberately independent of native_mmvq_weight_bytes: the reader's block geometry and
+                // the mapped file extent must agree with the kernel's planned upload extent.
+                const uint64_t bytes = strata::tensor_payload_bytes(tensor);
+                if (!bytes || gguf.data_start() > gguf.file_size() ||
+                    tensor.offset > gguf.file_size() - gguf.data_start() ||
+                    bytes > gguf.file_size() - gguf.data_start() - tensor.offset) {
+                    err = "native served source span cannot be bounded";
+                    return false;
+                }
+                if (bytes != source->second) {
+                    err = "native source spans differ from NativeDense::planned_bytes";
+                    return false;
+                }
+                if (!add(checked_bytes, bytes)) return false;
+                // A span can start anywhere in a page. Preserve the admission gate's two-boundary
+                // upper bound, rather than assuming GGUF tensor offsets are page-aligned.
+                uint64_t rounded = bytes;
+                if (page_size) {
+                    if (!add(rounded, page_size - 1) || !add(rounded, page_size - 1)) return false;
+                    rounded /= page_size;
+                    if (rounded > UINT64_MAX / page_size) {
+                        err = "native source page count overflow";
+                        return false;
+                    }
+                    rounded *= page_size;
+                }
+                if (!add(pages, rounded)) return false;
+            }
+        }
+        if (seen.size() != source_spans.size() || checked_bytes != planned_bytes) {
+            err = "native source spans differ from NativeDense::planned_bytes";
+            return false;
+        }
+        return true;
+    } catch (const std::exception&) {
+        err = "native GGUF source unavailable during page accounting";
         return false;
     }
 }

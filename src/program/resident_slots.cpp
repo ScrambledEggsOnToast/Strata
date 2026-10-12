@@ -339,7 +339,9 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
     return true;
 }
 
-bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error) {
+bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
+                                PrefixWork& work, std::string& error) const {
+    work = {};
     if (working_failed_ || !working_.request || !retained(slot) ||
         !slots_[(size_t) slot].input.scope.matches(input_.scope)) {
         error = "resident resume: no valid idle prefix"; return false;
@@ -349,7 +351,52 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
         !std::equal(checkpoint->ids.begin(), checkpoint->ids.end(), slots_[(size_t) slot].ids.begin()))) {
         error = "resident resume: checkpoint is not a retained prefix"; return false;
     }
-    if (!idle(error)) return false;
+    const int64_t cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
+    for (size_t k = 0; k < stages_.size(); ++k) {
+        const auto& stage = stages_[k];
+        const auto& from = *stage.slots[(size_t) slot];
+        core::ConversationStateSizes z;
+        if (cells < 1 || cells > from.max_cells || cells > stage.main->max_cells ||
+            !core::conversation_session_sizes(geometry_, from, z, error)) return false;
+        if (checkpoint) {
+            const auto& part = k == 0 ? *checkpoint : checkpoint->stage_parts[k - 1];
+            if (part.ids != checkpoint->ids || part.imgs != checkpoint->imgs ||
+                !core::conversation_checkpoint_validate(part, *stage.main, geometry_, error)) return false;
+        }
+        work.path(stage.device, -1);
+        const uint64_t state = z.gdn + (from.ple_hist ? z.ple : 0) +
+            uint64_t(from.qsa_alloc) * (z.tail + z.dead + z.block_pos);
+        work.add(state);
+        if (!checkpoint) work.add(state); // live recurrence is captured then restored
+        work.add(uint64_t(from.qsa_alloc) * z.dead); // restore refreshes the moving pooled row too
+        for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+            const auto& qsa = from.qsa_states[from.qsa_ord0 + j];
+            std::array<uint64_t, 5> parts{};
+            if (!core::conversation_kv_part_sizes(qsa, geometry_, cells, true, parts, error)) return false;
+            work.path(stage.device, qsa.kv_mode);
+            work.path(stage.device, int(qsa.n_slots));
+            const auto& target = stage.main->qsa_states[stage.main->qsa_ord0 + j];
+            work.path(stage.device, target.kv_mode);
+            work.path(stage.device, int(target.n_slots));
+            for (uint64_t n : parts) { work.add(n); work.add(n); } // save/restore, not a direct D2D copy
+        }
+    }
+    if (draft_.kv_state().max_cells > 0) {
+        const auto* from = draft_.slot_state(slot);
+        std::array<uint64_t, 5> parts{};
+        if (!from || !core::conversation_kv_part_sizes(*from, geometry_, cells, false, parts, error)) return false;
+        work.path(draft_.device(), from->kv_mode);
+        work.path(draft_.device(), int(from->n_slots));
+        work.path(draft_.device(), draft_.kv_state().kv_mode);
+        work.path(draft_.device(), int(draft_.kv_state().n_slots));
+        for (uint64_t n : parts) { work.add(n); work.add(n); }
+    }
+    return work.bytes != UINT64_MAX;
+}
+
+bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error) {
+    PrefixWork work;
+    if (!resume_work(slot, checkpoint, work, error) || !idle(error)) return false;
     const auto cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
     working_failed_ = true; // any partial write or exception makes the working context unusable
     try {
@@ -462,6 +509,27 @@ bool ResidentSlots::observe(const char* phase, int slot, int64_t cells, std::str
         (unsigned long long) id, (long long) cells, (unsigned long long) h.gdn,
         (unsigned long long) fingerprint_ple(h, session), (unsigned long long) fingerprint_kv(h),
         (unsigned long long) h.draft, (unsigned long long) observed);
+    if (stages_.size() > 1) {
+        uint64_t history = SessionFingerprint::basis;
+        const auto& owner = slots_[(size_t) slot];
+        for (int32_t token : owner.ids) history = fingerprint_word(history, (uint32_t) token);
+        for (size_t stage = 0; stage < stages_.size(); ++stage) {
+            const auto& private_state = std::strcmp(phase, "resume") == 0
+                ? *stages_[stage].main : *stages_[stage].slots[(size_t) slot];
+            SessionFingerprint part;
+            const auto& private_draft = stage + 1 != stages_.size() ? empty_draft
+                : std::strcmp(phase, "resume") == 0 ? draft_.kv_state() : *draft;
+            if (!session_fingerprint(private_state, private_draft, geometry_, cells, part, error)) return false;
+            std::fprintf(stderr, "STATE_STAGE phase=%s stage=%zu slot=%d request=%llu cells=%lld "
+                                 "gdn=%016llx ple=%016llx kv=%016llx draft=%016llx history=%016llx "
+                                 "seed=%llu counter=%llu\n", phase, stage, slot, (unsigned long long) id,
+                         (long long) cells, (unsigned long long) part.gdn,
+                         (unsigned long long) fingerprint_ple(part, private_state),
+                         (unsigned long long) fingerprint_kv(part), (unsigned long long) part.draft,
+                         (unsigned long long) history, (unsigned long long) owner.sampling.seed,
+                         (unsigned long long) owner.sampling.counter);
+        }
+    }
     if (residual && std::getenv("STRATA_BATCH_DIAGNOSTICS")) report_batch_state(phase, id, slot, cells, session, h);
     return true;
 }
