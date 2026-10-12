@@ -41,6 +41,12 @@ expert formats, and `fused_gr_bench 1 1 8` for norm/up and its intermediates. Th
 full-vocabulary rows and emitted token IDs at the same model prefixes. Source review does not substitute
 for those GPU/operator and real-model checks.
 
+For in-engine attribution, `STRATA_VERIFY_NODES=1` records full captured kernel names, grids, blocks and
+shared bytes with the verifier/device/layer-range/T/doorbell key. Match that inventory to a
+`VERIFY_REPLAY ... completed=1` record from the existing serial or split-window completion join.
+An inventory alone is not proof that a graph ran. These diagnostic records add no GPU events or
+synchronization and are not an external kernel timeline; keep them out of normal speed comparisons.
+
 
 ## Measuring sm_89 (or any other card)
 
