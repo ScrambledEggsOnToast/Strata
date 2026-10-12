@@ -3810,7 +3810,7 @@ int main(int argc, char** argv) {
         }
         const char* batch = std::getenv("STRATA_BATCH_MTP");
         const bool grouped_draft = o.batch_mtp || (batch && batch[0] && batch[0] != '0');
-        const int grouped_rows = o.batch_mtp_pipeline ? std::max(o.spec, o.batch) : strata::kernels::kVerifyMaxT;
+        const int grouped_rows = o.batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4)) : strata::kernels::kVerifyMaxT;
         if (o.spec > 0) {
             const uint64_t windows = grouped_draft
                 ? strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows)
@@ -6042,7 +6042,7 @@ int main(int argc, char** argv) {
     if (o.batch > 0) resolve_groups_auto();
     if (o.batch_mtp_pipeline) {
         const char* why = !split_batch_mtp ? "it needs --batch-mtp and a distinct-device layer split"
-                        : (o.batch != 2 && o.batch != 4) ? "only --batch 2 or 4 has bounded two-group handoff ownership"
+                        : (o.batch < 2 || o.batch > 8 || o.batch % 2) ? "only even --batch 2 through 8 has bounded two-group handoff ownership"
                         : o.batch_groups != 2 ? "it needs --batch-groups 2"
                         : o.resident_multiplex ? "resident multiplexing is a different schedule" : nullptr;
         if (why) { std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: %s\n", why); return 1; }
@@ -6110,7 +6110,7 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
-    if (batch_mtp_pipeline && (o.batch < 2 || o.batch_groups != 2)) {
+    if (batch_mtp_pipeline && (o.batch < 2 || o.batch > 8 || o.batch % 2 || o.batch_groups != 2)) {
         std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: two supported resident groups did not fit\n");
         return 1;
     }
@@ -8986,7 +8986,8 @@ int main(int argc, char** argv) {
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
         strata::core::Verifier ver_b;
         auto stage_peer = [&](int st) -> strata::core::Verifier& { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; };
-        const int batch_compute_rows = batch_mtp && !batch_mtp_pipeline ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch);
+        const int batch_compute_rows = batch_mtp && !batch_mtp_pipeline ? strata::kernels::kVerifyMaxT
+                                     : batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4)) : std::max(o.spec, o.batch);
         SplitDrive split_drive_b;
         cudaStream_t pl_stream[2] = {nullptr, nullptr};
         if (pipe) {
@@ -10926,12 +10927,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch-mtp-pipeline: two group-owned replay chains, "
                                  "%d compute rows per owner, physical handoff bases 0/%d; "
                                  "accepted-prefix commit before either group reuses its owner.\n",
-                                 batch_compute_rows, o.batch);
+                                 batch_compute_rows, std::min(o.batch, 4));
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
             int count = 0;
+            int cursor = 0;                 ///< rotating waves only when a group owns more than two slots
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
@@ -11148,6 +11150,32 @@ int main(int argc, char** argv) {
                     PGroup& G = pg[(size_t) pick];
                     G.round_started = bounded_round;
                     G.count = 0;
+                    if (GS > 2) {
+                        int selected[2] = {}, n = 0, scanned = 0;
+                        for (; scanned < GS && n < 2; ++scanned) {
+                            const int b = pick * GS + (G.cursor + scanned) % GS;
+                            const BSlot& sl = bs[(size_t) b];
+                            if (!sl.active) continue;
+                            if (sl.stop) {
+                                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                                print_mtp_done(b, "cancel");
+                                continue;
+                            }
+                            selected[n++] = b;
+                        }
+                        G.cursor = (G.cursor + scanned) % GS;
+                        // Six unordered pairs × four depth shapes, plus eight singleton shapes: <= 32 keys.
+                        if (n == 2 && selected[0] > selected[1]) std::swap(selected[0], selected[1]);
+                        for (int t = 0; t < n; ++t) {
+                            const int b = selected[t];
+                            const BSlot& sl = bs[(size_t) b];
+                            if (sl.draft < 0) { std::printf("ERR batch MTP: live slot has no proposal\n"); return false; }
+                            G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
+                            if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
+                                G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
+                            }
+                        }
+                    } else
                     for (int t = 0; t < GS; ++t) {
                         const int b = pick * GS + t;
                         const BSlot& sl = bs[(size_t) b];
@@ -11172,7 +11200,7 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::Verifier& owner = group_verifier(k, pick);
                 strata::core::progress().busy.store(true);
-                if (!owner.batch_launch(pick * (2 * GS), G.rows, G.count, G.tok, G.pos, err,
+                if (!owner.batch_launch(pick * std::min(2 * GS, 4), G.rows, G.count, G.tok, G.pos, err,
                                         strata::core::Verifier::BatchCommit::deferred)) {
                     std::printf("ERR %s\n", err.c_str()); return false;
                 }

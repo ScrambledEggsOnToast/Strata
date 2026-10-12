@@ -463,11 +463,15 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
   penalty histories remain request-local. This is not coupled draft sampling. Admission prices the eight-row
   verifier arena on every split stage; the synchronous schedule adds no retained rollback buffers.
   Separately, `--batch-mtp --batch-mtp-pipeline --batch-groups 2` retains **both** group pipelines on a
-  distinct-device layer split with two or four resident slots; other shapes refuse. Each group owns a verifier
+  distinct-device layer split with an even two through eight resident slots; other shapes refuse. Each group owns a verifier
   arena, row metadata, sampling/history controls and canary lease on every stage until the same recursive
   accepted-prefix commit completes. Four slots use four compute rows per owner and disjoint physical mapped
   handoff regions `[0,4)` and `[4,8)`, independent of active-slot compaction. Session and draft KV remain private
   per request, not duplicated per group. Engine status reports `batch_schedule=pipelined` and effective groups=2.
+  Six/eight slots rotate through at most two selected slots per group; four compute rows and fixed handoff bases
+  0/4 suffice. Selected slots are ordered canonically, bounding the four-slot group's pair/singleton depth shapes
+  to 32 graph keys. Two/four-slot formation is unchanged. Compute capacity is `max(spec, min(batch, 4))`;
+  larger resident counts increase private session/draft state and controls, not the retained replay quantum.
   A completed group waits for host-served expert graphs on other stages to drain before a synchronous prefix
   commit could strand their doorbells; fully resident stages retain continuous group overlap.
 - Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
