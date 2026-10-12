@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import make_profile as MP  # noqa: E402
+import bench_eviction as BE  # noqa: E402
 
 NE = 4   # a tiny "experts per layer"; the layer count is fixed at MP.N_LAYER
 
@@ -30,6 +31,45 @@ def write_trace(path, records):
 def full_base():
     """Every pair, in an order that differs from rank_profile's fill (e-major then layer)."""
     return [(layer, e) for layer in range(MP.N_LAYER) for e in range(NE)]
+
+
+class TraceStructure(unittest.TestCase):
+    def test_both_consumers_refuse_every_partial_terminal_record(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "routing.bin"
+            write_trace(path, [(0, [1, 2]), (1, [2, 3])])
+            complete = path.read_bytes()
+            first_record_bytes = 24
+            # A complete prefix is not a substitute for the damaged final record.
+            for end in range(first_record_bytes + 1, len(complete)):
+                path.write_bytes(complete[:end])
+                for reader in (MP.read_trace, BE.read_trace):
+                    with self.subTest(end=end, reader=reader.__module__):
+                        with self.assertRaisesRegex(ValueError, "truncated routing"):
+                            reader(path, n_expert=NE)
+
+    def test_invalid_counts_and_weights_are_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "routing.bin"
+            for k in (-1, 0, 4097):
+                path.write_bytes(struct.pack("<ii", 0, k))
+                for reader in (MP.read_trace, BE.read_trace):
+                    with self.subTest(k=k, reader=reader.__module__):
+                        with self.assertRaisesRegex(ValueError, "implausible expert count"):
+                            reader(path, n_expert=NE)
+            for weight in (float("nan"), float("inf"), -0.5):
+                path.write_bytes(struct.pack("<iiif", 0, 1, 2, weight))
+                for reader in (MP.read_trace, BE.read_trace):
+                    with self.subTest(weight=weight, reader=reader.__module__):
+                        with self.assertRaisesRegex(ValueError, "invalid routing weights"):
+                            reader(path, n_expert=NE)
+
+    def test_zero_weight_placeholders_and_frequency_order_remain_valid(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "routing.bin"
+            path.write_bytes(struct.pack("<iiif", 0, 1, 2, 0.0) * 2)
+            self.assertEqual(MP.read_trace(path, NE), {(0, 2): 2})
+            self.assertEqual(list(BE.read_trace(path, NE)), [BE.encode(0, 2)] * 2)
 
 
 class RankProfile(unittest.TestCase):
@@ -83,6 +123,18 @@ class Main(unittest.TestCase):
             MP.main()
         finally:
             sys.argv = old
+
+    def test_malformed_trace_never_rewrites_the_output_profile(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            trace, out = root / "routing.bin", root / "profile.bin"
+            write_trace(trace, [(0, [1]), (1, [2])])
+            # Both IDs exist, but the terminal weight is missing.
+            trace.write_bytes(trace.read_bytes()[:-4])
+            out.write_bytes(b"existing profile must survive")
+            with self.assertRaisesRegex(ValueError, "truncated routing body"):
+                self.run_main([str(trace), "--no-base", "--out", str(out)])
+            self.assertEqual(out.read_bytes(), b"existing profile must survive")
 
     def test_end_to_end_reorder_over_a_complete_base(self):
         with tempfile.TemporaryDirectory() as d:

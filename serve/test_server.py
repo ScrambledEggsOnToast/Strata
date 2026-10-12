@@ -5100,6 +5100,71 @@ class UntimedReads(unittest.TestCase):
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
 
+class QueueRetryHint(unittest.TestCase):
+    """Deterministic monotonic queue samples; no engine process or elapsed-time sleeps."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def snapshot(self):
+        with mock.patch("serve.server.time.perf_counter", return_value=100), self.svc.status_lock:
+            return self.svc._admission_snapshot()
+
+    def test_idle_but_full_queue_is_small_and_old_waiter_increases_hint(self):
+        self.svc.configure_admission({"request_queue_limit": 0})
+        self.svc.admission_waiters = [{"_clock": 100}]
+        fresh = self.snapshot()
+        self.assertEqual((fresh["active"], fresh["waiting"], fresh["retry_after_s"]), (0, 1, 1))
+        self.svc.admission_waiters[0]["_clock"] = 96
+        old = self.snapshot()
+        self.assertEqual((old["oldest_wait_s"], old["retry_after_s"]), (4, 5))
+
+    def test_service_estimate_excludes_queue_and_uses_recent_successes(self):
+        self.svc.history.append({"finish": "stop", "duration_s": 1000, "queue_s": 0})
+        self.svc.history.extend({"finish": "stop", "duration_s": 100.25, "queue_s": 100} for _ in range(32))
+        self.svc.admission_waiters = [{"_clock": 98}]
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot["service_time_estimate_s"], 0.25)
+        self.assertEqual(snapshot["retry_after_s"], 3)
+        self.svc.history.clear()
+        self.svc.history.extend([
+            {"finish": "stop", "duration_s": 102, "queue_s": 100},
+            {"finish": "length", "duration_s": 106, "queue_s": 100},
+            {"finish": "cancel", "duration_s": 1000, "queue_s": 0},
+            {"finish": "stop", "duration_s": float("inf"), "queue_s": 0},
+            {"finish": "stop", "duration_s": float("nan"), "queue_s": 0},
+            {"finish": "stop", "duration_s": 0, "queue_s": 0},
+        ])
+        snapshot = self.snapshot()
+        self.assertEqual((snapshot["service_time_estimate_s"], snapshot["retry_after_s"]), (4, 6))
+
+    def test_active_service_age_is_a_lower_bound_without_its_queue_wait(self):
+        self.svc.admission_active = {"active": {"_clock": 90, "queue_s": 8, "state": "admitted"}}
+        snapshot = self.snapshot()
+        self.assertEqual((snapshot["service_time_estimate_s"], snapshot["retry_after_s"]), (2, 2))
+        self.svc.admission_waiters = [{"_clock": 98}]
+        self.assertEqual(self.snapshot()["retry_after_s"], 4)
+
+    def test_pathological_estimates_stay_inside_timeout_aware_clamp(self):
+        for timeout, ceiling in ((600, 30), (5.9, 5), (1, 1), (0.25, 1)):
+            with self.subTest(timeout=timeout):
+                self.svc.configure_admission({"request_timeout_s": timeout})
+                self.svc.history.clear()
+                self.svc.history.append({"finish": "stop", "duration_s": 1e300, "queue_s": 0})
+                self.svc.admission_waiters = [{"_clock": -1e300}]
+                snapshot = self.snapshot()
+                self.assertEqual(snapshot["retry_after_ceiling_s"], ceiling)
+                self.assertEqual(snapshot["service_time_estimate_s"], ceiling)
+                self.assertEqual(snapshot["retry_after_s"], ceiling)
+                self.assertGreaterEqual(snapshot["retry_after_s"], 1)
+
+    def test_idle_startup_is_not_throttled_by_old_service_history(self):
+        self.svc.history.append({"finish": "stop", "duration_s": 1000, "queue_s": 0})
+        self.assertEqual(self.snapshot()["retry_after_s"], 1)
+
+
 class BoundedAdmission(unittest.TestCase):
     """HTTP admission stays bounded; status describes reservations, not native compute."""
 
@@ -5176,9 +5241,11 @@ class BoundedAdmission(unittest.TestCase):
         for path in ("/metrics", "/health", "/v1/status"):
             observed = self.get(path)["admission"]
             self.assertEqual((observed["active"], observed["waiting"], observed["request_queue_limit"]), (1, 2, 2))
+            self.assertGreaterEqual(observed["retry_after_s"], 1)
+            self.assertLessEqual(observed["retry_after_s"], observed["retry_after_ceiling_s"])
         status, headers, body = self.post()
         self.assertEqual(status, 429, body)
-        self.assertEqual(headers.get("Retry-After"), "1")
+        self.assertIn(int(headers["Retry-After"]), range(1, 6))
         self.assertIn("queue is full", body["error"]["message"])
         self.release.set()
         for thread in self.threads:
@@ -5189,6 +5256,28 @@ class BoundedAdmission(unittest.TestCase):
         snapshot = self.wait_for_queue(0)
         self.assertEqual((snapshot["active"], snapshot["oldest_wait_s"]), (0, 0))
 
+    def test_old_waiter_hint_matches_status_and_metrics_on_429_and_503(self):
+        self.start_request()
+        self.assertTrue(self.entered.wait(5))
+        self.start_request()
+        self.start_request()
+        self.wait_for_queue(2)
+        with self.svc.status_lock:
+            self.svc.admission_waiters[0]["_clock"] -= 30
+        for path in ("/status", "/metrics", "/health", "/v1/status"):
+            snapshot = self.get(path)["admission"]
+            self.assertEqual((snapshot["retry_after_s"], snapshot["retry_after_ceiling_s"]), (5, 5))
+        status, headers, body = self.post()
+        self.assertEqual(status, 429, body)
+        self.assertEqual(headers["Retry-After"], "5")
+        # /props has an existing unloaded-engine 503 path that does not need a generation reservation.
+        with mock.patch.object(self.svc.engine, "alive", return_value=False, create=True):
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                self.get("/props")
+            with refused.exception as response:
+                self.assertEqual(response.code, 503)
+                self.assertEqual(response.headers["Retry-After"], "5")
+
     def test_zero_depth_admits_idle_slot_but_refuses_overflow(self):
         self.svc.configure_admission({"request_queue_limit": 0, "request_timeout_s": 5})
         self.start_request()
@@ -5197,7 +5286,7 @@ class BoundedAdmission(unittest.TestCase):
         self.assertEqual((snapshot["active"], snapshot["request_queue_limit"]), (1, 0))
         status, headers, body = self.post()
         self.assertEqual(status, 429, body)
-        self.assertEqual(headers.get("Retry-After"), "1")
+        self.assertIn(int(headers["Retry-After"]), range(1, 6))
         self.release.set()
         self.threads[0].join(10)
         self.assertEqual(self.post()[0], 200)

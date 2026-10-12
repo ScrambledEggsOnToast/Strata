@@ -69,15 +69,11 @@ def read_trace(path, n_expert=N_EXPERT, n_layers=N_LAYER):
     Same records as make_profile.read_trace - (layer, k, k expert ids, k weights) - but eviction policy
     is a question about order, so the frequencies it returns are not enough.  Out-of-range pairs are
     skipped the same way it skips them."""
-    blob = Path(path).read_bytes()
-    codes, off = array("I"), 0
-    while off + 8 <= len(blob):
-        layer, k = struct.unpack_from("<ii", blob, off)
-        off += 8
-        for e in struct.unpack_from("<%di" % k, blob, off):
+    codes = array("I")
+    for layer, experts in MP.trace_records(path):
+        for e in experts:
             if 0 <= layer < n_layers and 0 <= e < n_expert:
                 codes.append(encode(layer, e))
-        off += 8 * k  # the ids and the weights
     return codes
 
 

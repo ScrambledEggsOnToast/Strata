@@ -777,12 +777,28 @@ class ParallelService(unittest.TestCase):
                     self.assertEqual((observed["active"], observed["waiting"],
                                       observed["request_queue_limit"]), (2, depth, depth))
                     self.assertEqual((observed["executing"], observed["native_waiting"]), (1, 1))
+                    self.assertGreaterEqual(observed["retry_after_s"], 1)
+                    self.assertLessEqual(observed["retry_after_s"], observed["retry_after_ceiling_s"])
                 with self.assertRaises(urllib.error.HTTPError) as refused:
                     self.chat("beyond the bounded capacity")
                 with refused.exception as response:
                     self.assertEqual(response.code, 429)
-                    self.assertEqual(response.headers.get("Retry-After"), "1")
+                    self.assertIn(int(response.headers["Retry-After"]), range(1, 31))
                     self.assertIn("queue is full", json.load(response)["error"]["message"])
+                with self.svc.status_lock:
+                    if depth:
+                        self.svc.admission_waiters[0]["_clock"] -= 40
+                    else:
+                        next(iter(self.svc.admission_active.values()))["_clock"] -= 40
+                for path in ("/status", "/metrics", "/health", "/v1/status"):
+                    old = self.get(path)["admission"]
+                    self.assertEqual((old["active"], old["waiting"]), (2, depth))
+                    self.assertEqual((old["retry_after_s"], old["retry_after_ceiling_s"]), (30, 30))
+                with self.assertRaises(urllib.error.HTTPError) as refused:
+                    self.chat("retry while the queue is still full")
+                with refused.exception as response:
+                    self.assertEqual(response.code, 429)
+                    self.assertEqual(response.headers["Retry-After"], "30")
             finally:
                 gate.unlink(missing_ok=True)
                 for thread in threads:
@@ -794,6 +810,7 @@ class ParallelService(unittest.TestCase):
             self.assertTrue(all(reply["choices"][0]["message"]["content"] == "ok, done." for reply in replies))
             snapshot = self.get("/status")["admission"]
             self.assertEqual((snapshot["active"], snapshot["waiting"], snapshot["oldest_wait_s"]), (0, 0, 0))
+            self.assertEqual(snapshot["retry_after_s"], 1)
 
     def test_configured_depth_refuses_at_effective_slots_plus_depth(self):
         self.queue_boundary(3)
