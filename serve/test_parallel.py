@@ -44,6 +44,8 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+if "--says-budget" in args:
+    print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
 if "--says-residency" in args:
     for info in args[args.index("--says-residency") + 1].splitlines():
         print("INFO " + info, flush=True)
@@ -71,6 +73,8 @@ def window():        # one batch window: every active slot one token
         t = left.pop(0) if left else 257
         produced += 1
         print(f"BT {b} {t}", flush=True)
+        if log and "--says-budget" in args:
+            log.write(f"COMMIT {b} {produced}\n"); log.flush()
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
@@ -82,6 +86,7 @@ log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
 def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
     return 0 if not REUSE else len(ids) - 1 if continued(ids)[1] else 3
+parked = {}
 while True:
     try:
         line = lines.get(timeout=STEP if active else None)
@@ -93,6 +98,7 @@ while True:
         continue                              # too late: the read it was for has ended
     if line.startswith("BSTOP "):
         b = int(line.split()[1])
+        parked.pop(b, None)
         if b in active:
             active[b][1] = 0
             stopped.add(b)
@@ -117,9 +123,15 @@ while True:
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
-        for q in range(CH, len(ids) - 1, CH):
+        saved = parked.pop(slot, None) if slot is not None else None
+        start = saved[1] if saved and saved[0] == ids else 0
+        read_reused = max(reused(ids), start)   # Resumed legs include this request's own parked work.
+        for q in range(start + CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
-            print(f"PP {q} {len(ids)} 1 1", flush=True)
+            if "--quiet-prefill" not in args:
+                print(f"PP {q} {len(ids)} 1 1", flush=True)
+            if log and "--says-budget" in args:
+                log.write(f"PREFILL {slot} {q}\n"); log.flush()
             held = []
             while True:
                 try:
@@ -139,10 +151,11 @@ while True:
             if active and (q // CH) % 4 == 0:     # the slots decode between the prompt's chunks (as the engine)
                 window()
         if given:
+            parked[given[0]] = (ids, given[1])
             if log:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {reused(ids)}", flush=True)
+            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {read_reused}", flush=True)
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
@@ -157,7 +170,7 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {read_reused}", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -215,6 +228,121 @@ class ParallelArgs(unittest.TestCase):
             engine_args({"args": [], "resident_multiplex": True})
         with self.assertRaises(ValueError):
             engine_args({"args": [], "resident_multiplex": "true"})
+
+
+class ControlBudget(unittest.TestCase):
+    def test_arrival_trace_bounds_background_wait_without_reordering_foreground(self):
+        import collections
+        engine = object.__new__(StrataEngine)
+        engine.foreground_budget_s = 1.0
+        engine.background_share = .25
+        background = [3000, object(), "background", 1.0]
+        foreground = [[20, object(), "foreground", float("inf")] for _ in range(100)]
+        engine.control_waiters = collections.deque([background, *foreground])
+        self.assertIs(engine._control_turn(0), foreground[0])
+        engine.control_waiters.remove(foreground[0])
+        self.assertIs(engine._control_turn(.99), foreground[1])
+        self.assertIs(engine._control_turn(1.0), background,
+                      "new foreground arrivals cannot overtake a due background continuation")
+        with mock.patch("serve.server.time.monotonic", return_value=2.0):
+            self.assertAlmostEqual(engine._background_next(1.8), 2.6)
+            self.assertEqual(engine._background_next(0), 8.0,
+                             "background requeue must repay measured service, not force a chunk every budget")
+        self.assertTrue(engine._can_yield(100), "the legacy two-yield cap bypasses the configured policy")
+        engine.foreground_budget_s = 0
+        self.assertIs(engine._control_turn(1.0), background)
+        self.assertFalse(engine._can_yield(2), "rollback preserves the legacy policy")
+
+    def test_foreground_waiting_for_a_physical_slot_stays_in_the_control_queue(self):
+        import collections
+        engine = object.__new__(StrataEngine)
+        engine.foreground_budget_s = 1.0
+        engine.background_share = .25
+        engine.slot_cv = threading.Condition()
+        engine.ctl = threading.Lock()
+        engine.ctl_epoch = 0
+        engine.waiting = 0
+        engine.wait_lens = []
+        engine.control_waiters = collections.deque()
+        engine.alive = lambda: True
+        ready, acquired, cancel = threading.Event(), threading.Event(), threading.Event()
+        results = []
+        def request():
+            def wait():
+                results.append((yield from engine._take_control(cancel, 20, lambda _: acquired.set(),
+                                                               slot_ready=ready.is_set)))
+            list(wait())
+        thread = threading.Thread(target=request)
+        thread.start()
+        with engine.slot_cv:
+            self.assertTrue(engine.slot_cv.wait_for(lambda: engine.waiting == 1, timeout=2))
+            foreground = engine.control_waiters[0]
+            background = [3000, object(), "background", time.monotonic() + 10]
+            engine.control_waiters.append(background)
+            self.assertIs(engine._control_turn(time.monotonic()), foreground,
+                          "a foreground slot waiter must not disappear and make background appear alone")
+            self.assertFalse(engine.ctl.locked())
+            background[3] = 0
+            self.assertIs(engine._control_turn(time.monotonic()), background,
+                          "keeping a slot waiter visible must not starve due background work")
+            engine.control_waiters.remove(background)
+            ready.set()
+            engine.slot_cv.notify_all()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [True])
+        self.assertTrue(acquired.is_set())
+        self.assertEqual(engine.waiting, 0)
+        self.assertEqual(list(engine.control_waiters), [])
+        engine.ctl.release()
+
+    def test_http_foreground_waiter_is_visible_but_cannot_starve_due_background(self):
+        import collections
+        service = object.__new__(Service)
+        foreground = {"priority": "foreground"}
+        service.admission_waiters = [foreground]
+        service.admission_active = {}
+        service._refresh_foreground_pending()
+        self.assertTrue(service._foreground_pending)
+        service.admission_waiters.remove(foreground)
+        service.admission_active["foreground"] = foreground
+        service._refresh_foreground_pending()
+        self.assertTrue(service._foreground_pending, "admitted but unsubmitted requests are still waiting")
+        foreground["_executing"] = True
+        service._refresh_foreground_pending()
+        self.assertFalse(service._foreground_pending, "an executing decoder is not an admission waiter")
+        foreground["_executing"] = False
+        service._refresh_foreground_pending()
+        engine = object.__new__(StrataEngine)
+        engine.foreground_budget_s = 1.0
+        engine.background_share = .25
+        engine.slot_cv = threading.Condition()
+        engine.ctl = threading.Lock()
+        engine.ctl_epoch = 0
+        engine.waiting = 0
+        engine.wait_lens = []
+        engine.control_waiters = collections.deque()
+        engine.alive = lambda: True
+        acquired, cancel = threading.Event(), threading.Event()
+        results = []
+        due = time.monotonic() + 1.0
+        def request():
+            def wait():
+                results.append((yield from engine._take_control(
+                    cancel, 3000, lambda _: acquired.set(), priority="background", background_due=due,
+                    foreground_pending=lambda: service._foreground_pending)))
+            list(wait())
+        thread = threading.Thread(target=request)
+        thread.start()
+        with engine.slot_cv:
+            self.assertTrue(engine.slot_cv.wait_for(lambda: engine.waiting == 1, timeout=.5))
+            self.assertFalse(engine.ctl.locked(), "HTTP foreground demand forbids early background reacquisition")
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(acquired.is_set(), "a due background request advances even under persistent demand")
+        self.assertEqual(results, [True])
+        engine.ctl.release()
+
 
 
 class PickSlot(unittest.TestCase):
@@ -332,8 +460,9 @@ class ParallelService(unittest.TestCase):
         if getattr(self, "tmp", None):
             self.tmp.cleanup()
 
-    def chat(self, text, max_tokens=64):
-        body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens, "reasoning_effort": "none"}
+    def chat(self, text, max_tokens=64, priority="foreground"):
+        body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
+                "reasoning_effort": "none", "strata_priority": priority}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -781,6 +910,98 @@ class ParallelService(unittest.TestCase):
         self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
         log = self.log.read_text().splitlines()
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_time_budget_silent_prefill_yields_before_the_ten_second_heartbeat(self):
+        self.start(2, says_groups=2, more=("--says-budget", "--quiet-prefill"))
+        replies, failures = {}, []
+        def request(name, text):
+            try:
+                replies[name] = self.chat(text, max_tokens=12,
+                                          priority="background" if name == "long" else "foreground")
+            except Exception as error:
+                failures.append(str(error))
+        long = threading.Thread(target=request, args=("long", "long " * 600))
+        long.start()
+        time.sleep(.1)
+        short = threading.Thread(target=request, args=("short", "short chat"))
+        short.start()
+        for thread in (short, long):
+            thread.join(5)
+        self.assertFalse(long.is_alive() or short.is_alive(), "silent prefill bypassed cooperative yield polling")
+        self.assertEqual(failures, [])
+        self.assertEqual(set(replies), {"long", "short"})
+        log = self.log.read_text().splitlines()
+        yielded = next(index for index, line in enumerate(log) if line.startswith("YIELD "))
+        continued = next(index for index, line in enumerate(log) if line.startswith("PREFILL ") and
+                         int(line.split()[2]) > 2500)
+        self.assertLess(yielded, continued, "the short request waited for the whole silent prefill")
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_time_budget_background_progresses_under_foreground_arrivals(self):
+        self.start(3, says_groups=3, more=("--says-budget",))
+        failures, replies = [], {}
+        def request(name, text, priority="foreground"):
+            try:
+                replies[name] = self.chat(text, max_tokens=12, priority=priority)
+            except Exception as error:
+                failures.append(str(error))
+        background = threading.Thread(target=request, args=("background", "long " * 600, "background"))
+        background.start()
+        arrivals = []
+        for index in range(8):
+            time.sleep(.08)
+            thread = threading.Thread(target=request, args=(f"short-{index}", f"short arrival {index}"))
+            thread.start()
+            arrivals.append(thread)
+        for thread in [background, *arrivals]:
+            thread.join(15)
+        self.assertFalse(any(thread.is_alive() for thread in [background, *arrivals]), "an arrival starved")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(replies), 9)
+        self.assertTrue(all(reply["choices"][0]["message"]["content"] == "ok, done." for reply in replies.values()))
+        self.assertEqual(replies["background"]["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+                         "a cold request's own parked prefill is not reused input")
+        log = self.log.read_text().splitlines()
+        progress = [int(line.split()[2]) for line in log if line.startswith("PREFILL ") and int(line.split()[2]) > 64]
+        self.assertGreater(max(progress), 2500, "background prefill did not keep advancing")
+        yields = [int(line.split()[2]) for line in log if line.startswith("YIELD ")]
+        self.assertGreater(len(yields), 2, "sustained arrivals must exercise beyond the legacy yield cap")
+        self.assertEqual(yields, sorted(set(yields)), "a resumed read lost its arithmetic position")
+        self.assertTrue(any(line.startswith("COMMIT ") for line in log), "decoders ran during the read")
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_time_budget_several_decoders_and_prefill_complete_in_isolation(self):
+        self.start(4, says_groups=2, more=("--says-budget",))
+        replies, failures = {}, []
+        def request(name, text, priority="foreground"):
+            try:
+                replies[name] = self.chat(text, max_tokens=60, priority=priority)
+            except Exception as error:
+                failures.append(str(error))
+        threads = [threading.Thread(target=request, args=(str(i), f"decoder {i} LONGREPLY")) for i in range(3)]
+        for thread in threads:
+            thread.start()
+            time.sleep(.03)
+        prefill = threading.Thread(target=request, args=("prefill", "long " * 500, "background"))
+        prefill.start()
+        time.sleep(.15)
+        short = threading.Thread(target=request, args=("short", "arriving short chat"))
+        short.start()
+        for thread in [*threads, prefill, short]:
+            thread.join(15)
+        self.assertFalse(any(thread.is_alive() for thread in [*threads, prefill, short]))
+        self.assertEqual(failures, [])
+        self.assertEqual(replies["prefill"]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(replies["short"]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(replies["prefill"]["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+                         "a cold BGEN's first parked leg must not receive internal-prefix credit")
+        for index in range(3):
+            self.assertEqual(replies[str(index)]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        frames = self.log.read_text().splitlines()
+        first_read = next(i for i, frame in enumerate(frames) if frame.startswith("PREFILL ") and int(frame.split()[2]) > 64)
+        self.assertTrue(any(frame.startswith("COMMIT ") for frame in frames[first_read + 1:]),
+                        "active decoders must commit while long prefill advances")
         self.assertFalse(any(self.engine.slot_busy))
 
     def test_no_way_given_to_a_long_one(self):
