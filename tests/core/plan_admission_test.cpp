@@ -262,6 +262,21 @@ void test_request_admission_by_state_demand() {
             "request state demand arithmetic is wrong");
     require(admit_request(req, 3990).reason.find("exceeds the context") != std::string::npos,
             "an over-context request did not name the context in its refusal");
+    // A resident prefill executes GEN 1, but admission must price the original
+    // completion budget, with the same eight-cell margin as the solo request.
+    req.prompt_tokens = 23;
+    req.max_new_tokens = 4065;
+    const auto near = admit_request(req, 4096);
+    require(near.admitted && near.cells == 4088 &&
+            near.state_demand_bytes == state_bytes(g) + 4088ull * kv_bytes_per_token(g),
+            "near-limit resident budget lost cells or state demand");
+    ++req.max_new_tokens;
+    require(!admit_request(req, 4096).admitted,
+            "one cell beyond the unchanged resident context margin admitted");
+    req.prompt_tokens = 2;
+    req.max_new_tokens = INT64_MAX;
+    require(!admit_request(req, 4096).admitted,
+            "resident output-budget overflow reached state pricing");
 }
 
 // AC-3: the explain-or-shrink rule.  An overshoot within tolerance is fine; beyond tolerance it blocks

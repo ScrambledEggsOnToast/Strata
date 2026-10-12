@@ -25,6 +25,16 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    program::ResidentRequest oversized;
+    oversized.max_new = 55; // two prompt cells + 55 output + the unchanged eight-cell margin > 64
+    check(!slots.begin(-1, {11, 22}, oversized, error) && error.find("exceeds the context") != std::string::npos,
+          "full output budget refuses before binding working consumers");
+    oversized.max_new = INT64_MAX;
+    check(!slots.begin(-1, {11, 22}, oversized, error) && error.find("overflowing") != std::string::npos,
+          "overflowing output budget refuses before state pricing or binding");
+    check(slots.working().request == 0 && dispatch.request_generation == 0 &&
+          slots.slots()[0].request == 0 && slots.slots()[1].request == 0,
+          "budget refusal publishes no identity and changes no resident owner");
     const core::ExpertOperation operation{71, 0, 0, 1, 1};
     check(dispatch.completion[0].begin(operation, 0), "operation lease acquired");
     program::ResidentRequest config;

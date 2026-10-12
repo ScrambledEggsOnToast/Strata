@@ -307,7 +307,7 @@ struct AdmissionDecision {
 ///   * guest or host demand exceeds the measured ceiling less the (floored) reserve, or either ceiling
 ///     is unmeasured while that scope carries demand;
 ///   * every device is hypothetical - nothing was measured, so nothing is admitted.
-AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
+inline AdmissionDecision admit_configuration(const std::vector<DeviceCost>& devices,
                                       const std::vector<DeviceTelemetry>& telemetry,
                                       const Scope& guest_demand, const Scope& host_demand,
                                       const GuestHostPolicy& policy,

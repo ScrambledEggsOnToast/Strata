@@ -39,6 +39,28 @@ or an over-budget plan. After admission, runtime allocation may still reduce the
 single-session fallback when fewer than two slots fit. The server reads the effective count from
 `INFO batch_slots=N`; `GET /v1/status` reports `concurrency.serving`.
 
+Each arrival checks **prompt + the original requested output + eight cells of slack** before position uploads,
+request-identity binding or prompt/decode submission. `BGEN`'s internal `GEN 1` is only its prefill leg: it is
+not the request's output budget. Main-session demand is the full, preallocated arena footprint of the
+startup-resolved working/slot role, summed over each stage's own layer range. A shorter arrival neither
+resizes nor re-resolves that placement. `ADMIT` reports that fixed device footprint, not an extra allocation;
+draft, pinned-host and workspace budgets remain separately charged at startup. Invalid or overflowing lengths
+refuse before work. A refused `BGEN` emits
+`REJECT bounded=1 ...` followed immediately by `BADM <slot> 0`, with no output or new request identity.
+The server consumes that exact boundary and frees only the rejected reservation; a missing or mismatched
+boundary still ends the engine rather than risk assigning its lines to another request.
+
+The HTTP `admission.active` count is a reservation count, not an execution count. `admission.waiting` counts
+the bounded HTTP queue; `admission.native_waiting` counts reserved requests waiting to submit their next
+native leg; `admission.executing` counts submitted request legs through their drained completion. The latter
+does not claim simultaneous GPU kernels or overlapping prefill and decode. Active slot metrics include the
+stable frontend `request_id`, matching `X-Strata-Request-Id` across solo/resident transitions and slot reuse.
+
+For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complete native stdout frames as
+`wire<` lines in the frontend log. Count only those trace lines' `T` and `BT` token IDs once; `ADMIT`, `BADM`,
+`BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
+and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage and slot request IDs.
+
 ### Resident multiplexing without compute batching
 
 `--serve --batch N --resident-multiplex` keeps the resident state allocation but
@@ -499,13 +521,15 @@ On top of `GEN` / `GENI`:
 | `BGEN <slot> <max_new> [keys] <ids>` | in | read the prompt (as `GEN 1`), then continue in `<slot>` |
 | `BPRIORITY <slot> foreground\|background` | in | set the resident slot's scheduling class before BGEN (multiplex mode); no success reply, malformed requests emit ERR |
 | `BGENI <slot> <max_new> [keys] <file> <ids>` | in | the same with images |
-| `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
+| `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended; also the exact terminal boundary after a bounded admission refusal |
 | `BT <slot> <id>` | out | a token of that slot |
-| `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
+| `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again; a non-pipelined slot may keep its conversation, a pipelined slot does not |
 | `BSTOP <slot>` | in | retire an active slot at the next safe boundary with BDONE, without another token; for an inactive yielded slot, end continuation ownership without BDONE |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |
+| `ADMIT cells=N state_demand_bytes=N context_limit=N batch_capacity=N slot_capacity_bytes=N admission_ns=N` | out | original prompt/output extent and summed stage-local main-session device arena demand/capacity, before work; timestamp uses the engine's steady clock |
+| `REJECT bounded=1 <reason>` then `BADM <slot> 0` | out | a resident request refused before any output or identity binding; its slot remains reusable and other requests continue |
 
 `tools/batch_test.py` drives the engine directly: the same prompts alone, then together, compared token by token,
 and the aggregate rate.
