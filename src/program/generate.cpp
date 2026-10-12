@@ -3661,11 +3661,12 @@ int main(int argc, char** argv) {
         strata::plan::DeviceCost& d0 = add_device("CUDA0");
         strata::plan::Scope& v0 = d0.vram;
         v0.add("weights_canonical", pool_bytes, "WeightTable::pool_bytes (pack index header)");
-        uint64_t native_source_bytes = 0;
+        // Host upload demand is the source union of all priced stages, not CUDA0's trimmed payload.
+        strata::core::NativeDense::SourceSpans native_source_spans;
         if (!o.native_dense_gguf.empty()) {
             uint64_t nb = 0;
             if (!strata::core::NativeDense::planned_bytes(o.native_dense_gguf, o.native_ple_key, nb, err,
-                                                        &native_source_bytes)) {
+                                                        &native_source_spans)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -3830,7 +3831,7 @@ int main(int argc, char** argv) {
                     // Price under that same range, then restore CUDA0's pending load range.
                     if (stage_trim) strata::core::NativeDense::set_layer_range((int) layer_begin, (int) layer_end);
                     const bool dense_priced = strata::core::NativeDense::planned_bytes(
-                        o.native_dense_gguf, o.native_ple_key, dense_bytes, err);
+                        o.native_dense_gguf, o.native_ple_key, dense_bytes, err, &native_source_spans);
                     if (stage_trim) strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
                     if (!dense_priced) {
                         std::fprintf(stderr, "strata generate: stage native dense pricing: %s\n", err.c_str());
@@ -4354,33 +4355,9 @@ int main(int argc, char** argv) {
             } else ram_unknown("embedding_pinned", "GGUF token_embd.weight unavailable");
         }
         uint64_t native_dense_source_pages = 0;
-        if (native_source_bytes) {
-            std::set<std::string> served;
-            if (!strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, served, err)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return 1;
-            }
-            uint64_t checked_native_source_bytes = 0;
-            for (const auto& path : o.native_dense_gguf) {
-                try {
-                    strata::GgufFile gguf(path);
-                    for (const auto& tensor : gguf.tensors()) {
-                        if (!served.count(tensor.name)) continue;
-                        const uint64_t bytes = tensor_payload_bytes(gguf, tensor);
-                        if (!bytes) {
-                            ram_unknown("file:native_dense_upload", "native served source span cannot be bounded", ByteMeaning::clean_file);
-                            continue;
-                        }
-                        checked_native_source_bytes = byte_add(checked_native_source_bytes, bytes);
-                        native_dense_source_pages = byte_add(native_dense_source_pages, source_span_pages(bytes));
-                    }
-                } catch (const std::exception&) {
-                    ram_unknown("file:native_dense_upload", "native GGUF source unavailable during page accounting", ByteMeaning::clean_file);
-                }
-            }
-            if (checked_native_source_bytes != native_source_bytes)
-                ram_unknown("file:native_dense_upload", "native source spans differ from NativeDense::planned_bytes", ByteMeaning::clean_file);
-        }
+        if (!native_source_spans.empty() && !strata::core::NativeDense::source_pages(
+                o.native_dense_gguf, native_source_spans, source_page, native_dense_source_pages, err))
+            ram_unknown("file:native_dense_upload", err.c_str(), ByteMeaning::clean_file);
         upload("file:native_dense_upload", native_dense_source_pages, "each supported native GGUF source span page-rounded; retained after upload/unmap");
         upload("file:native_head_upload", source_span_pages(head_bytes), "native GGUF output.weight source pages retained after upload/unmap");
         startup_only.add("canonical_upload_staging", 24ull << 20,

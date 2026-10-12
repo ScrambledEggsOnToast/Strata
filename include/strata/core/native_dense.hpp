@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -32,10 +33,16 @@ public:
     /// dense tier with the same arithmetic the loader allocates with.  `layer_lo`/`layer_hi` are the same
     /// stage bounds `load` takes (hi < 0 = every layer), and the same selection predicate decides both, so a
     /// stage's price is the stage's upload.
-    /// Optional source_bytes receives just the tensor payload working set read during upload (no scratch).
+    /// Optional source_spans accumulates the deduplicated tensor payloads read by the priced stages (no
+    /// scratch). Reuse it across stage calls: replicated projections/PLE keys occupy the same source pages.
+    using SourceSpans = std::map<std::string, uint64_t>;
     static bool planned_bytes(const std::vector<std::string>& shards, bool include_ple_key,
-                              uint64_t& bytes, std::string& err, uint64_t* source_bytes = nullptr,
+                              uint64_t& bytes, std::string& err, SourceSpans* source_spans = nullptr,
                               int64_t layer_lo = 0, int64_t layer_hi = -1);
+    /// Independently check that the planned source union matches the GGUF payload geometry and file bounds,
+    /// then sum its conservatively page-rounded read spans. No current stage range is consulted here.
+    static bool source_pages(const std::vector<std::string>& shards, const SourceSpans& source_spans,
+                             uint64_t page_size, uint64_t& pages, std::string& err);
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
