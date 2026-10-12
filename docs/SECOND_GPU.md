@@ -228,10 +228,13 @@ unequal-sized slots; metadata and its consumers use the same compute stream.
 The existing cancellation, relayout and final drain remain the scratch owners.
 One 16-byte status copy per chunk uses the containing chunk drain, not a
 per-layer routing join or launch-size readback.
-The legacy `STRATA_PREFILL_TIMING` (presence) and `STRATA_PREFILL_ATTRIBUTION`
-(nonzero integer value) observers keep host grouping: their event pools rely on those layer joins.
-They establish no device-grouping exposure. Use observer-off matched timings
-and a separately matched external kernel timeline for critical-path attribution.
+`STRATA_PREFILL_TIMING` (presence) and `STRATA_PREFILL_ATTRIBUTION` (nonzero integer)
+now observe this route without selecting host grouping or inserting a layer join.
+Events for device layers are folded at the existing chunk hand-off/completion drain.
+Attribution separates the routing readback, direct CPU grouping/enqueue spans,
+the containing host wait, rank/scan/scatter envelopes, and native dispatch shape.
+Keep both observers off in every latency arm; collect an otherwise matched observer
+pair separately. GPU-event envelopes are not pure CPU cost or cross-device clocks.
 
 For 48 layers and 512 experts the additional loanable device price is
 200,704 bytes (including the allocator guards), and the counted host mirror and
@@ -259,10 +262,13 @@ client arrival-TTFT regression. All 24576 experts remained resident with no
 loans. The 8 screen and 7 held-out committed FP32 predictor rows were bitwise
 equal, as were both same-engine eight-row recoveries after prefill cancellation.
 
-**Promotion is rejected pending attribution, not rejected for no measured gain.**
-The separately profiled host-control arm's `nsys stop` timed out at 180 seconds
-and normal MPS retirement timed out at 15 seconds. It remains a failed trace,
-not kernel-timeline evidence; the required matched timeline gate was not met.
+**The original #194 promotion was rejected pending attribution, not for no measured gain.**
+Its separately profiled host-control arm's `nsys stop` timed out at 180 seconds
+and normal MPS retirement timed out at 15 seconds (#200). It remains a failed
+trace, never performance evidence. For #201 the operator explicitly authorised
+the in-engine observer as the replacement evidence surface: prior GPU completion,
+actual host grouping/submission, the integer kernels, unchanged native work and
+chunk/request bounds must still be observed separately from the latency arms.
 The removed synchronization contains preceding GPU work, so these observer-off
 results do not attribute the gain to pure CPU grouping time. The treatment also
 replaces selected up-to-16-expert native dispatch batches with device-sized

@@ -71,6 +71,22 @@ void native_grouped_set_v1(bool v1);
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
+
+/// #195 opt-in Volta prefill: same packed weights, FP16 X/decoded weights, FP32 tensor-core sums.
+/// Covers gate/up IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS and down IQ4_NL/Q2_0, CUDA SM70 only.
+/// False means unsupported before launch (including device-local dynamic shared-memory refusal).
+bool gemm_iq_f16_grouped_supported(int ty, int n_out, int K) noexcept;
+/// Y[r] = X[ids ? ids[r] : r] . W_e^T, r in [bounds[e], bounds[e+1]).
+/// Bounds are absolute in Y, or relative to an offset Y view. X is FP16 (ldx),
+/// Y FP32 (ldy). n_out is a multiple of 128, K a multiple of 256 (gate/up) or
+/// 128 (down); partial token-row tiles are zero-padded. ids may repeat.
+/// W is contiguous with expert_bytes stride, or a device table of expert pointers.
+/// GU/IQ4_NL use four 64-row tiles per chunk; Q2_0 down uses two.
+/// Returns false only before launch; a launch error is a failure, not a fallback.
+bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
+                         const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
+                         const int32_t* ids = nullptr, bool indirect_weights = false);
+
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.

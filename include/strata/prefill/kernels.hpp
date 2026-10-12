@@ -75,6 +75,8 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream);
+/// Same FP16 SwiGLU rounding/saturation, with each GU row laid out [gate 640 | up 640].
+void swiglu_split(const float* gu, uint16_t* h16, int64_t n, void* stream);
 /// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, width 640)
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream);
 /// dst[i] = src[i] for n int32s, as a kernel: either side may be mapped host memory, and the copy never waits
@@ -102,6 +104,13 @@ struct NativeGroupPointers {
 };
 void native_group_pointers(NativeGroupPointers group, unsigned long long* pointers, int32_t* count,
                            int32_t* bounds, void* stream);
+#if !defined(STRATA_USE_HIP)
+/// #195 indirect WMMA weights; the host table is captured by value at launch.
+/// n must be 0..16; blobs remain live through both products. dst arrays hold 16 pointers each.
+constexpr int kExpertPtrTableMax = 16;
+void expert_ptr_table(const void* const* gu, const void* const* dn, int n, const void** dst_gu,
+                      const void** dst_dn, void* stream);
+#endif
 /// Resident helper partials in the router's k order. pair[r] identifies the
 /// original routed pair; inverse has T*10 entries and is reset on every call.
 void peer_reduce_k_order(const float* rows, const int32_t* pair, const float* weights, int64_t n_rows,

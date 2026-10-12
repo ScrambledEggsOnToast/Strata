@@ -20,6 +20,8 @@
 #include "strata/platform/protected_test.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/prefill/kernels.hpp"
 #include "swiglu_reference.hpp"
 
 #include "ggml.h"
@@ -924,10 +926,21 @@ int mmq_only_main(int argc, char** argv) {
     }
 }
 
+#if !defined(STRATA_USE_HIP)
+#include "iq_wmma_test.hpp"
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
+#if !defined(STRATA_USE_HIP)
+        if (argc == 2 && std::strcmp(argv[1], "--wmma-only") == 0) {
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+            return wmma_only_main();
+        }
+#endif
 #ifdef _WIN32
         _putenv_s("STRATA_PF_FUSED", "1");
 #else
