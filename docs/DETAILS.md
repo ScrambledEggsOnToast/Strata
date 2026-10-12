@@ -306,19 +306,27 @@ per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
 **Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
 `PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one
 per stage chunk, and a containing public `Prefill::run` record after its pipeline drains. Records include
-stage ownership, token position/count, MMQ and host-route exposure, mapped readback, deferred shared work,
-borrow status, streamed/DMA expert counts, GPU phase durations, and monotonic host intervals for the route
-join, host grouping, observer fold, stage download, successor wait and final chunk join. The observer adds
-no CUDA event or synchronization call sites and does not change expert arithmetic. It does add host
-accounting/logging and enables the event timer: use it for attribution, **not headline latency**.
+stage ownership, token position/count, MMQ and host/device-route exposure, mapped readback, deferred shared
+work, borrow status, streamed/DMA/resident expert counts, GPU phase durations, and monotonic host intervals
+for readback submission, the containing route join, direct CPU grouping, enqueue completion, observer fold,
+stage download, successor wait and final chunk join. Resident device layers keep their actual grouping and
+dispatch: rank/scan/scatter boundaries only enqueue events, which fold at the existing chunk drain. The
+instrument inserts no layer synchronization and does not change expert arithmetic or launch geometry.
+It adds events, host accounting and logging: use it for attribution, **not headline latency**.
 
-The host grouping GPU envelope starts after the previously queued attention/router work; a long host
-`cudaStreamSynchronize` call can instead be waiting for that earlier GPU work. Raw joins are not removable
-CPU delay, and the stage download interval includes its preceding work as well as the copy. Phase envelopes
-can contain submission gaps and are not isolated kernel measurements. Do not add overlapping host waits to
-GPU durations, or add two devices' timelines into wall time. Host stamps share a monotonic clock; the GPU
-durations do not establish cross-device clock alignment. Invalid event measurements mark the records
-incomplete. The switch is off by default; omit `STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
+`prior_gpu_ready_chunk_ms` is the same-device event offset from chunk origin to the completion of previously
+queued work, just before routing readback or resident rank. `route readback` times the mapped-copy/D2H
+envelope separately; `resident rank`, `resident scan` and `resident scatter` identify the new integer work.
+`dispatches`, `dispatch_cap_groups`, `dispatch_max_entries` and `dispatch_grid_groups` distinguish selected
+up-to-16-expert host batches from one device-sized dispatch. Device-layer `experts=-1` is deliberately
+unknown: there is no new per-layer count readback. The existing chunk status supplies total selected groups.
+The direct CPU grouping span excludes observer folding and shared-expert submission. The larger
+sync-to-enqueue interval still contains ordinary submission work; neither it nor the raw synchronization
+is a pure removable-CPU estimate. Native FFN envelopes can include metadata/submission gaps, not just kernels.
+Do not add overlapping host waits to GPU durations or add two devices' timelines into wall time. Host
+stamps share a monotonic clock; GPU events do not establish cross-device or host/device clock alignment.
+Invalid event measurements mark records incomplete. The switch is off by default; omit
+`STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
 This observer's layer-record storage supports bounds within `[0,48]`; it explicitly refuses other bounds
 rather than emitting a partial capture. The normal unobserved engine path is unchanged.
 
