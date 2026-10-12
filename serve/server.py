@@ -66,6 +66,8 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+DEFAULT_REQUEST_QUEUE_LIMIT = 32
+MAX_REQUEST_QUEUE_LIMIT = 256  # bounded HTTP workers/metadata, not a native serving-capacity claim
 
 
 def popen(what: str, args: list, **kw):
@@ -2746,7 +2748,7 @@ class Service:
         self.admission_waiters = []
         self.admission_active = {}
         self.admission_foreground = 0
-        self.request_queue_limit = 32
+        self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
         self.request_timeout_s = 600.0
         self.request_body_bytes = 4 * 1024 * 1024
         self.request_context_tokens = None
@@ -2858,11 +2860,14 @@ class Service:
         self.aliases = names
 
     def configure_admission(self, cfg):
-        for key, default in (("request_queue_limit", 32), ("request_body_bytes", 4 * 1024 * 1024)):
-            value = cfg.get(key, default)
-            if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key.endswith("limit") else 1):
-                raise ValueError(f'{key} must be a nonnegative queue limit or positive byte budget')
-            setattr(self, key, value)
+        value = cfg.get("request_queue_limit", DEFAULT_REQUEST_QUEUE_LIMIT)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_REQUEST_QUEUE_LIMIT:
+            raise ValueError(f"request_queue_limit must be an integer in [0, {MAX_REQUEST_QUEUE_LIMIT}]")
+        self.request_queue_limit = value
+        value = cfg.get("request_body_bytes", 4 * 1024 * 1024)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("request_body_bytes must be a positive byte budget")
+        self.request_body_bytes = value
         value = cfg.get("request_timeout_s", 600)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 86400:
             raise ValueError("request_timeout_s must be finite and in (0, 86400]")
@@ -2872,6 +2877,15 @@ class Service:
             raise ValueError("request_context_tokens must exceed the engine context slack")
         self.request_context_tokens = value
         self.lifecycle_api = cfg.get("lifecycle_api") is True
+
+    def _admission_snapshot(self):
+        """Generation reservations at the HTTP boundary; caller holds status_lock."""
+        now = time.perf_counter()
+        return {"slots": max(1, int(getattr(self.engine, "batch", 0) or 0)),
+                "request_queue_limit": self.request_queue_limit,
+                "active": len(self.admission_active), "waiting": len(self.admission_waiters),
+                "oldest_wait_s": round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6),
+                "request_timeout_s": self.request_timeout_s}
 
     def register_lifecycle(self, req, cancel):
         priority = req.get("strata_priority", "foreground")
@@ -3285,6 +3299,7 @@ class Service:
         the hardware (with a minute of history per series)."""
         with self.status_lock:
             s = dict(self.status)
+            admission = self._admission_snapshot()
             if self.live_reqs:                          # parallel requests: the newest one's status
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
@@ -3325,7 +3340,7 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -3337,6 +3352,7 @@ class Service:
         the APIs, what is running, and the last request's timings in llama.cpp's names.  /metrics has the rest."""
         with self.status_lock:
             s, totals = dict(self.status), dict(self.totals)
+            admission = self._admission_snapshot()
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
@@ -3359,6 +3375,7 @@ class Service:
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
+            "admission": admission,
             **({"slots": slots} if any("kv_mode" in slot for slot in slots) else {}),
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
@@ -4737,7 +4754,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "application/json")
             if self.lifecycle is not None:
                 self.send_header("X-Strata-Request-Id", self.lifecycle["id"])
-            if code == 429:
+            if code in (429, 503):
                 self.send_header("Retry-After", "1")
             self._cors()
             self.send_header("Content-Length", str(len(body)))
@@ -4841,14 +4858,16 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                with svc.status_lock:
+                    admission = svc._admission_snapshot()
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata", "admission": admission})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
                 with svc.status_lock:
-                    s = dict(svc.status)
+                    s = dict(svc.status, admission=svc._admission_snapshot())
                 now = time.time()
                 if s.get("busy"):
                     s["elapsed_s"] = round(now - s["started"], 1)

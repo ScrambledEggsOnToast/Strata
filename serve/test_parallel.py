@@ -21,13 +21,14 @@ from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, para
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
 # Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257).
-FAKE_BATCH = r'''import queue, sys, threading, time
+FAKE_BATCH = r'''import os, queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args
 groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
 STEP = 0.02
+hold = args[args.index("--hold-replies") + 1] if "--hold-replies" in args else None
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
 def reader():
@@ -58,6 +59,8 @@ def reply(ids):            # the rest of the reply after what the prompt already
 active = {}          # slot -> [tokens left, max_new, produced]
 stopped = set()      # BSTOPped slots: they end "cancel"
 def window():        # one batch window: every active slot one token
+    if hold and os.path.exists(hold):
+        return
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
         sys.exit(1)
@@ -138,6 +141,8 @@ while True:
         n = 1 if slot is not None else max_new
         out = 0
         for t in toks[:n]:
+            while slot is None and hold and os.path.exists(hold) and not stop.is_set():
+                time.sleep(0.005)
             if stop.is_set():
                 break
             print(f"T {t}", flush=True)
@@ -487,6 +492,65 @@ class ParallelService(unittest.TestCase):
         self.start(4, fit=0)
         self.assertEqual(self.engine.batch, 0)
         self.assertEqual(self.chat("hi")["choices"][0]["message"]["content"], "ok, done.")
+
+    def queue_boundary(self, depth):
+        """Effective HTTP reservations: two slots plus a configured waiting depth."""
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "hold"
+            gate.touch()
+            self.start(4, fit=2, more=("--hold-replies", str(gate)))
+            self.svc.configure_admission({"request_queue_limit": depth})
+            replies, errors = [], []
+
+            def go(index):
+                try:
+                    replies.append(self.chat(f"queued question {index}"))
+                except Exception as error:  # reported in the test thread
+                    errors.append(error)
+
+            threads = [threading.Thread(target=go, args=(i,)) for i in range(2 + depth)]
+            try:
+                for thread in threads:
+                    thread.start()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    snapshot = self.get("/status")["admission"]
+                    if (snapshot["active"], snapshot["waiting"]) == (2, depth):
+                        break
+                    time.sleep(0.005)
+                self.assertEqual((snapshot["slots"], snapshot["request_queue_limit"],
+                                  snapshot["active"], snapshot["waiting"]), (2, depth, 2, depth))
+                if depth:
+                    self.assertGreater(snapshot["oldest_wait_s"], 0)
+                else:
+                    self.assertEqual(snapshot["oldest_wait_s"], 0)
+                for path in ("/metrics", "/health", "/v1/status"):
+                    observed = self.get(path)["admission"]
+                    self.assertEqual((observed["active"], observed["waiting"],
+                                      observed["request_queue_limit"]), (2, depth, depth))
+                with self.assertRaises(urllib.error.HTTPError) as refused:
+                    self.chat("beyond the bounded capacity")
+                with refused.exception as response:
+                    self.assertEqual(response.code, 429)
+                    self.assertEqual(response.headers.get("Retry-After"), "1")
+                    self.assertIn("queue is full", json.load(response)["error"]["message"])
+            finally:
+                gate.unlink(missing_ok=True)
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(replies), 2 + depth)
+            self.assertTrue(all(reply["choices"][0]["message"]["content"] == "ok, done." for reply in replies))
+            snapshot = self.get("/status")["admission"]
+            self.assertEqual((snapshot["active"], snapshot["waiting"], snapshot["oldest_wait_s"]), (0, 0, 0))
+
+    def test_configured_depth_refuses_at_effective_slots_plus_depth(self):
+        self.queue_boundary(3)
+
+    def test_zero_depth_refuses_at_effective_slots(self):
+        self.queue_boundary(0)
 
     def test_concurrent_requests_share_the_slots(self):
         self.start(2)

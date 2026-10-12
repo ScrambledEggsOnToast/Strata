@@ -1898,13 +1898,15 @@ Run-config budgets (all bounded per request, not replacements for native byte-le
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `request_queue_limit` | 32 | waiting HTTP generations beyond the effective resident count; 0 refuses overflow immediately |
+| `request_queue_limit` | 32 | integer 0..256: waiting HTTP generations beyond the effective resident count; 0 refuses overflow immediately |
 | `request_timeout_s` | 600 | maximum request lifetime in seconds, including admission/loading/generation; positive, at most 86400 |
 | `request_body_bytes` | 4194304 | maximum JSON POST body size |
 | `request_context_tokens` | engine context | optional smaller positive prompt + output + 8-token-slack budget |
 | `lifecycle_api` | false | enable the private, loopback-peer-only lifecycle API below |
 
-A full queue returns **429** and `Retry-After: 1`; a queued deadline returns **408**. Oversized bodies return
+A full queue returns **429**; every JSON **429** or **503** (including engine startup) carries `Retry-After: 1`.
+This is a one-second delta-seconds retry hint, not an estimate of request completion or a readiness promise.
+A queued deadline still returns **408**, without a retry hint. Oversized bodies return
 **413**; invalid priority/deadline/context requests return **400**. A deadline during generation sets the same
 cancellation event as disconnect, drains work, then reports an error using the endpoint's existing JSON/SSE
 error path. A timeout is a cancellation deadline, **not permission to free buffers while a kernel runs**.
@@ -1931,6 +1933,14 @@ per record. `completion_s` includes response handling and drain; engine `timings
 `/metrics` history duration and TTFT include HTTP queue wait; private/API-monitor queue time also includes
 waiting for the engine's serialized control owner. A first token is a native generated token, even if it
 is an end-of-turn marker or buffered by structured output rather than visible to the client.
+
+JSON `/status`, `/metrics`, `/v1/status` and `/health` expose the same `admission` snapshot: `slots` (the effective
+count, at least one), `request_queue_limit`, `active` (admitted HTTP generations), `waiting` (generations waiting
+for HTTP admission), `oldest_wait_s` (the oldest waiter's monotonic queue age, or zero), and `request_timeout_s`
+(the configured total deadline). Counts are sampled together under the admission lock; an active request may
+still wait for native control/compute, so this is not a count of concurrently executing GPU kernels.
+Existing `queued` and native slot/control-wait metrics are unchanged. Queue capacity remains effective slots
+plus depth. Streaming errors after HTTP 200 headers keep their existing SSE form, not an HTTP retry hint.
 
 Cancellation during admission sends `STOP` and consumes `DONE`/`BADM`; an active resident slot receives
 `BSTOP` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned

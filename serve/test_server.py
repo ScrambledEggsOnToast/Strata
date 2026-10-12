@@ -3878,6 +3878,7 @@ class RestartWindow(unittest.TestCase):
                     urllib.request.urlopen(req, timeout=30)
                 with cm.exception as e:
                     self.assertEqual(e.code, 503, path)
+                    self.assertEqual(e.headers.get("Retry-After"), "1", path)
                     text = e.read().decode()
                 self.assertIn("starting", text)
                 self.assertNotIn("leaves no room", text)
@@ -5033,6 +5034,128 @@ class UntimedReads(unittest.TestCase):
         v = server.Vision.__new__(server.Vision)
         v.proc = SimpleNamespace(stdout=SimpleNamespace(readline=lambda: "OK 7 1 1 1\n"))
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
+
+
+class BoundedAdmission(unittest.TestCase):
+    """HTTP admission stays bounded; status describes reservations, not native compute."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.release, self.entered = threading.Event(), threading.Event()
+        release, entered = self.release, self.entered
+
+        class GateEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                entered.set()
+                while not release.wait(0.01):
+                    if cancel.is_set():
+                        return
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        self.svc = Service(GateEngine(tok, "ok", max_context=CTX), tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.configure_admission({"request_queue_limit": 2, "request_timeout_s": 5})
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.threads, self.replies, self.errors = [], [], []
+
+    def tearDown(self):
+        self.release.set()
+        for thread in self.threads:
+            thread.join(10)
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=5) as response:
+            return json.load(response)
+
+    def post(self, **options):
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, **options}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            response = urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            return response.status, response.headers, json.load(response)
+
+    def start_request(self):
+        def go():
+            try:
+                self.replies.append(self.post())
+            except Exception as error:  # reported in the test thread
+                self.errors.append(error)
+        thread = threading.Thread(target=go)
+        self.threads.append(thread)
+        thread.start()
+
+    def wait_for_queue(self, waiting):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            snapshot = self.get("/status")["admission"]
+            if snapshot["waiting"] == waiting:
+                return snapshot
+            time.sleep(0.005)
+        self.fail(f"queue never reached {waiting} waiting requests")
+
+    def test_configured_depth_and_serial_boundary_then_completion(self):
+        self.start_request()
+        self.assertTrue(self.entered.wait(5))
+        self.start_request()
+        self.start_request()
+        snapshot = self.wait_for_queue(2)
+        self.assertEqual((snapshot["slots"], snapshot["request_queue_limit"], snapshot["active"],
+                          snapshot["waiting"], snapshot["request_timeout_s"]), (1, 2, 1, 2, 5))
+        self.assertGreater(snapshot["oldest_wait_s"], 0)
+        for path in ("/metrics", "/health", "/v1/status"):
+            observed = self.get(path)["admission"]
+            self.assertEqual((observed["active"], observed["waiting"], observed["request_queue_limit"]), (1, 2, 2))
+        status, headers, body = self.post()
+        self.assertEqual(status, 429, body)
+        self.assertEqual(headers.get("Retry-After"), "1")
+        self.assertIn("queue is full", body["error"]["message"])
+        self.release.set()
+        for thread in self.threads:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.errors, [])
+        self.assertEqual([reply[0] for reply in self.replies], [200, 200, 200])
+        snapshot = self.wait_for_queue(0)
+        self.assertEqual((snapshot["active"], snapshot["oldest_wait_s"]), (0, 0))
+
+    def test_zero_depth_admits_idle_slot_but_refuses_overflow(self):
+        self.svc.configure_admission({"request_queue_limit": 0, "request_timeout_s": 5})
+        self.start_request()
+        self.assertTrue(self.entered.wait(5))
+        snapshot = self.wait_for_queue(0)
+        self.assertEqual((snapshot["active"], snapshot["request_queue_limit"]), (1, 0))
+        status, headers, body = self.post()
+        self.assertEqual(status, 429, body)
+        self.assertEqual(headers.get("Retry-After"), "1")
+        self.release.set()
+        self.threads[0].join(10)
+        self.assertEqual(self.post()[0], 200)
+
+    def test_queued_deadline_remains_408_without_retry_hint(self):
+        self.start_request()
+        self.assertTrue(self.entered.wait(5))
+        status, headers, body = self.post(strata_timeout_s=0.05)
+        self.assertEqual(status, 408, body)
+        self.assertIsNone(headers.get("Retry-After"))
+        snapshot = self.wait_for_queue(0)
+        self.assertEqual((snapshot["active"], snapshot["waiting"]), (1, 0))
+
+    def test_queue_configuration_is_an_integer_with_a_finite_upper_bound(self):
+        for invalid in (-1, 257, True, False, None, "2", 1.5):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "request_queue_limit"):
+                self.svc.configure_admission({"request_queue_limit": invalid})
+        for valid in (0, 7, 256):
+            self.svc.configure_admission({"request_queue_limit": valid})
+            self.assertEqual(self.get("/status")["admission"]["request_queue_limit"], valid)
+        self.svc.configure_admission({})
+        self.assertEqual(self.get("/status")["admission"]["request_queue_limit"], 32)
 
 
 if __name__ == "__main__":
