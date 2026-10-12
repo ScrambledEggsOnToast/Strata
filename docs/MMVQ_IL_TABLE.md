@@ -36,9 +36,10 @@ all rows choices, odd output-row tails in each supported format, table-zero shap
 T 1/5/8 and a Q8_0 fallback. Repeat both processes on sm_86; its dispatch must be identical.
 
 The bitwise contract is exact-layout, same-quantized-activation parity, not independent model accuracy.
-Use `native_expert_bench ... 0 8` for actual expert formats and `fused_gr_bench 1 1 8` for norm/up,
-then compare all committed full-vocabulary rows and emitted token IDs at the same model prefixes.
-Source review does not substitute for those GPU/operator and real-model checks.
+Use `native_expert_bench ... 0 8` to compare both the q8_1 handoff bytes and finite down outputs for actual
+expert formats, and `fused_gr_bench 1 1 8` for norm/up and its intermediates. Then compare all committed
+full-vocabulary rows and emitted token IDs at the same model prefixes. Source review does not substitute
+for those GPU/operator and real-model checks.
 
 
 ## Measuring sm_89 (or any other card)
