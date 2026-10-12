@@ -347,6 +347,39 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
+**Experimental native-IQ Volta prompt FFN (#195):** `STRATA_PREFILL_IQ_WMMA=1` opts into an additive
+port of jmnargi/Strata-V100 `277a707b58d08b7a089b9c41c4c9610a05a27405`, not a donor merge. It covers
+CUDA SM70 stage-local native experts at embedding/FF widths 2560/640: gate/up IQ3_XXS, IQ3_S,
+IQ2_S and IQ4_XS, down IQ4_NL or Q2_0. Existing host grouping supplies the same IDs/bounds, with
+1–16 experts and at least 16 rows per nonempty expert. That floor is a preregistered screen,
+not a measured crossover. Unsupported formats/shapes/devices, smaller groups, fused/native-grouped
+experts and resident-helper products keep their existing paths. SM86 and decode dispatch are unchanged.
+
+This is an **arithmetic change**, not a bit-exact optimization: packed weights and input activations
+are rounded to FP16, tensor cores accumulate FP32, and FP32 SwiGLU is rounded to FP16 (with the existing
+±65504 saturation) before FP16 down projection. Router selection, every contribution, coefficients,
+output reduction order, shared experts, KV and sampling code remain unchanged. Entirely resident groups
+read raw gate|up/down blobs through a by-value device pointer table; streamed/mixed groups retain their
+existing gathers and staging-slot releases. FP16 intermediates fit in the existing FP32 H allocation and
+the 256-byte pointer table aliases existing Hq scratch. No ring growth or extra workspace is introduced.
+
+The candidate is **default-off and rejected by model-level evidence**. CUDA12.9 SM70+SM86 compile/link
+and the seven-format independent complete-FFN fixture passed (worst FP16-reference relL2 `7.2e-5`);
+the mandatory SM86 refusal/skip gate passed too. In contrast, the matched 48,025-token model first
+predictor has relL2 `0.35648`, max |Δ| `2.59332` and top-20 overlap `0.75`, failing frozen limits
+`0.02`, `0.5` and `0.9`. Identical emitted sentinel words did not pass the arithmetic screen.
+This fixture/model contradiction is not explained away as ordinary FP16 imprecision: the retained
+hypotheses are wrong serving operands/scales/offsets/indirect wiring, mismatched predictor content,
+or changed upstream expert selection. The routing captures were incomplete: control terminal
+payload short 256 bytes; candidate structurally invalid after 1765 complete records. No repair or
+threshold movement was attempted. Parent-project `evidence/native-iq-wmma-20261012/qualification.json`
+retains the results and hypotheses; `contract.json` retains the original bounds.
+Teacher-forced logits are **impossible** for this native IQ3_S serving pack (#57). First/committed
+diagnostics are a **different, weaker check**, not satisfaction of literal AC-3. Observer timing is
+not performance evidence; held-out/performance arms were stopped after the public failure.
+Roll back by leaving `STRATA_PREFILL_IQ_WMMA` unset. No daily-profile change or speedup is claimed.
+
+
 ## Other GPUs (estimated)
 
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
