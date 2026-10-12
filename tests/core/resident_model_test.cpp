@@ -6,6 +6,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
+#include "conversation_snapshot_equivalence.hpp"
 #include <cuda_runtime.h>
 #include <array>
 #include <cstdio>
@@ -14,18 +15,10 @@
 #include <vector>
 
 namespace {
+using strata::test::same_snapshot;
 void* fail_destination = nullptr;
 bool transfer_failed = false;
 
-bool same_snapshot(const strata::core::SavedConversation& a, const strata::core::SavedConversation& b) {
-    if (a.live.ids!=b.live.ids || a.live.gdn!=b.live.gdn || a.live.ple!=b.live.ple ||
-        a.live.tails!=b.live.tails || a.live.dead!=b.live.dead || a.live.block_pos!=b.live.block_pos ||
-        a.kv.size()!=b.kv.size()) return false;
-    for (size_t i=0;i<a.kv.size();++i)
-        if (a.kv[i].k!=b.kv[i].k || a.kv[i].v!=b.kv[i].v || a.kv[i].k_scale!=b.kv[i].k_scale ||
-            a.kv[i].v_scale!=b.kv[i].v_scale || a.kv[i].pooled!=b.kv[i].pooled) return false;
-    return true;
-}
 }
 extern "C" cudaError_t __real_cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size, cudaMemcpyKind kind) {

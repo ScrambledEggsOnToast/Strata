@@ -2,6 +2,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/program/session_fingerprint.hpp"
+#include "../../tests/core/conversation_snapshot_equivalence.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -17,6 +18,8 @@
 
 using namespace strata::core;
 using namespace strata::kernels;
+using strata::test::equal;
+using strata::test::same_snapshot;
 
 namespace {
 int checks = 0;
@@ -118,9 +121,6 @@ struct Fixture {
     }
     ~Fixture() { for (void* p:device) cudaFree(p); for (void* p:host) cudaFreeHost(p); }
 };
-bool equal(const ConversationKv& a,const ConversationKv& b) {
-    return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
-}
 
 bool empty_map(const QsaState& st) {
     std::vector<int32_t> table(st.n_pages), slots(st.n_slots);
@@ -233,9 +233,7 @@ void full_session(int fmt, int mode, int experts) {
               mode?"streamed-to-resident complete snapshot":"resident-to-streamed complete snapshot");
         SavedConversation migrated;
         check(conversation_snapshot_save(migrated,view,target,g,destination_draft.state,err),"capture migrated complete session and draft");
-        check(migrated.live.gdn==a.live.gdn && migrated.live.ple==a.live.ple && migrated.live.tails==a.live.tails &&
-              migrated.live.dead==a.live.dead && migrated.live.block_pos==a.live.block_pos &&
-              equal(migrated.kv[0],a.kv[0]) && equal(migrated.kv.back(),a.kv.back()),
+        check(same_snapshot(migrated,a),
               "residency migration preserves all main, recurrence, indexer and draft payloads");
         uint64_t hash=0;
         check(conversation_kv_verify(a.kv.back(),destination_draft.state,g,65,false,hash,err),
@@ -297,9 +295,7 @@ void full_session(int fmt, int mode, int experts) {
           equal(restored.kv[0],b.kv[0]) && equal(restored.kv[1],b.kv[1]),"refusal preserves all tested state");
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore complete A");
     check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture restored A");
-    check(restored.live.gdn==a.live.gdn && restored.live.ple==a.live.ple && restored.live.tails==a.live.tails &&
-          restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
-          equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
+    check(same_snapshot(restored,a),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");

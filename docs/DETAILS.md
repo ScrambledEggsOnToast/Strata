@@ -650,6 +650,12 @@ expert layout. Both measured total **and free** VRAM must cover each device's de
 another process's occupied VRAM is not available capacity. Native dense overrides are counted whenever
 the loader enables them, including canonical packs, and the native head includes its Q8_1 scratch.
 
+The default native-pack PCIe probe's **256 MiB device scratch** and **256 MiB pinned source**
+are priced before admission, but the probe runs only after every scope admits and before
+the native embedding loads. Its measured bandwidth selects the execution-time PCIe expert
+fraction; the admission calculation does not consume it. The later automatic split search
+retains its independent per-stage bandwidth probes.
+
 `--expert-cache auto` (also the profile's implicit auto mode) commits an allocation budget at this gate:
 `floor((min(total, free) - fixed allocations - headroom) / max_blob) * max_blob`, bounded by the model's
 expert count and profile length. Runtime sizing may shrink that budget but never enlarge it. The native

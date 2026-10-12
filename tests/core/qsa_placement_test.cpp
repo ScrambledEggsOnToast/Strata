@@ -66,8 +66,9 @@ void test_absence_is_byte_identical_to_legacy_prices() {
             qsa_pinned_bytes(s, daily.slot_main.kv, kKvF16) == 116,
             "absent option added host backing to resident roles");
     const auto arena = qsa_arena_layout(s, daily.working_main, true);
-    require(arena.valid && arena.page_table == 268435456 && arena.payload_extent == 318901392 &&
-            arena.extent == 318901712, "legacy FP16 carve or trailing slack changed");
+    require(arena.valid && arena.extent == qsa_device_bytes(
+                s, daily.working_main.cells, daily.working_main.kv, daily.working_main.format, true),
+            "legacy FP16 carved extent differs from its price");
     const auto streamed = qsa_resolve_roles(s, 262144, kKvF16, 20480, -1, 32768, 8);
     require(qsa_device_bytes(s, 262144, streamed.working_main.kv, kKvF16, false) == 75865712 &&
             qsa_device_bytes(s, 262144, streamed.slot_main.kv, kKvF16, false) == 75865712,

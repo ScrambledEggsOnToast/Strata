@@ -150,6 +150,12 @@ hold the full context. Draft format selection is unchanged (whole INT8 under a h
 The four resolved role prices feed `working_main`, `slot_main`, `working_draft` and `slot_draft`; draft weights
 and operation scratch remain shared.
 
+The process-presence A/B overrides `STRATA_KV_MAIN_OFF` and `STRATA_KV_RING_OFF`
+disable streaming for the working main/non-ring draft and working draft ring, respectively.
+Even an empty or `0` value enables the corresponding override. Slots inherit these resolved
+placements only when `--slot-kv-window` is absent; an explicit slot window bypasses them.
+The Python planner and CUDA-free native partner apply the same rule when pricing these roles.
+
 Startup refuses a negative or above-`INT32_MAX` value, a positive value below the **20480-cell engine floor**,
 a window unable to hold one streamed call's `n_q * (cap / page_size + 2)` distinct blocks, or an undersized
 draft ring. These are named option errors before device allocation, not the separate CUDA `RT = 1024`
