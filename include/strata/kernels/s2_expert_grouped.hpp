@@ -105,6 +105,20 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream);
+/// Resident prefill overload: arbitrary int32-sized routing, 1..1024 experts, stable expert-ID order and
+/// routing order within each expert. `expert_ptr[e]` is the current resident blob (device table; slots may
+/// have unequal sizes). Produces the same compact pointer/start/token metadata consumed by the decode
+/// grouped kernels. `pair_slot[i]` maps routing pair i to its grouped row; use identity ent_dst for prefill.
+/// `scratch` holds 2*n_expert int32s; grp_ptr/start hold n_expert / n_expert+1 elements; pair_slot/ent_tok hold n.
+/// `counts` holds 4 int32s, aligned to 8 bytes: [0] groups, [1] sticky invalid-ID/pointer error, [2..3] uint64
+/// selected-group total. Zero counts once before use; error/total are inspected only after the containing
+/// operation drains, never for launch sizing. No allocations, host readback or architecture-gated math.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+void moe_group_resident(const int32_t* ids, int n, int k_per_tok, int n_expert,
+                        const unsigned long long* expert_ptr, int32_t* scratch,
+                        unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts,
+                        int32_t* pair_slot, int32_t* ent_tok, void* stream);
+#endif
 void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
                           int32_t* count, void* stream);
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,

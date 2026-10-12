@@ -1117,6 +1117,95 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
         ent_tok[at] = i / k_per_tok;
     }
 }
+
+#if !defined(__HIPCC__)
+// The decode resident grouper above ranks matching entries, scans their counts, and scatters stable
+// dst/tok metadata. Prefill needs more than its 128 entries: one block per expert computes the same rank
+// with warp ballots over consecutive tiles, then a compact count scan and scatter use the same layout.
+// O(n * n_expert) integer comparisons, O(n + n_expert) storage; no atomic placement cursor or padded rows.
+__global__ void resident_rank_kernel(const int32_t* __restrict__ ids, int n, int n_expert,
+                                     int32_t* __restrict__ expert_count, int32_t* __restrict__ pair_slot,
+                                     int32_t* __restrict__ counts) {
+    __shared__ int warp_start[8], tile_count;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, expert = blockIdx.x;
+    int before = 0;
+    for (int64_t base = 0; base < n; base += 256) {
+        const int64_t i = base + tid;
+        const int id = i < n ? ids[i] : -1;
+        const bool selected = i < n && id == expert;
+        const unsigned mask = __ballot_sync(0xffffffffu, selected);
+        if (lane == 0) warp_start[warp] = __popc(mask);
+        __syncthreads();
+        if (tid == 0) {
+            int total = 0;
+            for (int w = 0; w < 8; ++w) {
+                const int c = warp_start[w];
+                warp_start[w] = total;
+                total += c;
+            }
+            tile_count = total;
+        }
+        __syncthreads();
+        if (selected)
+            pair_slot[i] = before + warp_start[warp] + __popc(mask & ((1u << lane) - 1u));
+        if (expert == 0 && i < n && (unsigned) id >= (unsigned) n_expert) {
+            pair_slot[i] = 0;   // bounded even on the refused path
+            atomicOr(counts + 1, 1);
+        }
+        before += tile_count;
+        __syncthreads();   // the next tile reuses warp_start
+    }
+    if (tid == 0) expert_count[expert] = before;
+}
+
+__global__ void resident_scan_kernel(const int32_t* __restrict__ expert_count, int n_expert, int n,
+                                     const unsigned long long* __restrict__ expert_ptr,
+                                     int32_t* __restrict__ expert_start,
+                                     unsigned long long* __restrict__ grp_ptr,
+                                     int32_t* __restrict__ grp_start, int32_t* __restrict__ counts) {
+    __shared__ int warp_rows[32], warp_groups[32];
+    const int expert = threadIdx.x, lane = expert & 31, warp = expert >> 5;
+    const int c = expert < n_expert ? expert_count[expert] : 0;
+    const int live = c > 0 ? 1 : 0;
+    int rows = c, groups = live;
+    // The resident-plan prefix primitive, with separate counts rather than its 16-bit packed total.
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int r = __shfl_up_sync(0xffffffffu, rows, d);
+        const int g = __shfl_up_sync(0xffffffffu, groups, d);
+        if (lane >= d) { rows += r; groups += g; }
+    }
+    if (lane == 31) { warp_rows[warp] = rows; warp_groups[warp] = groups; }
+    if (live && expert_ptr[expert] == 0) atomicOr(counts + 1, 1);
+    __syncthreads();
+    int row_start = rows - c, group = groups - live;
+    for (int w = 0; w < warp; ++w) { row_start += warp_rows[w]; group += warp_groups[w]; }
+    if (expert < n_expert) expert_start[expert] = row_start;
+    if (live) { grp_ptr[group] = expert_ptr[expert]; grp_start[group] = row_start; }
+    if (expert == blockDim.x - 1) {
+        const int total_rows = row_start + c, total_groups = group + live;
+        if (total_rows != n) atomicOr(counts + 1, 1);
+        grp_start[total_groups] = total_rows;
+        counts[0] = total_groups;
+    }
+    __syncthreads();
+    if (expert == 0) {
+        if (counts[1]) { counts[0] = 0; grp_start[0] = 0; }
+        else *reinterpret_cast<unsigned long long*>(counts + 2) += (unsigned) counts[0];
+    }
+}
+
+__global__ void resident_scatter_kernel(const int32_t* __restrict__ ids, int n, int k,
+                                        const int32_t* __restrict__ expert_start,
+                                        const int32_t* __restrict__ counts,
+                                        int32_t* __restrict__ pair_slot, int32_t* __restrict__ ent_tok) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || counts[1]) return;
+    const int at = expert_start[ids[i]] + pair_slot[i];
+    pair_slot[i] = at;
+    ent_tok[at] = (int32_t) (i / k);
+}
+#endif
 }  // namespace
 
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
@@ -1127,6 +1216,29 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
                                                                grp_start, counts, ent_dst, ent_tok);
     check("moe_group_resident", stream);
 }
+
+#if !defined(__HIPCC__)
+void moe_group_resident(const int32_t* ids, int n, int k_per_tok, int n_expert,
+                        const unsigned long long* expert_ptr, int32_t* scratch,
+                        unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts,
+                        int32_t* pair_slot, int32_t* ent_tok, void* stream) {
+    if (n < 0 || k_per_tok <= 0 || n_expert < 1 || n_expert > 1024) {
+        std::fprintf(stderr, "moe_group_resident: invalid prefill geometry\n");
+        std::exit(1);
+    }
+    const cudaStream_t cs = (cudaStream_t) stream;
+    resident_rank_kernel<<<(unsigned) n_expert, 256, 0, cs>>>(ids, n, n_expert, scratch, pair_slot, counts);
+    check("moe_group_resident/rank", stream);
+    resident_scan_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, cs>>>(
+        scratch, n_expert, n, expert_ptr, scratch + n_expert, grp_ptr, grp_start, counts);
+    check("moe_group_resident/scan", stream);
+    if (n > 0) {
+        resident_scatter_kernel<<<(unsigned) (((int64_t) n + 255) / 256), 256, 0, cs>>>(
+            ids, n, k_per_tok, scratch + n_expert, counts, pair_slot, ent_tok);
+        check("moe_group_resident/scatter", stream);
+    }
+}
+#endif
 
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,

@@ -12,6 +12,7 @@
 #include "strata/plan/admission.hpp"
 #include "strata/plan/resident.hpp"
 #include "strata/plan/qsa_memory.hpp"
+#include "strata/program/time_budget.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -602,6 +603,56 @@ void test_role_aware_priceability_keeps_unknown_combinations_closed() {
             "elastic batch demand admitted or refusal lost its scope/class");
 }
 
+void test_measured_prefill_quanta_and_bounded_decode_share() {
+    using strata::program::TimeBudget;
+    require(TimeBudget::valid(1000, .25) && TimeBudget::valid(0, .25), "valid scheduling budget refused");
+    require(!TimeBudget::valid(std::nan(""), .25) && !TimeBudget::valid(1000, 0) &&
+            !TimeBudget::valid(1000, 1) && !TimeBudget::valid(60001, .25), "invalid scheduling budget accepted");
+    TimeBudget policy(1000, .25);
+    require(policy.prefill_tokens(10000, 2048, 0) == 2048, "cold estimate must use one admitted chunk");
+    require(policy.prefill_tokens(10000, 0, 0) == 0, "unknown memory headroom was treated as a chunk");
+    policy.prefilled(250, 1, 2048);
+    require(policy.prefill_tokens(10000, 2048, 0) == 8192, "measured time did not choose a multi-chunk quantum");
+    require(policy.prefill_tokens(10000, 2048, 700) == 2048, "due decoder did not shorten the quantum");
+    require(policy.prefill_tokens(123, 2048, 0) == 123, "tail partition changed");
+    policy.prefilled(1200, 1, 2048);
+    require(policy.prefill_tokens(INT64_MAX, 2048, 0) == 2048, "over-budget chunk was silently enlarged");
+    policy.prefilled(1, 1, 256);
+    require(policy.prefill_tokens(10000, 2048, 0) == 2048 && policy.decode_due(0, 2048),
+            "a short request poisoned a larger memory-admitted chunk's estimate");
+    TimeBudget overflow(60000, .25);
+    overflow.prefilled(1e-18, 1, 1);
+    require(overflow.prefill_tokens(INT64_MAX, 1, 0) == INT64_MAX &&
+            overflow.prefill_tokens(INT64_MAX, INT64_MAX, 0) == INT64_MAX, "quantum arithmetic overflow");
+
+    // Persistent foreground load: each round serves three decoders. The fourth
+    // decoder arrives during prefill; every indivisible round drains before the
+    // next background chunk and its overrun remains debt (not free credit).
+    TimeBudget busy(100, .25);
+    double now = 0, last = 0, prefill = 0, decode = 0;
+    int commits[4] = {}, background_chunks = 0;
+    for (int chunk = 0; chunk < 200; ++chunk) {
+        const int64_t tokens = busy.prefill_tokens(2048 * 201, 2048, now - last);
+        require(tokens > 0 && tokens % 2048 == 0, "scheduling changed the arithmetic partition");
+        const double cost = 50 * (double) (tokens / 2048);
+        now += cost; prefill += cost; ++background_chunks;
+        busy.prefilled(cost, tokens / 2048, 2048);
+        int rounds = 0;
+        while (busy.decode_due(now - last, 2048) && busy.decode_allowed(0)) {
+            now += 40; decode += 40; last = now;
+            busy.decoded(40);
+            for (int owner = 0; owner < (chunk >= 1 ? 4 : 3); ++owner) ++commits[owner];
+            require(++rounds <= 3, "foreground rounds starved background progress");
+        }
+        require(now - last <= 100, "foreground arrival trace exceeded its supported quantum envelope");
+    }
+    require(background_chunks == 200 && commits[0] > 0 && commits[3] > 0, "an owner starved");
+    require(decode <= prefill * 3 + 40, "indivisible-round debt was forgiven on every boundary");
+    busy.decoded(10000, false);
+    busy.prefilled(50, 1, 2048);
+    require(busy.decode_allowed(0), "decode-only time accumulated background debt");
+}
+
 }  // namespace
 
 int main() {
@@ -624,6 +675,7 @@ int main() {
         test_remote_device_mapping_excludes_every_stage_and_helper();
         test_streamed_slot_host_budget_refuses_before_allocation();
         test_role_aware_priceability_keeps_unknown_combinations_closed();
+        test_measured_prefill_quanta_and_bounded_decode_share();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "plan_admission_test: %s\n", e.what());
         return 1;
