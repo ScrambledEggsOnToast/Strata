@@ -12,6 +12,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import responses  # noqa: E402
@@ -330,6 +331,64 @@ class Server(unittest.TestCase):
         finally:
             c.close()
 
+
+
+class BarePromptParity(Server):
+    """#187: protocol equivalence at the generation boundary, not a model-quality fixture."""
+
+    def setUp(self):
+        # This comparison needs no hardware sampling, including on a host running a timed GPU campaign.
+        telemetry = mock.patch.object(Service, "start_telemetry")
+        telemetry.start()
+        self.addCleanup(telemetry.stop)
+        super().setUp()
+
+    def test_missing_instructions_matches_chat_messages_and_generation_defaults(self):
+        prompt = "Reply with the reference code only."
+        calls = []
+        generate = self.engine.generate
+        sampling_keys = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
+                         "presence_penalty", "frequency_penalty", "penalty_last_n",
+                         "reasoning_budget_tokens", "stop")
+
+        def capture(ids, max_new, sampling, cancel, embeddings=None):
+            calls.append((list(ids), max_new, {k: sampling[k] for k in sampling_keys if k in sampling}))
+            return generate(ids, max_new, sampling, cancel, embeddings)
+
+        self.svc.sampling_defaults = {"temperature": 0.7, "top_p": 0.75, "top_k": 19, "seed": 11}
+        with mock.patch.object(self.engine, "generate", side_effect=capture):
+            for shared, overrides in (({}, {}),
+                                      ({"max_tokens": 128, "reasoning_effort": "none"},
+                                       {"temperature": 0, "stop": ["not-in-the-script"]})):
+                self.svc.shared = shared
+                common = {"model": "m", **overrides}
+                calls.clear()
+                code, chat = self.post({**common, "messages": [{"role": "user", "content": prompt}]},
+                                       path="/v1/chat/completions")
+                self.assertEqual(code, 200, chat)
+                self.assertEqual(len(calls), 1)
+                control = calls[0]
+                self.assertIn(prompt, self.tok.decode(control[0]))
+                self.assertEqual(control[2]["temperature"], overrides.get("temperature", 0.7))
+                self.assertEqual(control[2]["seed"], 11)
+                if shared:
+                    self.assertEqual(control[1], 128)
+                    self.assertIn("<think>\n\n</think>", self.tok.decode(control[0]))
+                for instructions in ({}, {"instructions": None}, {"instructions": ""}):
+                    for input_value in (prompt, [{"role": "user", "content": [
+                            {"type": "input_text", "text": prompt}]}]):
+                        with self.subTest(shared=shared, instructions=instructions, input=input_value):
+                            calls.clear()
+                            code, reply = self.post({**common, "input": input_value, **instructions})
+                            self.assertEqual(code, 200, reply)
+                            self.assertEqual(calls, [control])  # identical prompt, cap and sampler; one pass
+                            self.assertEqual(reply["instructions"], instructions.get("instructions"))
+                            self.assertEqual(reply["status"], "completed")
+                            text = "".join(part["text"] for item in reply["output"] if item["type"] == "message"
+                                           for part in item["content"] if part["type"] == "output_text")
+                            self.assertEqual(text, chat["choices"][0]["message"]["content"])
+                            self.assertEqual(reply["usage"]["input_tokens"], chat["usage"]["prompt_tokens"])
+                            self.assertEqual(reply["usage"]["output_tokens"], chat["usage"]["completion_tokens"])
 
 
 class OverHttp(Server):

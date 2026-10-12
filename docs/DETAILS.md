@@ -1352,14 +1352,19 @@ are refused with an error that says so.
 | Request | What Strata does |
 | --- | --- |
 | `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
-| `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
+| `instructions` (optional) | The system message (with leading `developer` messages; later ones become user messages, as on the chat path). Missing, `null` or `""` adds no client instruction |
 | `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the model's default (high) |
-| `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
+| `max_output_tokens` | The output cap (thinking included). Without it, shared Chat settings apply if configured; otherwise the remaining context is available, as on Chat Completions. Running out ends the response `incomplete` (`max_output_tokens`) |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
 | `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `strata-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
+
+For example, `{"input": "Reply with the reference code only."}` uses the same prompt and generation defaults as
+`{"messages": [{"role": "user", "content": "Reply with the reference code only."}]}` on Chat Completions.
+No reference code or other task instruction is invented. The model template can still add its default reasoning
+directive: omitting `instructions` neither disables thinking nor introduces a separate token budget.
 
 The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
 `response.reasoning_text.delta`). This model writes no separate summaries, so `summary` is empty. With
