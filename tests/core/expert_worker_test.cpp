@@ -5,6 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <random>
 
 namespace {
 void require(bool value, const char* message) {
@@ -469,10 +473,217 @@ void split_stage_consumers_cannot_release_other_lanes() {
     }
 }
 
+// Independent scalar work is evaluated in router order. Grouped evaluation may
+// run in any group/member order, but writes unweighted original router indices.
+float synthetic_expert(int expert, float input, int64_t layer, int column) {
+    const float sign = expert & 1 ? -1.0f : 1.0f;
+    return std::fma(input, sign * (float) (expert + 1),
+                    std::ldexp((float) (layer + column + 1), (expert % 9) - 4));
+}
+
+void grouped_scatter_reduction_oracle() {
+    using namespace strata::core;
+    std::mt19937 random(38);
+    uint64_t checked_entries = 0, checked_groups = 0, overlap = 0;
+    for (int trial = 0; trial < 2048; ++trial) {
+        const int tokens = trial % 9, routes = 1 + (trial / 9) % 16, columns = 1 + trial % 5;
+        std::array<int32_t, 128> ids{}, assigned{}, workers{};
+        std::array<uint64_t, 8> requests{};
+        std::array<int64_t, 8> positions{};
+        std::array<int, 8> slots{};
+        std::array<float, 8> input{};
+        std::array<float, 128> coefficients{};
+        for (int t = 0; t < tokens; ++t) {
+            // Two positions per request, unrelated requests at different positions,
+            // and physical slots unrelated to the packed residual row index.
+            requests[t] = 100 + (uint64_t) (t / 2);
+            positions[t] = 700 * (t / 2) + t % 2;
+            slots[t] = 7 - t / 2;
+            input[t] = std::ldexp((float) (t + 1), trial % 11 - 5);
+        }
+        for (int i = 0; i < tokens * routes; ++i) {
+            ids[i] = (int32_t) (random() % (trial % 2 ? 512 : 7));
+            workers[i] = 1 + (int32_t) (random() % 5);
+            coefficients[i] = (float) (random() % 17) / 16.0f; // includes exact zero
+        }
+        auto work = make_work(ids.data(), assigned.data(), tokens, routes, columns);
+        work.operation.layer = trial % 48;
+        work.input = input.data();
+        work.request_ids = requests.data();
+        work.positions = positions.data();
+        work.request_slots = slots.data();
+        ExpertRouteGroups groups;
+        require(groups.form(work, nullptr, 512), "bounded ready group formation failed");
+        require(groups.resolve_workers(workers.data()) || groups.form(work, workers.data(), 512),
+                "exact resolved-worker partition failed");
+        require(groups.entries() == (size_t) (tokens * routes), "group lost routed entries");
+        std::array<unsigned, 128> visits{};
+        std::array<float, 128 * 5 + 2> parts;
+        parts.fill(12345);
+        // Reverse completion order deliberately; destinations, not completions,
+        // determine the final reduction order.
+        for (size_t g = groups.size(); g-- > 0;) {
+            const auto& group = groups.group(g);
+            uint16_t previous = 0;
+            for (size_t m = 0; m < group.count; ++m) {
+                const auto entry = groups.entry(g, m);
+                require(entry.destination < tokens * routes && entry.token < tokens &&
+                        entry.route < routes && entry.destination == entry.token * routes + entry.route,
+                        "scatter crossed the routed shape");
+                require(ids[entry.destination] == entry.expert && workers[entry.destination] == entry.worker,
+                        "expert/worker grouping changed the resolved placement");
+                require(!m || previous < entry.destination, "group changed member order");
+                previous = entry.destination;
+                ++visits[entry.destination];
+                require(groups.matches(entry, requests[entry.token], positions[entry.token],
+                                       slots[entry.token], work.operation, work.weights),
+                        "request/position identity was lost");
+                for (int c = 0; c < columns; ++c)
+                    parts[1 + entry.destination * columns + c] =
+                        synthetic_expert(entry.expert, input[entry.token], work.operation.layer, c);
+            }
+        }
+        for (int t = 0; t < tokens; ++t)
+            for (int c = 0; c < columns; ++c) {
+                float separate = 0, grouped = 0;
+                unsigned coefficient_visits = 0;
+                for (int route = 0; route < routes; ++route) {
+                    const int i = t * routes + route;
+                    require(visits[i] == 1, "selected contribution was omitted or duplicated");
+                    separate = std::fma(coefficients[i],
+                        synthetic_expert(ids[i], input[t], work.operation.layer, c), separate);
+                    grouped = std::fma(coefficients[i], parts[1 + i * columns + c], grouped);
+                    ++coefficient_visits;
+                }
+                require(coefficient_visits == (unsigned) routes &&
+                        std::memcmp(&grouped, &separate, sizeof(float)) == 0,
+                        "grouping changed routing coefficients or FP32 reduction order");
+            }
+        for (size_t i = 1 + (size_t) tokens * routes * columns; i < parts.size(); ++i)
+            require(parts[i] == 12345, "scatter overwrote unused result storage");
+        require(parts[0] == 12345, "scatter overwrote leading canary");
+        checked_entries += groups.entries();
+        checked_groups += groups.size();
+        overlap += groups.cross_request_groups();
+    }
+    // This oracle would fail if a later implementation reduced in expert order.
+    const float a = std::fma(1.0f, -1e20f, std::fma(1.0f, 1.0f, 1e20f));
+    const float b = std::fma(1.0f, 1.0f, std::fma(1.0f, -1e20f, 1e20f));
+    require(a != b, "summation-order negative control has no power");
+    std::printf("scatter/reduction: 2048 mixed windows, %llu entries exactly once, %llu groups, "
+                "%llu cross-request groups; bit-exact router-order reduction; launch savings unmeasured\n",
+                (unsigned long long) checked_entries, (unsigned long long) checked_groups,
+                (unsigned long long) overlap);
+}
+
+void group_snapshot_cancellation_and_stale_delivery() {
+    using namespace strata::core;
+    int32_t ids[] = {9, 4, 9, 7, 9, 4, 9, 7}, workers[] = {2, 1, 2, 1, 2, 1, 2, 1};
+    int32_t assigned[8]{};
+    uint64_t requests[] = {41, 41, 77, 77};
+    int64_t positions[] = {17, 18, 901, 902};
+    int slots[] = {7, 7, 2, 2};
+    auto work = make_work(ids, assigned, 4, 2);
+    work.request_ids = requests; work.positions = positions; work.request_slots = slots;
+    ExpertRouteGroups groups;
+    require(groups.form(work, workers, 512) && groups.cross_request_groups() == 3,
+            "mixed-request shared experts were not grouped");
+    const ExpertOperation operation = work.operation;
+    const ExpertWeights weights = work.weights;
+    std::promise<void> started, release;
+    auto ready = started.get_future();
+    auto gate = release.get_future().share();
+    // A helper completes after the caller observes cancellation and destroys its
+    // input metadata. The immutable group and its outputs remain alive until drain.
+    auto helper = std::async(std::launch::async, [groups, gate, &started] {
+        started.set_value();
+        gate.wait();
+        std::array<float, 8> result{};
+        for (size_t g = 0; g < groups.size(); ++g)
+            for (size_t m = 0; m < groups.group(g).count; ++m) {
+                const auto e = groups.entry(g, m);
+                result[e.destination] = synthetic_expert(e.expert, (float) e.position, groups.operation().layer, 0);
+            }
+        return result;
+    });
+    ready.wait();
+    requests[0] = requests[1] = 0; // retired request, while the group is still in flight
+    std::fill(std::begin(ids), std::end(ids), -1);
+    std::fill(std::begin(positions), std::end(positions), -1);
+    std::fill(std::begin(workers), std::end(workers), -1);
+    release.set_value();
+    const auto result = helper.get();
+    float delivered[8];
+    std::fill(std::begin(delivered), std::end(delivered), 12345);
+    unsigned discarded = 0, committed = 0;
+    for (size_t g = 0; g < groups.size(); ++g)
+        for (size_t m = 0; m < groups.group(g).count; ++m) {
+            const auto e = groups.entry(g, m);
+            if (!groups.matches(e, requests[e.token], e.position, e.slot, operation, weights)) { ++discarded; continue; }
+            delivered[e.destination] = result[e.destination];
+            ++committed;
+        }
+    require(discarded == 4 && committed == 4, "partial cancellation affected the other request");
+    for (int i = 0; i < 8; ++i)
+        require(delivered[i] == (i < 4 ? 12345 : synthetic_expert(i % 2 ? (i == 5 ? 4 : 7) : 9,
+                    (float) (901 + (i - 4) / 2), operation.layer, 0)),
+                "cancelled member leaked or surviving speculative position was corrupted");
+    const auto e = groups.entry(0, 0);
+    auto op = operation; ++op.layer;
+    require(!groups.matches(e, e.request, e.position, e.slot, op, weights), "wrong layer accepted result");
+    op = operation; ++op.generation;
+    require(!groups.matches(e, e.request, e.position, e.slot, op, weights), "rejected span retry accepted stale result");
+    auto version = weights; ++version.residency_version;
+    require(!groups.matches(e, e.request, e.position, e.slot, operation, version), "stale weights accepted result");
+    version = weights; ++version.gate_up_format;
+    require(!groups.matches(e, e.request, e.position, e.slot, operation, version), "mixed formats accepted result");
+    require(!groups.matches(e, e.request + 1, e.position, e.slot, operation, weights) &&
+            !groups.matches(e, e.request, e.position + 1, e.slot, operation, weights) &&
+            !groups.matches(e, e.request, e.position, e.slot - 1, operation, weights),
+            "request, speculative position or reused slot accepted stale output");
+    auto forged = e; ++forged.expert;
+    require(!groups.matches(forged, e.request, e.position, e.slot, operation, weights), "wrong expert accepted output");
+    forged = e; ++forged.worker;
+    require(!groups.matches(forged, e.request, e.position, e.slot, operation, weights), "wrong worker accepted output");
+    std::printf("asynchronous scatter: cancelled 4 entries after submission, committed 4 surviving entries; "
+                "stale request/layer/position/span/worker/format/residency refused\n");
+}
+
+void group_bounds_and_worker_partitions() {
+    using namespace strata::core;
+    int32_t ids[128]{}, assigned[128]{}, workers[128]{};
+    std::fill(std::begin(workers), std::end(workers), 1);
+    auto work = make_work(ids, assigned, 8, 16);
+    ExpertRouteGroups groups;
+    require(groups.form(work, workers, 512) && groups.entries() == 128 &&
+            groups.size() == 1 && groups.group(0).count == 128, "full repeated-expert extent failed");
+    require(groups.resolve_workers(workers) && groups.group(0).worker == 1,
+            "static placement could not resolve the formed expert group");
+    for (int i = 0; i < 128; ++i) workers[i] = 1 + i % 3;
+    require(!groups.resolve_workers(workers) && groups.size() == 1,
+            "row-selective placement was merged into one worker");
+    require(groups.form(work, workers, 512) && groups.size() == 3, "same expert crossed worker partitions");
+    work.operation.token_count = 9;
+    require(!groups.form(work, workers, 512) && groups.size() == 3, "oversized window replaced valid metadata");
+    work.operation.token_count = 8; work.routed_width = 17;
+    require(!groups.form(work, workers, 512), "entry cap overflow accepted");
+    work.routed_width = INT64_MAX;
+    require(!groups.form(work, workers, 512), "multiplication overflow accepted");
+    work.routed_width = 16; ids[127] = 512;
+    require(!groups.form(work, workers, 512), "invalid expert accepted");
+    ids[127] = 0;
+    work.operation.token_count = 0;
+    require(groups.form(work, workers, 512) && !groups.entries() && !groups.size(), "empty ready window retained work");
+    require(sizeof(groups) == 2048, "global group scratch grew");
+}
+
 } // namespace
 
 int main() {
     using namespace strata::core;
+    grouped_scatter_reduction_oracle();
+    group_snapshot_cancellation_and_stale_delivery();
+    group_bounds_and_worker_partitions();
     graph_worker_requires_matching_consumer();
     split_stage_consumers_cannot_release_other_lanes();
     distinct_workers_preserve_rows_and_metadata();

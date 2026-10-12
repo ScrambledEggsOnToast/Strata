@@ -298,7 +298,7 @@ struct GpuPlanSink {
     int pcie_mode = 0;
 };
 
-/// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
+/// The adapter's shared state: one global pool/scratch set across sessions and stages.
 struct ForesightSwap;
 
 struct ExpertDispatch {
@@ -424,13 +424,14 @@ struct ExpertDispatch {
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;
     strata::kernels::cpu::ActQ act;
-    /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
-    /// job map (reset after every layer).
+    /// One quantized activation per ready row and multi-token jobs, shared across requests.
     std::vector<strata::kernels::cpu::ActQ> act_multi;
     /// Plan v0.3 P6: a native pack's per-token activations (MAXT x kNativeActBytes).
     std::vector<uint8_t> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
-    std::vector<int16_t> job_of;
+    ExpertRouteGroups route_groups;
+    int64_t grouped_entries = 0, formed_groups = 0, cross_request_groups = 0;
+    uint64_t expert_upload_bytes = 0;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;

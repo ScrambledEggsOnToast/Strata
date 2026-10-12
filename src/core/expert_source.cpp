@@ -3323,8 +3323,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool native = lay.native;
     if (d.act_multi.size() < (size_t) n_tok ||
         (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) ||
-        d.job_of.size() != (size_t) d.n_expert || d.jobs_multi.size() < (size_t) (n_tok * k)) {
+        d.jobs_multi.size() < (size_t) (n_tok * k)) {
         d.failed = true; d.fail = "expert dispatch scratch exceeds setup allocation"; return;
+    }
+    ExpertWork grouped_work;
+    grouped_work.operation = d.worker_contract ? d.operation[d.worker_group]
+        : ExpertOperation{d.request_generation, d.layers, d.next_position, n_tok, 0};
+    grouped_work.weights = {1, 1, d.src, H, native ? lay.fmt[(size_t) d.layers].n_ff : FF,
+                           native ? lay.fmt[(size_t) d.layers].gu_type : 0,
+                           native ? lay.fmt[(size_t) d.layers].d_type : 0};
+    grouped_work.input = x_f;
+    grouped_work.experts = ids;
+    grouped_work.positions = d.positions;
+    grouped_work.request_slots = d.request_slots;
+    grouped_work.request_ids = d.worker_requests;
+    grouped_work.routed_width = k;
+    if (!d.route_groups.form(grouped_work, nullptr, d.n_expert)) {
+        d.failed = true; d.fail = "invalid request-owned expert grouping metadata"; return;
     }
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
@@ -3347,17 +3362,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             auto* plan = static_cast<GpuPlanSink*>(context);
             if (plan && plan->publish) plan->publish(plan->ctx);
         });
-        ExpertWork work;
-        work.operation = d.operation[d.worker_group];
-        work.weights = {1, 1, d.src, H, native ? lay.fmt[(size_t) d.layers].n_ff : FF,
-                       native ? lay.fmt[(size_t) d.layers].gu_type : 0,
-                       native ? lay.fmt[(size_t) d.layers].d_type : 0};
-        work.input = x_f;
-        work.experts = ids;
-        work.positions = d.positions;
-        work.request_slots = d.request_slots;
-        work.request_ids = d.worker_requests;
-        work.routed_width = k;
+        ExpertWork work = grouped_work;
+        work.positions = d.route_groups.positions();
+        work.request_slots = d.route_groups.slots();
+        work.request_ids = d.route_groups.requests();
         work.assigned = kind;
         std::string error;
         if (primary.begin(work, error)) return true;
@@ -3365,8 +3373,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.failed = true; d.fail = "primary graph worker submission failed"; return false;
     };
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
-        int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
-        int nd = 0, nmiss = 0;
+        const int nd = (int) d.route_groups.size();
+        int nmiss = 0;
         // a helper GPU (RemoteExperts) holding the expert computes it in its own VRAM once begin() claims the row: like
         // the peer tier's, such an expert is no miss of this plan and never part of the PCIe share, which would read it
         // over the primary's link instead (2x RX 6900 XT, IQ3_S, --remote-expert-opt with the probed share 0.39: ~4
@@ -3376,26 +3384,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (remote->holds(d.layers, e)) return true;
             return false;
         };
-        for (int64_t i = 0; i < n; ++i) {
-            first_of[i] = i;
-            for (int64_t j = 0; j < i; ++j)
-                if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
-            if (first_of[i] == i) {
-                distinct[nd++] = i;
-                const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
-            }
+        for (int q = 0; q < nd; ++q) {
+            const int32_t e = d.route_groups.group(q).expert;
+            if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
-        int64_t pcie_i0[64];
+        int pcie_group[64];
         for (int q = 0; q < nd; ++q) {
-            const int64_t i0 = distinct[q];
-            const int32_t e = ids[i0];
+            const auto& routed = d.route_groups.group(q);
+            const int32_t e = routed.expert;
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
@@ -3417,39 +3419,39 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
-                            pcie_i0[fetches] = i0;
+                            pcie_group[fetches] = q;
                             ++fetches;
                         }
                     }
                     ++miss_rank;
                 }
             }
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+            for (size_t member = 0; member < routed.count; ++member)
+                kind[d.route_groups.entry(q, member).destination] = kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (size_t member = 0; member < routed.count; ++member) {
+                const auto entry = d.route_groups.entry(q, member);
+                P.dst[entries] = entry.destination;
+                P.tok[entries] = entry.token;
+                ++entries;
+            }
             ++groups;
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
-            const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
+            const int g = pcie_group[q];
+            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, d.route_groups.group(g).expert)
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (size_t member = 0; member < d.route_groups.group(g).count; ++member) {
+                const auto entry = d.route_groups.entry(g, member);
+                P.dst[entries] = entry.destination;
+                P.tok[entries] = entry.token;
+                ++entries;
+            }
             ++d.pcie_experts;
         }
         P.start2[fetches] = entries;
@@ -3462,6 +3464,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         else if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (P.fetch && P.pcie_mode == 0) d.expert_upload_bytes += (uint64_t) fetches * bb;
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -3491,25 +3494,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (!d.workers.empty()) {
         static thread_local std::string remote_error;
-        ExpertWork work;
-        work.operation = d.operation[d.worker_group];
-        work.operation.layer = d.layers;
-        work.operation.token_count = n_tok;
-        work.weights.input_width = H;
-        work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
-        work.weights.handle = d.src;
-        work.weights.model_generation = 1; // one immutable model load per engine process
-        work.weights.residency_version = 1;
-        if (native) {
-            work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
-            work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
-        }
-        work.input = x_f;
-        work.experts = ids;
-        work.routed_width = k;
-        work.positions = d.positions;
-        work.request_slots = d.request_slots;
-        work.request_ids = d.worker_requests;
+        ExpertWork work = grouped_work;
+        work.positions = d.route_groups.positions();
+        work.request_slots = d.route_groups.slots();
+        work.request_ids = d.route_groups.requests();
         work.assigned = kind;
         work.primary_residency = d.host_res;
         if (d.worker_contract) {
@@ -3554,61 +3542,66 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
-                std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
-                miss.push_back(ids[i]);
+        for (size_t q = 0; q < d.route_groups.size(); ++q) {
+            for (size_t member = 0; member < d.route_groups.group(q).count; ++member) {
+                const auto entry = d.route_groups.entry(q, member);
+                if (kind[entry.destination] < 0) { miss.push_back(entry.expert); break; }
+            }
+        }
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
-    int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
-                if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
-                if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
+    // Final worker ownership partitions the same selected entries. Helpers have
+    // snapshotted their metadata, and the primary plan owns its own dst/tok tables.
+    int32_t resolved_workers[kMaxWindowEntries];
+    for (int64_t i = 0; i < n; ++i) {
+        resolved_workers[i] = kind[i] < 0 ? 1 : kind[i] == 2 ? 3 : 2;
+        if (d.worker_contract && kind[i] >= 0)
+            resolved_workers[i] = (int32_t) d.completion[d.worker_group].owner((size_t) i);
+        else if (!d.worker_contract)
+            for (size_t w = 0; w < d.remote.size(); ++w)
+                if (d.remote[w]->owns(i)) { resolved_workers[i] = (int32_t) (4 + w); break; }
+        float* row = out + (size_t) i * H;
+        if (kind[i] >= 0) {
+            if (kind[i] == 0) ++d.cache_hits;
+            else ++d.offload_entries;
+            if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
+            if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                  (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                std::memset(row, 0, (size_t) H * sizeof(float));
+        } else {
             ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0 || d.jobs_multi[(size_t) jo].nt == MAXT) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
-                    d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    ++d.missing;
-                    if (d.worker_contract) drain_failed_workers(d);
-                    return;
-                }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
-            }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
             ++d.multi_entries;
         }
+    }
+    if (!d.route_groups.resolve_workers(resolved_workers) &&
+        !d.route_groups.form(grouped_work, resolved_workers, d.n_expert)) {
+        if (d.worker_contract) drain_failed_workers(d);
+        d.failed = true; d.fail = "resolved expert grouping metadata changed"; return;
+    }
+    int njobs = 0;
+    for (size_t q = 0; q < d.route_groups.size(); ++q) {
+        const auto& group = d.route_groups.group(q);
+        if (group.worker != 1) continue;
+        // Preserve the existing per-job MAXT cap, including repeated router IDs.
+        for (size_t first = 0; first < group.count; first += MAXT) {
+            const uint8_t* blob = d.src->blob(d.layers, group.expert);
+            if (!blob) {
+                d.failed = true; d.fail = "the expert source could not produce a blob";
+                d.fail_layer = d.layers; d.fail_expert = group.expert; ++d.missing;
+                if (d.worker_contract) drain_failed_workers(d);
+                return;
+            }
+            ExpertJobMulti& job = d.jobs_multi[(size_t) njobs++];
+            job.blob = blob;
+            job.nt = (int) std::min<size_t>(MAXT, group.count - first);
+            for (int member = 0; member < job.nt; ++member) {
+                const auto entry = d.route_groups.entry(q, first + (size_t) member);
+                job.act[member] = &d.act_multi[entry.token];
+                job.nact[member] = native ? d.nact_multi.data() + (size_t) entry.token * kNativeActBytes : nullptr;
+                job.out[member] = out + (size_t) entry.destination * H;
+            }
+        }
+    }
     if (d.worker_contract)
         for (int64_t i = 0; i < n; ++i) if (kind[i] < 0 &&
             !d.completion[d.worker_group].claim((size_t) i, 1, 1)) {
@@ -3619,23 +3612,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (d.worker_contract) {
         CpuExpertWorker cpu(d, njobs);
-        ExpertWork work;
-        work.operation = d.operation[d.worker_group];
-        work.weights.handle = d.src;
-        work.weights.model_generation = 1;
-        work.weights.residency_version = 1;
-        work.weights.input_width = H;
-        work.weights.hidden_width = native ? lay.fmt[(size_t) d.layers].n_ff : FF;
-        if (native) {
-            work.weights.gate_up_format = lay.fmt[(size_t) d.layers].gu_type;
-            work.weights.down_format = lay.fmt[(size_t) d.layers].d_type;
-        }
-        work.input = x_f;
-        work.experts = ids;
-        work.positions = d.positions;
-        work.request_slots = d.request_slots;
-        work.request_ids = d.worker_requests;
-        work.routed_width = k;
+        ExpertWork work = grouped_work;
+        work.positions = d.route_groups.positions();
+        work.request_slots = d.route_groups.slots();
+        work.request_ids = d.route_groups.requests();
         work.assigned = kind;
         std::string error;
         if (!cpu.begin(work, error) || !cpu.finish(out, error)) {
@@ -3675,6 +3655,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.worker_contract && d.completion[d.worker_group].has_owner(3) && !d.completion[d.worker_group].complete(d.operation[d.worker_group], 3, 1)) {
         d.completion[d.worker_group].fail(); d.failed = true; d.fail = "stale peer expert completion"; return;
     }
+    for (size_t q = 0; q < d.route_groups.size(); ++q)
+        for (size_t member = 0; member < d.route_groups.group(q).count; ++member) {
+            const auto entry = d.route_groups.entry(q, member);
+            const uint64_t request = entry.slot >= 0 ? d.slot_requests[entry.slot] : d.request_generation;
+            const int64_t position = d.positions ? d.positions[entry.token] : d.next_position + entry.token;
+            if (ids[entry.destination] != entry.expert ||
+                !d.route_groups.matches(entry, request, position, entry.slot,
+                                       grouped_work.operation, grouped_work.weights)) {
+                if (d.worker_contract) drain_failed_workers(d);
+                d.failed = true; d.fail = "expert result owner changed before scatter consumption"; return;
+            }
+        }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -3682,11 +3674,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
     d.multi_misses += njobs;
+    d.grouped_entries += n;
+    d.formed_groups += (int64_t) d.route_groups.size();
+    d.cross_request_groups += (int64_t) d.route_groups.cross_request_groups();
+    pt("grouped entries", n);
+    pt("resolved groups", (long long) d.route_groups.size());
+    pt("cross-request groups", (long long) d.route_groups.cross_request_groups());
+    pt("cumulative DMA payload bytes", (long long) d.expert_upload_bytes);
     ++d.layers;
     d.experts += n_tok * k;
 }

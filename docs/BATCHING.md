@@ -107,6 +107,58 @@ The project's protected B1 greedy cell exercised this path successfully. B2/B4,
 sampling, configured EOS, and multiplex qualification are separate gates; this
 result does not establish those capabilities or V100 runtime support.
 
+### Request-owned expert groups
+
+Expert execution already grouped a ready window's rows by expert, on both the
+CPU pool and the primary GPU. It did not need another cross-request queue.
+`ExpertRouteGroups` now supplies one CUDA-free scatter map to both paths:
+each member retains its request generation, physical slot, logical position,
+packed token index and original router index. Layer, operation generation,
+immutable weight identity and gate/up/down formats belong to the whole window;
+the final groups partition by expert and resolved execution worker. A helper
+that selects only some rows produces separate worker groups, not a changed route.
+
+Formation uses only rows already ready at the layer doorbell: **no formation
+wait**, at most eight input rows and 128 routed entries. One fixed **2048-byte**
+map is shared by all requests and stages, and charged once by admission; it does
+not multiply the CPU pool, its scratch, or resident main/draft placements.
+The existing single-resolved-placement pricing/carving contract is unchanged.
+CPU jobs retain the eight-member cap, including repeated expert IDs.
+
+Outputs remain **unweighted** at `(packed token * routed width + router rank)`.
+The existing graph owns router coefficients and combines in the same router
+order. No expert kernel, quantization, routing, shared-expert contribution,
+sampling, speculative acceptance or reduction order changes. Group completion
+order cannot become summation order. Exact affected-operator and same-prefix
+real-model regression remain required; the CPU scatter oracle does not replace
+them.
+
+Cancellation keeps the existing single-host linearization: before submission a
+cancelled row is omitted; an already launched window retains all member storage
+and immutable weights until its consumers drain. Only then may a request retire
+or its slot be reused. The frozen result identity is checked before host results
+are exposed to the graph. There is no per-job cancellation that frees a member's
+scratch while other members still use it. The asynchronous CPU oracle separately
+exercises retiring one request after submission and discarding only its delivery,
+without changing another request's speculative positions.
+
+`STRATA_POOL_TRACE=1` reports actual routed entries, resolved groups, groups
+spanning request identities, CPU jobs (`run`), and cumulative **submitted DMA
+payload bytes** on host-serviced layers. These are separate quantities: shared
+groups are not measured saved bytes or launch savings. Device-only all-resident
+plans still bypass the host doorbell and are not counted by this trace. This
+metadata change adds/removes no expert kernel launches and claims no speedup;
+real-model overlap/traffic and a matched performance comparison need the GPU.
+There is no new worker queue or dynamic worker-cost estimator.
+
+The existing `expert_worker_test` includes a bit-exact grouped/separate
+scatter/reduction oracle with mixed expert/worker sets, zero coefficients,
+repeated IDs, permuted physical slots and multiple positions per request, plus
+out-of-order asynchronous completion, partial retirement and stale
+request/layer/span/format/residency refusal. `qsa_placement_test` and the parent's
+native/Python planner fixtures continue to pin admission and resolved placement.
+
+
 ### What a slot costs, and what setup recommends
 
 Each resident slot owns a `SessionOwner` (GDN recurrence/convolution, QSA KV/indexer and PLE history), a private

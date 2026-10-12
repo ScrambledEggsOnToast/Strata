@@ -53,6 +53,132 @@ struct ExpertWork {
     const int32_t* primary_residency = nullptr;
 };
 
+// A ready layer window, not a queue: formation never waits for another request.
+// Layer, formats and immutable weight/residency identity are common to the window;
+// expert + resolved worker partition its entries. Original router indices are the
+// scatter destinations, so this module never weights or reduces an expert output.
+class ExpertRouteGroups {
+public:
+    static constexpr size_t kCapacity = 128, kTokens = 8;
+    struct Group {
+        int32_t expert = 0, worker = 0;
+        uint16_t start = 0, count = 0;
+    };
+    struct Entry {
+        uint64_t request;
+        int64_t position;
+        int32_t slot, expert, worker;
+        uint16_t destination, token, route, group_index, member_index;
+    };
+
+    bool form(const ExpertWork& work, const int32_t* workers, int64_t expert_count) {
+        const int64_t tokens = work.operation.token_count, width = work.routed_width;
+        if (tokens < 0 || tokens > (int64_t) kTokens || width <= 0 ||
+            width > (int64_t) kCapacity || tokens > (int64_t) kCapacity / width ||
+            work.operation.layer < 0 || work.operation.first_position < 0 ||
+            work.operation.first_position > INT64_MAX - tokens || expert_count <= 0 ||
+            (tokens && !work.experts)) return false;
+        // Reject the whole descriptor before replacing an earlier valid snapshot.
+        for (int64_t t = 0; t < tokens; ++t)
+            if ((work.positions && work.positions[t] < 0) ||
+                (work.request_slots && (work.request_slots[t] < -1 ||
+                                        work.request_slots[t] >= (int) kTokens))) return false;
+        for (int64_t i = 0; i < tokens * width; ++i)
+            if (work.experts[i] < 0 || work.experts[i] >= expert_count) return false;
+        operation_ = work.operation;
+        weights_ = work.weights;
+        width_ = (uint16_t) width;
+        count_ = (uint16_t) (tokens * width);
+        groups_ = 0;
+        for (int64_t t = 0; t < tokens; ++t) {
+            requests_[t] = work.request_ids ? work.request_ids[t] : work.operation.request;
+            positions_[t] = work.positions ? work.positions[t] : work.operation.first_position + t;
+            slots_[t] = work.request_slots ? work.request_slots[t] : -1;
+        }
+        uint16_t group_of[kCapacity];
+        for (uint16_t i = 0; i < count_; ++i) {
+            const int32_t worker = workers ? workers[i] : -1;
+            uint16_t g = 0;
+            while (g < groups_ && (group_[g].expert != work.experts[i] || group_[g].worker != worker)) ++g;
+            if (g == groups_) group_[groups_++] = {work.experts[i], worker, 0, 0};
+            group_of[i] = g;
+            ++group_[g].count;
+        }
+        uint16_t fill[kCapacity], offset = 0;
+        for (uint16_t g = 0; g < groups_; ++g) {
+            fill[g] = group_[g].start = offset;
+            offset += group_[g].count;
+        }
+        for (uint16_t i = 0; i < count_; ++i) destinations_[fill[group_of[i]]++] = i;
+        return true;
+    }
+
+    // Static placement normally assigns an entire expert to one worker. Resolve
+    // that common case in linear time without rebuilding or copying row identity.
+    // A row-selective helper can instead form the exact expert/worker partition.
+    bool resolve_workers(const int32_t* workers) {
+        if (count_ && !workers) return false;
+        for (size_t g = 0; g < groups_; ++g) {
+            const Group& q = group_[g];
+            const int32_t worker = workers[destinations_[q.start]];
+            for (size_t m = 1; m < q.count; ++m)
+                if (workers[destinations_[q.start + m]] != worker) return false;
+        }
+        for (size_t g = 0; g < groups_; ++g)
+            group_[g].worker = workers[destinations_[group_[g].start]];
+        return true;
+    }
+
+    size_t size() const { return groups_; }
+    size_t entries() const { return count_; }
+    const Group& group(size_t g) const { return group_[g]; }
+    Entry entry(size_t g, size_t member) const {
+        const Group& q = group_[g];
+        const uint16_t destination = destinations_[q.start + member];
+        const uint16_t token = destination / width_;
+        return {requests_[token], positions_[token], slots_[token], q.expert, q.worker,
+                destination, token, (uint16_t) (destination % width_), (uint16_t) g, (uint16_t) member};
+    }
+    // Retirement/slot reuse may discard presentation, never an in-flight member's
+    // compute or storage. Match the frozen identity at the drained delivery boundary.
+    bool matches(const Entry& e, uint64_t request, int64_t position, int slot,
+                 const ExpertOperation& operation, const ExpertWeights& weights) const {
+        return operation == operation_ && weights.model_generation == weights_.model_generation &&
+               weights.residency_version == weights_.residency_version && weights.handle == weights_.handle &&
+               weights.input_width == weights_.input_width && weights.hidden_width == weights_.hidden_width &&
+               weights.gate_up_format == weights_.gate_up_format && weights.down_format == weights_.down_format &&
+               e.group_index < groups_ && e.member_index < group_[e.group_index].count &&
+               e.expert == group_[e.group_index].expert && e.worker == group_[e.group_index].worker &&
+               e.destination == destinations_[group_[e.group_index].start + e.member_index] &&
+               e.token < operation_.token_count && e.route < width_ && e.destination < count_ &&
+               e.destination == e.token * width_ + e.route && e.request == requests_[e.token] &&
+               e.position == positions_[e.token] &&
+               e.slot == slots_[e.token] && request == e.request && position == e.position && slot == e.slot;
+    }
+    const ExpertOperation& operation() const { return operation_; }
+    const ExpertWeights& weights() const { return weights_; }
+    const uint64_t* requests() const { return requests_; }
+    const int64_t* positions() const { return positions_; }
+    const int* slots() const { return slots_; }
+    size_t cross_request_groups() const {
+        size_t count = 0;
+        for (size_t g = 0; g < groups_; ++g)
+            for (size_t j = 1; j < group_[g].count; ++j)
+                if (entry(g, j).request != entry(g, 0).request) { ++count; break; }
+        return count;
+    }
+private:
+    ExpertOperation operation_;
+    ExpertWeights weights_;
+    Group group_[kCapacity];
+    uint16_t destinations_[kCapacity];
+    uint64_t requests_[kTokens];
+    int64_t positions_[kTokens];
+    int slots_[kTokens];
+    uint16_t width_ = 0, count_ = 0, groups_ = 0;
+};
+static_assert(sizeof(ExpertRouteGroups) == 2048, "update the global route-group price together");
+
 // begin must synchronously snapshot caller-owned input and routing/position/request
 // metadata into adapter-owned staging before returning. Caller buffers may be
 // overwritten by primary-graph teardown even when helper cancellation fails.

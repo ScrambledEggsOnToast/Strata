@@ -4176,6 +4176,8 @@ int main(int argc, char** argv) {
             strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity) +
             sizeof(strata::core::ExpertCompletion) + sizeof(strata::core::ExpertOperation) + sizeof(strata::core::GraphExpertWorker)),
             "two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes");
+        ram("expert_route_groups", sizeof(strata::core::ExpertRouteGroups),
+            "one fixed request-owned route map shared by the global pool and all stages, never per slot");
         static_assert(sizeof(void*) == 8, "update worker helper pointer accounting together");
         ram("expert_worker_helpers", byte_mul(2 * helper_count, sizeof(void*)),
             "two setup-only registries of exactly the configured helper count, shared by all stages");
@@ -7119,7 +7121,6 @@ int main(int argc, char** argv) {
     drive.d.act_multi.resize((size_t) strata::kernels::cpu::MAXT);
     if (strata::kernels::cpu::expert_layout().native)
         drive.d.nact_multi.resize((size_t) strata::kernels::cpu::MAXT * strata::kernels::cpu::kNativeActBytes);
-    drive.d.job_of.assign((size_t) g.n_expert, (int16_t) -1);
     drive.d.jobs_multi.resize((size_t) strata::kernels::cpu::MAXT * K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
