@@ -303,6 +303,25 @@ hits, the router, the head, ...). The GPU profile times every stage with events,
 use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of
 per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
 
+**Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
+`PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one
+per stage chunk, and a containing public `Prefill::run` record after its pipeline drains. Records include
+stage ownership, token position/count, MMQ and host-route exposure, mapped readback, deferred shared work,
+borrow status, streamed/DMA expert counts, GPU phase durations, and monotonic host intervals for the route
+join, host grouping, observer fold, stage download, successor wait and final chunk join. The observer adds
+no CUDA event or synchronization call sites and does not change expert arithmetic. It does add host
+accounting/logging and enables the event timer: use it for attribution, **not headline latency**.
+
+The host grouping GPU envelope starts after the previously queued attention/router work; a long host
+`cudaStreamSynchronize` call can instead be waiting for that earlier GPU work. Raw joins are not removable
+CPU delay, and the stage download interval includes its preceding work as well as the copy. Phase envelopes
+can contain submission gaps and are not isolated kernel measurements. Do not add overlapping host waits to
+GPU durations, or add two devices' timelines into wall time. Host stamps share a monotonic clock; the GPU
+durations do not establish cross-device clock alignment. Invalid event measurements mark the records
+incomplete. The switch is off by default; omit `STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
+This observer's layer-record storage supports bounds within `[0,48]`; it explicitly refuses other bounds
+rather than emitting a partial capture. The normal unobserved engine path is unchanged.
+
 Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
 and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
 
