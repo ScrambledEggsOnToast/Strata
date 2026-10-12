@@ -209,6 +209,55 @@ a speed/concurrency claim. Retain neither V100 role assignment without matched
 real-model quality/state, memory and decode/prefill measurements; link width
 alone is not evidence about its HBM-local arithmetic.
 
+## Resident device prefill grouping (experimental, #194)
+
+`STRATA_PREFILL_NATIVE_GROUPED=1 STRATA_PREFILL_DEVICE_GROUPING=1` selects a
+CUDA-only resident route. The device builds compact expert counts, bounds and
+stable token/slot maps, then the existing native grouped operator computes
+gate/up, SwiGLU, Q8_1 intermediates and down. The existing prefill combine still
+walks the original router-k order with the unchanged weights and shared expert.
+No routing/count readback sizes these launches. The resident grouper extends the
+decode metadata layout beyond its 128-entry window; it does not enable the
+SM80-only fused expert arithmetic on Volta.
+
+All experts of a layer must remain in the local live cache after prompt scratch
+is lent. Missing experts, streamed layers, peer/resident-helper ownership,
+non-native-grouped arithmetic and HIP keep the established host route. Cache
+pointers are rebuilt per prompt from the current slot addresses, including
+unequal-sized slots; metadata and its consumers use the same compute stream.
+The existing cancellation, relayout and final drain remain the scratch owners.
+One 16-byte status copy per chunk uses the containing chunk drain, not a
+per-layer routing join or launch-size readback.
+The legacy `STRATA_PREFILL_TIMING` and `STRATA_PREFILL_ATTRIBUTION=1` GPU-event
+observers keep host grouping: their event pools rely on those layer joins.
+They establish no device-grouping exposure. Use observer-off matched timings
+and a separately matched external kernel timeline for critical-path attribution.
+
+For 48 layers and 512 experts the additional loanable device price is
+200,704 bytes (including the allocator guards), and the counted host mirror and
+eligibility flags add 196,656 bytes. The standalone allocator adds one 2 MiB
+allocation. Counts/offset scratch uses the already-admitted bounds tail; the
+expert operator keeps its existing full `T*K` scratch with no padded rows or
+weight-storage loans added by dispatch. The rank pass makes `T*K*n_expert`
+integer comparisons, so its complete GPU cost must be included in the screen.
+These are source-derived prices, not measured memory peaks.
+
+Rollback is `STRATA_PREFILL_DEVICE_GROUPING=0` (the default). Keep
+`STRATA_PREFILL_NATIVE_GROUPED=1` in **both** comparison arms: enabling native
+grouped arithmetic against default MMQ is a separate arithmetic change, not
+evidence for this grouping treatment. The CPU `resident_grouping_test` checks
+eligibility; `prefill_allocation_test --native-host-grouping` and
+`--native-device-grouping` expose the admitted prices without a GPU.
+`native_grouped_parity --resident-prefill` checks exact maps through 327,680
+entries, singleton/hot/tail native FFNs and the actual weighted combine.
+
+This candidate is not a measured speedup or a qualified profile. A matched
+multi-chunk HTTP comparison must preserve resolved placement, inputs, observers
+and arithmetic. The removed host synchronization also completed preceding GPU
+work; its wall interval is not removable CPU cost. Reject the optimization if
+the complete route does not usefully shorten the critical path, and confirm a
+promising result on a held-out prompt before retaining it.
+
 ## Resident-owner prefill (experimental, HET-022)
 
 The opt-in native-grouped path has built with inspected SM70/SM86 device code

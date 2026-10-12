@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
 #include "mmq_resident_sort.hpp"
+#include "resident_grouping.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -16,6 +17,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -784,6 +786,9 @@ struct Prefill::Impl {
     int32_t* native_count = nullptr;
     uint8_t* native_resident = nullptr;
     std::vector<uint8_t> native_resident_host;
+    unsigned long long* native_expert_ptrs = nullptr;
+    std::vector<unsigned long long> native_expert_ptrs_host;
+    std::vector<uint8_t> native_device_layer;
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
@@ -996,7 +1001,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
 struct MmqPlan {
-    bool any = false, fallback = true, native_grouped = false;
+    bool any = false, fallback = true, native_grouped = false, device_grouped = false;
     std::vector<char> layer;                   // per layer: MMQ
     std::vector<char> fo;                      // per layer: no MMQ here but the native fused kernels cover its formats
                                                // (gfx11: UD-Q4_K_XL's Q4_K / Q5_K and Q5_1 / Q8_0 experts, STRATA_PF_FUSED=1)
@@ -1012,6 +1017,12 @@ const MmqPlan& mmq_plan() {
         p.native_grouped = native_env != nullptr && std::atoi(native_env) != 0;
         if (p.native_grouped && (!on || !lay.native))
             throw std::runtime_error("native grouped prefill requires native weights and STRATA_PREFILL_MMQ enabled");
+        // The legacy event observers reuse their pool only at host layer joins; keep them on the host
+        // route rather than create unpriced event storage or reintroduce a join in the treatment.
+        const char* attribution = std::getenv("STRATA_PREFILL_ATTRIBUTION");
+        p.device_grouped = p.native_grouped && detail::resident_grouping_requested() &&
+                           std::getenv("STRATA_PREFILL_TIMING") == nullptr &&
+                           !(attribution && std::strcmp(attribution, "1") == 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
@@ -1308,8 +1319,14 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>(mmq_bounds_count(m.g->n_expert), ok);
         if (mp.native_grouped) {
-            m.native_ptrs = o.take<unsigned long long>(MMQ_GROUP, ok);
-            m.native_count = o.take<int32_t>(1, ok);
+            m.native_ptrs = o.take<unsigned long long>(mp.device_grouped ? std::max<int64_t>(MMQ_GROUP, g.n_expert) : MMQ_GROUP, ok);
+            m.native_count = o.take<int32_t>(mp.device_grouped ? 4 : 1, ok);
+            if (mp.device_grouped) {
+                const size_t entries = (size_t) g.n_layers * g.n_expert;
+                m.native_expert_ptrs = o.take<unsigned long long>(entries, ok);
+                m.native_expert_ptrs_host.resize(entries);
+                m.native_device_layer.resize((size_t) g.n_layers);
+            }
             m.native_resident = o.take<uint8_t>((size_t) m.g->n_layers * m.g->n_expert, ok);
             m.native_resident_host.resize((size_t) m.g->n_layers * m.g->n_expert, 0);
         } else {
@@ -2219,8 +2236,10 @@ uint64_t Prefill::bytes_needed_from(const core::ModelGeometry& g, const PrefillF
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>(mmq_bounds_count(g.n_expert), ok);
         if (mp.native_grouped) {
-            o.take<unsigned long long>(MMQ_GROUP, ok);
-            o.take<int32_t>(1, ok);
+            o.take<unsigned long long>(mp.device_grouped ? std::max<int64_t>(MMQ_GROUP, g.n_expert) : MMQ_GROUP, ok);
+            o.take<int32_t>(mp.device_grouped ? 4 : 1, ok);
+            if (mp.device_grouped)
+                o.take<unsigned long long>((size_t) g.n_layers * g.n_expert, ok);
             o.take<uint8_t>((size_t) g.n_layers * g.n_expert, ok);
         } else {
             o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
@@ -2515,6 +2534,42 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (m.native_resident != nullptr)
         cudaMemcpyAsync(m.native_resident, m.native_resident_host.data(), m.native_resident_host.size(),
                         cudaMemcpyHostToDevice, m.cs);
+    // Residency is authoritative AFTER the caller lends/evicts prompt scratch. Never retain pointers across
+    // runs or relayouts; unequal cache slots are resolved with device_slot, not id*max_blob.
+    int64_t device_group_layers = 0;
+    int32_t device_group_status[4] = {};
+    unsigned long long accounted_device_groups = 0;
+    const auto collect_device_groups = [&]() -> bool {
+        if (!m.native_expert_ptrs) return true;
+        if (device_group_status[1]) { err = "prefill: invalid resident device grouping"; return false; }
+        unsigned long long groups = 0;
+        std::memcpy(&groups, device_group_status + 2, sizeof(groups));
+        stats_.experts_resident += (int64_t) (groups - accounted_device_groups);
+        accounted_device_groups = groups;
+        return true;
+    };
+    if (m.native_expert_ptrs) {
+        std::fill(m.native_expert_ptrs_host.begin(), m.native_expert_ptrs_host.end(), 0);
+        std::fill(m.native_device_layer.begin(), m.native_device_layer.end(), 0);
+        for (int64_t l = LB; l < LE; ++l) {
+            const int32_t* resident = m.host_res ? m.host_res + (size_t) l * g.n_expert : nullptr;
+            if (!detail::resident_grouping_eligible(true, mmq_plan().native_grouped, m.cache != nullptr,
+                                                   resident, g.n_expert, m.cache ? m.cache->slots() : 0,
+                                                   helper_for_layer(l) != nullptr || core::peer_portable(), true))
+                continue;
+            m.native_device_layer[(size_t) l] = 1;
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                m.native_expert_ptrs_host[(size_t) l * g.n_expert + e] =
+                    reinterpret_cast<unsigned long long>(m.cache->device_slot(resident[e]));
+        }
+        if (cudaMemcpyAsync(m.native_expert_ptrs, m.native_expert_ptrs_host.data(),
+                            m.native_expert_ptrs_host.size() * sizeof(unsigned long long),
+                            cudaMemcpyHostToDevice, m.cs) != cudaSuccess ||
+            cudaMemsetAsync(m.native_count, 0, 4 * sizeof(int32_t), m.cs) != cudaSuccess) {
+            err = "prefill: resident device grouping setup";
+            return false;
+        }
+    }
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -3385,6 +3440,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = !mmq_plan().native_grouped && (use_mmq || fused_only) && stream_all &&
                                            no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    const bool device_grouped = m.native_expert_ptrs && m.native_device_layer[(size_t) l] &&
+                                                !m.pp && no_peer && (!stream_all ||
+                                                seq_start[(size_t) l] == seq_start[(size_t) l + 1]);
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3468,6 +3526,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 give_back(consumed);
                             }
                         }
+                    } else if (device_grouped) {
+#if !defined(STRATA_USE_HIP)
+                        // Same native expert arithmetic and stable row order as the host-grouped arm.
+                        // All metadata writes/reads stay on cs, including previous-layer consumers: the
+                        // removed host sync was an ownership join as well as a router readback.
+                        pt.mark(kPfHostGroup, cs);
+                        strata::kernels::moe_group_resident(m.ids, (int) (T * K), (int) K, (int) g.n_expert,
+                            m.native_expert_ptrs + (size_t) l * g.n_expert,
+                            m.bounds_dev + g.n_expert + 1, m.native_ptrs, m.bounds_dev,
+                            m.native_count, m.slot_dev, m.src_dev, m.cs);
+                        if (defer_shared) {
+                            pt.mark(kPfRouter, cs);
+                            if (!shared_expert()) return false;
+                        }
+                        pt.mark(kPfGather, cs);
+                        strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.Xq, m.cs);
+                        pt.mark(kPfNativeFfn, cs);
+                        const auto& f = lay.fmt[(size_t) l];
+                        const auto layout = strata::kernels::native_expert_layout(f.gu_type, f.d_type, N, 640);
+                        strata::kernels::native_expert_grouped(layout, m.native_ptrs, m.bounds_dev,
+                            m.native_count, m.ids_identity, m.src_dev, g.n_expert, T * K,
+                            m.Xq, m.GU, m.Dm, m.cs, MMQ_GROUP);
+                        ++device_group_layers;
+#endif
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);
@@ -4465,6 +4547,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
+        // Only diagnostics cross back, once per chunk at its existing drain, never for group sizing.
+        if (m.native_expert_ptrs &&
+            cudaMemcpyAsync(device_group_status, m.native_count, sizeof(device_group_status),
+                            cudaMemcpyDeviceToHost, m.cs) != cudaSuccess) {
+            err = "prefill: resident device grouping status";
+            return false;
+        }
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
@@ -4473,6 +4562,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            if (!collect_device_groups()) return false;
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
@@ -4527,6 +4617,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            if (!collect_device_groups()) return false;
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk) {
@@ -4572,6 +4663,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return false;
     }
     if (!m.canary.validate("prefill", err)) return false;
+    if (!collect_device_groups()) return false;
+    if (m.native_expert_ptrs)
+        std::fprintf(stderr, "strata: resident device grouping: %lld layers, %llu selected expert groups\n",
+                     (long long) device_group_layers, accounted_device_groups);
     lease.complete = true;
     if (kv_prefetch) {
         if (const cudaError_t cst = cudaStreamSynchronize(m.kv_copy); cst != cudaSuccess) {
@@ -4743,6 +4838,10 @@ bool Prefill::host_allocation_from(const core::ModelGeometry& g, const PrefillFa
     add(dynamic, 2 * (uint64_t) g.n_expert, sizeof(int));                 // MoE grouping: stage_of/job_of
     add(dynamic, (uint64_t) g.n_layers, sizeof(char));                    // the per-layer MMQ table
     add(dynamic, T, sizeof(int32_t));                                     // the draft layer's token staging
+    if (mmq_plan().device_grouped) {
+        add(dynamic, (uint64_t) g.n_layers * (uint64_t) g.n_expert, sizeof(unsigned long long));
+        add(dynamic, (uint64_t) g.n_layers, sizeof(uint8_t));
+    }
     if (f.kv_mode == 1) add(dynamic, (uint64_t) f.n_pages, sizeof(int32_t));  // the streaming identity page table
     return ok;
 }

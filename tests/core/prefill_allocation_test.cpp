@@ -32,7 +32,7 @@ void check(bool ok, const char* what) {
 }
 
 // Run in its own process: the prompt MMQ plan freezes the loaded artifact on first use.
-int native_bounds_regression() {
+int native_bounds_regression(int grouping = -1) {
     using namespace strata;
     if (!prefill::mmq::built() || !kernels::cpu::native_experts_available()) return 77;
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -63,6 +63,17 @@ int native_bounds_regression() {
 #else
     if (setenv("STRATA_PREFILL_MMQ", "1", 1) != 0) return 1;
 #endif
+    if (grouping >= 0) {
+#if defined(STRATA_USE_HIP)
+        return 77;   // the new route deliberately keeps HIP's existing host path
+#elif defined(_WIN32)
+        if (_putenv_s("STRATA_PREFILL_NATIVE_GROUPED", "1") != 0 ||
+            _putenv_s("STRATA_PREFILL_DEVICE_GROUPING", grouping ? "1" : "0") != 0) return 1;
+#else
+        if (setenv("STRATA_PREFILL_NATIVE_GROUPED", "1", 1) != 0 ||
+            setenv("STRATA_PREFILL_DEVICE_GROUPING", grouping ? "1" : "0", 1) != 0) return 1;
+#endif
+    }
     prefill::PrefillFacts facts;
     facts.max_cells = 4097;
     facts.n_pages = (facts.max_cells + 3) / 4;
@@ -76,12 +87,30 @@ int native_bounds_regression() {
     check(full_price != UINT64_MAX && small_price != UINT64_MAX && full_price >= small_price &&
           full_price - small_price >= allocation(full_bounds) - allocation(small_bounds),
           "native MMQ admission covers one row-limited compact group per expert");
+    if (grouping >= 0) {
+        uint64_t payload = 0, dynamic = 0;
+        check(prefill::Prefill::host_allocation_from(g, facts, 64, 16, true, g.n_layers * g.n_expert,
+                                                    payload, dynamic), "native grouping host price available");
+        if (grouping) {
+            const uint64_t pointer_delta = (uint64_t) g.n_layers * (g.n_expert - small.n_expert) *
+                                           sizeof(unsigned long long);
+            check(full_price - small_price >= pointer_delta,
+                  "resident pointer table is included in the admitted device sequence");
+            check(dynamic >= (uint64_t) g.n_layers * g.n_expert * sizeof(unsigned long long),
+                  "resident pointer mirror is included in dynamic host storage");
+        }
+        std::printf("native_grouping_price device_grouping=%d loanable=%llu host_payload=%llu host_dynamic=%llu\n",
+                     grouping, (unsigned long long) full_price, (unsigned long long) payload,
+                     (unsigned long long) dynamic);
+    }
     return failures ? 1 : 0;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--native-bounds") return native_bounds_regression();
+    if (argc == 2 && std::string(argv[1]) == "--native-host-grouping") return native_bounds_regression(0);
+    if (argc == 2 && std::string(argv[1]) == "--native-device-grouping") return native_bounds_regression(1);
     using namespace strata;
     core::ModelGeometry g;                       // the artifact's fixed geometry (validated inside)
     kernels::cpu::ExpertLayout experts;          // canonical pack: default max_blob, no native tables

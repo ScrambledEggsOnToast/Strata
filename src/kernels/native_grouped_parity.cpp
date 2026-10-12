@@ -14,6 +14,8 @@
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
 #include "strata/platform/protected_test.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -232,6 +234,151 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     g_fail += bad;
 }
 
+#if !defined(STRATA_USE_HIP)
+// The scalable resident overload must produce the host prefill's exact maps, not just conserve counts.
+void check_resident_metadata(cudaStream_t s) {
+    constexpr int E = 512, K = 10, CAP = 32768 * K;
+    int32_t *ids = dalloc<int32_t>(CAP), *slot = dalloc<int32_t>(CAP), *tok = dalloc<int32_t>(CAP),
+            *start = dalloc<int32_t>(E + 1), *counts = dalloc<int32_t>(4), *scratch = dalloc<int32_t>(2 * E);
+    auto* ptr = dalloc<unsigned long long>(E);
+    auto* experts = dalloc<unsigned long long>(E);
+    std::vector<unsigned long long> addresses(E);
+    for (int e = 0; e < E; ++e) addresses[e] = 0x10000000ull + (E - e) * 8192ull + e * 16ull;
+    ck(cudaMemcpy(experts, addresses.data(), E * 8, cudaMemcpyHostToDevice), "expert pointers");
+    int cases = 0, bad = 0;
+    for (int n : {0, 1, 10, 31, 32, 33, 255, 256, 257, 1290, 20480, 40970, CAP}) {
+        for (int hot : {0, 1}) {
+            std::vector<int32_t> routed(n), c(E), off(E + 1), want_slot(n), want_tok(n);
+            for (int i = 0; i < n; ++i) { routed[i] = hot ? 7 : ((i / K) * 17 + (i % K) * 37) % E; ++c[routed[i]]; }
+            for (int e = 0; e < E; ++e) off[e + 1] = off[e] + c[e];
+            auto fill = off;
+            std::vector<int32_t> want_start;
+            std::vector<unsigned long long> want_ptr;
+            for (int e = 0; e < E; ++e) if (c[e]) { want_start.push_back(off[e]); want_ptr.push_back(addresses[e]); }
+            want_start.push_back(n);
+            for (int i = 0; i < n; ++i) { const int at = fill[routed[i]]++; want_slot[i] = at; want_tok[at] = i / K; }
+            if (n) ck(cudaMemcpy(ids, routed.data(), (size_t) n * 4, cudaMemcpyHostToDevice), "ids");
+            ck(cudaMemset(counts, 0, 16), "counts");
+            ck(cudaMemset(scratch, 0x7f, 2 * E * 4), "stale scratch");
+            // Two launches without a join reuse the same scratch just as consecutive layers do.
+            for (int rep = 0; rep < 2; ++rep)
+                k::moe_group_resident(ids, n, K, E, experts, scratch, ptr, start, counts, slot, tok, s);
+            ck(cudaStreamSynchronize(s), "resident metadata");
+            std::vector<int32_t> got_slot(n), got_tok(n), got_start(want_start.size());
+            std::vector<unsigned long long> got_ptr(want_ptr.size());
+            int32_t got_count[4];
+            if (n) {
+                ck(cudaMemcpy(got_slot.data(), slot, (size_t) n * 4, cudaMemcpyDeviceToHost), "slot");
+                ck(cudaMemcpy(got_tok.data(), tok, (size_t) n * 4, cudaMemcpyDeviceToHost), "tok");
+            }
+            if (!got_ptr.empty()) ck(cudaMemcpy(got_ptr.data(), ptr, got_ptr.size() * 8, cudaMemcpyDeviceToHost), "ptr");
+            ck(cudaMemcpy(got_start.data(), start, got_start.size() * 4, cudaMemcpyDeviceToHost), "start");
+            ck(cudaMemcpy(got_count, counts, 16, cudaMemcpyDeviceToHost), "count");
+            unsigned long long groups;
+            std::memcpy(&groups, got_count + 2, 8);
+            const bool ok = got_slot == want_slot && got_tok == want_tok && got_start == want_start &&
+                            got_ptr == want_ptr && got_count[0] == (int) want_ptr.size() &&
+                            got_count[1] == 0 && groups == 2 * want_ptr.size();
+            ++cases;
+            if (!ok) { ++bad; std::printf("resident metadata n=%d hot=%d FAIL\n", n, hot); }
+        }
+    }
+    // Invalid IDs and selected null pointers empty the plan and set a sticky refusal, never a stale launch.
+    for (int invalid : {-1, E, 0}) {
+        int32_t routed[3] = {1, invalid, 2};
+        ck(cudaMemcpy(ids, routed, sizeof(routed), cudaMemcpyHostToDevice), "invalid ids");
+        auto missing = addresses;
+        if (invalid == 0) missing[0] = 0;
+        ck(cudaMemcpy(experts, missing.data(), E * 8, cudaMemcpyHostToDevice), "missing pointer");
+        ck(cudaMemset(counts, 0, 16), "error clear");
+        k::moe_group_resident(ids, 3, K, E, experts, scratch, ptr, start, counts, slot, tok, s);
+        ck(cudaStreamSynchronize(s), "invalid metadata");
+        int32_t state[4];
+        ck(cudaMemcpy(state, counts, 16, cudaMemcpyDeviceToHost), "invalid state");
+        ++cases;
+        if (state[0] != 0 || state[1] != 1) { ++bad; std::printf("resident invalid=%d FAIL\n", invalid); }
+    }
+    std::printf("resident prefill metadata: %d cases, %d failures (stable maps through %d entries)\n", cases, bad, CAP);
+    g_fail += bad;
+    cudaFree(ids); cudaFree(slot); cudaFree(tok); cudaFree(start); cudaFree(counts); cudaFree(scratch);
+    cudaFree(ptr); cudaFree(experts);
+}
+
+// Same native FFN as the serving callsite: host-built 16-expert launches versus device metadata, then
+// the real prefill combine in routing-k order with exactly the same coefficients and shared contribution.
+void check_resident_prefill(int down_type, cudaStream_t s, std::mt19937& rng, int T = 33) {
+    constexpr int K = 10, E = 19, H = 2560, FF = 640;
+    Setup S(21, down_type, H, FF, T, K, E, rng, s);
+    int32_t *ids = dalloc<int32_t>(S.cap), *slot = dalloc<int32_t>(S.cap),
+            *counts = dalloc<int32_t>(4), *scratch = dalloc<int32_t>(2 * E);
+    auto* experts = dalloc<unsigned long long>(E);
+    float *weights = dalloc<float>(S.cap), *shared = dalloc<float>(T * H),
+          *gate = dalloc<float>(T), *combined = dalloc<float>(T * H);
+    std::vector<unsigned long long> addresses(E);
+    for (int e = 0; e < E; ++e) addresses[e] = (unsigned long long) (S.blobs + S.slot * (size_t) ((7 * e) % E));
+    ck(cudaMemcpy(experts, addresses.data(), E * 8, cudaMemcpyHostToDevice), "prefill pointers");
+    std::vector<int32_t> identity(S.cap);
+    std::iota(identity.begin(), identity.end(), 0);
+    ck(cudaMemcpy(S.dst, identity.data(), (size_t) S.cap * 4, cudaMemcpyHostToDevice), "identity");
+    std::vector<float> w(S.cap), sh(T * H), sg(T);
+    for (int i = 0; i < S.cap; ++i) w[i] = 0.05f + (i % 7) * 0.01f;
+    for (int i = 0; i < T * H; ++i) sh[i] = (i % 13 - 6) * 0.01f;
+    for (int i = 0; i < T; ++i) sg[i] = (i % 5 - 2) * 0.25f;
+    ck(cudaMemcpy(weights, w.data(), w.size() * 4, cudaMemcpyHostToDevice), "weights");
+    ck(cudaMemcpy(shared, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice), "shared");
+    ck(cudaMemcpy(gate, sg.data(), sg.size() * 4, cudaMemcpyHostToDevice), "shared gate");
+    int bad = 0;
+    for (int hot : {0, 1}) {
+        std::vector<int32_t> routed(S.cap), c(E), off(E + 1), row(S.cap), tok(S.cap), order;
+        for (int i = 0; i < S.cap; ++i) { routed[i] = hot ? 3 : ((i / K) * 3 + i % K) % E; ++c[routed[i]]; }
+        for (int e = 0; e < E; ++e) { off[e + 1] = off[e] + c[e]; if (c[e]) order.push_back(e); }
+        auto fill = off;
+        for (int i = 0; i < S.cap; ++i) { const int at = fill[routed[i]]++; row[i] = at; tok[at] = i / K; }
+        ck(cudaMemcpy(ids, routed.data(), routed.size() * 4, cudaMemcpyHostToDevice), "prefill ids");
+        ck(cudaMemcpy(slot, row.data(), row.size() * 4, cudaMemcpyHostToDevice), "host slots");
+        ck(cudaMemcpy(S.tok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice), "host tokens");
+        ck(cudaMemset(S.out, 0xff, S.out_floats * 4), "host output poison");
+        ck(cudaMemset(S.scr, 0x7f, S.scr_bytes), "host scratch poison");
+        for (size_t g = 0; g < order.size(); g += 16) {
+            strata::prefill::NativeGroupPointers p;
+            p.count = (int) std::min<size_t>(16, order.size() - g);
+            const int r0 = off[order[g]], end = off[order[g + p.count - 1] + 1], nr = end - r0;
+            for (int j = 0; j < p.count; ++j) { p.blob[j] = (const uint8_t*) addresses[order[g + j]]; p.bounds[j] = off[order[g + j]] - r0; }
+            p.bounds[p.count] = nr;
+            strata::prefill::native_group_pointers(p, S.ptr, S.n, S.start, s);
+            k::native_expert_grouped(S.L, S.ptr, S.start, S.n, S.dst, S.tok + r0, 16, nr,
+                                     S.xq, S.scr, S.out + (size_t) r0 * H, s);
+        }
+        strata::prefill::moe_combine(S.out, slot, weights, shared, gate, combined, T, s);
+        ck(cudaStreamSynchronize(s), "host prefill FFN");
+        std::vector<uint32_t> ref(S.out_floats), ref_sum(T * H);
+        ck(cudaMemcpy(ref.data(), S.out, ref.size() * 4, cudaMemcpyDeviceToHost), "host rows");
+        ck(cudaMemcpy(ref_sum.data(), combined, ref_sum.size() * 4, cudaMemcpyDeviceToHost), "host combine");
+        ck(cudaMemset(counts, 0, 16), "prefill counts clear");
+        ck(cudaMemset(S.out, 0xff, S.out_floats * 4), "device output poison");
+        ck(cudaMemset(S.scr, 0x3f, S.scr_bytes), "device scratch poison");
+        k::moe_group_resident(ids, S.cap, K, E, experts, scratch, S.ptr, S.start, counts, slot, S.tok, s);
+        k::native_expert_grouped(S.L, S.ptr, S.start, counts, S.dst, S.tok, E, S.cap,
+                                 S.xq, S.scr, S.out, s, 16);
+        strata::prefill::moe_combine(S.out, slot, weights, shared, gate, combined, T, s);
+        ck(cudaStreamSynchronize(s), "device prefill FFN");
+        std::vector<uint32_t> got(S.out_floats), got_sum(T * H);
+        ck(cudaMemcpy(got.data(), S.out, got.size() * 4, cudaMemcpyDeviceToHost), "device rows");
+        ck(cudaMemcpy(got_sum.data(), combined, got_sum.size() * 4, cudaMemcpyDeviceToHost), "device combine");
+        int32_t state[4];
+        ck(cudaMemcpy(state, counts, 16, cudaMemcpyDeviceToHost), "prefill state");
+        const bool ok = ref == got && ref_sum == got_sum && state[0] == (int) order.size() && state[1] == 0 &&
+                        std::none_of(ref.begin(), ref.end(), [](uint32_t v) { return v == 0xffffffffu; });
+        if (!ok) ++bad;
+        std::printf("resident prefill IQ3_S/%s T=%d hot=%d rows + weighted combine: %s\n",
+                     name_of(down_type), T, hot, ok ? "bitwise equal" : "FAIL");
+    }
+    g_fail += bad;
+    cudaFree(ids); cudaFree(slot); cudaFree(counts); cudaFree(scratch); cudaFree(experts);
+    cudaFree(weights); cudaFree(shared); cudaFree(gate); cudaFree(combined);
+}
+#endif
+
 // ------------------------------------------------------------------------------------------------ --bench
 // A window's 48 calls, one per layer, each with ITS OWN experts as the layers have: copies of the Setup's blobs in one
 // arena, so the weights stream from DRAM as in the engine.  (48 calls re-reading the same 28 experts - 73 MB, about an
@@ -340,9 +487,20 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 int main(int argc, char** argv) {
     if (!strata::platform::acknowledge_protected_test()) return 2;
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
+    const bool resident_only = argc > 1 && std::string(argv[1]) == "--resident-prefill";
+#if defined(STRATA_USE_HIP)
+    if (resident_only) { std::fprintf(stderr, "resident prefill device grouping is CUDA-only\n"); return 77; }
+#endif
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
+#if !defined(STRATA_USE_HIP)
+    check_resident_metadata(s);
+    check_resident_prefill(20, s, rng);
+    check_resident_prefill(42, s, rng);
+    check_resident_prefill(20, s, rng, 1);   // singleton expert groups
+#endif
+    if (!resident_only) {
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13,
 #ifdef STRATA_Q6K_EXPERTS
                    14,
@@ -352,6 +510,7 @@ int main(int argc, char** argv) {
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
     if (do_bench) bench(s, rng);
+    }
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
     return g_fail ? 1 : 0;
