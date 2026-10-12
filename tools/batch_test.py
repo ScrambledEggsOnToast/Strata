@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--n", type=int, default=4, help="prompts (<= --batch)")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--skip-solo", action="store_true")
+    ap.add_argument("--require-rejection", action="store_true",
+                    help="require split batch-MTP draft counts and at least one rejected proposal")
     ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
     ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
     ap.add_argument("--dump", default="", help="write every slot's tokens (solo and batch) as JSON: an A/B of two engine builds")
@@ -154,6 +156,19 @@ def main():
           f"{sum(len(v) for v in got.values()) / max(t_end - (first_bt or t_admit), 1e-9):.1f} tok/s from the first batch token",
           flush=True)
     ok = True
+    if a.require_rejection:
+        accepted = offered = 0
+        for line in done.values():
+            fields = dict(part.split("=", 1) for part in line.split()[5:] if "=" in part)
+            if "draft_accepted" not in fields or "draft_offered" not in fields:
+                print("missing split batch-MTP accepted/offered counts:", line)
+                ok = False
+                continue
+            accepted += int(fields["draft_accepted"])
+            offered += int(fields["draft_offered"])
+        ok &= offered > accepted >= 0
+        print(f"split batch-MTP: {accepted}/{offered} proposals accepted; "
+              f"{'REJECTION EXERCISED' if offered > accepted else 'NO REJECTION'}")
     for i in range(len(prompts)):
         b = got[i]
         if solo:

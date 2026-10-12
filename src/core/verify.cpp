@@ -3621,7 +3621,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 || (next_ != nullptr && hbase > (int) slots_.size() - S)) {
+    if (S < 1 || S > max_t_ || hbase < 0 || hbase > strata::kernels::kVerifyMaxT - S) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -3637,10 +3637,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
         if (t > 0 && rows[t] == rows[t - 1] && pos[t] != pos[t - 1] + 1) {
             err = "verify: proposed rows must have consecutive positions";
-            return false;
-        }
-        if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr) {
-            err = "verify: grouped slot rows do not support a layer split yet";
             return false;
         }
         if (!slot_request_id_[rows[t]]) { err = "verify: bind request IDs before resident windows"; return false; }
@@ -3973,6 +3969,11 @@ bool Verifier::sample_rows(int S, std::string& err) {
 bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    for (int t = 1; t < S; ++t)
+        if (rows[t] == rows[t - 1]) {
+            err = "verify: speculative slot rows require deferred accepted-prefix commit";
+            return false;
+        }
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }

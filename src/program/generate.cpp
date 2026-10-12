@@ -928,8 +928,8 @@ void usage() {
                  "  --foreground-budget-ms N  --serve --batch: measured-cost scheduling at existing chunk boundaries\n"
                  "                       (0 = legacy policy; positive N <= 60000 is a target, not a latency promise)\n"
                  "  --background-share F  minimum prefill/control share under contention (0.01..0.99, default 0.25)\n"
-                 "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
-                 "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
+                 "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP\n"
+                 "                       proposal; layer splits retain one synchronous quantum (no group pipeline)\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -3804,9 +3804,9 @@ int main(int argc, char** argv) {
                 v0.add_unknown("prefill_library_storage",
                        "opaque CUDA/cuBLAS handle and first-use storage is separate from explicit prefill allocator bytes and remains unqualified");
         }
+        const char* batch = std::getenv("STRATA_BATCH_MTP");
+        const bool grouped_draft = o.batch_mtp || (batch && batch[0] && batch[0] != '0');
         if (o.spec > 0) {
-            const char* batch = std::getenv("STRATA_BATCH_MTP");
-            const bool grouped_draft = o.batch_mtp || (batch && batch[0] && batch[0] != '0');
             const uint64_t windows = grouped_draft
                 ? strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, strata::kernels::kVerifyMaxT)
                 : (uint64_t) kWindowMib << 20;
@@ -3907,7 +3907,7 @@ int main(int argc, char** argv) {
                             "bounded prefill/MTP scratch owner tables, conservatively per stage");
                 if (o.spec > 0) {
                     const uint64_t windows = strata::core::Verifier::planned_device_bytes(
-                        g, o.max_context, n_vocab, std::max(o.spec, o.batch));
+                        g, o.max_context, n_vocab, grouped_draft ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch));
                     if (windows == UINT64_MAX)
                         ds.vram.add_unknown("verify_windows", "stage verifier arena geometry unavailable");
                     else ds.vram.add("verify_windows", std::max(windows, (uint64_t) kWindowMib << 20),
@@ -5968,13 +5968,14 @@ int main(int argc, char** argv) {
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     if (batch_mtp) {
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
-                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : (multi_gpu || split_same || !stages.empty())
-                        ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve" : nullptr;
+                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
+                        ? "it needs each layer-split stage on its own GPU" : !o.serve ? "it needs --serve" : nullptr;
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --batch-mtp refused: %s\n", why);
             return 1;
         }
     }
+    const bool split_batch_mtp = batch_mtp && !stages.empty();
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -8993,7 +8994,9 @@ int main(int argc, char** argv) {
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
                     gs.ver.set_remote_expert_opt(remote_opt.get());
-                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max(o.spec, o.batch), err);
+                    if (batch_mtp) gs.ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
+                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -10399,8 +10402,10 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups) +
-                                       " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0)).c_str() : "");
+                                       " batch_groups=" + std::to_string(split_batch_mtp ? 1 : o.batch_groups) +
+                                       " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0) +
+                                       (split_batch_mtp ? " batch_mtp=1 batch_schedule=synchronous batch_groups_requested=" +
+                                           std::to_string(o.batch_groups) : "")).c_str() : "");
             if (o.foreground_budget_ms > 0)
                 std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
                             o.foreground_budget_ms, o.background_share);
@@ -10617,6 +10622,9 @@ int main(int argc, char** argv) {
         // this loop retains only scheduling policy and protocol emission.
         using BSlot = strata::program::ResidentSlot;
         const auto& bs = resident.slots();
+        struct BatchDraftCounts { uint64_t request = 0; int64_t offered = 0, accepted = 0; };
+        BatchDraftCounts batch_drafts[strata::kernels::kVerifyMaxT] = {};
+        const bool batch_mtp_trace = split_batch_mtp && std::getenv("STRATA_STATE_HASH");
         size_t resident_cursor = 0;
         unsigned resident_credit = 0;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -10650,7 +10658,12 @@ int main(int argc, char** argv) {
                 // The previous operation has drained. Cancellation must not execute another row.
                 if (!resident.finish(b, err)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
+                if (split_batch_mtp)
+                    std::printf("BDONE %d %lld cancel %.1f draft_accepted=%lld draft_offered=%lld\n",
+                                b, (long long) sl.produced, ms,
+                                (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
+                else
+                    std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
             }
             std::fflush(stdout);
             if (o.resident_multiplex) {
@@ -10734,6 +10747,19 @@ int main(int argc, char** argv) {
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                if (split_batch_mtp) {
+                    auto& counts = batch_drafts[b];
+                    if (counts.request != sl.request) counts = {sl.request, 0, 0};
+                    if (i + 1 < S && rows[i + 1] == b) {
+                        ++counts.offered;
+                        counts.accepted += keep[b] - 1;
+                        if (batch_mtp_trace)
+                            std::fprintf(stderr, "strata batch MTP: request=%llu slot=%d position=%lld "
+                                                 "proposal=%d target=%d keep=%d\n",
+                                         (unsigned long long) sl.request, b, (long long) sl.p,
+                                         tok[i + 1], outb[i], keep[b]);
+                    }
+                }
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10763,7 +10789,12 @@ int main(int argc, char** argv) {
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        if (split_batch_mtp)
+                            std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
+                                        b, (long long) sl.produced, fin, ms,
+                                        (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
+                        else
+                            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         if (!resident.finish(b, err)) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
@@ -10799,12 +10830,11 @@ int main(int argc, char** argv) {
         };
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
-        const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
-        if (piped && batch_mtp)   // #1413: said, not silent
-            std::fprintf(stderr,
-                         "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
-                         "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
-                         "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
+        const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1 && !split_batch_mtp;
+        if (split_batch_mtp)
+            std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
+                                 "one eight-row quantum retained through target acceptance and prefix commit; "
+                                 "--batch-groups %d requested, effective groups=1 (no group pipeline).\n", o.batch_groups);
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         struct PGroup {
             bool inflight = false;

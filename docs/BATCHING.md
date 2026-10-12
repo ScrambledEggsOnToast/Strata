@@ -453,10 +453,15 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 ## Limits (for now)
 
 - Batch windows carry no MTP drafts by default. `--batch-mtp` (or `STRATA_BATCH_MTP=1`) enables one proposal
-  per resident request on a single GPU. At most four requests occupy the eight-row verifier quantum; a rotating
-  cursor services larger slot sets. Each request retains its private draft KV and uses the one serialized MTP
-  scratch/head/weight owner. A proposal is kept only when the independently sampled target equals it; target
-  Philox counters and per-row penalty histories remain request-local. This is not coupled draft sampling.
+  per resident request on one GPU or a layer split with each stage on its own GPU. At most four requests occupy
+  the eight-row verifier quantum; a rotating cursor services larger slot sets. Split batch-MTP uses the existing
+  synchronous verifier and accepted-prefix commit: every stage retains its scratch until target acceptance is
+  known. It **overrides the group pipeline**, reports the requested groups and effective `batch_groups=1`,
+  and exposes `batch_schedule=synchronous` in engine status. Ordinary batching keeps its group pipeline.
+  Each request retains its private draft KV and uses the one serialized MTP scratch/head/weight owner.
+  A proposal is kept only when the independently sampled target equals it; target Philox counters and per-row
+  penalty histories remain request-local. This is not coupled draft sampling. Admission prices the eight-row
+  verifier arena on every split stage; the synchronous schedule adds no retained rollback buffers.
 - Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
   beyond the bound refuses before capture; live graphs are not evicted.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
@@ -609,6 +614,11 @@ shared draft-vocabulary head. This compares both slots' output against solo deco
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 2 --n 2 --max-new 64 \
     --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
+
+For CUDA split batch-MTP, `BDONE` also carries `draft_accepted` and `draft_offered`. Add
+`--require-rejection` to the protocol-driving check to require a rejected proposal; retain and compare
+the committed token sequences, not only its acceptance rate. `STRATA_STATE_HASH=1` additionally logs each
+split proposal, independently sampled target, and committed prefix length for diagnostic runs.
 
 ## Engine protocol (`--serve`)
 
