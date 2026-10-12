@@ -89,6 +89,15 @@ int main() {
     check(!slots.init_resources(error), "uninitialized verifier cannot create resident resources");
     check(!slots.admit(1, prefix, request, error) && slots.slots()[1].request == 0,
           "failed resource initialization cannot expose another ready slot");
+    const bool failed_before_pricing = slots.slots()[0].failed;
+    program::PrefixWork restore_work{123, 456};
+    check(!slots.resume_work(0, nullptr, restore_work, error) && restore_work.bytes == 0 &&
+          restore_work.route == 0, "read-only pricing refuses an unpublished resident owner without stale costs");
+    check(!slots.resume_work(-1, nullptr, restore_work, error),
+          "read-only pricing refuses a nonexistent seat before reading state");
+    check(slots.working().request == 0 && slots.slots()[0].ids.empty() &&
+          slots.slots()[0].failed == failed_before_pricing,
+          "pricing refusal changes no request identity, history or failure state");
     std::printf("resident lifecycle preflight: failures=%d\n", failures);
     return failures ? 1 : 0;
 }

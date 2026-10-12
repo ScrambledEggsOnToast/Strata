@@ -1154,6 +1154,46 @@ follows the reused prefix (or the root) is read in one run, and its session is n
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
+**Cost-aware continuation (opt-in).** `--prefix-selection cost` considers every valid active,
+resident-slot and parked-RAM live/checkpoint prefix, and fresh recomputation, before taking or
+overwriting any source. It estimates **outgoing park + restore + remaining prefill** in milliseconds.
+A resident source can beat a deeper parked image; a worthwhile deeper image still wins.
+Authorization, token/image equality, steering, snapshot validation, admission and memory ceilings
+are not scores and cannot be overridden by a saving. Exact resends of yielded requests still resume
+their own slot, request identity and sampling sequence without an economic choice.
+
+The process learns from its own completed operations on the resolved placement, not a fixed
+tokens-per-millisecond rule or a new benchmark. Eight recent wall-time observations per copy path
+cover checkpoint restores, resident live/checkpoint host-bounced copies, whole parked restores and
+outgoing captures. Byte extents include the real recurrence/K/V layouts and host checkpoint-chain
+copies (retained unchanged pages are subtracted for parking); rates are separated by device,
+authoritative resident/streamed/ring paths and resident window sizes. Resident migration is
+charged as capture **and** restore, not assumed to be a direct device
+copy. Prediction is limited to 1/4–4 times an observed transfer extent. Prefill learns separate
+batched/window milliseconds per fresh token by power-of-two context bucket, using the same bucket
+or one neighbor and only 1/4–4 times an observed read span, with an eight-observation effective
+averaging horizon. Its request key includes
+the PCIe arithmetic share, steering and image mode. Successful read intervals include lending and
+checkpoint capture, exclude separately timed interleaved decode, and never include an earlier
+park/restore. The estimate predicts existing root/message/turn/pin cuts; it does not repartition
+arithmetic. Transfer timings include synchronization and host metadata overhead, so the byte
+extent is a cost-model input, **not measured PCIe or DRAM traffic**.
+
+Unknown or out-of-bound alternatives never win; if the longest valid source itself is unpriced,
+selection stays longest. Cost ties and gains no larger than `--prefix-min-savings-ms N` (integer
+0–60000, default 0) keep the original longest source and tie order. Observations are bounded to
+4 KiB, charged as `prefix_cost_model` in host admission, and discarded on process exit.
+`STRATA_CKPT_REREAD` and the dynamic test-only `STRATA_PIPELINE_SWITCH` use the longest fallback
+instead of learning across changed arithmetic. The stderr `prefix selection` line records the
+chosen source, longest match, fallback reason and estimated park/restore/prefill costs; `-1` means
+unknown. Existing park/restore wall times and fresh/reused/committed counts remain available.
+
+**Rollback:** `--prefix-selection longest` (the default, or omit the option). No cache format,
+placement, cache budget or frontend protocol changes are needed. `--prompt-cache 0` remains the
+separate **reuse-off** correctness control, not the rollback for this selection policy. Default
+promotion requires a matched full-model and held-out comparison; source/CPU checks alone do not
+establish latency gains or committed-token equality.
+
 **One long document, many questions in one conversation: a pinned prefix (opt-in, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
 A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),
 `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and

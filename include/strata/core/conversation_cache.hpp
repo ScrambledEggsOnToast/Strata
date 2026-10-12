@@ -259,28 +259,39 @@ public:
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
     size_t retained_bytes() const { return reuse_.bytes(); }
+    int64_t unchanged_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
+    }
+
+    // Read-only enumeration: a caller can validate and price every authorized source
+    // before take(), eviction, or an outgoing-state overwrite.
+    template<class Token, class Visitor>
+    void for_each_match(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images,
+                        bool cvec, const ConversationScope& scope, Visitor&& visit) const {
+        if (!scope.valid()) return;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (!e.scope.matches(scope) || e.cvec != cvec) continue;
+            auto consider = [&](const ConversationCheckpoint& c, bool live) {
+                const int64_t n = conversation_prefix(c, prompt, images);
+                if (n > 0) visit(Match{i, n, live}, e, c);
+            };
+            consider(e.live, true);
+            for (const auto& c : e.checkpoints) consider(c, false);
+        }
     }
 
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
                const ConversationScope& scope) const {
         Match best;
-        if (!scope.valid()) return best;
-        // Ties prefer the most recently parked branch. The caller prefers its
-        // already-active state when that offers the same prefix length.
-        for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
-            if (!e.scope.matches(scope) || e.cvec != cvec) continue;
-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
-                const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live};
-            };
-            consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
-        }
+        // Ties prefer the newest parked branch; the caller prefers an equally
+        // long active or resident prefix.
+        for_each_match(prompt, images, cvec, scope, [&](Match match, const auto&, const auto&) {
+            if (match.tokens > best.tokens) best = match;
+        });
         return best;
     }
 
