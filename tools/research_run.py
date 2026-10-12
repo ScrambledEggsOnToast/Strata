@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -72,13 +73,15 @@ def run(args) -> dict:
         headers["Authorization"] = "Bearer " + args.api_key
     rows: list[dict | None] = [None] * len(questions)
     started = time.time()
+    conversation = "research-" + uuid.uuid4().hex
     for k in range(0, len(questions), max(1, args.parallel)):
         group = list(range(k, min(k + max(1, args.parallel), len(questions))))
 
         def one(i):
             try:
-                rows[i] = {"q": i, **ask(args.url, request_body(doc, questions[i], args.layout, args.prefix == "on",
-                                                                  args.max_tokens, args.model), headers, args.timeout)}
+                body = request_body(doc, questions[i], args.layout, args.prefix == "on", args.max_tokens, args.model)
+                body["strata_conversation_id"] = conversation
+                rows[i] = {"q": i, **ask(args.url, body, headers, args.timeout)}
             except Exception as e:  # noqa: BLE001 - a failed question is reported, the run goes on
                 rows[i] = {"q": i, "error": repr(e)}
         threads = [threading.Thread(target=one, args=(i,)) for i in group]

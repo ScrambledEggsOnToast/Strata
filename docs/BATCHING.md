@@ -290,11 +290,11 @@ there is no `BDONE` for that parked state. This ends continuation ownership whil
   half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
   so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
   same chunks (at most twice per request).
-- **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the
-  checkpoint at the prompt's last turn boundary); the next turn of that conversation goes to that slot and the
-  engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
-  a client that drops the reply's thinking from the history (the checkpoint matches up to the new turn). A new
-  conversation takes an empty slot, else the one used longest ago.
+- **Each slot is a private conversation cache.** After draining its consumers, a completed CUDA slot keeps its
+  committed state and turn checkpoint only when prompt caching is enabled, the request permits checkpoints,
+  its conversation scope is valid, and it has neither images nor failed state. The next turn must match that
+  scope as well as exact tokens and steering mode. Scope affinity precedes pipeline-group hole filling; a new
+  conversation uses the existing empty/LRU/group-spread policy. Request IDs, counters and sampling stay private.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
@@ -346,7 +346,11 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
-- `--batch-groups` needs every stage on its own GPU. A finished pipelined slot is **not** kept as a conversation cache here: the fork's resident lifecycle clears it (`resident.finish(slot, keep_cache=false)`), where upstream 0.1.41 makes a pipelined slot a cache again — its #857 rule ships with the pad-row invalidation that this fork's compacted group window does not have. Carrying that rule is a batching-lane port item, not a re-pin change.
+- `--batch-groups` needs every stage on its own GPU. HET-042 retains completed CUDA pipelined slots: this fork's
+  compacted group windows contain **only active rows**, and admission drains in-flight groups before mounting
+  a prefix. Thus inactive sessions are not overwritten by pad rows. The old `finish(..., keep_cache=false)` was
+  an obsolete restriction here. The separate SYCL pipeline still pads inactive rows and invalidates those
+  caches; its non-retention is deliberate and has not been relaxed by this CUDA fix.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 - Each requested role, including full streamed host backing, is charged before allocation.
   Unpriceable combinations and elastic K/V growth remain refused.

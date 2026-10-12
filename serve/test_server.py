@@ -37,6 +37,7 @@ ANSWER = "xy" * 1000                             # longer than the old 1024 fall
 class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
+        self.last_cache_scope = sampling.get("_strata_cache_scope")
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
@@ -1500,6 +1501,63 @@ class ToolArguments(unittest.TestCase):
                 self.assertIn("arguments", m[1]["tool_calls"][0]["function"]["arguments"])
 
 
+class ConversationScopes(unittest.TestCase):
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = RecordingEngine(self.tok, "blue", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def test_same_conversation_and_changed_identity(self):
+        req = {"strata_conversation_id": "A", "seed": 17}
+        first = self.svc.cache_scope(req, "principal-a")
+        self.assertEqual(first, self.svc.cache_scope({**req, "seed": 99}, "principal-a"))
+        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-b"))
+        self.assertNotEqual(first, self.svc.cache_scope({**req, "strata_conversation_id": "B"}, "principal-a"))
+        self.svc.template.source += "\n"
+        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
+        self.svc.template.source = self.svc.template.source[:-1]
+        self.svc.tok = ByteTokenizer()
+        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
+        self.svc.tok = self.tok
+        self.svc.model = "another-model"
+        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
+        self.assertNotEqual(self.svc.cache_scope({}, "principal-a"), self.svc.cache_scope({}, "principal-a"))
+
+    def test_codex_forks_do_not_share_a_grouping_key(self):
+        def req(thread):
+            return {"prompt_cache_key": "parent-group",
+                    "client_metadata": {"x-codex-turn-metadata":
+                                        json.dumps({"session_id": "session", "thread_id": thread})}}
+        self.assertEqual(self.svc.cache_scope(req("A"), ""), self.svc.cache_scope(req("A"), ""))
+        self.assertNotEqual(self.svc.cache_scope(req("A"), ""), self.svc.cache_scope(req("fork"), ""))
+        for invalid in ("", 1, True, "x" * 257):
+            with self.assertRaises(ValueError):
+                self.svc.cache_scope({"strata_conversation_id": invalid}, "")
+
+    def test_http_scope_comes_from_authorization_not_client_digest(self):
+        self.svc.api_key = "principal-a,principal-b"
+        httpd = serve(self.svc, port=0)
+        try:
+            def request(principal, conversation="A", injected="1" * 64):
+                body = {"messages": [{"role": "user", "content": "same private prompt"}], "max_tokens": 8,
+                        "strata_conversation_id": conversation, "_strata_cache_scope": injected}
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                             data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", "Authorization": f"Bearer {principal}"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    json.load(response)
+                return self.engine.last_cache_scope
+            a = request("principal-a")
+            self.assertNotEqual(a, "1" * 64)
+            self.assertNotEqual(a, request("principal-b", injected=a))
+            self.assertEqual(a, request("principal-a"))
+            self.assertNotEqual(a, request("principal-a", "B", injected=a))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class SamplingKeys(unittest.TestCase):
     """The GEN line's sampling keys: top_k 0 ("off") or wider than the engine's 64 get the widest list, 64 (they used
     to fall back to the engine default 20); a penalty always carries its window."""
@@ -1526,6 +1584,12 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("ckpt=0", self.keys(temperature=0, strata_checkpoint=False))
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
             self.assertNotIn("ckpt=0", self.keys(**absent), absent)
+
+    def test_scope_is_fixed_width_and_default_deny(self):
+        self.assertIn("scope=" + "1" * 64, self.keys(_strata_cache_scope="1" * 64))
+        for invalid in ("", "1", "0" * 64, "z" * 64, 1):
+            with self.assertRaises(ValueError):
+                self.keys(_strata_cache_scope=invalid)
 
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))

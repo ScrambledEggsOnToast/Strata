@@ -13,7 +13,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
-from conversation_cache_parity import STATE_KEYS, engine_args, load_tokenizer, require, state_hashes
+from conversation_cache_parity import STATE_KEYS, engine_args, fixture_scope, load_tokenizer, require, state_hashes
 from gguf_reader import GGUFFile
 from gguf_writer import GGUFWriter
 from serve.server import StrataEngine, child_env
@@ -111,7 +111,9 @@ def main():
         results['engine_info'][label] = dict(engine.info)
         def generate(name, ids, image=None, steering=True):
             embeddings = str(args.output / (image + '.sve')) if image else None
-            out = [t for t in engine.generate(ids, 1, {'experimental_speed_projection': steering},
+            sampling = {'temperature': 0, 'experimental_speed_projection': steering,
+                        '_strata_cache_scope': fixture_scope('B' if name == 'text-B' else 'A')}
+            out = [t for t in engine.generate(ids, 1, sampling,
                                              threading.Event(), embeddings=embeddings) if t is not None]
             records.append({'name': name, 'ids': out, **engine.last})
         try:

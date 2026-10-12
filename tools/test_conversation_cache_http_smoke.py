@@ -20,12 +20,15 @@ class FakeClient:
     def metrics(self):
         return {'live': {'state': 'idle', 'queued': 0},
                 'engine': {'model': 'fake', 'conversation_cache_slots': 4, 'conversation_cache_mib': 8192},
+                'conversation_cache': {'parked': max(0, len(self.cache) - 1), 'bytes': len(self.cache) * 100,
+                                       'restores': sum(r['reused'] > 0 for r in self.history)},
                 'requests': self.history[::-1]}
 
-    def request(self, model, content, stream=False, count=8):
-        reused = 100 if content in self.cache else 0
-        self.cache.pop(content, None)
-        self.cache[content] = True
+    def request(self, model, content, stream=False, count=8, conversation=None, messages=None):
+        key = (conversation, content)
+        reused = 100 if key in self.cache else 0
+        self.cache.pop(key, None)
+        self.cache[key] = True
         while len(self.cache) > 5:  # active plus four parked entries
             self.cache.popitem(last=False)
         self.history.append({'time': len(self.history) + 1, 'reused': reused, 'output_tokens': 5,
@@ -41,6 +44,13 @@ class HttpSmoke(unittest.TestCase):
         self.assertEqual(len(result['records']), 12)
         self.assertEqual(result['records'][-1]['name'], 'cancelled-A-restored')
         self.assertGreater(result['records'][-1]['reused'], 0)
+
+    def test_minimal_turns_include_a_distinct_identical_cold_control(self):
+        result = run(FakeClient(), 'turns')
+        self.assertEqual([r['name'] for r in result['records']],
+                         ['A1', 'A2', 'B1', 'A3-parked', 'A3-cold-control'])
+        self.assertEqual([r['reused'] for r in result['records']], [0, 100, 0, 100, 0])
+        self.assertTrue(all(r['http_wall_ms'] >= 0 for r in result['records']))
 
     def test_busy_server_receives_no_requests(self):
         client = Mock()

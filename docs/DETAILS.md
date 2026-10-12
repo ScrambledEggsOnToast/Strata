@@ -1071,24 +1071,28 @@ print(r.choices[0].message.content)
   own page (or no `Origin`), like `/settings`. `POST /slots/0?action=save|restore` keeps the Host and API-key checks
   and also takes only JSON from no `Origin`, Strata's own page or a trusted origin - also when an API key is set.
 
-**Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
-live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
-assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
-and pictures. The oldest checkpoint - in practice the end of the system prompt, which every chat of the same client
-shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
-reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
-prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
-system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
-request (`cch=...`) and every session (the 4th part of `cc_version=`); the server pins both stamps (to `f`s, as
-llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
-`--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
+**Conversation cache.** A request that continues the **same authorized conversation** reads only the part after
+what the engine holds: the live session, a resident slot, or a checkpoint in RAM (up to `--prompt-cache N`, taken
+at assistant-turn boundaries and every `--prompt-cache-every` tokens). Prefix tokens, image identities and steering
+mode must still match. Supply a stable `"strata_conversation_id": "your-thread-id"` (a nonempty UTF-8 string of
+at most 256 bytes) on every turn. The server binds it to the authenticated principal, loaded model, tokenizer and
+template, then sends a fixed 32-byte `scope` to the native engine. Codex's explicit session/thread turn metadata
+also identifies a conversation; its `prompt_cache_key` alone does not, because forks can share that grouping key.
+The web chat supplies and persists its own ID, rotating it for New chat. Missing identity is request-private:
+identical text in another conversation never authorizes reuse. Scope metadata is process-local, not a durable
+session credential. Changed scopes discard the live checkpoint chain; resident and parked searches require an
+exact scope match before token/image matching. Existing snapshot geometry, format and model/config checks remain.
+The oldest checkpoint remains a root **within that conversation**, not a shared system-prompt cache. Other leaves
+rotate by LRU. Options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no root
+checkpoint), `--turn-token ID`. Trusted native clients supply `scope=<64 nonzero hex digits>` on `GEN`/`BGEN`;
+malformed scopes refuse before mutation, and absent scopes cannot match or park a reusable prefix.
 A one-shot request that no later request continues (a classification call, a probe) can send
 `"strata_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
-**One long document, many questions: a pinned shared prefix (opt-in, 0.1.40.2, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
+**One long document, many questions in one conversation: a pinned prefix (opt-in, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
 A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),
 `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and
 the question in one message) or `{"tokens": 12345}`. The engine reads the prompt in two parts there, keeps the checkpoint
@@ -1105,8 +1109,8 @@ without it. The engine's own key is `pin=N` on the `GEN` line.
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
-their requests alternate; it does not execute requests concurrently. No client session
-ID is required: only exact token/image prefixes with matching steering mode are reused.
+their requests alternate; it does not execute requests concurrently. Each worker must
+declare its own conversation identity; no cross-conversation sharing is performed.
 The default budget is 0 (disabled); `--prompt-cache 0` also disables parking.
 With `--layer-split`, a parked conversation holds one image per stage (each later stage's
 session and its share of the conversation checkpoints), every image is validated before
@@ -1148,9 +1152,14 @@ The engine log reports parking, restoration, bytes, evictions, individual snapsh
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not
 persisted across restarts; the session files below are.
+The budget charges the additional 32-byte scope on each saved image. Slot and byte ceilings, held-incoming
+admission, retained-KV charging, physical free-RAM floors, pinning and oldest-first eviction still apply; no new
+unbounded identity registry or parking queue is introduced.
 
-**Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
-restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
+**Session files (disk).** The engine's current state can still be saved and restored after model/config and payload
+validation. The legacy file format has no authorized-conversation scope; loading it does not silently attach that
+state to the next caller by token similarity, so automatic scoped prefix reuse cold-misses after a legacy restore.
+This RAM-reuse change does not introduce a scoped persistence format. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
 `"slot_save_path"` in the config); NAME must be a plain file name inside DIR. There is no erase action and the file
 format is Strata's own, not llama.cpp's:

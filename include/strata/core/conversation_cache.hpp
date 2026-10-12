@@ -10,9 +10,41 @@
 #include <cstdint>
 #include <deque>
 #include <utility>
+#include <string_view>
 #include <vector>
 
 namespace strata::core {
+
+// Opaque frontend-issued authorization/conversation/render identity. The loaded
+// engine's model, arithmetic and placement are immutable for this cache lifetime.
+// An absent identity never authorizes prefix reuse, even for identical tokens.
+struct ConversationScope {
+    std::array<uint8_t, 32> value{};
+    bool valid() const {
+        return std::any_of(value.begin(), value.end(), [](uint8_t v) { return v != 0; });
+    }
+    bool matches(const ConversationScope& other) const { return valid() && *this == other; }
+    bool operator==(const ConversationScope&) const = default;
+};
+
+inline bool conversation_scope_parse(std::string_view text, ConversationScope& out) {
+    ConversationScope candidate;
+    if (text.size() != 64) return false;
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < candidate.value.size(); ++i) {
+        const int hi = hex(text[2 * i]), lo = hex(text[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        candidate.value[i] = uint8_t(16 * hi + lo);
+    }
+    if (!candidate.valid()) return false;
+    out = candidate;
+    return true;
+}
 
 struct ConversationImageKey {
     int64_t start = 0;
@@ -146,6 +178,8 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 }
 
 struct SavedConversation {
+    // RAM-only namespace; session files keep their existing model/config schema.
+    ConversationScope scope;
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
@@ -164,7 +198,7 @@ struct SavedConversation {
     }
 
     size_t bytes() const {
-        size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
+        size_t n = sizeof(scope) + live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
                    kv.capacity() * sizeof(ConversationKv);
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
@@ -231,13 +265,15 @@ public:
     }
 
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+               const ConversationScope& scope) const {
         Match best;
+        if (!scope.valid()) return best;
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
+            if (!e.scope.matches(scope) || e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
                 if (n > best.tokens) best = {i, n, live};
@@ -294,7 +330,8 @@ public:
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                           const ConversationScope& scope) {
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;
             for (const auto& k : checkpoints)
@@ -307,7 +344,7 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
+            if (e.scope.matches(scope) && e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
                 bytes_ -= e.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
@@ -322,8 +359,8 @@ public:
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        if (!enabled() || !image.scope.valid() || held > budget_ || n > budget_ - held) return false;
+        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, image.scope);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         bytes_ += n;

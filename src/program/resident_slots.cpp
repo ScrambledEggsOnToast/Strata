@@ -39,7 +39,8 @@ namespace {
 bool same_request(const ResidentRequest& a, const ResidentRequest& b) {
     const auto& x = a.sampling;
     const auto& y = b.sampling;
-    return a.max_new == b.max_new && a.steering == b.steering && a.images == b.images &&
+    return a.scope.matches(b.scope) && a.checkpoint == b.checkpoint &&
+           a.max_new == b.max_new && a.steering == b.steering && a.images == b.images &&
            a.pcie_fraction == b.pcie_fraction && a.spec_min_probability == b.spec_min_probability &&
            x.top_k == y.top_k && x.top_p == y.top_p && x.min_p == y.min_p &&
            x.temperature == y.temperature && x.min_keep == y.min_keep &&
@@ -275,9 +276,9 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.ids.assign(prefix.begin(), prefix.end());
     if (parked) {
         state.prompt.assign(working_prompt_->begin(), working_prompt_->end());
-        state.input = input_;
         state.original_slot = destination_;
     } else state.prompt.clear();
+    state.input = input_;
     state.sampling = working_.sampling;
     state.request = working_.request;
     state.x = request.next_token;
@@ -333,7 +334,8 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
 }
 
 bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error) {
-    if (working_failed_ || !working_.request || !retained(slot)) {
+    if (working_failed_ || !working_.request || !retained(slot) ||
+        !slots_[(size_t) slot].input.scope.matches(input_.scope)) {
         error = "resident resume: no valid idle prefix"; return false;
     }
     if (checkpoint && (checkpoint->stage_parts.size() + 1 != stages_.size() ||
@@ -416,7 +418,7 @@ bool ResidentSlots::propose(int slot, const float* residual, std::string& error)
 }
 
 
-bool ResidentSlots::finish(int slot, bool keep_cache, std::string& error, bool diagnostic) {
+bool ResidentSlots::finish(int slot, std::string& error, bool diagnostic) {
     if (slot < 0 || (size_t) slot >= slots_.size() || !slots_[(size_t) slot].active) {
         error = "resident completion: no active request"; return false;
     }
@@ -426,9 +428,8 @@ bool ResidentSlots::finish(int slot, bool keep_cache, std::string& error, bool d
         if (diagnostic && !observe("cancel", slot, (int64_t) state.ids.size(), error)) return fail(slot);
         residency("cancel", slot);
     }
-    state.active = false;
+    state.complete(cache_);
     residency("pause", slot);
-    state.cached = keep_cache && cache_ && !state.img;
     return true;
 }
 

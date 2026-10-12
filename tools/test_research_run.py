@@ -60,6 +60,7 @@ class ResearchRun(unittest.TestCase):
         self.assertEqual([q["q"] for q in out["questions"]], [0, 1, 2])          # the blank line is skipped
         self.assertTrue(all(q["text"] for q in out["questions"]))
         self.assertEqual(len(self.engine.samplings), 3)
+        self.assertEqual(len({s["_strata_cache_scope"] for s in self.engine.samplings}), 1)
         for s in self.engine.samplings:
             self.assertEqual(s["strata_prefix"]["tokens"] > 0, True)               # resolved by the server
         self.assertIn("median first token", text)
@@ -68,10 +69,12 @@ class ResearchRun(unittest.TestCase):
         self.engine.samplings.clear()
         self.go("--prefix", "off")
         self.assertTrue(all("strata_prefix" not in s for s in self.engine.samplings))
+        previous = self.engine.samplings[-1]["_strata_cache_scope"]
         self.engine.samplings.clear()
         code, out, _ = self.go("--prefix", "on", "--layout", "joined", "--parallel", "2")
         self.assertEqual(code, 0)
         self.assertTrue(all(s["strata_prefix"]["tokens"] > 0 for s in self.engine.samplings))
+        self.assertNotEqual(previous, self.engine.samplings[-1]["_strata_cache_scope"])
 
     def test_compare(self):
         d = Path(self.dir.name)

@@ -13,7 +13,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
-from conversation_cache_parity import STATE_KEYS, load_tokenizer, require, state_hashes
+from conversation_cache_parity import STATE_KEYS, fixture_scope, load_tokenizer, require, state_hashes
 from conversation_cache_disabled import SETTINGS, common_args
 from conversation_cache_soak import answer_text
 from serve.frontend import ChatTemplate
@@ -115,7 +115,8 @@ def main():
         with a.engine.open('rb') as source:
             arm['exe_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
         def generate(request):
-            ids = [x for x in engine.generate(request['ids'], request['max_new'], {'temperature': 0},
+            sampling = {'temperature': 0, '_strata_cache_scope': fixture_scope(request['name'][0])}
+            ids = [x for x in engine.generate(request['ids'], request['max_new'], sampling,
                                                threading.Event()) if x is not None]
             arm['records'].append({'name': request['name'], 'ids': ids, 'text': tok.decode(ids), **engine.last})
             return ids

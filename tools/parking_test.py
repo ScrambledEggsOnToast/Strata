@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batch_test import Engine, tokenizer  # noqa: E402
+from conversation_cache_parity import fixture_scope  # noqa: E402
 
 DOC = ("The history of the printing press begins with movable type in East Asia and continues with Gutenberg's "
        "press in Mainz around 1450, which spread across Europe within decades, lowered the cost of books, changed "
@@ -22,8 +23,8 @@ def chat(user):
     return f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
-def gen(eng, out, ids, n):
-    eng.send(f"GEN {n} " + ",".join(map(str, ids)))
+def gen(eng, out, ids, n, conversation):
+    eng.send(f"GEN {n} scope={fixture_scope(conversation)} " + ",".join(map(str, ids)))
     got = []
     for line in out:
         if line.startswith("T "):
@@ -38,18 +39,18 @@ def run(a, cfg, tok, with_b):
     eng = Engine(a.exe, cfg, 0, {"STRATA_IQ_MT_MIN": "1", "STRATA_SNAPSHOT_VERIFY": "1"}, a.extra.split())
     out = eng.lines()
     pa = tok.encode(chat(DOC * a.repeat + "\nSummarize this text in five sentences."), parse_special=True)
-    ans, _ = gen(eng, out, pa, a.max_new)
+    ans, _ = gen(eng, out, pa, a.max_new, "A")
     if with_b:
         pb = tok.encode(chat("Write a short poem about the sea, then explain its metaphors." * 20), parse_special=True)
-        gen(eng, out, pb, a.max_new)
+        gen(eng, out, pb, a.max_new, "B")
     end = tok.encode("<|im_end|>\n", parse_special=True)
     follow = pa + ans + ([] if ans and ans[-1] in end else end) + \
         tok.encode(chat("Now give three keywords for that text, with one sentence each.")[0:], parse_special=True)
     t0 = time.time()
-    got, done = gen(eng, out, follow, a.max_new)
+    got, done = gen(eng, out, follow, a.max_new, "A")
     dt = time.time() - t0
     if with_b:   # B again: A is parked a second time, from retained K/V (every stage's) - only its new tail copied
-        gen(eng, out, pb, 8)
+        gen(eng, out, pb, 8, "B")
     eng.send("QUIT")
     eng.p.wait(timeout=180)
     log = open("/tmp/batch_test_engine.log").read()

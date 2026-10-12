@@ -26,9 +26,10 @@ class Client:
         with urllib.request.urlopen(self.url + '/metrics', timeout=10) as response:
             return json.load(response)
 
-    def request(self, model, content, stream=False, count=8):
-        body = {'model': model, 'messages': [{'role': 'user', 'content': content}],
+    def request(self, model, content, stream=False, count=8, conversation=None, messages=None):
+        body = {'model': model, 'messages': messages or [{'role': 'user', 'content': content}],
                 'max_tokens': count, 'temperature': 0, 'stream': stream,
+                'strata_conversation_id': conversation,
                 'chat_template_kwargs': {'enable_thinking': False}}
         request = urllib.request.Request(self.url + '/v1/chat/completions',
                                         data=json.dumps(body).encode(),
@@ -36,7 +37,7 @@ class Client:
         return urllib.request.urlopen(request, timeout=120)
 
 
-def run(client):
+def run(client, scenario='full'):
     initial = client.metrics()
     require(initial['live']['state'] == 'idle' and initial['live']['queued'] == 0, 'server is busy')
     info = initial['engine']
@@ -72,28 +73,53 @@ def run(client):
             f'Record {i}: blue square, green triangle, red circle.' for i in range(128)
         ) + '\nName one color. Answer with one word.'
 
-    def ask(label, content):
+    def ask(label, content, conversation, messages=None):
         stamp = before()
-        with client.request(info['model'], content) as response:
+        started = time.monotonic()
+        with client.request(info['model'], content, conversation=marker + '-' + conversation, messages=messages) as response:
             result = json.load(response)
         require(bool(result.get('choices')), 'missing completion')
         record = after(stamp, label)
+        record['http_wall_ms'] = 1000 * (time.monotonic() - started)
+        record['committed_message'] = result['choices'][0]['message']
         require(record['finish'] in ('length', 'stop'), 'request did not finish normally')
         return result['choices'][0]['message'], record
 
-    a, _ = ask('A', prompt('A'))
-    ask('B', prompt('B'))
-    restored, record = ask('A-restored', prompt('A'))
+    if scenario == 'turns':
+        content = prompt('A')
+        first, first_record = ask('A1', content, 'A')
+        require(first_record['reused'] == 0, 'turn one unexpectedly reused state')
+        second_prompt = [{'role': 'user', 'content': content}, first,
+                         {'role': 'user', 'content': 'Name another color from that list. One word.'}]
+        second, second_record = ask('A2', content, 'A', second_prompt)
+        require(second_record['reused'] > 0, 'turn two re-prefilled its whole conversation')
+        ask('B1', prompt('B'), 'B')
+        third_prompt = second_prompt + [second, {'role': 'user', 'content': 'Name a shape from that list. One word.'}]
+        third, third_record = ask('A3-parked', content, 'A', third_prompt)
+        require(third_record['reused'] > 0, 'parked conversation did not resume')
+        cold, cold_record = ask('A3-cold-control', content, 'cold-control', third_prompt)
+        require(cold_record['reused'] == 0 and cold == third,
+                'distinct-conversation canary reused state or committed output differs from cold control')
+        cache = client.metrics().get('conversation_cache', {})
+        require(cache.get('restores', 0) > 0, 'no RAM-parking restoration was observed')
+        require(0 <= cache.get('parked', -1) <= slots and
+                0 <= cache.get('bytes', -1) <= info['conversation_cache_mib'] * 1024 * 1024,
+                'parked count/bytes missing or outside configured ceilings')
+        return {'engine_info': info, 'records': records, 'cache': cache}
+
+    a, _ = ask('A', prompt('A'), 'A')
+    ask('B', prompt('B'), 'B')
+    restored, record = ask('A-restored', prompt('A'), 'A')
     require(record['reused'] > 0 and a == restored, 'A/B/A reuse or output mismatch')
     for i in range(slots + 1):
-        ask(f'evict-{i}', prompt(f'evict-{i}'))
-    _, record = ask('A-evicted', prompt('A'))
+        ask(f'evict-{i}', prompt(f'evict-{i}'), f'evict-{i}')
+    _, record = ask('A-evicted', prompt('A'), 'A')
     require(record['reused'] == 0, 'old A survived slot eviction')
 
     text = marker + ' cancel: ' + 'blue green red. ' * 256
     text += '\nCount from 1 to 1000, one number per line. Do not summarize.'
     stamp = before()
-    with client.request(info['model'], text, stream=True, count=4096) as response:
+    with client.request(info['model'], text, stream=True, count=4096, conversation=marker + '-cancel') as response:
         for line in response:
             if not line.startswith(b'data: ') or line.strip() == b'data: [DONE]':
                 continue
@@ -105,8 +131,8 @@ def run(client):
     record = after(stamp, 'cancelled')
     require(record['finish'] in ('disconnect', 'cancel') and 0 < record['output_tokens'] < 4096,
             'stream cancellation not observed')
-    ask('after-cancel-B', marker + ' Unrelated B: say hello.')
-    _, record = ask('cancelled-A-restored', text)
+    ask('after-cancel-B', marker + ' Unrelated B: say hello.', 'B')
+    _, record = ask('cancelled-A-restored', text, 'cancel')
     require(record['reused'] > 0, 'cancelled conversation was not restored')
     return {'engine_info': info, 'records': records}
 
@@ -116,6 +142,8 @@ def main():
     parser.add_argument('--url', default='http://127.0.0.1:11434')
     parser.add_argument('--output', type=Path, required=True, help='new results file; existing paths refused')
     parser.add_argument('--run', action='store_true')
+    parser.add_argument('--scenario', choices=('full', 'turns'), default='full',
+                        help='turns: five requests for turn-two reuse, A/B/A parking and an identical cold control')
     args = parser.parse_args()
     if not args.run:
         print('Dry run: HTTP A/B/A, slot eviction, cancellation and recovery. No network traffic.')
@@ -123,7 +151,7 @@ def main():
     # Refuse accidental overwrites before generating traffic.
     with args.output.open('x', encoding='utf-8') as output:
         try:
-            result = run(Client(args.url))
+            result = run(Client(args.url), args.scenario)
         except Exception as error:
             json.dump({'passed': False, 'error': str(error)}, output, indent=2)
             output.write('\n')

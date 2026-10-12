@@ -216,6 +216,8 @@ class PickSlot(unittest.TestCase):
         e.slot_order = list(range(n))
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
+        e.slot_scope = ["a"] * n
+        e.slot_groups = 1
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
         e.slot_group = [0] * n
@@ -225,15 +227,15 @@ class PickSlot(unittest.TestCase):
         e = self.engine(3)
         e.slot_held = [[1, 2, 3], [], [1, 2, 3, 4, 5]]
         e.slot_used = [5.0, 0.0, 9.0]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5, 6]), 2)       # the longest held start
-        self.assertEqual(e.pick_slot([1, 2, 3, 9]), 0)
-        self.assertEqual(e.pick_slot([7, 8]), 1)                    # no match: the empty slot first
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5, 6], 'a'), 2)       # the longest held start
+        self.assertEqual(e.pick_slot([1, 2, 3, 9], 'a'), 0)
+        self.assertEqual(e.pick_slot([7, 8], 'a'), 1)                    # no match: the empty slot first
         e.slot_busy[1] = True
-        self.assertEqual(e.pick_slot([7, 8]), 0)                    # then the one used longest ago
+        self.assertEqual(e.pick_slot([7, 8], 'a'), 0)                    # then the one used longest ago
         e.slot_busy = [True] * 3
-        self.assertIsNone(e.pick_slot([7, 8]))
+        self.assertIsNone(e.pick_slot([7, 8], 'a'))
         e.slot_busy = [False] * 3
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        self.assertEqual(e.pick_slot([1, 2, 3], 'a'), 1)                 # a held prompt is never the WHOLE prompt
 
     def test_batch_groups_spread_requests_over_the_groups(self):
         # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
@@ -243,12 +245,24 @@ class PickSlot(unittest.TestCase):
         e.slot_group = [0, 0, 1, 1]
         e.slot_busy[0] = True
         e.slot_held[1] = [1, 2, 3]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 2)
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5], 'a'), 2)
         e.slot_held[1] = list(range(1, 601))                       # a long prefix is worth the unbalanced group
-        self.assertEqual(e.pick_slot(list(range(1, 700))), 1)
+        self.assertEqual(e.pick_slot(list(range(1, 700)), 'a'), 1)
         e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
         e.slot_held[1] = [1, 2, 3]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5], 'a'), 1)
+
+    def test_pipelined_prefix_affinity_is_scoped_and_precedes_hole_filling(self):
+        e = self.engine(4)
+        e.slot_groups, e.slot_gs = 2, 2
+        e.slot_group = [0, 0, 1, 1]
+        e.slot_busy[0] = True
+        e.slot_held[2] = list(range(600))
+        e.slot_scope[2] = "a"
+        prompt = list(range(601))
+        self.assertEqual(e.pick_slot(prompt, "a"), 2)
+        self.assertEqual(e.pick_slot(prompt, "other"), 1)
+        self.assertEqual(e.pick_slot(prompt, ""), 1)
 
     def test_slots_view(self):
         e = self.engine(2)
@@ -412,7 +426,7 @@ class ParallelService(unittest.TestCase):
         def reserve_after_drain(slot, stream=None):
             release(slot, stream)
             with engine.slot_cv:
-                chosen = engine.pick_slot([])
+                chosen = engine.pick_slot([], "")
                 self.assertEqual(chosen, slot)
                 engine.slot_busy[chosen] = True
                 successor.append(chosen)
@@ -717,7 +731,7 @@ class ParallelService(unittest.TestCase):
         mine = [h for h in held if h[-len(reply) + 1:] == reply[:-1] and bytes(x for x in h if x < 256).find(b"conversation A") >= 0]
         self.assertEqual(len(mine), 1, held)
         slot = self.engine.slot_held.index(mine[0])
-        self.assertEqual(self.engine.pick_slot(mine[0] + [10, 11]), slot)
+        self.assertEqual(self.engine.pick_slot(mine[0] + [10, 11], self.engine.slot_scope[slot]), slot)
         self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
 
     def test_a_failed_window_names_its_error(self):

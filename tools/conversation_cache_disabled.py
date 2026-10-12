@@ -14,7 +14,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
-from conversation_cache_parity import load_tokenizer, require
+from conversation_cache_parity import fixture_scope, load_tokenizer, require
 from conversation_cache_soak import answer_text
 from serve.frontend import ChatTemplate
 from serve.server import StrataEngine, child_env
@@ -145,7 +145,8 @@ def main():
         with exe.open('rb') as source:
             arm['exe_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
         def generate(request):
-            ids = [t for t in engine.generate(request['ids'], request['max_new'], {'temperature': 0},
+            sampling = {'temperature': 0, '_strata_cache_scope': fixture_scope('disabled-parity')}
+            ids = [t for t in engine.generate(request['ids'], request['max_new'], sampling,
                                              threading.Event()) if t is not None]
             arm['records'].append({'name': request['name'], 'ids': ids, **engine.last,
                                    'text': tok.decode(ids)})

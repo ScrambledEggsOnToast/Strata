@@ -243,6 +243,7 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         const std::vector<int32_t> prefix{11, 22};
         program::ResidentRequest request;
         request.max_new = 8;
+        request.scope.value[0] = 1;
         request.sampling.seed = 0; // chosen seed must survive repeated yields
         request.sampling.penalty_last_n = 2;
         require(!owner.init_resources(error), "repeated init refuses");
@@ -304,12 +305,12 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(!owner.release_resources(error), "active request prevents resource release");
         require(ledger.begin(operation, 0) && ledger.retain_submission(operation), "retain C consumer");
         owner.cancel(0);
-        require(!owner.finish(0, true, error) && !owner.available(0), "finish refuses a retained consumer");
+        require(!owner.finish(0, error) && !owner.available(0), "finish refuses a retained consumer");
         ledger.cancel();
-        require(!owner.finish(0, true, error) && owner.slots()[0].active,
+        require(!owner.finish(0, error) && owner.slots()[0].active,
                 "cancelled submission still prevents finish/reuse");
         require(ledger.drain_submission(operation) && ledger.release(operation), "drain C consumer");
-        require(owner.finish(0, true, error), "finish C");
+        require(owner.finish(0, error), "finish C");
         require(owner.release_resources(error), "release batch scratch with C cached");
         require(owner.begin(-1, prompt, request, error) && owner.resume(0, nullptr, error),
                 "solo restore uses cached C while batch scratch is released");
@@ -338,7 +339,7 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
                 owner.slots()[1].request == bid && owner.slots()[1].active && owner.slots()[1].ids == prefix,
                 "failure cannot mutate B state or identity");
         owner.cancel(1);
-        require(owner.finish(1, true, error), "cancel survivor after failed peer");
+        require(owner.finish(1, error), "cancel survivor after failed peer");
         require(owner.release_resources(error) && owner.init_resources(error) && !owner.available(0) && owner.available(1),
                 "resource re-init restores valid contexts only");
         require(owner.begin(1, prompt, request, error), "select retained B for restore failure");

@@ -3,6 +3,7 @@
 Dry-run by default. --run requires an available GPU/model-loading window.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -21,6 +22,11 @@ STATE_KEYS = ('L', 'gdn', 'ple', 'tail', 'dead', 'pooled', 'pooled_full', 'kv', 
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+def fixture_scope(conversation):
+    """Explicit identities for public, trusted native fixtures; never infer them from token similarity."""
+    return hashlib.sha256(conversation.encode('utf-8')).hexdigest()
+
 
 
 def load_tokenizer(path):
@@ -46,7 +52,7 @@ def engine_args(cfg, budget, spec):
     # Native IQ packs require verifier capacity >= 2, even for one-token decode.
     return list(cfg['args']) + [
         '--conversation-cache-mib', str(budget), '--conversation-cache-slots', '4',
-        '--prompt-cache', '6', '--adapt-swaps', '0', '--spec', str(max(2, spec)),
+        '--prompt-cache', '6' if budget else '0', '--adapt-swaps', '0', '--spec', str(max(2, spec)),
         '--mtp-max-t', str(spec), '--suffix-draft', '0', '--spec-min-p', '0']
 
 
@@ -116,6 +122,7 @@ def verify_results(results, prompt_tokens, spec):
         require(state_keys <= record['state'].keys(), 'incomplete state fingerprint')
     require(len(baseline[0]['ids']) == len(candidate[0]['ids']) == 1, 'invalid initial A output length')
     require(baseline[0]['ids'] == candidate[0]['ids'], 'initial A output differs')
+    require(all(r['reused'] == 0 for r in baseline), 'cold control unexpectedly reused a prefix')
     require(candidate[2]['reused'] >= prompt_tokens, 'A was not restored after B')
     require(candidate[4]['reused'] > 0, 'parked checkpoint was not restored')
     for key in ('expert_slots', 'kv', 'kv_resident', 'context', 'spec', 'mtp_max', 'lookup', 'cvec'):
@@ -196,7 +203,8 @@ def main():
         results['engine_info'][label] = dict(engine.info)
         records = []
         def generate(ids, count, name):
-            out = [t for t in engine.generate(ids, count, {'temperature': 0}, threading.Event()) if t is not None]
+            sampling = {'temperature': 0, '_strata_cache_scope': fixture_scope(name[0])}
+            out = [t for t in engine.generate(ids, count, sampling, threading.Event()) if t is not None]
             records.append({'name': name, 'ids': out, **engine.last})
             return out
         try:

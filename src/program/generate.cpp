@@ -9163,10 +9163,10 @@ int main(int argc, char** argv) {
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
         // saved points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain -
-        // the radix cache's tree collapsed onto the one branch of history whose cells the session holds.  The
-        // chain's root is the deepest point every request so far shared (the end of the system prompt, in
-        // practice); the retention policy pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that
-        // shares that prefix mounts through it instead of reading it again.
+        // the radix cache's tree collapsed onto the one branch of history whose cells the session holds.
+        // Within one authorized conversation, the root and rotating LRU leaves
+        // retain useful turn boundaries. Token similarity across scopes never
+        // authorizes a new conversation to mount this chain.
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
@@ -9174,6 +9174,7 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        strata::core::ConversationScope live_scope;
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
@@ -9256,10 +9257,10 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!conversations.enabled() || !live_ok || !live_scope.valid() || live.empty()) return true;
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, live_scope))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
@@ -9379,6 +9380,7 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
+                image.scope = live_scope;
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
                     return true;
@@ -10516,7 +10518,7 @@ int main(int argc, char** argv) {
                 const BSlot& sl = bs[(size_t) b];
                 if (!sl.active || !sl.stop) continue;
                 // The previous operation has drained. Cancellation must not execute another row.
-                if (!resident.finish(b, true, err)) return false;
+                if (!resident.finish(b, err)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                 std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
             }
@@ -10632,7 +10634,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
-                        if (!resident.finish(b, true, err)) {
+                        if (!resident.finish(b, err)) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
                         break;
@@ -10727,7 +10729,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", G.rows[t], (long long) sl.produced, fin, ms);
-                        if (!resident.finish(G.rows[t], false, err, false)) {
+                        if (!resident.finish(G.rows[t], err, false)) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
                     }
@@ -11139,6 +11141,7 @@ int main(int argc, char** argv) {
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
+                    live_scope = {}; // Disk files do not carry a RAM authorization namespace.
                     live_ok = true;
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
@@ -11169,6 +11172,8 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            strata::core::ConversationScope req_scope;
+            bool bad_scope = false;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -11188,8 +11193,10 @@ int main(int argc, char** argv) {
                     const size_t eq = tok.find('=');
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
-                    const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    const float fv = key == "scope" ? 0.0f : std::strtof(tok.c_str() + eq + 1, nullptr);
+                    if (key == "scope")
+                        bad_scope = bad_scope || !strata::core::conversation_scope_parse(std::string_view(tok).substr(eq + 1), req_scope);
+                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -11214,8 +11221,8 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
-                std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
+            if (bad_scope || max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+                std::printf("ERR bad request: %s\n", bad_scope ? "scope must be 64 nonzero hex digits" : pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
@@ -11367,6 +11374,8 @@ int main(int argc, char** argv) {
             input.images = !req_imgs.empty();
             input.pcie_fraction = req_pcie_frac;
             input.spec_min_probability = req_spec_min_p;
+            input.scope = req_scope;
+            input.checkpoint = req_ckpt != 0;
             input.sampling.greedy = req_temperature <= 0.0f;
             input.sampling.temperature = req_temperature;
             input.sampling.top_p = req_top_p;
@@ -11399,7 +11408,7 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            if (o.prompt_cache > 0 && live_scope.matches(req_scope) && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -11416,7 +11425,7 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
-                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
+                    if (!sl.reusable(req_scope, want_cvec)) continue;
                     if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
@@ -11435,7 +11444,7 @@ int main(int argc, char** argv) {
                 slot_tokens = (int64_t) bs[(size_t) slot_source].ids.size();
                 slot_ck = nullptr;
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids, req_imgs, want_cvec, req_scope);
             std::optional<strata::core::SavedConversation> incoming;
             if (yielded_source < 0 && parked.tokens > std::max(resume, slot_tokens))
                 incoming.emplace(conversations.take(parked.index));
@@ -11480,6 +11489,9 @@ int main(int argc, char** argv) {
             }
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
+                // Retained RAM K/V belongs to the previous working state, not
+                // the resident owner being mounted (even a branch of this scope).
+                conversations.limit_reuse(0);
                 if (!resident.resume(slot_source, slot_ck, err)) {
                     // A transfer may have partly overwritten the working state.
                     // Never publish it as reusable or continue after a failed owner.
@@ -11503,6 +11515,8 @@ int main(int argc, char** argv) {
                     live_imgs.clear();
                     resume = slot_tokens;
                     from_live = true;
+                    live_scope = req_scope;
+                    cvec_cached = want_cvec;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
@@ -11560,6 +11574,7 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
+                live_scope = incoming->scope;
                 resume = parked.tokens;
                 from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
@@ -11573,11 +11588,13 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
-            if (want_cvec != cvec_cached) {
+            if (!live_scope.matches(req_scope) || want_cvec != cvec_cached) {
+                conversations.limit_reuse(0);
                 live_ok = false;
                 checks.clear();
                 cvec_cached = want_cvec;
             }
+            live_scope = req_scope;
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new

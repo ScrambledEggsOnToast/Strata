@@ -12,7 +12,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
-from conversation_cache_parity import STATE_KEYS, engine_args, load_tokenizer, require, state_hashes
+from conversation_cache_parity import STATE_KEYS, engine_args, fixture_scope, load_tokenizer, require, state_hashes
 from serve.server import StrataEngine, child_env
 from serve.frontend import ChatTemplate
 
@@ -114,9 +114,10 @@ def main():
                               cwd=cfg.get('cwd'), log=str(log), env=env)
         results['engine_info'][label] = dict(engine.info)
         hash_count = 0
-        def generate(ids, count):
+        def generate(ids, count, conversation):
             nonlocal hash_count
-            output = [t for t in engine.generate(ids, count, {'temperature': 0}, threading.Event()) if t is not None]
+            sampling = {'temperature': 0, '_strata_cache_scope': fixture_scope(str(conversation))}
+            output = [t for t in engine.generate(ids, count, sampling, threading.Event()) if t is not None]
             text = log.read_text(encoding='utf-8')
             hashes = state_hashes(text)
             require(len(hashes) == hash_count + 1 and int(hashes[-1]['L']) >= len(ids), 'missing current state fingerprint')
@@ -136,11 +137,11 @@ def main():
             require(max(map(len, prompts)) + len(suffix) + 64 < engine.max_context, 'test prompt exceeds context')
             if label == 'baseline':
                 for i, ids in enumerate(prompts):
-                    head = generate(ids, 1)
+                    head = generate(ids, 1, i)
                     require(len(head['ids']) == 1, 'baseline initial output is missing')
                     heads.append(head['ids'])
                     continuations.append(ids + head['ids'] + suffix)
-                    answer = generate(continuations[-1], 16)
+                    answer = generate(continuations[-1], 16, i)
                     results['contexts'].append({'expected': secrets[i], 'prompt_tokens': len(ids), 'baseline': answer})
                     require(answer_text(answer['text']) == secrets[i].casefold(), 'baseline known answer is wrong')
                     print(f'baseline length={len(ids)} answer={answer_text(answer["text"])}', flush=True)
@@ -149,11 +150,11 @@ def main():
                 for cycle in range(args.cycles):
                     index = cycle % len(prompts)
                     if index not in primed:
-                        head = generate(prompts[index], 1)
+                        head = generate(prompts[index], 1, index)
                         require(head['ids'] == heads[index], 'initial candidate output differs')
                         primed.add(index)
-                    generate(other, 1)
-                    answer = generate(continuations[index], 16)
+                    generate(other, 1, 'other')
+                    answer = generate(continuations[index], 16, index)
                     results['cycles'].append({'cycle': cycle, 'context': index, **answer})
                     print(f'cycle={cycle + 1}/{args.cycles} length={len(prompts[index])} '
                           f'reused={answer["reused"]} answer={answer_text(answer["text"])}', flush=True)

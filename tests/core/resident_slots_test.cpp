@@ -25,6 +25,40 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    {
+        program::ResidentSlot completed;
+        completed.active = true;
+        completed.request = 17;
+        completed.input.scope.value[0] = 1;
+        completed.ids = {11, 22, 33};
+        completed.sampling.seed = 99;
+        completed.produced = 2;
+        completed.p = 3;
+        completed.complete(true); // same policy called after serial and pipelined row drains
+        const core::ConversationScope other{{2}};
+        check(completed.reusable(completed.input.scope, true),
+              "completed pipelined turn retains a same-conversation prefix");
+        check(!completed.reusable(other, true) && !completed.reusable({}, true) &&
+              !completed.reusable(completed.input.scope, false),
+              "cold conversation, absent scope and changed steering all miss");
+        check(!completed.active && completed.request == 17 && completed.produced == 2 &&
+              completed.p == 3 && completed.sampling.seed == 99 && completed.ids.size() == 3,
+              "retention changes neither committed output, identity, RNG nor position");
+        completed.input.checkpoint = false;
+        completed.complete(true);
+        check(!completed.cached, "one-shot completed turns cannot become reusable");
+        completed.input.checkpoint = true;
+        completed.img = true;
+        completed.complete(true);
+        check(!completed.cached, "image slots stay ineligible");
+        completed.img = false;
+        completed.failed = true;
+        completed.complete(true);
+        check(!completed.cached, "failed state is never reusable");
+        completed.failed = false;
+        completed.complete(false);
+        check(!completed.cached, "prompt-cache zero still disables retention");
+    }
     const core::ExpertOperation operation{71, 0, 0, 1, 1};
     check(dispatch.completion[0].begin(operation, 0), "operation lease acquired");
     program::ResidentRequest config;

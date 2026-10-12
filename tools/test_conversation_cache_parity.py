@@ -15,12 +15,22 @@ def fixture():
         return {'name': name, 'ids': [123], 'finish': 'length', 'state': dict(state), 'reused': 100}
     info = {'expert_slots': 100, 'kv': 'int8', 'kv_resident': 32768, 'context': 65536,
             'spec': 1, 'mtp_max': 0, 'lookup': 0, 'cvec': '0'}
-    return {'baseline': [record('A'), record('A+')],
+    return {'baseline': [{**record('A'), 'reused': 0}, {**record('A+'), 'reused': 0}],
             'candidate': [record(n) for n in ('A', 'B', 'A+', 'B-again', 'A+-checkpoint')],
             'engine_info': {'baseline': dict(info), 'candidate': dict(info)}}
 
 
 class ParityGate(unittest.TestCase):
+    def test_native_parking_helper_has_an_explicit_scope(self):
+        from unittest.mock import Mock
+        from tools.parking_test import gen
+        from tools.conversation_cache_parity import fixture_scope
+        engine = Mock()
+        tokens, terminal = gen(engine, iter(["T 4\n", "DONE 1\n"]), [1, 2, 3], 8, "A")
+        engine.send.assert_called_once_with(f"GEN 8 scope={fixture_scope('A')} 1,2,3")
+        self.assertEqual(tokens, [4])
+        self.assertEqual(terminal, "DONE 1\n")
+
     def test_native_iq_single_token_arguments(self):
         cfg = {'args': ['--spec', '4', '--mtp-max-t', '4']}
         args = engine_args(cfg, 400, 1)
@@ -31,6 +41,8 @@ class ParityGate(unittest.TestCase):
         self.assertEqual(values['--adapt-swaps'], '0')
         self.assertEqual(values['--conversation-cache-mib'], '400')
         self.assertEqual(cfg['args'], ['--spec', '4', '--mtp-max-t', '4'])
+        cold = engine_args(cfg, 0, 1)
+        self.assertEqual(cold[cold.index('--prompt-cache') + 1], '0')
 
     def test_complete_evidence(self):
         verify_results(fixture(), 100, 1)
@@ -45,6 +57,7 @@ class ParityGate(unittest.TestCase):
             'output differs': lambda d: d['candidate'][2].update(ids=[456]),
             'live not restored': lambda d: d['candidate'][2].update(reused=0),
             'checkpoint not restored': lambda d: d['candidate'][4].update(reused=0),
+            'warm alleged cold control': lambda d: d['baseline'][1].update(reused=100),
             'different residency': lambda d: d['engine_info']['candidate'].update(expert_slots=99),
             'cancellation': lambda d: d['candidate'][2].update(finish='cancel'),
             'initial output differs': lambda d: d['candidate'][0].update(ids=[789]),

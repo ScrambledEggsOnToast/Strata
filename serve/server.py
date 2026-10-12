@@ -764,6 +764,7 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_scope = [""] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
@@ -957,6 +958,11 @@ class StrataEngine:
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        scope = sampling.get("_strata_cache_scope")
+        if scope is not None:
+            if not isinstance(scope, str) or not re.fullmatch(r"[0-9a-f]{64}", scope) or int(scope, 16) == 0:
+                raise ValueError("invalid internal conversation cache scope")
+            keys += f" scope={scope}"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -1244,6 +1250,7 @@ class StrataEngine:
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
         keys = self.sampling_keys(sampling or {})
+        scope = (sampling or {}).get("_strata_cache_scope", "")
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1289,9 +1296,10 @@ class StrataEngine:
                             if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                     self._shorter_waiting(len(prompt))):
                                 with self.slot_cv:          # the slot the part read will wait in
-                                    reserved = self.pick_slot(prompt)
+                                    reserved = self.pick_slot(prompt, scope)
                                     if reserved is not None:
                                         self.slot_busy[reserved] = True
+                                        self.slot_scope[reserved] = scope
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
@@ -1324,7 +1332,7 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, scope)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     break
@@ -1332,7 +1340,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, scope) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -1366,6 +1374,7 @@ class StrataEngine:
                     if callable(on_slot):
                         on_slot(slot)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    self.slot_scope[slot] = scope
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -1506,30 +1515,28 @@ class StrataEngine:
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], scope: str) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        def held_prefix(b):
+            h = self.slot_held[b]
+            return len(h) if (scope and self.slot_scope[b] == scope and h and len(h) < len(prompt) and
+                             prompt[:len(h)] == h) else 0
+        best = max(free, key=held_prefix)
+        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+            return best
         gs = getattr(self, "slot_gs", 0)
         if gs:
-            # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
-            # free for a next turn.  A group's window spans its slots up to its last busy one, so first fill a hole
-            # below a busy slot of the same group (it costs no extra row), then follow the spreading order
-            # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
+            # With no useful authorized prefix, retain the pipeline's existing
+            # hole-filling/spreading policy rather than holding a row for reuse.
             def fills_hole(b):
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
-        def held_prefix(b):
-            h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
-        best = max(free, key=held_prefix)
-        # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
-            return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in = {}
@@ -1562,6 +1569,11 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        sampling = dict(sampling or {})
+        if "_strata_cache_scope" not in sampling:
+            # Trusted direct callers without a conversation identity are private
+            # to this generation, including its yield/promotion/solo legs.
+            sampling["_strata_cache_scope"] = uuid.uuid4().hex + uuid.uuid4().hex
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -2693,6 +2705,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.cache_secret = uuid.uuid4().bytes
         self.supervised = os.environ.get("STRATA_SUPERVISED") == "1"
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -3450,6 +3463,22 @@ class Service:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
+
+    def cache_scope(self, req: dict, principal: str) -> str:
+        """A fixed namespace, not a growing conversation registry or token-similarity key."""
+        conversation = req.get("strata_conversation_id")
+        if conversation is not None:
+            if not isinstance(conversation, str) or not 1 <= len(conversation.encode("utf-8")) <= 256:
+                raise ValueError("strata_conversation_id must be a nonempty string of at most 256 UTF-8 bytes")
+            conversation = ("explicit", conversation)
+        else:
+            _, codex = responses_api._codex_turn(req)
+            conversation = ("codex", *codex) if codex else ("request", uuid.uuid4().hex)
+        # Model/config/geometry and resolved placement cannot change inside a
+        # loaded engine. Replacement tokenizer/template objects or template source
+        # invalidate this namespace before native token/image/steering validation.
+        identity = [principal, conversation, self.model, id(self.tok), self.template.source]
+        return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
@@ -5034,6 +5063,11 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    auth = self.headers.get("Authorization", "")
+                    principal = (auth[7:].strip() if auth.lower().startswith("bearer ") else
+                                 self.headers.get("x-api-key", "")) if svc.api_key else ""
+                    # Never trust a client-supplied internal scope or cache grouping key.
+                    req["_strata_cache_scope"] = svc.cache_scope(req, principal)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel)

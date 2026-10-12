@@ -24,6 +24,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
+from conversation_cache_parity import fixture_scope
 
 
 def override(args, pairs):
@@ -144,7 +145,8 @@ def main():
         records = []
 
         def generate(ids, count, name):
-            out = [t for t in engine.generate(ids, count, {'temperature': 0}, threading.Event()) if t is not None]
+            sampling = {'temperature': 0, '_strata_cache_scope': fixture_scope(name[0])}
+            out = [t for t in engine.generate(ids, count, sampling, threading.Event()) if t is not None]
             records.append({'name': name, 'ids': out, **engine.last})
             print(f'{label} {summarize(records[-1:]).strip()}', flush=True)
             return out

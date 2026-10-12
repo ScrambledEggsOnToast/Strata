@@ -23,6 +23,8 @@ struct ResidentRequest {
     int64_t max_new = 0;
     bool steering = true, images = false;
     double pcie_fraction = 0, spec_min_probability = 0;
+    core::ConversationScope scope;
+    bool checkpoint = true;
 };
 
 struct ResidentWorking {
@@ -49,6 +51,15 @@ struct ResidentSlot {
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
     bool failed = false;
+
+    // Called only after the operation owner certifies this row's drain.
+    void complete(bool cache_enabled) {
+        active = false;
+        cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed;
+    }
+    bool reusable(const core::ConversationScope& scope, bool steering) const {
+        return !active && !failed && cached && request && cvec == steering && input.scope.matches(scope);
+    }
 };
 
 struct ResidentAdmission {
@@ -92,7 +103,7 @@ public:
     // Called only for a GPU-committed row. No state migration or allocation.
     bool committed(int slot, int32_t next, const float* residual, std::string& error, bool observe = true);
     bool propose(int slot, const float* residual, std::string& error);
-    bool finish(int slot, bool keep_cache, std::string& error, bool diagnostic = true);
+    bool finish(int slot, std::string& error, bool diagnostic = true);
 private:
     enum class Resources { released, ready, failed };
     bool idle(std::string& error);
