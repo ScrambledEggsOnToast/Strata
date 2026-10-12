@@ -353,14 +353,21 @@ read raw gate|up/down blobs through a by-value device pointer table; streamed/mi
 existing gathers and staging-slot releases. FP16 intermediates fit in the existing FP32 H allocation and
 the 256-byte pointer table aliases existing Hq scratch. No ring growth or extra workspace is introduced.
 
-The candidate remains **opt-in and unqualified**: no local GPU result or speedup is implied by the donor's
-measurements. `iq_wmma_policy_test` is a CPU eligibility check; `prefill_fused_iq_test --wmma-only`
-checks independent complete-FFN references, all seven format pairs in the Swift IQ3_S pack, indirect
-versus gathered addressing, guards, empty groups, partial row/chunk tiles and SwiGLU boundaries on SM70.
-The parent project's `evidence/native-iq-wmma-20261012/contract.json` fixes rejection limits before
-evaluation. Native teacher-forced logits remain unavailable (#57): first/committed diagnostic rows are
-a **different, weaker check**, not satisfaction of teacher-forced AC-3. Numerical observers are separate
-from HTTP timing. Roll back by unsetting the opt-in; the daily profile is not changed.
+The candidate is **default-off and rejected by model-level evidence**. CUDA12.9 SM70+SM86 compile/link
+and the seven-format independent complete-FFN fixture passed (worst FP16-reference relL2 `7.2e-5`);
+the mandatory SM86 refusal/skip gate passed too. In contrast, the matched 48,025-token model first
+predictor has relL2 `0.35648`, max |Δ| `2.59332` and top-20 overlap `0.75`, failing frozen limits
+`0.02`, `0.5` and `0.9`. Identical emitted sentinel words did not pass the arithmetic screen.
+This fixture/model contradiction is not explained away as ordinary FP16 imprecision: the retained
+hypotheses are wrong serving operands/scales/offsets/indirect wiring, mismatched predictor content,
+or changed upstream expert selection. The routing captures were incomplete: control terminal
+payload short 256 bytes; candidate structurally invalid after 1765 complete records. No repair or
+threshold movement was attempted. Parent-project `evidence/native-iq-wmma-20261012/qualification.json`
+retains the results and hypotheses; `contract.json` retains the original bounds.
+Teacher-forced logits are **impossible** for this native IQ3_S serving pack (#57). First/committed
+diagnostics are a **different, weaker check**, not satisfaction of literal AC-3. Observer timing is
+not performance evidence; held-out/performance arms were stopped after the public failure.
+Roll back by leaving `STRATA_PREFILL_IQ_WMMA` unset. No daily-profile change or speedup is claimed.
 
 
 ## Other GPUs (estimated)
