@@ -3355,8 +3355,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (!context_idle(err)) return false;
     if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: release batch resources before rebinding slots"; return false; }
-    if (slots.empty() || (int) slots.size() > max_t_) {
-        err = "verify: init_slots needs 1.." + std::to_string(max_t_) + " sessions";
+    // Resident identities are slot-indexed; max_t_ bounds only this owner's compute rows.
+    if (slots.empty() || slots.size() > (size_t) strata::kernels::kVerifyMaxT) {
+        err = "verify: init_slots needs 1.." + std::to_string(strata::kernels::kVerifyMaxT) + " sessions";
         return false;
     }
     for (SessionState* x : slots) {

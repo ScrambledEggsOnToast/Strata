@@ -1,6 +1,7 @@
 // CPU-only lifecycle preflight. Real graph/isolation checks run through the protected model vehicle.
 #include "strata/program/resident_slots.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -25,6 +26,17 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    check(stage.batch_peer == nullptr, "ordinary resident stages have no replay peer");
+    const auto untouched = verifier.batch_resources();
+    check(untouched.device_bytes == 0 && untouched.pinned_bytes == 0 &&
+          untouched.history_bytes == 0 && untouched.graph_keys == 0 && untouched.graph_execs == 0,
+          "an uninitialized optional verifier owns no resident arena, history or captures");
+    const core::GraphCaptureProbe disabled_probe({"resident-default", "no-observer"});
+    for (const auto phase : {core::GraphCapturePhase::BeforeCapture, core::GraphCapturePhase::AfterCapture,
+                            core::GraphCapturePhase::AfterInstantiate, core::GraphCapturePhase::AfterUpload,
+                            core::GraphCapturePhase::Retained})
+        check(disabled_probe.check(phase, error),
+              "an absent capture observer performs no CUDA query, including with CUDA_VISIBLE_DEVICES=-1");
     {
         program::ResidentSlot completed;
         completed.active = true;

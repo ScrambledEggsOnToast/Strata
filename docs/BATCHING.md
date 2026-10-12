@@ -505,6 +505,69 @@ per-stage mapped/history/diagnostic host staging and another finite graph-storag
 MPS ceiling. An unknown or over-budget plan refuses. Kernel exactness/performance still require parent-project
 qualification; source integration is not runtime evidence.
 
+### Split batch-MTP qualification, 2026-10-12
+
+The parent project's `evidence/batch-mtp-split-20261012/summary.json` retains configurations, native token
+sequences, admission prices, excluded arms and the slot-count curve. The adopted daily profile and its
+protected frontend are unchanged; the new schedules are opt-in.
+
+On engine `9c6d7b77`, four concurrent identical 224-token prompts with a 512-token cap, the same original
+sender and frontend, and both `STRATA_BATCH_TRACE` and `STRATA_STATE_HASH` absent measured **137.1921 OFF
+versus 156.9355 ON tok/s (+14.39%)**. The numerator is 2,048 API-committed tokens and the denominator is
+last response minus first submission. Historical 131.19 used a different binary and is context, not this
+pair's control. The separate 9,500-token/700-output cohort measured **82.4776 OFF versus 87.9263 ON
+native committed tok/s (+6.61%)**, on the same binary/frontend/input within that pair. Its numerator is
+`sum(BDONE.generated - 1)` and denominator the engine batch-window wall, including admissions. Native
+per-request decode increased from 20.94/25.31/32.00/43.64 to 22.45/27.47/35.43/50.27 tok/s. These two
+workloads and denominators must not be blended. The long cohort's newer frontend is measurement-only;
+neither absolute figure qualifies the older daily frontend's scheduling/admission behavior.
+
+The synchronous alternative was a measured negative on `903013ae`: ordinary pipelined batching
+82.5555, synchronous without drafting 46.4209, synchronous with drafting 47.8359 native committed tok/s.
+Drafting gained 3.05% against its synchronous control but remained 42.06% below the ordinary pipeline.
+The previously traced timing figures were withdrawn; state-hash runs are correctness-only.
+
+The combined greedy case offered 1,603 drafts and accepted 1,188: **415 rejected proposals** traversed
+accepted-prefix commit across all three retained owners. All 2,800 emitted IDs matched the retained OFF
+control. A diagnostic 32-token capture showed 30 rejections, including:
+`request=3 slot=2 position=9500 proposal=6765 target=16107 keep=1`; emitted token index 1 was `16107`.
+A separate non-greedy four-seed case (temperature 0.8, top-k 20, top-p 0.95 and request-local repetition,
+frequency and presence penalties) matched all 160 control IDs and produced four distinct sequences.
+This finite sampled parity plus source inspection of independent target Philox counters is evidence,
+not a universal distributional proof; the concrete trace above is a greedy rejection case.
+
+Admission charges an additional **67,440,368 B/device** for each second owner (67,234,560 B arena,
+205,088 B controls, 720 B canary), another **256 MiB/device finite graph-storage allowance**, and
+**303,174,720 B host-staging envelope**. The allowance/envelope are conservative prices, not measured
+opaque graph allocations. Runtime arena allocation agrees with the ledger's 64.12 MiB. Private draft
+KV was already allocated with the flag off, so it has no marginal cost at fixed slot count.
+All 24,576 experts remained resident at N=4. A loaded capture observed free VRAM in CUDA0/1/2 order
+of 3,861/4,853/2,428 MiB (physical NVIDIA indices 2/0/1). No reset or clock/power setting changed.
+
+#### Production instrumentation boundary
+
+The second-owner allocation, controls, graph allowance and replay lifetime are guarded by
+`--batch-mtp-pipeline`; without it, no second verifier is initialized and ordinary `pump` is unchanged.
+The off path retains pre-existing mandatory request/slot/epoch canaries, and small flag/null/deferred-mode
+checks. The eight request-accounting records also reserve 192 bytes of host stack at serving setup;
+they are production draft counters, not token/state capture. Do not describe the total off cost as zero.
+
+`STRATA_STATE_HASH` gates hashes, proposal decision logs and canary/resource *printing*; it does not gate
+mandatory safety checks. `STRATA_BATCH_DIAGNOSTICS` additionally enables diagnostic commands/dumps.
+`STRATA_BATCH_TRACE` gates frontend token tracing. With these absent, there are no fingerprint copies,
+per-token diagnostic output or diagnostic captures. Existing verifier profile/session-row/node/handshake
+observations remain separately default-off; disabled observation retains only its pre-existing checks
+and any fixed host bookkeeping. `GraphCaptureProbe` has a null thread-local observer by default: no
+CUDA/RSS measurement or observation-forced upload/synchronization occurs. A nonempty graph's ordinary
+node-count validation is pre-existing mandatory capture validation, not the optional node inventory.
+The CPU resident preflight checks the absent peer, zero uninitialized-owner resources and disabled
+capture observer under `CUDA_VISIBLE_DEVICES=-1`; it does not replace the runtime allocation ledger.
+
+`STRATA_IQ_MT_MIN=1` is legitimate CPU expert arithmetic/performance policy (consistent rounding across
+window widths), not instrumentation. `STRATA_PREFILL_RING=8` is the required bounded source-ring policy
+for windowed-expert prefill, not instrumentation. Both remain in the daily environment.
+
+
 
 ## Historical upstream measurements (not fork qualification)
 
