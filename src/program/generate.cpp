@@ -10799,6 +10799,21 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        uint64_t working_capacity = 0, resident_capacity = 0;
+        for (size_t k = 0; k <= stages.size(); ++k) {
+            const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
+            const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
+            const uint64_t working = strata::core::session_bytes(g, o.max_context, K, lo, hi, &kv_roles.working_main);
+            const uint64_t resident = o.batch > 0
+                ? strata::core::session_bytes(g, o.max_context, K, lo, hi, &kv_roles.slot_main) : 0;
+            if (!working || (o.batch > 0 && !resident) ||
+                working > UINT64_MAX - working_capacity || resident > UINT64_MAX - resident_capacity) {
+                std::fprintf(stderr, "strata request admission: unknown or overflowing role/stage capacity\n");
+                return 1;
+            }
+            working_capacity += working;
+            resident_capacity += resident;
+        }
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -11226,6 +11241,33 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // BGEN's internal GEN 1 is only the prefill leg, not its output budget.
+            // Slots, draft state and workspace were reserved at startup; reachable
+            // cells must fit that envelope before uploads, identity binding or work.
+            strata::plan::RequestDemand request_demand;
+            request_demand.prompt_tokens = n;
+            request_demand.max_new_tokens = admit_slot >= 0 ? admit_max_new : max_new;
+            // Each private owner already reserves its full resolved-context arena.
+            // A shorter request does not resize or re-resolve that placement.
+            const uint64_t slot_capacity = admit_slot >= 0 ? resident_capacity : working_capacity;
+            request_demand.state_bytes_per_sequence = slot_capacity;
+            const auto request_admission = strata::plan::admit_request(request_demand, o.max_context);
+            if (!request_admission.admitted) {
+                std::printf("REJECT %s%s cells=%lld\n",
+                            admit_slot >= 0 ? "bounded=1 " : "", request_admission.reason.c_str(),
+                            (long long) request_admission.cells);
+                if (admit_slot >= 0) std::printf("BADM %d 0\n", admit_slot);
+                std::fflush(stdout);
+                continue;
+            }
+            const auto admission_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now().time_since_epoch()).count();
+            std::printf("ADMIT cells=%lld state_demand_bytes=%llu context_limit=%lld "
+                        "batch_capacity=%d slot_capacity_bytes=%llu admission_ns=%lld\n",
+                        (long long) request_admission.cells, (unsigned long long) request_admission.state_demand_bytes,
+                        (long long) o.max_context, o.batch > 0 ? o.batch : 1,
+                        (unsigned long long) slot_capacity, (long long) admission_ns);
+            std::fflush(stdout);
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -11318,26 +11360,6 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            // HET-017: THE OBSERVABLE ADMISSION DECISION, before any prompt work.  ADMIT/REJECT frames
-            // are what lets the harness time admission (`admission_monotonic_s`) and record a
-            // `admission_rejected` status with zero committed tokens instead of a bare ERR-failure.
-            // The state demand is priced with the allocator's own `session_bytes` at the cells this
-            // request can reach - context length, not a slot count.
-            {
-                const int64_t cells_wanted = n + max_new;
-                const uint64_t state_demand =
-                    (uint64_t) strata::core::session_bytes(g, cells_wanted, K, 0, -1);
-                if (cells_wanted + 8 > o.max_context) {
-                    std::printf("REJECT prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld) "
-                                "cells=%lld state_demand_bytes=%llu\n",
-                                (long long) n, (long long) max_new, (long long) o.max_context,
-                                (long long) cells_wanted, (unsigned long long) state_demand);
-                    continue;
-                }
-                std::printf("ADMIT cells=%lld state_demand_bytes=%llu context_limit=%lld\n",
-                            (long long) cells_wanted, (unsigned long long) state_demand,
-                            (long long) o.max_context);
-            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }

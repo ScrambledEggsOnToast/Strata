@@ -1945,15 +1945,19 @@ is an end-of-turn marker or buffered by structured output rather than visible to
 
 JSON `/status`, `/metrics`, `/v1/status` and `/health` expose the same `admission` snapshot: `slots` (the effective
 count, at least one), `request_queue_limit`, `active` (admitted HTTP generations), `waiting` (generations waiting
-for HTTP admission), `oldest_wait_s` (the oldest waiter's monotonic queue age, or zero), and `request_timeout_s`
-(the configured total deadline). Counts are sampled together under the admission lock; an active request may
-still wait for native control/compute, so this is not a count of concurrently executing GPU kernels.
+for HTTP admission), `executing` (submitted native request legs through drain), `native_waiting` (reserved
+requests waiting to submit their next native leg), `oldest_wait_s` (the oldest HTTP waiter's monotonic queue
+age, or zero), and `request_timeout_s` (the configured total deadline). Counts are sampled together under
+the admission lock. `active` includes preparation, native waiting and execution; `executing` does not claim
+concurrently executing GPU kernels or prefill/decode overlap. Active slot rows carry the stable frontend
+`request_id`, also returned in `X-Strata-Request-Id`.
 Existing `queued` and native slot/control-wait metrics are unchanged. Queue capacity remains effective slots
 plus depth. Streaming errors after HTTP 200 headers keep their existing SSE form, not an HTTP retry hint.
 
 Cancellation during admission sends `STOP` and consumes `DONE`/`BADM`; an active resident slot receives
 `BSTOP` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned
-through that drain. Missing acknowledgements or ambiguous native admission errors end the engine rather
+through that drain. A `REJECT bounded=1 ...` followed by the exact `BADM <slot> 0` boundary releases only
+the refused request with zero output. Missing acknowledgements or ambiguous native admission errors end the engine rather
 than return a potentially live slot to the queue. Existing consumers must retire before restart. This
 fail-closed path can fail other active requests; it must not silently mutate or complete them with another
 request's output. Qualification must exercise both successful isolated cancellation and failure/retry.

@@ -5,6 +5,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/resident_memory.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/plan/admission.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,11 @@ bool ResidentSlots::begin(int destination, const std::vector<int64_t>& prompt,
         request.max_new < 1 || destination < -1 || (destination >= 0 && !available(destination))) {
         error = "resident working request: invalid or unavailable context"; return false;
     }
+    plan::RequestDemand demand;
+    demand.prompt_tokens = (int64_t) prompt.size();
+    demand.max_new_tokens = request.max_new;
+    const auto admission = plan::admit_request(demand, context_);
+    if (!admission.admitted) { error = admission.reason; return false; }
     if (!idle(error)) return false;
     ResidentWorking next;
     for (size_t b = 0; b < slots_.size(); ++b) {

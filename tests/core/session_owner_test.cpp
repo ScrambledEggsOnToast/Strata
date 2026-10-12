@@ -4,6 +4,7 @@
 // STRATA_SESSION_TEST_WRAP. Wrappers forward to the REAL runtime; they count and inject allocation failures.
 // --gpu also requires STRATA_ROPE_TABLE=1 (set before process start) to observe registration ownership.
 #include "strata/core/session.hpp"
+#include "strata/plan/admission.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -129,6 +130,29 @@ int main(int argc, char** argv) {
           qsa_state_host_bytes(streamed, 65536, 1) == 134218868,
           "drafter ring charges full-context pinned backing even when main K/V is resident");
     qsa_set_kv_resident(0);
+    const auto roles = qsa_role_placements(streamed, 65536, 20480, 0, 4);
+    const int64_t bounds[] = {0, 20, 39, 48};
+    for (const auto* role : {&roles.working_main, &roles.slot_main}) {
+        for (int stage = 0; stage < 3; ++stage) {
+            const uint64_t capacity = session_bytes(streamed, 65536, 4, bounds[stage], bounds[stage + 1], role);
+            check(capacity > 0, "resolved stage role has a known preallocated arena");
+            for (int64_t cells : {5, 20480, 20481, 65528}) {
+                strata::plan::RequestDemand request;
+                request.prompt_tokens = cells - 1;
+                request.max_new_tokens = 1;
+                request.state_bytes_per_sequence = capacity;
+                const auto decision = strata::plan::admit_request(request, 65536);
+                check(decision.admitted && decision.cells == cells && decision.state_demand_bytes == capacity,
+                      "variable-context requests retain their fixed stage/role reservation");
+                check(!session_bytes(streamed, cells, 4, bounds[stage], bounds[stage + 1], role),
+                      "a frozen placement cannot be repriced at a different context");
+            }
+            qsa_set_kv_resident(1); // ambient policy must not re-resolve the admitted owner
+            check(session_bytes(streamed, 65536, 4, bounds[stage], bounds[stage + 1], role) == capacity,
+                  "request pricing retains the single resolved role after ambient policy changes");
+            qsa_set_kv_resident(0);
+        }
+    }
     SessionAllocationBytes whole, range;
     check(session_allocation_bytes(g, 65, 10, whole), "price without CUDA initialization");
     check(whole.device == session_bytes(g, 65, 10), "owner and external arena use identical pricing");

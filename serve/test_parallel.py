@@ -4,6 +4,8 @@ A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / B
 real StrataEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -102,6 +104,12 @@ while True:
         ids = f[-1].split(",")
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # #1059: refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
+            continue
+        if bytes(int(x) & 255 for x in ids).find(b"ADMISSIONREFUSE") >= 0:
+            print("REJECT bounded=1 prompt + max_new exceeds the context", flush=True)
+            if slot is not None:
+                boundary = slot + 1 if "--bad-refusal-boundary" in args else slot
+                print(f"BADM {boundary} 0", flush=True)
             continue
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
@@ -529,11 +537,13 @@ class ParallelService(unittest.TestCase):
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     snapshot = self.get("/status")["admission"]
-                    if (snapshot["active"], snapshot["waiting"]) == (2, depth):
+                    if (snapshot["active"], snapshot["waiting"], snapshot.get("executing"),
+                            snapshot.get("native_waiting")) == (2, depth, 1, 1):
                         break
                     time.sleep(0.005)
                 self.assertEqual((snapshot["slots"], snapshot["request_queue_limit"],
                                   snapshot["active"], snapshot["waiting"]), (2, depth, 2, depth))
+                self.assertEqual((snapshot["executing"], snapshot["native_waiting"]), (1, 1))
                 if depth:
                     self.assertGreater(snapshot["oldest_wait_s"], 0)
                 else:
@@ -542,6 +552,7 @@ class ParallelService(unittest.TestCase):
                     observed = self.get(path)["admission"]
                     self.assertEqual((observed["active"], observed["waiting"],
                                       observed["request_queue_limit"]), (2, depth, depth))
+                    self.assertEqual((observed["executing"], observed["native_waiting"]), (1, 1))
                 with self.assertRaises(urllib.error.HTTPError) as refused:
                     self.chat("beyond the bounded capacity")
                 with refused.exception as response:
@@ -565,6 +576,67 @@ class ParallelService(unittest.TestCase):
 
     def test_zero_depth_refuses_at_effective_slots(self):
         self.queue_boundary(0)
+
+    def test_native_budget_refusal_drains_without_poisoning_a_survivor(self):
+        self.start(2)
+        replies, errors = [], []
+
+        def survivor():
+            try:
+                replies.append(self.chat("survivor LONGREPLY"))
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=survivor)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not self.log.exists():
+                time.sleep(0.005)
+            self.assertTrue(self.log.exists(), "the survivor submitted work before the refusal")
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                self.chat("ADMISSIONREFUSE")
+            with refused.exception as response:
+                self.assertEqual(response.code, 400)
+                self.assertIn("exceeds the context", json.load(response)["error"]["message"])
+        finally:
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(replies[0]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        self.assertTrue(self.engine.alive(), "an explicit bounded refusal must not kill coexisting work")
+        self.assertEqual(self.chat("replacement")["choices"][0]["message"]["content"], "ok, done.")
+        refused_record = next(row for row in self.svc.lifecycle_records() if row["state"] == "error")
+        self.assertEqual(refused_record.get("output_tokens", 0), 0)
+        self.assertFalse(any(self.engine.slot_busy))
+        snapshot = self.get("/metrics")["admission"]
+        self.assertEqual((snapshot["active"], snapshot["waiting"], snapshot["executing"],
+                          snapshot["native_waiting"]), (0, 0, 0, 0))
+
+    def test_mixed_context_refusal_never_submits_or_truncates_work(self):
+        self.start(2, more=("--says-context", "256"))
+        self.assertEqual(self.chat("short", max_tokens=4)["usage"]["completion_tokens"], 4)
+        before = self.log.read_text()
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            self.chat("long context " * 30, max_tokens=4)
+        with refused.exception as response:
+            self.assertEqual(response.code, 400)
+            self.assertIn("never truncated", json.load(response)["error"]["message"])
+        self.assertEqual(self.log.read_text(), before, "an over-context request must not reach GEN/BGEN")
+        self.assertEqual(self.chat("short successor", max_tokens=4)["usage"]["completion_tokens"], 4)
+        records = self.svc.lifecycle_records()
+        self.assertEqual([row.get("output_tokens", 0) for row in records], [4, 0, 4])
+        self.assertEqual([row["state"] for row in records], ["completed", "error", "completed"])
+
+    def test_bounded_refusal_with_wrong_slot_boundary_still_fails_closed(self):
+        self.start(2, more=("--bad-refusal-boundary",))
+        # A one-token request enters BGEN even when alone.
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            self.chat("ADMISSIONREFUSE", max_tokens=1)
+        with refused.exception as response:
+            self.assertEqual(response.code, 503)
+            self.assertIn("missing its slot boundary", json.load(response)["error"]["message"])
+        self.assertFalse(self.engine.alive())
 
     def test_concurrent_requests_share_the_slots(self):
         self.start(2)
@@ -608,6 +680,32 @@ class ParallelService(unittest.TestCase):
         # never more than two in the slots at once (the fake logs how many were active at each admission)
         active = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertTrue(all(a <= 1 for a in active), active)
+        identities = {row["id"] for row in self.svc.lifecycle_records()}
+        seen_owners = {}
+        for snapshot in seen:
+            active_slots = [slot for slot in snapshot.get("slots", []) if slot["state"] != "idle"]
+            request_ids = [slot["request_id"] for slot in active_slots]
+            self.assertEqual(len(request_ids), len(set(request_ids)))
+            self.assertLessEqual(set(request_ids), identities)
+            for slot in active_slots:
+                seen_owners.setdefault(slot["slot"], set()).add(slot["request_id"])
+        self.assertTrue(any(len(owners) > 1 for owners in seen_owners.values()),
+                        "a departing slot takes a new identity while a peer still runs")
+
+    def test_wire_trace_reconciles_committed_tokens_not_scheduled_rows(self):
+        import serve.server as server
+        self.start(2)
+        trace = io.StringIO()
+        with mock.patch.object(server, "_BTRACE", True), contextlib.redirect_stderr(trace):
+            replies = self.race("trace owner LONGREPLY", "trace peer", delay=0.05)
+        frames = [line.split(" wire< ", 1)[1] for line in trace.getvalue().splitlines() if " wire< " in line]
+        emitted = sum(frame.startswith(("T ", "BT ")) for frame in frames)
+        self.assertTrue(any(frame.startswith("BT ") for frame in frames), "trace exposes resident commits")
+        self.assertEqual(emitted, sum(row["output_tokens"] for row in self.get("/metrics")["requests"]))
+        self.assertEqual(replies["trace owner LONGREPLY"][0], "ok, " + "la " * 15 + "done.")
+        self.assertEqual(replies["trace peer"][0], "ok, done.")
+        self.assertTrue(any(frame.startswith("BADM ") for frame in frames))
+        self.assertTrue(any(frame.startswith("BDONE ") for frame in frames))
 
     def race(self, first, second, delay=0.15, max_tokens=64):
         """`first` sent, `second` after `delay` seconds; -> {text: (reply, seconds it took)}"""

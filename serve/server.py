@@ -778,6 +778,8 @@ class StrataEngine:
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            if _BTRACE:
+                btrace("wire<", line.rstrip())
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1034,11 +1036,12 @@ class StrataEngine:
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, slot=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
         stopped = False
+        rejection = None
         born, lines = getattr(self, "gen", None), self.lines
         beat = time.monotonic()
         while True:
@@ -1061,6 +1064,11 @@ class StrataEngine:
             beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if rejection is not None:
+                if line.strip() != f"BADM {slot} 0":
+                    raise self._silent("bounded admission refusal missing its slot boundary")
+                self._ctl_erred = True
+                raise ValueError(rejection)
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
@@ -1099,18 +1107,24 @@ class StrataEngine:
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
             elif line.startswith("REJECT"):
-                # Refusals have no BADM boundary. Poison rather than assign an ambiguous pipe to another owner.
-                raise self._silent("engine admission refused: " + line.strip())
+                if self._ctl_mode == "batch" and slot is not None and line.startswith("REJECT bounded=1 "):
+                    rejection = line.removeprefix("REJECT bounded=1 ").strip()
+                elif self._ctl_mode == "solo":
+                    self._ctl_erred = True
+                    raise ValueError(line[7:].strip())
+                else:
+                    raise self._silent("engine admission refused without a bounded boundary: " + line.strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None, slot=None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers. A missing live boundary poisons the process.
         `born` identifies the process that owns the request: never drain a successor's lines."""
         end = time.monotonic() + timeout
         lines = self.lines
+        rejected = False
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
                 return None
@@ -1120,6 +1134,13 @@ class StrataEngine:
                 continue
             if line is None:
                 return None
+            if rejected:
+                if line.strip() != f"BADM {slot} 0":
+                    raise self._silent("bounded admission refusal missing its slot boundary while draining")
+                return line
+            if line.startswith("REJECT bounded=1 ") and until == "BADM" and slot is not None:
+                rejected = True
+                continue
             if line.startswith("YIELDED "):
                 fields = line.split()
                 self._yielded = (int(fields[1]), int(fields[2]))
@@ -1170,8 +1191,10 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, on_control=None):
+    def _take_control(self, cancel, plen: int, on_control=None, on_wait=None):
         """FIFO control ownership; a yielded chunk read rejoins behind already-waiting requests."""
+        if callable(on_wait):
+            on_wait()
         entry = [plen, object()]
         with self.slot_cv:
             self.waiting += 1
@@ -1255,8 +1278,10 @@ class StrataEngine:
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
         on_control = (sampling or {}).get("_strata_control_ready")
+        on_wait = (sampling or {}).get("_strata_native_waiting")
+        on_submit = (sampling or {}).get("_strata_submitted")
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
-        ok = yield from self._take_control(cancel, len(prompt), on_control)
+        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1270,7 +1295,7 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt), on_control)
+                    ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
                     if not ok:
                         return
                     holding = True
@@ -1281,6 +1306,8 @@ class StrataEngine:
                 if alone and left > 1 and not getattr(self, "resident_multiplex", False):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    if callable(on_submit):
+                        on_submit(None)
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -1337,6 +1364,8 @@ class StrataEngine:
                                     self.slot_busy[slot] = True
                                     break
                             if holding:
+                                if callable(on_wait):
+                                    on_wait()
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
@@ -1345,7 +1374,7 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                                ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -1356,7 +1385,7 @@ class StrataEngine:
                         yields += 1
                         self.ctl.release()
                         holding = False
-                        ok = yield from self._take_control(cancel, len(prompt), on_control)
+                        ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait)
                         if not ok:
                             return
                         holding = True
@@ -1369,18 +1398,22 @@ class StrataEngine:
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
+                    if (sampling or {}).get("_strata_request_id"):
+                        live["request_id"] = sampling["_strata_request_id"]
                     self.slot_live[slot] = live
                     on_slot = (sampling or {}).get("_strata_slot")
                     if callable(on_slot):
                         on_slot(slot)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_scope[slot] = scope
+                    if callable(on_submit):
+                        on_submit(slot)
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
                     asked = False
-                    for x in self._control(cancel, pending.append):
+                    for x in self._control(cancel, pending.append, slot=slot):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -1479,7 +1512,7 @@ class StrataEngine:
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     self._send("STOP")
-                    line = self._drain_control("BADM", born=born)
+                    line = self._drain_control("BADM", born=born, slot=slot)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
                 # A parked slot is inactive: BSTOP invalidates its continuation,
@@ -1560,7 +1593,8 @@ class StrataEngine:
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None, **residency})
+                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None, **residency,
+                         **({"request_id": r["request_id"]} if r.get("request_id") else {})})
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -1583,6 +1617,9 @@ class StrataEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
+        on_submit = (sampling or {}).get("_strata_submitted")
+        if callable(on_submit):
+            on_submit(None)
         born, lines = getattr(self, "gen", None), self.lines
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2897,6 +2934,8 @@ class Service:
         return {"slots": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                 "request_queue_limit": self.request_queue_limit,
                 "active": len(self.admission_active), "waiting": len(self.admission_waiters),
+                "executing": sum(bool(r.get("_executing")) for r in self.admission_active.values()),
+                "native_waiting": sum(r["state"] == "engine_wait" for r in self.admission_active.values()),
                 "oldest_wait_s": round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6),
                 "request_timeout_s": self.request_timeout_s}
 
@@ -3686,20 +3725,25 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         lifecycle = getattr(self.lifecycle_local, "record", None)
         if lifecycle is not None:
-            self.lifecycle_note(lifecycle, "generating", prompt_tokens=len(ids), max_tokens=max_new,
-                                context_budget=len(ids) + max_new + CTX_SLACK)
+            self.lifecycle_note(lifecycle, "preparing", prompt_tokens=len(ids), max_tokens=max_new,
+                                context_budget=len(ids) + max_new + CTX_SLACK, _executing=False)
             if cancel.is_set():
                 raise ValueError("request cancelled before generation")
-            if isinstance(self.engine, StrataEngine) and self.engine.batch:
+            if isinstance(self.engine, StrataEngine):
                 def control_ready(waited):
                     with self.status_lock:
                         lifecycle["queue_s"] += waited
                         if trace is not None:
                             trace["queue_s"] += waited
+                def native_waiting():
+                    self.lifecycle_note(lifecycle, "engine_wait", _executing=False)
+                def submitted(slot):
+                    self.lifecycle_note(lifecycle, "prefill", slot=slot, _executing=True)
                 def slot_assigned(slot):
-                    self.lifecycle_note(lifecycle, "prefill", slot=slot)
+                    self.lifecycle_note(lifecycle, "admitted", slot=slot)
                 sampling = {**(sampling or {}), "_strata_control_ready": control_ready,
-                            "_strata_slot": slot_assigned}
+                            "_strata_slot": slot_assigned, "_strata_native_waiting": native_waiting,
+                            "_strata_submitted": submitted, "_strata_request_id": lifecycle["id"]}
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -3796,6 +3840,8 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
+                            if lifecycle is not None and not isinstance(self.engine, StrataEngine):
+                                self.lifecycle_note(lifecycle, "generating", _executing=True)
                             for t in gen:
                                 if cancel.is_set():
                                     break
@@ -3881,7 +3927,7 @@ class Service:
                                     self.lifecycle_note(lifecycle, "draining")
                                 gen.close()             # drain before freeing request admission or embeddings
                                 if lifecycle is not None:
-                                    self.lifecycle_note(lifecycle, "drained")
+                                    self.lifecycle_note(lifecycle, "drained", _executing=False)
                             except EngineDied as e:
                                 finish = "error"
                                 self._say_died(e)
