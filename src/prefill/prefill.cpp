@@ -1022,7 +1022,7 @@ const MmqPlan& mmq_plan() {
         const char* attribution = std::getenv("STRATA_PREFILL_ATTRIBUTION");
         p.device_grouped = p.native_grouped && detail::resident_grouping_requested() &&
                            std::getenv("STRATA_PREFILL_TIMING") == nullptr &&
-                           !(attribution && std::strcmp(attribution, "1") == 0);
+                           !(attribution && std::atoi(attribution) != 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
