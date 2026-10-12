@@ -151,6 +151,21 @@ Prompts are read in chunks that flow through the cards in turn; while a later ca
 already reads chunk c+1. Conversation checkpoints save and restore every card's state; the adaptive expert swaps copy
 into the card that owns the layer.
 
+Resident `--batch` seats keep eager private GPU sessions on every stage. Their
+host checkpoint price is state-only: the owned GDN recurrence/convolution,
+indexer tails/dead/block positions, and each stage's PLE history and token IDs,
+plus the seat's `ids`/`prompt` vectors. It is not another copy of the session's
+device arena, attention K/V, RoPE or scratch. Admission adds a documented 12.5%
+logical-seat payload margin and 4 KiB per stage for checkpoint metadata.
+
+Seat promotion copies one stage-local checkpoint and one logical layer K/V image
+at a time. The subsequent draft copy is serial, so transfer admission uses the
+larger of that main-copy peak and the draft image, with 12.5% plus 4 KiB margin,
+never a sum of device arenas or a multiplier for seat/stage count. This runtime
+transient is not added to weight-loader/init transients. Logical streamed K/V
+backing is still charged in full, and all ownership/isolation and admission gates
+remain unchanged. With no requested slots, these price corrections add nothing.
+
 ## Limits (for now)
 
 - **Works across cards** (bench/results/2026-09-29-layer-split-limits):

@@ -1,6 +1,7 @@
 // HET-035/HET-017 resident-slot payload contract. No CUDA dependencies.
 #pragma once
 #include "strata/plan/qsa_memory.hpp"
+#include "strata/kernels/ngram.hpp"
 #include <algorithm>
 #include <cstdint>
 
@@ -10,6 +11,79 @@ namespace strata::plan {
 inline constexpr uint64_t kResidentOwnerBytes = 4096;
 inline constexpr uint64_t kResidentQsaBytes = 4096;
 inline constexpr uint64_t kResidentMaxSlots = 8;
+// Fresh checkpoint/vector copies allocate their logical extents. Add 12.5% of
+// the whole retained seat payload for capacity/alignment slack, plus 4 KiB per
+// stage for checkpoint objects/directories (ABI-checked by the core adapter).
+// Serial transfer images receive the same percentage and one 4-KiB envelope.
+// Allocator/driver/graph overhead still needs the separate enforced allowance.
+inline constexpr uint64_t kResidentPayloadMarginDivisor = 8;
+inline constexpr uint64_t kResidentCheckpointMetadataBytes = 4096;
+struct CheckpointStateBytes {
+    uint64_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
+};
+// The definitions consumed by conversation_checkpoint_save/restore. GDN is
+// stage-local; PLE is duplicated in every stage; indexer terms are per layer.
+inline bool checkpoint_state_bytes(uint64_t gdn_layers, uint64_t state_size, uint64_t v_heads,
+                                    uint64_t conv_channels, uint64_t d_conv,
+                                    const strata::kernels::QsaShapes& s, CheckpointStateBytes& out) {
+    out = {};
+    if (!state_size || !v_heads || !conv_channels || !d_conv || s.idx_block <= 0 || s.idx_dim <= 0) return false;
+    LogicalBytes count;
+    CheckpointStateBytes b;
+    const uint64_t recurrence = count.product({state_size, v_heads, state_size});
+    const uint64_t convolution = count.product({conv_channels, d_conv - 1});
+    b.gdn = count.product({gdn_layers, count.sum({recurrence, convolution}), sizeof(float)});
+    b.ple = count.product({strata::kernels::NG_HIST, strata::kernels::NG_HC_DIM, sizeof(float)});
+    b.tail = count.product({(uint64_t) (s.idx_block - 1), (uint64_t) s.idx_dim, sizeof(float)});
+    b.dead = count.product({(uint64_t) s.idx_dim, sizeof(float)});
+    b.block_pos = sizeof(int32_t);
+    if (!count.valid) return false;
+    out = b;
+    return true;
+}
+struct ResidentCheckpointPayload {
+    uint64_t bytes = 0, stage_peak = 0, stages = 0;
+};
+inline bool resident_checkpoint_stage(uint64_t cells, uint64_t qsa_layers,
+                                       const CheckpointStateBytes& state, ResidentCheckpointPayload& out) {
+    LogicalBytes count;
+    const uint64_t layer = count.sum({state.tail, state.dead, state.block_pos});
+    const uint64_t payload = count.sum({state.gdn, state.ple, count.product({qsa_layers, layer}),
+                                        count.product({cells, sizeof(int32_t)})});
+    const uint64_t total = count.sum({out.bytes, payload});
+    if (!count.valid || out.stages == UINT64_MAX) return false;
+    out.bytes = total;
+    out.stage_peak = std::max(out.stage_peak, payload);
+    ++out.stages;
+    return true;
+}
+struct ResidentHostBytes {
+    // Histories/checkpoints are per seat; transfer is one serial operation peak.
+    uint64_t histories = 0, checkpoints = 0, transfer_transient = 0;
+};
+inline bool resident_host_bytes(uint64_t cells, const ResidentCheckpointPayload& checkpoint,
+                                 uint64_t main_image, uint64_t draft_image, ResidentHostBytes& out) {
+    out = {};
+    if (!cells || cells > INT32_MAX || !checkpoint.stages || !checkpoint.bytes ||
+        !checkpoint.stage_peak || checkpoint.stage_peak > checkpoint.bytes) return false;
+    LogicalBytes count;
+    const auto margin = [](uint64_t n) {
+        return n / kResidentPayloadMarginDivisor + (n % kResidentPayloadMarginDivisor != 0);
+    };
+    ResidentHostBytes b;
+    // The third old "history" was the checkpoint ID vector: charge it in each
+    // stage's checkpoint instead. ResidentSlot itself retains only ids/prompt.
+    b.histories = count.product({cells, 2, sizeof(int32_t)});
+    b.checkpoints = count.sum({checkpoint.bytes, margin(count.sum({checkpoint.bytes, b.histories})),
+                               count.product({checkpoint.stages, kResidentCheckpointMetadataBytes})});
+    // copy_to: one stage checkpoint + one main layer image; draft.save_slot
+    // starts only after copy_to returns. Neither seats nor stages multiply it.
+    const uint64_t transfer = std::max(count.sum({checkpoint.stage_peak, main_image}), draft_image);
+    b.transfer_transient = count.sum({transfer, margin(transfer), kResidentCheckpointMetadataBytes});
+    if (!count.valid) return false;
+    out = b;
+    return true;
+}
 struct ResidentPayload {
     uint64_t device = 0, pinned = 0;
 };
@@ -46,11 +120,12 @@ inline const char* resident_role_unpriced(const strata::kernels::QsaShapes& s, i
 // slots is the REQUESTED --batch count, additional to the main working session.
 // Never replace it with a count trimmed by a later runtime fallback. Calls are serial;
 // weights, verifier/MTP scratch and opaque graph allowance are shared, not multiplied.
-// One retained checkpoint and three context-bounded int32 token histories per slot.
-// Transfer bound covers a slot checkpoint plus the larger main/draft image in either direction.
+// One state-only checkpoint (with stage-local IDs/PLE) and two seat histories.
+// The supplied host bound is derived from the actual checkpoint/image definitions.
 inline bool resident_bytes(uint64_t slots, uint64_t cells, uint64_t nq, uint64_t tail_floats,
                            const ResidentPayload& working_main, const ResidentPayload& slot_main, uint64_t init_transient,
-                           const ResidentPayload& working_draft, const ResidentPayload& slot_draft, bool mtp, ResidentBytes& out) {
+                           const ResidentPayload& working_draft, const ResidentPayload& slot_draft, bool mtp,
+                           const ResidentHostBytes& host, ResidentBytes& out) {
     out = {};
     const auto bounded = [](const ResidentPayload& p) { return p.device <= (1ull << 50) && p.pinned <= (1ull << 50); };
     if (slots > kResidentMaxSlots || cells == 0 || cells > INT32_MAX || nq > 48 ||
@@ -60,11 +135,13 @@ inline bool resident_bytes(uint64_t slots, uint64_t cells, uint64_t nq, uint64_t
     out.working_main = working_main;
     if (mtp) out.working_draft = working_draft;
     if (!slots) return true;
+    if (!host.checkpoints || !host.transfer_transient || host.histories > (1ull << 50) ||
+        host.checkpoints > (1ull << 50) || host.transfer_transient > (1ull << 50)) return false;
     const auto align256 = [](uint64_t n) { return (n + 255) & ~255ull; };
     out.slot_main = {slots * slot_main.device, slots * slot_main.pinned};
     out.slot_main_owner = slots * (kResidentOwnerBytes + nq * kResidentQsaBytes);
-    out.histories = slots * cells * 3 * sizeof(int32_t);
-    out.checkpoints = slots * slot_main.device; // full slot arena bounds one state-only checkpoint
+    out.histories = slots * host.histories;
+    out.checkpoints = slots * host.checkpoints;
     const uint64_t commit = slots * (2 + kResidentMaxSlots) * sizeof(int32_t);
     out.verifier_device = align256(align256(commit) + slots * std::max<uint64_t>(nq, 1) * tail_floats * 4)
                           + kResidentMaxSlots * (4096 + 1) * sizeof(int32_t);
@@ -72,8 +149,7 @@ inline bool resident_bytes(uint64_t slots, uint64_t cells, uint64_t nq, uint64_t
     out.verifier_history = kResidentMaxSlots * 4096 * sizeof(int32_t);
     if (mtp) out.slot_draft = {slots * slot_draft.device, slots * slot_draft.pinned};
     out.slot_draft_owner = mtp ? slots * (kResidentQsaBytes + 3 * sizeof(uint64_t)) : 0;
-    out.transfer_transient = slot_main.device + std::max(working_main.device, slot_main.device) +
-        cells * 3 * sizeof(int32_t) + (mtp ? std::max(working_draft.device, slot_draft.device) : 0);
+    out.transfer_transient = host.transfer_transient;
     out.init_transient = init_transient;
     return true;
 }

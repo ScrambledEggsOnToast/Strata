@@ -42,7 +42,7 @@ struct ResidentSlot {
     int64_t p = 0, produced = 0, max_new = 0;
     std::chrono::steady_clock::time_point t0;
     std::vector<int32_t> ids;
-    std::vector<int32_t> prompt; // yielded full prompt; third accounted token history
+    std::vector<int32_t> prompt; // yielded full prompt; second seat-owned token vector
     ResidentRequest input;
     int original_slot = -1;
     bool cached = false, cvec = true, img = false;
