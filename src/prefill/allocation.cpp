@@ -15,6 +15,7 @@
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/cpu_share_memory.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -60,6 +61,7 @@ bool Prefill::allocation_config(int64_t max_cells, int64_t chunk, int kv_mode, b
     out.kv_hybrid = kv_hybrid;
     out.kv_stage_own = kv_stage_own_env();
     out.gr_unfused = gr_unfused_env();
+    out.cpu_share = cpu_share_enabled();
     out.ring = (int) ring_slots_for(chunk);
     out.stager_ring = stager_ring_env();
     const char* env = std::getenv("STRATA_PREFILL_MMQ");
@@ -190,6 +192,13 @@ bool Prefill::allocation_needed(const core::ModelGeometry& g, const AllocationCo
                               out.host_dynamic)) {
         err = "prefill: host allocation arithmetic overflow";
         return false;
+    }
+    if (c.cpu_share && experts.native) {
+        out.host_cpu_share = cpu_share_host_bytes(c.chunk, g.n_expert);
+        if (out.host_cpu_share == UINT64_MAX) {
+            err = "prefill: CPU-share host allocation arithmetic overflow";
+            return false;
+        }
     }
     return true;
 }

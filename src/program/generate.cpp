@@ -3454,6 +3454,11 @@ int main(int argc, char** argv) {
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
     const bool batch_requested = o.batch > 0; // keep admission intent even if runtime eligibility disables it
+    // Freeze the pool/default-share choice before ANY prefill price/loan/layout snapshot.
+    // Runtime batch/split fallback must not arm a new, unpriced configuration later.
+    const bool prefill_share_pool = !o.no_pool && (o.serve ? !batch_requested : !multi_gpu);
+    strata::prefill::Prefill::arm_cpu_share(prefill_share_pool,
+        prefill_share_pool && split_devs.empty() && !batch_requested);
     // Known ranges commit exact owner extents. Auto's pre-search bounds are
     // not exact carves and therefore do not arm the runtime equality checks.
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
@@ -3817,6 +3822,7 @@ int main(int argc, char** argv) {
             v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
         uint64_t prefill_host_payload = admitted_prefill.host_payload;
         uint64_t prefill_host_dynamic = admitted_prefill.host_dynamic;
+        uint64_t prefill_host_cpu_share = admitted_prefill.host_cpu_share;
         if (split_real) {
             const size_t last = split_devs.size() - 1;
             for (size_t i = 0; i < split_devs.size(); ++i) {
@@ -3930,6 +3936,7 @@ int main(int argc, char** argv) {
                     }
                     prefill_host_payload = byte_add(prefill_host_payload, stage_prefill.host_payload);
                     prefill_host_dynamic = byte_add(prefill_host_dynamic, stage_prefill.host_dynamic);
+                    prefill_host_cpu_share = byte_add(prefill_host_cpu_share, stage_prefill.host_cpu_share);
                     ds.vram.add("prefill_buffers", stage_prefill.standalone_device,
                                 "Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)");
                     if (o.prefill_library_allowance_bytes != 0)
@@ -4416,6 +4423,8 @@ int main(int argc, char** argv) {
                 "Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags");
             ram("prefill_host_dynamic", prefill_host_dynamic,
                 "per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit");
+            ram("prefill_cpu_share_buffers", prefill_host_cpu_share,
+                "resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit");
             // prefill_runtime_storage is added below, once the supervisor's measured worker limit is
             // known: the operator allowance is only admissible inside an enforced cgroup ceiling.
             if (split_real)
@@ -8399,10 +8408,8 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
-        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
-        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu);
+        // The admitted choice remains fixed even if batching/split eligibility fell back during setup.
+        const bool share_pool = prefill_share_pool;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -13468,7 +13475,6 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
-    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, !multi_gpu && !o.no_pool && o.batch <= 0);   // before the chunk below sizes the loan
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -13519,7 +13525,7 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (prefill_share_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
