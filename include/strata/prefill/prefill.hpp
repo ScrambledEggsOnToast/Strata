@@ -68,6 +68,7 @@ struct AllocationConfig {
     int64_t layer_begin = 0, layer_end = -1; ///< Stage validation; device scratch remains shared/all-path sized.
     int kv_mode = 0;
     bool kv_int8 = false, kv_q4 = false, kv_hybrid = false, kv_stage_own = false, gr_unfused = false, mmq = true;
+    bool cpu_share = false; ///< Resolved pool/share eligibility before the ring/layout snapshot.
     int ring = 8; ///< Snapshot of ring_slots_for(chunk) - the ring `init` lays out, clamped 16..ring_cap().
     int stager_ring = 16; ///< Snapshot of the host copy ring for unpinned blobs (STRATA_STAGER_RING, clamped
                           ///< 2..256 exactly as the stager reads it at init).
@@ -98,6 +99,9 @@ struct AllocationBytes {
     /// nothing here bounds them: allocator block headers and other heap/driver metadata around these arrays,
     /// cudaEvent_t driver objects, resident thread stacks, and the container-managed init-lifetime tables.
     uint64_t host_dynamic = 0;
+    /// CPU-share pinned input/output, both retained activation formats, exact job/selection/work arrays.
+    /// Separate from host_payload/host_dynamic and opaque allocator/driver/thread metadata.
+    uint64_t host_cpu_share = 0;
 };
 
 // ========================== END FORK BLOCK (admission structs) ==========================
@@ -314,16 +318,18 @@ public:
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
     /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
     /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
-    /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
+    /// (the CPU's own activation format). Null or explicit share 0: every expert on the GPU. Only for a pool no other
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
-    /// for a chunk. Set before `init`.
+    /// for a chunk. Set before `init`; resolve its eligibility with arm_cpu_share before admission.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
-    /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
+    /// Before allocation_config or any `bytes_needed` (the ring and small-chunk buffers follow the limit);
+    /// `init` repeats the already-resolved choice. Startup fallback must not enable an unpriced pool/default.
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    static bool cpu_share_enabled();
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,

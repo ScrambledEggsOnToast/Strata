@@ -1221,17 +1221,21 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, int n_expert,
                         const unsigned long long* expert_ptr, int32_t* scratch,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts,
-                        int32_t* pair_slot, int32_t* ent_tok, void* stream) {
+                        int32_t* pair_slot, int32_t* ent_tok, void* stream,
+                        void (*mark)(void*, int, void*), void* observer) {
     if (n < 0 || k_per_tok <= 0 || n_expert < 1 || n_expert > 1024) {
         std::fprintf(stderr, "moe_group_resident: invalid prefill geometry\n");
         std::exit(1);
     }
     const cudaStream_t cs = (cudaStream_t) stream;
+    if (mark) mark(observer, 0, stream);
     resident_rank_kernel<<<(unsigned) n_expert, 256, 0, cs>>>(ids, n, n_expert, scratch, pair_slot, counts);
     check("moe_group_resident/rank", stream);
+    if (mark) mark(observer, 1, stream);
     resident_scan_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, cs>>>(
         scratch, n_expert, n, expert_ptr, scratch + n_expert, grp_ptr, grp_start, counts);
     check("moe_group_resident/scan", stream);
+    if (mark) mark(observer, 2, stream);
     if (n > 0) {
         resident_scatter_kernel<<<(unsigned) (((int64_t) n + 255) / 256), 256, 0, cs>>>(
             ids, n, k_per_tok, scratch + n_expert, counts, pair_slot, ent_tok);

@@ -306,19 +306,29 @@ per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
 **Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
 `PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one
 per stage chunk, and a containing public `Prefill::run` record after its pipeline drains. Records include
-stage ownership, token position/count, MMQ and host-route exposure, mapped readback, deferred shared work,
-borrow status, streamed/DMA expert counts, GPU phase durations, and monotonic host intervals for the route
-join, host grouping, observer fold, stage download, successor wait and final chunk join. The observer adds
-no CUDA event or synchronization call sites and does not change expert arithmetic. It does add host
-accounting/logging and enables the event timer: use it for attribution, **not headline latency**.
+stage ownership, token position/count, MMQ and host/device-route exposure, mapped readback, deferred shared
+work, borrow status, streamed/DMA/resident expert counts, GPU phase durations, and monotonic host intervals
+for readback submission, the containing route join, direct CPU grouping, enqueue completion, observer fold,
+stage download, successor wait and final chunk join. Resident device layers keep their actual grouping and
+dispatch: rank/scan/scatter boundaries only enqueue events, which fold at the existing chunk drain. The
+instrument inserts no layer synchronization and does not change expert arithmetic or launch geometry.
+It adds events, host accounting and logging: use it for attribution, **not headline latency**.
 
-The host grouping GPU envelope starts after the previously queued attention/router work; a long host
-`cudaStreamSynchronize` call can instead be waiting for that earlier GPU work. Raw joins are not removable
-CPU delay, and the stage download interval includes its preceding work as well as the copy. Phase envelopes
-can contain submission gaps and are not isolated kernel measurements. Do not add overlapping host waits to
-GPU durations, or add two devices' timelines into wall time. Host stamps share a monotonic clock; the GPU
-durations do not establish cross-device clock alignment. Invalid event measurements mark the records
-incomplete. The switch is off by default; omit `STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
+`prior_gpu_ready_chunk_ms` is the same-device event offset from chunk origin to the completion of previously
+queued work, just before routing readback or resident rank. `route readback` times the mapped-copy/D2H
+envelope separately; `resident rank`, `resident scan` and `resident scatter` identify the new integer work.
+`dispatches`, `dispatch_cap_groups`, `dispatch_max_entries` and `dispatch_grid_groups` distinguish selected
+up-to-16-expert host batches from one device-sized dispatch. Device-layer `experts=-1` is deliberately
+unknown: there is no new per-layer count readback. The existing chunk status supplies total selected groups.
+`dispatches` counts complete expert FFN sequences: one native grouped call, or one MMQ gate/up + down pair.
+MMQ's `dispatch_grid_groups=-1` means the native grid parameter is inapplicable, not an unexecuted group.
+The direct CPU grouping span excludes observer folding and shared-expert submission. The larger
+sync-to-enqueue interval still contains ordinary submission work; neither it nor the raw synchronization
+is a pure removable-CPU estimate. Native FFN envelopes can include metadata/submission gaps, not just kernels.
+Do not add overlapping host waits to GPU durations or add two devices' timelines into wall time. Host
+stamps share a monotonic clock; GPU events do not establish cross-device or host/device clock alignment.
+Invalid event measurements mark records incomplete. The switch is off by default; omit
+`STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
 This observer's layer-record storage supports bounds within `[0,48]`; it explicitly refuses other bounds
 rather than emitting a partial capture. The normal unobserved engine path is unchanged.
 
@@ -1143,6 +1153,46 @@ A one-shot request that no later request continues (a classification call, a pro
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
+
+**Cost-aware continuation (opt-in).** `--prefix-selection cost` considers every valid active,
+resident-slot and parked-RAM live/checkpoint prefix, and fresh recomputation, before taking or
+overwriting any source. It estimates **outgoing park + restore + remaining prefill** in milliseconds.
+A resident source can beat a deeper parked image; a worthwhile deeper image still wins.
+Authorization, token/image equality, steering, snapshot validation, admission and memory ceilings
+are not scores and cannot be overridden by a saving. Exact resends of yielded requests still resume
+their own slot, request identity and sampling sequence without an economic choice.
+
+The process learns from its own completed operations on the resolved placement, not a fixed
+tokens-per-millisecond rule or a new benchmark. Eight recent wall-time observations per copy path
+cover checkpoint restores, resident live/checkpoint host-bounced copies, whole parked restores and
+outgoing captures. Byte extents include the real recurrence/K/V layouts and host checkpoint-chain
+copies (retained unchanged pages are subtracted for parking); rates are separated by device,
+authoritative resident/streamed/ring paths and resident window sizes. Resident migration is
+charged as capture **and** restore, not assumed to be a direct device
+copy. Prediction is limited to 1/4–4 times an observed transfer extent. Prefill learns separate
+batched/window milliseconds per fresh token by power-of-two context bucket, using the same bucket
+or one neighbor and only 1/4–4 times an observed read span, with an eight-observation effective
+averaging horizon. Its request key includes
+the PCIe arithmetic share, steering and image mode. Successful read intervals include lending and
+checkpoint capture, exclude separately timed interleaved decode, and never include an earlier
+park/restore. The estimate predicts existing root/message/turn/pin cuts; it does not repartition
+arithmetic. Transfer timings include synchronization and host metadata overhead, so the byte
+extent is a cost-model input, **not measured PCIe or DRAM traffic**.
+
+Unknown or out-of-bound alternatives never win; if the longest valid source itself is unpriced,
+selection stays longest. Cost ties and gains no larger than `--prefix-min-savings-ms N` (integer
+0–60000, default 0) keep the original longest source and tie order. Observations are bounded to
+4 KiB, charged as `prefix_cost_model` in host admission, and discarded on process exit.
+`STRATA_CKPT_REREAD` and the dynamic test-only `STRATA_PIPELINE_SWITCH` use the longest fallback
+instead of learning across changed arithmetic. The stderr `prefix selection` line records the
+chosen source, longest match, fallback reason and estimated park/restore/prefill costs; `-1` means
+unknown. Existing park/restore wall times and fresh/reused/committed counts remain available.
+
+**Rollback:** `--prefix-selection longest` (the default, or omit the option). No cache format,
+placement, cache budget or frontend protocol changes are needed. `--prompt-cache 0` remains the
+separate **reuse-off** correctness control, not the rollback for this selection policy. Default
+promotion requires a matched full-model and held-out comparison; source/CPU checks alone do not
+establish latency gains or committed-token equality.
 
 **One long document, many questions in one conversation: a pinned prefix (opt-in, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
 A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),

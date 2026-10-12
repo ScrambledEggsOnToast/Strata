@@ -260,9 +260,15 @@ void check_resident_metadata(cudaStream_t s) {
             if (n) ck(cudaMemcpy(ids, routed.data(), (size_t) n * 4, cudaMemcpyHostToDevice), "ids");
             ck(cudaMemset(counts, 0, 16), "counts");
             ck(cudaMemset(scratch, 0x7f, 2 * E * 4), "stale scratch");
-            // Two launches without a join reuse the same scratch just as consecutive layers do.
-            for (int rep = 0; rep < 2; ++rep)
-                k::moe_group_resident(ids, n, K, E, experts, scratch, ptr, start, counts, slot, tok, s);
+            // An observer changes only event submission, not maps or dispatch. Both launches reuse scratch
+            // without a join, as consecutive device-grouped layers do.
+            struct Marks { int next = 0; bool valid = true; cudaStream_t stream; } marks{0, true, s};
+            const auto mark = +[](void* context, int boundary, void* stream) {
+                auto& m = *static_cast<Marks*>(context);
+                m.valid = m.valid && boundary == m.next++ && stream == m.stream;
+            };
+            k::moe_group_resident(ids, n, K, E, experts, scratch, ptr, start, counts, slot, tok, s);
+            k::moe_group_resident(ids, n, K, E, experts, scratch, ptr, start, counts, slot, tok, s, mark, &marks);
             ck(cudaStreamSynchronize(s), "resident metadata");
             std::vector<int32_t> got_slot(n), got_tok(n), got_start(want_start.size());
             std::vector<unsigned long long> got_ptr(want_ptr.size());
@@ -278,7 +284,7 @@ void check_resident_metadata(cudaStream_t s) {
             std::memcpy(&groups, got_count + 2, 8);
             const bool ok = got_slot == want_slot && got_tok == want_tok && got_start == want_start &&
                             got_ptr == want_ptr && got_count[0] == (int) want_ptr.size() &&
-                            got_count[1] == 0 && groups == 2 * want_ptr.size();
+                            got_count[1] == 0 && groups == 2 * want_ptr.size() && marks.valid && marks.next == 3;
             ++cases;
             if (!ok) { ++bad; std::printf("resident metadata n=%d hot=%d FAIL\n", n, hot); }
         }

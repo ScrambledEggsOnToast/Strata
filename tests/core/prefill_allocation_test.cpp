@@ -11,6 +11,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/cpu_share_memory.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -144,6 +145,10 @@ int main(int argc, char** argv) {
     const uint64_t bounds = (uint64_t) (g.n_expert + 1 + (g.n_expert + 15) / 16 * 17) * 4;
     check(b.host_payload == (uint64_t) c.chunk * 4 + (2 * (uint64_t) g.n_expert + 1) * 4 + 16 + bounds,
           "non-MMQ host payload includes the mapped bounds tail");
+    c.cpu_share = true;
+    check(estimate(other) && other.host_cpu_share == 0,
+          "canonical experts cannot allocate native CPU-share payload");
+    c.cpu_share = false;
 
     // ---- a loan never covers the token ids: they are owned even in the plainest configuration.
     check(b.owned_device == owned((uint64_t) c.chunk * 4), "raw token allocation uses 2 MiB granules");
@@ -308,6 +313,14 @@ int main(int argc, char** argv) {
     } else {
         check(b.mmq_workspace == 0, "no MMQ support: no workspace charged");
     }
+    check(b.host_cpu_share == 0, "disabled CPU share is known zero");
+    c.cpu_share = true;
+    check(estimate(other) && other.host_cpu_share == prefill::cpu_share_host_bytes(c.chunk, g.n_expert),
+          "native CPU-share price uses the real pinned/heap allocation contract");
+    check(other.host_payload == b.host_payload && other.host_dynamic == b.host_dynamic &&
+          other.standalone_device == b.standalone_device,
+          "CPU-share buffers are separate: no second charge in existing prefill rows/device scope");
+    c.cpu_share = false;
 
     // Only the staging-vector row depends on MMQ support; the mapped tail is always priced.
     c.mmq = false;

@@ -140,6 +140,11 @@ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+#if !defined(STRATA_USE_HIP)
+const bool g_nodes = std::getenv("STRATA_VERIFY_NODES") != nullptr;
+#else
+constexpr bool g_nodes = false;
+#endif
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
@@ -2415,11 +2420,13 @@ bool Verifier::capture(int T, std::string& err) {
         return false;
     }
 #if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
-    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
+    if (g_nodes) {   // inventory only; VERIFY_REPLAY below proves this graph completed
         size_t nn = 0;
         cudaGraphGetNodes(graph, nullptr, &nn);
         std::vector<cudaGraphNode_t> nodes(nn);
         cudaGraphGetNodes(graph, nodes.data(), &nn);
+        std::fprintf(stderr, "VERIFY_NODES verifier=%p device=%d layers=%lld:%lld T=%d doorbell=%d nodes=%zu\n",
+                     (const void*) this, device_, (long long) lb_, (long long) le_, T, ar_off_, nn);
         std::map<std::string, int> kinds;
         for (cudaGraphNode_t nd : nodes) {
             cudaGraphNodeType ty;
@@ -2432,6 +2439,11 @@ bool Verifier::capture(int T, std::string& err) {
                     const char* fn = nullptr;
                     if (cudaFuncGetName(&fn, kp.func) == cudaSuccess && fn) name = fn;
 #endif
+                    std::fprintf(stderr, "VERIFY_NODE verifier=%p device=%d layers=%lld:%lld T=%d doorbell=%d "
+                                         "name=%s grid=%u,%u,%u block=%u,%u,%u shared=%u\n",
+                                 (const void*) this, device_, (long long) lb_, (long long) le_, T, ar_off_, name.c_str(),
+                                 kp.gridDim.x, kp.gridDim.y, kp.gridDim.z,
+                                 kp.blockDim.x, kp.blockDim.y, kp.blockDim.z, kp.sharedMemBytes);
                 }
             } else if (ty == cudaGraphNodeTypeMemcpy) name = "memcpy";
             else if (ty == cudaGraphNodeTypeMemset) name = "memset";
@@ -3035,6 +3047,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         else collect_profile();
     }
     causal_operation("profile-accumulate", profile_sum_start, causal_now());
+    if (g_nodes)
+        std::fprintf(stderr, "VERIFY_REPLAY verifier=%p device=%d layers=%lld:%lld T=%d doorbell=%d position=%lld completed=1\n",
+                     (const void*) this, device_, (long long) lb_, (long long) le_, T, ar_off_, (long long) pos0);
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -4342,6 +4357,9 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (fl_prof_) accumulate_profile(prof_pin_);
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
+    if (g_nodes)
+        std::fprintf(stderr, "VERIFY_REPLAY verifier=%p device=%d layers=%lld:%lld T=%d doorbell=%d position=%lld completed=1\n",
+                     (const void*) this, device_, (long long) lb_, (long long) le_, fl_T_, ar_off_, (long long) last_pos0_);
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;

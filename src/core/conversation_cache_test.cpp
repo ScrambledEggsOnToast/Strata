@@ -1,8 +1,11 @@
 #include "strata/core/conversation_cache.hpp"
+#include "strata/program/prefix_selection.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <cmath>
+#include <limits>
 
 using namespace strata::core;
 
@@ -394,6 +397,116 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {
+        using namespace strata::program;
+        PrefixCosts costs;
+        PrefixWork resident{1000, 11}, parked{10000, 22}, park{5000, 33};
+        check(!costs.transfer_ms(PrefixTransfer::resident_live, resident), "unobserved transfer is unknown");
+        check(costs.transfer_ms(PrefixTransfer::park, {}) == 0.0, "no outgoing capture has zero cost");
+        costs.transfer(PrefixTransfer::resident_live, resident, 10);
+        costs.transfer(PrefixTransfer::parked, parked, 400);
+        costs.transfer(PrefixTransfer::park, park, 5);
+        costs.prefill(0, 2048, false, 409.6);
+        const auto tail = costs.prefill_ms(1024, 2048, false);
+        check(tail && std::abs(*tail - 204.8) < 1e-9, "reuse gain comes from observed fresh-prefill work");
+        costs.prefill(1536, 2048, false, 102.4); // observed suffix geometry, not an extrapolated tiny batch
+        auto choose = [&](const PrefixCosts& model, bool measured, double margin = 0) {
+            PrefixChoice selection(measured, margin);
+            selection.consider(0, 0, model.prefill_ms(0, 2048, false).value() +
+                model.transfer_ms(PrefixTransfer::park, park).value());
+            selection.consider(1, 1024, model.transfer_ms(PrefixTransfer::resident_live, resident).value() +
+                model.prefill_ms(1024, 2048, false).value() + 5);
+            selection.consider(2, 1792, model.transfer_ms(PrefixTransfer::parked, parked).value() +
+                model.prefill_ms(1792, 2048, false).value() + 5);
+            return selection;
+        };
+        check(choose(costs, true).selected() == 1 && choose(costs, true).using_cost(),
+              "cheaper shallower resident source beats a deeper parked source");
+        check(choose(costs, false).selected() == 2, "longest policy is the original rollback");
+        PrefixCosts fast = costs;
+        for (int i = 0; i < 8; ++i) fast.transfer(PrefixTransfer::parked, parked, 1);
+        check(choose(fast, true).selected() == 2, "deeper parked image wins when the measured copy is worthwhile");
+        PrefixChoice overpriced(true);
+        overpriced.consider(0, 0, 10);
+        overpriced.consider(1, 1000, 100);
+        check(overpriced.selected() == 0, "full recomputation beats an expensive restore");
+        check(choose(costs, true, 300).selected() == 2, "preregistered savings margin keeps longest");
+        PrefixChoice tied(true);
+        tied.consider(0, 0, 200);
+        tied.consider(1, 1024, 100);
+        tied.consider(2, 1792, 100);
+        tied.consider(3, 1792, 100);
+        check(tied.selected() == 2, "cost ties preserve longest and its original stable tie order");
+        PrefixChoice unknown(true);
+        unknown.consider(0, 0, 100);
+        unknown.consider(1, 1024, 20);
+        unknown.consider(2, 1792, {});
+        check(unknown.selected() == 2 && unknown.unknown(), "unpriced longest uses deterministic longest fallback");
+        unknown.consider(3, 2048, std::numeric_limits<double>::quiet_NaN());
+        check(unknown.selected() == 3, "nonfinite costs cannot become a spurious cheapest source");
+        PrefixChoice missing_alternative(true);
+        missing_alternative.consider(0, 0, {});
+        missing_alternative.consider(1, 1024, 20);
+        missing_alternative.consider(2, 1792, 100);
+        check(missing_alternative.selected() == 1,
+              "unobserved alternatives cannot veto improvement over a priced longest prefix");
+        check(!costs.transfer_ms(PrefixTransfer::parked, {10000, 23}),
+              "observations never cross resolved device or residency paths");
+        check(!costs.transfer_ms(PrefixTransfer::checkpoint, parked),
+              "capture, restore and resident bounce costs are separate observations");
+        check(!costs.transfer_ms(PrefixTransfer::parked, {40001, 22}) &&
+              costs.transfer_ms(PrefixTransfer::parked, {40000, 22}) == 1600.0,
+              "transfer prediction stops at its declared four-times size bound");
+        check(!costs.prefill_ms(0, 65536, false) && !costs.prefill_ms(1024, 2048, true),
+              "unknown context scale and window geometry remain unknown");
+        check(!costs.prefill_ms(2000, 2048, false), "tiny batched parts cannot inherit a long-prefill rate");
+        costs.prefill(1024, 2048, true, 512, 7);
+        check(costs.prefill_ms(1536, 2048, true, 7) == 256.0 &&
+              !costs.prefill_ms(1536, 2048, true, 8), "request arithmetic paths calibrate separately");
+        costs.transfer(PrefixTransfer::parked, parked, std::numeric_limits<double>::infinity());
+        check(costs.transfer_ms(PrefixTransfer::parked, parked) == 400.0, "failed/nonfinite timing is not learned");
+        PrefixWork overflow{UINT64_MAX - 2, 1};
+        overflow.add(3);
+        check(!costs.transfer_ms(PrefixTransfer::parked, overflow), "byte overflow is unknown, never a cheap copy");
+    }
+    {
+        // Price every compatible parked branch without taking, copying or evicting it.
+        ConversationCache cache(4096, 4);
+        auto shallow = image({1,2});
+        auto deep = image({1,2,3,4});
+        deep.checkpoints.push_back(ConversationCheckpoint{});
+        deep.checkpoints.back().ids = {1,2,3};
+        check(cache.put(std::move(shallow)) && cache.put(std::move(deep)), "park cost-selection branches");
+        const size_t bytes = cache.bytes();
+        int visits = 0;
+        std::vector<int64_t> order;
+        cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope,
+            [&](auto, const auto&, const auto& c) { ++visits; order.push_back((int64_t) c.ids.size()); });
+        check(visits == 3 && order == std::vector<int64_t>({4,3,2}),
+              "all live/checkpoint candidates visit newest first in the old tie order");
+        check(cache.size() == 2 && cache.bytes() == bytes && cache.evictions() == 0 &&
+              cache.best(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope).tokens == 4,
+              "candidate enumeration changes no history, byte accounting or lifecycle state");
+        visits = 0;
+        auto denied = [&](auto, const auto&, const auto&) { ++visits; };
+        cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, ConversationScope{{2}}, denied);
+        cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, {}, denied);
+        cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, false, test_scope, denied);
+        check(visits == 0, "identity and steering refusals happen before any economic comparison");
+        auto economics = [&](const ConversationScope& scope) {
+            strata::program::PrefixChoice selection(true);
+            selection.consider(0, 0, 1000);
+            size_t candidate = 0;
+            cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, scope,
+                [&](auto match, const auto&, const auto&) {
+                    selection.consider(++candidate, match.tokens, 1 + 100 * (4 - match.tokens));
+                });
+            return selection.selected();
+        };
+        check(economics(test_scope) == 1, "same-conversation long beneficial prefix stays reusable with cost on");
+        check(economics(ConversationScope{{2}}) == 0 && economics({}) == 0,
+              "even an attractive measured reuse gain cannot authorize a different or absent conversation");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
