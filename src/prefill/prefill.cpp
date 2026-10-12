@@ -4489,6 +4489,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (pt.attribution) {
+                                    // Count one complete MMQ expert group (GU + down), not individual kernels.
+                                    auto& a = pt.attribution->layers[l];
+                                    ++a.dispatches; a.dispatch_cap_groups = MMQ_GROUP;
+                                    a.dispatch_max_entries = std::max<int64_t>(a.dispatch_max_entries, nr);
+                                    a.dispatch_grid_groups = -1;   // MMQ has its own tiler, not the native grid_groups API
+                                }
                                 return true;
                             }
                             const int q = (int) (j % DQ);

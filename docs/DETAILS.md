@@ -320,6 +320,8 @@ envelope separately; `resident rank`, `resident scan` and `resident scatter` ide
 `dispatches`, `dispatch_cap_groups`, `dispatch_max_entries` and `dispatch_grid_groups` distinguish selected
 up-to-16-expert host batches from one device-sized dispatch. Device-layer `experts=-1` is deliberately
 unknown: there is no new per-layer count readback. The existing chunk status supplies total selected groups.
+`dispatches` counts complete expert FFN sequences: one native grouped call, or one MMQ gate/up + down pair.
+MMQ's `dispatch_grid_groups=-1` means the native grid parameter is inapplicable, not an unexecuted group.
 The direct CPU grouping span excludes observer folding and shared-expert submission. The larger
 sync-to-enqueue interval still contains ordinary submission work; neither it nor the raw synchronization
 is a pure removable-CPU estimate. Native FFN envelopes can include metadata/submission gaps, not just kernels.
