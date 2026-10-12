@@ -112,8 +112,10 @@ Before an `auto` split search has chosen ranges, admission keeps the conservativ
 layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in
 VRAM, decode 39.2 -> 41.7 tok/s). Opt-in for now, on AMD and NVIDIA alike: `--trim-stage-weights` or
 `STRATA_STAGE_TRIM=1` (please report how it goes).
-A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
-without it.
+More resident experts can change which servicing path executes them. Those paths have **distinct arithmetic**;
+**committed-token parity is not promised** across cache/residency or split/device-placement changes.
+Record the cache grant, actual residency, placement and adaptation policy as numerical configuration;
+this is not a quality-equivalence claim. See [expert residency](DETAILS.md#sharing-the-gpu-with-other-programs-optional).
 Admission prices native upload source pages from the deduplicated union of every stage's planned tensors,
 after applying the same trim as its loader. Later-stage projections remain counted; a PLE key uploaded to
 several cards counts once in the source working set. Independent GGUF payload geometry and file bounds must

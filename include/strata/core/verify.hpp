@@ -109,6 +109,10 @@ public:
         return ((uint64_t) g.n_layers * kProfPer + 6) * sizeof(unsigned long long);
     }
 
+    /// Opt-in first serial window, row zero: native MoE boundaries per layer.
+    /// Mapped host payload only; no changed expert arithmetic or routing.
+    static uint64_t planned_residency_host_bytes(const ModelGeometry& g, int64_t k);
+
     /// Opt-in, one serial serving verification window (HET-033). The environment
     /// names an explicit request/window and a residual limit fixed before capture.
     /// Host payload includes actual FP32 MoE inputs, actual routing and bounded
@@ -449,6 +453,9 @@ private:
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    struct ResidencyCapture;
+    ResidencyCapture* residency_ = nullptr;
+    bool write_residency_capture(std::string& err);
     // pipelined windows (pl_launch ...)
     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;

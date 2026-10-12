@@ -2420,6 +2420,21 @@ int main(int argc, char** argv) {
                              "serial --serve, no batch slots and no pipelined windows\n");
         return 2;
     }
+    const char* residency_prefix = std::getenv("STRATA_RESIDENCY_CAPTURE");
+    const bool residency_requested = residency_prefix != nullptr;
+    const char* teacher_logit_prefix = std::getenv("STRATA_DUMP_TEACHER_LOGITS");
+    if ((residency_requested || teacher_logit_prefix) &&
+        (!o.serve || o.spec < 2 || o.batch > 0 || o.pipeline_windows > 0 || o.spec_split ||
+         o.no_pool || o.no_capture || o.adapt_async || o.adapt_swaps != 0 ||
+         (residency_requested && (!*residency_prefix || std::strlen(residency_prefix) >= 512 ||
+             !std::filesystem::path(residency_prefix).is_absolute())) ||
+         (teacher_logit_prefix && (!*teacher_logit_prefix ||
+             !std::filesystem::path(teacher_logit_prefix).is_absolute())))) {
+        std::fprintf(stderr, "strata serve: residency/teacher capture needs absolute create-only prefixes, "
+                             "serial captured --serve --spec >= 2 with the real expert pool, "
+                             "no batch/pipeline/spec-split or adaptive swaps\n");
+        return 2;
+    }
     const char* native_grouped_env = std::getenv("STRATA_PREFILL_NATIVE_GROUPED");
     const bool native_grouped_requested = native_grouped_env && std::atoi(native_grouped_env) != 0;
     if (o.prefill_helpers && !native_grouped_requested) {
@@ -3773,6 +3788,10 @@ int main(int argc, char** argv) {
             ? strata::core::Verifier::planned_causal_host_bytes(g, K) : 0;
         if (causal_host_bytes == UINT64_MAX)
             v0.add_unknown("verify_causal_host_storage", "bounded actual routing/input observation geometry is unavailable");
+        const uint64_t residency_host_bytes = residency_requested
+            ? strata::core::Verifier::planned_residency_host_bytes(g, K) : 0;
+        if (residency_host_bytes == UINT64_MAX)
+            v0.add_unknown("verify_residency_host_storage", "bounded native MoE boundary geometry is unavailable");
         if (profile_requested) {
             if (profile_bytes == UINT64_MAX || o.pipeline_windows > 0 || o.batch > 0)
                 v0.add_unknown("verify_profile_storage", "profile geometry or concurrent copies lack qualified pricing");
@@ -4248,6 +4267,9 @@ int main(int argc, char** argv) {
             ram("verify_causal_host_storage", byte_mul(stage_count, causal_host_bytes),
                 "Verifier::planned_causal_host_bytes: actual eight-row FP32 inputs/routing per layer, "
                 "fixed helper records and bounded observation I/O workspace per serial stage");
+        if (residency_requested && residency_host_bytes != UINT64_MAX)
+            ram("verify_residency_host_storage", byte_mul(stage_count, residency_host_bytes),
+                "first-window row-zero native MoE boundaries: priced mapped records per serial stage and bounded I/O");
 #ifdef STRATA_RESIDENCY_MODEL_TEST
         // One mapped hand-off plus control/candidate copies; all Verifier arenas are serial.
         ram("residency_regression_host", byte_add(byte_mul(8ull * sizeof(float),
@@ -6802,16 +6824,12 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
-        // token 0). That fault was fixed long since (native_expert_parity, expert_parity, the grouped kernels'
-        // tests), and the warning outlived it (issue #23). What remains is rounding: a GPU expert and the CPU's
-        // compute the same quantized expert with different float order, so a near-tie can flip. Measured teacher-
-        // forced on 2,557 tokens (bench/results/2026-09-27-cache-parity): 95-98% same top-1, and perplexity equal
-        // (on - off = -0.005 +- 0.005 nats). Neither output is more correct than the other.
+        // #197: format/device-specific operator and teacher-forced evidence is required.
+        // The retained Q2_0 result is not an arithmetic-equivalence or model-wide quality guarantee.
         std::fprintf(stderr,
-                     "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
-                     "                 so a reply can differ slightly from a run without the cache (same quality:\n"
-                     "                 bench/results/2026-09-27-cache-parity).\n");
+                     "strata generate: expert servicing paths have distinct arithmetic; committed-token parity is not promised.\n"
+                     "                 Record cache grants, actual residency, placement and adaptation as numerical configuration.\n"
+                     "                 The retained 2026-09-27 Q2_0 cache-parity result does not qualify other formats/devices.\n");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -8469,6 +8487,7 @@ int main(int argc, char** argv) {
     }
     if (o.serve) {
         uint64_t committed_logit_bytes = 0;
+        uint64_t teacher_logit_bytes = 0;
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
@@ -12444,6 +12463,38 @@ int main(int argc, char** argv) {
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
+                    }
+                    if (teacher_logit_prefix) {
+                        const uint64_t bytes = 8 + (uint64_t) T * (uint64_t) n_vocab * sizeof(float);
+                        if (n_vocab > INT32_MAX || bytes > (uint64_t{1} << 30) - teacher_logit_bytes) {
+                            e = "teacher logit diagnostic exceeds int32 dimensions or its 1GiB process budget";
+                            return false;
+                        }
+                        LogitsDump dump;
+                        dump.path = std::string(teacher_logit_prefix) + "." +
+                            std::to_string(drive.d.request_generation) + "." + std::to_string(q);
+                        dump.n_vocab = n_vocab;
+                        dump.expected_rows = T;
+                        dump.f = std::fopen(dump.path.c_str(), "wx");
+                        if (!dump.f) { e = "cannot create teacher logit dump: " + dump.path; return false; }
+                        const int32_t header[2] = {(int32_t) n_vocab, T};
+                        if (std::fwrite(header, sizeof(int32_t), 2, dump.f) != 2) {
+                            e = "cannot write teacher logit header"; return false;
+                        }
+                        for (int t = 0; t < T; ++t) {
+                            if (!ver.read_logits_rows(t, t + 1, logits.data(), e)) return false;
+                            for (float value : logits)
+                                if (!std::isfinite(value)) { e = "nonfinite teacher logit row"; return false; }
+                            if (!dump.write_row(logits.data(), q + t)) { e = "cannot write teacher logit row"; return false; }
+                        }
+                        if (!dump.finish()) { e = "cannot finish teacher logit dump"; return false; }
+                        teacher_logit_bytes += bytes;
+                        std::fprintf(stderr, "TEACHER_LOGITS request=%llu position=%lld rows=%d inputs=",
+                            (unsigned long long) drive.d.request_generation, (long long) q, T);
+                        for (int t = 0; t < T; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", win[(size_t) t]);
+                        std::fprintf(stderr, " next=");
+                        for (int t = 0; t < T; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", nxt[(size_t) t]);
+                        std::fprintf(stderr, " vocab=%lld path=%s\n", (long long) n_vocab, dump.path.c_str());
                     }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every
                     // token is committed and nxt[t] is the prompt's own next token), appended to <path>; the last

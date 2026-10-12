@@ -18,6 +18,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -51,7 +52,9 @@ constexpr int64_t H = 2560, FF = 640;
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
-               cudaStream_t s) {
+               cudaStream_t s, const float* replay = nullptr, const float* want_cpu = nullptr,
+               const float* want_gpu = nullptr, const uint8_t* replay_q8 = nullptr, int replay_width = NT) {
+    const int NT = replay ? replay_width : 3;
     int failures = 0;
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
@@ -65,7 +68,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     std::mt19937 rng(11 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x((size_t) NT * H);
-    for (auto& v : x) v = nd(rng);
+    if (replay)
+        for (int k = 0; k < NT; ++k) std::copy(replay, replay + H, x.data() + k * H);
+    else
+        for (auto& v : x) v = nd(rng);
     std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
     for (int k = 0; k < NT; ++k) {
         std::vector<float> h(FF);
@@ -85,10 +91,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
         std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
         std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
-        const void* a[NT];
-        float* ffp[NT];
-        const void* hp[NT];
-        float* op[NT];
+        const void* a[8];
+        float* ffp[8];
+        const void* hp[8];
+        float* op[8];
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_act(f, x.data() + k * H, act[k].data());
             a[k] = act[k].data();
@@ -121,7 +127,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // one multi-token kernel: parity against ggml's vec_dot, then one-token and NT-token throughput
             auto check = [&](const char* tag, bool is512) {
                 std::vector<float> g((size_t) NT * FF);
-                float* gp[NT];
+                float* gp[8];
                 for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
                 (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
                 const double rg = rel(g, gref);
@@ -156,6 +162,28 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             op[k] = got_c.data() + k * H;
         }
         cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+        if (replay) {
+            // Exercise the real ExpertJobMulti phases, not just their row-kernel helpers.
+            cpu::ExpertPool pool(4, false);
+            cpu::ExpertJobMulti job;
+            job.blob = blob.data();
+            job.nt = NT;
+            std::vector<float> pooled((size_t) NT * H);
+            for (int k = 0; k < NT; ++k) {
+                job.nact[k] = a[k];
+                job.out[k] = pooled.data() + k * H;
+            }
+            pool.run_split_multi_native(f, &job, 1);
+            const bool same = std::memcmp(pooled.data(), got_c.data(), pooled.size() * 4) == 0;
+            std::printf("          ExpertJobMulti vs row kernels: %s\n", same ? "bitwise equal" : "MISMATCH");
+            if (!same) ++failures;
+            if (want_cpu) {
+                const bool captured = std::memcmp(pooled.data(), want_cpu, (size_t) H * 4) == 0;
+                std::printf("          ExpertJobMulti vs captured CPU expert: %s\n",
+                            captured ? "bitwise equal" : "MISMATCH");
+                if (!captured) ++failures;
+            }
+        }
         {   // #152: a token's rows must not depend on how many tokens share the call - each token alone (nt = 1)
             // against its row of the NT-token call above, bit for bit, gate/up and down
             size_t gu_diff = 0, dn_diff = 0;
@@ -229,9 +257,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
             // kernel unconditionally faults on a Zen 2/3 CPU.
             std::vector<cpu::ActQ> a2(NT);
-            const cpu::ActQ* ap[NT];
+            const cpu::ActQ* ap[8];
             std::vector<float> alt((size_t) NT * H);
-            float* altp[NT];
+            float* altp[8];
             for (int k = 0; k < NT; ++k) {
                 cpu::act_quant_any(ff[k].data(), (int) FF, a2[k]);   // gated: AVX-512 or AVX-2 per CPU
                 ap[k] = &a2[k];
@@ -245,7 +273,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
-            float* altp[NT];
+            float* altp[8];
             for (int k = 0; k < NT; ++k) altp[k] = alt.data() + k * H;
             cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
             const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
@@ -297,16 +325,28 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         const unsigned long long p = (unsigned long long) dblob;
-        const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+        const int32_t st[2] = {0, NT}, one = 1, idx[8] = {0, 1, 2, 3, 4, 5, 6, 7};
         cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
-        strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
+        if (replay_q8) {
+            for (int t = 0; t < NT; ++t)
+                cudaMemcpyAsync((uint8_t*) dxq + (size_t) t * H / 32 * 36, replay_q8,
+                                (size_t) H / 32 * 36, cudaMemcpyHostToDevice, s);
+            std::printf("          GPU replay uses captured q8_1 bytes, window width %d\n", NT);
+        } else
+            strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
         strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        if (want_gpu) {
+            const bool captured = std::memcmp(got_g.data(), want_gpu, (size_t) H * 4) == 0;
+            std::printf("          grouped GPU vs captured resident expert: %s\n",
+                        captured ? "bitwise equal" : "MISMATCH");
+            if (!captured) ++failures;
+        }
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
             // the formats without a decode-once split take the per-entry kernels either way)
             std::vector<float> old_g(got_g.size());
@@ -532,12 +572,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --q5_1-min\n"
-                             "       native_expert_parity --bf16-embd\n");
+                             "       native_expert_parity --bf16-embd\n"
+                             "       native_expert_parity --replay SHARD LAYER EXPERT INPUT_F32 CPU_F32 GPU_F32 Q8_1 TOKENS\n");
         return 2;
     }
     if (!strata::platform::acknowledge_protected_test()) return 2;
+    const bool replay_mode = std::strcmp(argv[1], "--replay") == 0;
     // #152's width check tests the opt-in rule (the multi-token kernels from one token on)
-    if (std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
+    if (!replay_mode && std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
 #ifdef _WIN32
         _putenv_s("STRATA_IQ_MT_MIN", "1");
 #else
@@ -545,6 +587,32 @@ int main(int argc, char** argv) {
 #endif
     }
     int failures = 0;
+    std::vector<float> replay, want_cpu, want_gpu;
+    std::vector<uint8_t> replay_q8;
+    const int replay_width = replay_mode && argc == 10 ? std::atoi(argv[9]) : 3;
+    auto load_row = [](const char* path, std::vector<float>& row) {
+        FILE* file = std::fopen(path, "rb");
+        if (!file) return false;
+        row.resize((size_t) H);
+        const bool ok = std::fread(row.data(), sizeof(float), row.size(), file) == row.size() &&
+                        std::fgetc(file) == EOF && !std::ferror(file);
+        std::fclose(file);
+        return ok && std::all_of(row.begin(), row.end(), [](float x) { return std::isfinite(x); });
+    };
+    if (replay_mode && (argc != 10 || replay_width < 1 || replay_width > 8 || !load_row(argv[5], replay) ||
+            !load_row(argv[6], want_cpu) || !load_row(argv[7], want_gpu))) {
+        std::fprintf(stderr, "replay needs one finite FP32 row of exactly 2560 values per file\n");
+        return 2;
+    }
+    if (replay_mode) {
+        FILE* file = std::fopen(argv[8], "rb");
+        if (!file) { std::fprintf(stderr, "cannot open captured q8_1 row\n"); return 2; }
+        replay_q8.resize((size_t) H / 32 * 36);
+        const bool ok = std::fread(replay_q8.data(), 1, replay_q8.size(), file) == replay_q8.size() &&
+                        std::fgetc(file) == EOF && !std::ferror(file);
+        std::fclose(file);
+        if (!ok) { std::fprintf(stderr, "captured q8_1 row has the wrong byte count\n"); return 2; }
+    }
     cudaStream_t s;
     cudaStreamCreate(&s);
     const std::string mode = argv[1];
@@ -569,9 +637,12 @@ int main(int argc, char** argv) {
             failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
-        const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
+        const strata::GgufModel model(strata::gguf_split_paths(argv[replay_mode ? 2 : 1]));
         std::vector<int> layers;
-        for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        if (replay_mode) layers.push_back(std::atoi(argv[3]));
+        else for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        const int expert = replay_mode ? std::atoi(argv[4]) : E;
+        if (expert < 0 || expert >= 512) { std::fprintf(stderr, "invalid expert ID\n"); return 2; }
         if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};
@@ -589,11 +660,13 @@ int main(int argc, char** argv) {
                 std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
             }
             std::vector<uint8_t> blob(f.bytes);
-            std::memcpy(blob.data(), data[0] + (size_t) E * f.up_off, f.up_off);
-            std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
-            std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
+            std::memcpy(blob.data(), data[0] + (size_t) expert * f.up_off, f.up_off);
+            std::memcpy(blob.data() + f.up_off, data[1] + (size_t) expert * f.up_off, f.up_off);
+            std::memcpy(blob.data() + f.down_off, data[2] + (size_t) expert * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
+            failures += check_blob(f, blob, l, "layer " + std::to_string(l) + " expert " + std::to_string(expert), s,
+                replay_mode ? replay.data() : nullptr, replay_mode ? want_cpu.data() : nullptr,
+                replay_mode ? want_gpu.data() : nullptr, replay_mode ? replay_q8.data() : nullptr, replay_width);
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);

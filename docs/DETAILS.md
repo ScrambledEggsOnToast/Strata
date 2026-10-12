@@ -658,6 +658,17 @@ before). A relative path is in the Strata folder; one file per model, and a prof
 (point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
 Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
 
+**Expert residency is numerical configuration, not just a memory budget.** Expert servicing paths have
+**distinct arithmetic**: native GPU experts consume q8_1 activations, while native CPU expert activation and
+row arithmetic are format-specific. **Committed-token parity is not promised** when cache grants, actual
+residency or split/device placement changes. Record the cache grant, actual resident/total expert counts,
+placement and adaptation policy as part of the numerical configuration.
+The retained [2026-09-27 Q2_0 cache-parity result](../bench/results/2026-09-27-cache-parity/README.md) is bounded
+to that experiment; it does not qualify the other formats and devices now serving, nor justify a universal
+"same quality" assurance. Identical stored weight bytes do not establish identical arithmetic, and different
+committed tokens do not by themselves establish a quality loss. A numerical qualification claim still needs
+independent affected-operation checks and same-prefix teacher-forced logits for the claimed configuration.
+
 **The expert cache size is a budget, and on Windows an over-sized one pages instead of failing.** `--expert-cache N`
 (`"expert_cache": N`) is `N` times the largest expert blob, and the engine compares it only with the free VRAM it
 reads **before** the slots are written. `--expert-cache auto` (the default) sizes from that same figure but **checks
@@ -1419,6 +1430,44 @@ write failures and a process-total1GiB disk budget refuse the diagnostic.
 It reuses the already-priced host row buffer, supports serial layer splits by
 reading the final head stage, and refuses batch slots or pipelined decode.
 It is a same-prefix observer, not a claim of unsupported full-state coverage.
+
+Native startup `EXPERT_ARITHMETIC` records label the available paths
+(`gpu=native-q8_1`, `cpu=native-format-specific`) and report each stage's actual
+resident/total counts. These are arithmetic/configuration labels, not proof that a
+CPU job ran, that device placements are bit-equivalent, or that either variant has
+model-wide quality qualification. Record the real cache grant and adaptation policy
+as well; a requested `auto` cache is not evidence of full residency.
+
+**Teacher-forced rows and expert-residency boundaries (serial diagnostic).**
+`STRATA_DUMP_TEACHER_LOGITS=/absolute/create-only-prefix` writes full-vocabulary
+FP32 predictor rows for the fixed input tokens read through short-read verification
+windows, before commit or draft execution. The file format is the committed-row
+format above; `TEACHER_LOGITS` binds each row's actual input and following token IDs.
+It does not capture the batched prompt path. Require identical input prefixes and
+complete expected short-read positions; later free-running rows are not teacher
+forcing. It reuses the existing host row and refuses nonfinite values, failed writes,
+or more than 1GiB of teacher-row files per process.
+
+`STRATA_RESIDENCY_CAPTURE=/absolute/create-only-prefix` captures row zero of the
+first real verification window on each stage, not a synthetic graph preparation.
+Each `PREFIX.device-N.bin` has 14 little-endian uint64 fields: magic
+`0x3153455241545353`, version 2, layer begin/end, embedding width, routing width,
+expert count, record stride, input position/token, window width, device ordinal,
+request generation and zero-doorbell-graph flag. Each layer record contains actual
+int32 residency slots; FP32 MoE input/router logits; int32 routed IDs; FP32 routed
+weights; raw GPU q8_1 input; FP32 per-expert rows before combine, shared expert and
+combined output, then FP32 normalized attention input and attention branch output.
+A negative slot means nonresident on the owning stage, not proof of CPU execution:
+a PCIe/helper share can still execute on a GPU.
+The setup-only mapped allocation and bounded I/O are charged to host admission.
+Observer copies leave the selected arithmetic and routing intact; default-off
+execution allocates none of this payload.
+
+Both diagnostics require serial captured serving, `--spec >=2`, the real expert
+pool and `--adapt-swaps 0`; batch, pipelined windows, spec-split and asynchronous
+adaptation are refused. Layer splits are supported. The boundary capture is limited
+to the native 2560-width, 512-expert, top-10 geometry. Keep the same observers in matched
+arms and do not interpret their runtime as observer-off performance.
 
 ---
 

@@ -342,6 +342,65 @@ struct Verifier::CausalCapture {
     size_t n_operations = 0;
 };
 
+struct Verifier::ResidencyCapture {
+    char prefix[512] = {};
+    uint8_t *host = nullptr, *device = nullptr;
+    size_t input = 0, router = 0, ids = 0, weights = 0, q8 = 0, parts = 0, shared = 0, combine = 0;
+    size_t attn_input = 0, attn_output = 0, stride = 0;
+    bool written = false;
+    ResidencyCapture(int64_t n, int64_t k, int64_t experts) {
+        input = (size_t) k * 4; // actual residency slots are filled after graph completion
+        router = input + (size_t) n * 4;
+        ids = router + (size_t) experts * 4;
+        weights = ids + (size_t) k * 4;
+        q8 = weights + (size_t) k * 4;
+        parts = q8 + (size_t) (n / 32) * 36;
+        shared = parts + (size_t) k * (size_t) n * 4;
+        combine = shared + (size_t) n * 4;
+        attn_input = combine + (size_t) n * 4;
+        attn_output = attn_input + (size_t) n * 4;
+        stride = attn_output + (size_t) n * 4;
+    }
+};
+
+uint64_t Verifier::planned_residency_host_bytes(const ModelGeometry& g, int64_t k) {
+    if (g.n_layers <= 0 || g.n_layers > 48 || g.n_embd != 2560 || g.n_expert != 512 || k != 10)
+        return UINT64_MAX;
+    const ResidencyCapture layout(g.n_embd, k, g.n_expert);
+    return (uint64_t) g.n_layers * layout.stride + sizeof(ResidencyCapture) + (64ull << 10);
+}
+
+bool Verifier::write_residency_capture(std::string& err) {
+    if (!residency_ || residency_->written || !request_id_) return true;
+    auto& r = *residency_;
+    for (int64_t l = lb_; l < le_; ++l) {
+        uint8_t* row = r.host + (size_t) (l - lb_) * r.stride;
+        for (int64_t j = 0; j < ss_->k; ++j) {
+            int32_t expert;
+            std::memcpy(&expert, row + r.ids + (size_t) j * 4, 4);
+            if (expert < 0 || expert >= g_->n_expert) { err = "residency capture: invalid expert ID"; return false; }
+            const int32_t slot = h_res_ ? h_res_[l * g_->n_expert + expert] : -1;
+            std::memcpy(row + (size_t) j * 4, &slot, 4);
+        }
+    }
+    char path[560];
+    std::snprintf(path, sizeof path, "%s.device-%d.bin", r.prefix, device_);
+    FILE* f = std::fopen(path, "wbx");
+    if (!f) { err = "residency capture: cannot create exclusive output"; return false; }
+    const uint64_t header[] = {0x3153455241545353ull, 2, (uint64_t) lb_, (uint64_t) le_,
+        (uint64_t) g_->n_embd, (uint64_t) ss_->k, (uint64_t) g_->n_expert, (uint64_t) r.stride,
+        (uint64_t) last_pos0_, (uint64_t) (uint32_t) last_tokens_[0], (uint64_t) last_t_,
+        (uint64_t) device_, request_id_, (uint64_t) ar_on()};
+    const size_t bytes = (size_t) (le_ - lb_) * r.stride;
+    bool ok = std::fwrite(header, sizeof header, 1, f) == 1 && std::fwrite(r.host, 1, bytes, f) == bytes;
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok) { err = "residency capture: incomplete output (retained)"; return false; }
+    r.written = true;
+    std::fprintf(stderr, "RESIDENCY_CAPTURE device=%d layers=%lld,%lld position=%lld token=%d width=%d path=%s\n",
+        device_, (long long) lb_, (long long) le_, (long long) last_pos0_, last_tokens_[0], last_t_, path);
+    return true;
+}
+
 uint64_t Verifier::planned_causal_host_bytes(const ModelGeometry& g, int64_t k) {
     if (g.n_layers <= 0 || g.n_layers > 48 || g.n_embd <= 0 || g.n_embd > 8192 || k <= 0 || k > 64)
         return UINT64_MAX;
@@ -866,6 +925,10 @@ Verifier::~Verifier() {
     if (row_trace_ && std::fclose(row_trace_) != 0) std::terminate();
     if (h_route_trace_) cudaFreeHost(h_route_trace_);
     if (causal_x_h_) cudaFreeHost(causal_x_h_);
+    if (residency_) {
+        if (residency_->host) cudaFreeHost(residency_->host);
+        delete residency_;
+    }
     if (prof_) cudaFree(prof_);
     delete causal_;
     for (auto& e : exec_)
@@ -1123,6 +1186,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             err = "cross-help capture: admitted actual input storage allocation failed"; return false;
         }
     }
+    if (const char* prefix = std::getenv("STRATA_RESIDENCY_CAPTURE")) {
+        if (!*prefix || std::strlen(prefix) >= 512 ||
+            planned_residency_host_bytes(g, ss.k) == UINT64_MAX || !strata::kernels::cpu::expert_layout().native) {
+            err = "residency capture: bounded native geometry and nonempty prefix required"; return false;
+        }
+        residency_ = new (std::nothrow) ResidencyCapture(g.n_embd, ss.k, g.n_expert);
+        if (!residency_ || !mapped((size_t) (le_ - lb_) * residency_->stride,
+                (void**) &residency_->host, (void**) &residency_->device)) {
+            err = "residency capture: admitted mapped storage allocation failed"; return false;
+        }
+        std::memcpy(residency_->prefix, prefix, std::strlen(prefix) + 1);
+    }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_ != nullptr;
     if (prof_on_) {
         const uint64_t bytes = planned_profile_bytes(g);
@@ -1259,6 +1334,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             !mapped((size_t) g.n_layers * strata::kernels::kVerifyMaxT * (size_t) ss.k * 8, &h_route_trace_, &m_route_trace_)) {
             err = "verify: bounded routing observation storage failed"; return false;
         }
+    }
+    if (strata::kernels::cpu::expert_layout().native && h_res_) {
+        int64_t resident = 0;
+        for (int64_t l = lb_; l < le_; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) resident += h_res_[l * g.n_expert + e] >= 0;
+        std::fprintf(stderr, "EXPERT_ARITHMETIC device=%d layers=%lld,%lld resident=%lld total=%lld "
+                             "gpu=native-q8_1 cpu=native-format-specific selection=residency\n",
+            device_, (long long) lb_, (long long) le_, (long long) resident,
+            (long long) ((le_ - lb_) * g.n_expert));
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -1624,6 +1708,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
+        if (residency_ && tb == 0 &&
+            cudaMemcpyAsync(residency_->device + (size_t) (l - lb_) * residency_->stride + residency_->attn_input,
+                            xm, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            err = "residency capture: attention input copy failed"; return false;
+        }
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
@@ -1947,6 +2036,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (residency_ && tb == 0 &&
+            cudaMemcpyAsync(residency_->device + (size_t) (l - lb_) * residency_->stride + residency_->attn_output,
+                            bo_, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            err = "residency capture: attention output copy failed"; return false;
+        }
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -2001,6 +2095,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
+        if (residency_ && tb == 0) {
+            auto copy = [&](size_t offset, const void* src, size_t bytes) {
+                return cudaMemcpyAsync(residency_->device + (size_t) (l - lb_) * residency_->stride + offset,
+                    src, bytes, cudaMemcpyDeviceToDevice, cs) == cudaSuccess;
+            };
+            if (!copy(residency_->input, xm, (size_t) N * 4) ||
+                !copy(residency_->router, logits_, (size_t) NE * 4) ||
+                !copy(residency_->ids, ids_, (size_t) K * 4) ||
+                !copy(residency_->weights, w_, (size_t) K * 4)) {
+                err = "residency capture: input/router copy failed"; return false;
+            }
         }
         if (causal_x_m_ &&
             cudaMemcpyAsync(causal_x_m_ + (size_t) ((l - lb_) * max_t_ + tb) * N, xm,
@@ -2088,6 +2194,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        if (residency_ && tb == 0 &&
+            cudaMemcpyAsync(residency_->device + (size_t) (l - lb_) * residency_->stride + residency_->q8,
+                nat_xq_, (size_t) (N / 32) * 36, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            err = "residency capture: q8_1 copy failed"; return false;
+        }
         stamp(l, 18, grp);
         return true;
     };
@@ -2179,6 +2290,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        if (residency_ && tb == 0) {
+            uint8_t* row = residency_->device + (size_t) (l - lb_) * residency_->stride;
+            if (cudaMemcpyAsync(row + residency_->parts, parts_out, (size_t) K * N * 4,
+                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess ||
+                cudaMemcpyAsync(row + residency_->shared, shared_, (size_t) N * 4,
+                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                err = "residency capture: expert/shared copy failed"; return false;
+            }
+        }
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -2196,6 +2316,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (residency_ && tb == 0 &&
+            cudaMemcpyAsync(residency_->device + (size_t) (l - lb_) * residency_->stride + residency_->combine,
+                bo_, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            err = "residency capture: combine copy failed"; return false;
+        }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
@@ -3041,6 +3166,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     causal_operation("expert-final-consumer-acknowledge", acknowledge_start, causal_now());
     if (!causal_finish(err)) return false;
+    if (!write_residency_capture(err)) return false;
     const int64_t profile_sum_start = causal_now();
     if (prof_on_ && G == 1) {
         if (causal_ && causal_->selected && !causal_->written) accumulate_profile(prof_h_.data());
