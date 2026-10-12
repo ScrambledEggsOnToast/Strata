@@ -110,10 +110,14 @@ Before an `auto` split search has chosen ranges, admission keeps the conservativ
 **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
 layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in
-VRAM, decode 39.2 -> 41.7 tok/s). Opt-in for now, on AMD and NVIDIA alike: `STRATA_STAGE_TRIM=1` (please report how
-it goes).
+VRAM, decode 39.2 -> 41.7 tok/s). Opt-in for now, on AMD and NVIDIA alike: `--trim-stage-weights` or
+`STRATA_STAGE_TRIM=1` (please report how it goes).
 A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
 without it.
+Admission prices native upload source pages from the deduplicated union of every stage's planned tensors,
+after applying the same trim as its loader. Later-stage projections remain counted; a PLE key uploaded to
+several cards counts once in the source working set. Independent GGUF payload geometry and file bounds must
+still agree with the planned upload extents: a real mismatch refuses before model allocation.
 
 **The resident RAM mode works on a split** (`--resident-experts`, the low-RAM mode). The RAM copy of the experts
 leaves out the ones every card's cache holds, not only the first card's, and when the rest does not fit whole it keeps
