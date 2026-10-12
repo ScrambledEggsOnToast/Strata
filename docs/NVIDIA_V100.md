@@ -123,3 +123,12 @@ kernels' output, GPU work per verify window 22.8 -> 21.2 ms on a V100-SXM2 in th
 sm_70 only when `STRATA_SM70_TABLE=1` is set. They become the default once the contributor has confirmed them on a V100 with
 the 0.1.41 code. Without the variable sm_70 runs what 0.1.40.3 ran. The single switches (`STRATA_EXP_MODE`, `STRATA_MMVQ_IL`,
 `STRATA_GR_FAST`) still apply on top.
+
+The cc-70 rows table is already present in the source, not a generated runtime dependency; see
+[MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md) for its lookup, fallbacks and exact operator checks. A profile should
+set only the bundle flag, not force mode 8 or fast norm/up globally: the latter overrides would also
+change other GPUs. Restarting with the bundle flag set to `0` restores the established Volta dispatch.
+
+Mode 8 now makes the CUDA SwiGLU product's rounding explicit with `__fmul_rn`, as the separate
+SwiGLU/q8_1 pass already does (HIP disables contraction in that epilogue). This closes a source-level
+contraction risk before enabling the route; it is not a new locally measured parity or speed result.

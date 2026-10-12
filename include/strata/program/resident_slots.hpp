@@ -2,6 +2,7 @@
 #pragma once
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/program/prefix_selection.hpp"
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -97,6 +98,10 @@ public:
     bool admit(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request, std::string& error);
     bool park(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request,
               bool from_start, std::string& error);
+    // No transfers, synchronization or owner mutation. Prices the actual host-bounced
+    // copy path and prevalidates all checkpoint parts before any working-state write.
+    bool resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
+                     PrefixWork& work, std::string& error) const;
     // Restores private model state into the working session. A partial restore
     // returns false; it is never advertised as a usable prefix by this interface.
     bool resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error);

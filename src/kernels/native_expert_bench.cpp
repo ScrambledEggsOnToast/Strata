@@ -515,20 +515,34 @@ int main(int argc, char** argv) {
             K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G, NE, dxq, dscr, dout, s);
         };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
+        // The fused mode-8 epilogue promises the same q8_1 handoff, not just the same down output.
+        // Keep these copies outside the timing loop; the three float scratch regions are 256-byte aligned.
+        const size_t float_bytes = (size_t) NE * FF * sizeof(float);
+        const size_t hq_offset = 3 * ((float_bytes + 255) & ~(size_t) 255);
+        const size_t hq_bytes = (size_t) NE * (FF / 32) * 36;
+        const auto* hq = (const uint8_t*) dscr + hq_offset;
+        std::vector<uint8_t> ref_hq(hq_bytes), got_hq(hq_bytes);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(mref, 0);
         cudaMemcpyAsync(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(ref_hq.data(), hq, hq_bytes, cudaMemcpyDeviceToHost, s);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(mode, 0);
         cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(got_hq.data(), hq, hq_bytes, cudaMemcpyDeviceToHost, s);
         if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error\n", l); return 1; }
         size_t ndiff = 0;
         double worst = 0;
-        for (size_t i = 0; i < ref.size(); ++i)
+        bool finite = true;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            finite = finite && std::isfinite(ref[i]) && std::isfinite(got[i]);
             if (std::memcmp(&ref[i], &got[i], 4) != 0) {
                 ++ndiff;
                 worst = std::fmax(worst, std::fabs((double) ref[i] - got[i]) / (std::fabs((double) ref[i]) + 1e-6));
             }
+        }
+        size_t hq_diff = 0;
+        for (size_t i = 0; i < hq_bytes; ++i) hq_diff += ref_hq[i] != got_hq[i];
         auto time = [&](int m, int phase) {
             for (int i = 0; i < 10; ++i) run(m, phase);
             cudaEventRecord(e0, s);
@@ -549,9 +563,10 @@ int main(int argc, char** argv) {
                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
                     mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
-                    ndiff ? "DIFFERS" : "bitwise equal");
-        if (ndiff) {
-            std::printf("          %zu of %zu outputs differ, worst rel %.2e\n", ndiff, ref.size(), worst);
+                    (ndiff || hq_diff || !finite) ? "DIFFERS" : "bitwise equal (q8_1 and output)");
+        if (ndiff || hq_diff || !finite) {
+            std::printf("          %zu of %zu outputs differ, worst rel %.2e; %zu of %zu q8_1 bytes differ%s\n",
+                        ndiff, ref.size(), worst, hq_diff, hq_bytes, finite ? "" : "; nonfinite output");
             ++failures;
         }
         K::native_expert_set_mode(-1, 0);
