@@ -579,6 +579,157 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
+class SpeculationPolicy:
+    """Choose existing native paths from committed wire output, never from proposal counts.
+
+    Costs are local to this process, context-length bucket and effective load. Whole
+    native batch intervals include admissions, catch-up and drain time; solo intervals
+    run from REUSED through DONE (including drafting/verification/rollback). Queue
+    deadlines bound any extra solo service. These estimates are not benchmark results.
+    """
+    MIN_TOKENS = 8
+    MARGIN = 1.10
+
+    def __init__(self, budget_s: float, slots: int):
+        self.budget_s, self.capacity = budget_s, slots
+        self.lock = threading.Lock()
+        self.costs = {}
+        self.handoffs = {}
+        self.probed = {}
+        self.solo = self.control = self.epoch = None
+        self.slots = {}
+        self.defer_until = None
+
+    @staticmethod
+    def _key(path, load, context):
+        return path, load, min(20, max(1, context).bit_length())
+
+    def _observe(self, path, load, context, committed, wall_s):
+        if committed < 0 or not math.isfinite(wall_s) or wall_s <= 0:
+            return
+        key = self._key(path, load, context)
+        old = self.costs.get(key)
+        # Decay numerator and denominator together. Zero-output work still costs time.
+        self.costs[key] = ([committed, wall_s, committed] if old is None else
+                           [old[0] * .8 + committed, old[1] * .8 + wall_s, old[2] + committed])
+
+    def observe(self, path, load, context, committed, wall_s):
+        """CPU test seam; production supplies only counted T/BT frames and elapsed wall time."""
+        with self.lock:
+            self._observe(path, load, context, committed, wall_s)
+
+    def _rate(self, path, load, context):
+        cost = self.costs.get(self._key(path, load, context))
+        return cost[0] / cost[1] if cost and cost[2] >= self.MIN_TOKENS and cost[0] > 0 else None
+
+    def _flush_batch(self, now):
+        if self.epoch is not None:
+            key, started, committed = self.epoch
+            self._observe(*key, committed, now - started)
+
+    def _reset_batch(self, now):
+        self.epoch = ([("batch", len(self.slots), max(self.slots.values())), now, 0]
+                      if self.slots else None)
+
+    def begin(self, path, context, slot=None, transition=False, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self._flush_batch(now)
+            if path == "solo":
+                self.epoch = None
+                self.solo = [context, now, 0]
+                self.probed[self._key("solo", 1, context)] = now
+                self.defer_until = None
+            else:
+                self.slots[slot] = context
+                self._reset_batch(now)
+            self.control = [path, slot, now, transition, False]
+
+    def wire(self, line, now=None):
+        """One native frame. Advisory: a malformed or unexpected line is ignored,
+        never an exception in the engine's stdout reader."""
+        now = time.monotonic() if now is None else now
+        f = line.split()
+        if not f:
+            return
+        slot = int(f[1]) if len(f) > 1 and f[1].lstrip("-").isdigit() else None
+        with self.lock:
+            if f[0] == "REUSED" and self.solo is not None:
+                self.solo[1] = now       # prefix restore/prefill is priced by the handoff, not steady decode
+            elif f[0] in ("T", "BT"):
+                if f[0] == "T" and self.control and not self.control[4]:
+                    path, cslot, started, transition, _ = self.control
+                    self.control[4] = True
+                    if transition:
+                        context = self.solo[0] if path == "solo" else self.slots.get(cslot)
+                        if context is not None:
+                            key = self._key(path, 1, context)
+                            self.handoffs[key] = max(now - started, self.handoffs.get(key, 0) * .9)
+                if f[0] == "T" and self.solo is not None:
+                    context, started, _ = self.solo
+                    self.solo[2] += 1
+                    if self.solo[2] >= self.MIN_TOKENS:
+                        self._observe("solo", 1, context, self.solo[2], now - started)
+                        self.solo = [context + self.solo[2], now, 0]
+                elif self.epoch is not None:
+                    # BT: a slot's committed token. T here is a BGEN leg's own
+                    # admission token (a solo leg keeps its own state above).
+                    self.epoch[2] += 1
+                    if f[0] == "BT" and slot in self.slots:
+                        self.slots[slot] += 1
+                    if self.epoch[2] >= self.MIN_TOKENS:
+                        self._flush_batch(now)
+                        self._reset_batch(now)
+            elif f[0] == "DONE" and self.solo is not None:
+                context, started, committed = self.solo
+                self._observe("solo", 1, context, committed, now - started)
+                self.solo = self.control = None
+            elif f[0] == "BDONE" or (f[0] == "BADM" and len(f) > 2 and f[2] == "0"):
+                self._flush_batch(now)
+                if slot is not None:
+                    self.slots.pop(slot, None)
+                self._reset_batch(now)
+            elif f[0] == "BADM":
+                self.control = None
+
+    def yield_solo(self, context, left, waiters, foreground_pending=False, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if not waiters and not foreground_pending:
+                self.defer_until = None
+                return False
+            if not waiters or (foreground_pending and not any(entry[2] == "foreground" for entry in waiters)):
+                return True             # HTTP foreground demand not yet in the native control queue
+            load = min(self.capacity, 1 + len(waiters))
+            batch_context = max(context, max(entry[0] for entry in waiters))
+            solo = self._rate("solo", 1, context)
+            batch = self._rate("batch", load, batch_context)
+            if solo is None or batch is None or solo <= batch * self.MARGIN:
+                return True             # cold/uncertain policy retains the existing ordinary-batch fallback
+            slack = min(entry[3] - now for entry in waiters)
+            handoff = self.handoffs.get(self._key("batch", 1, context), 0)
+            reserve = handoff + load / batch
+            if slack <= reserve:
+                return True             # due background service is just as binding as foreground slack
+            if self.defer_until is None:
+                self.defer_until = now + min(self.budget_s * .25, slack - reserve, left / solo)
+            return now >= self.defer_until
+
+    def prefer_solo(self, context, left, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            key = self._key("solo", 1, context)
+            solo, batch = self._rate("solo", 1, context), self._rate("batch", 1, context)
+            if solo is None or batch is None:
+                return True             # bootstrap through the already-supported solo path
+            if now - self.probed.get(key, now) >= 8 * max(1.0, self.budget_s):
+                return True             # bounded remeasurement: stale bad acceptance cannot veto MTP forever
+            handoff = self.handoffs.get(key, 0)
+            # A conservative switching guard: observed first-token restore/catch-up
+            # must be repaid by the expected saving over this request's remaining work.
+            return solo > batch * self.MARGIN and left * (1 / batch - 1 / solo) > handoff
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -621,6 +772,10 @@ class StrataEngine:
             self._protected_started = True
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.resident_multiplex = "--resident-multiplex" in args
+        spec_policy = os.environ.get("STRATA_SPEC_POLICY", "static")
+        if spec_policy not in ("static", "adaptive"):
+            raise ValueError("STRATA_SPEC_POLICY must be static or adaptive")
+        self.speculation_policy = None
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -770,6 +925,20 @@ class StrataEngine:
         self.slot_scope = [""] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        if spec_policy == "adaptive":
+            native_env = os.environ if env is None else env
+            batch_mtp = "--batch-mtp" in args or native_env.get("STRATA_BATCH_MTP", "0") not in ("", "0")
+            has_mtp = "--mtp" in args and int(self.info.get("spec") or 0) >= 2
+            if not has_mtp:
+                print("[strata] adaptive speculation inactive: no loaded solo MTP; ordinary paths retained", flush=True)
+            elif self.resident_multiplex or batch_mtp:
+                self.close()
+                raise ValueError("adaptive speculation selects ordinary batches, not resident-multiplex or batch-MTP")
+            elif self.batch < 2 or not self.info.get("slot_cache") or self.foreground_budget_s <= 0:
+                self.close()
+                raise ValueError("adaptive speculation needs effective --batch >= 2, --prompt-cache and --foreground-budget-ms")
+            else:
+                self.speculation_policy = SpeculationPolicy(self.foreground_budget_s, self.batch)
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -779,6 +948,7 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        policy = getattr(self, "speculation_policy", None)  # this process's cost state, never a restarted successor's
         line = None
         for line in proc.stdout:
             if _BTRACE:
@@ -795,6 +965,8 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if policy is not None:
+                policy.wire(line)
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -1271,7 +1443,7 @@ class StrataEngine:
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
 
-    def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
+    def _may_go_solo(self, left: int, times: int, embeddings, context: int) -> bool:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
@@ -1280,7 +1452,9 @@ class StrataEngine:
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
-            return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+            alone = sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+        policy = getattr(self, "speculation_policy", None)
+        return alone and (policy is None or policy.prefer_solo(context, left))
 
     def _shorter_waiting(self, plen: int) -> bool:
         """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
@@ -1306,6 +1480,7 @@ class StrataEngine:
         scope = (sampling or {}).get("_strata_cache_scope", "")
         out: list[int] = []
         pending: list[int] = []
+        policy = getattr(self, "speculation_policy", None)
         prompt, left = list(ids), int(max_new)
         on_control = (sampling or {}).get("_strata_control_ready")
         on_wait = (sampling or {}).get("_strata_native_waiting")
@@ -1346,8 +1521,11 @@ class StrataEngine:
                         raise EngineDied("the engine restarted during this request")
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1 and not getattr(self, "resident_multiplex", False):
+                if (alone and left > 1 and not getattr(self, "resident_multiplex", False) and
+                        (policy is None or policy.prefer_solo(len(prompt), left))):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    if policy is not None:
+                        policy.begin("solo", len(prompt), transition=bool(out))
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     if callable(on_submit):
                         on_submit(None)
@@ -1356,7 +1534,12 @@ class StrataEngine:
                     self._ctl_erred = False
                     def others():
                         with self.slot_cv:
-                            return self.waiting > 0
+                            if policy is None:
+                                return self.waiting > 0
+                            return policy.yield_solo(len(ids) + len(out) + len(pending),
+                                                     int(max_new) - len(out) - len(pending),
+                                                     list(self.control_waiters),
+                                                     callable(foreground_pending) and foreground_pending())
                     for x in self._control(cancel, pending.append, stop_when=others):
                         while pending:
                             t = pending.pop(0)
@@ -1453,6 +1636,8 @@ class StrataEngine:
                     on_slot = (sampling or {}).get("_strata_slot")
                     if callable(on_slot):
                         on_slot(slot)
+                    if policy is not None:
+                        policy.begin("batch", len(prompt), slot, transition=bool(out))
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_scope[slot] = scope
                     if callable(on_submit):
@@ -1522,7 +1707,7 @@ class StrataEngine:
                             continue
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
-                                                                                  embeddings):
+                                                                                  embeddings, len(ids) + len(out)):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):

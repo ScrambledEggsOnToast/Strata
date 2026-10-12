@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import (ByteTokenizer, Service, SpeculationPolicy, StrataEngine, engine_args, parallel_args, serve)
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -46,6 +46,8 @@ print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
+if "--says-spec" in args:
+    print("INFO spec=4", flush=True)
 if "--says-residency" in args:
     for info in args[args.index("--says-residency") + 1].splitlines():
         print("INFO " + info, flush=True)
@@ -228,6 +230,99 @@ class ParallelArgs(unittest.TestCase):
             engine_args({"args": [], "resident_multiplex": True})
         with self.assertRaises(ValueError):
             engine_args({"args": [], "resident_multiplex": "true"})
+
+
+class AdaptiveSpeculation(unittest.TestCase):
+    @staticmethod
+    def waiter(context=100, due=2.0, priority="foreground"):
+        return [context, object(), priority, due]
+
+    def test_cold_policy_never_withholds_waiting_capacity(self):
+        policy = SpeculationPolicy(2.0, 4)
+        self.assertTrue(policy.yield_solo(100, 64, [self.waiter()], now=0))
+        self.assertTrue(policy.prefer_solo(100, 64, now=0))
+        self.assertFalse(policy.yield_solo(100, 64, [], now=0))
+
+    def test_wire_counts_commits_not_proposals_or_terminal_totals(self):
+        policy = SpeculationPolicy(2.0, 4)
+        policy.begin("solo", 100, transition=True, now=0)
+        policy.wire("REUSED 99", now=1)
+        policy.wire("DRAFT 999 rejected 999", now=1.05)
+        for i in range(8):
+            policy.wire(f"T {10 + i}", now=1.1 + i / 10)
+        key = policy._key("solo", 1, 100)
+        before = policy.costs[key][0] / policy.costs[key][1]
+        policy.wire("DONE 8 100 1 1 length 999 999 99", now=2)
+        after = policy.costs[key][0] / policy.costs[key][1]
+        self.assertEqual(policy.costs[key][2], 8)
+        self.assertLess(after, before, "zero-output tail drafting/drain still costs wall time")
+        self.assertAlmostEqual(policy.handoffs[key], 1.1)
+        policy.begin("batch", 100, slot=0, now=3)
+        policy.wire("T 20", now=3.2)  # BGEN's first committed target token
+        policy.wire("DONE 1 100 1 1 length 0 0 99", now=3.3)
+        policy.wire("BADM 0 1", now=3.4)
+        policy.begin("batch", 200, slot=1, now=3.5)
+        policy.wire("T 21", now=3.6)
+        policy.wire("DONE 1 200 1 1 length 0 0 0", now=3.7)
+        policy.wire("BADM 1 1", now=3.8)
+        for i in range(8):
+            policy.wire(f"BT {i % 2} {30 + i}", now=4 + i / 10)
+        policy.wire("BDONE 0 5 cancel 1700", now=5)
+        policy.wire("BDONE 1 5 length 1900", now=5.2)
+        self.assertEqual(sum(value[2] for k, value in policy.costs.items() if k[0] == "batch"), 10)
+        self.assertEqual(policy.slots, {})
+        self.assertIsNone(policy.epoch)
+
+    def test_context_load_and_fixed_slack_change_actual_choice(self):
+        policy = SpeculationPolicy(2.0, 4)
+        policy.observe("solo", 1, 100, 80, 1)
+        policy.observe("batch", 2, 100, 20, 1)
+        waiters = [self.waiter()]
+        self.assertFalse(policy.yield_solo(100, 64, waiters, now=0))
+        self.assertFalse(policy.yield_solo(100, 64, waiters, now=.49))
+        self.assertTrue(policy.yield_solo(100, 64, waiters, now=.5),
+                        "a profitable solo burst cannot keep extending its own deadline")
+        policy.yield_solo(100, 64, [], now=.6)
+        self.assertTrue(policy.yield_solo(100, 64, [self.waiter(due=.7)], now=.6))
+        self.assertTrue(policy.yield_solo(100, 64, [self.waiter(due=0, priority="background")], now=.6))
+        self.assertTrue(policy.yield_solo(100, 64, [], foreground_pending=True, now=.6))
+        self.assertTrue(policy.yield_solo(100, 64, [self.waiter(priority="background")],
+                                         foreground_pending=True, now=.6))
+        self.assertTrue(policy.yield_solo(100, 64, [self.waiter() for _ in range(3)], now=.6),
+                        "unmeasured higher load retains immediate ordinary-batch fallback")
+        policy.observe("solo", 1, 4096, 10, 1)
+        policy.observe("batch", 2, 4096, 50, 1)
+        self.assertTrue(policy.yield_solo(4096, 64, [self.waiter(4096)], now=0))
+
+    def test_gain_must_repay_catchup_and_clear_hysteresis(self):
+        policy = SpeculationPolicy(2.0, 2)
+        policy.observe("solo", 1, 100, 80, 1)
+        policy.observe("batch", 1, 100, 20, 1)
+        key = policy._key("solo", 1, 100)
+        policy.probed[key] = 0
+        policy.handoffs[key] = 3.0
+        self.assertFalse(policy.prefer_solo(100, 64, now=1))
+        self.assertTrue(policy.prefer_solo(100, 120, now=1))
+        policy.observe("solo", 1, 200, 21, 1)
+        policy.observe("batch", 1, 200, 20, 1)
+        self.assertFalse(policy.prefer_solo(200, 1000, now=1), "a 5% noisy gain is not a switch")
+        policy.observe("solo", 1, 300, 10, 1)
+        policy.observe("batch", 1, 300, 40, 1)
+        key = policy._key("solo", 1, 300)
+        policy.probed[key] = 0
+        self.assertFalse(policy.prefer_solo(300, 64, now=15.99))
+        self.assertTrue(policy.prefer_solo(300, 64, now=16), "stale acceptance is remeasured, not frozen")
+        policy.begin("solo", 300, now=16)
+        self.assertFalse(policy.prefer_solo(300, 64, now=16.01))
+
+    def test_new_process_has_no_predecessor_cost_or_deadline_state(self):
+        before = SpeculationPolicy(2.0, 2)
+        before.observe("solo", 1, 100, 100, 1)
+        before.observe("batch", 2, 100, 20, 1)
+        self.assertFalse(before.yield_solo(100, 64, [self.waiter()], now=0))
+        after = SpeculationPolicy(2.0, 2)
+        self.assertTrue(after.yield_solo(100, 64, [self.waiter()], now=.1))
+        self.assertIsNone(after.defer_until)
 
 
 class ControlBudget(unittest.TestCase):
@@ -1010,6 +1105,95 @@ class ParallelService(unittest.TestCase):
         res = self.race("long " * 600, "lung " * 600)
         self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 2)
         self.assertFalse(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
+
+    def test_adaptive_policy_preserves_solo_concurrent_solo_identity_and_wire_totals(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "adaptive"}):
+            self.start(2, slot_cache=True, reuse=True,
+                       more=("--says-budget", "--says-spec", "--mtp", "fake", "--spec", "4"))
+        policy = self.engine.speculation_policy
+        self.assertIsNotNone(policy)
+        for exponent in range(1, 13):
+            policy.observe("solo", 1, 1 << exponent, 200, 1)
+            policy.observe("batch", 1, 1 << exponent, 20, 1)
+            policy.observe("batch", 2, 1 << exponent, 20, 1)
+        trace = io.StringIO()
+        with mock.patch.object(server, "_BTRACE", True), contextlib.redirect_stderr(trace):
+            replies = self.race("adaptive owner LONGREPLY", "adaptive peer", delay=.05, max_tokens=200)
+        self.assertEqual(replies["adaptive owner LONGREPLY"][0], "ok, " + "la " * 15 + "done.")
+        self.assertEqual(replies["adaptive peer"][0], "ok, done.")
+        kinds = [line.split()[0] for line in self.log.read_text().splitlines()
+                 if line.startswith(("GEN ", "BGEN "))]
+        self.assertEqual(kinds[0], "GEN")
+        self.assertIn("BGEN", kinds)
+        self.assertEqual(kinds[-1], "GEN")
+        frames = [line.split(" wire< ", 1)[1] for line in trace.getvalue().splitlines() if " wire< " in line]
+        owners = [line.split() for line in trace.getvalue().splitlines() if " owner " in line]
+        requests = self.get("/metrics")["requests"]
+        self.assertEqual(sum(frame.startswith(("T ", "BT ")) for frame in frames),
+                         sum(request["output_tokens"] for request in requests))
+        self.assertEqual(len({line[4] for line in owners}), 2, "one stable identity per request across returns")
+        self.assertTrue(any(line[6] != "None" for line in owners), "the cohort was admitted through a physical slot")
+        self.assertEqual(kinds.count("GEN"), 2, "the owner's own solo leg, and its return after the peer left")
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertEqual(policy.slots, {})
+
+    def test_adaptive_unprofitable_solo_uses_real_ordinary_singleton(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "adaptive"}):
+            self.start(2, slot_cache=True,
+                       more=("--says-budget", "--says-spec", "--mtp", "fake", "--spec", "4"))
+        policy = self.engine.speculation_policy
+        for exponent in range(1, 13):
+            policy.observe("solo", 1, 1 << exponent, 8, 2)
+            policy.observe("batch", 1, 1 << exponent, 100, 1)
+        reply = self.chat("ordinary fallback", max_tokens=200)
+        self.assertEqual(reply["choices"][0]["message"]["content"], "ok, done.")
+        kinds = [line.split()[0] for line in self.log.read_text().splitlines()
+                 if line.startswith(("GEN ", "BGEN "))]
+        self.assertEqual(kinds, ["BGEN"], "no invented target-only command or spurious return to MTP")
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_adaptive_without_mtp_reports_inactive_and_retains_static_paths(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "adaptive"}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.start(2, more=("--says-budget",))
+        self.assertIn("no loaded solo MTP", output.getvalue())
+        self.assertIsNone(self.engine.speculation_policy)
+        self.chat("ordinary no drafter")
+        self.assertEqual(self.log.read_text().split()[0], "GEN")
+
+    def test_adaptive_refuses_a_different_batch_mechanism(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "adaptive"}):
+            with self.assertRaisesRegex(ValueError, "ordinary batches"):
+                self.start(2, slot_cache=True,
+                           more=("--says-budget", "--says-spec", "--mtp", "fake", "--batch-mtp"))
+
+    def test_adaptive_requires_the_fixed_foreground_budget(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "adaptive"}):
+            with self.assertRaisesRegex(ValueError, "foreground-budget-ms"):
+                self.start(2, slot_cache=True, more=("--says-spec", "--mtp", "fake", "--spec", "4"))
+
+    def test_static_default_does_not_construct_or_train_a_policy(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ):
+            server.os.environ.pop("STRATA_SPEC_POLICY", None)
+            self.start(2, slot_cache=True,
+                       more=("--says-budget", "--says-spec", "--mtp", "fake", "--spec", "4"))
+        self.assertIsNone(self.engine.speculation_policy)
+        self.chat("static unchanged")
+        self.assertEqual(self.log.read_text().split()[0], "GEN")
+
+    def test_invalid_policy_is_refused_before_any_native_process(self):
+        import serve.server as server
+        with mock.patch.dict(server.os.environ, {"STRATA_SPEC_POLICY": "invalid"}), \
+                mock.patch.object(server.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "static or adaptive"):
+                StrataEngine("not-launched", [])
+            spawn.assert_not_called()
 
     def test_left_alone_it_goes_back_to_the_solo_path(self):
         """A request decoding in a slot whose neighbour finished goes back to the solo path (MTP drafts), continued

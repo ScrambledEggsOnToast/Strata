@@ -61,6 +61,51 @@ For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complet
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
 and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage and slot request IDs.
 
+### Adaptive solo MTP versus ordinary batches
+
+The default frontend policy is unchanged: alone, use `GEN` (solo MTP when loaded);
+on an arrival, stop and continue through `BGEN`; when left alone, return to `GEN`
+with at least 32 tokens left, at most twice per request. `STRATA_PARALLEL_SOLO=0`
+still disables that return.
+
+`STRATA_SPEC_POLICY=adaptive`, set in the **frontend's environment**, opts into a
+measured policy over those same paths. It needs loaded `--mtp --spec >= 2`,
+effective `--batch >= 2`, `--prompt-cache > 0` and a positive
+`--foreground-budget-ms`. The policy refuses `--batch-mtp` and resident
+multiplexing: its concurrent choice is the existing ordinary independent-request
+batch, including split pipelines. Without loaded MTP it reports itself inactive
+and retains ordinary generation; it adds no target-only command. Unset the
+variable or use `STRATA_SPEC_POLICY=static` for the original policy.
+
+Only received `T`/`BT` frames train the committed-output numerator. `DONE`,
+`BADM`, `BDONE`, drafts and padding add no tokens. Context-length buckets and
+effective load have separate decayed committed-token/wall-time estimates; eight
+commits are required before an estimate can choose a path. Solo timing covers
+`REUSED` through `DONE`, including proposal/verification/rejection/rollback and
+terminal drain. Ordinary-batch timing includes intervening admissions, copies,
+catch-up and zero-output wall time. These are process-local scheduling estimates,
+not throughput evidence or additional reservations; restart discards them.
+
+Unknown costs give waiting requests capacity immediately, as before. A measured
+solo advantage above 10% may retain solo service for **at most one quarter of the
+fixed foreground budget** and only while the existing control-queue deadline
+has room for the observed handoff and a batch service interval. The burst's
+deadline is fixed on first contention, not extended on each token. Due background
+service and foreground HTTP demand not yet in the native queue force handoff.
+When alone again, the predicted remaining-work saving must clear the 10% margin
+and repay the measured first-token restore/catch-up cost before returning to MTP.
+Stale solo costs are remeasured no more often than every eight seconds or eight
+foreground budgets, whichever is longer; the existing per-request return cap
+still applies. No performance gain or latency qualification is claimed before a
+matched real-model run.
+
+The policy changes neither sampler/acceptance nor state transfers, resolved
+placement, admission ceilings, request identity or the native prefill partition.
+The existing 2048-token cuts and tails remain fixed when that chunk is admitted.
+It is not a new distributional guarantee: host acceptance tests establish their
+own mathematical rule, not floating-point equivalence of all native dispatch
+shapes. Sampled support and GPU parity retain their existing qualification bounds.
+
 ### Resident multiplexing without compute batching
 
 `--serve --batch N --resident-multiplex` keeps the resident state allocation but
