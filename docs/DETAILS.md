@@ -318,6 +318,32 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
+**Experimental native-IQ Volta prompt FFN (#195):** `STRATA_PREFILL_IQ_WMMA=1` opts into an additive
+port of jmnargi/Strata-V100 `277a707b58d08b7a089b9c41c4c9610a05a27405`, not a donor merge. It covers
+CUDA SM70 stage-local native experts at embedding/FF widths 2560/640: gate/up IQ3_XXS, IQ3_S,
+IQ2_S and IQ4_XS, down IQ4_NL or Q2_0. Existing host grouping supplies the same IDs/bounds, with
+1–16 experts and at least 16 rows per nonempty expert. That floor is a preregistered screen,
+not a measured crossover. Unsupported formats/shapes/devices, smaller groups, fused/native-grouped
+experts and resident-helper products keep their existing paths. SM86 and decode dispatch are unchanged.
+
+This is an **arithmetic change**, not a bit-exact optimization: packed weights and input activations
+are rounded to FP16, tensor cores accumulate FP32, and FP32 SwiGLU is rounded to FP16 (with the existing
+±65504 saturation) before FP16 down projection. Router selection, every contribution, coefficients,
+output reduction order, shared experts, KV and sampling code remain unchanged. Entirely resident groups
+read raw gate|up/down blobs through a by-value device pointer table; streamed/mixed groups retain their
+existing gathers and staging-slot releases. FP16 intermediates fit in the existing FP32 H allocation and
+the 256-byte pointer table aliases existing Hq scratch. No ring growth or extra workspace is introduced.
+
+The candidate remains **opt-in and unqualified**: no local GPU result or speedup is implied by the donor's
+measurements. `iq_wmma_policy_test` is a CPU eligibility check; `prefill_fused_iq_test --wmma-only`
+checks independent complete-FFN references, all seven format pairs in the Swift IQ3_S pack, indirect
+versus gathered addressing, guards, empty groups, partial row/chunk tiles and SwiGLU boundaries on SM70.
+The parent project's `evidence/native-iq-wmma-20261012/contract.json` fixes rejection limits before
+evaluation. Native teacher-forced logits remain unavailable (#57): first/committed diagnostic rows are
+a **different, weaker check**, not satisfaction of teacher-forced AC-3. Numerical observers are separate
+from HTTP timing. Roll back by unsetting the opt-in; the daily profile is not changed.
+
+
 ## Other GPUs (estimated)
 
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU

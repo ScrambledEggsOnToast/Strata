@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
 #include "mmq_resident_sort.hpp"
+#include "iq_wmma_policy.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -1298,6 +1299,9 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
             m.H = mp.native_grouped ? nullptr : c.take<float>(mb.h, ok);
             m.Hq = mp.native_grouped ? nullptr : c.take<uint8_t>(mb.hq, ok);
+            // #195 reuses only already-priced scratch: FP16 H fits in H's
+            // FP32 payload, and both 16-pointer tables fit in Hq. Its shape
+            // and minimum-row gates are checked before dispatch, not carve.
         }
         if (base == nullptr) ok = false;
     }
@@ -2448,6 +2452,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     m.canary.begin(8, m.cs, n > 0 ? (int32_t) tokens[0] : 0, (int32_t) pos0);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    int wmma_cc = 0;
+#if !defined(STRATA_USE_HIP)
+    if (detail::iq_wmma_requested()) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, m.device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, m.device) != cudaSuccess) {
+            err = "prefill: cannot query the opt-in IQ WMMA device capability";
+            return false;
+        }
+        wmma_cc = major * 100 + minor * 10;
+    }
+#endif
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // The direct successor's future lives on the Prefill object. Intermediate
@@ -3385,6 +3401,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = !mmq_plan().native_grouped && (use_mmq || fused_only) && stream_all &&
                                            no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    const bool use_wmma = detail::iq_wmma_layer_eligible(detail::iq_wmma_requested(), wmma_cc,
+                        lay.native, use_mmq, mmq_plan().native_grouped || fused_l, mmq_gt, mmq_dt, N, 640) &&
+                        strata::kernels::gemm_iq_f16_grouped_supported(mmq_gt, 1280, N) &&
+                        strata::kernels::gemm_iq_f16_grouped_supported(mmq_dt, N, 640);
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3746,7 +3766,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             if (mmq_plan().native_grouped)
                                 strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.Xq, m.cs);
-                            else
+                            else if (!use_wmma || std::any_of(order.begin(), order.end(),
+                                        [&](int32_t e) { return m.cnt[(size_t) e] < 16; }))
                                 mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
@@ -4146,6 +4167,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         size_t gg_j0 = 0;
+                        bool wmma_group = false, indirect_w = false;
+                        const void* gu_ptr[MMQ_GROUP] = {};
+                        const void* dn_ptr[MMQ_GROUP] = {};
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
@@ -4193,7 +4217,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
-                                if (group_gather) {
+                                if (q == 0 && use_wmma) {
+                                    const size_t end = std::min(order.size(), j + (size_t) MMQ_GROUP);
+                                    int64_t minr = T * K;
+                                    bool all_resident = m.host_res && m.cache;
+                                    for (size_t i = j; i < end; ++i) {
+                                        const int32_t id = order[i];
+                                        minr = std::min<int64_t>(minr, m.cnt[(size_t) id]);
+                                        all_resident = all_resident &&
+                                            m.host_res[(size_t) l * m.g->n_expert + id] >= 0;
+                                    }
+                                    wmma_group = detail::iq_wmma_group_eligible((int) (end - j), minr);
+                                    // Streamed/mixed groups keep their existing gathers and ring releases:
+                                    // only entirely resident blobs bypass copying, so no ring size/lifetime changes.
+                                    indirect_w = wmma_group && all_resident &&
+                                                 lay.fmt[(size_t) l].down_off == mmq_gub;
+                                }
+                                if (indirect_w) {
+                                    gu_ptr[q] = blob_dev;
+                                    dn_ptr[q] = blob_dev + lay.fmt[(size_t) l].down_off;
+                                } else if (group_gather) {
                                     if (gg.n == 0) gg_j0 = j - q;
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
@@ -4221,6 +4264,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
+#if !defined(STRATA_USE_HIP)
+                                if (wmma_group) {
+                                    const void* w_gu = m.grp_gu;
+                                    const void* w_dn = m.grp_d;
+                                    if (indirect_w) {
+                                        auto** tables = reinterpret_cast<const void**>(m.Hq);
+                                        expert_ptr_table(gu_ptr, dn_ptr, ngx, tables, tables + MMQ_GROUP, m.cs);
+                                        w_gu = tables; w_dn = tables + MMQ_GROUP;
+                                    }
+                                    if (!strata::kernels::gemm_iq_f16_grouped(mmq_gt, w_gu, mmq_gub, 1280, N,
+                                            m.mixed_h, N, m.bounds_dev + j0, ngx, (int) maxr, m.GU, 1280, m.cs,
+                                            m.src_dev, indirect_w)) {
+                                        err = "prefill: IQ WMMA gate/up refused a prechecked group";
+                                        return false;
+                                    }
+                                    auto* h16 = reinterpret_cast<uint16_t*>(m.H);
+                                    swiglu_split(m.GU + r0 * 1280, h16 + r0 * 640, nr, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    if (!strata::kernels::gemm_iq_f16_grouped(mmq_dt, w_dn, mmq_db, N, 640,
+                                            h16 + r0 * 640, 640, m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1),
+                                            ngx, (int) maxr, m.Dm + r0 * N, N, m.cs, nullptr, indirect_w)) {
+                                        err = "prefill: IQ WMMA down refused a prechecked group";
+                                        return false;
+                                    }
+                                    static thread_local bool said = false;
+                                    if (!said) {
+                                        said = true;
+                                        std::fprintf(stderr, "strata: opt-in IQ WMMA FP16 prompt FFN on CUDA%d SM70 "
+                                            "(GU type %d, down %d, %d experts, %lld rows; %s weights); "
+                                            "arithmetic differs from q8_1\n", m.device, mmq_gt, mmq_dt, ngx,
+                                            (long long) nr, indirect_w ? "resident indirect" : "gathered");
+                                    }
+                                    return true;
+                                }
+#endif
                                 // the zeroed tail after the group's last expert (see MMQ_TAIL)
                                 cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
                                 cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
@@ -4379,7 +4457,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t gpu_rows = T * K - rows_cpu;
                         const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * 1280), bdm = bad(m.Dm, T * K * N),
                                       bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H && !fused_l ? bad(m.H, gpu_rows * 640) : -1;
+                        // WMMA groups alias H as FP16, mixed with fallback FP32 groups:
+                        // interpreting the payload as all FP32 would invent NaNs.
+                        const int64_t bh = m.H && !fused_l && !use_wmma ? bad(m.H, gpu_rows * 640) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;

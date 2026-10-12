@@ -3611,3 +3611,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 }
 
 }  // namespace strata::kernels
+
+// Fork-owned additive port; the existing grouped/q8_1 kernels above are unchanged.
+#include "iq_wmma.cuh"
