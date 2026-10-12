@@ -23,8 +23,12 @@ held, on the IQ3_S 4-way rig).
 
 A routing trace comes from a one-shot engine run with `--dump-routing FILE` (a prompt typical of your use; the
 routed experts of every layer and position are written).  Point the model config's `--expert-profile` at the result.
+Both this tool and `bench_eviction.py` refuse partial headers/bodies, invalid expert counts and invalid
+weights before returning a result. Zero placeholder weights remain valid. Framing cannot detect missing
+whole records or establish request/phase coverage; those require the capture's independent run binding.
 """
 import argparse
+import math
 import struct
 from collections import defaultdict
 from pathlib import Path
@@ -44,17 +48,34 @@ def read_profile(path, n_expert=N_EXPERT):
     return [struct.unpack_from("<HH", blob, 24 + 4 * i) for i in range(n)]
 
 
+def trace_records(path):
+    """Read complete records; never interpret a malformed capture's valid prefix as evidence."""
+    with Path(path).open("rb") as source:
+        offset = 0
+        while header := source.read(8):
+            if len(header) != 8:
+                raise ValueError(f"{path}: truncated routing header at byte {offset}")
+            layer, k = struct.unpack("<ii", header)
+            if not 0 < k <= 4096:
+                raise ValueError(f"{path}: implausible expert count {k} at byte {offset}")
+            body = source.read(8 * k)
+            if len(body) != 8 * k:
+                raise ValueError(f"{path}: truncated routing body at byte {offset + 8}")
+            experts = struct.unpack_from(f"<{k}i", body)
+            weights = struct.unpack_from(f"<{k}f", body, 4 * k)
+            if any(not math.isfinite(weight) or weight < 0 for weight in weights):
+                raise ValueError(f"{path}: invalid routing weights at byte {offset}")
+            yield layer, experts
+            offset += 8 + 8 * k
+
+
 def read_trace(path, n_expert=N_EXPERT):
-    """(layer, k, k expert ids, k weights) records, as `--dump-routing` writes them."""
-    blob = Path(path).read_bytes()
-    off, freq = 0, defaultdict(int)
-    while off + 8 <= len(blob):
-        layer, k = struct.unpack_from("<ii", blob, off)
-        off += 8
-        for e in struct.unpack_from("<%di" % k, blob, off):
+    """Count in-range pairs only after checking every record's complete IDs and weights."""
+    freq = defaultdict(int)
+    for layer, experts in trace_records(path):
+        for e in experts:
             if 0 <= layer < N_LAYER and 0 <= e < n_expert:
                 freq[(layer, e)] += 1
-        off += 8 * k                                    # the ids and the weights
     return freq
 
 
