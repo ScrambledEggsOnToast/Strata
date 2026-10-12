@@ -3972,9 +3972,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
                                 // a Q2_0 layer (gate/up on the pool's Q2_0 kernels): ActQ activations, as decode's
                                 const bool q2 = strata::kernels::cpu::q2_native_kernels(cf.gu_type);
-                                if (q2) m.cpu_host.ensure_actq((size_t) m.T_max);
-                                else m.cpu_host.ensure_nact((size_t) m.T_max);
-                                m.cpu_host.ensure_work((size_t) m.T_max, (size_t) m.g->n_expert);
+                                if (q2) m.cpu_host.ensure_actq((size_t) T);
+                                else m.cpu_host.ensure_nact((size_t) T);
+                                m.cpu_host.ensure_work((size_t) T, (size_t) m.g->n_expert);
                                 char* need = m.cpu_host.need.get();
                                 std::fill_n(need, (size_t) T, 0);
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)   // the tokens the CPU's experts read
