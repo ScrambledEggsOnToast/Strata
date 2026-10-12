@@ -64,7 +64,8 @@ inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int
                                       int requested_slots, bool mtp,
                                       const strata::plan::QsaRolePlacements& placements,
                                       strata::plan::ResidentBytes& out, const char*& unpriced_class,
-                                      uint64_t stage_count = 1, const int64_t* split_at = nullptr) {
+                                      uint64_t stage_count = 1, const int64_t* split_at = nullptr,
+                                      int64_t layer_lo = 0, int64_t layer_hi = -1) {
     out = {};
     const auto shape = strata::kernels::qsa_real_shapes();
     unpriced_class = "resident_slot_count";
@@ -73,9 +74,9 @@ inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int
     if (unpriced_class) return false;
     SessionAllocationBytes working, slot;
     unpriced_class = "session_state";
-    if (!session_allocation_bytes(g, cells, k, working, 0, -1, &placements.working_main)) return false;
+    if (!session_allocation_bytes(g, cells, k, working, layer_lo, layer_hi, &placements.working_main)) return false;
     unpriced_class = "resident_slot_main_device";
-    if (!session_allocation_bytes(g, cells, k, slot, 0, -1, &placements.slot_main)) return false;
+    if (!session_allocation_bytes(g, cells, k, slot, layer_lo, layer_hi, &placements.slot_main)) return false;
     const strata::plan::ResidentPayload main{working.device, working.host_pinned};
     const strata::plan::ResidentPayload slot_main{slot.device, slot.host_pinned};
     const auto draft = mtp ? resident_draft_payload(g, cells, -1, &placements.working_draft)

@@ -6,6 +6,24 @@
 #include <cstdint>
 
 namespace strata::plan {
+// Validated [lo, hi) session ranges own their recurrent rows and attention
+// pools. Even an attention-free range retains a primary QSA when the model
+// has attention; shared scratch, PLE and the primary RoPE are never prorated.
+struct SessionLayerCounts {
+    int64_t gdn = 0, qsa = 0;
+};
+inline SessionLayerCounts session_layer_counts(int64_t n_layers, int64_t interval,
+                                                int64_t lo, int64_t hi) {
+    const int64_t qsa = hi / interval - lo / interval;
+    return {hi - lo - qsa, std::max<int64_t>(qsa, n_layers / interval ? 1 : 0)};
+}
+inline uint64_t session_arena_bytes(const SessionLayerCounts& layers, uint64_t shared,
+                                     uint64_t recurrent, uint64_t qsa_first, uint64_t qsa_rest) {
+    uint64_t bytes = shared + (uint64_t) layers.gdn * recurrent;
+    if (layers.qsa) bytes += qsa_first + (uint64_t) (layers.qsa - 1) * qsa_rest;
+    return (bytes + 255) / 256 * 256 + 4096;
+}
+
 // Conservative ABI envelopes, enforced against the source types by core/resident_memory.hpp.
 // These are payload bounds, not measured allocator/driver/graph overhead.
 inline constexpr uint64_t kResidentOwnerBytes = 4096;

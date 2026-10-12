@@ -10,6 +10,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/plan/resident.hpp"
 
 #include <cuda_runtime.h>
 
@@ -105,26 +106,16 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
                         const strata::plan::QsaPlacement* placement) {
     if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return 0;
     const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
-    // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
-    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
-    const int64_t q_lo = layer_lo / I, q_hi = layer_hi / I;
-    const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
-    const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
-    uint64_t n = 0;
-    n += gdn_buffers_bytes(g);
-    n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
+    const auto layers = strata::plan::session_layer_counts(g.n_layers, g.qsa_interval, layer_lo, layer_hi);
+    uint64_t first = 0, rest = 0;
     if (g.n_qsa_layers() > 0) {
-        const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, &resolved);
-        const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, &resolved);
+        first = qsa_state_bytes(g, max_cells, true, 0, &resolved);
+        rest = qsa_state_bytes(g, max_cells, false, 0, &resolved);
         if (!first || !rest) return 0;
-        n += first + (uint64_t) (q_n - 1) * rest;
     }
-    n += qsa_buffers_bytes(g, max_cells);
-    n += moe_buffers_bytes(g, k);
-    n += block_buffers_bytes(g);
-    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
-    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+    const uint64_t shared = gdn_buffers_bytes(g) + qsa_buffers_bytes(g, max_cells) +
+                            moe_buffers_bytes(g, k) + block_buffers_bytes(g) + ple_hist_bytes();
+    return strata::plan::session_arena_bytes(layers, shared, gdn_state_floats(g) * 4, first, rest);
 }
 
 bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
@@ -134,13 +125,13 @@ bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t
     if (!allocation_shape(g, max_cells, k, layer_lo, layer_hi)) return false;
     const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
     const int64_t nq = g.n_qsa_layers();
-    const int64_t count = std::max<int64_t>(layer_hi / g.qsa_interval - layer_lo / g.qsa_interval, nq ? 1 : 0);
+    const auto layers = strata::plan::session_layer_counts(g.n_layers, g.qsa_interval, layer_lo, layer_hi);
     SessionAllocationBytes b;
     b.device = session_bytes(g, max_cells, k, layer_lo, layer_hi, &resolved);
     if (!b.device) return false;
-    b.host_pinned = (uint64_t) count * qsa_state_host_bytes(g, max_cells, 0, &resolved);
+    b.host_pinned = (uint64_t) layers.qsa * qsa_state_host_bytes(g, max_cells, 0, &resolved);
     b.host_heap = sizeof(SessionOwner) + (uint64_t) nq * sizeof(QsaState);
-    if (count) {
+    if (layers.qsa) {
         const auto shape = strata::kernels::qsa_real_shapes();
         const uint64_t rope = (uint64_t) max_cells * (shape.n_rot / 2) * sizeof(float) * 2;
         const uint64_t pages = ((uint64_t) max_cells + shape.page_size - 1) / shape.page_size;
@@ -260,12 +251,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.layer_lo = layer_lo;
     s.layer_hi = layer_hi;
     const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
-    const int64_t q_n_range = layer_hi / I - layer_lo / I;
+    const auto layers = strata::plan::session_layer_counts(g.n_layers, I, layer_lo, layer_hi);
     // A suffix after the final QSA still needs a primary; keep it INSIDE the global ordinal array.
     s.qsa_ord0 = g.n_qsa_layers() ? std::min(layer_lo / I, g.n_qsa_layers() - 1) : 0;
-    s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);
+    s.qsa_alloc = layers.qsa;
     s.gdn_ord0 = layer_lo - layer_lo / I;
-    s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
+    s.gdn_alloc = layers.gdn;
 
     void* gdn_arena = take(gdn_buffers_bytes(g));
     if (!gdn_arena) return 0;

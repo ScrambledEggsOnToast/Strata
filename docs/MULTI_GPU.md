@@ -100,6 +100,13 @@ The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
 everything - the bit-exact check of the hand-off, not a speed mode.
 
+Admission prices each explicit stage's working session and requested resident slots from the same layer range
+and frozen K/V role placement that its `SessionOwner` carves. Shared session scratch, PLE history and one primary
+RoPE table still belong to each owner; only per-layer state follows the range. An attention-free stage still
+needs its primary QSA. The corrected fixed price leaves more room for the existing expert-cache grant, without
+changing its ceiling, headroom, blob rounding or profile cap. An admitted/carved extent disagreement is an error.
+Before an `auto` split search has chosen ranges, admission keeps the conservative whole-model per-stage bound.
+
 **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
 layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in

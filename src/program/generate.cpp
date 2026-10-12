@@ -3424,6 +3424,10 @@ int main(int argc, char** argv) {
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
     const bool batch_requested = o.batch > 0; // keep admission intent even if runtime eligibility disables it
+    // Known ranges commit exact owner extents. Auto's pre-search bounds are
+    // not exact carves and therefore do not arm the runtime equality checks.
+    std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
+    std::array<uint64_t, SplitDrive::kMax> admitted_slot_session_bytes{};
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -3580,11 +3584,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: admission refused: expert geometry exceeds allocator/kernel limits\n");
             return 1;
         }
-        const int64_t session_full = strata::core::session_bytes(g, o.max_context, K, 0, -1, &kv_roles.working_main);
+        const int64_t primary_hi = split_real && !split_auto ? split_at[0] : g.n_layers;
         const int requested_slots = std::clamp(o.batch, 0, strata::kernels::kVerifyMaxT);
         strata::plan::ResidentBytes resident;
         strata::core::SessionAllocationBytes session_allocation;
-        if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation, 0, -1,
+        if (!strata::core::session_allocation_bytes(g, o.max_context, K, session_allocation, 0, primary_hi,
                                                    &kv_roles.working_main)) {
             std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA0:session_state "
                                  "reason=working-session pricing failed\n");
@@ -3593,15 +3597,22 @@ int main(int argc, char** argv) {
         const char* unpriced_class = nullptr;
         if (requested_slots && !strata::core::resident_allocation_bytes(
                 g, o.max_context, K, requested_slots, !o.mtp.empty(), kv_roles, resident, unpriced_class,
-                split_real ? split_devs.size() + 1 : 1, split_real && !split_auto ? split_at.data() : nullptr)) {
+                split_real ? split_devs.size() + 1 : 1, split_real && !split_auto ? split_at.data() : nullptr,
+                0, primary_hi)) {
             std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA0:%s "
                                  "reason=resolved resident-role pricing failed\n", unpriced_class);
             return 1;
         }
         const uint64_t blob_gate = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
-        if (session_full <= 0 || headroom_mib < 0 || blob_gate == 0) {
+        if (!session_allocation.device || headroom_mib < 0 || blob_gate == 0) {
             std::fprintf(stderr, "strata generate: admission refused: invalid session/headroom/expert accounting\n");
             return 1;
+        }
+        uint64_t session_host_pinned = session_allocation.host_pinned;
+        uint64_t slot_host_pinned = requested_slots ? resident.slot_main.pinned : 0;
+        if (!split_auto) {
+            admitted_working_session_bytes[0] = session_allocation.device;
+            if (requested_slots) admitted_slot_session_bytes[0] = resident.slot_main.device / requested_slots;
         }
 
         std::vector<strata::plan::DeviceCost> devs;
@@ -3657,10 +3668,13 @@ int main(int argc, char** argv) {
             v0.add("mtp_drafter_buffers", working_draft < envelope ? envelope - working_draft : 0,
                    "remaining shared drafter/head envelope after named working KV");
         }
-        v0.add("session_state", requested_slots ? resident.working_main.device : (uint64_t) session_full,
-               "session_bytes(geometry, --max-context, K); a split's per-stage shares are upper-bounded by it");
+        v0.add("session_state", session_allocation.device,
+               split_auto ? "session_bytes upper bound until the split search places the ranges"
+                          : "session_bytes of the primary stage's own resolved layer range");
         if (requested_slots) {
-            v0.add("resident_slot_main_device", resident.slot_main.device, "requested resident SessionOwner arenas before runtime fallback");
+            v0.add("resident_slot_main_device", resident.slot_main.device,
+                   split_auto ? "requested slots; full session bound before split placement"
+                              : "requested slots; session_bytes of the primary stage's own resolved layer range");
             v0.add("resident_verifier_device", resident.verifier_device, "bounded per-slot commit/indexer/steering/penalty controls");
             if (mtp_here) v0.add("resident_slot_draft_device", resident.slot_draft.device, "one private QSA draft state per requested slot");
         }
@@ -3766,11 +3780,10 @@ int main(int argc, char** argv) {
             v0.add_unknown("control_vector", "--control-vector files: the accounting cannot price them");
         d0.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
 
-        // Layer-split stage devices: their own weight arena (every stage loads the full pool), their
+        // Explicit stage devices price their actual session ranges; auto keeps
+        // a whole-model bound until the split search resolves those ranges.
         if (multi_gpu && split_auto)
             v0.add_unknown("split_expert_caches", "per-stage auto cache budgets not yet known before split search");
-        // session share (upper-bounded by the full range until the split search has placed it) and the
-        // stage_room reserves.  The last stage carries the MTP drafter.
         uint64_t prefill_host_payload = admitted_prefill.host_payload;
         uint64_t prefill_host_dynamic = admitted_prefill.host_dynamic;
         if (split_real) {
@@ -3801,20 +3814,30 @@ int main(int argc, char** argv) {
                             strata::kernels::native_q8_1_bytes((int) g.n_embd, 1)), "last-stage native output head and Q8_1 scratch");
                     else ds.vram.add_unknown("weights_native_head", "last-stage native output tensor unreadable");
                 }
-                if (split_auto)
-                    ds.vram.add("session_state", requested_slots ? resident.working_main.device : (uint64_t) session_full,
-                                "session_bytes upper bound until the split search places the ranges");
-                else {
-                    // An explicit split knows its placement: price this stage's own carve,
-                    // the same arithmetic the carve allocates after the search would run.
-                    const int64_t lb = split_at[i];
-                    const int64_t le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
-                    ds.vram.add("session_state", (uint64_t) strata::core::session_bytes(g, o.max_context, K, lb, le,
-                                                                                     &kv_roles.working_main),
-                                "session_bytes of this stage's own layer range (explicit split)");
+                strata::core::SessionAllocationBytes working, slot;
+                if (!strata::core::session_allocation_bytes(g, o.max_context, K, working,
+                        layer_begin, layer_end, &kv_roles.working_main)) {
+                    std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA%d:session_state "
+                                         "reason=stage working-session pricing failed\n", split_devs[i]);
+                    return 1;
                 }
+                ds.vram.add("session_state", working.device,
+                            split_auto ? "session_bytes upper bound until the split search places the ranges"
+                                       : "session_bytes of this stage's own resolved layer range");
+                session_host_pinned = byte_add(session_host_pinned, working.host_pinned);
+                if (!split_auto) admitted_working_session_bytes[i + 1] = working.device;
                 if (requested_slots) {
-                    ds.vram.add("resident_slot_main_device", resident.slot_main.device, "requested slots; full session bound before split placement");
+                    if (!strata::core::session_allocation_bytes(g, o.max_context, K, slot,
+                            layer_begin, layer_end, &kv_roles.slot_main)) {
+                        std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA%d:resident_slot_main_device "
+                                             "reason=stage slot-session pricing failed\n", split_devs[i]);
+                        return 1;
+                    }
+                    ds.vram.add("resident_slot_main_device", byte_mul(requested_slots, slot.device),
+                                split_auto ? "requested slots; full session bound before split placement"
+                                           : "requested slots; session_bytes of this stage's own resolved layer range");
+                    slot_host_pinned = byte_add(slot_host_pinned, byte_mul(requested_slots, slot.host_pinned));
+                    if (!split_auto) admitted_slot_session_bytes[i + 1] = slot.device;
                     ds.vram.add("resident_verifier_device", resident.verifier_device, "per-stage resident controls");
                     if (i == last) ds.vram.add("resident_slot_draft_device", resident.slot_draft.device, "draft slot state on final stage");
                 }
@@ -4046,7 +4069,8 @@ int main(int argc, char** argv) {
                 const uint64_t budget = strata::plan::split_stage_cache_budget(
                     residual_ceiling, fixed_demand, stage_dev->headroom_bytes, blob_gate, profile_bound);
                 if (budget < blob_gate) {
-                    std::fprintf(stderr, "strata generate: admission refused: CUDA%d requires a nonempty expert cache; "
+                    std::fprintf(stderr, "strata generate: admission refused: limiting=CUDA%d:split_expert_caches "
+                                         "requires a nonempty expert cache; "
                                          "fixed demand/headroom/profile leave less than one expert blob\n", split_devs[i]);
                     return 1;
                 }
@@ -4098,24 +4122,6 @@ int main(int argc, char** argv) {
             uploads.add(name, bytes, source, ByteMeaning::clean_file);
         };
         const uint64_t stage_count = split_real ? split_devs.size() + 1 : 1;
-        uint64_t session_host_pinned = requested_slots ? resident.working_main.pinned : session_allocation.host_pinned;
-        if (split_real && !split_auto) {
-            session_host_pinned = 0;
-            int64_t lo = 0;
-            for (size_t stage = 0; stage < stage_count; ++stage) {
-                const int64_t hi = stage < split_at.size() ? split_at[stage] : g.n_layers;
-                strata::core::SessionAllocationBytes allocation;
-                if (!strata::core::session_allocation_bytes(g, o.max_context, K, allocation, lo, hi,
-                                                           &kv_roles.working_main)) {
-                    std::fprintf(stderr, "strata generate: cannot price split stage's pinned session state\n");
-                    return 1;
-                }
-                session_host_pinned = byte_add(session_host_pinned, allocation.host_pinned);
-                lo = hi;
-            }
-        } else {
-            session_host_pinned = byte_mul(stage_count, session_host_pinned);
-        }
         ram("session_host_pinned", session_host_pinned,
             "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
         if (!o.mtp.empty() && o.spec >= 2) {
@@ -4135,8 +4141,8 @@ int main(int argc, char** argv) {
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
         if (requested_slots) {
-            ram("resident_slot_main_pinned", byte_mul(stage_count, resident.slot_main.pinned),
-                "requested slot QSA staging and full logical streamed KV backing; stage-count upper bound");
+            ram("resident_slot_main_pinned", slot_host_pinned,
+                "requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges");
             ram("resident_slot_main_owner", byte_mul(stage_count, resident.slot_main_owner), "ABI-checked resident owner envelopes");
             ram("resident_histories", resident.histories, "two context-bounded ResidentSlot ids/prompt vectors per requested slot");
             ram("resident_checkpoints", resident.checkpoints,
@@ -5851,6 +5857,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (admitted_working_session_bytes[0] &&
+            session_owner.memory().device != admitted_working_session_bytes[0]) {
+            std::fprintf(stderr, "strata generate: limiting=CUDA0:session_state "
+                                 "reason=admitted/carved working-session extent mismatch\n");
+            return 1;
+        }
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -5879,6 +5891,12 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on(st.dev);
         if (!st.session_owner.init(g, o.max_context, K, err, st.lb, st.le, &kv_roles.working_main)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
+            return 1;
+        }
+        if (admitted_working_session_bytes[i + 1] &&
+            st.session_owner.memory().device != admitted_working_session_bytes[i + 1]) {
+            std::fprintf(stderr, "strata generate: limiting=CUDA%d:session_state "
+                                 "reason=admitted/carved working-session extent mismatch\n", st.dev);
             return 1;
         }
         const bool last = i + 1 == stages.size();
@@ -5973,6 +5991,11 @@ int main(int argc, char** argv) {
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
                     fit = b;
                     break;
+                }
+                if (admitted_slot_session_bytes[k] && u->memory().device != admitted_slot_session_bytes[k]) {
+                    std::fprintf(stderr, "strata generate: limiting=CUDA%d:resident_slot_main_device "
+                                         "reason=admitted/carved slot-session extent mismatch\n", dev);
+                    return 1;
                 }
                 strata::core::session_zero(u->state(), g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
