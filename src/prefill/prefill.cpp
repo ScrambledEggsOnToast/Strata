@@ -3527,7 +3527,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     } else if (device_grouped) {
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
                         // Same native expert arithmetic and stable row order as the host-grouped arm.
                         // All metadata writes/reads stay on cs, including previous-layer consumers: the
                         // removed host sync was an ownership join as well as a router readback.

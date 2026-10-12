@@ -113,7 +113,7 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
 /// `counts` holds 4 int32s, aligned to 8 bytes: [0] groups, [1] sticky invalid-ID/pointer error, [2..3] uint64
 /// selected-group total. Zero counts once before use; error/total are inspected only after the containing
 /// operation drains, never for launch sizing. No allocations, host readback or architecture-gated math.
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, int n_expert,
                         const unsigned long long* expert_ptr, int32_t* scratch,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts,

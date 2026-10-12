@@ -8,7 +8,7 @@
 namespace strata::prefill::detail {
 
 inline bool resident_grouping_requested() {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     return false;
 #else
     static const bool on = [] {

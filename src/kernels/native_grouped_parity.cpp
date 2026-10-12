@@ -234,7 +234,7 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     g_fail += bad;
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 // The scalable resident overload must produce the host prefill's exact maps, not just conserve counts.
 void check_resident_metadata(cudaStream_t s) {
     constexpr int E = 512, K = 10, CAP = 32768 * K;
@@ -488,13 +488,13 @@ int main(int argc, char** argv) {
     if (!strata::platform::acknowledge_protected_test()) return 2;
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     const bool resident_only = argc > 1 && std::string(argv[1]) == "--resident-prefill";
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     if (resident_only) { std::fprintf(stderr, "resident prefill device grouping is CUDA-only\n"); return 77; }
 #endif
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     check_resident_metadata(s);
     check_resident_prefill(20, s, rng);
     check_resident_prefill(42, s, rng);

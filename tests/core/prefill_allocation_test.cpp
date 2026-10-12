@@ -64,7 +64,7 @@ int native_bounds_regression(int grouping = -1) {
     if (setenv("STRATA_PREFILL_MMQ", "1", 1) != 0) return 1;
 #endif
     if (grouping >= 0) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         return 77;   // the new route deliberately keeps HIP's existing host path
 #elif defined(_WIN32)
         if (_putenv_s("STRATA_PREFILL_NATIVE_GROUPED", "1") != 0 ||
