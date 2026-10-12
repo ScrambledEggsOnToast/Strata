@@ -102,7 +102,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
-constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+constexpr int64_t N = kernels::cpu::H, HC = 4, D = N * HC, LR = 320, K = kCpuShareRoutes,
+                  NE = kernels::cpu::NE;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 constexpr int MMQ_GROUP = 16;   // experts per MMQ launch
 constexpr size_t mmq_bounds_count(int64_t n_expert) {
