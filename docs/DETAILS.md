@@ -1965,8 +1965,18 @@ Run-config budgets (all bounded per request, not replacements for native byte-le
 | `request_context_tokens` | engine context | optional smaller positive prompt + output + 8-token-slack budget |
 | `lifecycle_api` | false | enable the private, loopback-peer-only lifecycle API below |
 
-A full queue returns **429**; every JSON **429** or **503** (including engine startup) carries `Retry-After: 1`.
-This is a one-second delta-seconds retry hint, not an estimate of request completion or a readiness promise.
+A full queue returns **429**; every JSON **429** or **503** (including engine startup) carries a derived
+`Retry-After` integer-seconds hint. It is bounded, finite and never zero, not a completion or readiness promise.
+The hint is `ceil(oldest_wait_s + service_time_estimate_s)`, clamped to
+`[1, max(1, min(30, floor(request_timeout_s)))]`. The service estimate is the mean of valid successful
+(`stop`/`length`) durations in the last 32 history entries, minus each request's HTTP queue time, with a
+one-second fallback before any valid sample. Each sample and the estimate are capped at the hint ceiling.
+The oldest active request's admitted age (also excluding its queue time) is a lower bound on that estimate,
+not a prediction of remaining service time. Idle services use 1 even with old history. The 30-second cap
+avoids minute-long backoffs; the timeout cap avoids waiting past the configured request lifetime.
+For subsecond timeouts the mandatory integer-second floor still gives 1: the protocol cannot express a
+smaller delta-seconds hint, and admission/configuration semantics are unchanged. Clients own retry policy,
+cancellation and their total deadline; shortened per-request deadlines still take precedence.
 A queued deadline still returns **408**, without a retry hint. Oversized bodies return
 **413**; invalid priority/deadline/context requests return **400**. A deadline during generation sets the same
 cancellation event as disconnect, drains work, then reports an error using the endpoint's existing JSON/SSE
@@ -1999,8 +2009,10 @@ JSON `/status`, `/metrics`, `/v1/status` and `/health` expose the same `admissio
 count, at least one), `request_queue_limit`, `active` (admitted HTTP generations), `waiting` (generations waiting
 for HTTP admission), `executing` (submitted native request legs through drain), `native_waiting` (reserved
 requests waiting to submit their next native leg), `oldest_wait_s` (the oldest HTTP waiter's monotonic queue
-age, or zero), and `request_timeout_s` (the configured total deadline). Counts are sampled together under
-the admission lock. `active` includes preparation, native waiting and execution; `executing` does not claim
+age, or zero), `request_timeout_s` (the configured total deadline), `service_time_estimate_s` (bounded admitted
+service duration estimate), `retry_after_s` (the current hint), and `retry_after_ceiling_s` (its upper clamp).
+Counts and the hint are sampled together under the admission lock. `active` includes preparation, native
+waiting and execution; `executing` does not claim
 concurrently executing GPU kernels or prefill/decode overlap. Active slot rows carry the stable frontend
 `request_id`, also returned in `X-Strata-Request-Id`.
 Existing `queued` and native slot/control-wait metrics are unchanged. Queue capacity remains effective slots

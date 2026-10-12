@@ -68,6 +68,7 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 DEFAULT_REQUEST_QUEUE_LIMIT = 32
 MAX_REQUEST_QUEUE_LIMIT = 256  # bounded HTTP workers/metadata, not a native serving-capacity claim
+MAX_RETRY_AFTER_S = 30  # bounded advisory backoff, never a readiness/completion promise
 
 
 def popen(what: str, args: list, **kw):
@@ -3166,15 +3167,37 @@ class Service:
         self.lifecycle_api = cfg.get("lifecycle_api") is True
 
     def _admission_snapshot(self):
-        """Generation reservations at the HTTP boundary; caller holds status_lock."""
+        """Generation reservations and bounded retry hint; caller holds status_lock."""
         now = time.perf_counter()
+        oldest_wait = round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6)
+        # HTTP Retry-After uses whole seconds. Subsecond request timeouts still get its mandatory 1 s floor.
+        ceiling = max(1, min(MAX_RETRY_AFTER_S, math.floor(self.request_timeout_s)))
+        durations = []
+        for index, request in enumerate(reversed(self.history)):
+            if index == 32:
+                break
+            if request.get("finish") not in ("stop", "length"):
+                continue
+            duration, queued = request.get("duration_s"), request.get("queue_s")
+            if duration is not None and queued is not None:
+                service = duration - queued
+                if math.isfinite(service) and service > 0:
+                    durations.append(min(ceiling, service))
+        # Admitted age is a lower bound on service duration, not an estimate of remaining time.
+        active_age = max((now - r["_clock"] - r["queue_s"] for r in self.admission_active.values()),
+                         default=0.0)
+        service_estimate = min(ceiling, max(active_age, sum(durations) / len(durations) if durations else 1.0))
+        retry_after = min(ceiling, max(1, math.ceil(min(ceiling, oldest_wait) + service_estimate)))
+        if not self.admission_active and not self.admission_waiters:
+            retry_after = 1  # Old history must not throttle an idle service, including startup 503s.
         return {"slots": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                 "request_queue_limit": self.request_queue_limit,
                 "active": len(self.admission_active), "waiting": len(self.admission_waiters),
                 "executing": sum(bool(r.get("_executing")) for r in self.admission_active.values()),
                 "native_waiting": sum(r["state"] == "engine_wait" for r in self.admission_active.values()),
-                "oldest_wait_s": round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6),
-                "request_timeout_s": self.request_timeout_s}
+                "oldest_wait_s": oldest_wait, "request_timeout_s": self.request_timeout_s,
+                "service_time_estimate_s": round(service_estimate, 6),
+                "retry_after_s": retry_after, "retry_after_ceiling_s": ceiling}
 
     def _refresh_foreground_pending(self):
         """Publish an atomic scalar under status_lock; native control never locks the HTTP queue."""
@@ -5077,7 +5100,9 @@ def make_handler(svc: Service):
             if self.lifecycle is not None:
                 self.send_header("X-Strata-Request-Id", self.lifecycle["id"])
             if code in (429, 503):
-                self.send_header("Retry-After", "1")
+                with svc.status_lock:
+                    retry_after = svc._admission_snapshot()["retry_after_s"]
+                self.send_header("Retry-After", str(retry_after))
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
