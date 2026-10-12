@@ -228,8 +228,8 @@ unequal-sized slots; metadata and its consumers use the same compute stream.
 The existing cancellation, relayout and final drain remain the scratch owners.
 One 16-byte status copy per chunk uses the containing chunk drain, not a
 per-layer routing join or launch-size readback.
-The legacy `STRATA_PREFILL_TIMING` and `STRATA_PREFILL_ATTRIBUTION=1` GPU-event
-observers keep host grouping: their event pools rely on those layer joins.
+The legacy `STRATA_PREFILL_TIMING` (presence) and `STRATA_PREFILL_ATTRIBUTION`
+(nonzero integer value) observers keep host grouping: their event pools rely on those layer joins.
 They establish no device-grouping exposure. Use observer-off matched timings
 and a separately matched external kernel timeline for critical-path attribution.
 
@@ -240,7 +240,7 @@ allocation. Counts/offset scratch uses the already-admitted bounds tail; the
 expert operator keeps its existing full `T*K` scratch with no padded rows or
 weight-storage loans added by dispatch. The rank pass makes `T*K*n_expert`
 integer comparisons, so its complete GPU cost must be included in the screen.
-These are source-derived prices, not measured memory peaks.
+The CPU price tests confirm these admitted prices; they are not measured memory peaks.
 
 Rollback is `STRATA_PREFILL_DEVICE_GROUPING=0` (the default). Keep
 `STRATA_PREFILL_NATIVE_GROUPED=1` in **both** comparison arms: enabling native
@@ -251,12 +251,25 @@ eligibility; `prefill_allocation_test --native-host-grouping` and
 `native_grouped_parity --resident-prefill` checks exact maps through 327,680
 entries, singleton/hot/tail native FFNs and the actual weighted combine.
 
-This candidate is not a measured speedup or a qualified profile. A matched
-multi-chunk HTTP comparison must preserve resolved placement, inputs, observers
-and arithmetic. The removed host synchronization also completed preceding GPU
-work; its wall interval is not removable CPU cost. Reject the optimization if
-the complete route does not usefully shorten the critical path, and confirm a
-promising result on a held-out prompt before retaining it.
+The 2026-10-12 three-GPU split `20,39` screen held native grouped arithmetic
+fixed in both arms at chunk 2048, context 262144, K8V4 and MTP4. Observer-off
+AB/BA pairs shortened fresh committed prefill by 37.6–37.8% at 16029 tokens;
+held-out tagged retrieval at 16068 tokens confirmed 38.0–38.1%, without a
+client arrival-TTFT regression. All 24576 experts remained resident with no
+loans. The 8 screen and 7 held-out committed FP32 predictor rows were bitwise
+equal, as were both same-engine eight-row recoveries after prefill cancellation.
+
+**Promotion is rejected pending attribution, not rejected for no measured gain.**
+The separately profiled host-control arm's `nsys stop` timed out at 180 seconds
+and normal MPS retirement timed out at 15 seconds. It remains a failed trace,
+not kernel-timeline evidence; the required matched timeline gate was not met.
+The removed synchronization contains preceding GPU work, so these observer-off
+results do not attribute the gain to pure CPU grouping time. The treatment also
+replaces selected up-to-16-expert native dispatch batches with device-sized
+dispatch: that scheduling cost belongs to the treatment, not a new arithmetic
+claim. The candidate stays opt-in/default-off and is not a qualified A/19
+profile. Its measured scope is only these prompt lengths, chunking and host;
+neither default-MMQ comparisons nor other placements/context lengths are covered.
 
 ## Resident-owner prefill (experimental, HET-022)
 
