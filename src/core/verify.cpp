@@ -38,6 +38,9 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#if !defined(STRATA_USE_HIP)
+#include "strata/core/qsa_score_snapshot.hpp"
+#endif
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -3375,6 +3378,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     causal_operation("graph-sync", sync_start, causal_now(), -1, true, (int) (g.n_layers * kProfPer + 4));
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+#if !defined(STRATA_USE_HIP)
+    if (!qsa_score_snapshot(device_, pos0, T, max_blocks_, scores_, step_, err)) return false;
+#endif
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";

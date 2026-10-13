@@ -6,6 +6,9 @@
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_fp16.h>
+#endif
 
 #include <cfloat>
 #include <cstdio>
@@ -688,16 +691,22 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 }
 
 #if !defined(__HIPCC__)
+#include "qsa_select_narrow.cuh"
 // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
 // kernel's threads, per-warp histograms and warp scans, with each key read from memory again on every pass.  A
 // histogram has no order, so on the four radix passes thread t reads blocks t, t + 1024, ...: a warp reads 32
 // neighbours at a time.  The cells are emitted ascending in the order (warp, row, lane): warp w holds the `per` rows
 // of 32 consecutive blocks from block w * 32 * per.  block_topk_kernel's selection rule (radix threshold, ties to the
 // lowest index): identical ids.
+template <bool Narrow = false, bool Diagnose = false>
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids) {
-    __shared__ int hist[TK_T / 32][256];
+    __shared__ union {
+        int hist[TK_T / 32][256];
+        QsaNarrowScratch narrow;
+    } scratch;
+    int (*hist)[256] = scratch.hist;
     __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
     __shared__ int s_digit, s_above;
     const int64_t qi = blockIdx.x;
@@ -715,7 +724,11 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
     auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
     uint32_t prefix = 0;
     int above = 0;
-    for (int shift = 24; shift >= 0; shift -= 8) {
+    const bool narrowed = Narrow && qsa_narrow_pivot(sc, n_kv, n_bid, (int) width, scratch.narrow, prefix, above);
+    const uint32_t candidate_prefix = prefix;
+    const int candidate_above = above;
+    if (Diagnose && narrowed) { prefix = 0; above = 0; }
+    for (int shift = narrowed && !Diagnose ? -8 : 24; shift >= 0; shift -= 8) {
         for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
         __syncwarp();
         const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
@@ -745,6 +758,14 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         prefix |= (uint32_t) s_digit << shift;
         above = s_above;
         __syncthreads();
+    }
+    if (Diagnose && n_kv >= (int64_t) QSA_NARROW_MIN * R && t == 0) {
+        const bool exact = !narrowed || (candidate_prefix == prefix && candidate_above == above);
+        printf("QSA_NARROW_CHECK row=%lld nkv=%lld live_blocks=%lld narrowed=%d exact_cutoff=%d "
+               "cutoff=%08x above=%d shared_bytes=%llu\n", (long long) qi, (long long) n_kv,
+               (long long) (n_bid + (n_kv % R != 0)), narrowed, exact, prefix, above,
+               (unsigned long long) (sizeof(scratch) + sizeof(s_gt) + sizeof(s_eq) + sizeof(int) * 2));
+        if (!exact) __trap();
     }
     const uint32_t thr = prefix;
     const int eq_budget = (int) (width - above);      // cells equal to thr that fit, lowest index first
@@ -1224,6 +1245,19 @@ static bool topk_active_turing_device() {
     }
     return turing;
 }
+
+static bool topk_narrow_sm70_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    static thread_local int cc[16] = {};
+    if (cc[dev] == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
+        cc[dev] = major * 10 + minor;
+    }
+    return cc[dev] == 70;
+}
 #endif
 
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -1350,8 +1384,25 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
-    if (reach > fit || (turing_wide && counted && reach > 22528))   // past the register kernel's reach, or Turing's band
-        block_topk_wide_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    if (reach > fit || (turing_wide && counted && reach > 22528)) {   // the existing wide-kernel band only
+        static const bool narrow = [] {
+            const char* v = std::getenv("STRATA_QSA_NARROW");
+            return v && v[0] == '1';
+        }();
+        // The capacity check is host-side; the live-length decision stays in the
+        // kernel. SM86 and large prefill batches keep their original dispatch.
+        const bool use_narrow = narrow && nq <= 32 && max_blocks >= QSA_NARROW_MIN && topk_narrow_sm70_device();
+        static const bool diagnose = [] {
+            const char* v = std::getenv("STRATA_QSA_NARROW_DIAG");
+            return v && v[0] == '1';
+        }();
+        if (use_narrow && diagnose)
+            block_topk_wide_kernel<true, true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        else if (use_narrow)
+            block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        else
+            block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    }
     else
 #endif
     if (reach <= (int64_t) TK_T * TK_PER)

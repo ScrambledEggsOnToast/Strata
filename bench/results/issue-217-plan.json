@@ -1,0 +1,19 @@
+{
+  "ticket": 217,
+  "base_source": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "donor_source": "be3722bc095b9792bf9833068595f0b1ef70ad37",
+  "classification": "arithmetic-preserving; integer exact selector only; scorer arithmetic unchanged",
+  "control": "current optimized block_topk_wide_kernel; STRATA_QSA_NARROW=0",
+  "candidate": "STRATA_QSA_NARROW=1; SM70 only; at most 32 query rows; wide dispatch only; device-live blocks >=32768",
+  "gain_criterion_fixed_before_evaluation": {
+    "long_context": "at least 3 percent reduction in the containing committed decode/verification interval for an otherwise matched observer-off serving pair",
+    "short_context": "no more than 2 percent regression in that containing interval",
+    "operator_only": "selector speed is diagnostic, never sufficient for keep or promotion",
+    "held_out": "one compact held-out same-shape case only if the matched long-context pair clears 3 percent",
+    "reject": "correct but below 3 percent, regressing, or a short-context regression above 2 percent",
+    "blocked": "missing required exact operator, same-prefix full-model, real exposure, or matched timing evidence"
+  },
+  "scope": "daily Swift 1.5 Flash-Next profile.json; original model, three-device layer placement, K8V4, MTP4, batch4/groups2, arithmetic, host reserve and power/thermal policy retained; no length sweep",
+  "regression": "exact selected cell IDs on real/scorer scores and adversarial cutoff ties, concentration, NaNs, signed zero, empty/short rows, all four-cell tails and overflow; changed lengths replayed through one graph; applicable same-prefix full-model exact regression required",
+  "rollback": "unset STRATA_QSA_NARROW or set it to 0; original source/binary control remains available; no default promotion"
+}

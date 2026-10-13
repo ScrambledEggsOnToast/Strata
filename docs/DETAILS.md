@@ -28,6 +28,24 @@ argmax run on thread-block clusters (RTX 50, sm_90+; other cards keep the previo
 IQ3 packs about even; on HIP they run on gfx11 and on gfx1200 / gfx1201, see AMD_HIP.md); `STRATA_QSA_CLUSTER=0` / `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. The tables
 below are 0.1.26's.
 
+**Experimental V100 selection (#217).** `STRATA_QSA_NARROW=1` enables exact
+candidate narrowing only on SM70, inside the existing wide selector's dispatch,
+with at most 32 query rows and at least 32,768 live score blocks. This applies to
+decode/verification and any small-row prompt call with that shape; it is not a
+large-prefill optimization. FP16 is only a monotone coarse bucket: the cutoff
+uses the unchanged FP32 order keys and weighted four-cell counts, and the same
+ascending cell emitter resolves ties and partial tails. NaNs, concentrated
+probes and oversized buckets fall back to the optimized wide selector.
+Unset the switch or set it to `0` for the original control; SM86 is unchanged.
+Scratch reuses the wide histogram storage rather than adding global buffers.
+`STRATA_QSA_NARROW_DIAG=1` checks each exposed candidate cutoff against the wide
+selector during graph replay; it is a correctness observer, not a timing mode.
+`STRATA_QSA_SCORE_SNAPSHOT=/absolute/create-only-prefix` retains the first long
+solo verification's last-layer scores and steps on each V100 for
+`qsa_topk_active_parity --snapshot FILE`. Neither observer belongs in latency
+arms. This opt-in experiment is not a default promotion or a measured daily
+profile gain.
+
 ### Prompt processing (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
