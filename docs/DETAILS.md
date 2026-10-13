@@ -379,7 +379,24 @@ and `--input-index-on` expose the allocation prices for matched MMQ and fused-fa
 FFN equality, empty/uneven groups, tails, nontrivial output maps, graph replay and isolated streams using
 the existing native-format fixtures. `--mmq-indexed-timing` measures matched input preparation plus
 the existing products at chunk 2048, including input indirection. These commands need a protected
-machine window. The default is off; no performance qualification or daily-profile promotion is implied.
+machine window. The candidate is **default-off and rejected** by the 2026-10-13 matched screen:
+ten native-format pairs passed exact payload/complete-FFN checks on V100 SM70 and RTX3090 SM86,
+including graph replay and request isolation. The current batch-4 solo-GEN first predictor was exact
+across all 248,320 logits; a separate serial diagnostic matched every logit and token ID in all eight
+emitted rows. The existing committed-row diagnostic refuses batch slots; it was not quietly enabled
+on a concurrent path or presented as teacher-forced batched-prompt coverage.
+
+At the current 2048-token chunk, split20,39, K8V4 and all 24,576 resident experts, an 8192-token
+request took 5037 -> 5087 ms fresh prefill and 5081.06 -> 5130.60 ms response-bound TTFT
+(about 1% slower). The matched configuration was cache-free, no-borrow and bounded at 600 seconds:
+those are explicit differences from the daily profile, not a daily-profile speed claim. The prompt
+buffer allocation and sampled physical peak fell by 50 MiB per GPU, but full-chunk preparation/FFN
+phase envelopes rose by 2.74% / 1.74% / 8.13% on the two V100s and 3090 respectively. These are
+separate same-GPU observer envelopes, not a summed cross-device critical path or unobserved kernel
+attribution. The first matched pair regressed too; no promising result justified a held-out promotion.
+The [retained result](../bench/results/2026-10-13-mmq-input-index/result.json) binds exact sources,
+binaries, commands, profiles, failed parser/preflight evidence and scratch artifacts. No daily-profile
+change or positive speed claim is made; HIP/SYCL toolchains were unavailable and their index route is disabled.
 Roll back by unsetting `STRATA_PREFILL_MMQ_INDEXED` (expanded MMQ, not FP16/native/WMMA).
 
 **Experimental native-IQ Volta prompt FFN (#195):** `STRATA_PREFILL_IQ_WMMA=1` opts into an additive

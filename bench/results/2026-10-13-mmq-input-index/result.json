@@ -1,0 +1,74 @@
+{
+  "ticket": 219,
+  "disposition": "reject",
+  "reason": "Quantization/storage duplication was removed exactly, but indexed GU reads erased the input-preparation saving. Both matched model pairs regressed fresh prefill and response-bound TTFT; final per-stage full-chunk input-preparation plus FFN envelopes regressed on all three GPUs.",
+  "source": {
+    "base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "initial_candidate": "be34f28ae6d8afa8381311203a10fe3579cea211",
+    "final_code": "cb51365433c0a17c4720fdd4fa87a1f1e112ce94",
+    "ggml": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "ggml_header_sha256": "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b",
+    "donor": "https://github.com/1CatAI/1Cat-vLLM/tree/be3722bc095b9792bf9833068595f0b1ef70ad37",
+    "donor_scope": "PR390 and csrc/sm70_turbomind/ops/gguf_dp4a_sm70.cu input-indirection idea only; no NVFP4 representation, small-batch product, native product or FP16 intermediate boundaries copied"
+  },
+  "binaries": {
+    "control": {"path": "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f", "sha256": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68"},
+    "initial_candidate": {"path": "/home/joshkirklin/strata-workspace/scratch/1cat-219-build/strata", "sha256": "951727cc0086292499af91897b8582d8794a564a7effeb56296191ece244474a"},
+    "final_candidate": {"path": "/home/joshkirklin/strata-workspace/scratch/1cat-219-final-bin/strata", "sha256": "e29ffdc6851fac6853cd141ea1aec32a71f239eaa350d8f872ad5344a16e9a09"},
+    "final_fixture": {"path": "/home/joshkirklin/strata-workspace/scratch/1cat-219-final-bin/prefill_fused_iq_test", "sha256": "db09463b04fb91cb9979e2f9fb68d6879f364b75493a6dfba8a046f483a28dd7"}
+  },
+  "implementation": {
+    "classification": "arithmetic-preserving",
+    "switch": "build STRATA_MMQ_INPUT_INDEX=ON, runtime STRATA_PREFILL_MMQ_INDEXED=1; default off",
+    "input_map": "Product.input_ids/input_rows, independent of existing OUTPUT Product.ids; reuses src_dev with no extra device metadata allocation",
+    "quantizer": "original quantize_mmq_q8_1_cuda, original rounding/scales/512-value padding; weight-dependent layout derived from mmq_get_q8_1_ds_layout",
+    "representations": "D4, DS4 and D2S6 have equal 144-byte block sizes but different payloads; actual pack GU/down types all use D4. One GU representation is live per layer and Xq is reused between layers.",
+    "preserved": ["weights and router", "stable groups of up to16 experts", "MMQ tiler and product/reduction arithmetic", "FP32 GU/H/down boundaries", "output mapping and K reduction order"],
+    "fallback": "Unsupported layers reserve expanded shared Xq capacity; enabled fused layers retain their 80-byte/64-value representation's established full-capacity lifetime. No retained expanded MMQ buffer is counted as a saving.",
+    "other_paths": "native-grouped, WMMA, FP16 and peer-helper products remain unchanged; HIP/SYCL indexing disabled"
+  },
+  "exact_evidence": {
+    "sm70": "final/20261013T054105-exact-sm70.log:10 pairs passed",
+    "sm86": "final/20261013T054105-exact-sm86.log:10 pairs passed",
+    "formats": "all7 actual pack pairs plus3 additional supported native pairs; repeated token routes, uneven/empty groups, group tails, independent nontrivial output maps",
+    "coverage": ["all quantized row bytes including padding at widths2560/640", "FP32 GU/H and complete routed FFN", "weighted complete FFN and K-order reduction", "graph replay on changed buffers", "isolated request streams/workspaces with different inputs"],
+    "model_current_batch4_first_predictor": {"input_tokens":8192,"vocab":248320,"exact":true,"sha256":"be1165d55f288d61992824338958678a783c6efc63cfdd01641ba20367e72b20"},
+    "model_serial_committed_predictors": {"input_tokens":4096,"emitted_rows":8,"exact_full_vocabulary_and_token_ids":true,"positions_inclusive":[4095,4102],"scope":"separate serial diagnostic; batch slots/groups and batch-MTP pipeline flags removed because the existing committed dump refuses batch slots. Not teacher-forced batched-prompt or concurrent-request qualification."}
+  },
+  "measurement_configuration": {
+    "model":"adopted Swift1.5 Flash-Next pack",
+    "chunk":2048,"placement":"20,39; ordered V100/V100/RTX3090","kv":"k8v4","resident_experts":24576,
+    "same_as_daily":"model, tokenizer/frontend, placement, chunk, context262144, MTP/spec4, batch4/groups2, trim and power/thermal/MPS ceilings",
+    "daily_differences":["binary path", "timeout_s0->600", "prompt-cache6->0", "add no-prefill-borrow (placement/reserve change, not pure hygiene)", "new opt-in env flag1 in both arms (old control ignores it)", "artifact_root on scratch volume"],
+    "arm_difference":"binary only for latency arms; diagnostic arms additionally have their own output prefixes",
+    "leg":"solo GEN; no claim about concurrent legs or batch-MTP pipeline execution",
+    "latency":"streamed request-ID-bound monotonic first-token receipt, including indirection/submission overhead; GPU event observer off in both latency arms"
+  },
+  "memory": {
+    "Xq_capacity_bytes":{"control":59000832,"candidate":5916672,"saved":53084160},
+    "actual_prefill_allocation_per_gpu_bytes":{"control":1050673152,"candidate":998244352,"saved":52428800},
+    "physical_sampled_peak_bytes_ordered":{"control":[29939990528,28914483200,22814916608],"candidate":[29887561728,28862054400,22762487808],"sample_resolution":1048576,"scope":"whole owned action including load, not a per-kernel or MPS-client-only peak"},
+    "fallback_price_fixture_bytes":{"MMQ_off":991629824,"MMQ_on":938545664,"fused_off":991629824,"fused_on":991629824}
+  },
+  "performance": {
+    "initial_pair":{"ttft_ms":[5088.208771,5128.696957],"prefill_ms":[5044,5072]},
+    "final_pair":{"input_tokens":8192,"ttft_ms":[5081.061735,5130.596054],"fresh_prefill_ms":[5037,5087],"http_complete_s":[5.151154402,5.200495419],"ttft_regression_pct":0.9748812666217077,"prefill_regression_pct":0.9926543577526203},
+    "initial_source_mmq_fixture_T2048_K10_E512_ms":{"SM70_preparation_gather_FFN":[16.617472,17.062912],"SM70_preparation_products":[12.790784,13.211648],"SM86_preparation_gather_FFN":[8.727552,8.888320],"SM86_preparation_products":[5.015552,4.912128]},
+    "final_model_full_chunk_mean_preparation_FFN_phase_ms_ordered":{"control":[18.26889331301667,27.20541648215789,9.981727999925925],"candidate":[18.769222389815,27.67952846206316,10.793596439444444],"regression_pct":[2.7386939549416622,1.7427117141037174,8.133546010515857]},
+    "observer_scope":"three matched full chunks per GPU; separate same-GPU phase envelopes including preparation/GEMM/FFN, not individual kernel times or a cross-device critical-path sum; partial chunk and verification edge remain inside full request TTFT",
+    "heldout":"not run because primary and final source were not promising; no promotion or positive speed claim"
+  },
+  "safety":"exclusive machine windows, all model runs cleanly stopped; no safety/telemetry failure or numerical mismatch; reserve/thermal/power/MPS limits unchanged",
+  "limitations":["HIP/SYCL toolchains unavailable (hipcc/icpx/dpcpp absent); those backends' new indexed route is disabled", "DS4/D2S6 not exercised by the actual D4 pack/build", "no long-context, broad distributional or concurrency qualification"],
+  "failed_evidence":"parser-diagnosis.json preserves a successful model run's offline FIRST-vs-COMMITTED format-reader failure; first dump is headerless. Recovered by reading the original raw bytes, not rerunning/relabeling the engine. final/fixture-preflight-refusal.json preserves one missing artifact-directory preflight, before GPU work.",
+  "rollback":"leave STRATA_PREFILL_MMQ_INDEXED unset/0 for expanded MMQ; use adopted control binary. Do not substitute native or WMMA arithmetic. Daily profile unchanged; no push performed.",
+  "evidence_root":"/home/joshkirklin/strata-workspace/scratch/1cat-219",
+  "key_receipts":["plan.json","20261013T044651-build-record.json","20261013T051729-build-record.json","summary-r1.json","final/summary-f1.json","final/20261013T054105-exact-record.json","final/20261013T054105-allocation-prices.json","final/latency/control/physical-vram.json","final/latency/candidate/physical-vram.json","final/first/exact-comparison-f1.json","final/committed/exact-comparison-f1.json","final/complete.json"],
+  "commands": {
+    "initial_build":"/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 219 --purpose 'Pinned SM70+SM86 indexed default-MMQ candidate and exact fixture' --max-s 1800 -- /usr/bin/python3 /home/joshkirklin/strata-workspace/scratch/1cat-219/build.py",
+    "final_build":"/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 219 --purpose 'Final indexed MMQ fused-fallback lifetime guard, keeping original evidence binary intact' --max-s 1800 -- /usr/bin/python3 /home/joshkirklin/strata-workspace/scratch/1cat-219/build.py /home/joshkirklin/strata-workspace/scratch/1cat-219-final-bin",
+    "final_campaign":"/usr/bin/python3 /home/joshkirklin/strata-workspace/scratch/1cat-219/final_campaign.py (each actual window/child command recorded in final/queue-*.json)",
+    "final_analysis":"/usr/bin/python3 /home/joshkirklin/strata-workspace/scratch/1cat-219/analyze.py /home/joshkirklin/strata-workspace/scratch/1cat-219/final f1",
+    "configure_details":"20261013T051729-build-record.json retains exact CUDA12.9.86 Release make-j4, architectures70;86, experimentalSM60, local pinned ggml and compiler/AR/RANLIB pins. Extra build flag is STRATA_MMQ_INPUT_INDEX; runtime output-directory relocation only preserves the initial binary."
+  }
+}
