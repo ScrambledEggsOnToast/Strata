@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <type_traits>
 
 namespace strata::kernels {
@@ -769,6 +770,126 @@ __device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint3
 #endif
 }
 
+// #218: Page4 union + per-query nibble masks, inspired by 1Cat-vLLM PR #387 at
+// be3722bc095b9792bf9833068595f0b1ef70ad37 (Apache-2.0). Independently implemented for Strata's 12 heads/KV head,
+// int8 K / q4_0 V and unchanged per-row arithmetic; no donor code or six-head/FP16 layout is copied.
+constexpr int GROUP70 = 8, HASH70 = 2048;
+struct alignas(16) GroupCell70 {
+    int8_t k[HD];
+    __half v[HD];
+    uint16_t ks[4];
+    uint16_t padding[4];
+};
+static_assert(sizeof(GroupCell70) == 784, "aligned int8 K + FP16 V + four K scales");
+struct GroupHeader70 { int pages, enabled, selected, reserved; };
+struct GroupCache70 {
+    unsigned char* base;
+    size_t stride;
+    int limit, cap, n_kv;
+    __device__ GroupHeader70* header(int group) const {
+        return reinterpret_cast<GroupHeader70*>(base + (size_t) group * stride);
+    }
+    __device__ int32_t* pages(int group) const { return reinterpret_cast<int32_t*>(header(group) + 1); }
+    __device__ uint32_t* masks(int group) const { return reinterpret_cast<uint32_t*>(pages(group) + limit); }
+    __device__ int32_t* map(int group) const { return reinterpret_cast<int32_t*>(masks(group) + limit); }
+    __device__ GroupCell70* cells(int group) const {
+        const size_t bytes = (sizeof(GroupHeader70) + (size_t) limit * 8 + (size_t) GROUP70 * cap * 4 + 15) & ~size_t(15);
+        return reinterpret_cast<GroupCell70*>(base + (size_t) group * stride + bytes);
+    }
+};
+
+__global__ void group_pages70_plan(const int32_t* ids, const int32_t* steps, const int32_t* table,
+                                   int page_size, GroupCache70 cache) {
+    __shared__ int keys[HASH70], slots[HASH70], count, bad, selected;
+    __shared__ uint32_t masks[HASH70];
+    const int t = threadIdx.x, group = blockIdx.x, q0 = group * GROUP70;
+    if (t == 0) { count = bad = selected = 0; *cache.header(group) = {}; }
+    for (int i = t; i < HASH70; i += blockDim.x) { keys[i] = -1; slots[i] = -1; masks[i] = 0; }
+    __syncthreads();
+    if (t < GROUP70) {
+        const int* step = steps + (size_t) (q0 + t) * kStepCount;
+        const int pos = steps[(size_t) q0 * kStepCount + kStepPos];
+        if (step[kStepPos] != pos + t || step[kStepNKv] != step[kStepPos] + 1 ||
+            step[kStepWidth] < 0 || step[kStepWidth] > cache.cap)
+            atomicExch(&bad, 1);
+        else atomicAdd(&selected, step[kStepWidth]);
+    }
+    __syncthreads();
+    for (int i = t; i < GROUP70 * cache.cap; i += blockDim.x) {
+        const int row = i / cache.cap, at = i % cache.cap;
+        const int* step = steps + (size_t) (q0 + row) * kStepCount;
+        if (bad || at >= step[kStepWidth]) continue;  // never read invalid selection padding
+        const int cell = ids[(size_t) (q0 + row) * cache.cap + at];
+        if (cell < 0 || cell >= step[kStepNKv]) { atomicExch(&bad, 1); continue; }
+        if (table[cell / page_size] < 0) { atomicExch(&bad, 1); continue; }
+        const int page = cell / 4;
+        int slot = (uint32_t(page) * 2654435761u) & (HASH70 - 1);
+        for (int probe = 0; probe < HASH70; ++probe) {
+            const int old = atomicCAS(keys + slot, -1, page);
+            if (old == -1 || old == page) {
+                if (old == -1 && atomicAdd(&count, 1) >= cache.limit) atomicExch(&bad, 1);
+                atomicOr(masks + slot, 1u << (row * 4 + (cell & 3)));
+                break;
+            }
+            slot = (slot + 1) & (HASH70 - 1);
+        }
+    }
+    __syncthreads();
+    // Union bound and a conservative traffic gate: dequantizing/loading fewer than half the selected cells.
+    // Oversized/low-overlap groups use the original gather; the planner never truncates a query's selection.
+    if (bad || count * 4 * 2 >= selected) return;
+    if (t == 0) { cache.header(group)->pages = count; cache.header(group)->selected = selected; count = 0; }
+    __syncthreads();
+    for (int i = t; i < HASH70; i += blockDim.x) {
+        if (keys[i] < 0) continue;
+        const int out = atomicAdd(&count, 1);
+        slots[i] = out;
+        cache.pages(group)[out] = keys[i];
+        cache.masks(group)[out] = masks[i];
+    }
+    __syncthreads();
+    for (int i = t; i < GROUP70 * cache.cap; i += blockDim.x) {
+        const int row = i / cache.cap, at = i % cache.cap;
+        if (at >= steps[(size_t) (q0 + row) * kStepCount + kStepWidth]) continue;
+        const int cell = ids[(size_t) (q0 + row) * cache.cap + at], page = cell / 4;
+        int slot = (uint32_t(page) * 2654435761u) & (HASH70 - 1);
+        while (keys[slot] != page) slot = (slot + 1) & (HASH70 - 1);
+        cache.map(group)[i] = slots[slot] * 4 + (cell & 3);
+    }
+    __syncthreads();
+    if (t == 0) cache.header(group)->enabled = 1;
+}
+
+__global__ void group_pages70_gather(QsaAttnPools p, int page_size, GroupCache70 cache) {
+    const int group = blockIdx.z, kvh = blockIdx.y;
+    if (!cache.header(group)->enabled) return;
+    const int page0 = blockIdx.x * (CH / 4), t = threadIdx.x;
+    constexpr int BLKS = HD / QK4_0, BYTES = BLKS * sizeof(block_q4_0);
+    for (int i = t; i < CH * BLKS; i += blockDim.x) {
+        const int c = i / BLKS, b = i % BLKS, pi = page0 + c / 4, tail = c & 3;
+        if (pi >= cache.header(group)->pages) continue;
+        const uint32_t mask = cache.masks(group)[pi];
+        // Only selected cells are loaded. A partial/causal page cannot expose its unselected neighbours.
+        if (!(mask & (0x11111111u << tail))) continue;
+        const int cell = cache.pages(group)[pi] * 4 + tail;
+        const long long page = p.page_table[cell / page_size];
+        const long long r = (page * cache.n_kv + kvh) * page_size + cell % page_size;
+        GroupCell70& dst = cache.cells(group)[(size_t) (pi * 4 + tail) * cache.n_kv + kvh];
+        *reinterpret_cast<uint4*>(dst.k + b * QK4_0) =
+            __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD + b * QK4_0));
+        *reinterpret_cast<uint4*>(dst.k + b * QK4_0 + 16) =
+            __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD + b * QK4_0 + 16));
+        if (b < 4) dst.ks[b] = p.k_scale[r * 4 + b];
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + r * BYTES) + b;
+        const float d = __half2float(__ushort_as_half(blk->d));
+#pragma unroll
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            dst.v[b * QK4_0 + j] = __float2half_rn((float) ((int) (blk->qs[j] & 0x0F) - 8) * d);
+            dst.v[b * QK4_0 + j + QK4_0 / 2] = __float2half_rn((float) ((int) (blk->qs[j] >> 4) - 8) * d);
+        }
+    }
+}
+
 template <int KV_MODE>
 struct Smem70 {
     using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
@@ -790,12 +911,12 @@ struct Smem70 {
     long long row[CH];
 };
 
-template <int KV_MODE>
+template <int KV_MODE, bool GROUPED = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                   const int32_t* __restrict__ ids,
                                                                   const int32_t* __restrict__ steps, int n_kv_heads,
                                                                   int page_size, float scale_log2,
-                                                                  float* __restrict__ attn, int cap) {
+                                                                  float* __restrict__ attn, int cap, GroupCache70 cache) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem70<KV_MODE>& S = *reinterpret_cast<Smem70<KV_MODE>*>(smem_raw);
     const int qi = blockIdx.x, kvh = blockIdx.y;
@@ -805,6 +926,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
     ids += (size_t) qi * cap;
     const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const bool cached = GROUPED && cache.header(qi / GROUP70)->enabled;
     const int qp = (lane >> 2) & 3, jj = (lane & 3) + 4 * (lane >> 4);   // quad-pair, thread within it
     const int crow = (lane & 1) + 4 * (lane >> 4);                        // C row of register 0 (+2 per register pair)
     const int ccol = lane & 2;                                           // C column of register 0 (+4 per half, +1 per reg)
@@ -843,9 +965,15 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         if (t < CH) {
             long long r = -1;
             if (t < nh) {
-                const int cell = ids[c0 + t];
-                const long long page = (long long) p.page_table[cell / page_size];
-                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if (cached) {
+                    r = cache.map(qi / GROUP70)[(qi % GROUP70) * cap + c0 + t];
+                    const uint32_t mask = cache.masks(qi / GROUP70)[r / 4];
+                    if (!(mask & (1u << ((qi % GROUP70) * 4 + (r & 3))))) r = -1;
+                } else {
+                    const int cell = ids[c0 + t];
+                    const long long page = (long long) p.page_table[cell / page_size];
+                    r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
             }
             S.row[t] = r;
         }
@@ -859,7 +987,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                 const long long r = S.row[c];
                 uint4 kx = make_uint4(0, 0, 0, 0);
                 if (r >= 0) {
-                    if constexpr (KV_MODE == 0)
+                    if (cached)
+                        kx = __ldg(reinterpret_cast<const uint4*>(cache.cells(qi / GROUP70)[r * n_kv_heads + kvh].k) + pc);
+                    else if constexpr (KV_MODE == 0)
                         kx = __ldg(reinterpret_cast<const uint4*>(p.k_pool + r * HD) + pc);
                     else   // modes 1 and 3: the K side is INT8
                         kx = __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);
@@ -874,7 +1004,11 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                     const long long r = S.row[c];
 #pragma unroll
                     for (int j = 0; j < QK4_0; ++j) S.v[c][b * QK4_0 + j] = __half(0);
-                    if (r >= 0) {
+                    if (r >= 0 && cached) {
+#pragma unroll
+                        for (int j = 0; j < QK4_0; ++j)
+                            S.v[c][b * QK4_0 + j] = cache.cells(qi / GROUP70)[r * n_kv_heads + kvh].v[b * QK4_0 + j];
+                    } else if (r >= 0) {
                         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + r * BYTES) + b;
                         const float d = __half2float(__ushort_as_half(blk->d));
 #pragma unroll
@@ -909,7 +1043,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                         a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
                         b = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
                     } else if constexpr (KV_MODE == 3) {   // K as int8, V dequantized to fp16 (scale 1)
-                        a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                        const uint16_t sc = cached ? cache.cells(qi / GROUP70)[r * n_kv_heads + kvh].ks[g]
+                                                   : p.k_scale[r * (HD / KV_Q8_GROUP) + g];
+                        a = __half2float(__ushort_as_half(sc));
                         b = 1.0f;
                     } else {
                         a = b = 1.0f;
@@ -1108,7 +1244,7 @@ bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         prompt_attn_v70_kernel<KV_MODE><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
             q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, {});
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -1117,10 +1253,61 @@ bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
     }
     return true;
 }
+
+bool launch_group70(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                    const QsaShapes& s, float* attn, int64_t n_q,
+                    void* workspace, uint64_t workspace_bytes, cudaStream_t st) {
+    if (!workspace || (reinterpret_cast<uintptr_t>(workspace) & 15) || n_q < GROUP70 ||
+        cap > 2051 || s.n_head_kv != 2 || s.page_size < 4 || s.page_size % 4) return false;
+    // The compact real prompt's sparse groups reached ~1.66x one row's pages; bound at 2x without new storage.
+    const int limit = 2 * (((int) cap + 3) / 4);
+    const size_t metadata = (sizeof(GroupHeader70) + (size_t) limit * 8 + (size_t) GROUP70 * cap * 4 + 15) & ~size_t(15);
+    const size_t stride = metadata + (size_t) limit * 4 * s.n_head_kv * sizeof(GroupCell70);
+    const int groups = (int) std::min<uint64_t>(workspace_bytes / stride, std::min<int64_t>(n_q / GROUP70, 8191));
+    if (groups < 1) return false;
+    static bool attr[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    const int bytes = (int) sizeof(Smem70<3>);
+    if (!attr[dev]) {
+        if (cudaFuncSetAttribute(prompt_attn_v70_kernel<3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr[dev] = true;
+    }
+    GroupCache70 cache{static_cast<unsigned char*>(workspace), stride, limit, (int) cap, (int) s.n_head_kv};
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    const int64_t full = n_q / GROUP70 * GROUP70;
+    for (int64_t q0 = 0; q0 < full; q0 += (int64_t) groups * GROUP70) {
+        const int ng = (int) std::min<int64_t>(groups, (full - q0) / GROUP70);
+        group_pages70_plan<<<ng, THREADS, 0, st>>>(ids + q0 * cap, steps + q0 * kStepCount, pools.page_table,
+                                                   (int) s.page_size, cache);
+        group_pages70_gather<<<dim3((unsigned) ((limit + CH / 4 - 1) / (CH / 4)),
+                                   (unsigned) s.n_head_kv, (unsigned) ng), THREADS, 0, st>>>(pools, (int) s.page_size, cache);
+        prompt_attn_v70_kernel<3, true><<<dim3((unsigned) ng * GROUP70, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, cache);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (sm_70 grouped pages): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    // The final <8 rows keep the original path; they never read an incomplete group's cache.
+    return full == n_q || launch70<3>(q + full * s.n_head * HD, pools, ids + full * cap, steps + full * kStepCount,
+                                     cap, s, attn + full * s.n_head * HD, n_q - full, st);
+}
 #else   // AMD, or a build without STRATA_EXPERIMENTAL_SM60: no m8n8k4 kernel (the caller keeps the old one)
 template <int KV_MODE>
 bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
               int64_t, cudaStream_t) {
+    return false;
+}
+bool launch_group70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
+                    int64_t, void*, uint64_t, cudaStream_t) {
     return false;
 }
 #endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
@@ -1451,7 +1638,8 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
+                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q,
+                           void* workspace, uint64_t workspace_bytes, void* stream) {
     if (n_q <= 0) return true;
     bool volta = false, turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
@@ -1504,7 +1692,12 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
         if (!pools.k_scale) return false;
-        if (volta) return launch70<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
+        if (volta) {
+            const char* group = std::getenv("STRATA_PROMPT_GROUP_PAGES");
+            if (group && !std::strcmp(group, "1") &&
+                launch_group70(q, pools, ids, steps, cap, s, attn, n_q, workspace, workspace_bytes, st)) return true;
+            return launch70<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
+        }
         return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr) {

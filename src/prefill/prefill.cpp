@@ -834,6 +834,8 @@ struct Prefill::Impl {
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
+    void* page_workspace = nullptr;
+    uint64_t page_workspace_bytes = 0;
     // MoE
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
@@ -1358,6 +1360,13 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
+        // #218: selection has finished before attention; reuse the larger already-priced scratch allocation.
+        const uint64_t select_bytes = (uint64_t) m.sel_batch * m.max_blocks * sizeof(float);
+        const uint64_t decode_bytes = (uint64_t) m.attn_batch *
+            strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * sizeof(float);
+        m.page_workspace = select_bytes >= decode_bytes ? static_cast<void*>(m.sel_scores)
+                                                       : static_cast<void*>(m.attn_scratch);
+        m.page_workspace_bytes = std::max(select_bytes, decode_bytes);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
@@ -3569,8 +3578,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    // #218 borrows dead-after-selection scratch on this stream, already counted/carved by
+                    // qsa_set_bytes. Every stage keeps its own simultaneous workspace; no new residency cost.
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
+                                                                            m.attn, T, m.page_workspace,
+                                                                            m.page_workspace_bytes, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,

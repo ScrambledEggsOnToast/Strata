@@ -39,8 +39,15 @@ template <typename T> T* up(const std::vector<T>& h) {
 }
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
+void group_flag(bool on) {
+#if defined(_WIN32)
+    _putenv_s("STRATA_PROMPT_GROUP_PAGES", on ? "1" : "0");
+#else
+    setenv("STRATA_PROMPT_GROUP_PAGES", on ? "1" : "0", 1);
+#endif
+}
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0, 3 K8V4
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
     if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
         int dev = 0, major = 0;
@@ -53,7 +60,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
 #endif
-    const k::QsaShapes s = k::qsa_real_shapes();
+    k::QsaShapes s = k::qsa_real_shapes();
+    if (const char* ps = std::getenv("QA_PAGE")) s.page_size = std::atoll(ps);
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
     std::mt19937 rng(1234 + fmt);
@@ -65,19 +73,27 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     std::vector<uint16_t> ks, vs, kh, vh;
     std::vector<uint8_t> k4, v4;   // q4_0: 8 blocks of {fp16 d, 16 code bytes} per row (kv_q4.hpp)
     constexpr int64_t B4 = 18, ROW4 = 8 * B4;
-    if (fmt == 2) {
+    if (fmt == 2 || fmt == 3) {
         std::uniform_int_distribution<int> byte(0, 255);
         // the scales as a q4_0 pool holds them: signed (ggml's d = max / -8) and spread over two decades, so a chunk's
         // cells mix signs and magnitudes (a positive-only bound on them overflowed FP16 on real K/V)
         std::uniform_real_distribution<float> lg(std::log(0.01f), std::log(1.0f));
         auto sc4 = [&](std::mt19937& r) { return std::exp(lg(r)) * (byte(r) & 1 ? -1.0f : 1.0f); };
-        k4.resize(rows * ROW4); v4.resize(rows * ROW4);
-        for (auto* pool : {&k4, &v4})
+        if (fmt == 2) k4.resize(rows * ROW4);
+        v4.resize(rows * ROW4);
+        for (auto* pool : {&k4, &v4}) {
+            if (pool->empty()) continue;
             for (int64_t b = 0; b < rows * 8; ++b) {
                 const uint16_t d = f2h(sc4(rng));
                 std::memcpy(pool->data() + b * B4, &d, 2);
                 for (int j = 0; j < 16; ++j) (*pool)[b * B4 + 2 + j] = (uint8_t) byte(rng);
             }
+        }
+        if (fmt == 3) {
+            kq.resize(rows * HD); ks.resize(rows * 4);
+            for (auto& x : kq) x = (int8_t) code(rng);
+            for (auto& x : ks) x = f2h(sc(rng));
+        }
     } else if (fmt == 1) {
         kq.resize(rows * HD); vq.resize(rows * HD); ks.resize(rows * 4); vs.resize(rows * 4);
         for (auto& x : kq) x = (int8_t) code(rng);
@@ -102,6 +118,9 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int64_t pos = ctx - nq + i, nkv = pos + 1;
         const int64_t w = k::qsa_selection_width(nkv, s);
         int32_t* sel = ids.data() + i * cap;
+        steps[i * k::kStepCount + k::kStepPos] = (int32_t) pos;
+        steps[i * k::kStepCount + k::kStepNKv] = (int32_t) nkv;
+        steps[i * k::kStepCount + k::kStepNBid] = (int32_t) (nkv / s.idx_block);
         steps[i * k::kStepCount + k::kStepWidth] = (int32_t) w;
         if (w == nkv) {
             for (int64_t c = 0; c < w; ++c) sel[c] = (int32_t) c;
@@ -144,9 +163,26 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 std::copy(v.begin(), v.end(), ids.data() + i * cap);
                 continue;
             }
-            const int64_t base = mode == 1 ? 0 : std::min<int64_t>(i / 4 * 64, nkv - w);
+            const int64_t base = mode == 1 ? 0 : mode == 5 ? (i % 8) * w
+                                                           : std::min<int64_t>(i / 4 * 64, nkv - w);
+            if (base + w > nkv) { std::fprintf(stderr, "QA_SAME disjoint fixture exceeds causal history\n"); std::exit(2); }
             for (int64_t c = 0; c < w; ++c) ids[i * cap + c] = (int32_t) (base + c);
         }
+    }
+    // Reuse the selection fixtures above, adding ragged widths/causal tails and poisoned unused cells.
+    // QA_GROUP_BOUNDS=2 also makes an actively selected page nonresident: the original per-row path must run.
+    if (const char* bounds = std::getenv("QA_GROUP_BOUNDS")) {
+        for (int64_t i = 0; i < nq; ++i) {
+            const int64_t nkv = ctx - nq + i + 1;
+            const int64_t w = std::min<int64_t>(nkv, std::max<int64_t>(1, cap - i % 7));
+            steps[i * k::kStepCount + k::kStepWidth] = (int32_t) w;
+            for (int64_t c = 0; c < w; ++c)
+                ids[i * cap + c] = (int32_t) c;
+            if (w >= 4)
+                for (int64_t c = w - 4; c < w; ++c) ids[i * cap + c] = (int32_t) (nkv - (w - c));
+            std::fill(ids.begin() + i * cap + w, ids.begin() + (i + 1) * cap, INT32_MIN);
+        }
+        if (std::atoi(bounds) == 2) table[0] = -1;
     }
     // QA_DUMP=<file> QA_LAYER=n (S23 probe): the engine's own selections (STRATA_QSA_DUMP records {layer, pos0, T, cap} +
     // T*cap cells): the last record of that layer, whose T must be nq and pos0 + T ctx
@@ -184,6 +220,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     k::QsaAttnPools pl;
     if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
+    else if (fmt == 3) { pl.k_q = up(kq); pl.k_scale = up(ks); pl.v_q4 = up(v4); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
     // nibble of byte j - 16, minus 8, times the block's scale
@@ -210,13 +247,78 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
+        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq,
+                                    scratch, batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4, nullptr)) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
             std::exit(2);
         }
     };
     old_run();
     new_run();
+    bool exact_group = true, isolated = true;
+    float ms_row = 0;
+    if (fmt == 3) {
+        ck(cudaDeviceSynchronize(), "before grouped comparison");
+        std::vector<float> row((size_t) (nq * NH * HD)), grouped(row.size());
+        group_flag(false);
+        new_run();
+        ck(cudaMemcpy(row.data(), d_new, row.size() * 4, cudaMemcpyDeviceToHost), "row control");
+        cudaEvent_t a, b;
+        ck(cudaEventCreate(&a), "event"); ck(cudaEventCreate(&b), "event");
+        ck(cudaEventRecord(a), "event");
+        for (int r = 0; r < reps; ++r) new_run();
+        ck(cudaEventRecord(b), "event"); ck(cudaEventSynchronize(b), "event");
+        ck(cudaEventElapsedTime(&ms_row, a, b), "event");
+        cudaEventDestroy(a); cudaEventDestroy(b);
+        group_flag(true);
+        new_run();
+        ck(cudaMemcpy(grouped.data(), d_new, grouped.size() * 4, cudaMemcpyDeviceToHost), "grouped");
+        exact_group = !std::memcmp(row.data(), grouped.data(), row.size() * 4);
+        // Two independent request page tables, streams, outputs and scratch arenas. Logical IDs deliberately
+        // collide while mapping to different physical data; a global cache keyed only by cell would fail.
+        auto second_table = table;
+        std::reverse(second_table.begin(), second_table.end());
+        k::QsaAttnPools second = pl;
+        second.page_table = up(second_table);
+        float *out2 = nullptr, *scratch2 = nullptr;
+        const uint64_t bytes = batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4;
+        ck(cudaMalloc(&out2, row.size() * 4), "second output");
+        ck(cudaMalloc(&scratch2, bytes), "second workspace");
+        std::vector<float> reference2(row.size()), got2(row.size());
+        group_flag(false);
+        if (!k::qsa_prompt_attn_batch(d_q, second, d_ids, d_steps, cap, s, out2, nq, scratch2, bytes, nullptr))
+            std::exit(2);
+        ck(cudaMemcpy(reference2.data(), out2, row.size() * 4, cudaMemcpyDeviceToHost), "second row control");
+        cudaStream_t stream1, stream2;
+        ck(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking), "stream");
+        ck(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking), "stream");
+        group_flag(true);
+        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, scratch, bytes, stream1) ||
+            !k::qsa_prompt_attn_batch(d_q, second, d_ids, d_steps, cap, s, out2, nq, scratch2, bytes, stream2))
+            std::exit(2);
+        ck(cudaStreamSynchronize(stream1), "stream"); ck(cudaStreamSynchronize(stream2), "stream");
+        ck(cudaMemcpy(grouped.data(), d_new, row.size() * 4, cudaMemcpyDeviceToHost), "first request");
+        ck(cudaMemcpy(got2.data(), out2, row.size() * 4, cudaMemcpyDeviceToHost), "second request");
+        isolated = !std::memcmp(row.data(), grouped.data(), row.size() * 4) &&
+                   !std::memcmp(reference2.data(), got2.data(), row.size() * 4);
+        cudaStreamDestroy(stream1); cudaStreamDestroy(stream2);
+        cudaFree(out2); cudaFree(scratch2); cudaFree((void*) second.page_table);
+        std::printf("GROUP70 exact off/on %s, request/stream isolation %s, row %.3f ms\n",
+                    exact_group ? "PASS" : "FAIL", isolated ? "PASS" : "FAIL", ms_row / reps);
+        int dev = 0, major = 0, minor = 0;
+        ck(cudaGetDevice(&dev), "device");
+        ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cc");
+        ck(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev), "cc");
+        if (major == 7 && minor == 0 && nq >= 8 && PS >= 4 && PS % 4 == 0) {
+            int header[4];
+            ck(cudaMemcpy(header, scratch, sizeof(header), cudaMemcpyDeviceToHost), "group metadata");
+            std::printf("GROUP70 last-batch first group: union pages %d, cache enabled %d, selected cells %d\n",
+                        header[0], header[1], header[2]);
+            const char* same = std::getenv("QA_SAME"), *bounds = std::getenv("QA_GROUP_BOUNDS");
+            if (((same && std::atoi(same) == 1) || (bounds && std::atoi(bounds) == 1)) && !header[1])
+                exact_group = false;  // a fallback-only run cannot qualify the cache path
+        }
+    }
     ck(cudaDeviceSynchronize(), "run");
     std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size());
     ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
@@ -239,8 +341,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 2 ? q4v(k4, row, d)
-                                      : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
+                    const double kv = row < 0 ? 0.0 : fmt == 2 ? q4v(k4, row, d)
+                                      : (fmt == 1 || fmt == 3) ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
                 }
                 sco[c] = a / 16.0;
@@ -252,7 +354,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                    const double vv = row < 0 ? 0.0 : fmt == 2 ? q4v(v4, row, d)
+                                      : fmt == 3 ? h2f(f2h((float) q4v(v4, row, d)))
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
@@ -285,12 +388,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = diff <= 1e-4 * scale;
+    // Mode 3's existing independent hybrid regression has a 1e-2 absolute bound (kv_hybrid_parity).
+    // Arithmetic preservation itself is exact against the current tensor-core row kernel, not that bound.
+    const bool ok1 = fmt == 3 ? err_new < 1e-2 : err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
+    const bool ok2 = fmt == 3 ? exact_group && isolated : diff <= 1e-4 * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
+                ok1 && ok2 ? "PASS" : "FAIL", fmt == 3 ? "K8V4" : fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
+    if (fmt == 3) std::printf("GROUP70 timed row %.3f -> complete planner/gather/attention %.3f ms (%.3fx)\n",
+                             ms_row / reps, ms_new / reps, ms_row / ms_new);
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
     cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
@@ -321,12 +428,15 @@ int main(int argc, char** argv) {
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
+    if (const char* format = std::getenv("QA_FMT")) return run(std::atoi(format), ctx, nq, reps);
     int fails = 0;
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
     fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
+    fails += run(3, ctx, nq, reps);
+    fails += run(3, 1500, std::min<int64_t>(nq, 17), reps);
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge

@@ -5,7 +5,7 @@
 // kernel. At 32K that is 21% of the prompt (5.6 s of 26 s on a 5070, Q2_0, int8 KV), and it is limited by
 // instruction issue, not memory (~150 GB/s of logical reads, 3.4 TFLOP/s).
 //
-// This kernel keeps the same per-query selection (no masking, no union) and reads the same pools, but:
+// The default kernel keeps the same per-query selection and reads the same pools:
 //   * one block per (query, KV head) walks all its selected cells in chunks of 32 with an online softmax: no
 //     split-K scratch and no merge kernel;
 //   * q.k and p.v are m16n8k16 FP16 MMAs with FP32 accumulation over the 12 query heads of the KV head (+4 pad rows);
@@ -24,9 +24,14 @@
 
 namespace strata::kernels {
 
-/// Same arguments and output as `qsa_decode_attn_batch` minus the scratch. Returns false (nothing launched) when the
-/// geometry is not 24 heads / 2 KV heads / 256: the caller then uses the old kernel.
+/// Same arguments and output as `qsa_decode_attn_batch`. Returns false (nothing launched) when the geometry is
+/// unsupported. `workspace` is optional borrowed device storage, exclusively owned by this call's stream until
+/// its work completes; nullptr/0 keeps the per-row path. It must not alias inputs or outputs.
+/// STRATA_PROMPT_GROUP_PAGES=1 opts SM70 K8V4 into eight-query Page4 gather/dequant reuse. Each call owns one
+/// request's page table: groups never span calls, requests or streams. All planning/cache storage fits inside the
+/// supplied workspace; no allocation, expert eviction, precision change or selected-cell reordering.
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
+                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q,
+                           void* workspace, uint64_t workspace_bytes, void* stream);
 
 }  // namespace strata::kernels

@@ -94,6 +94,31 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**Shared sparse Page4 loads (SM70 experiment, default off):** `STRATA_PROMPT_GROUP_PAGES=1` lets K8V4 prompt
+attention plan eight adjacent queries from one request, union their selected four-cell pages and keep one
+four-bit visibility nibble per query. It gathers int8 K/scales and dequantizes q4_0 V once per selected union
+cell, then feeds the existing twelve-heads-per-KV-head row kernel in its original selected-cell/chunk order.
+The separate hi/lo MMA chains and softmax reduction are unchanged. No cache requantization, routing change,
+larger prompt chunk or cross-request cache is introduced; SM86 dispatch is unchanged.
+
+The planner, page IDs/masks, exact row-to-cache maps and aligned K/V cache all reuse the larger of the
+already-priced selection/decode scratch allocations on the owning prefill stream. Stages keep independent
+simultaneous arenas; there is no new device allocation or expert-residency credit. Per eight-query group the
+bound is `2*ceil(cap/4)` union pages; metadata is `align16(16 + pages*8 + 8*cap*4)` bytes and cached cells
+are `pages*4*kv_heads*784` bytes. The launch batches only as many groups as that arena holds. Union overflow,
+less than twofold estimated load reuse, nonresident pages or non-adjacent step state keep the original
+per-row gather. The final fewer-than-eight rows, missing/undersized workspace and unsupported shapes keep
+the original row launch. Omit the switch or set it to `0` for rollback/control.
+
+This is an independently implemented experiment inspired by
+[1Cat-vLLM PR #387](https://github.com/1CatAI/1Cat-vLLM/pull/387) at
+`be3722bc095b9792bf9833068595f0b1ef70ad37`, not a port of its six-head FP16/E4M3 arithmetic or its
+8192-token chunks. No local gain or adoption is implied. `qsa_prompt_attn_parity` includes K8V4 exact
+off/on checks, concurrent request/page-table/stream isolation and an independent FP64 check; its
+`QA_DUMP` input replays real selections. The `qsa_prompt_group_pages_*` tests cover overlapping/disjoint
+pages, poisoned selection padding, nonresident pages, ragged causal tails and seventeen-query counts.
+Use `QA_PAGE=1|16|512` for unsupported-page fallback and physical-page-boundary fixtures.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

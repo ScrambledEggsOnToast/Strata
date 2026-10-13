@@ -399,6 +399,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME qsa_prompt_group_pages_overlap COMMAND qsa_prompt_attn_parity 4096 17 2)
+      set_tests_properties(qsa_prompt_group_pages_overlap PROPERTIES
+                           ENVIRONMENT "QA_FMT=3;QA_SAME=1;QA_GROUP_BOUNDS=1" TIMEOUT 120)
+      add_test(NAME qsa_prompt_group_pages_disjoint COMMAND qsa_prompt_attn_parity 32768 17 2)
+      set_tests_properties(qsa_prompt_group_pages_disjoint PROPERTIES
+                           ENVIRONMENT "QA_FMT=3;QA_SAME=5" TIMEOUT 120)
+      add_test(NAME qsa_prompt_group_pages_nonresident COMMAND qsa_prompt_attn_parity 4096 17 2)
+      set_tests_properties(qsa_prompt_group_pages_nonresident PROPERTIES
+                           ENVIRONMENT "QA_FMT=3;QA_GROUP_BOUNDS=2" TIMEOUT 120)
+    endif()
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise
