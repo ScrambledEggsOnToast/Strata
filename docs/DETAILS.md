@@ -884,13 +884,32 @@ unattributed explicit first-use bytes are not called library allocations.
 Admission and complete-run high-water are retained on stderr before
 `DONE`/MTP `BDONE`, rather than relying on a frontend to preserve protocol
 stdout or run child destructors. The offline reconciliation also checks
-the incremental host heap/RSS envelope, not only device payloads.
+the isolated judge-phase host heap/RSS envelope, not only device payloads.
+After generation resumes, all additional observed allocations remain in
+the report and are checked against the complete generation-plus-judge
+ledger; they are not mislabeled as isolated judge first-use costs.
 Shared-library and driver allocations are not claimed as link-wrapped payloads.
 `STRATA_JUDGE_OWNERSHIP_PROBE=<bounded token CSV>` runs two fresh serial
 leases before `READY`, requires identical native-head bytes and verified
 generation restoration, then permits ordinary serving. This is an
 ownership/reconciliation seam, not a scoring transport, numerical
 qualification, throughput claim or deployment.
+
+The [#232 reconciliation](../bench/results/issue-232/reconciliation-r3-corrected.json)
+records 4,096-cell payloads of 75.07 / 71.38 / 40.57 MiB, including the
+last stage's head row and every canary. Cold shared-owner first use adds
+86.99 / 47.62 / 5.13 MiB of explicit device storage; the measured total
+MPS-budget increments are 203.06 / 159.99 / 56.75 MiB. The declared
+incremental device envelopes are 334 / 330 / 300 MiB, not the smaller
+session-only figures. Source-derived retained host payload is 128.48 MiB,
+with a separate 512-MiB first-use allowance and 1-MiB serial initialization
+transient; the isolated lane's observed heap increment is 588.51 MiB.
+The later generation-resume heap growth remains in the full joint ledger.
+All 24,576 pairs remained resident, two leases restored generation, and
+the matched fresh 1,024-token/8-output request preserved both text and
+reasoning digests. Full-context/four-concurrent execution and non-CUDA
+backends were not exercised. These are copied-profile measurements, not
+qualification of the daily configuration or an inference-speed claim.
 
 ### A declared MPS client ceiling
 

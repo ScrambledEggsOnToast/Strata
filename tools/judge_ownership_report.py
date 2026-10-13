@@ -133,17 +133,21 @@ def reconcile(control_path, candidate_path):
         report['stage_reconciliation'].append(entry)
     before_host = next((row for row in hosts if row.get('phase') == 'before-state-init'), None)
     ready_hosts = [row for row in hosts if row.get('phase') == 'lane-ready']
-    used_hosts = [row for row in hosts if row.get('phase') in ('first-use-complete', 'generation-resumed-final')]
+    judge_hosts = [row for row in hosts if row.get('phase') == 'first-use-complete']
+    generation_hosts = [row for row in hosts if row.get('phase') == 'generation-resumed-final']
+    used_hosts = judge_hosts + generation_hosts
     host_exact = host_priced = False
-    if before_host and ready_hosts and used_hosts and static and plans:
+    if before_host and ready_hosts and judge_hosts and generation_hosts and static and plans:
         derived_host = sum(integer(price, key) for price in static for key in
                            ('session_pinned_host', 'session_heap_host', 'canary_host', 'checkpoint_host', 'readback_host', 'metadata_host'))
         transient = max(integer(price, 'init_host_transient') for price in static)
         input_bytes = max(integer(price, 'cells') for price in static) * 8
         runtime_bound = integer(plans[-1], 'runtime_allowance')
         envelope = derived_host + transient + input_bytes + runtime_bound
-        heap_increment = max(integer(row, 'heap_live_bytes') for row in used_hosts) - integer(before_host, 'heap_live_bytes')
-        rss_increment = max(integer(row, 'rss_high_water_bytes') for row in used_hosts) - integer(before_host, 'rss_high_water_bytes')
+        # The incremental envelope is for the isolated judge phase. Generation's later
+        # first-use/checkpoint allocations retain their own charges in the joint ledger.
+        heap_increment = max(integer(row, 'heap_live_bytes') for row in judge_hosts) - integer(before_host, 'heap_live_bytes')
+        rss_increment = max(integer(row, 'rss_high_water_bytes') for row in judge_hosts) - integer(before_host, 'rss_high_water_bytes')
         expected_pinned = sum(integer(price, key) for price in static for key in ('session_pinned_host', 'canary_host'))
         pinned_increment = integer(ready_hosts[-1], 'pinned_live_bytes') - integer(before_host, 'pinned_live_bytes')
         joint_host = integer(plans[-1], 'guest_demand_bytes')
@@ -158,6 +162,12 @@ def reconcile(control_path, candidate_path):
             'measured_rss_high_water_increment_bytes': rss_increment, 'derived_incremental_pinned_bytes': expected_pinned,
             'measured_incremental_pinned_bytes': pinned_increment, 'matched_pinned_payload': host_exact,
             'combined_generation_judge_host_admission_bytes': joint_host, 'within_incremental_and_joint_envelopes': host_priced,
+            'incremental_measurement_scope': 'before-state-init through first-use-complete; ordinary generation is checked against the complete joint ledger',
+            'measured_full_run_host_heap_live_max_bytes': max(integer(row, 'heap_live_bytes') for row in used_hosts),
+            'measured_full_run_host_rss_high_water_bytes': max(integer(row, 'rss_high_water_bytes') for row in used_hosts),
+            'measured_full_run_host_heap_increment_bytes': max(integer(row, 'heap_live_bytes') for row in used_hosts) - integer(before_host, 'heap_live_bytes'),
+            'unattributed_generation_resume_heap_growth_bytes': max(integer(row, 'heap_live_bytes') for row in generation_hosts) - max(integer(row, 'heap_live_bytes') for row in judge_hosts),
+            'full_run_within_joint_admission': joint_fits,
             'sampling_limit': 'heap live is phase-sampled, not an allocator-wide transient peak; VmHWM is process-wide physical RSS high-water',
         }
     else:

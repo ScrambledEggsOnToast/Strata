@@ -67,6 +67,18 @@ class Reconciliation(unittest.TestCase):
         self.assertFalse(report['host_reconciliation']['within_incremental_and_joint_envelopes'])
         self.assertEqual(report['criteria']['static_ownership_ledger_reconciled'], 'reject')
 
+    def test_generation_growth_keeps_its_joint_ledger_charge(self):
+        control, candidate, lines = evidence()
+        lines = [line.replace('heap_live_bytes=1500', 'heap_live_bytes=35000')
+                 .replace('rss_high_water_bytes=1500', 'rss_high_water_bytes=35000')
+                 if 'generation-resumed-final' in line else line for line in lines]
+        report = self.report(control, candidate, lines)
+        self.assertEqual(report['disposition'], 'keep')
+        self.assertEqual(report['host_reconciliation']['unattributed_generation_resume_heap_growth_bytes'], 33500)
+        self.assertEqual(report['host_reconciliation']['measured_full_run_host_heap_live_max_bytes'], 35000)
+        lines = [line.replace('guest_demand_bytes=1000000', 'guest_demand_bytes=30000') for line in lines]
+        self.assertEqual(self.report(control, candidate, lines)['criteria']['static_ownership_ledger_reconciled'], 'reject')
+
     def test_empty_text_does_not_hide_reasoning_regression(self):
         control, candidate, lines = evidence()
         candidate['requests'][0]['reasoning_sha256'] = 'changed'
