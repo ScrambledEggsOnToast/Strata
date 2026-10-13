@@ -2646,7 +2646,7 @@ int main(int argc, char** argv) {
     const char* causal_prefix = std::getenv("STRATA_CROSS_HELP_CAPTURE");
     if (o.judge_context && (!o.serve || !o.no_prefill_borrow || o.prefill_auto || o.prefill_chunk <= 0 ||
         o.judge_context > o.max_context || o.kv_grow || o.vram_elastic || o.adapt_async || o.adapt_swaps != 0 ||
-        o.pipeline_windows || o.prefill_helpers || o.peer_device >= 0 || o.vision)) {
+        o.pipeline_windows > 0 || o.prefill_helpers || o.peer_device >= 0 || o.vision)) {
         std::fprintf(stderr, "strata judge: needs serial --serve, fixed --prefill, --no-prefill-borrow, "
                              "resident nonelastic KV, no adaptive/peer/helper/vision paths; generation geometry is never reduced\n");
         return 2;
@@ -10190,7 +10190,7 @@ int main(int argc, char** argv) {
             bindings.reserve(stages.size() + 1);
             for (size_t k = 0; k <= stages.size(); ++k) {
                 auto& cache = k == 0 ? xcache : stages[k - 1]->cache;
-                if (cache.bytes() != judge_generation_cache_bytes[k]) {
+                if (cache.bytes() <= 0 || (uint64_t)cache.bytes() != judge_generation_cache_bytes[k]) {
                     std::fprintf(stderr, "strata judge: concrete generation cache extent differs from the all-pair ledger\n"); return 1;
                 }
                 strata::program::JudgeStage stage;

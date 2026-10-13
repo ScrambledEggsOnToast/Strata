@@ -111,9 +111,12 @@ def reconcile(control_path, candidate_path):
     new = candidate.get('requests', [])
     fixtures_match = control.get('input', {}).get('token_ids_sha256') == candidate.get('input', {}).get('token_ids_sha256') and bool(control.get('input'))
     generations_match = bool(old and new and old[0].get('status') == new[0].get('status') == 200 and
-                             old[0].get('text') == new[0].get('text') and old[0].get('usage') == new[0].get('usage'))
+                             old[0].get('text_sha256') is not None and old[0].get('reasoning_sha256') is not None and
+                             old[0].get('text_sha256') == new[0].get('text_sha256') and
+                             old[0].get('reasoning_sha256') == new[0].get('reasoning_sha256') and
+                             old[0].get('usage') == new[0].get('usage'))
     geometry_kept = bool(capacity and capacity[-1].get('context') == '262144' and capacity[-1].get('batch_slots') == '4' and capacity[-1].get('prefill_chunk') == '2048')
-    report['generation_comparison'] = {'matched_frozen_input': fixtures_match, 'matched_response_text_and_usage': generations_match,
+    report['generation_comparison'] = {'matched_frozen_input': fixtures_match, 'matched_text_reasoning_digests_and_usage': generations_match,
                                      'configured_capacity_unchanged': geometry_kept,
                                      'exercised_prompt_tokens': 1024 if fixtures_match else None,
                                      'full_context_boundary_exercised': False, 'four_simultaneous_slots_exercised': False}
