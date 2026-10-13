@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "branch_id": "arithmetic-sanity-yes-no-D",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Question: What is 2 + 2?\nIs 6 the correct answer? Reply only Yes or No."
+    }
+  ],
+  "rendered_prompt": "<|im_start|>user\nQuestion: What is 2 + 2?\nIs 6 the correct answer? Reply only Yes or No.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "prompt_token_ids": [
+    248045,
+    846,
+    198,
+    14162,
+    25,
+    3437,
+    369,
+    220,
+    17,
+    478,
+    220,
+    17,
+    30,
+    198,
+    3742,
+    220,
+    21,
+    279,
+    4252,
+    4087,
+    30,
+    17308,
+    1132,
+    7179,
+    466,
+    2233,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+  ],
+  "token_digest": "4ba1e16f20e031234fc98c313dac4fe61a4c3bcd5b025b3fbdbfbfa1137dbe05",
+  "selected_token_ids": [
+    9175,
+    2665
+  ],
+  "prompt_contract": {
+    "template": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "enable_thinking": false,
+    "add_generation_prompt": true,
+    "reasoning_effort_injection": false,
+    "effort_at_end": false,
+    "template_fallback": false
+  },
+  "tokenizer_sha256": {
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+    "merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+    "token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+    "tokenizer.json": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"
+  },
+  "family": "per_option_yes_no_log_odds",
+  "declared_option": {
+    "id": "D",
+    "text": "6"
+  },
+  "evidence_role": "arithmetic sanity only, not issue-224 human gold or semantic screen"
+}

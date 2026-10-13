@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "claim_scope": "Fresh serial native CLI reference, not daily-profile equivalence or a performance/serving promotion",
+  "profile_difference_record": "profile-differences.json",
+  "runtime": {
+    "engine_mode": "serial_solo",
+    "request_path": "Standalone --score-reference consumes its CLI-bound token file through the ordinary serial serve prompt reader plus final sampling-disabled input-token window, then exits before decode.",
+    "prompt_path": "Pack ChatTemplate directly, frozen thinking/generation flags and literal-token protection; no HTTP/frontend effort rewriting. Semantic-screen plans separately use the issue-223 shared compiler and score_call.",
+    "frontend_field": "The copied profile's frontend path is the process working directory; no HTTP frontend is started for standalone captures.",
+    "runtime_lifecycle": "One owned per-run MPS daemon under the exclusive machine queue, using host.py's normal default-limit declaration/start_server lifecycle at unchanged daily UUIDs and byte caps; only that daemon is stopped afterward.",
+    "safety": "Existing host.py sample(profile), verify_power_limits(profile), report_mps_preflight(profile), finite profile lifetime and queue deadline. Sampling failure, thermal/power/ECC excursion or physical-host reserve below 8 GiB stops the owned experiment.",
+    "profile_fields_not_applied_as_http_controls": ["port", "bind_host", "allowed_hosts", "request_queue_limit", "request_timeout_s", "request_body_bytes", "koko_capabilities"],
+    "memory_max_bytes": "The successful arm must run in an owned transient user unit with the unchanged profile MemoryMax=27917287424, CPUQuota=400%, KillMode=mixed, TimeoutStopSec=50 and RuntimeMaxSec=900 (host.unit_properties). This supplies the finite cgroup memory.max required by --host-native. Capture-1/2 lacked that unit and were refused before scoring; their failure evidence is retained. The external monitor additionally enforces the 8 GiB physical-host reserve."
+  },
+  "unchanged": ["IQ3_S shards and pack", "model quantization", "262144 context", "k8v4 KV", "layer split 20,39 and devices 1,2", "expert cache/profile and arithmetic switches", "MPS byte caps", "physical power limits and stop thresholds", "thermal threshold", "daily profile and release manifest on disk"],
+  "excluded_claims": ["batched capture", "concurrent scorer qualification", "daily request timing", "semantic qualification", "family selection", "calibration", "deployment"]
+}

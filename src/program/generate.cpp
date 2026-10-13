@@ -72,6 +72,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/score_protocol.hpp"
+#include "strata/program/readout_reference.hpp"
 #include "logits_dump.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/session_fingerprint.hpp"
@@ -463,6 +464,8 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
+    std::string score_reference;     // standalone fresh serial readout, not a generation request
+    std::vector<int64_t> score_select;
     int64_t max_new = 16;
     int64_t max_context = 4096;
     bool greedy = true;
@@ -869,6 +872,9 @@ void usage() {
                  "  --judge-context N    opt-in serial short scoring state (1..4096); shares actual prompt/head owners\n"
                  "  --judge-library-allowance-bytes N  additional per-device first-use/driver bound (required)\n"
                  "  --judge-runtime-allowance-bytes N  additional host opaque-storage bound (required)\n"
+                 "  --score-reference PATH  create a fresh serial final-position JSON readout, then exit; needs\n"
+                 "                       --serve, --tokens[-file], --score-select, no MTP/batch/prefix cache\n"
+                 "  --score-select LIST  every requested token ID, in output order (no top-k truncation)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
@@ -2160,6 +2166,13 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
+        else if (a == "--score-reference") o.score_reference = next("--score-reference");
+        else if (a == "--score-select") {
+            std::string e;
+            if (!parse_i64_list(next("--score-select"), o.score_select, e)) {
+                std::fprintf(stderr, "strata reference: %s\n", e.c_str()); return 2;
+            }
+        }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
@@ -2609,6 +2622,24 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (!o.score_reference.empty() || !o.score_select.empty()) {
+        if (o.score_reference.empty() || o.score_select.empty() || !have_tokens ||
+            !std::filesystem::path(o.score_reference).is_absolute() ||
+            std::filesystem::exists(o.score_reference) || !o.serve || o.spec < 2 ||
+            o.batch > 0 || o.batch_mtp || o.batch_mtp_pipeline || o.pipeline_windows != 0 ||
+            o.spec_split || o.no_pool || o.no_capture || !o.mtp.empty() || o.suffix_draft != 0 ||
+            o.lookup_chain != 0 || o.adapt_async || o.adapt_swaps != 0 ||
+            o.prompt_cache != 0 || o.conversation_cache_mib != 0 || !o.greedy ||
+            !o.dump_logits.empty() || !o.dump_layers.empty() ||
+            std::getenv("STRATA_DUMP_TEACHER_LOGITS") || std::getenv("STRATA_DUMP_COMMITTED_LOGITS") ||
+            std::getenv("STRATA_DUMP_FIRST_LOGITS") || std::getenv("STRATA_LOGPOS")) {
+            std::fprintf(stderr, "strata reference: needs an absolute create-only output, explicit prompt/selected IDs, "
+                                 "serial captured --serve --spec >= 2, real pool, no MTP/draft/batch/pipeline/"
+                                 "adaptive swaps/prefix cache/sampling or diagnostic dumps\n");
+            return 2;
+        }
+        o.max_new = 1; // serve's internal admission placeholder; the readout never enters decode
     }
     if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
         (o.foreground_budget_ms > 0 && (!o.serve || o.batch < 2 || o.prompt_cache <= 0))) {
@@ -6868,6 +6899,12 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    if (!o.score_reference.empty() &&
+        (!strata::program::readout_reference::valid_ids(o.tokens, n_vocab, err) ||
+         !strata::program::readout_reference::valid_ids(o.score_select, n_vocab, err))) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 2;
+    }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -12728,7 +12765,14 @@ int main(int argc, char** argv) {
         }
         strata::program::score::Request score_request; // retain bounded host staging across scoring requests
         std::vector<float> score_values;
+        bool reference_pending = !o.score_reference.empty();
         for (;;) {
+            if (reference_pending) {
+                line = "GEN 1 ckpt=0 ";
+                for (size_t i = 0; i < o.tokens.size(); ++i)
+                    line += (i ? "," : "") + std::to_string(o.tokens[i]);
+                reference_pending = false;
+            } else
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(time_budget.enabled() ? decode_round(false) : piped ? pipeline_step(true) : batch_step())) return 1;
@@ -14619,6 +14663,32 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            if (!o.score_reference.empty()) {
+                // The prompt reader stops at n-1. Consume its final input token,
+                // without a pick, to obtain the prediction for position n.
+                if (cancelled || nf_hit || resume != 0 || ids != o.tokens || at != n - 1) {
+                    std::fprintf(stderr, "strata reference: incomplete or nonfresh prompt read\n");
+                    return 1;
+                }
+                ver.set_head_sampling(false);
+                const int32_t last = (int32_t) ids.back();
+                int32_t unused = 0;
+                drive.d.layers = drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(1, &last, n - 1, win_pool_fn, win_pool_user, &unused, err) ||
+                    drive.d.failed || nonfinite_hit(ver, "reference") ||
+                    !ver.read_logits_rows(0, 1, logits.data(), err) ||
+                    !ver.commit(1, err) || !ver.wait_commit(err) ||
+                    !strata::program::readout_reference::write(o.score_reference, logits.data(), n_vocab,
+                                                             n, o.score_select, err)) {
+                    std::fprintf(stderr, "strata reference: %s\n", err.empty() ? "verification failed" : err.c_str());
+                    return 1;
+                }
+                std::printf("REFERENCE position=%lld selected=%zu mode=fresh engine_mode=serial_solo generated_tokens=0\n",
+                            (long long) n, o.score_select.size());
+                std::fflush(stdout);
+                return 0;
+            }
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone

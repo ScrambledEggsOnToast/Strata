@@ -264,6 +264,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
   add_test(NAME batch_read_test COMMAND batch_read_test)
+  add_executable(readout_reference_test tests/program/readout_reference_test.cpp)
+  target_include_directories(readout_reference_test PRIVATE include)
+  add_test(NAME readout_reference_test COMMAND readout_reference_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

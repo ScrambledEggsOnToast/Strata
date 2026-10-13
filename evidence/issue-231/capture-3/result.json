@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "started_utc": "2026-10-13T10:12:47Z",
+  "half_a": "keep",
+  "half_b": "blocked",
+  "blocking_issue": 224,
+  "semantic_screen": "not run; independent-human-labelled 200-group development corpus is absent",
+  "profile": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/serial-profile.json",
+  "profile_sha256": "a60c8d3f7ad55041ec1b3e9e7d4c32c9735bebb4a4327193946f8d5902c87e2c",
+  "fixtures_sha256": "2423084f99058f1d03c45b9078b177fb3d3fb6789c518f9153b7d5d84e876011",
+  "receipts": [
+    {
+      "branch_id": "arithmetic-sanity-direct",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-direct/receipt.json",
+      "sha256": "889434a636f5b98f4a6607dbe6d4bc10dbe4052b590a5115f73dc0e5372f3060",
+      "position": 46,
+      "selected": 4,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "selected-coverage-beyond-256",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/selected-coverage-beyond-256/receipt.json",
+      "sha256": "669dc8c688f2a412e77903c657dae5b11c3941bf02d3dbfd48448537a9e58599",
+      "position": 46,
+      "selected": 300,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "prefill-plus-final-input",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/prefill-plus-final-input/receipt.json",
+      "sha256": "320e662bb705014cc96bf6b8e0ada01240c36f5fff463b061b01fe014d38d872",
+      "position": 1093,
+      "selected": 4,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "arithmetic-sanity-yes-no-A",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-A/receipt.json",
+      "sha256": "4ae8de3f2bb11cee101dd2256032fe32545270778bb2970e78d1eb32db722d73",
+      "position": 36,
+      "selected": 2,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "arithmetic-sanity-yes-no-B",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-B/receipt.json",
+      "sha256": "37f1de86ea630d14b953465e8082d4487d315a7042c43a1408fbb0bdf86852bf",
+      "position": 36,
+      "selected": 2,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "arithmetic-sanity-yes-no-C",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-C/receipt.json",
+      "sha256": "248cf4f7d6b961eaf2bb8251c5712db001f845f2fd15a4848d19f71bcd2c9d60",
+      "position": 36,
+      "selected": 2,
+      "generated_tokens": 0
+    },
+    {
+      "branch_id": "arithmetic-sanity-yes-no-D",
+      "path": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-D/receipt.json",
+      "sha256": "45e75c7e546a16e909ca3562158dd61844f4365e71ae703ecb4ef37a544e9079",
+      "position": 36,
+      "selected": 2,
+      "generated_tokens": 0
+    }
+  ],
+  "mps_preflight": {
+    "sampled_at": 1791886367.3308225,
+    "basis": "nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order",
+    "scope": "physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides",
+    "devices": [
+      {
+        "cuda_device": 0,
+        "gpu_uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 1,
+        "gpu_uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 2,
+        "gpu_uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+        "free_bytes": 22706913280,
+        "ceiling_bytes": 22548578304,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 22615687168,
+        "margin_bytes": 91226112,
+        "max_fitting_ceiling_bytes": 22639804416,
+        "max_fitting_whole_gib": 21,
+        "physical_envelope_prediction": "would_fit"
+      }
+    ]
+  },
+  "arithmetic_sanity_direct": {
+    "option_ids": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "logits": [
+      13.2865324,
+      20.2952576,
+      12.025773,
+      11.4740944
+    ],
+    "probabilities": [
+      0.0009027796089150715,
+      0.9986939538536763,
+      0.00025588268000249195,
+      0.00014738385740621822
+    ],
+    "expected_sanity_option": "B"
+  },
+  "arithmetic_sanity_yes_no": {
+    "option_ids": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "log_odds": [
+      -7.637405399999999,
+      7.015851000000001,
+      -7.7946051999999995,
+      -7.3921338
+    ],
+    "probabilities": [
+      4.326841783241794e-07,
+      0.9999986446160897,
+      3.6974304135963716e-07,
+      5.529566907577143e-07
+    ],
+    "expected_sanity_option": "B"
+  },
+  "sanity_claim": "sanity-only observations; no semantic screen, family selection or calibration",
+  "mps_cleanup": {
+    "exit_code": 0,
+    "stderr": ""
+  },
+  "elapsed_s": 402.24829128501005
+}

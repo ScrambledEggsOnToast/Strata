@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "started_utc": "2026-10-13T09:05:51Z",
+  "half_a": "blocked",
+  "half_b": "blocked",
+  "blocking_issue": 224,
+  "semantic_screen": "not run; independent-human-labelled 200-group development corpus is absent",
+  "profile": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/serial-profile.json",
+  "profile_sha256": "a60c8d3f7ad55041ec1b3e9e7d4c32c9735bebb4a4327193946f8d5902c87e2c",
+  "fixtures_sha256": "2423084f99058f1d03c45b9078b177fb3d3fb6789c518f9153b7d5d84e876011",
+  "receipts": [],
+  "mps_preflight": {
+    "sampled_at": 1791882351.6182363,
+    "basis": "nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order",
+    "scope": "physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides",
+    "devices": [
+      {
+        "cuda_device": 0,
+        "gpu_uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 1,
+        "gpu_uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 2,
+        "gpu_uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+        "free_bytes": 22706913280,
+        "ceiling_bytes": 22548578304,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 22615687168,
+        "margin_bytes": 91226112,
+        "max_fitting_ceiling_bytes": 22639804416,
+        "max_fitting_whole_gib": 21,
+        "physical_envelope_prediction": "would_fit"
+      }
+    ]
+  },
+  "error": "reference engine exited 2",
+  "mps_cleanup": {
+    "exit_code": 0,
+    "stderr": ""
+  },
+  "elapsed_s": 67.97083493298851
+}

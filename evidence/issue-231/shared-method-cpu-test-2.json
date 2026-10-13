@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "test": "real shared compiler/readout + retained-reference CPU integration",
+  "disposition": "pass",
+  "shared_scoring_sha256": "1464d1c432628c6cef105fe6e95c44165d5e13a1ad8715ac012113aeb2d9cfc9",
+  "jobs": 2010,
+  "typed_question_outcomes_per_family": 603,
+  "covers": [
+    "Choice, Noul and Score use real normalize_request/compile_request/score_call",
+    "both readout families",
+    "raw T=1",
+    "source/model identity attestation",
+    "complete declared option vectors",
+    "missing-branch denominator refusal",
+    "retained model identity skew refusal"
+  ],
+  "evidence_boundary": "Synthetic CPU fixtures only; zero engine launches, no real semantic screen or family selection."
+}

@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "mode": "fresh",
+  "engine_mode": "serial_solo",
+  "position": 36,
+  "consumed_prompt_tokens": 36,
+  "row_position": 35,
+  "prefix_tokens": 0,
+  "generated_tokens": 0,
+  "sampling": false,
+  "mtp": false,
+  "n_vocab": 248320,
+  "vocab_logsumexp": 22.16813818533998,
+  "selected_token_ids": [
+    9175,
+    2665
+  ],
+  "logits": [
+    22.1614113,
+    15.1455603
+  ],
+  "log_probs": [
+    -0.00672689993958997,
+    -7.022577920752578
+  ],
+  "branch_identity": {
+    "id": "arithmetic-sanity-yes-no-B",
+    "token_digest": "abcd2eb390e257bbd8523741c3d1f81ace35e4b9f7a58728d51dfe3853bed5aa"
+  },
+  "token_digest": "abcd2eb390e257bbd8523741c3d1f81ace35e4b9f7a58728d51dfe3853bed5aa",
+  "engine_incarnation": {
+    "id": "b34a65c8-b802-450d-a4fa-b245335c9034",
+    "pid": 621729,
+    "proc_start_ticks": "22618971",
+    "boot_id": "1dd458db-252e-4cbd-b3ff-5a80efebcbd4"
+  },
+  "source": {
+    "branch": "judge/231-readout-reference",
+    "commit": "6214f5b8d0e7fe1045b3583db3c65aaa3b556eb8",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capture_source_sha256": {
+      "src/program/generate.cpp": "c6fb9d36057de337f7e2a48508e999226494e433fb86307935eab41fe380a934",
+      "include/strata/program/readout_reference.hpp": "026530037bd0f314f5eb6e4e40a6b5053a26849170740cfaa7bde2071d535849",
+      "tools/judge_reference.py": "24f9ab3fa75cab77bef1a4fd181ee40ba39bc6d1089e4d127841c2e5bcf4280d"
+    },
+    "model": "swift-1.5-flash-next-256k-host"
+  },
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-231-build/strata",
+    "sha256": "1e9aec92a40b9c0c523ac5d07b7baf74baa36b47ff782a60d5a7fd6981b34e86"
+  },
+  "profile_sha256": "344ed267aa57c18c7af6325c11d0689f176bb0a9f077e5ad7e8014041ede5f97",
+  "model_identity": {
+    "release_manifest_sha256": "4709129f5a749d3926a990593fd1ee0ce4972dbac00b4bed2f0bba96bbce7989",
+    "quantization": "GSQ-RCO IQ3_S",
+    "revision": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
+    "files": {
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": {
+        "sha256": "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b",
+        "bytes": 44900816736
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": {
+        "sha256": "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608",
+        "bytes": 38842920384
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/index.txt": {
+        "sha256": "d83b66e10838fbe6fbfe5be3d027403644382e79b05680001134a661a2ecd092",
+        "bytes": 93691
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/conversions.json": {
+        "sha256": "13a6e8387ae050d148db1277d20b51402ec916b88d8547eb83f9d35cc1a9c5d6",
+        "bytes": 35627
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/native_experts.txt": {
+        "sha256": "540776d2ccbfa5006631e8813341ceb1d7f19b8c96a5d6dacd39bac871bdcb69",
+        "bytes": 5370
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/dense.bin": {
+        "sha256": "d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13",
+        "bytes": 1538035200
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": {
+        "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+        "bytes": 744960
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": {
+        "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+        "bytes": 3353258
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": {
+        "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+        "bytes": 5737005
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": {
+        "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        "bytes": 8952
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/tokenizer.json": {
+        "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf",
+        "bytes": 541
+      }
+    }
+  },
+  "environment": {
+    "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+    "STRATA_PREFILL_RING": "8",
+    "STRATA_IQ_MT_MIN": "1",
+    "CUDA_VISIBLE_DEVICES": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21,GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331,GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_MODULE_LOADING": "LAZY",
+    "STRATA_SUPERVISED": "1",
+    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/s231-616955",
+    "CUDA_MPS_LOG_DIRECTORY": "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/mps-log",
+    "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT": "0=33285996544,1=33285996544,2=22548578304"
+  },
+  "prompt_contract": {
+    "template": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "enable_thinking": false,
+    "add_generation_prompt": true,
+    "reasoning_effort_injection": false,
+    "effort_at_end": false,
+    "template_fallback": false
+  },
+  "request_sha256": "021d3480f97b52b1a2af20c6ff842c37d449e3e05f8ecc360851b91a947301fa",
+  "readout_sha256": "c9b137fb0ffd1ff6b4f1cfd8ae2f6b9e147021041ffe3050884b329fd8c646cd",
+  "argv": [
+    "/home/joshkirklin/strata-workspace/scratch/judge-231-build/strata",
+    "--pack",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+    "--native",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+    "--expert-cache",
+    "auto",
+    "--expert-profile",
+    "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+    "--prefill",
+    "2048",
+    "--max-context",
+    "262144",
+    "--windowed-experts",
+    "--adapt-swaps",
+    "0",
+    "--pool-workers",
+    "4",
+    "--spec",
+    "4",
+    "--suffix-draft",
+    "0",
+    "--mps-cap-bytes",
+    "33285996544,33285996544,22548578304",
+    "--mps-outside-client-allowance-bytes",
+    "67108864",
+    "--graph-capture-allowance-bytes",
+    "268435456",
+    "--prefill-library-allowance-bytes",
+    "268435456",
+    "--guest-opaque-allowance-bytes",
+    "268435456",
+    "--kv",
+    "k8v4",
+    "--prompt-cache",
+    "0",
+    "--conversation-cache-mib",
+    "0",
+    "--greedy",
+    "--batch",
+    "0",
+    "--batch-groups",
+    "1",
+    "--trim-stage-weights",
+    "--layer-split",
+    "20,39",
+    "--split-device",
+    "1,2",
+    "--host-native",
+    "--rope-scaling",
+    "none",
+    "--spec-min-p",
+    "0.5",
+    "--no-prefill-borrow",
+    "--pipeline-windows",
+    "0",
+    "--serve",
+    "--tokens-file",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-B/prompt.tokens",
+    "--score-reference",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-231/evidence/issue-231/capture-3/arithmetic-sanity-yes-no-B/readout.json",
+    "--score-select",
+    "9175,2665"
+  ],
+  "elapsed_s": 47.8949344829889,
+  "exit_code": 0
+}
