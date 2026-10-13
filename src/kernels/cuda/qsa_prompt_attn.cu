@@ -997,25 +997,35 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                 *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.k[c][0]) + pc * 16) = kx;
             }
             if constexpr (KV_MODE == 3) {   // V: dequantize the row's q4_0 blocks straight into the fp16 V row
-                constexpr int BLKS = HD / QK4_0;
-                constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
-                for (int i = t; i < CH * BLKS; i += THREADS) {
-                    const int c = i / BLKS, b = i % BLKS;
-                    const long long r = S.row[c];
+                if (cached) {
+                    // Copy contiguous 16-byte pieces, as the original FP16 gather does. Scalar half copies
+                    // across q4 blocks made the staging cache's loads strided and instruction-heavy.
+                    constexpr int VPIECES = HD * (int) sizeof(__half) / 16;
+                    for (int i = t; i < CH * VPIECES; i += THREADS) {
+                        const int c = i / VPIECES, pc = i % VPIECES;
+                        const long long r = S.row[c];
+                        uint4 vx = make_uint4(0, 0, 0, 0);
+                        if (r >= 0)
+                            vx = __ldg(reinterpret_cast<const uint4*>(cache.cells(qi / GROUP70)[r * n_kv_heads + kvh].v) + pc);
+                        *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.v[c][0]) + pc * 16) = vx;
+                    }
+                } else {
+                    constexpr int BLKS = HD / QK4_0;
+                    constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
+                    for (int i = t; i < CH * BLKS; i += THREADS) {
+                        const int c = i / BLKS, b = i % BLKS;
+                        const long long r = S.row[c];
 #pragma unroll
-                    for (int j = 0; j < QK4_0; ++j) S.v[c][b * QK4_0 + j] = __half(0);
-                    if (r >= 0 && cached) {
+                        for (int j = 0; j < QK4_0; ++j) S.v[c][b * QK4_0 + j] = __half(0);
+                        if (r >= 0) {
+                            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + r * BYTES) + b;
+                            const float d = __half2float(__ushort_as_half(blk->d));
 #pragma unroll
-                        for (int j = 0; j < QK4_0; ++j)
-                            S.v[c][b * QK4_0 + j] = cache.cells(qi / GROUP70)[r * n_kv_heads + kvh].v[b * QK4_0 + j];
-                    } else if (r >= 0) {
-                        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + r * BYTES) + b;
-                        const float d = __half2float(__ushort_as_half(blk->d));
-#pragma unroll
-                        for (int j = 0; j < QK4_0 / 2; ++j) {
-                            S.v[c][b * QK4_0 + j] = __float2half_rn((float) ((int)(blk->qs[j] & 0x0F) - 8) * d);
-                            S.v[c][b * QK4_0 + j + QK4_0 / 2] =
-                                __float2half_rn((float) ((int)(blk->qs[j] >> 4) - 8) * d);
+                            for (int j = 0; j < QK4_0 / 2; ++j) {
+                                S.v[c][b * QK4_0 + j] = __float2half_rn((float) ((int)(blk->qs[j] & 0x0F) - 8) * d);
+                                S.v[c][b * QK4_0 + j + QK4_0 / 2] =
+                                    __float2half_rn((float) ((int)(blk->qs[j] >> 4) - 8) * d);
+                            }
                         }
                     }
                 }
