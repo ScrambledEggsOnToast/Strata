@@ -178,6 +178,25 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+Q8Layout q8_layout(int t) {
+    if (!supported(t)) return Q8Layout::Unsupported;
+    switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: return Q8Layout::D4;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: return Q8Layout::DS4;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: return Q8Layout::D2S6;
+    }
+    return Q8Layout::Unsupported;
+}
+
+bool input_index_supported(int t, int64_t cols) {
+#ifdef STRATA_MMQ_INPUT_INDEX
+    return q8_layout(t) != Q8Layout::Unsupported && cols > 0 && cols % 4 == 0 &&
+           cols <= std::numeric_limits<int>::max() - 511;
+#else
+    return false;
+#endif
+}
+
 bool device_config(int ordinal, int& cc, int& sms, uint64_t& shared_bytes) {
     const auto& info = ggml_cuda_info();
     if (ordinal < 0 || ordinal >= info.device_count) return false;
@@ -247,11 +266,17 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
-                        p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
-                        p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
-                        1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+    const int64_t input_rows = p.input_ids ? p.input_rows : p.total_rows;
+    GGML_ASSERT(!p.input_ids || (input_index_supported(p.type, p.w_cols) && input_rows > 0 &&
+                               p.ids != nullptr && input_rows <= std::numeric_limits<int>::max()));
+    mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+                  p.w_cols, p.w_rows, p.total_rows, bpr, input_rows, p.ld_dst,
+                  p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
+                  1, 1, 0, 0, 0,
+                  p.max_rows, p.max_rows};
+#ifdef STRATA_MMQ_INPUT_INDEX
+    a.ids_src = p.input_ids;
+#endif
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {

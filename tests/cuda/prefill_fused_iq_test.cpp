@@ -36,6 +36,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -194,8 +195,8 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
 // up rows), q8_1 of H, down.  Returns Dm [rows][N] in sorted-row order.
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
-    MmqBufs(const Pair& p, int64_t rows, int E)
-        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
+    MmqBufs(const Pair& p, int64_t rows, int E, int64_t input_rows = 0)
+        : xq(mmq::q8_bytes(input_rows ? input_rows : rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
           bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 1280, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
@@ -204,7 +205,8 @@ struct MmqBufs {
 // with rows: the timing part's layout), the cost of MMQ's own kernels alone
 void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const Routing& r, const float* x_dev,
              const int32_t* src_dev, const std::vector<const uint8_t*>& blob, int64_t rows, cudaStream_t s,
-             bool direct = false, size_t stride = 0) {
+             bool direct = false, size_t stride = 0, int64_t input_rows = 0,
+             const int32_t* output_ids = nullptr, bool tables_ready = false) {
     const size_t gub = mmq::matrix_bytes(p.gu, 1280, N), db = mmq::matrix_bytes(p.d, N, FF);
     const int E = (int) r.cnt.size();
     std::vector<int32_t> order;
@@ -216,9 +218,12 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
     for (size_t g = 0; g < ng; ++g)
         for (size_t i = 0; i <= GROUP; ++i)
             bh[n + 1 + g * (GROUP + 1) + i] = bh[std::min(n, g * GROUP + i)] - bh[g * GROUP];
-    ck(cudaMemcpyAsync(b.bounds.p, bh.data(), bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
-    mmq::iota(b.ident.as<int32_t>(), rows, s);
-    mmq::quantize(x_dev, src_dev, b.xq.p, (int) p.gu, N, N, rows, s);
+    if (!tables_ready) {
+        ck(cudaMemcpyAsync(b.bounds.p, bh.data(), bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
+        mmq::iota(b.ident.as<int32_t>(), rows, s);
+    }
+    mmq::quantize(x_dev, input_rows ? nullptr : src_dev, b.xq.p, (int) p.gu, N, N,
+                  input_rows ? input_rows : rows, s);
     for (size_t j = 0; j < n; ++j) {
         const size_t q = j % GROUP;
         const uint8_t* bl = blob[(size_t) order[j]];
@@ -241,6 +246,7 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         gu.expert_bytes = direct ? stride : gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
         gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 1280;
+        if (input_rows) { gu.input_ids = src_dev; gu.input_rows = input_rows; }
         ctx.run(gu, s);
         mmq::swiglu(b.gu.as<float>() + r0 * 1280, b.h.as<float>() + r0 * FF, nr, FF, false, s);
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
@@ -248,7 +254,8 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
         dn.expert_bytes = direct ? stride : db;
         dn.n = ngx; dn.xq = b.hq.p; dn.bounds = b.bounds.as<int32_t>() + n + 1 + g * (GROUP + 1);
-        dn.ids = b.ident.as<int32_t>(); dn.total_rows = nr; dn.max_rows = maxr; dn.dst = b.dm.as<float>() + r0 * N;
+        dn.ids = output_ids ? output_ids + r0 : b.ident.as<int32_t>(); dn.total_rows = nr; dn.max_rows = maxr;
+        dn.dst = output_ids ? b.dm.as<float>() : b.dm.as<float>() + r0 * N;
         dn.ld_dst = N;
         ctx.run(dn, s);
     }
@@ -933,6 +940,7 @@ int mmq_only_main(int argc, char** argv) {
 
 #if !defined(STRATA_USE_HIP)
 #include "iq_wmma_test.hpp"
+#include "mmq_input_index_test.hpp"
 #endif
 
 }  // namespace
@@ -944,6 +952,16 @@ int main(int argc, char** argv) {
             int devices = 0;
             if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
             return wmma_only_main();
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--mmq-indexed-only") == 0) {
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+            return mmq_input_index_main();
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--mmq-indexed-timing") == 0) {
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+            return mmq_input_index_timing();
         }
 #endif
 #ifdef _WIN32

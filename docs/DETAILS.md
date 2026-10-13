@@ -354,6 +354,30 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
+**Experimental default-MMQ input indexing (#219):** a CUDA build with
+`-DSTRATA_MMQ_INPUT_INDEX=ON` can opt in at runtime with `STRATA_PREFILL_MMQ_INDEXED=1`.
+The gate/up product reads original token rows through a separate input map; the existing output
+map, expert grouping, tiler, product/reduction arithmetic and FP32 intermediate boundaries are unchanged.
+The pinned quantizer still writes transposed 144-byte blocks of 128 values, including its 512-value
+padding. D4 (FP32 scales), DS4 (FP16 scales/sums) and D2S6 are distinct representations, not interchangeable
+because their byte counts match. Each layer's GU representation is quantized once per token; the one
+Xq allocation is reused between layers, never a cache of simultaneous old representations.
+
+At chunk 2048/top-10/width 2560, one representation costs 5,916,672 bytes including the 18,432-byte tail,
+instead of 59,000,832 bytes. This is an Xq payload saving, not an assertion that the whole prompt peak
+falls by that amount: attention and MoE share a max-sized region, allocations have guards/alignment,
+and any unsupported MMQ layer reserves the expanded fallback capacity. Admission and carving use
+the same `moe_bufs` lifetime calculation. Fused/native-grouped/FP16 and resident-helper products retain
+their existing arithmetic and allocations. HIP/SYCL do not enable the new consumer. CUDA SM86 shares
+the opt-in consumer and requires explicit exact coverage, not an assumed unchanged path.
+
+`prefill_fused_iq_test --mmq-indexed-only` checks quantized bytes (including padding), complete weighted
+FFN equality, empty/uneven groups, tails, nontrivial output maps, graph replay and isolated streams using
+the existing native-format fixtures. `--mmq-indexed-timing` measures matched input preparation plus
+the existing products at chunk 2048, including input indirection. These commands need a protected
+machine window. The default is off; no performance qualification or daily-profile promotion is implied.
+Roll back by unsetting `STRATA_PREFILL_MMQ_INDEXED` (expanded MMQ, not FP16/native/WMMA).
+
 **Experimental native-IQ Volta prompt FFN (#195):** `STRATA_PREFILL_IQ_WMMA=1` opts into an additive
 port of jmnargi/Strata-V100 `277a707b58d08b7a089b9c41c4c9610a05a27405`, not a donor merge. It covers
 CUDA SM70 stage-local native experts at embedding/FF widths 2560/640: gate/up IQ3_XXS, IQ3_S,

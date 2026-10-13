@@ -24,6 +24,12 @@ bool fits(int ggml_type, int64_t w_rows);
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// Compatible activation representations, derived from the pinned MMQ quantizer's weight-type dispatch.
+/// Equal byte sizes do not imply compatible payloads: D4 has FP32 scales, DS4 FP16 scales/sums.
+enum class Q8Layout { Unsupported = -1, D4, DS4, D2S6 };
+Q8Layout q8_layout(int ggml_type);
+/// This build can consume once-quantized rows of this type/width without expanding them.
+bool input_index_supported(int ggml_type, int64_t cols);
 /// Maximum stream-k allocation over this build's supported types, J=8..128, both row fallbacks. Derived from
 /// pinned GGML configurations: fixup is at most sms*I*J floats. Pure arithmetic; zero without MMQ support.
 bool workspace_bytes(int cc, int sms, uint64_t shared_bytes, uint64_t& bytes);
@@ -40,9 +46,9 @@ void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64
               void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
-/// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
-/// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
-/// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
+/// [bounds[e], bounds[e+1]) of the route table (bounds on the device, n+1 entries) times its [w_rows, w_cols]
+/// matrix into dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row]).
+/// `total_rows`: route rows; `max_rows`: the most rows one expert has (the unchanged launch grid).
 struct Product {
     const void* w = nullptr;
     int type = -1;
@@ -55,6 +61,10 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    /// Optional route row -> xq row. Independent of the OUTPUT map `ids`; null retains expanded MMQ.
+    /// xq retains its quantizer's transposed [128-value block][input_rows] layout.
+    const int32_t* input_ids = nullptr;
+    int64_t input_rows = 0;
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.

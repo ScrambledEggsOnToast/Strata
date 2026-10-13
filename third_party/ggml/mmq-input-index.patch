@@ -1,0 +1,96 @@
+--- mmq.cuh
++++ mmq.cuh
+@@ -874,6 +874,7 @@
+ template <ggml_type type, int J, bool fallback, bool fixup>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
++        const int32_t * __restrict__ ids_src,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const float * __restrict__ y_scale,
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+@@ -913,7 +914,9 @@
+             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+ 
+-                tile_y[l] = by0[l];
++                // Only the VRAM row address changes; the SRAM tile and dot arithmetic do not.
++                tile_y[l] = ids_src ? (l / sz <= tile_y_max_j ?
++                    by0[ids_src[l / sz] * sz + l % sz] : 0) : by0[l];
+             }
+         }
+ 
+@@ -929,7 +933,8 @@
+             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+ 
+-                tile_y[l] = by0[l];
++                tile_y[l] = ids_src ? (l / sz <= tile_y_max_j ?
++                    by0[ids_src[l / sz] * sz + l % sz] : 0) : by0[l];
+             }
+         }
+ 
+@@ -959,7 +964,7 @@
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx, const int32_t * __restrict__ ids_src) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+@@ -1054,7 +1059,8 @@
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x, offset_x, ids_src ? y : y + offset_y, ids_src ? ids_src + col_low + jt*J : nullptr,
++             ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+@@ -1148,7 +1154,8 @@
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x, offset_x, ids_src ? y : y + offset_y, ids_src ? ids_src + col_low + jt*J : nullptr,
++             ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ 
+@@ -1232,7 +1239,8 @@
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     mul_mat_q_process_tile<type, J, fallback, fixup>
+-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++        (x, offset_x, ids_src ? y : y + offset_y, ids_src ? ids_src + col_low + jt*J : nullptr,
++         ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+          stride_row_x, ncols_y, stride_col_dst,
+          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ }
+@@ -1383,6 +1391,7 @@
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+     int64_t ncols_max;
+     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
++    const int32_t * ids_src = nullptr; // route row -> once-quantized token row; independent of ids_dst
+ };
+ 
+ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+@@ -1432,7 +1441,7 @@
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, args.ids_src);
+         return;
+     }
+ 
+@@ -1461,7 +1470,7 @@
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd, args.ids_src);
+ 
+     if (!fixup_needed) {
+         return;

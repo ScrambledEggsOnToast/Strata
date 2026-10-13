@@ -70,6 +70,8 @@ bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
+Q8Layout q8_layout(int) { return Q8Layout::Unsupported; }
+bool input_index_supported(int, int64_t) { return false; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
 Context::Context() {}
 Context::~Context() {}
@@ -842,6 +844,8 @@ struct Prefill::Impl {
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
+    size_t xq_bytes = 0;                     // actual shared Xq capacity, including any expanded fallback
+    bool input_index_said = false;
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
@@ -1070,6 +1074,8 @@ constexpr size_t MMQ_TAIL = 4096;
 struct MmqPlan {
     bool any = false, fallback = true, native_grouped = false, device_grouped = false;
     std::vector<char> layer;                   // per layer: MMQ
+    std::vector<char> input_index;             // per layer: the DEFAULT MMQ consumer can index original token rows
+    bool input_expanded = true;                // one shared buffer; max of indexed and fallback lifetimes, not both
     std::vector<char> fo;                      // per layer: no MMQ here but the native fused kernels cover its formats
                                                // (gfx11: UD-Q4_K_XL's Q4_K / Q5_K and Q5_1 / Q8_0 experts, STRATA_PF_FUSED=1)
     size_t gu_max = 0, d_max = 0;
@@ -1085,9 +1091,13 @@ const MmqPlan& mmq_plan() {
         if (p.native_grouped && (!on || !lay.native))
             throw std::runtime_error("native grouped prefill requires native weights and STRATA_PREFILL_MMQ enabled");
         p.device_grouped = p.native_grouped && detail::resident_grouping_requested();
+        const char* index_env = std::getenv("STRATA_PREFILL_MMQ_INDEXED");
+        const bool index_on = !p.native_grouped && index_env && std::atoi(index_env) != 0;
+        p.input_expanded = !index_on;
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
+        p.input_index.assign(p.layer.size(), 0);
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
@@ -1107,6 +1117,8 @@ const MmqPlan& mmq_plan() {
             }
             p.layer[(size_t) l] = 1;
             p.any = true;
+            p.input_index[(size_t) l] = index_on && mmq::input_index_supported(gt, N);
+            p.input_expanded |= !p.input_index[(size_t) l];
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
@@ -1127,15 +1139,20 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
+size_t mmq_input_bytes(size_t T) {
+    // Each layer has one GU type. Different quantizer representations reuse Xq sequentially;
+    // no cache of old representations and no expanded buffer coexist with this allocation.
+    return mmq::q8_bytes((int64_t) T * (mmq_plan().input_expanded ? K : 1), N);
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     if (mmq_plan().native_grouped)
         return {(strata::kernels::native_expert_scratch_bytes((int64_t) T * K, 640) + 3) / 4,
                 0, T * (N / 32) * 36, 0};
-    if (!fused) return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
+    if (!fused) return {T * K * 1280, T * K * 640, mmq_input_bytes(T), mmq::q8_bytes((int64_t) (T * K), 640)};
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
     return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
-            std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
+            std::max(mmq_input_bytes(ts), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
@@ -1371,6 +1388,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         if (mp.any) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
+            m.xq_bytes = mb.xq;
             m.H = mp.native_grouped ? nullptr : c.take<float>(mb.h, ok);
             m.Hq = mp.native_grouped ? nullptr : c.take<uint8_t>(mb.hq, ok);
             // #195 reuses only already-priced scratch: FP16 H fits in H's
@@ -3681,6 +3699,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    const bool use_input_index = use_mmq && mmq_plan().input_index[(size_t) l];
                     // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
                     // fused_ring() sized the ring and the buffers for it
                     const bool no_peer = !core::peer_portable();
@@ -4145,12 +4164,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
-                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
+                            // Keep the pinned quantizer and this layer's representation; only the physical row set changes.
                             if (mmq_plan().native_grouped)
                                 strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.Xq, m.cs);
                             else if (!use_wmma || std::any_of(order.begin(), order.end(),
                                         [&](int32_t e) { return m.cnt[(size_t) e] < 16; }))
-                                mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
+                                mmq::quantize(m.mixed, use_input_index ? nullptr : m.src_dev, m.Xq, mmq_gt, N, N,
+                                              use_input_index ? T : T * K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
@@ -4711,6 +4731,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                if (use_input_index) {
+                                    gu.input_ids = m.src_dev; gu.input_rows = T;
+                                    if (!m.input_index_said) {
+                                        m.input_index_said = true;
+                                        std::fprintf(stderr, "strata: indexed DEFAULT MMQ input on CUDA%d "
+                                            "(GU type %d, layout %d, tokens %lld, routes %lld, Xq capacity %zu B, "
+                                            "indexed payload+tail %zu B, expanded payload+tail %zu B); "
+                                            "unchanged FP32 FFN arithmetic\n", m.device, mmq_gt, (int) mmq::q8_layout(mmq_gt),
+                                            (long long) T, (long long) (T * K), m.xq_bytes,
+                                            mmq::q8_bytes(T, N), mmq::q8_bytes(T * K, N));
+                                    }
+                                }
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 pt.mark(kPfGemmD, cs);
@@ -5269,6 +5301,7 @@ bool Prefill::host_allocation_from(const core::ModelGeometry& g, const PrefillFa
     add(dynamic, 2 * (uint64_t) g.n_expert, sizeof(int32_t));             // MoE grouping: order/fill
     add(dynamic, 2 * (uint64_t) g.n_expert, sizeof(int));                 // MoE grouping: stage_of/job_of
     add(dynamic, (uint64_t) g.n_layers, sizeof(char));                    // the per-layer MMQ table
+    add(dynamic, (uint64_t) g.n_layers, sizeof(char));                    // per-layer indexed-input eligibility
     add(dynamic, T, sizeof(int32_t));                                     // the draft layer's token staging
     if (mmq_plan().device_grouped) {
         add(dynamic, (uint64_t) g.n_layers * (uint64_t) g.n_expert, sizeof(unsigned long long));
