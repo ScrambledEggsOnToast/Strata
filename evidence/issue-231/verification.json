@@ -36,6 +36,17 @@
       "covers": ["existing generation frontend", "existing context-overflow refusal", "existing logit-bias handling"],
       "observed_warnings": "Existing ResourceWarning messages from serve/telemetry.py unclosed /proc/stat, /proc/cpuinfo and /proc/meminfo file reads. All tests passed."
     }
+    ,{
+      "command": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python tools/test_judge_reference_shared.py --shared-root /home/joshkirklin/.omp/wt/t5961d0568/m --out evidence/issue-231/shared-method-cpu-test-2.json",
+      "disposition": "pass",
+      "shared_source_commit": "3d4da74",
+      "shared_scoring_sha256": "1464d1c432628c6cef105fe6e95c44165d5e13a1ad8715ac012113aeb2d9cfc9",
+      "jobs": 2010,
+      "typed_question_outcomes_per_family": 603,
+      "covers": ["real shared normalize_request/compile_request/score_call for Choice, Noul and Score", "both raw T=1 readout families", "retained model identity skew refusal", "complete declared option coverage", "missing-branch full-denominator refusal"],
+      "test_data": "Synthetic CPU fixtures only; no engine launches or semantic quality/family-selection claim.",
+      "resolved_prior_failure": "shared-method-cpu-test-2-failure.json retains source-closure drift/marshal fingerprint instability; issue-223 owner froze the closure and corrected marshal protocol before this passing run."
+    }
   ],
   "not_exercised": ["HIP and SYCL builds unavailable in this assigned CUDA configuration", "200 independent-human-labelled development groups and family selection (blocked on issue 224)", "calibration, held-out evaluation, daily-profile promotion, concurrent scoring and deployment"]
 }
