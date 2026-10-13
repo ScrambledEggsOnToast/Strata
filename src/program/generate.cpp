@@ -71,6 +71,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/program/score_protocol.hpp"
 #include "logits_dump.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/session_fingerprint.hpp"
@@ -11417,20 +11418,44 @@ int main(int argc, char** argv) {
         std::condition_variable in_cv;
         std::deque<std::string> in_lines;
         bool in_eof = false;
+        strata::program::score::Pending score_pending;
+        auto score_write = [&](const std::string& reply) {
+            std::printf("%s", reply.c_str());       // one stdio call: never interleave terminal bytes
+            std::fflush(stdout);
+        };
+        auto score_finish = [&](std::string_view id, std::string_view status,
+                                const strata::program::score::Request* request,
+                                const std::vector<float>* values, std::string_view error) {
+            std::lock_guard<std::mutex> lk(in_mu);
+            score_write(strata::program::score::terminal(id, status, request, values, error));
+            score_pending.complete(id);            // ownership ends only after terminal publication
+        };
         std::thread([&] {
             strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
             std::string l, buf;
+            std::string oversized_id;
+            bool oversized_score = false;
             char chunk[4096];
             auto getline_fd = [&](std::string& out) -> bool {
                 for (;;) {
                     const size_t nlpos = buf.find('\n');
                     if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
+                        if (oversized_score) {
+                            out = "SCORE " + oversized_id + " oversized";
+                            oversized_score = false;
+                        } else out.assign(buf, 0, nlpos);
                         buf.erase(0, nlpos + 1);
                         return true;
+                    }
+                    // Generation's long prompts retain their existing framing. SCORE alone has a 64 KiB line cap.
+                    if (oversized_score) buf.clear();
+                    else if (buf.size() > strata::program::score::max_wire_bytes && buf.rfind("SCORE ", 0) == 0) {
+                        oversized_id = strata::program::score::request_id(std::string_view(buf).substr(0, 72));
+                        oversized_score = true;
+                        buf.clear();
                     }
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
@@ -11439,8 +11464,13 @@ int main(int argc, char** argv) {
                     if (n < 0 && errno == EINTR) continue;
 #endif
                     if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
+                        if (oversized_score) {
+                            out = "SCORE " + oversized_id + " oversized";
+                            oversized_score = false;
+                        } else {
+                            if (buf.empty()) return false;
+                            out.swap(buf);
+                        }
                         buf.clear();
                         return true;
                     }
@@ -11451,7 +11481,28 @@ int main(int argc, char** argv) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
-                in_lines.push_back(l);
+                if (l.rfind("SCANCEL ", 0) == 0) {
+                    const std::string_view id(l.data() + 8, l.size() - 8);
+                    if (strata::program::score::valid_id(id)) score_pending.cancel(id);
+                    continue;                       // no STOP and no cancellation of unrelated generation
+                }
+                if (l.rfind("SCORE ", 0) == 0) {
+                    const auto id = strata::program::score::request_id(l);
+                    if (!strata::program::score::valid_id(id)) {
+                        score_write(strata::program::score::terminal("-", "ERROR", nullptr, nullptr, "invalid score ID"));
+                        std::_Exit(1);              // no unrouteable/ambiguous owner may survive
+                    }
+                    const auto admitted = score_pending.admit(id);
+                    if (admitted == strata::program::score::Pending::Admission::duplicate) {
+                        score_write(strata::program::score::terminal(id, "ERROR", nullptr, nullptr, "duplicate score ID"));
+                        std::_Exit(1);
+                    }
+                    if (admitted == strata::program::score::Pending::Admission::full) {
+                        score_write(strata::program::score::terminal(id, "REJECT", nullptr, nullptr, "score queue is full"));
+                        continue;
+                    }
+                }
+                in_lines.push_back(std::move(l));
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
@@ -11577,6 +11628,9 @@ int main(int argc, char** argv) {
                         mtp.slot_state(b), page_size);
                 }
             }
+            std::printf("INFO score=1 score_version=1 score_max_prompt=%zu score_max_selected=%zu score_max_pending=%zu\n",
+                        strata::program::score::max_prompt_tokens, strata::program::score::max_selected_tokens,
+                        strata::program::score::max_pending);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -12474,6 +12528,8 @@ int main(int argc, char** argv) {
             working_capacity += working;
             resident_capacity += resident;
         }
+        strata::program::score::Request score_request; // retain bounded host staging across scoring requests
+        std::vector<float> score_values;
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -12481,7 +12537,14 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
-                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
+                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) {
+                    if (line.rfind("SCORE ", 0) == 0) {
+                        score_finish(strata::program::score::request_id(line), "ERROR", nullptr, nullptr,
+                                     "score pipeline drain failed");
+                        std::_Exit(1);
+                    }
+                    return 1;
+                }
             } else if (!next_line(line)) {
                 break;
             }
@@ -12579,7 +12642,7 @@ int main(int argc, char** argv) {
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
-            if (!adapt_tick(true)) {
+            if (line.rfind("SCORE ", 0) != 0 && !adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
@@ -12617,6 +12680,128 @@ int main(int argc, char** argv) {
                     strata::core::progress_at("idle");
                 }
             } busy_scope;
+            if (line.rfind("SCORE ", 0) == 0) {
+                namespace score = strata::program::score;
+                auto& request = score_request;
+                std::string score_error;
+                const auto id = score::request_id(line);
+                bool parsed = false;
+                try {
+                    parsed = score::parse(line, o.max_context, n_vocab, request, score_error);
+                } catch (const std::exception& failure) {
+                    score_finish(id, "ERROR", nullptr, nullptr, failure.what());
+                    std::_Exit(1);
+                }
+                if (!parsed) {
+                    score_finish(id, "REJECT", nullptr, nullptr, score_error);
+                    continue;                       // ordinary refusal: no working-state mutation
+                }
+                auto cancelled = [&] {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    return in_eof || score_pending.cancelled(id);
+                };
+                if (cancelled()) {
+                    score_finish(id, "CANCELLED", nullptr, nullptr, "cancelled before prompt read");
+                    continue;
+                }
+                auto run_score = [&]() -> bool {
+                    if (!adapt_tick(true) || !resident.begin_score(score_error) ||
+                        !ver.set_logit_bias({}, score_error)) return false;
+                    ver.set_history(nullptr, 0);
+                    // The transient working state is never a cached generation prefix.
+                    live_ok = false;
+                    live.clear(); live_imgs.clear(); checks.clear();
+                    live_scope = {};
+                    tail_ckpt_len = -1;
+                    conversations.limit_reuse(0);
+                    if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(true);
+                    auto quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
+                    if (kvg.on && !kvg_ensure((int64_t) request.prompt.size(), quiesce)) {
+                        score_error = "score working KV capacity failed"; return false;
+                    }
+                    if (!mrope_identity) {
+                        const size_t cells = mrope_host.size() / 3;
+                        for (size_t cell = 0; cell < cells; ++cell)
+                            for (size_t axis = 0; axis < 3; ++axis)
+                                mrope_host[cell * 3 + axis] = (int32_t) cell;
+                        auto upload = [&](int32_t* device, cudaStream_t stream) {
+                            return cudaMemcpyAsync(device, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                                   cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                                   cudaStreamSynchronize(stream) == cudaSuccess;
+                        };
+                        if (!upload(d_mrope, main_stream)) { score_error = "score position upload failed"; return false; }
+                        for (auto& stage : stages) {
+                            const strata::core::OnDevice on(stage->dev);
+                            if (!upload(stage->mrope, stage->stream)) {
+                                score_error = "score stage position upload failed"; return false;
+                            }
+                        }
+                        mrope_identity = true;
+                    }
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                        score_error = "score session reset failed"; return false;
+                    }
+                    for (auto& stage : stages) {
+                        const strata::core::OnDevice on(stage->dev);
+                        strata::core::session_zero(stage->ss, g, nullptr, (void*) stage->stream);
+                        if (cudaStreamSynchronize(stage->stream) != cudaSuccess) {
+                            score_error = "score stage reset failed"; return false;
+                        }
+                    }
+                    std::printf("SADMIT %s v1 prompt_tokens=%zu selected_tokens=%zu\n",
+                                request.id.c_str(), request.prompt.size(), request.selected.size());
+                    std::fflush(stdout);
+                    int32_t tokens[strata::kernels::kVerifyMaxT], unused[strata::kernels::kVerifyMaxT];
+                    int final_row = 0;
+                    for (size_t position = 0; position < request.prompt.size();) {
+                        if (cancelled()) return true;  // the last launched window has already drained
+                        const int count = (int) std::min<size_t>((size_t) o.spec, request.prompt.size() - position);
+                        for (int row = 0; row < count; ++row) tokens[row] = (int32_t) request.prompt[position + row];
+                        struct NoSampling {
+                            strata::core::Verifier& verifier;
+                            explicit NoSampling(strata::core::Verifier& v) : verifier(v) { verifier.set_head_sampling(false); }
+                            ~NoSampling() { verifier.set_head_sampling(true); }
+                        } no_sampling(ver);
+                        drive.d.layers = drive.d.experts = 0;
+                        drive.d.failed = false;
+                        if (!ver.run(count, tokens, (int64_t) position, win_pool_fn, win_pool_user, unused, score_error) ||
+                            drive.d.failed || ver.nonfinite_row() >= 0) {
+                            if (drive.d.failed && drive.d.fail) score_error = drive.d.fail;
+                            else if (ver.nonfinite_row() >= 0) score_error = "non-finite score prompt logits";
+                            return false;
+                        }
+                        if (!ver.commit(count, score_error) || !ver.wait_commit(score_error)) return false;
+                        final_row = count - 1;
+                        position += (size_t) count;
+                        strata::core::progress_beat();
+                        if (position < request.prompt.size() && batch_on()) {
+                            ver.set_head_sampling(true);  // unrelated resident rows keep their own generation policy
+                            if (!decode_round(false)) { score_error = "score peer decode failed"; return false; }
+                        }
+                    }
+                    if (cancelled()) return true;
+                    return ver.read_logits_rows(final_row, final_row + 1, logits.data(), score_error);
+                };
+                auto& values = score_values;
+                values.clear();
+                bool ok = false;
+                try {
+                    ok = run_score();
+                    if (ok && !cancelled())
+                        ok = score::select_logits(logits.data(), n_vocab, request.selected, values, score_error);
+                } catch (const std::exception& failure) {
+                    score_error = failure.what();
+                }
+                if (!ok) {
+                    score_finish(id, "ERROR", nullptr, nullptr,
+                                 score_error.empty() ? "score device/working state failed" : score_error);
+                    std::_Exit(1);                  // no destructor or later owner may touch the poisoned state
+                }
+                if (cancelled()) score_finish(id, "CANCELLED", nullptr, nullptr, "cancelled during prompt read");
+                else score_finish(id, "OK", &request, &values, {});
+                continue;                           // no T/BT/DONE/BDONE and no sampling or MTP leg
+            }
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;

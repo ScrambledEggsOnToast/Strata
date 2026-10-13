@@ -103,6 +103,8 @@ public:
     // yielded resend or solo-to-parked-slot promotion retains identity and seed.
     bool begin(int destination, const std::vector<int64_t>& prompt, const ResidentRequest& request,
                std::string& error);
+    // Fresh transient scoring identity, no generated-token budget, draft or resident admission.
+    bool begin_score(std::string& error);
     const ResidentWorking& working() const { return working_; }
     bool active() const;
     bool available(int slot) const;

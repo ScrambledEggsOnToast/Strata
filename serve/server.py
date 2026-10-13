@@ -64,6 +64,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve import scoring as score_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -850,6 +851,10 @@ class StrataEngine:
             self.ctl = threading.Lock()
             self.admitting = 0                          # #1603: those that gave the lines back to wait for a slot
         self.wlock = threading.Lock()
+        if "score_waiters" not in self.__dict__:
+            self.score_waiters = 0
+        self.score_q = {}
+        self.score_control = {"id": None}
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -1016,9 +1021,147 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _route_score(self, line, queues):
+        if not line.startswith(("SADMIT ", "SDONE ")):
+            return False
+        fields = line.split(" ", 3)
+        if len(line) > score_api.MAX_WIRE_BYTES or len(fields) < 3:
+            raise ValueError("malformed or oversized score frame")
+        with self.slot_cv:
+            owner = queues.get(fields[1])
+            if owner is None or owner["terminal"]:
+                raise ValueError("unknown, mismatched or duplicate score terminal ID")
+            terminal = fields[0] == "SDONE"
+            if terminal:
+                if len(fields) != 4:
+                    raise ValueError("score terminal missing result")
+                owner["terminal"] = True
+            else:
+                if owner["admitted"]:
+                    raise ValueError("duplicate score admission")
+                owner["admitted"] = True
+            try:
+                owner["queue"].put_nowait(line)
+            except queue.Full:
+                raise ValueError("score reply queue limit exceeded") from None
+        return True
+
+    SCORE_TIMEOUT_S = 300.0
+    SCORE_DRAIN_S = 30.0
+
+    def _read_score(self, request_id, owner, born, prompt, selected, cancel):
+        deadline = time.monotonic() + self.SCORE_TIMEOUT_S
+        stopped = False
+        while True:
+            if self.gen != born:
+                raise EngineDied("the engine restarted during scoring")
+            now = time.monotonic()
+            if not stopped and (cancel.is_set() or now >= deadline):
+                cancel.set()
+                self._send(f"SCANCEL {request_id}")
+                stopped = True
+                deadline = now + self.SCORE_DRAIN_S
+            if now >= deadline:
+                raise self._silent("missing matching SDONE score terminal")
+            try:
+                line = owner["queue"].get(timeout=min(.1, max(.001, deadline - now)))
+            except queue.Empty:
+                if not self.alive():
+                    raise EngineDied(self.death_note())
+                continue
+            if line is None:
+                raise EngineDied(self.death_note())
+            if line.startswith("SADMIT "):
+                expected = (f"SADMIT {request_id} v1 prompt_tokens={len(prompt)} "
+                            f"selected_tokens={len(selected)}")
+                if line.strip() != expected:
+                    raise self._silent("mismatched score admission boundary")
+                continue
+            fields = line.split(" ", 3)
+            try:
+                if len(fields) != 4 or fields[:2] != ["SDONE", request_id]:
+                    raise ValueError("wrong score terminal")
+                result = score_api.validate_terminal(fields[2], json.loads(fields[3]), request_id, prompt, selected)
+                if fields[2] == "CANCELLED" and not stopped:
+                    raise ValueError("unsolicited score cancellation")
+            except (ValueError, TypeError, OverflowError) as error:
+                raise self._silent(str(error)) from None
+            owner["drained"] = True
+            if fields[2] == "ERROR":
+                raise self._silent("fatal score engine/state error: " + result["error"])
+            if fields[2] == "REJECT":
+                raise ValueError(result["error"])
+            if fields[2] == "CANCELLED" or cancel.is_set():
+                raise AdmissionError("score cancelled after matching terminal drained", 409)
+            return result
+
+    def score(self, request, cancel, request_id=None, on_wait=None, on_submit=None):
+        """One bounded score owner on the existing control FIFO and stdout pump.
+
+        SCANCEL never releases ownership: only the matching, validated SDONE does.
+        The synchronous drain also covers a disconnected HTTP consumer.
+        """
+        if not score_api.capabilities(self)["available"]:
+            raise ValueError("this engine does not support SCORE v1")
+        prompt, selected, payload = score_api.prepare(request, self)
+        request_id = request_id or uuid.uuid4().hex
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
+            raise ValueError("invalid score request ID")
+        with self.slot_cv:
+            if self.score_waiters >= score_api.capabilities(self)["max_pending"]:
+                raise AdmissionError("score queue is full")
+            self.score_waiters += 1
+        acquired, sent = False, False
+        owner = {"queue": queue.Queue(maxsize=2), "terminal": False, "admitted": False, "drained": False}
+        born, queues, control = self.gen, self.score_q, self.score_control
+        try:
+            turn = self._take_control(cancel, len(prompt), on_wait=on_wait,
+                                      priority=request.get("strata_priority", "foreground"))
+            while True:
+                try:
+                    next(turn)
+                except StopIteration as finished:
+                    acquired = bool(finished.value)
+                    break
+            if not acquired:
+                raise AdmissionError("score cancelled before submission", 409)
+            if self.gen != born:
+                raise EngineDied("the engine restarted while scoring waited")
+            with self.slot_cv:
+                if request_id in queues:
+                    raise ValueError("duplicate score request ID")
+                queues[request_id] = owner       # register before any pipe write
+                control["id"] = request_id
+            sent = True                         # even a partial write needs a drain or process retirement
+            self._send(f"SCORE {request_id} {payload}")
+            if callable(on_submit):
+                on_submit()
+            return self._read_score(request_id, owner, born, prompt, selected, cancel)
+        finally:
+            try:
+                if sent and not owner["drained"] and self.gen == born and self.alive():
+                    cancel.set()
+                    try:
+                        self._read_score(request_id, owner, born, prompt, selected, cancel)
+                    except (ValueError, AdmissionError):
+                        pass                    # the matching terminal was validated and drained
+            finally:
+                if sent and not owner["drained"] and self.gen == born and self.alive():
+                    self._silent("score ownership ended without a matching SDONE after failed write/drain")
+                with self.slot_cv:
+                    if queues.get(request_id) is owner:
+                        queues.pop(request_id)
+                        control["id"] = None
+                    self.score_waiters -= 1
+                    self.slot_cv.notify_all()
+                if acquired:
+                    self.ctl.release()
+
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        score_q = getattr(self, "score_q", {})
+        score_control = getattr(self, "score_control", {"id": None})
         policy = getattr(self, "speculation_policy", None)  # this process's cost state, never a restarted successor's
         line = None
         for line in proc.stdout:
@@ -1038,6 +1181,29 @@ class StrataEngine:
                 break                           # publish EOF, never the trailing DONE
             if policy is not None:
                 policy.wire(line)
+            try:
+                if self._route_score(line, score_q):
+                    continue
+                if score_control["id"] is not None:
+                    if line.startswith(("BT ", "BDONE ")):
+                        try:
+                            slot = int(line.split()[1])
+                            valid_slot = 0 <= slot < len(slot_q)
+                        except (ValueError, IndexError):
+                            valid_slot = False
+                        if not valid_slot:
+                            raise ValueError("wrong score terminal/mismatched generation slot boundary")
+                    else:
+                        raise ValueError("wrong score terminal/control line: " + line.strip()[:80])
+            except ValueError as error:
+                if self.proc is proc:
+                    self.silent_note = "Score protocol failure: " + str(error)
+                    self.ended = True
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                break
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -1052,6 +1218,12 @@ class StrataEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+        with self.slot_cv:
+            for owner in score_q.values():
+                try:
+                    owner["queue"].put_nowait(None)
+                except queue.Full:
+                    pass
         with self.slot_cv:
             self.slot_cv.notify_all()
 
@@ -3614,6 +3786,41 @@ class Service:
             self.admission_cv.notify_all()
             return True
 
+    def score(self, request, cancel):
+        """The same HTTP admission owner as generation, retained through native drain."""
+        if not isinstance(self.engine, StrataEngine):
+            raise ValueError("this engine does not support SCORE v1")
+        record = getattr(self.lifecycle_local, "record", None)
+        with contextlib.ExitStack() as turn:
+            if not getattr(self.engine, "batch", 0):
+                while not self.fifo.acquire(timeout=.1):
+                    if cancel.is_set():
+                        raise AdmissionError("score cancelled while queued", 409)
+                turn.callback(self.fifo.release)
+                self.ensure_loaded()
+            elif not self.loaded():
+                with self.fifo:
+                    self.ensure_loaded()
+            prompt, _, _ = score_api.prepare(request, self.engine)
+            if record is not None:
+                self.lifecycle_note(record, "preparing", prompt_tokens=len(prompt), output_tokens=0, _executing=False)
+            def waiting():
+                if record is not None:
+                    self.lifecycle_note(record, "engine_wait", _executing=False)
+            def submitted():
+                if record is not None:
+                    self.lifecycle_note(record, "scoring", _executing=True)
+            try:
+                result = self.engine.score(request, cancel, request_id=record["id"] if record else None,
+                                           on_wait=waiting, on_submit=submitted)
+                if record is not None:
+                    self.lifecycle_note(record, "drained", _executing=False, score_receipt=result["receipt"])
+                return result
+            except (ValueError, EngineDied, AdmissionError) as error:
+                if record is not None:
+                    record["error"] = str(error)
+                raise
+
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
 
@@ -5782,7 +5989,8 @@ def make_handler(svc: Service):
                     admission = svc._admission_snapshot()
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "service": "strata", "admission": admission})
+                                 "loaded": svc.loaded(), "service": "strata", "admission": admission,
+                                 "scoring": score_api.capabilities(svc.engine)})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -5959,12 +6167,13 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/score"):
                     auth = self.headers.get("Authorization", "")
                     principal = (auth[7:].strip() if auth.lower().startswith("bearer ") else
                                  self.headers.get("x-api-key", "")) if svc.api_key else ""
                     # Never trust a client-supplied internal scope or cache grouping key.
-                    req["_strata_cache_scope"] = svc.cache_scope(req, principal)
+                    if path != "/v1/score":        # scores never reuse a conversation prefix
+                        req["_strata_cache_scope"] = svc.cache_scope(req, principal)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel)
@@ -5990,6 +6199,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/score":
+                    self._json(200, svc.score(req, self.request_cancel))
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 else:

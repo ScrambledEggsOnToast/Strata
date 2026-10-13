@@ -1658,6 +1658,44 @@ arms and do not interpret their runtime as observer-off performance.
 
 ---
 
+### Selected-logit scoring (SCORE v1)
+
+`POST /v1/score` accepts `{"version":1,"prompt_token_ids":[5,6],"selected_token_ids":[3,1,0,3]}`.
+It consumes the entire text-token prompt and returns the **unscaled FP32 logits after its last token**,
+in selected-token order, including duplicates. These are not probabilities or log-probabilities.
+There is no generated token, sampler, normalization or MTP proposal. This is a separate scoring
+operation, not a zero-output chat request. Sampling, streaming and generation fields are refused.
+
+The complete response contains `version`, the server-owned `request_id`, `prompt_tokens`,
+`selected_token_ids`, `logits`, `generated_tokens:0`, and a `receipt` with `prompt_tokens`,
+`selected_tokens`, `logit_passes:1`, `dtype:"float32"` and `scale:1`.
+The request ID is also its `/requests` lifecycle ID. `/health` publishes `scoring.available`,
+the protocol version and limits; an engine without SCORE v1 cannot answer scores.
+The existing API-key/Host/Origin checks, priority, deadline and bounded admission queue apply.
+
+Native framing is `SCORE <id> v1 prompt=<comma-separated IDs> selected=<comma-separated IDs>`.
+IDs are 1–64 ASCII letters, digits, underscores or hyphens. The engine may emit
+`SADMIT <id> v1 prompt_tokens=<n> selected_tokens=<k>` and must finish with exactly one
+`SDONE <id> OK|REJECT|CANCELLED|ERROR <one-line JSON result>`. Failed results contain only
+`version`, `request_id`, `generated_tokens:0` and `error`: never a partial option set.
+Scores never use `T`, `BT`, `DONE` or `BDONE`. `SCANCEL <id>` cancels only its score.
+
+SCORE v1 caps each prompt at 4,096 tokens (and the engine's context), each selected list at
+256 tokens, each input/output line at 64 KiB, and native/direct-adapter pending score owners at eight.
+Its reply queue holds at most two frames, one admission and one terminal. The adapter registers
+the queue before writing and keeps the native control turn and HTTP admission until the matching
+terminal is validated and drained, including after a disconnect. Its native work deadline is 300 s;
+cancellation or expiry allows at most another 30 s to drain. Ordinary `REJECT` is nonfatal.
+An unknown, wrong, duplicate, missing or mismatched terminal, incomplete result, or device/state
+`ERROR` retires the process; ambiguous state is never reused.
+
+The working session is reset for scoring and is not published as a reusable generation prefix.
+Resident generation keeps its own owners and may decode between score windows. No release
+manifest, daily profile or deployment changes are needed for this opt-in interface.
+`serve.test_parallel.ScoreTransport` exercises the real adapter against the existing scripted engine;
+`score_protocol_test` exercises the production native parser, owner bounds and FP32 serialization.
+These are CPU transport/contract checks, not GPU arithmetic, placement or performance evidence.
+
 ### The Responses API and Codex CLI
 
 `POST /v1/responses` (0.1.39, #451) speaks OpenAI's newer Responses API, which Codex CLI uses (it no longer

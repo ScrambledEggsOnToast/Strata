@@ -23,7 +23,7 @@ from serve.server import (ByteTokenizer, Service, SpeculationPolicy, StrataEngin
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
 # Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257).
-FAKE_BATCH = r'''import os, queue, sys, threading, time
+FAKE_BATCH = r'''import json, os, queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
@@ -33,17 +33,25 @@ STEP = 0.02
 hold = args[args.index("--hold-replies") + 1] if "--hold-replies" in args else None
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
+score_cancel = set()
+score_lock = threading.Lock()
 def reader():
     for l in sys.stdin:
         l = l.strip()
         if l == "STOP":
             stop.set()
+        elif l.startswith("SCANCEL "):
+            with score_lock:
+                score_cancel.add(l.split()[1])
+            if "--score-cancel-file" in args:
+                open(args[args.index("--score-cancel-file") + 1], "w").close()
         else:
             lines.put(l)
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+print("INFO score=1 score_version=1 score_max_prompt=4096 score_max_selected=256 score_max_pending=8", flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
 if "--says-spec" in args:
@@ -97,6 +105,8 @@ READF = "--readfield" in args   # DONE's 15th field: the prompt tokens the engin
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
 def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
     return 0 if not REUSE else len(ids) - 1 if continued(ids)[1] else 3
+def score_done(request_id, status, result):
+    print(f"SDONE {request_id} {status} " + json.dumps(result, separators=(",", ":")), flush=True)
 parked = {}
 while True:
     try:
@@ -113,6 +123,79 @@ while True:
         if b in active:
             active[b][1] = 0
             stopped.add(b)
+        continue
+    if line.startswith("SCORE "):
+        _, request_id, payload = line.split(" ", 2)
+        fields = payload.split()
+        prompt = [int(t) for t in fields[1].removeprefix("prompt=").split(",")]
+        selected = [int(t) for t in fields[2].removeprefix("selected=").split(",")]
+        result = {"version": 1, "request_id": request_id, "generated_tokens": 0}
+        if log:
+            log.write(f"SCORE {request_id} {len(prompt)} {len(active)}\n"); log.flush()
+        if any(t >= 258 for t in prompt + selected):
+            result["error"] = "a token id is outside the vocabulary"
+            score_done(request_id, "REJECT", result)
+            continue
+        admission_n = len(prompt) + (1 if "--score-wrong-admission" in args else 0)
+        print(f"SADMIT {request_id} v1 prompt_tokens={admission_n} selected_tokens={len(selected)}", flush=True)
+        if "--score-flood" in args:
+            for _ in range(50):
+                print(f"SADMIT {request_id} v1 prompt_tokens={len(prompt)} selected_tokens={len(selected)}", flush=True)
+            continue
+        for q in range(0, len(prompt), CH):
+            if "--score-hold-file" in args:
+                gate = args[args.index("--score-hold-file") + 1]
+                while os.path.exists(gate):
+                    with score_lock:
+                        if request_id in score_cancel:
+                            break
+                    time.sleep(.005)
+            time.sleep(STEP / 2)
+            if active:
+                window()
+            with score_lock:
+                cancelled = request_id in score_cancel
+            if cancelled:
+                if "--score-drain-gate" in args:
+                    gate = args[args.index("--score-drain-gate") + 1]
+                    while os.path.exists(gate):
+                        time.sleep(.005)
+                result["error"] = "cancelled"
+                score_done(request_id, "CANCELLED", result)
+                break
+        else:
+            # Independent FP32 row fixture: these are not sampling probabilities.
+            row = {0: .125, 1: -17.5, 2: 2.25, 3: .3333333432674408}
+            result.update(prompt_tokens=len(prompt), selected_token_ids=selected,
+                          logits=[row.get(t, -3.0) for t in selected],
+                          receipt={"prompt_tokens": len(prompt), "selected_tokens": len(selected),
+                                   "logit_passes": 1, "dtype": "float32", "scale": 1})
+            if "--score-missing-terminal" in args:
+                continue
+            if "--score-wrong-terminal" in args:
+                print("DONE 0 0 0 0 stop", flush=True)
+                continue
+            if "--score-wrong-batch-terminal" in args:
+                print(f"BDONE {request_id} 0 stop 0", flush=True)
+                continue
+            if "--score-wrong-id" in args:
+                request_id += "x"
+            if "--score-wrong-boundary" in args:
+                result["prompt_tokens"] += 1
+            if "--score-partial" in args:
+                result["logits"] = result["logits"][:-1]
+            if "--score-wrong-pass" in args:
+                result["receipt"]["logit_passes"] = 2
+            if "--score-generated" in args:
+                result["generated_tokens"] = 1
+            if "--score-reordered" in args:
+                result["selected_token_ids"] = sorted(selected)
+            if "--score-nonfinite" in args:
+                result["logits"][0] = float("nan")
+            if "--score-error" in args:
+                result = {"version": 1, "request_id": request_id, "generated_tokens": 0,
+                          "error": "device state corrupted"}
+            score_done(request_id, "ERROR" if "--score-error" in args else "OK", result)
         continue
     if line.startswith(("GEN ", "BGEN ")):
         f = line.split()
@@ -1585,6 +1668,281 @@ class ParallelService(unittest.TestCase):
         t.join(60)
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["live"]["queued"], 0)
+
+
+class ScoreTransport(unittest.TestCase):
+    """#233: the public bounded adapter over the existing scripted engine pipe."""
+    start = ParallelService.start
+    tearDown = ParallelService.tearDown
+    chat = ParallelService.chat
+    get = ParallelService.get
+
+    def score(self, prompt=None, selected=None, **extra):
+        body = {"version": 1, "prompt_token_ids": prompt if prompt is not None else [5, 6],
+                "selected_token_ids": selected if selected is not None else [3, 1, 0, 3]}
+        request = urllib.request.Request(self.base + "/v1/score", data=json.dumps(body | extra).encode(),
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)
+
+    def test_complete_score_has_ordered_raw_fp32_and_identity_receipt(self):
+        self.start(2)
+        proc = self.engine.proc
+        result = self.score()
+        self.assertEqual(result["logits"], [.3333333432674408, -17.5, .125, .3333333432674408])
+        self.assertEqual(result["selected_token_ids"], [3, 1, 0, 3])
+        self.assertEqual(result["generated_tokens"], 0)
+        self.assertEqual(result["receipt"], {"prompt_tokens": 2, "selected_tokens": 4,
+                                           "logit_passes": 1, "dtype": "float32", "scale": 1})
+        record = self.svc.lifecycle_records(result["request_id"])
+        self.assertEqual((record["state"], record["output_tokens"]), ("completed", 0))
+        self.assertIs(self.engine.proc, proc)
+        self.assertFalse(self.engine.score_q)
+
+    def test_rejected_score_is_nonfatal_while_generation_interleaves_and_successor_scores(self):
+        self.start(2)
+        result, errors = [], []
+        def generate():
+            try:
+                result.append(self.chat("survivor LONGREPLY"))
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=generate)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 3
+            while not self.log.exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            proc = self.engine.proc
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                self.score(selected=[999])
+            with rejected.exception as response:
+                self.assertEqual(response.code, 400)
+            self.assertEqual(self.score(prompt=[5] * 96)["generated_tokens"], 0)
+            self.assertIs(self.engine.proc, proc)
+            self.assertTrue(self.engine.alive())
+        finally:
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        self.assertTrue(any(line.startswith("SCORE ") and int(line.split()[3]) > 0
+                            for line in self.log.read_text().splitlines()))
+        self.assertEqual(self.chat("successor")["choices"][0]["message"]["content"], "ok, done.")
+
+    def assert_protocol_failure(self, flag, text):
+        self.start(2, more=(flag,))
+        self.engine.SCORE_TIMEOUT_S = .2
+        self.engine.SCORE_DRAIN_S = .2
+        with self.assertRaises(urllib.error.HTTPError) as failed:
+            self.score()
+        with failed.exception as response:
+            self.assertEqual(response.code, 503)
+            body = json.load(response)
+            self.assertIn(text, body["error"]["message"])
+            self.assertNotIn("logits", body)
+        self.assertFalse(self.engine.alive(), "ambiguous or corrupt score state must be retired")
+        self.assertFalse(self.engine.score_q)
+        self.assertFalse(self.engine.ctl.locked())
+
+    def test_wrong_generation_terminal_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-wrong-terminal", "wrong score terminal")
+
+    def test_wrong_score_id_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-wrong-id", "score terminal ID")
+
+    def test_missing_terminal_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-missing-terminal", "missing matching SDONE")
+
+    def test_mismatched_prompt_boundary_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-wrong-boundary", "receipt boundary mismatch")
+
+    def test_mismatched_admission_boundary_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-wrong-admission", "admission boundary")
+
+    def test_score_cannot_hide_a_wrong_terminal_in_generation_slot_routing(self):
+        self.assert_protocol_failure("--score-wrong-batch-terminal", "wrong score terminal")
+
+    def test_partial_option_set_is_never_a_successful_answer(self):
+        self.assert_protocol_failure("--score-partial", "incomplete option set")
+
+    def test_wrong_pass_receipt_is_a_protocol_failure(self):
+        self.assert_protocol_failure("--score-wrong-pass", "receipt boundary mismatch")
+
+    def test_generated_token_count_cannot_be_disguised_as_scoring(self):
+        self.assert_protocol_failure("--score-generated", "generated-token boundary mismatch")
+
+    def test_selected_token_order_receipt_cannot_be_changed(self):
+        self.assert_protocol_failure("--score-reordered", "receipt boundary mismatch")
+
+    def test_nonfinite_logit_never_publishes_an_option_set(self):
+        self.assert_protocol_failure("--score-nonfinite", "non-finite")
+
+    def test_device_or_state_error_is_not_an_ordinary_rejection(self):
+        self.assert_protocol_failure("--score-error", "fatal score engine/state error")
+
+    def test_duplicate_nonterminal_cannot_flood_the_reply_queue(self):
+        self.assert_protocol_failure("--score-flood", "duplicate score admission")
+
+    def wait_for(self, predicate, text):
+        deadline = time.monotonic() + 5
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertTrue(predicate(), text)
+
+    def test_disconnect_during_prompt_read_keeps_admission_until_matching_terminal_drains(self):
+        import socket
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        gate, cancelled = Path(directory.name) / "drain", Path(directory.name) / "cancelled"
+        gate.touch()
+        self.start(2, more=("--score-drain-gate", str(gate), "--score-cancel-file", str(cancelled)))
+        body = json.dumps({"version": 1, "prompt_token_ids": [5] * 4096, "selected_token_ids": [3, 1]}).encode()
+        client = socket.create_connection(self.httpd.server_address, timeout=3)
+        self.addCleanup(client.close)
+        client.sendall(b"POST /v1/score HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: " +
+                       str(len(body)).encode() + b"\r\n\r\n" + body)
+        self.wait_for(lambda: self.log.exists() and "SCORE " in self.log.read_text(), "score submitted")
+        request_id = self.log.read_text().split()[1]
+        client.close()
+        self.wait_for(cancelled.exists, "disconnect sends SCANCEL during prompt read")
+        self.assertIn(request_id, self.engine.score_q)
+        self.assertTrue(self.engine.ctl.locked())
+        self.assertIn(request_id, self.svc.admission_active)
+        self.assertFalse(self.engine.score_q[request_id]["terminal"])
+        self.assertEqual(self.svc.unload(), "busy", "disconnect cannot unload before score terminal drain")
+        results, errors = [], []
+        def successor():
+            try:
+                results.append(self.score())
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=successor)
+        thread.start()
+        try:
+            self.wait_for(lambda: len(self.svc.admission_active) == 2, "successor admitted behind the draining owner")
+            self.assertEqual(sum(line.startswith("SCORE ") for line in self.log.read_text().splitlines()), 1)
+        finally:
+            gate.unlink(missing_ok=True)
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0]["generated_tokens"], 0)
+        self.assertNotEqual(results[0]["request_id"], request_id)
+        self.wait_for(lambda: not self.svc.admission_active, "both admission owners released after drain")
+        self.assertFalse(self.engine.score_q)
+        self.assertTrue(self.engine.alive())
+
+    def test_http_score_uses_existing_bounded_admission_queue(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        gate = Path(directory.name) / "hold"
+        gate.touch()
+        self.start(2, more=("--score-hold-file", str(gate)))
+        self.svc.request_queue_limit = 0
+        results, errors = [], []
+        def request():
+            try:
+                results.append(self.score())
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=request) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.wait_for(lambda: len(self.svc.admission_active) == 2, "two requests own the effective capacity")
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                self.score()
+            with rejected.exception as response:
+                self.assertEqual(response.code, 429)
+                self.assertIn("queue is full", json.load(response)["error"]["message"])
+            self.assertEqual(len(self.engine.score_q), 1)
+            self.assertEqual(next(iter(self.engine.score_q.values()))["queue"].maxsize, 2)
+        finally:
+            gate.unlink(missing_ok=True)
+            for thread in threads:
+                thread.join(10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertTrue(self.engine.alive())
+
+    def test_direct_native_waiter_count_is_bounded(self):
+        from serve.server import AdmissionError
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        gate = Path(directory.name) / "hold"
+        gate.touch()
+        self.start(2, more=("--score-hold-file", str(gate)))
+        self.engine.info["score_max_pending"] = 2
+        request = {"version": 1, "prompt_token_ids": [5], "selected_token_ids": [0]}
+        cancels, errors = [threading.Event(), threading.Event()], []
+        def native(cancel):
+            try:
+                self.engine.score(request, cancel)
+            except AdmissionError as error:
+                errors.append(error)
+        threads = [threading.Thread(target=native, args=(cancel,)) for cancel in cancels]
+        for thread in threads:
+            thread.start()
+        try:
+            self.wait_for(lambda: self.engine.score_waiters == 2, "bounded direct callers own the queue")
+            with self.assertRaisesRegex(AdmissionError, "score queue is full"):
+                self.engine.score(request, threading.Event())
+        finally:
+            for cancel in cancels:
+                cancel.set()
+            gate.unlink(missing_ok=True)
+            for thread in threads:
+                thread.join(10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(self.engine.score_waiters, 0)
+        self.assertFalse(self.engine.score_q)
+
+    def test_work_and_payload_shape_are_bounded_before_submission(self):
+        self.start(2)
+        invalid = [({"prompt": [5] * 4097}, "prompt_token_ids"),
+                   ({"selected": [0] * 257}, "selected_token_ids"),
+                   ({"selected": [True]}, "int32"), ({"selected": [1.0]}, "int32"),
+                   ({"prompt": []}, "prompt_token_ids"), ({"selected": []}, "selected_token_ids"),
+                   ({"version": 2}, "version"), ({"temperature": .5}, "unsupported score fields"),
+                   ({"max_tokens": 0}, "unsupported score fields")]
+        for body, reason in invalid:
+            with self.subTest(body_keys=list(body)):
+                with self.assertRaises(urllib.error.HTTPError) as refused:
+                    self.score(**body)
+                with refused.exception as response:
+                    self.assertEqual(response.code, 400)
+                    self.assertIn(reason, json.load(response)["error"]["message"])
+        self.assertEqual(self.log.read_text(), "", "refused work never reaches any native command")
+        self.assertEqual(self.score()["generated_tokens"], 0)
+        self.assertEqual(self.get("/health")["scoring"],
+                         {"available": True, "version": 1, "max_prompt_tokens": 4096,
+                          "max_selected_tokens": 256, "max_pending": 8})
+
+    def test_serial_generation_and_score_keep_their_protocols_separate(self):
+        import serve.server as server
+        self.start(0)
+        trace = io.StringIO()
+        with mock.patch.object(server, "_BTRACE", True), contextlib.redirect_stderr(trace):
+            self.assertEqual(self.score()["generated_tokens"], 0)
+        frames = [line.split(" wire< ", 1)[1] for line in trace.getvalue().splitlines() if " wire< " in line]
+        self.assertEqual(sum(frame.startswith("SDONE ") for frame in frames), 1)
+        self.assertFalse(any(frame.startswith(("T ", "BT ", "DONE ", "BDONE ")) for frame in frames))
+        self.assertEqual(self.chat("generation")["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_failed_score_write_never_reuses_ambiguous_ownership(self):
+        from serve.server import EngineDied
+        self.start(2)
+        request = {"version": 1, "prompt_token_ids": [5], "selected_token_ids": [0]}
+        with mock.patch.object(self.engine, "_send", side_effect=EngineDied("partial score write")):
+            with self.assertRaises(EngineDied):
+                self.engine.score(request, threading.Event())
+        self.assertFalse(self.engine.alive(), "a failed write and failed cancel drain cannot release live ownership")
+        self.assertFalse(self.engine.score_q)
+        self.assertFalse(self.engine.ctl.locked())
+
 
 
 class ParkedCancellation(unittest.TestCase):
