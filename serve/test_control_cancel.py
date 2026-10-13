@@ -57,10 +57,12 @@ class ControlCancelTest(unittest.TestCase):
 
     def test_refusal_without_boundary_never_reuses_control_lines(self):
         eng = self._engine(["REJECT request memory exceeds admitted envelope"])
+        # GEN's REJECT is terminal; BGEN must prove its bounded BADM boundary.
+        eng._ctl_mode = "batch"
         eng._silent = mock.Mock(return_value=server.EngineSilent("request memory refused"))
         tokens = []
         with self.assertRaises(server.EngineSilent):
-            list(eng._control(threading.Event(), tokens.append))
+            list(eng._control(threading.Event(), tokens.append, slot=0))
         self.assertEqual(tokens, [])
         eng._silent.assert_called_once()
 
@@ -69,6 +71,8 @@ class ControlCancelTest(unittest.TestCase):
         eng.gen = 1
         eng.slot_cv = threading.Condition()
         eng.slot_busy, eng.slot_held = [True], [[]]
+        eng.slot_claims = {0}
+        eng.slot_releasing = set()
         arrived, drained = threading.Event(), threading.Event()
         class SlotQueue(queue.Queue):
             def get(self, *args, **kwargs):
@@ -76,10 +80,11 @@ class ControlCancelTest(unittest.TestCase):
                 return super().get(*args, **kwargs)
         eng.slot_q = [SlotQueue()]
         eng.alive = lambda: True
+        owner = (eng.gen, eng.slot_q, eng.slot_busy, eng.slot_held, eng.slot_claims, eng.slot_releasing)
         errors = []
         def drain():
             try:
-                eng._release_slot_when_done(0, [1, 2])
+                eng._release_slot_when_done(0, [1, 2], owner)
             except Exception as error:
                 errors.append(error)
             finally:
@@ -90,12 +95,16 @@ class ControlCancelTest(unittest.TestCase):
             self.assertTrue(arrived.wait(2))
             self.assertEqual(eng.sent, ["BSTOP 0"])
             self.assertTrue(eng.slot_busy[0])
+            self.assertEqual(eng.slot_releasing, {0})
+            self.assertEqual(eng.slot_claims, {0})
             self.assertFalse(drained.is_set())
             eng.slot_q[0].put("BT 0 3")
             eng.slot_q[0].put("BDONE 0 3 cancel 1")
             self.assertTrue(drained.wait(2))
             self.assertEqual(errors, [])
             self.assertFalse(eng.slot_busy[0])
+            self.assertEqual(eng.slot_releasing, set())
+            self.assertEqual(eng.slot_claims, set())
             self.assertEqual(eng.slot_held[0], [1, 2])
         finally:
             eng.slot_q[0].put(None)

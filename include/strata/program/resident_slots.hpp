@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core { class Verifier; class MtpDrafter; struct ExpertDispatch; }
@@ -36,6 +37,15 @@ struct ResidentWorking {
     int resume_slot = -1;
 };
 
+// The post-prefill request setup installs the resident owner's already-resolved policy.
+// Setter-only targets let the CPU regression exercise this production seam without a device.
+template<class Verifier, class Drafter>
+void apply_request_sampling(const ResidentWorking& owner, Verifier& verifier, Verifier* peer, Drafter* draft) {
+    verifier.set_sampling(owner.sampling);
+    if (peer) peer->set_sampling(owner.sampling);
+    if (draft) draft->set_draft_sampling(owner.sampling);
+}
+
 // Read-only to the scheduler. The vector objects and graph-referenced sessions
 // never move while bound. Token storage is reserved once per admitted slot.
 struct ResidentSlot {
@@ -54,11 +64,14 @@ struct ResidentSlot {
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
     bool failed = false;
+    // #879: a window met non-finite logits while this slot was running: its state may have started from the
+    // poisoned state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends.
+    bool tainted = false;
 
     // Called only after the operation owner certifies this row's drain.
     void complete(bool cache_enabled) {
         active = false;
-        cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed;
+        cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed && !tainted;
     }
     bool reusable(const core::ConversationScope& scope, bool steering) const {
         return !active && !failed && cached && request && cvec == steering && input.scope.matches(scope);
@@ -94,6 +107,11 @@ public:
     bool active() const;
     bool available(int slot) const;
     void cancel(int slot);
+    /// #879: the running slot's state may hold the poison: `complete` must not keep it as a cache when it ends.
+    void taint(int slot);
+    /// #879 for a whole batch: taint every running slot and drop every idle slot's cached conversation
+    /// (`cached=false`, `partial=false`, `checks.clear()`).  Returns (running, idle-cleared) for the report.
+    std::pair<size_t, size_t> invalidate_after_nonfinite();
     void priority(int slot, bool foreground);
     bool init_resources(std::string& error);
     bool release_resources(std::string& error);

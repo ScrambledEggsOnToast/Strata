@@ -138,6 +138,18 @@ void ResidentSlots::cancel(int slot) {
     }
 }
 
+void ResidentSlots::taint(int slot) {
+    if (slot >= 0 && (size_t) slot < slots_.size()) slots_[(size_t) slot].tainted = true;
+}
+
+std::pair<size_t, size_t> ResidentSlots::invalidate_after_nonfinite() {
+    size_t running = 0, idle = 0;
+    for (auto& sl : slots_)
+        if (sl.active) { sl.tainted = true; ++running; }
+        else if (sl.cached) { sl.cached = false; sl.partial = false; sl.checks.clear(); ++idle; }
+    return {running, idle};
+}
+
 void ResidentSlots::priority(int slot, bool foreground) {
     if (slot >= 0 && (size_t) slot < slots_.size()) slots_[(size_t) slot].foreground = foreground;
 }

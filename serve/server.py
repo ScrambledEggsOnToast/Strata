@@ -54,11 +54,12 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -145,6 +146,7 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -158,14 +160,23 @@ LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
+LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
+LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
 
 
 def reasoning_repeat_coverage(text):
     """Coverage of recent words by 12-word passages seen at least three times.
 
     Only reasoning is supplied. The history (the last LOOP_HISTORY_WORDS words) detects repeated verification passes
-    separated by long code drafts; the recent window excludes old repetitions.
+    separated by long code drafts; the recent window excludes old repetitions.  #1753: a loop can also be one long
+    word (a 24k-digit string cycling an 11-digit pattern): the word split makes it a single word and no word count
+    grows, and #606's token run never grows either (the tokenizer has no multi-digit tokens), so before the word
+    count the last LOOP_TAIL_CHARS chars are checked for a period of at most LOOP_TAIL_PERIOD, and a periodic tail
+    reads as full coverage: it is all of the recent output, repeated.
     """
+    tail = text[-LOOP_TAIL_CHARS:].lower()
+    if len(tail) == LOOP_TAIL_CHARS and any(tail[p:] == tail[:-p] for p in range(1, LOOP_TAIL_PERIOD + 1)):
+        return 1.0
     words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
     width, window = 12, 2000
     if len(words) < window:
@@ -199,6 +210,8 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -295,6 +308,11 @@ class EngineStarting(RuntimeError):
     not a 400 about the prompt."""
 
 
+class ClientGone(Exception):
+    """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
+    waiting for its turn): nothing is left to answer."""
+
+
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
@@ -311,6 +329,13 @@ class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
     EngineDied, so the request ends with an error and the next one starts the engine again."""
+
+
+class EngineNonFinite(ValueError):
+    """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
+    engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
+    request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
+    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
 class SessionRefused(ValueError):
@@ -337,7 +362,28 @@ class EngineStuck(RuntimeError):
 
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
-    model server) is using it, so the engine is not started into the little that is left."""
+    model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
+    for the Retry-After header of the 503."""
+
+    def __init__(self, message="", retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def unload_wait(value, default: float) -> float:
+    """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
+    yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
+    if value is None:
+        return 0.0
+    v = str(value).strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return 0.0
+    if v in ("1", "true", "yes", "on"):
+        return default
+    try:
+        return min(3600.0, max(0.0, float(v)))
+    except ValueError:
+        return default
 
 
 ENGINE_REQUEST = re.compile(
@@ -764,14 +810,15 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None):
         if os.environ.get("STRATA_SUPERVISED") == "1":
             if lazy:
                 raise ValueError("protected engine requires eager startup")
             if self.__dict__.get("_protected_started", False):
                 raise EngineDied("protected engine lifetime consumed; start a new supervised action")
             self._protected_started = True
-        self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+        self.session_save_reclaim = '--session-save-reclaim' in args
         self.resident_multiplex = "--resident-multiplex" in args
         spec_policy = os.environ.get("STRATA_SPEC_POLICY", "static")
         if spec_policy not in ("static", "adaptive"):
@@ -801,6 +848,7 @@ class StrataEngine:
             self.control_waiters = collections.deque()
             self.ctl_epoch = 0
             self.ctl = threading.Lock()
+            self.admitting = 0                          # #1603: those that gave the lines back to wait for a slot
         self.wlock = threading.Lock()
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
@@ -828,8 +876,11 @@ class StrataEngine:
             except OSError:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
+        pin = {}
+        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
+            pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
@@ -881,8 +932,10 @@ class StrataEngine:
                 pass
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
-            raise RuntimeError(why + (f" (see {log})" if log else "") +
-                               start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+            # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
+            # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
+            raise EngineDied(why + (f" (see {log})" if log else "") +
+                             start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -913,13 +966,19 @@ class StrataEngine:
         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
-        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
-        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
+        # A pipelined group's window spans its slots up to its last busy one.
+        # Without a useful scoped prefix, pick_slot fills holes before spreading
+        # new requests over the groups.
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
+        # given back; slot_releasing: slots synchronously draining their BDONE. A busy slot in neither has no owner
+        # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
+        self.slot_claims: set[int] = set()
+        self.slot_releasing: set[int] = set()
+        self._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
@@ -940,6 +999,17 @@ class StrataEngine:
                 raise ValueError("adaptive speculation needs effective --batch >= 2, --prompt-cache and --foreground-budget-ms")
             else:
                 self.speculation_policy = SpeculationPolicy(self.foreground_budget_s, self.batch)
+        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
+        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
+        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
+        # new lists.
+        if "slot_cv" not in self.__dict__:
+            self.slot_cv = threading.Condition()
+            self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
+            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.ctl_epoch = 0                          # how often the control lines were taken
+            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -989,15 +1059,17 @@ class StrataEngine:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
         if getattr(self, "silent_note", None):          # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
-        tail = ""
+        tail = wide = ""
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                f.seek(max(0, f.tell() - 262144))
+                wide = f.read().decode("utf-8", "replace")
+            tail = wide[-4096:]
         except (OSError, TypeError):
             pass
-        for line in reversed(tail.splitlines()):
+        # #1705: STRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
+        for line in reversed(wide.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
@@ -1083,8 +1155,10 @@ class StrataEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
-            with self.slot_cv:                   # #1012: wake the requests that waited through it: they go on with the
-                self.slot_cv.notify_all()        # new engine, or (it did not start) end with a clean EngineDied
+            # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
+            if "slot_cv" in self.__dict__:
+                with self.slot_cv:               # #1012: wake the requests that waited through it: they go on with the
+                    self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -1183,6 +1257,12 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
+            # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
+            # ignores a 1).  Anything else is not sent.
+            ac = tune.get("aux_cpus")
+            if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
+                keys += f" aux_cpus={int(ac)}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -1194,7 +1274,7 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1294,6 +1374,11 @@ class StrataEngine:
                 self._ctl_result = ("done", None)
                 return
 
+    def _done_finish(self) -> str | None:
+        """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
+        f = (getattr(self, "_last_done", None) or "").split()
+        return f[5] if len(f) > 5 else None
+
     def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None, slot=None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers. A missing live boundary poisons the process.
@@ -1328,18 +1413,54 @@ class StrataEngine:
                 return line
         raise self._silent(f"the engine did not acknowledge {until} within {timeout:g} s")
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _apply_bdone(self, f: list[str]) -> None:
+        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        if len(f) >= 5 and isinstance(self.last, dict):
+            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+
+    def _bdone_after_eos(self, slot: int, owner, wait_s: float = 2.0):
+        """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
+        in the same window). Read it here, so the request's figures are the slot leg's (the synchronous release would eat it,
+        and the request kept the admission's single token). None when it does not come in `wait_s`: then the bounded
+        synchronous release drains it."""
+        born, queues, _, _, _, _ = owner
+        if slot >= len(queues):
+            return None
+        end = time.monotonic() + wait_s
+        while time.monotonic() < end:
+            if self.gen != born or not self.alive():
+                return None
+            try:
+                line = queues[slot].get(timeout=max(0.05, end - time.monotonic()))
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            if line.startswith("BDONE "):
+                return line
+        return None
+
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None, owner):
         """Stop and drain synchronously before slot reuse or release of admission/embeddings.
 
         Keep the process's queues and slot state: a restart must not free a successor's slot.
         A missing live acknowledgement ends the process rather than reusing a running slot.
+        `stream`: the prompt and every token of it so far - with the tokens still to come before BDONE, all but
+        the last are what the slot holds then (the next turn of its conversation).  The slot is in slot_releasing
+        while its BDONE is waited for here, so #1603's orphan reaping never takes it.
         """
-        if slot >= len(self.slot_q):
+        born, queues, busy, held, claims, releasing = owner
+        if slot >= len(queues):
             return
-        born = self.gen
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held
-        if self.alive():
-            self._send(f"BSTOP {slot}")
+        q = queues[slot]
+        with self.slot_cv:
+            releasing.add(slot)
+        try:
+            if self.gen == born and self.alive():
+                self._send(f"BSTOP {slot}")
+        except EngineDied:                              # it died between the check and the line
+            pass
         end = time.monotonic() + 600.0
         tail = list(stream or [])
         while True:
@@ -1357,13 +1478,67 @@ class StrataEngine:
                 tail = []
                 break
             if line.startswith("BT "):
-                tail.append(int(line.split()[2]))
+                try:
+                    tail.append(int(line.split()[2]))
+                except (IndexError, ValueError):
+                    tail = []
             if line.startswith("BDONE "):
+                if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
+                    tail = []
                 break
         held[slot] = tail[:-1] if stream and tail else []
         with self.slot_cv:
+            # Retire the captured generation's claim before publishing availability.
+            # No caller may discard it later: a successor can reserve as soon as we notify.
+            claims.discard(slot)
             busy[slot] = False
+            releasing.discard(slot)
             self.slot_cv.notify_all()
+
+    BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
+    SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
+
+    def _park_slot(self, slot: int, owner) -> None:
+        """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
+        give it back: the engine's view has caught up, or the next refusal parks it again."""
+        _, _, busy, _, claims, releasing = owner
+        with self.slot_cv:
+            claims.discard(slot)
+            busy[slot] = True
+
+        def free():
+            with self.slot_cv:
+                if slot not in claims and slot not in releasing:
+                    busy[slot] = False
+                self.slot_cv.notify_all()
+        t = threading.Timer(self.SLOT_PARK_S, free)
+        t.daemon = True
+        t.start()
+
+    ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
+
+    def _reap_orphan_slots(self) -> list[int]:
+        """#1603: free the slots whose busy flag has no owner (no request holds or reserves them and no BDONE wait is
+        running for them).  The caller holds slot_cv.  A flag that leaked kept every later request waiting for a slot
+        that nothing would free - with nothing running, nothing queued and nothing for the frozen-engine check to see.
+        A slot is only given back after it has looked ownerless for ORPHAN_SLOT_S, so a flag set a moment before its
+        owner registers is never taken."""
+        now = time.monotonic()
+        freed = []
+        for b, busy in enumerate(self.slot_busy):
+            if busy and b not in self.slot_claims and b not in self.slot_releasing:
+                first = self._orphan_seen.setdefault(b, now)
+                if now - first >= self.ORPHAN_SLOT_S:
+                    self.slot_busy[b] = False
+                    self._orphan_seen.pop(b, None)
+                    freed.append(b)
+            else:
+                self._orphan_seen.pop(b, None)
+        if freed:
+            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
+                  "(issue #1603); freed, the waiting request goes on", flush=True)
+            self.slot_cv.notify_all()
+        return freed
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
     def _control_turn(self, now):
@@ -1488,6 +1663,7 @@ class StrataEngine:
         on_submit = (sampling or {}).get("_strata_submitted")
         foreground_pending = (sampling or {}).get("_strata_foreground_pending")
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+        carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         background_due = None
         slot = None
         def slot_ready():
@@ -1504,11 +1680,14 @@ class StrataEngine:
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
         slot_queues, slot_busy, slot_held = self.slot_q, self.slot_busy, self.slot_held
         slot_live, slot_used = self.slot_live, self.slot_used
+        slot_claims, slot_releasing = self.slot_claims, self.slot_releasing
+        slot_owner = (born, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing)
         btrace("ctl acquired")
         gen0, reserved = None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
-        yields, solo_again = 0, 0
+        yields, solo_again, refused = 0, 0, 0
+        admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1527,6 +1706,7 @@ class StrataEngine:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     if policy is not None:
                         policy.begin("solo", len(prompt), transition=bool(out))
+                    self._last_done = None                  # (#879: this request's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     if callable(on_submit):
                         on_submit(None)
@@ -1552,8 +1732,9 @@ class StrataEngine:
                                 with self.slot_cv:          # the slot the part read will wait in
                                     reserved = self.pick_slot(prompt, scope)
                                     if reserved is not None:
-                                        self.slot_busy[reserved] = True
+                                        slot_busy[reserved] = True
                                         self.slot_scope[reserved] = scope
+                                        slot_claims.add(reserved)
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
@@ -1564,11 +1745,14 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
-                            self.slot_busy[reserved] = False
+                            slot_busy[reserved] = False
+                            slot_claims.discard(reserved)
                             self.slot_cv.notify_all()
                         reserved = None
                     if slot is None:
@@ -1576,6 +1760,10 @@ class StrataEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
+                        if reused0 is None:
+                            reused0 = (self.last or {}).get("reused")
+                        carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
+                                                            # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -1588,14 +1776,32 @@ class StrataEngine:
                             with self.slot_cv:
                                 slot = self.pick_slot(prompt, scope)
                                 if slot is not None:
-                                    self.slot_busy[slot] = True
+                                    slot_busy[slot] = True
+                                    slot_claims.add(slot)
+                                    if admit_wait:
+                                        admit_wait = False
+                                        self.admitting = max(0, self.admitting - 1)
                                     break
+                                if not admit_wait:          # #1603: counted while it waits for a slot (it holds no
+                                    admit_wait, admit_since = True, time.monotonic()   # control lines then)
+                                    self.admitting += 1
                             if holding:
                                 if callable(on_wait):
                                     on_wait()
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
+                                if self.pick_slot(prompt, scope) is None:
+                                    if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
+                                        # the stall check of #1317 only watches a request on the control lines; one
+                                        # waiting here is covered by looking for a slot nobody owns, and by saying so
+                                        if not admit_said:
+                                            admit_said = True
+                                            busy = [b for b, v in enumerate(self.slot_busy) if v]
+                                            print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
+                                                  f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
+                                                  f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
+                                    self._reap_orphan_slots()
                                 if self.pick_slot(prompt, scope) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
@@ -1605,6 +1811,13 @@ class StrataEngine:
                                                                    priority, background_due, slot_ready, foreground_pending)
                                 if not ok:
                                     return
+                                # No slot is owned while waiting across a restart. Capture the
+                                # successor's complete ownership generation before reserving one.
+                                if self.gen != born:
+                                    slot_queues, slot_busy, slot_held = self.slot_q, self.slot_busy, self.slot_held
+                                    slot_live, slot_used = self.slot_live, self.slot_used
+                                    slot_claims, slot_releasing = self.slot_claims, self.slot_releasing
+                                    slot_owner = (self.gen, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing)
                                 holding, born = True, self.gen
                                 control_started = time.monotonic()
                     if self._yielded is not None:           # it gave way: the others waiting then go first
@@ -1639,6 +1852,7 @@ class StrataEngine:
                         on_slot(slot)
                     if policy is not None:
                         policy.begin("batch", len(prompt), slot, transition=bool(out))
+                    self._last_done = None                  # (#879: this admission's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_scope[slot] = scope
                     if callable(on_submit):
@@ -1648,17 +1862,37 @@ class StrataEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
                     asked = False
-                    for x in self._control(cancel, pending.append, slot=slot):
-                        while pending:
-                            t = pending.pop(0)
-                            out.append(t)
-                            yield t
-                        if x is None:
-                            if (not asked and not embeddings and self._can_yield(yields) and
-                                    prefill_waiter()):
-                                self._send(f"BYIELD {slot}")
-                                asked = True
-                            yield None
+                    try:
+                        for x in self._control(cancel, pending.append, slot=slot):
+                            while pending:
+                                t = pending.pop(0)
+                                out.append(t)
+                                yield t
+                            if x is None:
+                                if (not asked and not embeddings and self._can_yield(yields) and
+                                        prefill_waiter()):
+                                    self._send(f"BYIELD {slot}")
+                                    asked = True
+                                yield None
+                    except ValueError as e:
+                        # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
+                        # slot it still holds).  That is not the request's fault and nothing was read: park the slot
+                        # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
+                        if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
+                            raise
+                        refused += 1
+                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                              f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
+                        if refused > self.BGEN_REFUSALS_MAX:
+                            raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
+                                      retry_after=5) from e
+                        self.slot_live[slot] = None
+                        self.slot_held[slot] = []
+                        phase = "none"
+                        self._ctl_erred = False
+                        self._park_slot(slot, slot_owner)
+                        slot = None
+                        continue
                     if reused0 is None:
                         reused0 = (self.last or {}).get("reused")
                     cont = bool(self._ctl_result and self._ctl_result[1])
@@ -1669,6 +1903,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if not cont and self._done_finish() == "nonfinite":   # #879
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -1714,19 +1950,22 @@ class StrataEngine:
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
-                        if len(f) >= 5 and isinstance(self.last, dict):
-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                        self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
-                        self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
+                            slot_held[slot] = []
+                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
-                            self.slot_live[slot] = None
-                            self.slot_used[slot] = time.time()
+                            carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
+                            slot_live[slot] = None
+                            slot_used[slot] = time.time()
                             with self.slot_cv:
-                                self.slot_busy[slot] = False
+                                slot_busy[slot] = False
+                                slot_claims.discard(slot)
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
                             if reused0 is None:
@@ -1762,24 +2001,45 @@ class StrataEngine:
             except EngineDied:
                 pass
             finally:
+                bdone_in = False
+                if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
+                    bd = self._bdone_after_eos(slot, slot_owner)   # (#1869) the slot's figures, not the admission's
+                    if bd is not None:
+                        self._apply_bdone(bd.split())
+                        bdone_in = True
                 if reused0 is not None and isinstance(self.last, dict):
                     self.last = {**self.last, "reused": reused0}
+                if carry and isinstance(self.last, dict):
+                    self.last = add_carry(carry, self.last)
                 if holding:
                     self.ctl.release()
+                if admit_wait:
+                    with self.slot_cv:
+                        self.admitting = max(0, self.admitting - 1)
             if reserved is not None:
                 with self.slot_cv:
                     slot_busy[reserved] = False
+                    slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
             if slot is not None:
                 slot_live[slot] = None
                 slot_used[slot] = time.time()
                 if phase == "slot" and self.gen == born:
-                    slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # admission held until BDONE
+                    if bdone_in:
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                        with self.slot_cv:
+                            slot_busy[slot] = False
+                            slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
+                    else:
+                        slot_held[slot] = []
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        self._release_slot_when_done(slot, stream, slot_owner)  # synchronous drain retires its claim
                 else:
                     with self.slot_cv:
                         slot_busy[slot] = False
+                        slot_claims.discard(slot)
                         self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
@@ -1845,6 +2105,7 @@ class StrataEngine:
             # Trusted direct callers without a conversation identity are private
             # to this generation, including its yield/promotion/solo legs.
             sampling["_strata_cache_scope"] = uuid.uuid4().hex + uuid.uuid4().hex
+        bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -1932,6 +2193,8 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if self.last.get("finish") == "nonfinite":   # #879
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
                 elif line.startswith("ADMIT"):
                     continue                # HET-017: the admission decision the harness times; the server
@@ -2388,12 +2651,14 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
+    def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
-        had read it)."""
+        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
         out: list[tuple[Path, int]] = []
         for src in sources:
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
@@ -2467,6 +2732,20 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def engine_binary(exe: str, cfg: dict | None = None) -> str:
+    """The file that holds the engine's own option strings, for a feature check that reads it.  The Intel launcher
+    (sycl/serve/strata-sycl.sh) is a shell script that runs its repo's STRATA_SYCL_BIN (default build-sycl-aot/strata)
+    in a container, so the check reads that binary, not the script.  Any other `exe` is the engine itself."""
+    p = Path(exe)
+    if p.name == "strata-sycl.sh":
+        rel = ((cfg or {}).get("env") or {}).get("STRATA_SYCL_BIN") or os.environ.get("STRATA_SYCL_BIN") \
+            or "build-sycl-aot/strata"
+        b = p.resolve().parents[2] / rel
+        if b.is_file():
+            return str(b)
+    return exe
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -2478,7 +2757,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     if pos == "start":
         return None
     try:
-        with open(exe, "rb") as f:
+        with open(engine_binary(exe, cfg), "rb") as f:
             known = b"--tail-role-token" in f.read()
     except OSError:
         known = False
@@ -2582,7 +2861,7 @@ def engine_args(cfg: dict) -> list[str]:
     return learned_profile_args(cfg, args)
 
 
-PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
+PARALLEL_MAX = 8      # native admission normalizes all requested slot counts to kVerifyMaxT, including batch-MTP
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
@@ -2600,7 +2879,7 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         return []
     if n <= 1:
         return []
-    if n > PARALLEL_MAX and "--batch-mtp" not in args and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
+    if n > PARALLEL_MAX:
         print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
@@ -2711,14 +2990,34 @@ def hip_speed_scores(indices: list[int], root: str = "/sys/class/kfd/kfd/topolog
     return got if all(i in got for i in indices) else None
 
 
-def ordered_gpus(cfg: dict, scores=None) -> list[int]:
+def gpu_vram_mib(indices: list[int], hip: bool = False) -> dict[int, int] | None:
+    """Total VRAM of each card in MiB (NVML / amdgpu sysfs); None when any of them cannot be read."""
+    try:
+        from serve.telemetry import gpu_reader
+    except ImportError:
+        return None
+    out = {}
+    for i in indices:
+        g = gpu_reader(i, amd=hip)
+        if not g.ok():
+            return None
+        total = g.read().get("mem_total")
+        if total is None:
+            return None
+        out[i] = int(total) >> 20
+    return out
+
+
+def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     """#1352: the cards of a layer split in the order the engine stages them.  With "layer_split": "auto" (the
     default) the faster card goes LAST - the last stage runs the head, the draft layer and the verify, and a prompt
     chunk waits on it (the reporter's 4070 Ti SUPER + 5060 Ti: a 6K prompt took 50 s one way round and 15 s the
-    other); "faster" is multiprocessors x max clock.  Equal cards keep the config's order (the sort is stable), and
+    other); "faster" is multiprocessors x max clock.  Equal cards - scores within 5% - keep the config's order, and
     so does anything we cannot measure.  "gpu_order": "as_given" keeps the config's order whatever the cards.  A
-    manual "layer_split" ("24") also keeps it: the user placed the layers.  scores: {index: score} (tests); None asks
-    the driver."""
+    manual "layer_split" ("24") also keeps it: the user placed the layers.  #1576: the reorder is skipped when it
+    would land the last stage on a card with less total VRAM than the one the config put there - that stage's head,
+    draft and verify have a floor the smaller card cannot afford.  scores/vrams: {index: value} (tests); None asks
+    the driver - injected scores without injected vrams means no VRAM check (a test seam is a test seam)."""
     gl = gpu_list(cfg)
     if len(gl) < 2 or cfg.get("gpu_order") == "as_given":
         return gl
@@ -2729,8 +3028,16 @@ def ordered_gpus(cfg: dict, scores=None) -> list[int]:
     sc = scores if scores is not None else (hip_speed_scores(gl) if hip else gpu_speed_scores(gl))
     if not sc or any(i not in sc for i in gl):
         return gl
+    if max(sc[i] for i in gl) < 1.05 * min(sc[i] for i in gl):
+        return gl     # #1760: cards within 5% of each other are the same card (two 5070 Ti read 1.2% apart on the clock): keep the order
     out = sorted(gl, key=lambda i: sc[i])
     if out != gl:
+        vram = vrams if vrams is not None else (None if scores is not None else gpu_vram_mib(gl, hip))
+        if vram is not None and all(i in vram for i in gl) and vram[out[-1]] < vram[gl[-1]]:
+            print(f"[strata] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
+                  f"less VRAM than the one the split ends on ({vram[out[-1]]} vs {vram[gl[-1]]} MiB, #1576)",
+                  flush=True)
+            return gl
         print(f"[strata] layer split: card order {','.join(map(str, out))} (the faster card last; "
               f'"gpu_order": "as_given" keeps {",".join(map(str, gl))}, #1352)', flush=True)
     return out
@@ -2990,6 +3297,8 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3050,6 +3359,10 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
+        self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
+        self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
+        self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
+        self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
@@ -3107,7 +3420,11 @@ class Service:
                                    else "restoring a session", started=time.time(), first_token=None,
                                    prompt_tokens=None, generated=None, max_tokens=None)
             try:
-                r = self.engine.session_file(action, path)
+                if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
+                    from serve.session_save_retry import session_file
+                    r = session_file(self, action, path, SessionRefused)
+                else:
+                    r = self.engine.session_file(action, path)
             except SessionRefused as e:
                 body = error(e.status, str(e))
                 body[1]["error"]["kind"] = e.kind
@@ -3343,6 +3660,7 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        hook_failed = None
         if self.supervised:
             raise EngineDied("protected engine is unavailable; start a new supervised action")
         with self.status_lock:
@@ -3353,19 +3671,51 @@ class Service:
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            why = None
             try:
-                subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
+                r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
+                                   stdin=subprocess.DEVNULL)
+                if r.returncode != 0:
+                    why = f"it exited with code {r.returncode}"
+            except subprocess.TimeoutExpired:
+                why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
-                print(f"[strata] the before_load command failed ({e}); loading anyway", flush=True)
-        if self.min_free_vram_mib:
+                why = f"it could not run ({e})"
+            if why is not None:
+                # #1997: a failing hook (e.g. the other server's /unload that is still busy) may mean the GPU was not
+                # given back.  A peer that is simply not running also makes `curl` fail (exit 7), so the exit code alone
+                # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
+                # refuses, "ignore" always loads.
+                if self.before_load_strict and not self.before_load_ignore_failure:
+                    print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
+                          "request is answered 503 - try again (before_load_strict)", flush=True)
+                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
+                                  "model was not loaded; try again in a moment", retry_after=15)
+                hook_failed = why
+                if self.before_load_ignore_failure or not self.min_free_vram_mib:
+                    print(f"[strata] the before_load command failed ({why}); loading anyway"
+                          + ("" if self.before_load_ignore_failure else
+                             " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
+                          flush=True)
+                else:
+                    print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
+        if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
             free = self.free_vram_mib()
-            deadline = time.time() + 15                 # memory another process just gave back can take a moment
+            deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
             while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
                 time.sleep(0.5)
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
+                if hook_failed and not self.before_load_ignore_failure:
+                    print(f"[strata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
+                          f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
+                              + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
+                              retry_after=15)
+            if hook_failed and not self.before_load_ignore_failure:
+                print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
+                      "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
@@ -3444,19 +3794,42 @@ class Service:
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
-        with self.fifo:
-            loading = time.perf_counter()
-            if trace is not None:
+        with self.status_lock:                          # #1603: waiting for the fifo to start the engine is queued, not nothing
+            self.status["queued"] += 1
+        counted = True
+        try:
+            with self.fifo:
                 with self.status_lock:
-                    trace["queue_s"] += round(loading - waiting, 3)
-                    trace["state"] = "loading"
-            try:
-                self.ensure_loaded()
-            finally:
+                    self.status["queued"] -= 1
+                counted = False
+                loading = time.perf_counter()
                 if trace is not None:
                     with self.status_lock:
-                        trace["load_s"] += round(time.perf_counter() - loading, 3)
-                        trace["state"] = "queued"
+                        trace["queue_s"] += round(loading - waiting, 3)
+                        trace["state"] = "loading"
+                try:
+                    self.ensure_loaded()
+                finally:
+                    if trace is not None:
+                        with self.status_lock:
+                            trace["load_s"] += round(time.perf_counter() - loading, 3)
+                            trace["state"] = "queued"
+        finally:
+            if counted:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+
+    UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
+
+    def unload_waiting(self, wait_s: float) -> str:
+        """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
+        a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            r = self.unload()
+            if r != "busy" or time.monotonic() >= deadline:
+                return r
+            time.sleep(0.25)
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -3514,12 +3887,12 @@ class Service:
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
-        if not s:
+        effort = s.get("reasoning_effort") or self.config_effort   # the Chat settings first, then the config's
+        if not s and not effort:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        effort = s.get("reasoning_effort")
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
@@ -3653,9 +4026,12 @@ class Service:
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
-                        waiting=int(getattr(self.engine, "waiting", 0) or 0))
+                        waiting=int(getattr(self.engine, "waiting", 0) or 0),
+                        admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
+        if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
+            live["replicas"] = self.engine.replica_view()
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -3665,6 +4041,35 @@ class Service:
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
+
+    def prometheus(self) -> str:
+        """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
+        metric names (llamacpp:*) so its dashboards work unchanged; the drafts and requests as strata:*."""
+        with self.status_lock:
+            s, t = dict(self.status), dict(self.totals)
+            running = len(self.live_reqs) or int(bool(s.get("busy")))
+        prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
+        prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
+        rows = [
+            ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", prompt_n),
+            ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held",
+             t["reused"]),
+            ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", prompt_s),
+            ("llamacpp:tokens_predicted_total", "counter", "Tokens generated", t["output_tokens"]),
+            ("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", decode_s),
+            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s",
+             prompt_n / prompt_s if prompt_s else 0),
+            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s",
+             t["output_tokens"] / decode_s if decode_s else 0),
+            ("llamacpp:requests_processing", "gauge", "Requests running", running),
+            ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
+            ("strata:requests_total", "counter", "Requests finished", t["requests"]),
+            ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t["drafts_offered"]),
+            ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
+            ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
+        ]
+        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
+                       for name, kind, help_, value in rows)
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -3742,7 +4147,22 @@ class Service:
         prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def _note_unreadable_tool_images(self, messages):
+    @contextlib.contextmanager
+    def _turn(self, cancel=None):
+        """The engine's single turn (self.fifo) for an image encode.  #1999: a client that leaves while this request
+        waits for it gives its place up (ClientGone), as a queued generation does (#1619)."""
+        if cancel is None:
+            self.fifo.acquire()
+        else:
+            while not self.fifo.acquire(timeout=0.25):
+                if cancel.is_set():
+                    raise ClientGone()
+        try:
+            yield
+        finally:
+            self.fifo.release()
+
+    def _note_unreadable_tool_images(self, messages, cancel=None):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
         image encoder, or the encoder refuses that picture - becomes a short note in its place instead of a 400.
         Clients resend the whole history every turn, so one unreadable tool picture would fail every later request of
@@ -3760,9 +4180,11 @@ class Service:
                 if why is None:
                     src = item["source"]
                     try:
+                        if cancel is not None and cancel.is_set():
+                            raise ClientGone()
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self.fifo:          # the encoder takes its turn with the requests (see below)
+                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self.vision.encode(src)
                     except (ValueError, OSError) as e:
                         why = str(e)
@@ -3787,11 +4209,13 @@ class Service:
         identity = [principal, conversation, self.model, id(self.tok), self.template.source]
         return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
-        fetched = self._note_unreadable_tool_images(messages)
+        # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
+        # between pictures and raise ClientGone
+        fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -3807,14 +4231,18 @@ class Service:
             start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
-            images = [fetched[src] if src in fetched else Vision.download(src) if src.startswith(("http://", "https://"))
-                      else src for src in images]
+            def fetch(src):
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                return fetched[src] if src in fetched else Vision.download(src) \
+                    if src.startswith(("http://", "https://")) else src
+            images = [fetch(src) for src in images]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo:
-                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
+            with self._turn(cancel):
+                encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                            else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
@@ -3849,12 +4277,14 @@ class Service:
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's strata-<model>.json to shorten it to the room left (#545)")
@@ -3984,11 +4414,25 @@ class Service:
             print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
+            limit = (f"budget {s['thinking_budget']} (max {s.get('max_tokens')})"
+                     if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
+            print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        ka = self.keep_awake
+        if ka is not None:
+            ka.acquire()
+        try:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        finally:
+            if ka is not None:
+                ka.release()
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         lifecycle = getattr(self.lifecycle_local, "record", None)
@@ -4020,6 +4464,14 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if budget and max_new and max_new > 0:
+            # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
+            # it has no answer.  Close the thinking early enough to leave room for one.
+            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            if budget > max_new - reserve:
+                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                      f"the answer (budget {budget})", flush=True)
+                budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
@@ -4050,6 +4502,7 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
@@ -4067,29 +4520,62 @@ class Service:
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
-        if lifecycle is None:
-            with self.status_lock:
-                self.status["queued"] += 1
+        # HTTP lifecycle admission and the FIFO/native-startup wait are successive
+        # queue phases. This run owns a symmetric count even after HTTP admission.
+        with self.status_lock:
+            self.status["queued"] += 1
+        counted = True
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            turn = contextlib.ExitStack()
+            if not getattr(self.engine, "batch", 0):
+                # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
+                # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
+                # a client that left while queued gives its place up instead of taking the turn only to cancel there
+                got = False
+                while not got:
+                    got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                    if got:
+                        turn.callback(self.fifo.release)
+                    elif cancel.is_set():
+                        break
+                    else:
+                        yield "ping", None
+                if not got:                              # cancelled while queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        counted = False
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                    return
+            with turn:
                 try:
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
-                        if lifecycle is None:
+                        if not par:
                             self.status["queued"] -= 1
+                            counted = False
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
-                    # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
+                    # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
+                    # #1603: a parallel request stays counted as queued until it is registered as running below -
+                    # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
+                    # loaded engine has nothing to start, so it does not wait for the fifo at all
                     if lifecycle is not None and cancel.is_set():
                         raise ValueError("request cancelled before generation")
-                    with (self.fifo if par else contextlib.nullcontext()):
+                    if not par:
                         self.ensure_loaded()
+                    elif not (self.loaded() and not self._vision_down()):
+                        with self.fifo:
+                            self.ensure_loaded()
                     with self.status_lock:
+                        if par:
+                            self.status["queued"] -= 1
+                            counted = False
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, reasoning_recoveries=0)
+                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -4102,21 +4588,29 @@ class Service:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
+                        segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         if lifecycle is not None:
                             lifecycle.setdefault("_generators", []).append(gen)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             if lifecycle is not None and not isinstance(self.engine, StrataEngine):
                                 self.lifecycle_note(lifecycle, "generating", _executing=True)
+                            # A value the frontend holds back (a tool call's array or object argument is sent
+                            # whole, once complete) can keep the stream silent for minutes while tokens are
+                            # generated; a client's idle timeout then ends the request.  Send the same keep-alive
+                            # the engine's heartbeat sends when nothing has gone out for KEEPALIVE_S.
+                            last_out = time.perf_counter()
                             for t in gen:
                                 if cancel.is_set():
                                     break
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
+                                    last_out = time.perf_counter()
                                     yield "ping", None
                                     continue
                                 n += 1
@@ -4130,6 +4624,9 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
+                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                        opens = True    # #537: the held </think> was the end: the call opens there
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -4152,6 +4649,11 @@ class Service:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
+                                if evs:
+                                    last_out = time.perf_counter()
+                                elif time.perf_counter() - last_out >= KEEPALIVE_S:
+                                    last_out = time.perf_counter()
+                                    yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
@@ -4180,6 +4682,8 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                        except EngineNonFinite:
+                            nonfinite = True
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
@@ -4209,6 +4713,28 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if nonfinite and not cancel.is_set():
+                            # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
+                            # from token 0.  Nothing sent yet: the same request once more, unseen by the client
+                            if n == 0 and not nf_retried:
+                                nf_retried = True
+                                # the retry reads from token 0: its DONE, not this one's, says what was reused
+                                del segments[segments_before:]
+                                print("[strata] the engine's logits became non-finite before the first token (#879); it "
+                                      "dropped its cached state: sending the request again once", flush=True)
+                                continue
+                            if n == 0:
+                                finish = "error"
+                                print("[strata] the engine's logits became non-finite again on the retry (#879): the "
+                                      "request ends with an error", flush=True)
+                                raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
+                                                      "(#879); the engine has dropped its cached state - send the "
+                                                      "request again")
+                            print(f"[strata] the engine's logits became non-finite after {n} tokens (#879): the reply "
+                                  "ends here as \"length\"; the engine dropped its cached state, so the next request "
+                                  "reads its prompt from the start", flush=True)
+                            finish = "length"
+                            break
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at
@@ -4231,6 +4757,7 @@ class Service:
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
+                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
@@ -4258,7 +4785,7 @@ class Service:
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
-                            budget = None
+                            budget = st["thinking_budget"] = None
                             text = REASONING_WRAP_UP + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
@@ -4377,6 +4904,9 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            if counted:
+                with self.status_lock:
+                    self.status["queued"] -= 1
             if emb:
                 Path(emb).unlink(missing_ok=True)
         if lifecycle is not None and lifecycle.get("cancel_reason") in ("timeout", "cancelled"):
@@ -4409,6 +4939,27 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
 
 
+def carry_leg(carry: dict, leg: dict) -> None:
+    """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE, which
+    replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
+    carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
+    carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
+    if leg.get("prompt_read") is not None:
+        carry.setdefault("prompt_read", int(leg["prompt_read"]))
+
+
+def add_carry(carry: dict, last: dict) -> dict:
+    """The request's totals: the earlier legs' decode time and tokens plus the final one's; the prompt figures of the leg
+    that read the prompt (the solo continuation reads next to nothing)."""
+    out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
+           "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
+           "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    if "prompt_read" in carry:
+        out["prompt_read"] = carry["prompt_read"]
+    return out
+
+
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
@@ -4416,6 +4967,10 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
     if last.get("prompt_ms") is None:
         return None
     cache_n = int(last.get("reused") or 0)
+    if last.get("prompt_read") is not None and last.get("finish") != "cancel":
+        # #1870: the engine says how many prompt tokens it read: the slot's own session may have held the rest
+        # (not the conversation cache), so the rate is not made of tokens it never read
+        cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
     decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
@@ -4545,7 +5100,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        try:
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
+        except ClientGone:                                      # #1999: the client left while a picture was prepared
+            done = {**done, "finish": "cancel"}
+            break
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4884,10 +5443,13 @@ def make_handler(svc: Service):
                 if size < 0:
                     raise BadBody(400, "malformed chunk size in the request body")
                 if size == 0:
-                    for _ in range(64):                       # the trailers, up to the blank line
-                        if self.rfile.readline(8193).strip() == b"":
-                            break
-                    return b"".join(parts)
+                    for _ in range(64):                       # the trailers, including the final blank line
+                        trailer = self.rfile.readline(8193)
+                        if trailer == b"\r\n":
+                            return b"".join(parts)
+                        if not trailer.endswith(b"\r\n"):
+                            raise BadBody(400, "malformed or incomplete chunked request trailers")
+                    raise BadBody(400, "too many chunked request trailers")
                 total += size
                 if total > limit:
                     self.close_connection = True
@@ -5083,7 +5645,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             if isinstance(obj, dict) and "error" in obj:
                 self._note(error=obj["error"])
             if self.record is not None:
@@ -5103,6 +5665,8 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     retry_after = svc._admission_snapshot()["retry_after_s"]
                 self.send_header("Retry-After", str(retry_after))
+            for k, v in (headers or {}).items():
+                self.send_header(k, str(v))
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -5159,6 +5723,15 @@ def make_handler(svc: Service):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if path == "/metrics/prometheus":
+                if self._authorized():
+                    body = svc.prometheus().encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 return
             if path == "/metrics":
                 from serve import prometheus
@@ -5305,7 +5878,9 @@ def make_handler(svc: Service):
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
-                    r = svc.unload()
+                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
+                                         svc.UNLOAD_WAIT_S)
+                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -5316,7 +5891,9 @@ def make_handler(svc: Service):
                     svc.load()
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    ra = getattr(e, "retry_after", None)
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                               headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
                 if path == "/settings":
@@ -5352,7 +5929,9 @@ def make_handler(svc: Service):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
-                        result = svc.unload()
+                        wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
+                                             svc.UNLOAD_WAIT_S)
+                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     else:
@@ -5415,6 +5994,10 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineNonFinite as e:                    # #879, twice: not the request's fault
+                print(f"[strata] 503: {e}", flush=True)
+                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -5429,7 +6012,9 @@ def make_handler(svc: Service):
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                           headers={"Retry-After": int(ra)} if ra else None)
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
                 # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
@@ -5447,6 +6032,8 @@ def make_handler(svc: Service):
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
+            except ClientGone:                               # #1999: the client left while the request was prepared
+                self._note(outcome="disconnected")
             except OSError:
                 self._note(outcome="disconnected")
                 if self.request_cancel is not None:
@@ -5680,6 +6267,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -5690,6 +6278,7 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
@@ -5703,9 +6292,10 @@ def make_handler(svc: Service):
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+            check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = self.request_cancel
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
@@ -5764,15 +6354,19 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
+            cancel = self.request_cancel                     # (#1999) already armed and watched at the dispatch
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
+            except ClientGone:
+                self._note(outcome="disconnected")
+                return
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            cancel = self.request_cancel
+
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -5799,6 +6393,8 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     message = str(e) if svc.supervised else f"{e}; the next request restarts it"
                     return self._json(503, responses_error_body(message, "server_error", code="server_error"))
+                except EngineNonFinite as e:                 # #879, twice: not the request's fault
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -5844,7 +6440,7 @@ def make_handler(svc: Service):
             except OSError:
                 pass
 
-        def _responses_prepare(self, req):
+        def _responses_prepare(self, req, cancel=None):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
@@ -5872,18 +6468,24 @@ def make_handler(svc: Service):
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
+            try:
+                check_request_sampling(req)                   # the request is also the sampling dict (see below)
+            except ValueError as e:                           # its message starts with the field's name: the param
+                raise ResponsesError(str(e), str(e).partition(":")[0]) from None
             svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
             try:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                                                          cancel=cancel)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                                                          cancel=cancel)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -5904,6 +6506,7 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
+            check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
@@ -5917,9 +6520,10 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
+            check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = self.request_cancel
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
@@ -6295,15 +6899,56 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+def lift_reasoning_effort_arg(cfg: dict) -> None:
+    """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
+    option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
+    the level for requests that name none), so the flag is taken out of the engine's arguments and becomes that key
+    unless the config already has one; said at startup."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, value, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--reasoning-effort" and i + 1 < len(args):
+            value, i = args[i + 1], i + 2
+        elif isinstance(a, str) and a.startswith("--reasoning-effort="):
+            value, i = a.partition("=")[2], i + 1
+        else:
+            out.append(a)
+            i += 1
+    if value is None:
+        return
+    cfg["args"] = out
+    if cfg.get("reasoning_effort") is None:
+        cfg["reasoning_effort"] = value
+    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
+          "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
+          f"{cfg['reasoning_effort']!r}", flush=True)
+
+
+# #1819: llama.cpp clients call the repetition penalty and its window repeat_penalty / repeat_last_n; they are the
+# same settings as repetition_penalty / penalty_last_n (the /props answer already reports them under those names)
+SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
+    presence_penalty, repetition_penalty (also written repeat_penalty), frequency_penalty, penalty_last_n (also
+    repeat_last_n), seed.  The request's own fields
     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
-    for key, value in (cfg.get("sampling") or {}).items():
+    block = dict(cfg.get("sampling") or {})
+    for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
+        if block.get(alias) is not None:
+            if block.get(canon) is not None:
+                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                                 f"setting, keep one")
+            block[canon] = block.pop(alias)
+    for key, value in block.items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -6353,6 +6998,85 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool):
+    """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
+    and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
+    from serve import replicas as rp
+    n = len(groups)
+    cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
+    print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
+          f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
+          flush=True)
+    engines: list = [None] * n
+    errors: list = []
+
+    def one(i: int):
+        rc = rp.replica_cfg(cfg, i, groups[i])
+        try:
+            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+                                      env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None)
+        except BaseException as e:        # noqa: BLE001
+            errors.append((i, e))
+    rc0 = rp.replica_cfg(cfg, 0, groups[0])
+    warn_budget_over_ram(engine_args(rc0) if "args" in rc0 else [])
+    if os.environ.get("STRATA_REPLICA_START", "") == "serial":
+        for i in range(n):
+            one(i)
+    else:
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    if errors:
+        for e in engines:
+            if e is not None:
+                try:
+                    e.close()
+                except Exception:        # noqa: BLE001
+                    pass
+        i, e = errors[0]
+        raise SystemExit(f"[strata] replica {i} did not start: {e}")
+    load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
+    return rp.ReplicaEngine(engines, load_tokens=load)
+
+
+def check_request_sampling(req) -> None:
+    """A request's sampling field of the wrong JSON type ("temperature": "0.7", "top_k": 40.0, "seed": true) is a 400
+    that names the field, as the same value is through POST /settings or the run config.  Unchecked, the value
+    replaced the configured default in run()'s merge and sampling_keys dropped it, so the reply was greedy.  Only
+    types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
+    integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
+    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
+        if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
+            req["repetition_penalty"] = req["repeat_penalty"]
+        rl = req.get("repeat_last_n")
+        if req.get("penalty_last_n") is None and isinstance(rl, int) and not isinstance(rl, bool) and rl > 0:
+            req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
+    for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
+                         ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
+                         ("penalty_last_n", True), ("seed", True)):
+        value = (req or {}).get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():      # some clients send numbers as strings: read and used
+            try:
+                num = float(value)
+                num = int(num) if integer and num == int(num) else (num if not integer else None)
+                if integer and num is None:
+                    raise ValueError
+                if not integer and re.fullmatch(r"\s*[+-]?\d+\s*", value):
+                    num = int(value)
+            except (ValueError, OverflowError):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}") from None
+            if num != num or num in (float("inf"), float("-inf")):
+                raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+            req[key] = value = num
+        if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+            raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -6395,8 +7119,15 @@ def main() -> int:
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--replicas", type=int, default=None, metavar="N",
+                    help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
+                         "each, requests spread over them (also \"replicas\" in the config: a number, or "
+                         "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    lift_reasoning_effort_arg(cfg)
+    if a.replicas is not None:
+        cfg["replicas"] = a.replicas
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -6467,12 +7198,20 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+        from serve import replicas as rp
+        try:
+            groups = rp.gpu_groups(cfg)
+        except rp.ReplicaConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if groups:
+            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
+        else:
+            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                                  env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                                 linux_desktop())
+                                 linux_desktop()) if not groups else None
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
     else:
@@ -6486,6 +7225,18 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
+        raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
+    from serve.keepawake import KeepAwake
+    svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
+    if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
+        try:
+            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if svc.config_effort:
+            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+                  "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
@@ -6531,6 +7282,13 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    try:
+        svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
+    except (TypeError, ValueError):
+        print("[strata] \"before_load_timeout_s\" in the config is not a number; using "
+              f"{svc.before_load_timeout_s:g} s", flush=True)
+    svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
+    svc.before_load_strict = cfg.get("before_load_strict") is True
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):
@@ -6572,6 +7330,9 @@ def main() -> int:
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    if a.engine == "strata" and groups:                 # replicas: every card of every group
+        svc.gpu_indices = [c for g in groups for c in g]
+        svc.gpu_index = svc.gpu_indices[0]
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
@@ -6638,6 +7399,11 @@ def main() -> int:
             except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
                 if getattr(engine, "proc", None):
                     engine.proc.kill()
+        try:
+            from serve import cache_drop
+            cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
+        except Exception as e:  # noqa: BLE001 - never block the exit
+            print(f"[strata] could not release the model files' cache: {e}", flush=True)
         print("[strata] stopped", flush=True)
     return 0
 

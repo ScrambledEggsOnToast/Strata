@@ -19,6 +19,65 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
+With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
+environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
+described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the
+engine's free-memory log before using it on a smaller card. An incompatible explicit `--batch-mtp` request
+**refuses startup**; it is not silently disabled. It needs at least two slots, `--serve`, loaded `--mtp --spec >= 2`,
+and distinct devices for a layer split. The synchronous split route also refuses helper expert caches.
+Historical one-GPU RTX PRO 5000 runs measured +31% to +39% total throughput with 2 to 4 clients (a RX R9700 run too).
+
+**Native layer-split ownership:** one MTP scratch/head/weight owner on the last stage serves every slot;
+each slot has private draft K/V, not a separate drafter object. A synchronous window verifies up to four slots
+through the eight-row verifier quantum; six/eight slots rotate through successive windows. Select
+`--batch-groups 1`, or `STRATA_BATCH_MTP_SERIAL=1` with no explicit groups, for synchronous split MTP.
+The layer-split default otherwise resolves multiple pipelined groups when the slot count permits:
+without `--batch-mtp-pipeline`, that combination refuses rather than dropping MTP or choosing serial execution.
+
+`--batch-mtp --batch-mtp-pipeline --batch-groups 2` retains the fork's separate two-group route.
+It admits **effective even slot counts 2, 4, 6 or 8**, on a distinct-device layer split, with no resident multiplexing.
+Counts above eight normalize to eight **before** this even-count check: requested `--batch 9` can admit eight,
+whereas an effective seven refuses. Runtime fit must still leave two supported groups. The pipeline's constrained
+helper-cache exemption remains; optimized helpers, automatic helper counts and adaptive helper composition refuse.
+These native ownership/retirement statements do not retire the SYCL backend's own per-slot drafters or graph cache.
+The measurements below are historical results from their named configurations, not qualification of this merge.
+
+Measured on a layer split of 2x RTX 3080 20 GB (220 W cap) with a Xeon E5-2696 v4, UD-Q4_K_XL, `"layer_split": "23"`,
+`"parallel": 2`, `--spec 4`: two concurrent greedy decodes of 300 tokens, the two streams' tok/s added, median of
+the measurements (10 rounds of two streams after each restart of the engine, 20 measurements per restart). The
+engine was 0.1.41 with the rest of our production stack on it (the shared KV pool, and the adaptive expert tier
+running in batch windows in the first two arms; the pipelined path of the third never adapts in windows), so this is
+`--batch-mtp` on top of that, not this change alone on main.
+
+| arm | aggregate tok/s | restarts, measurements | per window |
+| --- | --- | --- | --- |
+| `--batch-mtp`, one group | **89.2** | 3, 60 | 3.3 rows, 34.6 ms, 66-67% of the proposals accepted |
+| no `--batch-mtp`, one serial group | 77.3 | 2, 40 | 2.0 rows, 23.7 ms |
+| no `--batch-mtp`, `--batch-groups` unset (the 0.1.41 default: two pipelined groups of one slot) | 77.7 | 1, 20 | one row per group step |
+
+That is +15.4% for `--batch-mtp` against serial windows without it (95% bootstrap interval of the ratio of medians
++12.5% to +17.9%) and +14.8% against the pipelined default; the two arms without it tie. One stream alone decodes the
+same with and without it (81.7 and 82.0 tok/s), and the two slot drafters cost 35 to 110 expert-cache slots on the
+last GPU (50 MiB of private state each).
+
+The pipelined default is better in one place: a new prompt of about 48k tokens arriving while one stream decodes was
+read at 2508 tok/s with pipelined groups and 1217 tok/s in serial windows, and the decoding stream finished sooner
+(25.0 against 18.0 tok/s over its whole run); `--batch-mtp` does not change that. So it pays where concurrent decodes
+dominate; with long reads arriving beside decodes the pipelined groups can be the better choice. Not measured: more
+than two stages (the report on #1253 found no gain at four stages), more than two slots, sampled decoding, an
+upstream-main binary (the pipelined arm is our build, started with the flags 0.1.41 resolves to).
+
+Our measurement of `--batch-mtp` on a layer split with 2x R9700 and all experts in VRAM: 80.2 -> 62.7 tok/s (-21.9%, 0/5 pairs faster) against the pipelined default, so it pays only when the experts do not all fit in VRAM.
+
+Earlier, on engine 0.1.40.3 with this change and the same two cards, two concurrent streams: UD-Q4_K_XL 39.9 to 43.5
+tok/s without and 44.5 to 51.3 with `--batch-mtp` (2 runs per arm), and a small Coder IQ1_M test model with all
+experts in VRAM 84.0 without and 101.2 with it, the greedy text of both streams identical.
+
+Text: with the same expert cache on both arms (the slot drafters take VRAM, so the cache differs unless the
+reserve is adjusted) and `--pcie-frac 0`, `--adapt-every 0`, the greedy text with `--batch-mtp` was equal to the text
+without it for 5 short prompts in all 6 comparisons (one restart per arm). That is text equality, not a bit-exactness
+proof, and a 25k-token prompt read while the other stream decodes was not repeatable between two identical streams
+of the same arm.
 With a layer split, the engine options go into the config's `args`:
 
 ```
@@ -28,16 +87,16 @@ With a layer split, the engine options go into the config's `args`:
 
 | Option | What it does |
 | --- | --- |
-| `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
+| `"parallel": N` / `--batch N` / `--slots N` | up to eight effective conversations have batch slots; larger requests normalize to eight, including grouped MTP. More requests wait for a free slot. Each slot gets its own state on every split GPU. Six/eight MTP slots rotate through bounded verifier windows. |
 | `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
-| `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. |
+| `--batch-groups auto` | the layer-split default: the most groups, at most one per GPU stage, that divide the effective slots. `INFO batch_groups=G` reports the result. `--batch-groups 1` disables the pipeline. With `--batch-mtp`, multiple groups refuse unless `--batch-mtp-pipeline --batch-groups 2` selects the bounded MTP pipeline; `STRATA_BATCH_MTP_SERIAL=1` with no explicit groups chooses synchronous MTP. `--adapt-async 1` still resolves an unspecified group count to one. Historical ordinary-batch measurements, eight clients against one group: 4 x R9700 166 against 86 tok/s, 2 GPUs 109 against 78, 3 GPUs 110 against 78. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
-The fork's admission gate prices the **requested** count before allocation, including private main-model and
-MTP state, pinned staging, histories/checkpoints and transfer peaks. It refuses unsupported resident KV formats
-or an over-budget plan. After admission, runtime allocation may still reduce the count, retaining the
-single-session fallback when fewer than two slots fit. The server reads the effective count from
-`INFO batch_slots=N`; `GET /v1/status` reports `concurrency.serving`.
+The fork's admission gate prices the **normalized requested** count (`min(N, 8)`) before allocation, including
+private main-model and MTP state, pinned staging, histories/checkpoints and transfer peaks. It refuses unsupported
+resident KV formats or an over-budget plan. Runtime allocation may still reduce that count, retaining the
+single-session fallback when fewer than two slots fit, except that the MTP pipeline refuses unsupported post-fit
+counts. The server uses `INFO batch_slots=N`; `GET /v1/status` reports this effective `concurrency.serving`.
 
 Each arrival checks **prompt + the original requested output + eight cells of slack** before position uploads,
 request-identity binding or prompt/decode submission. `BGEN`'s internal `GEN 1` is only its prefill leg: it is
@@ -268,7 +327,7 @@ never count as zero. Requested payloads are charged before the automatic expert-
 
 The CUDA-free payload contract names four roles: `working_main`, `slot_main`, `working_draft` and
 `slot_draft`, each with device and pinned bytes. Working owners are charged once; slot terms multiply the
-requested count. Histories/checkpoints and serial transfer bounds remain separate, and shared drafter/head
+normalized requested count (at most eight). Histories/checkpoints and serial transfer bounds remain separate, and shared drafter/head
 storage is not charged twice. `plan/qsa_memory.hpp` shares format and pool arithmetic with the actual
 allocator: a hybrid main state's host backing costs 3264 B/page, and its draft uses whole INT8 at 1056 B/cell
 rather than hybrid's 816 B/cell. FP16 drafts remain FP16. These are source-derived payload prices pinned by
@@ -444,6 +503,43 @@ or SSE-chunk timestamps. `STRATA_STATE_HASH=1` additionally reports every split 
 resume; resume hashes the restored working state (not just the unchanged saved slot), including logical
 GDN/PLE/KV, draft KV on its owning last stage, history and sampling identity/counter. These draining
 diagnostics cost time and remain off by default.
+## The VRAM expert tier keeps adapting in batch windows
+
+Batch windows count which experts they route to, and every `--adapt-every` windows (default 4) the engine swaps the
+most-routed experts that are not in VRAM into the cache in place of the least-routed resident ones, the same rule the
+solo path uses (`--adapt-swaps` and `--adapt-decay` apply too; on a layer split every GPU's cache adapts). It runs when the
+tier is not the whole model and both `--adapt-every` and `--adapt-swaps` are above 0. By default the round runs beside the
+window's commit and drafts and has landed before the next window starts. It stands still while a long prompt is read
+between decoding windows (the prompt may hold a loan of cache slots). The `strata batch:` log line shows the rounds and swaps, each stage's
+GPU-reach wait and pool time, and how many routed entries the VRAM tier, the PCIe share and the CPU served per window.
+Swaps move experts between the GPU and the CPU, which round differently, so greedy outputs can differ from run to run;
+`--adapt-every 1000000` keeps the tier fixed (as in the exactness settings below). The pipelined `--batch-groups` path
+does not adapt.
+
+With `--adapt-async 1` (needs the resident RAM mode) the round does not hold a window up: each batch window moves the
+round on one step (table changes and uploads on the main thread, the copies on a helper thread and the cards' refill
+streams), as on the solo path. A request that arrives finishes the round in flight before it starts, and a prompt read
+between decoding windows does not move it. `--adapt-min-gain F` (default 1.5) raises the bar a swap must clear (the
+routing count of the expert coming in against the one going out), so fewer experts move per round; both tiers use it.
+The log line's `adapt wait` is the time the main thread spent on the tier per window (the blocking tier: waiting for
+its round).
+
+Measured with the same setup as the `--batch-mtp` numbers above (2x RTX 3080 20 GB, UD-Q4_K_XL, `"layer_split": "23"`,
+`"parallel": 2`, `--batch-mtp`, engine 0.1.41 with our production stack; two concurrent greedy decodes, the streams'
+tok/s added, median of 20 measurements per restart):
+
+| tier | aggregate tok/s | restarts | per window | routed entries served from VRAM |
+| --- | --- | --- | --- | --- |
+| `--adapt-async 1 --adapt-every 2` | **89.2** | 3 | 34.6 ms, adapt wait 0.2 ms | 92.1% |
+| blocking, `--adapt-every 2` | 74.7 | 1 | 41.4 ms, adapt wait 8.4 ms | 92.3% |
+| none, the cache frozen from a profile the tier had learned on the same prompts | 69.5 | 1 | 43.6 ms | 77.2% |
+| none, `--adapt-every 0` | 45.2 | 2 | 66-68 ms | 52.7% |
+
+The switch changes the tier in the solo path as well (there is no switch for batch windows alone), so the table
+compares the tier as a whole, not "batch windows only": the solo decode speed moves the same way (81.7, 66.3, 69.0 and
+43.1 tok/s). The prompts are the benchmark's own, eight topics that repeat, which the tier learns quickly, so on a
+more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
+was not measured against an upstream binary.
 
 ## Exactness
 
@@ -486,9 +582,9 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
 - Batch windows carry no MTP drafts by default. `--batch-mtp` (or `STRATA_BATCH_MTP=1`) enables one proposal
   per resident request on one GPU or a layer split with each stage on its own GPU. At most four requests occupy
   the eight-row verifier quantum; a rotating cursor services larger slot sets. Split batch-MTP uses the existing
-  synchronous verifier and accepted-prefix commit: every stage retains its scratch until target acceptance is
-  known. It **overrides the group pipeline**, reports the requested groups and effective `batch_groups=1`,
-  and exposes `batch_schedule=synchronous` in engine status. Ordinary batching keeps its group pipeline.
+  synchronous verifier and accepted-prefix commit when groups resolve to one: every stage retains its scratch
+  until target acceptance is known. It exposes `batch_schedule=synchronous`. Multiple groups refuse without
+  `--batch-mtp-pipeline`; there is no silent override or feature drop. Ordinary batching keeps its group pipeline.
   Each request retains its private draft KV and uses the one serialized MTP scratch/head/weight owner.
   A proposal is kept only when the independently sampled target equals it; target Philox counters and per-row
   penalty histories remain request-local. This is not coupled draft sampling. Admission prices the eight-row
@@ -507,6 +603,7 @@ batch and the single-session fallback; resident teardown cannot invalidate a cap
   commit could strand their doorbells; fully resident stages retain continuous group overlap.
 - Verifier graphs retain at most 32 row-order/base keys (window and commit executable per key). An unseen key
   beyond the bound refuses before capture; live graphs are not evicted.
+- Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
@@ -728,6 +825,10 @@ For CUDA split batch-MTP, `BDONE` also carries `draft_accepted` and `draft_offer
 the committed token sequences, not only its acceptance rate. `STRATA_STATE_HASH=1` additionally logs each
 split proposal, independently sampled target, and committed prefix length for diagnostic runs.
 Use the additional `--batch-mtp-pipeline --batch-groups 2` flags for the separately retained two-group path.
+`STRATA_NAN_INJECT=<window>[:<row>][,...]` injects a nonfinite report into the numbered head window's local row
+(row zero when omitted). Select each group's head window and a rejected proposal row when checking the
+nonfinite contract: every verified row invalidates its whole slot, emits `BDONE nonfinite` instead of its tokens,
+taints retained state and forces cold prefix reads. Deferred owners still commit/drain before slot retirement.
 Run long greedy and independently seeded sampled requests against drafting-off controls and require rejection
 in both modes. Keep state/token tracing in correctness captures only: unset **both** `STRATA_STATE_HASH` and
 `STRATA_BATCH_TRACE` in every timing arm. Record the actual environment per arm and use native `BDONE`

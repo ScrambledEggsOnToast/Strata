@@ -139,6 +139,14 @@ public:
         return {requests_[token], positions_[token], slots_[token], q.expert, q.worker,
                 destination, token, (uint16_t) (destination % width_), (uint16_t) g, (uint16_t) member};
     }
+    /// The best routing rank across every token/request occurrence of this expert.
+    uint16_t minimum_route(size_t g) const {
+        const Group& q = group_[g];
+        uint16_t rank = width_;
+        for (size_t member = 0; member < q.count; ++member)
+            rank = std::min(rank, (uint16_t) (destinations_[q.start + member] % width_));
+        return rank;
+    }
     // Retirement/slot reuse may discard presentation, never an in-flight member's
     // compute or storage. Match the frozen identity at the drained delivery boundary.
     bool matches(const Entry& e, uint64_t request, int64_t position, int slot,
@@ -260,6 +268,7 @@ private:
 class ExpertCompletion {
 public:
     static constexpr size_t kCapacity = 128;
+    static constexpr uint32_t kZeroOwner = std::numeric_limits<uint32_t>::max();
     explicit ExpertCompletion(size_t capacity) : rows_(capacity) {}
 
     bool begin(const ExpertOperation& operation, size_t count) {
@@ -279,6 +288,13 @@ public:
         if (!active_ || cancelled_ || failed_ || row >= count_ || owner == 0 ||
             rows_[row].owner != 0) return false;
         rows_[row] = {owner, residency_version, false};
+        return true;
+    }
+    /// The dispatch thread has already written this row's zero contribution. It owns
+    /// and completes that contribution, without pretending an expert worker computed it.
+    bool complete_zero(const ExpertOperation& operation, size_t row, uint64_t residency_version) {
+        if (!(operation == operation_) || !claim(row, kZeroOwner, residency_version)) return false;
+        rows_[row].done = true;
         return true;
     }
 
@@ -391,8 +407,8 @@ public:
     explicit ExpertHelperScheduler(const std::vector<ExpertWorker*>& workers,
                                    uint32_t first_owner = 4, int32_t assignment_value = 2)
         : workers_(workers.size()), first_owner_(first_owner), assignment_value_(assignment_value) {
-        if (first_owner == 0 || assignment_value < 0 ||
-            workers.size() > (uint64_t) std::numeric_limits<uint32_t>::max() - first_owner + 1)
+        if (first_owner == 0 || first_owner == ExpertCompletion::kZeroOwner || assignment_value < 0 ||
+            workers.size() > (uint64_t) ExpertCompletion::kZeroOwner - first_owner)
             throw std::invalid_argument("invalid helper ownership range");
         for (size_t i = 0; i < workers.size(); ++i) {
             if (workers[i] == nullptr || std::find(workers.begin(), workers.begin() + i, workers[i]) != workers.begin() + i)

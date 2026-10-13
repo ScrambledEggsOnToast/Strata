@@ -17,6 +17,9 @@ def engine(batch, groups, pipelined=True):
     e = object.__new__(StrataEngine)          # pick_slot reads only the slot tables
     gs = batch // groups
     e.batch = batch
+    e.slot_groups = groups
+    e.slot_group = [b // gs for b in range(batch)]
+    e.slot_scope = ["conversation"] * batch
     e.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
     e.slot_busy = [False] * batch
     e.slot_held = [[] for _ in range(batch)]
@@ -30,7 +33,7 @@ class Pipelined(unittest.TestCase):
         e = engine(6, 3)
         got = []
         for _ in range(6):
-            b = e.pick_slot([1, 2, 3])
+            b = e.pick_slot([1, 2, 3], "conversation")
             e.slot_busy[b] = True
             got.append(b)
         self.assertEqual(got, [0, 2, 4, 1, 3, 5])
@@ -41,7 +44,7 @@ class Pipelined(unittest.TestCase):
         e.slot_busy[3] = True                       # group 1 = [_ B]
         e.slot_used[0] = 0.0                        # least recently used: what the LRU fallback picked
         e.slot_used[2] = 99.0
-        self.assertEqual(e.pick_slot([1]), 2)
+        self.assertEqual(e.pick_slot([1], "conversation"), 2)
 
     def test_never_opens_a_hole_below_the_pick(self):
         for batch, groups in ((6, 3), (8, 4), (8, 2), (4, 2)):
@@ -52,7 +55,7 @@ class Pipelined(unittest.TestCase):
                 if busy and (rng.random() < 0.45 or len(busy) == batch):
                     e.slot_busy[rng.choice(busy)] = False          # a request ends, anywhere
                     continue
-                b = e.pick_slot([7])
+                b = e.pick_slot([7], "conversation")
                 g0 = b - b % gs
                 with self.subTest(batch=batch, groups=groups):
                     self.assertTrue(all(e.slot_busy[x] for x in range(g0, b)),
@@ -60,23 +63,23 @@ class Pipelined(unittest.TestCase):
                 e.slot_busy[b] = True
 
     def test_held_tokens_are_ignored(self):
-        # the engine keeps no pipelined slot as a cache: a held prefix must not pull a request into a hole-making slot
+        # A short scoped prefix is not worth unbalancing the pipeline or opening a hole.
         e = engine(6, 3)
         e.slot_held[5] = [1, 2]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 0)
+        self.assertEqual(e.pick_slot([1, 2, 3], "conversation"), 0)
 
 
 class OneGroup(unittest.TestCase):
     def test_reuse_then_least_recently_used(self):
         e = engine(4, 1, pipelined=False)
         e.slot_held[2] = [1, 2]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 2)        # its conversation's next turn
+        self.assertEqual(e.pick_slot([1, 2, 3], "conversation"), 2)        # its conversation's next turn
         e.slot_held[2] = [9]
         e.slot_held = [[5], [], [9], [6]]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)        # an empty slot before evicting a held one
+        self.assertEqual(e.pick_slot([1, 2, 3], "conversation"), 1)        # an empty slot before evicting a held one
         e.slot_held[1] = [8]
         e.slot_used = [5.0, 3.0, 9.0, 1.0]
-        self.assertEqual(e.pick_slot([1, 2, 3]), 3)        # else the least recently used
+        self.assertEqual(e.pick_slot([1, 2, 3], "conversation"), 3)        # else the least recently used
 
 
 if __name__ == "__main__":

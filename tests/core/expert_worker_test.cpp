@@ -677,6 +677,53 @@ void group_bounds_and_worker_partitions() {
     require(sizeof(groups) == 2048, "global group scratch grew");
 }
 
+void repeated_expert_minimum_rank_controls_tail_skip() {
+    using namespace strata::core;
+    int32_t ids[] = {1, 2, 3, 9, 4, 9, 7, 7, 9, 5, 6, 7};
+    int32_t assigned[12]{};
+    uint64_t requests[] = {11, 22, 22};
+    auto work = make_work(ids, assigned, 3, 4);
+    work.request_ids = requests;
+    ExpertRouteGroups groups;
+    require(groups.form(work, nullptr, 10), "tail-rank route groups refused");
+    require(groups.group(3).expert == 9 && groups.minimum_route(3) == 0,
+            "a later request's rank-zero occurrence was lost behind the first rank-three occurrence");
+    require(groups.group(5).expert == 7 && groups.minimum_route(5) == 2,
+            "repeated expert did not retain its minimum rank");
+    require(groups.minimum_route(3) < 2 && groups.minimum_route(5) >= 2,
+            "tail skipping must apply to every occurrence only when all ranks meet the threshold");
+}
+
+void zero_contribution_completes_only_its_owned_row() {
+    using namespace strata::core;
+    const ExpertOperation operation{7, 3, 19, 2, 11};
+    ExpertCompletion rows(3);
+    require(rows.begin(operation, 3) && rows.retain_submission(operation), "zero contribution setup refused");
+    require(rows.claim(0, 2, 1), "primary contribution claim refused");
+    auto stale = operation; ++stale.generation;
+    require(!rows.complete_zero(stale, 1, 1), "stale operation certified a zero contribution");
+    require(rows.complete_zero(operation, 1, 1) && rows.owner(1) == ExpertCompletion::kZeroOwner,
+            "already-written zero did not receive completed ownership");
+    require(!rows.complete_zero(operation, 1, 1) && !rows.complete_zero(operation, 0, 1),
+            "zero contribution overwrote an existing claim");
+    require(!rows.publishable() && !rows.release(operation), "zero contribution hid missing or in-flight work");
+    require(rows.complete_zero(operation, 2, 1) && rows.complete(operation, 2, 1),
+            "complete zero and primary contributions refused");
+    require(!rows.publishable() && !rows.release(operation), "zero completion freed retained graph staging");
+    require(rows.drain_submission(operation) && rows.publishable() && rows.release(operation),
+            "complete zero contributions prevented successful consumer release");
+    require(rows.begin(operation, 1), "zero contribution storage did not release");
+    rows.cancel();
+    require(!rows.complete_zero(operation, 0, 1) && !rows.publishable(),
+            "cancelled operation accepted a new zero contribution");
+    require(rows.release(operation), "unclaimed cancelled row did not release");
+    MockDevice worker(9, 3.0f);
+    bool reserved_owner = false;
+    try { ExpertHelperScheduler scheduler({&worker}, ExpertCompletion::kZeroOwner); }
+    catch (const std::invalid_argument&) { reserved_owner = true; }
+    require(reserved_owner, "helper owner aliases the zero-contribution owner");
+}
+
 } // namespace
 
 int main() {
@@ -684,6 +731,8 @@ int main() {
     grouped_scatter_reduction_oracle();
     group_snapshot_cancellation_and_stale_delivery();
     group_bounds_and_worker_partitions();
+    repeated_expert_minimum_rank_controls_tail_skip();
+    zero_contribution_completes_only_its_owned_row();
     graph_worker_requires_matching_consumer();
     split_stage_consumers_cannot_release_other_lanes();
     distinct_workers_preserve_rows_and_metadata();

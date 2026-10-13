@@ -26,6 +26,32 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    {
+        // This is the same post-prefill request-setup seam used by generate.cpp,
+        // after begin() has resolved/restored the resident owner's automatic seed.
+        struct SamplingSink {
+            const kernels::SamplerParams* installed = nullptr;
+            int calls = 0;
+            void set_sampling(const kernels::SamplerParams& sp) { installed = &sp; ++calls; }
+            void set_draft_sampling(const kernels::SamplerParams& sp) { installed = &sp; ++calls; }
+        } primary, peer, drafter;
+        program::ResidentWorking working;
+        working.request = 42;
+        working.sampling.seed = 987654321;  // resolved automatic seed, retained across a resend
+        working.sampling.greedy = false;
+        working.sampling.temperature = 0.7f;
+        working.sampling.penalty_last_n = 13;
+        const program::ResidentRequest arriving;  // the original omitted seed must never be resolved again here
+        program::apply_request_sampling(working, primary, &peer, &drafter);
+        check(primary.installed == &working.sampling && peer.installed == &working.sampling &&
+              drafter.installed == &working.sampling && arriving.sampling.seed == 0 &&
+              primary.installed->seed == 987654321 && primary.installed->penalty_last_n == 13,
+              "production request setup distributes the owner's resolved sampling object unchanged");
+        program::apply_request_sampling(working, primary, (SamplingSink*) nullptr, (SamplingSink*) nullptr);
+        check(primary.calls == 2 && peer.calls == 1 && drafter.calls == 1 &&
+              primary.installed->seed == 987654321,
+              "resend and disabled optional samplers cannot resolve a second automatic seed");
+    }
     check(stage.batch_peer == nullptr, "ordinary resident stages have no replay peer");
     const auto untouched = verifier.batch_resources();
     check(untouched.device_bytes == 0 && untouched.pinned_bytes == 0 &&
