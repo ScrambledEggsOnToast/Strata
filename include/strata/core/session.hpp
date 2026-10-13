@@ -31,6 +31,7 @@ namespace strata::core {
 struct SessionState {
     int64_t max_cells = 0;
     int allocation_device = -1;     ///< device captured by session_init; -1 for a non-owning/manual view
+    ModelGeometry allocation_geometry; ///< immutable geometry captured by session_init, for borrower rebinds
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)

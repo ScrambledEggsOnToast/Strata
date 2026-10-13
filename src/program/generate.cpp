@@ -76,6 +76,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
+#include "strata/program/serial_judge.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -569,6 +570,9 @@ struct Options {
     /// admissible only inside an enforced worker cgroup ceiling, so it requires the protected
     /// supervisor's measured worker limit and refuses without it.
     uint64_t guest_opaque_allowance_bytes = 0;      // --guest-opaque-allowance-bytes
+    int64_t judge_context = 0;                      // --judge-context: one independent serial state, not a slot
+    uint64_t judge_library_allowance_bytes = 0;     // incremental first-use/driver allowance; unknown if absent
+    uint64_t judge_runtime_allowance_bytes = 0;     // incremental host allocator/driver/test instrumentation
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
@@ -862,6 +866,9 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
+                 "  --judge-context N    opt-in serial short scoring state (1..4096); shares actual prompt/head owners\n"
+                 "  --judge-library-allowance-bytes N  additional per-device first-use/driver bound (required)\n"
+                 "  --judge-runtime-allowance-bytes N  additional host opaque-storage bound (required)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
@@ -2269,6 +2276,15 @@ int main(int argc, char** argv) {
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
         else if (a == "--guest-opaque-allowance-bytes") o.guest_opaque_allowance_bytes = bytes_flag(next("--guest-opaque-allowance-bytes"), "--guest-opaque-allowance-bytes");
+        else if (a == "--judge-context") {
+            const auto cells = bytes_flag(next("--judge-context"), "--judge-context");
+            if (cells < 1 || cells > 4096) { std::fprintf(stderr, "--judge-context requires 1..4096 cells\n"); return 2; }
+            o.judge_context = (int64_t)cells;
+        }
+        else if (a == "--judge-library-allowance-bytes")
+            o.judge_library_allowance_bytes = bytes_flag(next("--judge-library-allowance-bytes"), "--judge-library-allowance-bytes");
+        else if (a == "--judge-runtime-allowance-bytes")
+            o.judge_runtime_allowance_bytes = bytes_flag(next("--judge-runtime-allowance-bytes"), "--judge-runtime-allowance-bytes");
         else if (a == "--host-native") o.host_native = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
@@ -2629,6 +2645,17 @@ int main(int argc, char** argv) {
         }
     }
     const char* causal_prefix = std::getenv("STRATA_CROSS_HELP_CAPTURE");
+    if (o.judge_context && (!o.serve || !o.no_prefill_borrow || o.prefill_auto || o.prefill_chunk <= 0 ||
+        o.judge_context > o.max_context || o.kv_grow || o.vram_elastic || o.adapt_async || o.adapt_swaps != 0 ||
+        o.pipeline_windows > 0 || o.prefill_helpers || o.peer_device >= 0 || o.vision)) {
+        std::fprintf(stderr, "strata judge: needs serial --serve, fixed --prefill, --no-prefill-borrow, "
+                             "resident nonelastic KV, no adaptive/peer/helper/vision paths; generation geometry is never reduced\n");
+        return 2;
+    }
+    if (!o.judge_context && (o.judge_library_allowance_bytes || o.judge_runtime_allowance_bytes ||
+                             std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE"))) {
+        std::fprintf(stderr, "strata judge: allowances/probe require --judge-context\n"); return 2;
+    }
     const bool causal_requested = causal_prefix != nullptr;
     if (causal_requested) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
@@ -3872,6 +3899,12 @@ int main(int argc, char** argv) {
     // not exact carves and therefore do not arm the runtime equality checks.
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> admitted_slot_session_bytes{};
+    strata::plan::QsaPlacement judge_placement;
+    if (o.judge_context) judge_placement = strata::core::qsa_state_placement(g, o.judge_context, 0, o.judge_context);
+    std::array<strata::program::JudgeStageBytes, SplitDrive::kMax> admitted_judge_bytes{};
+    std::array<uint64_t, SplitDrive::kMax> judge_generation_cache_bytes{};
+    const int judge_generation_slots = o.batch;
+    const int64_t judge_generation_context = o.max_context, judge_generation_chunk = o.prefill_chunk;
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -4584,6 +4617,67 @@ int main(int argc, char** argv) {
                    "auto: floor((min(driver total, free) - fixed classes - headroom)/max_blob) slots");
         }
 
+        // #232: retain the already committed cache BUDGETS. Price their concrete all-pair
+        // allocations, rather than spending the residual budget a second time or taking
+        // any residency to fund the judge. Runtime proves these exact extents/residency.
+        uint64_t judge_host_init_peak = 0;
+        if (o.judge_context) {
+            if (split_auto || split_same || !native_pack || g.n_layers * g.n_expert != 24576) {
+                v0.add_unknown("judge_execution_geometry", "requires native frozen geometry and explicit stage ranges");
+            } else {
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                for (size_t st = 0; st <= split_devs.size(); ++st) {
+                    const int64_t lo = st ? split_at[st - 1] : 0;
+                    const int64_t hi = st < split_at.size() ? split_at[st] : g.n_layers;
+                    const int dev = st ? split_devs[st - 1] : 0;
+                    auto& demand = devs[st].vram;
+                    const char* cache_class = st ? "split_expert_caches" : "expert_cache";
+                    uint64_t full_cache = 0;
+                    for (int64_t l = lo; l < hi; ++l)
+                        full_cache = byte_add(full_cache, byte_mul((uint64_t)g.n_expert,
+                            byte_mul(byte_add((uint64_t)layout.blob_bytes(l), 255) / 256, 256)));
+                    auto cache = std::find_if(demand.classes.begin(), demand.classes.end(),
+                        [&](const auto& allocation) { return allocation.name == cache_class; });
+                    if (!layout.native || cache == demand.classes.end() || cache->bytes < full_cache) {
+                        demand.add_unknown("judge_generation_capacity", "unchanged cache budget cannot retain every existing expert pair");
+                    } else {
+                        cache->bytes = full_cache;
+                        cache->source = "concrete existing all-pair stage allocation: ExpertCache::open_sized 256-aligned blobs; original budget unchanged";
+                        judge_generation_cache_bytes[st] = full_cache;
+                        demand.add("judge_generation_cache_granule", ((full_cache + (2ull << 20) - 1) / (2ull << 20)) * (2ull << 20) - full_cache,
+                                   "existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed");
+                    }
+                    auto& bytes = admitted_judge_bytes[st];
+                    if (!strata::program::judge_stage_bytes(g, o.judge_context, K, lo, hi, n_vocab,
+                            hi == g.n_layers, judge_placement, bytes)) {
+                        demand.add_unknown("judge_short_session", "independent short owner/branch/readback price unavailable");
+                        continue;
+                    }
+                    demand.add("judge_short_session", bytes.session.device, "derived SessionOwner: GDN/QSA/MoE/block/PLE, complete independent short arena");
+                    demand.add("judge_operation_canary", bytes.device_canary, "derived 280 B per-stage operation owner; existing prefill canary also retained");
+                    demand.add("judge_head_output", bytes.device_head_output, "derived one full vocabulary FP32 row on actual native-head device");
+                    demand.add("judge_allocator_granule", bytes.device_allocator_padding, "derived separate session/canary/output allocations rounded to 2 MiB granules");
+                    demand.add("judge_shared_prefill_gemm_workspace", 0, "same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver");
+                    demand.add("judge_shared_native_head", 0, "same actual native weights/Q8_1 head scratch: generation native-head charge retained in full");
+                    if (o.judge_library_allowance_bytes)
+                        demand.add("judge_library_first_use_driver", o.judge_library_allowance_bytes,
+                            "additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained");
+                    else demand.add_unknown("judge_library_first_use_driver", "no incremental first-use/driver bound supplied");
+                    judge_host_init_peak = std::max(judge_host_init_peak, bytes.session.host_transient);
+                    std::fprintf(stderr, "JUDGE_STATIC device=%d cells=%lld session_device=%llu canary_device=%llu head_output_device=%llu "
+                                         "allocator_padding_device=%llu session_pinned_host=%llu session_heap_host=%llu canary_host=%llu "
+                                         "checkpoint_host=%llu readback_host=%llu metadata_host=%llu init_host_transient=%llu library_allowance=%llu\n",
+                        dev, (long long)o.judge_context, (unsigned long long)bytes.session.device,
+                        (unsigned long long)bytes.device_canary, (unsigned long long)bytes.device_head_output,
+                        (unsigned long long)bytes.device_allocator_padding, (unsigned long long)bytes.session.host_pinned,
+                        (unsigned long long)bytes.session.host_heap, (unsigned long long)bytes.host_canary,
+                        (unsigned long long)bytes.host_checkpoint, (unsigned long long)bytes.host_readback,
+                        (unsigned long long)bytes.host_metadata, (unsigned long long)bytes.session.host_transient,
+                        (unsigned long long)o.judge_library_allowance_bytes);
+                }
+            }
+        }
+
         // Clean source pages can accumulate across loaders and remain cached after unmap/close.
         // No eviction credit is inferred from madvise/fadvise success or a two-layer access window.
         // Only explicitly freed anonymous upload scratch is separated from runtime below.
@@ -4613,6 +4707,25 @@ int main(int argc, char** argv) {
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
             (uint64_t) g.n_qsa_layers() * strata::plan::kResidentQsaBytes), "ABI-checked owner/QSA envelopes");
         startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
+        if (o.judge_context) {
+            for (size_t stage = 0; stage < stage_count; ++stage) {
+                const auto& bytes = admitted_judge_bytes[stage];
+                ram("judge_session_host_pinned", bytes.session.host_pinned, "derived independent short SessionOwner mapped QSA controls");
+                ram("judge_session_host_heap", bytes.session.host_heap, "derived SessionOwner plus global QsaState array ABI");
+                ram("judge_operation_canary_host", bytes.host_canary, "derived 108 B per stage staging/readback");
+                ram("judge_branch_checkpoint_host", bytes.host_checkpoint, "derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin");
+                ram("judge_head_readback_host", bytes.host_readback, "derived one full native-head row; no per-position full-logit matrix");
+                ram("judge_metadata_host", bytes.host_metadata, "derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated");
+            }
+            startup_only.add("judge_session_init_transient", judge_host_init_peak,
+                "derived maximum serial short-owner RoPE/page-table construction payload, in addition to retained branch storage");
+            if (o.judge_runtime_allowance_bytes)
+                ram("judge_opaque_runtime_host", o.judge_runtime_allowance_bytes,
+                    "additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling");
+            else ram_unknown("judge_opaque_runtime_host", "no additional host allocator/driver/initialization bound supplied");
+            ram("judge_request_input_host", (uint64_t)o.judge_context * sizeof(int64_t),
+                "one bounded caller-owned prompt vector for the serial lane");
+        }
         if (o.spec > 0 || !o.mtp.empty() || requested_slots)
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
@@ -5147,6 +5260,26 @@ int main(int argc, char** argv) {
                     (unsigned long long) admission.host_ceiling_bytes,
                     (unsigned long long) admitted_cache_bytes, admission.limiting_term.c_str());
         std::fflush(stdout);
+        if (o.judge_context > 0) {
+            std::fprintf(stderr, "JUDGE_ADMISSION admit=%d verified=%d unknown_classes=%zu devices=%zu "
+                                 "guest_fits=%d host_fits=%d guest_demand_bytes=%llu host_demand_bytes=%llu "
+                                 "guest_ceiling_bytes=%llu host_ceiling_bytes=%llu runtime_allowance=%llu\n",
+                         admission.admitted ? 1 : 0, admission.verified ? 1 : 0, admission.unknown_classes.size(),
+                         admission.devices.size(), admission.guest_fits ? 1 : 0, admission.host_fits ? 1 : 0,
+                         (unsigned long long)admission.guest_demand_bytes,
+                         (unsigned long long)admission.host_demand_bytes,
+                         (unsigned long long)admission.guest_ceiling_bytes,
+                         (unsigned long long)admission.host_ceiling_bytes,
+                         (unsigned long long)o.judge_runtime_allowance_bytes);
+            for (size_t i = 0; i < admission.devices.size(); ++i) {
+                const auto& line = admission.devices[i];
+                std::fprintf(stderr, "JUDGE_DEVICE_ADMISSION device=%zu name=%s demand_bytes=%llu "
+                                     "ceiling_bytes=%llu headroom_bytes=%llu fits=%d\n",
+                             i, line.name.c_str(), (unsigned long long)line.demand_bytes,
+                             (unsigned long long)line.ceiling_bytes, (unsigned long long)line.headroom_bytes,
+                             line.fits ? 1 : 0);
+            }
+        }
         if (!admission.admitted) {
             for (const auto& r : admission.reasons)
                 std::fprintf(stderr, "strata generate: admission refused: limiting=%s %s\n",
@@ -7390,7 +7523,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (!auto_cache || attempt - failed >= 6) break;
+            if (o.judge_context || !auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -9650,6 +9783,10 @@ int main(int argc, char** argv) {
             int dev = 0;
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
+                if (o.judge_context) {
+                    std::fprintf(stderr, "strata judge: generation prefill geometry does not fit; refusing, never resizing it\n");
+                    return 1;
+                }
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
                     int d2 = 0;
@@ -9668,6 +9805,10 @@ int main(int argc, char** argv) {
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
+            if (o.judge_context) {
+                std::fprintf(stderr, "strata judge: %s; refusing, never retrying with reduced generation capacity\n", err.c_str());
+                return 1;
+            }
             int64_t next = 0;
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
@@ -10059,6 +10200,37 @@ int main(int argc, char** argv) {
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
+        std::unique_ptr<strata::program::SerialJudgeLane> judge_lane;
+        if (o.judge_context) {
+            if (o.batch != judge_generation_slots || o.max_context != judge_generation_context ||
+                o.prefill_chunk != judge_generation_chunk || host_res.size() != 24576 ||
+                !std::all_of(host_res.begin(), host_res.end(), [](int32_t slot) { return slot >= 0; })) {
+                std::fprintf(stderr, "strata judge: refuses reduced generation geometry or incomplete expert residency\n"); return 1;
+            }
+            std::vector<strata::program::JudgeStage> bindings;
+            bindings.reserve(stages.size() + 1);
+            for (size_t k = 0; k <= stages.size(); ++k) {
+                auto& cache = k == 0 ? xcache : stages[k - 1]->cache;
+                if (cache.bytes() <= 0 || (uint64_t)cache.bytes() != judge_generation_cache_bytes[k]) {
+                    std::fprintf(stderr, "strata judge: concrete generation cache extent differs from the all-pair ledger\n"); return 1;
+                }
+                strata::program::JudgeStage stage;
+                stage.generation = k == 0 ? &session_owner : &stages[k - 1]->session_owner;
+                stage.prompt = k == 0 ? &sp : &stages[k - 1]->sp;
+                stage.verifier = &stage_ver((int)k);
+                stage.batch_peer = batch_mtp_pipeline ? &stage_peer((int)k) : nullptr;
+                stage.weights = k == 0 ? &wt : &stages[k - 1]->wt;
+                stage.stream = k == 0 ? main_cs : (void*)stages[k - 1]->stream;
+                bindings.push_back(stage);
+            }
+            judge_lane = std::make_unique<strata::program::SerialJudgeLane>();
+            if (!judge_lane->init(g, o.judge_context, K, n_vocab, judge_placement, bindings,
+                    stages.empty() ? native_head : stages.back()->head, use_mtp ? &mtp : nullptr, admission, err)) {
+                std::fprintf(stderr, "strata judge: %s\n", err.c_str()); return 1;
+            }
+            std::fprintf(stderr, "JUDGE_CAPACITY context=%lld batch_slots=%d prefill_chunk=%lld resident_pairs=24576 drafter_slots=%d independent=1\n",
+                         (long long)o.max_context, o.batch, (long long)o.prefill_chunk, o.batch);
+        }
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -11691,6 +11863,31 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // First-authorised-run ownership reconciliation; no serving transport or deployment.
+        // Public token IDs only, bounded by the admitted lane. The same engine then serves
+        // ordinary generation requests, proving that the original execution binding resumed.
+        if (const char* text = std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE")) {
+            std::vector<int64_t> probe;
+            if (!judge_lane || std::strlen(text) > 65536 || !parse_i64_list(text, probe, err) ||
+                probe.empty() || probe.size() > (size_t)o.judge_context) {
+                std::fprintf(stderr, "strata judge: invalid bounded ownership probe\n"); return 2;
+            }
+            uint64_t checksum = 0;
+            for (int pass = 0; pass < 2; ++pass) {
+                if (!judge_lane->run(UINT64_MAX - pass, probe.data(), (int64_t)probe.size(), err)) {
+                    std::fprintf(stderr, "strata judge: ownership probe: %s\n", err.c_str()); return 1;
+                }
+                const float* row = judge_lane->logits();
+                const uint64_t current = fnv1a(row, (size_t)n_vocab * sizeof(float));
+                if (pass && current != checksum) {
+                    std::fprintf(stderr, "strata judge: repeated fresh lease produced different native-head bytes\n"); return 1;
+                }
+                checksum = current;
+                std::fprintf(stderr, "JUDGE_PROBE pass=%d tokens=%zu vocabulary=%lld head_fnv64=%016llx argmax=%lld restored=1\n",
+                             pass, probe.size(), (long long)n_vocab, (unsigned long long)current,
+                             (long long)(std::max_element(row, row + n_vocab) - row));
+            }
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -11856,6 +12053,7 @@ int main(int argc, char** argv) {
             auto& counts = batch_drafts[b];
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            if (judge_lane) judge_lane->observe_generation();
             std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
                         b, (long long) sl.produced, reason, ms,
                         (long long) counts.accepted, (long long) counts.offered);
@@ -15514,6 +15712,7 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            if (judge_lane) judge_lane->observe_generation();
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
                         (long long) produced_n,

@@ -1,0 +1,137 @@
+{
+  "scope": "4096-cell serial ownership reconciliation under copied measurement configuration; not deployment or throughput qualification",
+  "evidence": {
+    "control_result": "bench/results/issue-232/result-control-r1.json",
+    "candidate_result": "bench/results/issue-232/result-candidate-r1.json",
+    "control_engine_log": "/home/joshkirklin/.local/state/strata-host/judge232-control-r1/engine.log",
+    "candidate_engine_log": "/home/joshkirklin/.local/state/strata-host/judge232-candidate-r1/engine.log"
+  },
+  "derived_static_stage_ledger": [],
+  "measured_explicit_allocation_high_water": [],
+  "measured_host_heap_rss_high_water": [],
+  "measured_mps_residual_observations": [],
+  "admission": [],
+  "operation_canary_and_lease_records": [],
+  "charges": {
+    "derived": [
+      "independent SessionOwner device/pinned/heap payload",
+      "280 B device/108 B host per-stage canary",
+      "one head output/readback row",
+      "retained GDN/PLE/indexer/ID branch checkpoint plus 12.5% capacity margin",
+      "stage/module metadata",
+      "per-allocation 2 MiB granule padding",
+      "bounded prompt input",
+      "serial RoPE/page-table construction transient"
+    ],
+    "measured": [
+      "link-wrapped explicit engine CUDA allocation live/peak payload",
+      "link-wrapped pinned/registration live/peak payload",
+      "glibc heap live bytes",
+      "process RSS and kernel VmHWM",
+      "MPS remaining-budget deltas",
+      "complete launcher safety telemetry"
+    ],
+    "allowances_not_measured_costs": [
+      "additional judge_library_first_use_driver",
+      "additional judge_opaque_runtime_host",
+      "retained generation graph/prefill-library/host-runtime allowances"
+    ],
+    "shared_no_incremental_owner": [
+      "same actual Prefill/Gemm/cuBLAS scratch/workspace",
+      "same actual NativeHead weights/Q8_1 scratch"
+    ],
+    "limitations": [
+      "link wrapping excludes shared-library/driver internal allocations",
+      "MPS residual delta does not isolate cuBLAS from module loading or other opaque driver commitments",
+      "VmHWM covers the whole process, not one individually attributed host transient"
+    ]
+  },
+  "criteria": {
+    "verified_complete_admission": "blocked",
+    "static_ownership_ledger_reconciled": "blocked",
+    "same_actual_execution_owners_restored": "blocked",
+    "all_24576_expert_pairs_resident": "blocked",
+    "generation_capacity_non_regression": "blocked",
+    "clean_authorised_lifecycle": "reject"
+  },
+  "stage_reconciliation": [],
+  "unknown_classes": [],
+  "generation_comparison": {
+    "matched_frozen_input": true,
+    "matched_text_reasoning_digests_and_usage": false,
+    "configured_capacity_unchanged": false,
+    "exercised_prompt_tokens": 1024,
+    "full_context_boundary_exercised": false,
+    "four_simultaneous_slots_exercised": false
+  },
+  "safety_peaks": {
+    "control": {
+      "samples": 29,
+      "mem_available_min_bytes": 48782544896,
+      "cpu_c_max": 73.875,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 47.0,
+          "power_max_w": 43.16
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 55.0,
+          "power_max_w": 156.82
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 47.0,
+          "power_max_w": 45.78
+        }
+      }
+    },
+    "candidate": {
+      "samples": 1,
+      "mem_available_min_bytes": 51489849344,
+      "cpu_c_max": 66.75,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 45.0,
+          "power_max_w": 24.92
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 48.0,
+          "power_max_w": 34.78
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 46.0,
+          "power_max_w": 27.74
+        }
+      }
+    }
+  },
+  "failures": {
+    "control": [],
+    "candidate": [
+      "the run ended before serving: failed frontend exited 1",
+      "run did not end stopped: failed frontend exited 1"
+    ]
+  },
+  "source_and_binary_identities": {
+    "control_fixture_files": {
+      "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/frontend.py": "a25d9337a4f8f202f9e86e9be153a040b3ef63ec6b2e463cfaa0dc3fe15fe28d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/server.py": "63349c03143cecbcf7bea690908c3f6cdd53765fa901d76b9ff36726c27acb0d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/tools/strata_tokenizer.py": "40595124e02c198e464c12cbe5fe6d4fb079daa3238263fc71ea8d2cf279ca12",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "candidate_fixture_files": {
+      "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test": "f07f49fb7fb45babcbe36c3ac9fa76123e42f48fdd4e27214258d92c5f85b237",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/frontend.py": "a25d9337a4f8f202f9e86e9be153a040b3ef63ec6b2e463cfaa0dc3fe15fe28d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/server.py": "63349c03143cecbcf7bea690908c3f6cdd53765fa901d76b9ff36726c27acb0d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/tools/strata_tokenizer.py": "40595124e02c198e464c12cbe5fe6d4fb079daa3238263fc71ea8d2cf279ca12",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    }
+  },
+  "disposition": "reject"
+}

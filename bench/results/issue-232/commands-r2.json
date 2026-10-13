@@ -1,0 +1,33 @@
+{
+  "configure": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 232 --purpose configure --max-s 1800 -- cmake -S /home/joshkirklin/strata-workspace/worktrees/judge-232 -B /home/joshkirklin/strata-workspace/scratch/judge-232-build -G \"Unix Makefiles\" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-cc -DCMAKE_CXX_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-g++ -DCMAKE_C_COMPILER_AR=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ar -DCMAKE_CXX_COMPILER_AR=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ar -DCMAKE_C_COMPILER_RANLIB=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ranlib -DCMAKE_CXX_COMPILER_RANLIB=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ranlib -DCMAKE_CUDA_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/nvcc -DCMAKE_CUDA_HOST_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-g++ -DCMAKE_CUDA_ARCHITECTURES=\"70;86\" -DCUDAToolkit_ROOT=/home/joshkirklin/strata-workspace/toolchains/cuda129 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_GGML_DIR=/home/joshkirklin/strata-workspace/scratch/repin-0.1.40.1-ggml -DSTRATA_PLE_FIXTURE_DIR=/home/joshkirklin/strata-workspace/worktrees/judge-232/bench/micro",
+  "build": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 232 --purpose build --max-s 1800 -- cmake --build /home/joshkirklin/strata-workspace/scratch/judge-232-build -j4",
+  "host_tests": "env CUDA_VISIBLE_DEVICES=-1 ctest --test-dir /home/joshkirklin/strata-workspace/scratch/judge-232-build -R \"^(serial_judge_pricing|session_owner_pricing|resident_slots_preflight)$\" --output-on-failure",
+  "fixture_control": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-control.json --prepare-request bench/results/issue-232/request-control.json --prompt-tokens 1024",
+  "fixture_candidate": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-candidate-r2.json --prepare-request bench/results/issue-232/request-candidate-r2.json --prompt-tokens 1024",
+  "measure_control": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class measure --ticket 232 --purpose control --max-s 1800 -- /home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-control.json --run-id judge232-control-r1 --request-json bench/results/issue-232/request-control.json --out bench/results/issue-232/result-control-r1.json",
+  "measure_candidate": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class measure --ticket 232 --purpose reconciliation --max-s 1800 -- /home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-candidate-r2.json --run-id judge232-candidate-r2 --request-json bench/results/issue-232/request-candidate-r2.json --out bench/results/issue-232/result-candidate-r2.json",
+  "offline_report": "python3 tools/judge_ownership_report.py --control bench/results/issue-232/result-control-r1.json --candidate bench/results/issue-232/result-candidate-r2.json --out bench/results/issue-232/reconciliation-r2.json",
+  "commands_are_reproducible": true,
+  "cwd": "/home/joshkirklin/strata-workspace/worktrees/judge-232",
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "ggml_pin": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "configured_build_identity": {
+    "generator": "Unix Makefiles",
+    "cuda": "12.9.86",
+    "host_gcc": "14.4.0",
+    "architectures": [
+      "70",
+      "86"
+    ]
+  },
+  "observed_before_final_lease_refinement": {
+    "full_build": "passed, 338.86 s",
+    "host_tests": "3/3 passed",
+    "transient_final_build_refusal": "exit 75: host launcher run is active; retried only through queue"
+  },
+  "source_commit": "bad73a72",
+  "retained_rejected_attempt": {
+    "result": "result-candidate-r1.json",
+    "cause": "unset -1 pipeline sentinel used as boolean before default resolution; source fixed, profile unchanged"
+  }
+}

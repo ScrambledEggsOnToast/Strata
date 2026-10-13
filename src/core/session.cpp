@@ -248,6 +248,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     };
 
     s.max_cells = max_cells;
+    s.allocation_geometry = g;
     s.k = k;
     s.layer_lo = layer_lo;
     s.layer_hi = layer_hi;

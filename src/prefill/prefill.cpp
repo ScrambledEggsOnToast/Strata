@@ -13,6 +13,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include <array>
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -798,14 +799,16 @@ struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
+    core::SessionState* original_ss = nullptr;
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
-    bool borrowed = false;
+    bool borrowed = false, initialized = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     core::OperationCanary canary;
+    uint64_t bound_request = 0;
     std::atomic<bool> running{false};
     bool poisoned = false;
     std::thread::id callback_thread;
@@ -1164,7 +1167,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
     Impl& m = *impl_;
+    m.initialized = false;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+    m.original_ss = &ss;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -1307,7 +1312,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
-    return m.canary.init(err);
+    m.initialized = m.canary.init(err);
+    return m.initialized;
 }
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
@@ -1468,8 +1474,17 @@ int64_t Prefill::chunk() const { return impl_->T; }
 
 bool Prefill::context_idle(std::string& err) const {
     const Impl& m = *impl_;
-    if (public_running_.load() || m.running.load() || m.poisoned) {
+    if (public_running_.load() || m.running.load() || m.poisoned || next_run_.valid()) {
         err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
+    }
+    if (m.device >= 0) {
+        const core::OnDevice on(m.device);
+        for (cudaStream_t stream : {m.cs, m.copy, m.kv_copy}) {
+            if (!stream) continue;
+            if (cudaStreamQuery(stream) != cudaSuccess) {
+                err = "prefill: owner stream is in flight or failed"; return false;
+            }
+        }
     }
     return !next_ || next_->context_idle(err);
 }
@@ -1478,7 +1493,93 @@ bool Prefill::bind_request(uint64_t request, std::string& err) {
     Impl& m = *impl_;
     if (!context_idle(err)) return false;
     if (!m.canary.bind(8, request, err)) return false;
+    m.bound_request = request;
     return !next_ || next_->bind_request(request, err);
+}
+
+core::SessionState* Prefill::bound_session() const { return impl_->ss; }
+const void* Prefill::gemm_owner() const { return &impl_->gemm; }
+uint64_t Prefill::bf16_conversion_bytes() const { return impl_->gemm.bf16_conversion_bytes(); }
+void* Prefill::stream() const { return impl_->cs; }
+uint64_t Prefill::bound_request() const { return impl_->bound_request; }
+
+bool Prefill::validate_rebind(const core::SessionState& ss, void* stream, uint64_t request,
+                             std::string& err) const {
+    const Impl& m = *impl_;
+    if (!context_idle(err)) return false;
+    if (!request && &ss != m.original_ss) {
+        err = "prefill: non-generation rebind requires a nonzero request canary"; return false;
+    }
+    if (!m.initialized || !m.ss || !m.g || m.device < 0 || m.borrowed || stream != m.cs ||
+        ss.allocation_device != m.device || !ss.allocation_id || ss.k != m.ss->k ||
+        ss.layer_lo != stage_lb_ || ss.layer_hi != stage_le_ || ss.max_cells <= 0 ||
+        ss.gdn_alloc != m.ss->gdn_alloc || ss.gdn_ord0 != m.ss->gdn_ord0 ||
+        ss.qsa_alloc != m.ss->qsa_alloc || ss.qsa_ord0 != m.ss->qsa_ord0 ||
+        !ss.qsa_states || !ss.R || !ss.gdn_state || !ss.ple_hist) {
+        err = "prefill: session rebind has wrong owner/device/stream/stage geometry or borrowed scratch";
+        return false;
+    }
+    const int64_t core::ModelGeometry::* dims[] = {
+        &core::ModelGeometry::n_embd, &core::ModelGeometry::n_layers, &core::ModelGeometry::qsa_interval,
+        &core::ModelGeometry::ssm_state_size, &core::ModelGeometry::ssm_k_heads,
+        &core::ModelGeometry::ssm_v_heads, &core::ModelGeometry::ssm_d_conv,
+        &core::ModelGeometry::ssm_conv_channels, &core::ModelGeometry::ssm_value_dim,
+        &core::ModelGeometry::n_head, &core::ModelGeometry::n_head_kv, &core::ModelGeometry::head_dim,
+        &core::ModelGeometry::idx_q_heads, &core::ModelGeometry::idx_key_dim,
+        &core::ModelGeometry::hc, &core::ModelGeometry::hc_lr,
+        &core::ModelGeometry::n_expert, &core::ModelGeometry::n_ff
+    };
+    for (auto dim : dims) if (ss.allocation_geometry.*dim != m.g->*dim) {
+        err = "prefill: session rebind artifact geometry mismatch"; return false;
+    }
+    const auto shape = strata::kernels::qsa_real_shapes();
+    if (ss.max_cells / shape.idx_block + 2 > m.max_blocks) {
+        err = "prefill: session rebind exceeds retained max-block scratch"; return false;
+    }
+    const core::OnDevice on(m.device);
+    auto device_pointer = [&](const void* ptr) {
+        cudaPointerAttributes attr{};
+        return ptr && cudaPointerGetAttributes(&attr, ptr) == cudaSuccess &&
+               attr.type == cudaMemoryTypeDevice && attr.device == m.device;
+    };
+    if (!device_pointer(ss.R) || !device_pointer(ss.gdn_state) || !device_pointer(ss.ple_hist) ||
+        !device_pointer(ss.block.mixed) || !device_pointer(ss.block_arena)) {
+        err = "prefill: session rebind state pointers are not owned by the stage device"; return false;
+    }
+    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+        const auto& q = ss.qsa_states[ss.qsa_ord0 + j];
+        const auto& previous = m.ss->qsa_states[m.ss->qsa_ord0 + j];
+        if (q.kv_mode != 0 || previous.kv_mode != 0 || q.kv_elastic >= 0 ||
+            q.max_cells != ss.max_cells || q.n_pages != (ss.max_cells + shape.page_size - 1) / shape.page_size ||
+            q.n_slots != q.n_pages || q.idx_pooled_rows != ss.max_cells / shape.idx_block + 2 ||
+            q.kv_int8 != previous.kv_int8 || q.kv_q4 != previous.kv_q4 ||
+            q.kv_hybrid != previous.kv_hybrid || q.kv_rot != previous.kv_rot) {
+            err = "prefill: session rebind QSA placement/format/max-block geometry mismatch"; return false;
+        }
+        for (const void* ptr : std::array<const void*, 7>{q.page_table, q.idx_tail, q.idx_dead,
+                                                       q.idx_pooled, q.idx_block_pos, q.cos_tab, q.sin_tab}) {
+            if (!device_pointer(ptr)) { err = "prefill: session rebind QSA device ownership mismatch"; return false; }
+        }
+        const void* k = q.kv_hybrid || q.kv_int8 ? static_cast<const void*>(q.k_q)
+                     : q.kv_q4 ? static_cast<const void*>(q.k_q4) : q.k_pool;
+        const void* v = q.kv_hybrid || q.kv_q4 ? static_cast<const void*>(q.v_q4)
+                     : q.kv_int8 ? static_cast<const void*>(q.v_q) : q.v_pool;
+        if (!device_pointer(k) || !device_pointer(v) ||
+            ((q.kv_hybrid || q.kv_int8) && !device_pointer(q.k_scale)) ||
+            (q.kv_int8 && !device_pointer(q.v_scale))) {
+            err = "prefill: session rebind KV device ownership mismatch"; return false;
+        }
+    }
+    return true;
+}
+
+bool Prefill::rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err) {
+    if (!validate_rebind(ss, stream, request, err)) return false;
+    Impl& m = *impl_;
+    if (!m.canary.bind(8, request, err)) return false;
+    m.ss = &ss;
+    m.bound_request = request;
+    return true;
 }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,

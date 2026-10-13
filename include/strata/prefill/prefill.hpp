@@ -140,6 +140,19 @@ public:
     bool bind_request(uint64_t request, std::string& err);
     bool context_idle(std::string& err) const;
 
+    /// Serial, allocation-free session lease. The caller stops all generation submitters first.
+    /// Accepts only independently owned resident state with identical artifact/stage/KV geometry,
+    /// on the original device and stream, within the retained max-block scratch. No relayout,
+    /// new Gemm/cuBLAS handle, cache loan or graph capture occurs. Validate every stage before
+    /// rebinding any stage; restore every original session/request before generation resumes.
+    bool validate_rebind(const core::SessionState& ss, void* stream, uint64_t request, std::string& err) const;
+    bool rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err);
+    core::SessionState* bound_session() const;
+    const void* gemm_owner() const;
+    uint64_t bf16_conversion_bytes() const;
+    void* stream() const;
+    uint64_t bound_request() const;
+
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);

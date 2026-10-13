@@ -834,6 +834,83 @@ for an overfull context. `--admission-headroom-mib` sets explicit device headroo
 hypothetical future capacities that are reported but never admitted - as the document
 `schemas/memory-plan.schema.json` describes.
 
+### Serial judge execution ownership
+
+`--judge-context N` (1..4096, off by default) admits one independent short
+`SessionOwner` per existing stage, outside the generation slots and MTP slot
+vectors. `SerialJudgeLane` leases the actual serving `Prefill` objects, their
+existing `Gemm`/cuBLAS handle and workspace, and the existing native head.
+It does not create a second prefill chain, borrow expert-cache storage, or
+change generation context, slot count or prompt chunk size.
+
+The initial lane requires native weights, resident nonelastic KV, fixed
+`--prefill` and `--no-prefill-borrow`, with no adaptive/peer/helper/vision
+paths. Generation submitters must be stopped at a quiescent serial boundary.
+Every stage validates the original device/stream, immutable allocation
+geometry, layer range, KV format, page/indexer extent, retained max-block
+scratch and request canary before rebinding. Verifiers and the drafter must
+also be idle. Generation callbacks, PLE history bindings, request identity
+and per-device RoPE registration are restored before generation resumes.
+An operation or restoration failure refuses reuse; it is not a fallback to
+the generation session or a smaller scoring state.
+
+The admission ledger names the complete independent session device/pinned/
+heap payload, 280-byte device and 108-byte host canary per stage, one head
+output/readback row, retained host branch checkpoint, object metadata,
+device allocation-granule padding, request input and initialization
+transients. The already-initialized shared workspace/head rows have a derived
+zero *incremental owner* price; their full generation charges remain.
+This is not zero first-use cost: the same Gemm's lazy BF16 conversion
+buffers and MMQ pool are included in the additional device first-use
+envelope, alongside library/driver commitments.
+Original expert-cache budgets are retained, while the opt-in demand prices the concrete 256-aligned blobs
+for every resident pair and verifies those cache extents before creating
+the lane. Exactly 24,576 resident pairs and unchanged generation geometry
+are required; no expert residency is available to pay for scoring.
+
+`--judge-library-allowance-bytes` and `--judge-runtime-allowance-bytes` supply
+additional finite first-use/driver and host allocator/runtime commitments.
+Omitting either leaves an unknown class and refuses admission. These are
+declared bounds, not measured costs; they supplement, never replace, the
+existing generation allowances and measured ceilings.
+
+For an authorized allocation-reconciliation run, `strata-judge-test` wraps
+the engine's explicit CUDA allocation/free and host registration calls.
+`JUDGE_STATIC`, `JUDGE_OWNER`, `JUDGE_ALLOC`, `JUDGE_HOST` and `JUDGE_MEMORY`
+separate source-derived payloads, explicit allocation high-water marks,
+host RSS high-water and MPS residual-budget observations.
+The existing Gemm's retained conversion bytes are reported separately;
+unattributed explicit first-use bytes are not called library allocations.
+Admission and complete-run high-water are retained on stderr before
+`DONE`/MTP `BDONE`, rather than relying on a frontend to preserve protocol
+stdout or run child destructors. The offline reconciliation also checks
+the isolated judge-phase host heap/RSS envelope, not only device payloads.
+After generation resumes, all additional observed allocations remain in
+the report and are checked against the complete generation-plus-judge
+ledger; they are not mislabeled as isolated judge first-use costs.
+Shared-library and driver allocations are not claimed as link-wrapped payloads.
+`STRATA_JUDGE_OWNERSHIP_PROBE=<bounded token CSV>` runs two fresh serial
+leases before `READY`, requires identical native-head bytes and verified
+generation restoration, then permits ordinary serving. This is an
+ownership/reconciliation seam, not a scoring transport, numerical
+qualification, throughput claim or deployment.
+
+The [#232 reconciliation](../bench/results/issue-232/reconciliation-r3-corrected.json)
+records 4,096-cell payloads of 75.07 / 71.38 / 40.57 MiB, including the
+last stage's head row and every canary. Cold shared-owner first use adds
+86.99 / 47.62 / 5.13 MiB of explicit device storage; the measured total
+MPS-budget increments are 203.06 / 159.99 / 56.75 MiB. The declared
+incremental device envelopes are 334 / 330 / 300 MiB, not the smaller
+session-only figures. Source-derived retained host payload is 128.48 MiB,
+with a separate 512-MiB first-use allowance and 1-MiB serial initialization
+transient; the isolated lane's observed heap increment is 588.51 MiB.
+The later generation-resume heap growth remains in the full joint ledger.
+All 24,576 pairs remained resident, two leases restored generation, and
+the matched fresh 1,024-token/8-output request preserved both text and
+reasoning digests. Full-context/four-concurrent execution and non-CUDA
+backends were not exercised. These are copied-profile measurements, not
+qualification of the daily configuration or an inference-speed claim.
+
 ### A declared MPS client ceiling
 
 When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes the

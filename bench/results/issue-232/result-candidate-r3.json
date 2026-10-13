@@ -1,0 +1,376 @@
+{
+  "run_id": "judge232-candidate-r3",
+  "profile": "/home/joshkirklin/strata-workspace/worktrees/judge-232/bench/results/issue-232/profile-candidate-r3.json",
+  "run_root": "/home/joshkirklin/.local/state/strata-host/judge232-candidate-r3",
+  "base": "http://127.0.0.1:19515",
+  "cases": [
+    "fixture"
+  ],
+  "repeat": 1,
+  "requests": [
+    {
+      "case": "fixture",
+      "max_tokens": 8,
+      "engine_log_offset": 119327,
+      "status": 200,
+      "http_wall_s": 1.537,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 8,
+        "total_tokens": 1032,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "text": "",
+      "text_sha256": "e3b0c44298fc1c14",
+      "reasoning_sha256": "24daac676d891c64",
+      "engine": {
+        "prompt_tokens": 1024,
+        "reused": 0,
+        "read_tokens": 1024,
+        "committed_prefill_ms": 1289,
+        "committed_prefill_tok_s": 794.2,
+        "committed_generated": 8,
+        "committed_decode_ms": 245,
+        "committed_decode_tok_s": 32.7
+      }
+    }
+  ],
+  "failures": [],
+  "input": {
+    "schema_version": 1,
+    "public": true,
+    "generator": "reference-table-v1",
+    "prompt_tokens": 1024,
+    "token_ids_sha256": "a3bb985675d473f4ffcb3eeac5b191e5f338db6a6c4158422fd7e6f1f9bc9be4",
+    "request_sha256": "db8c3fda9a49a8a29923e86acc54b46d5d199f663616c944824b0564ccee039b",
+    "files": {
+      "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test": "d3105b8f637dff3747be401013a0186670dea4b564524842986daa3fb8c63d6a",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/frontend.py": "a25d9337a4f8f202f9e86e9be153a040b3ef63ec6b2e463cfaa0dc3fe15fe28d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/server.py": "63349c03143cecbcf7bea690908c3f6cdd53765fa901d76b9ff36726c27acb0d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/tools/strata_tokenizer.py": "40595124e02c198e464c12cbe5fe6d4fb079daa3238263fc71ea8d2cf279ca12",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    }
+  },
+  "profile_snapshot": {
+    "name": "swift-1.5-flash-next-256k-host",
+    "binary": "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test",
+    "frontend": "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013",
+    "python": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python",
+    "tokenizer": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer",
+    "engine_args": [
+      "--pack",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+      "--native",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--ple-gguf",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--expert-cache",
+      "auto",
+      "--expert-profile",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+      "--prefill",
+      "2048",
+      "--max-context",
+      "262144",
+      "--windowed-experts",
+      "--adapt-swaps",
+      "0",
+      "--pool-workers",
+      "4",
+      "--spec",
+      "4",
+      "--suffix-draft",
+      "0",
+      "--mps-cap-bytes",
+      "33285996544,33285996544,22548578304",
+      "--mps-outside-client-allowance-bytes",
+      "67108864",
+      "--graph-capture-allowance-bytes",
+      "268435456",
+      "--prefill-library-allowance-bytes",
+      "268435456",
+      "--guest-opaque-allowance-bytes",
+      "268435456",
+      "--kv",
+      "k8v4",
+      "--prompt-cache",
+      "0",
+      "--conversation-cache-mib",
+      "0",
+      "--greedy",
+      "--batch",
+      "4",
+      "--batch-groups",
+      "2",
+      "--trim-stage-weights",
+      "--batch-mtp",
+      "--batch-mtp-pipeline",
+      "--layer-split",
+      "20,39",
+      "--split-device",
+      "1,2",
+      "--host-native",
+      "--rope-scaling",
+      "none",
+      "--mtp",
+      "/srv/ai-inference/models/strata-het002/mtp/rt",
+      "--spec-min-p",
+      "0.5",
+      "--no-prefill-borrow",
+      "--judge-context",
+      "4096",
+      "--judge-library-allowance-bytes",
+      "268435456",
+      "--judge-runtime-allowance-bytes",
+      "536870912"
+    ],
+    "gpu_uuids": [
+      "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+      "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+      "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b"
+    ],
+    "mps_caps_bytes": [
+      33285996544,
+      33285996544,
+      22548578304
+    ],
+    "timeout_s": 600,
+    "request_queue_limit": 12,
+    "request_timeout_s": 600,
+    "request_body_bytes": 33554432,
+    "reserve_bytes": 8589934592,
+    "memory_max_bytes": 27917287424,
+    "port": 19515,
+    "env": {
+      "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+      "STRATA_PREFILL_RING": "8",
+      "STRATA_IQ_MT_MIN": "1",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "TMPDIR": "/home/joshkirklin/strata-workspace/scratch",
+      "STRATA_JUDGE_OWNERSHIP_PROBE": "1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1",
+      "STRATA_STATE_HASH": "1"
+    },
+    "bind_host": "127.0.0.1",
+    "allowed_hosts": [
+      "debian-host.taildd9ef8.ts.net",
+      "debian-host"
+    ],
+    "thermal_limit_c": 83,
+    "power_stop_w": {
+      "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": 420,
+      "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": 250,
+      "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": 250
+    },
+    "power_limit_w": [
+      150.0,
+      150.0,
+      420.0
+    ],
+    "koko_capabilities": {
+      "responses": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "tool_types": [
+          "function"
+        ],
+        "reasoning": true,
+        "structured_output": {
+          "json_object": "validation"
+        }
+      },
+      "chat_completions": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "tool_types": [
+          "function"
+        ],
+        "reasoning": true,
+        "structured_output": {
+          "json_object": "validation"
+        }
+      }
+    },
+    "artifact_root": "/home/joshkirklin/strata-workspace/scratch/judge-232-runs"
+  },
+  "artifact_root": "/home/joshkirklin/strata-workspace/scratch/judge-232-runs/judge232-candidate-r3",
+  "launcher": {
+    "returncode": 0,
+    "stdout": "judge232-candidate-r3\n",
+    "stderr": "{\n  \"sampled_at\": 1791887956.079499,\n  \"basis\": \"nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order\",\n  \"scope\": \"physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides\",\n  \"devices\": [\n    {\n      \"cuda_device\": 0,\n      \"gpu_uuid\": \"GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21\",\n      \"free_bytes\": 34072428544,\n      \"ceiling_bytes\": 33285996544,\n      \"outside_client_allowance_bytes\": 67108864,\n      \"ceiling_plus_allowance_bytes\": 33353105408,\n      \"margin_bytes\": 719323136,\n      \"max_fitting_ceiling_bytes\": 34005319680,\n      \"max_fitting_whole_gib\": 31,\n      \"physical_envelope_prediction\": \"would_fit\"\n    },\n    {\n      \"cuda_device\": 1,\n      \"gpu_uuid\": \"GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331\",\n      \"free_bytes\": 34072428544,\n      \"ceiling_bytes\": 33285996544,\n      \"outside_client_allowance_bytes\": 67108864,\n      \"ceiling_plus_allowance_bytes\": 33353105408,\n      \"margin_bytes\": 719323136,\n      \"max_fitting_ceiling_bytes\": 34005319680,\n      \"max_fitting_whole_gib\": 31,\n      \"physical_envelope_prediction\": \"would_fit\"\n    },\n    {\n      \"cuda_device\": 2,\n      \"gpu_uuid\": \"GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b\",\n      \"free_bytes\": 22706913280,\n      \"ceiling_bytes\": 22548578304,\n      \"outside_client_allowance_bytes\": 67108864,\n      \"ceiling_plus_allowance_bytes\": 22615687168,\n      \"margin_bytes\": 91226112,\n      \"max_fitting_ceiling_bytes\": 22639804416,\n      \"max_fitting_whole_gib\": 21,\n      \"physical_envelope_prediction\": \"would_fit\"\n    }\n  ]\n}\nWARNING: this user manager cannot grant the 'koko-control' group, so the run unit will serve the engine but Koko will stay unavailable until readiness is published from a session that has the group (log out and back in, or run the manager under `sg koko-control`). systemd refuses to set a group its own manager does not have (unit exit status 216/GROUP).\nRunning as unit: strata-host-judge232-candidate-r3.service; invocation ID: f96b275b7600464eb30a66c92ef00e2c\n"
+  },
+  "load_s": 69.5,
+  "enforced_power_limit_w": {
+    "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": 150.0,
+    "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": 420.0,
+    "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": 150.0
+  },
+  "thermal_limit_c": 83.0,
+  "stop": {
+    "returncode": 0,
+    "stdout": "{\n  \"run_id\": \"judge232-candidate-r3\",\n  \"pid\": 645423,\n  \"status\": \"stopped\",\n  \"profile\": \"/home/joshkirklin/strata-workspace/worktrees/judge-232/bench/results/issue-232/profile-candidate-r3.json\",\n  \"started\": 1791887956.2144468,\n  \"lifetime_s\": 600,\n  \"request_queue_limit\": 12,\n  \"mps_preflight\": {\n    \"sampled_at\": 1791887956.2144718,\n    \"basis\": \"nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order\",\n    \"scope\": \"physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides\",\n    \"devices\": [\n      {\n        \"cuda_device\": 0,\n        \"gpu_uuid\": \"GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21\",\n        \"free_bytes\": 34072428544,\n        \"ceiling_bytes\": 33285996544,\n        \"outside_client_allowance_bytes\": 67108864,\n        \"ceiling_plus_allowance_bytes\": 33353105408,\n        \"margin_bytes\": 719323136,\n        \"max_fitting_ceiling_bytes\": 34005319680,\n        \"max_fitting_whole_gib\": 31,\n        \"physical_envelope_prediction\": \"would_fit\"\n      },\n      {\n        \"cuda_device\": 1,\n        \"gpu_uuid\": \"GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331\",\n        \"free_bytes\": 34072428544,\n        \"ceiling_bytes\": 33285996544,\n        \"outside_client_allowance_bytes\": 67108864,\n        \"ceiling_plus_allowance_bytes\": 33353105408,\n        \"margin_bytes\": 719323136,\n        \"max_fitting_ceiling_bytes\": 34005319680,\n        \"max_fitting_whole_gib\": 31,\n        \"physical_envelope_prediction\": \"would_fit\"\n      },\n      {\n        \"cuda_device\": 2,\n        \"gpu_uuid\": \"GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b\",\n        \"free_bytes\": 22706913280,\n        \"ceiling_bytes\": 22548578304,\n        \"outside_client_allowance_bytes\": 67108864,\n        \"ceiling_plus_allowance_bytes\": 22615687168,\n        \"margin_bytes\": 91226112,\n        \"max_fitting_ceiling_bytes\": 22639804416,\n        \"max_fitting_whole_gib\": 21,\n        \"physical_envelope_prediction\": \"would_fit\"\n      }\n    ]\n  },\n  \"power_limit_w\": {\n    \"GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331\": 150.0,\n    \"GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b\": 420.0,\n    \"GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21\": 150.0\n  },\n  \"thermal_limit_c\": 83.0,\n  \"frontend_pid\": 645449,\n  \"thermal_warnings\": {},\n  \"admission\": {\n    \"slots\": 4,\n    \"request_queue_limit\": 12,\n    \"active\": 1,\n    \"waiting\": 0,\n    \"executing\": 1,\n    \"native_waiting\": 0,\n    \"oldest_wait_s\": 0.0,\n    \"request_timeout_s\": 600.0,\n    \"service_time_estimate_s\": 1.062074,\n    \"retry_after_s\": 2,\n    \"retry_after_ceiling_s\": 30\n  },\n  \"admission_sampled_at\": 1791888027.75409,\n  \"koko_readiness\": {\n    \"announced\": false,\n    \"error\": \"cannot reach the Koko control socket /run/koko/control.sock: [Errno 13] Permission denied\"\n  },\n  \"ready_at\": 1791888025.7135215,\n  \"ended\": 1791888030.474264\n}\n",
+    "stderr": ""
+  },
+  "swap_page_faults": {
+    "pswpin": 0,
+    "pswpout": 0,
+    "pgmajfault": 0
+  },
+  "served": true,
+  "layout": [
+    "strata generate: layer split across 3 GPUs: CUDA0, then CUDA1,2 (split 20,39)",
+    "strata generate: layer split: CUDA0 loads the dense weights of layers 0-19 only",
+    "strata generate: layer split admission: CUDA1 expert cache budget 23096320000 B (residual ceiling 32969000432 B, fixed 9137710736 B, headroom 734003200 B, profile bound 25899827200 B)",
+    "strata generate: layer split admission: CUDA2 expert cache budget 10942464000 B (residual ceiling 22286907088 B, fixed 10609474704 B, headroom 734003200 B, profile bound 12268339200 B)",
+    "strata generate: layer split: CUDA1 loads the dense weights of layers 20-38 only",
+    "strata generate: layer split: CUDA1 PCIe probe 3.4 GB/s (best of 3.4 3.4 3.4 3.4) -> pcie_frac 0.09",
+    "strata generate: layer split: CUDA1 holds its weights; 29.27 GiB free (its session follows the split search)",
+    "strata generate: layer split: CUDA2 loads the dense weights of layers 39-47 only",
+    "strata generate: layer split: CUDA2 PCIe probe 13.5 GB/s (best of 13.4 13.5 13.5 13.4) -> pcie_frac 0.37",
+    "strata generate: layer split: CUDA2 holds its weights; 20.05 GiB free (its session follows the split search)",
+    "strata generate: layer split: CUDA1 holds its weights, session [20, 39); 28.23 GiB free",
+    "strata generate: layer split: CUDA2 holds its weights, session [39, 48) and the head; 18.79 GiB free",
+    "strata generate: the prompt path's own buffers for a 2048-token chunk: 1002 MiB",
+    "strata generate: layer split, CUDA1: expert cache held to the admitted 23096320000 B budget (free-memory room was 23158185328 B)",
+    "strata generate: layer split, CUDA1: 24.07 GiB free of 31.73, room for experts 21.51 GiB",
+    "strata generate: layer split: CUDA1 runs layers 20-38, expert cache 9728 slots (18.69 GiB), 9728 of its 9728 profiled pairs; slot 0 verified",
+    "strata generate: layer split, CUDA2: expert cache held to the admitted 10942464000 B budget (free-memory room was 11698700416 B)",
+    "strata generate: layer split, CUDA2: 13.40 GiB free of 23.68, room for experts 10.19 GiB",
+    "strata generate: layer split: CUDA2 runs layers 39-47, expert cache 4608 slots (9.69 GiB), 4608 of its 4608 profiled pairs; slot 0 verified",
+    "strata generate: layer split: CUDA0 runs layers 0-19",
+    "strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots",
+    "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)",
+    "strata serve: layer split: layers 0-19 (CUDA0), 20-38 (CUDA1), 39-47 (CUDA2), one hand-off per window",
+    "strata serve: adaptive overlap: off: not on a layer split"
+  ],
+  "cuda0_session_bytes": [
+    1365087744
+  ],
+  "cuda0_cache_bytes": [
+    19818086400
+  ],
+  "prefill_buffers": {
+    "CUDA0": 1050673152,
+    "CUDA1": 1050673152,
+    "CUDA2": 1050673152
+  },
+  "residency": [
+    "strata generate: R4 hit path ON - resident experts are computed on the GPU",
+    "strata generate: token graph hit path: 24576 resident experts, decided on the device",
+    "strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots"
+  ],
+  "peaks": {
+    "samples": 36,
+    "mem_available_min_bytes": 48628768768,
+    "cpu_c_max": 75.75,
+    "gpus": {
+      "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+        "temp_max_c": 52.0,
+        "power_max_w": 154.86
+      },
+      "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+        "temp_max_c": 56.0,
+        "power_max_w": 176.64
+      },
+      "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+        "temp_max_c": 52.0,
+        "power_max_w": 145.36
+      }
+    }
+  },
+  "terminal": {
+    "run_id": "judge232-candidate-r3",
+    "pid": 645423,
+    "status": "stopped",
+    "profile": "/home/joshkirklin/strata-workspace/worktrees/judge-232/bench/results/issue-232/profile-candidate-r3.json",
+    "started": 1791887956.2144468,
+    "lifetime_s": 600,
+    "request_queue_limit": 12,
+    "mps_preflight": {
+      "sampled_at": 1791887956.2144718,
+      "basis": "nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order",
+      "scope": "physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides",
+      "devices": [
+        {
+          "cuda_device": 0,
+          "gpu_uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+          "free_bytes": 34072428544,
+          "ceiling_bytes": 33285996544,
+          "outside_client_allowance_bytes": 67108864,
+          "ceiling_plus_allowance_bytes": 33353105408,
+          "margin_bytes": 719323136,
+          "max_fitting_ceiling_bytes": 34005319680,
+          "max_fitting_whole_gib": 31,
+          "physical_envelope_prediction": "would_fit"
+        },
+        {
+          "cuda_device": 1,
+          "gpu_uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+          "free_bytes": 34072428544,
+          "ceiling_bytes": 33285996544,
+          "outside_client_allowance_bytes": 67108864,
+          "ceiling_plus_allowance_bytes": 33353105408,
+          "margin_bytes": 719323136,
+          "max_fitting_ceiling_bytes": 34005319680,
+          "max_fitting_whole_gib": 31,
+          "physical_envelope_prediction": "would_fit"
+        },
+        {
+          "cuda_device": 2,
+          "gpu_uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+          "free_bytes": 22706913280,
+          "ceiling_bytes": 22548578304,
+          "outside_client_allowance_bytes": 67108864,
+          "ceiling_plus_allowance_bytes": 22615687168,
+          "margin_bytes": 91226112,
+          "max_fitting_ceiling_bytes": 22639804416,
+          "max_fitting_whole_gib": 21,
+          "physical_envelope_prediction": "would_fit"
+        }
+      ]
+    },
+    "power_limit_w": {
+      "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": 150.0,
+      "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": 420.0,
+      "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": 150.0
+    },
+    "thermal_limit_c": 83.0,
+    "frontend_pid": 645449,
+    "thermal_warnings": {},
+    "admission": {
+      "slots": 4,
+      "request_queue_limit": 12,
+      "active": 1,
+      "waiting": 0,
+      "executing": 1,
+      "native_waiting": 0,
+      "oldest_wait_s": 0.0,
+      "request_timeout_s": 600.0,
+      "service_time_estimate_s": 1.062074,
+      "retry_after_s": 2,
+      "retry_after_ceiling_s": 30
+    },
+    "admission_sampled_at": 1791888027.75409,
+    "koko_readiness": {
+      "announced": false,
+      "error": "cannot reach the Koko control socket /run/koko/control.sock: [Errno 13] Permission denied"
+    },
+    "ready_at": 1791888025.7135215,
+    "ended": 1791888030.474264
+  },
+  "end_status": "stopped",
+  "ok": true
+}
