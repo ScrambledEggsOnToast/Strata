@@ -119,6 +119,22 @@ off/on checks, concurrent request/page-table/stream isolation and an independent
 pages, poisoned selection padding, nonresident pages, ragged causal tails and seventeen-query counts.
 Use `QA_PAGE=1|16|512` for unsupported-page fallback and physical-page-boundary fixtures.
 
+**Local disposition: rejected (2026-10-13, #218).** On the adopted full native IQ3_S Swift/Flash-Next model,
+two V100s plus a 3090 at the existing `20,39` split, a 5,327-token public technical-reading prompt shared
+79–87% of neighbouring eight-query groups' Page4 reads. The borrowed-workspace staging implementation
+nevertheless regressed complete observer-off fresh prefill: 4,153 → 4,961 ms (+19.46%); the one corrected
+vector-copy candidate (`964fb772`) was 4,116 → 4,903 ms (+19.12%). Both arms kept 2,048-token chunks, K8V4,
+all 24,576 resident experts and equal allocated prefill/session/cache envelopes. These are solo-GEN,
+cache-free/no-borrow measurement-configuration results, not daily-profile, concurrent-slot or TTFT claims.
+
+The corrected candidate passed 37 operator/selection cases over both V100s and SM86, exact off/on attention
+and request/stream isolation, plus all eight emitted full-vocabulary predictor rows in a separate matched
+serial diagnostic. Logical page overlap alone did not justify this staging cache. Keep the simpler row path;
+do not promote either candidate. The held-out gate was not triggered because neither primary pair was
+promising. [The result record](../bench/results/2026-10-13-v100-k8v4-page-reuse.json) pins sources, binaries,
+the complete profile differences, workspace/register prices, commands, raw evidence and rollback. This
+rejects the measured implementation, not every possible cooperative query-group kernel.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

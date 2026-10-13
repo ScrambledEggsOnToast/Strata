@@ -1,0 +1,911 @@
+{
+  "kind": "sm70-k8v4-page4-borrowed-workspace-reuse",
+  "date": "2026-10-13",
+  "ticket": 218,
+  "disposition": "reject",
+  "decision": "Both candidates regress matched observer-off fresh-prefill by about 19%; retain the simpler row path and do not promote this staging implementation. Logical overlap alone did not produce a useful net gain.",
+  "source_commit": "964fb7728779b4f6690a4e66b6d1c7c2abccd96a",
+  "upstream_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "ggml_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "control": {
+    "source": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "binary": "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f",
+    "sha256": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68"
+  },
+  "candidates": [
+    {
+      "source": "2398b7be6a73ccd3c2b6e36bd5b10bb5fc71004d",
+      "binary": "/home/joshkirklin/strata-workspace/scratch/1cat-218-build/strata",
+      "sha256": "f4e4935e645a9fab52b42df060e72ae921294fba4fc6d52bce9544efba8b6b6a",
+      "disposition": "reject",
+      "performance": {
+        "mode": "performance",
+        "commands": [
+          [
+            "/home/joshkirklin/ai-optimise/.venv/bin/python",
+            "/home/joshkirklin/ai-optimise/tools/host-inference/measure.py",
+            "--profile",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/profile-control-paired.json",
+            "--run-id",
+            "1cat218-performance-control",
+            "--out",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/performance-control.json",
+            "--request-json",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/request-control.json"
+          ],
+          [
+            "/home/joshkirklin/ai-optimise/.venv/bin/python",
+            "/home/joshkirklin/ai-optimise/tools/host-inference/measure.py",
+            "--profile",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/profile-candidate.json",
+            "--run-id",
+            "1cat218-performance-candidate",
+            "--out",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/performance-candidate.json",
+            "--request-json",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218/request-candidate.json"
+          ]
+        ],
+        "ok": true,
+        "control_prefill_ms": 4153,
+        "candidate_prefill_ms": 4961,
+        "gain_pct": -19.455815073440885,
+        "primary_promising": false,
+        "control_http_full_response_s": 4.308,
+        "candidate_http_full_response_s": 5.113,
+        "exact_generated_text": true,
+        "prefill_buffers": {
+          "CUDA0": 1050673152,
+          "CUDA1": 1050673152,
+          "CUDA2": 1050673152
+        },
+        "scope": "Solo GEN, observer off, deployed chunk2048/K8V4/placement; cache0/no-borrow measurement configuration, not daily profile."
+      },
+      "evidence_root": "/home/joshkirklin/strata-workspace/scratch/1cat-218"
+    },
+    {
+      "source": "964fb7728779b4f6690a4e66b6d1c7c2abccd96a",
+      "binary": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2-build/strata",
+      "sha256": "202080161f31455e7ca514de24d8e5b0828e77691f79e909539ffaed54811293",
+      "disposition": "reject",
+      "performance": {
+        "mode": "performance",
+        "commands": [
+          [
+            "/home/joshkirklin/ai-optimise/.venv/bin/python",
+            "/home/joshkirklin/ai-optimise/tools/host-inference/measure.py",
+            "--profile",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/profile-control-paired.json",
+            "--run-id",
+            "1cat218v2-performance-control",
+            "--out",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/performance-control.json",
+            "--request-json",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/request-control.json"
+          ],
+          [
+            "/home/joshkirklin/ai-optimise/.venv/bin/python",
+            "/home/joshkirklin/ai-optimise/tools/host-inference/measure.py",
+            "--profile",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/profile-candidate.json",
+            "--run-id",
+            "1cat218v2-performance-candidate",
+            "--out",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/performance-candidate.json",
+            "--request-json",
+            "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/request-candidate.json"
+          ]
+        ],
+        "ok": true,
+        "control_prefill_ms": 4116,
+        "candidate_prefill_ms": 4903,
+        "gain_pct": -19.12050534499514,
+        "primary_promising": false,
+        "control_http_full_response_s": 4.281,
+        "candidate_http_full_response_s": 5.055,
+        "exact_generated_text": true,
+        "prefill_buffers": {
+          "CUDA0": 1050673152,
+          "CUDA1": 1050673152,
+          "CUDA2": 1050673152
+        },
+        "scope": "Solo GEN, observer off, deployed chunk2048/K8V4/placement; cache0/no-borrow measurement configuration, not daily profile."
+      },
+      "evidence_root": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2"
+    }
+  ],
+  "build": {
+    "type": "Release",
+    "cuda": "12.9.86",
+    "host_compiler": "GNU 14.4.0 from the adopted cuda129 toolchain",
+    "cuda_architectures": "70;86",
+    "experimental_sm60": true,
+    "recipe": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/build.sh",
+    "configure_log": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/configure.log",
+    "build_log": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/build.log",
+    "compiled_resources": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/cuda-resource-summary.json"
+  },
+  "model": {
+    "quantization": "GSQ-RCO IQ3_S",
+    "architecture": "Qwen3.8-Flash-Next (Swift 1.5 derivative)",
+    "repository": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    "revision": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
+    "store": "/srv/development/models/swift-1.5-flash-next-iq3-s",
+    "combined_bytes": 83743737120,
+    "shards_sha256": {
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608"
+    },
+    "pack": {
+      "path": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+      "files_sha256": {
+        "index.txt": "d83b66e10838fbe6fbfe5be3d027403644382e79b05680001134a661a2ecd092",
+        "conversions.json": "13a6e8387ae050d148db1277d20b51402ec916b88d8547eb83f9d35cc1a9c5d6",
+        "native_experts.txt": "540776d2ccbfa5006631e8813341ceb1d7f19b8c96a5d6dacd39bac871bdcb69",
+        "dense.bin": "d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13",
+        "tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+        "tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+        "tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+        "tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        "tokenizer/tokenizer.json": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"
+      },
+      "generator": "Published aede0c68 source, tools/iq_pack.py; 96 exact conversions, zero rounded conversions. Native expert index v4 handles layer 14 spanning shards. Own GGUF tokenizer and Swift template. PLE is in shard 1."
+    },
+    "tokenizer": {
+      "path": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer",
+      "files_sha256": {
+        "token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+        "merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+        "vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+        "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        "tokenizer.json": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"
+      }
+    },
+    "mtp": {
+      "path": "/srv/ai-inference/models/strata-het002/mtp/rt",
+      "files_sha256": {
+        "dense.bin": "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a",
+        "experts.bin": "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f",
+        "draft_vocab.bin": "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91",
+        "dense.txt": "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"
+      }
+    },
+    "expert_profile": {
+      "path": "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+      "sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf"
+    }
+  },
+  "model_identity_note": "Model pins/hashes quoted from the adopted swift-256k-native-daily-r4 manifest, not freshly rehashed here. Both arms use identical release paths and configuration; no model, quantization or routing change.",
+  "configuration": {
+    "chunk": 2048,
+    "kv": "k8v4",
+    "query_heads_per_kv_head": 12,
+    "query_heads": 24,
+    "kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 4,
+    "gpu_uuids": [
+      "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+      "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+      "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b"
+    ],
+    "engine_args": [
+      "--pack",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+      "--native",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--ple-gguf",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--expert-cache",
+      "auto",
+      "--expert-profile",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+      "--prefill",
+      "2048",
+      "--max-context",
+      "262144",
+      "--windowed-experts",
+      "--adapt-swaps",
+      "0",
+      "--pool-workers",
+      "4",
+      "--spec",
+      "4",
+      "--suffix-draft",
+      "0",
+      "--mps-cap-bytes",
+      "33285996544,33285996544,22548578304",
+      "--mps-outside-client-allowance-bytes",
+      "67108864",
+      "--graph-capture-allowance-bytes",
+      "268435456",
+      "--prefill-library-allowance-bytes",
+      "268435456",
+      "--guest-opaque-allowance-bytes",
+      "268435456",
+      "--kv",
+      "k8v4",
+      "--prompt-cache",
+      "0",
+      "--conversation-cache-mib",
+      "0",
+      "--greedy",
+      "--batch",
+      "4",
+      "--batch-groups",
+      "2",
+      "--trim-stage-weights",
+      "--batch-mtp",
+      "--batch-mtp-pipeline",
+      "--layer-split",
+      "20,39",
+      "--split-device",
+      "1,2",
+      "--host-native",
+      "--rope-scaling",
+      "none",
+      "--mtp",
+      "/srv/ai-inference/models/strata-het002/mtp/rt",
+      "--spec-min-p",
+      "0.5",
+      "--no-prefill-borrow"
+    ],
+    "scope": "Solo GEN leg on the deployed chunk/KV/three-GPU placement, with cache0/no-borrow bounded measurement configuration. Not a daily-profile, batch-concurrency or TTFT claim."
+  },
+  "profile_changes_from_daily": {
+    "control": {
+      "engine_args": {
+        "daily": [
+          "--pack",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+          "--native",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--ple-gguf",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--expert-cache",
+          "auto",
+          "--expert-profile",
+          "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+          "--prefill",
+          "2048",
+          "--max-context",
+          "262144",
+          "--windowed-experts",
+          "--adapt-swaps",
+          "0",
+          "--pool-workers",
+          "4",
+          "--spec",
+          "4",
+          "--suffix-draft",
+          "0",
+          "--mps-cap-bytes",
+          "33285996544,33285996544,22548578304",
+          "--mps-outside-client-allowance-bytes",
+          "67108864",
+          "--graph-capture-allowance-bytes",
+          "268435456",
+          "--prefill-library-allowance-bytes",
+          "268435456",
+          "--guest-opaque-allowance-bytes",
+          "268435456",
+          "--kv",
+          "k8v4",
+          "--prompt-cache",
+          "6",
+          "--conversation-cache-mib",
+          "0",
+          "--greedy",
+          "--batch",
+          "4",
+          "--batch-groups",
+          "2",
+          "--trim-stage-weights",
+          "--batch-mtp",
+          "--batch-mtp-pipeline",
+          "--layer-split",
+          "20,39",
+          "--split-device",
+          "1,2",
+          "--host-native",
+          "--rope-scaling",
+          "none",
+          "--mtp",
+          "/srv/ai-inference/models/strata-het002/mtp/rt",
+          "--spec-min-p",
+          "0.5"
+        ],
+        "measurement": [
+          "--pack",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+          "--native",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--ple-gguf",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--expert-cache",
+          "auto",
+          "--expert-profile",
+          "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+          "--prefill",
+          "2048",
+          "--max-context",
+          "262144",
+          "--windowed-experts",
+          "--adapt-swaps",
+          "0",
+          "--pool-workers",
+          "4",
+          "--spec",
+          "4",
+          "--suffix-draft",
+          "0",
+          "--mps-cap-bytes",
+          "33285996544,33285996544,22548578304",
+          "--mps-outside-client-allowance-bytes",
+          "67108864",
+          "--graph-capture-allowance-bytes",
+          "268435456",
+          "--prefill-library-allowance-bytes",
+          "268435456",
+          "--guest-opaque-allowance-bytes",
+          "268435456",
+          "--kv",
+          "k8v4",
+          "--prompt-cache",
+          "0",
+          "--conversation-cache-mib",
+          "0",
+          "--greedy",
+          "--batch",
+          "4",
+          "--batch-groups",
+          "2",
+          "--trim-stage-weights",
+          "--batch-mtp",
+          "--batch-mtp-pipeline",
+          "--layer-split",
+          "20,39",
+          "--split-device",
+          "1,2",
+          "--host-native",
+          "--rope-scaling",
+          "none",
+          "--mtp",
+          "/srv/ai-inference/models/strata-het002/mtp/rt",
+          "--spec-min-p",
+          "0.5",
+          "--no-prefill-borrow"
+        ]
+      },
+      "timeout_s": {
+        "daily": 0,
+        "measurement": 1500
+      },
+      "env": {
+        "daily": {
+          "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+          "STRATA_PREFILL_RING": "8",
+          "STRATA_IQ_MT_MIN": "1",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "measurement": {
+          "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+          "STRATA_PREFILL_RING": "8",
+          "STRATA_IQ_MT_MIN": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/tmp",
+          "CUDA_CACHE_PATH": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/cuda-cache",
+          "STRATA_PROMPT_GROUP_PAGES": "1"
+        }
+      },
+      "artifact_root": {
+        "daily": null,
+        "measurement": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/runs"
+      }
+    },
+    "candidate": {
+      "binary": {
+        "daily": "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f",
+        "measurement": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2-build/strata"
+      },
+      "engine_args": {
+        "daily": [
+          "--pack",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+          "--native",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--ple-gguf",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--expert-cache",
+          "auto",
+          "--expert-profile",
+          "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+          "--prefill",
+          "2048",
+          "--max-context",
+          "262144",
+          "--windowed-experts",
+          "--adapt-swaps",
+          "0",
+          "--pool-workers",
+          "4",
+          "--spec",
+          "4",
+          "--suffix-draft",
+          "0",
+          "--mps-cap-bytes",
+          "33285996544,33285996544,22548578304",
+          "--mps-outside-client-allowance-bytes",
+          "67108864",
+          "--graph-capture-allowance-bytes",
+          "268435456",
+          "--prefill-library-allowance-bytes",
+          "268435456",
+          "--guest-opaque-allowance-bytes",
+          "268435456",
+          "--kv",
+          "k8v4",
+          "--prompt-cache",
+          "6",
+          "--conversation-cache-mib",
+          "0",
+          "--greedy",
+          "--batch",
+          "4",
+          "--batch-groups",
+          "2",
+          "--trim-stage-weights",
+          "--batch-mtp",
+          "--batch-mtp-pipeline",
+          "--layer-split",
+          "20,39",
+          "--split-device",
+          "1,2",
+          "--host-native",
+          "--rope-scaling",
+          "none",
+          "--mtp",
+          "/srv/ai-inference/models/strata-het002/mtp/rt",
+          "--spec-min-p",
+          "0.5"
+        ],
+        "measurement": [
+          "--pack",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+          "--native",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--ple-gguf",
+          "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "--expert-cache",
+          "auto",
+          "--expert-profile",
+          "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+          "--prefill",
+          "2048",
+          "--max-context",
+          "262144",
+          "--windowed-experts",
+          "--adapt-swaps",
+          "0",
+          "--pool-workers",
+          "4",
+          "--spec",
+          "4",
+          "--suffix-draft",
+          "0",
+          "--mps-cap-bytes",
+          "33285996544,33285996544,22548578304",
+          "--mps-outside-client-allowance-bytes",
+          "67108864",
+          "--graph-capture-allowance-bytes",
+          "268435456",
+          "--prefill-library-allowance-bytes",
+          "268435456",
+          "--guest-opaque-allowance-bytes",
+          "268435456",
+          "--kv",
+          "k8v4",
+          "--prompt-cache",
+          "0",
+          "--conversation-cache-mib",
+          "0",
+          "--greedy",
+          "--batch",
+          "4",
+          "--batch-groups",
+          "2",
+          "--trim-stage-weights",
+          "--batch-mtp",
+          "--batch-mtp-pipeline",
+          "--layer-split",
+          "20,39",
+          "--split-device",
+          "1,2",
+          "--host-native",
+          "--rope-scaling",
+          "none",
+          "--mtp",
+          "/srv/ai-inference/models/strata-het002/mtp/rt",
+          "--spec-min-p",
+          "0.5",
+          "--no-prefill-borrow"
+        ]
+      },
+      "timeout_s": {
+        "daily": 0,
+        "measurement": 1500
+      },
+      "env": {
+        "daily": {
+          "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+          "STRATA_PREFILL_RING": "8",
+          "STRATA_IQ_MT_MIN": "1",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "measurement": {
+          "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+          "STRATA_PREFILL_RING": "8",
+          "STRATA_IQ_MT_MIN": "1",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/tmp",
+          "CUDA_CACHE_PATH": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/cuda-cache",
+          "STRATA_PROMPT_GROUP_PAGES": "1"
+        }
+      },
+      "artifact_root": {
+        "daily": null,
+        "measurement": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/runs"
+      }
+    }
+  },
+  "profile_sha256": {
+    "profile-control-paired.json": "8a9b4ef939ea29eb9c1ab8b24d07a0b71c03ba6f6f100667a92cca01d0403f4f",
+    "profile-candidate.json": "2918ef2df76f52f213662220b0f0bdc9fcdfe32c4fd2f0494bbe90cd3b927053",
+    "profile-serial-control.json": "cdf4757052f2afdc596bdffac912f1f0a31bbf62813a10fed295b392414e4b72",
+    "profile-serial-candidate.json": "c487579f60def0f6faa50a15109934ebe4aa49ba8e0a3c27d94f3441346fe4b7"
+  },
+  "serial_diagnostic_exception": {
+    "purpose": "Reachable exact full-vocabulary committed-row regression, not latency.",
+    "removed_in_both_arms": [
+      "--batch 4",
+      "--batch-groups 2",
+      "--batch-mtp",
+      "--batch-mtp-pipeline"
+    ],
+    "observers_in_both": [
+      "STRATA_DUMP_COMMITTED_LOGITS",
+      "STRATA_DUMP_FIRST_LOGITS"
+    ],
+    "scope": "Serial layer-split GEN; retain all model/GPU/chunk/KV/safety controls."
+  },
+  "prompt": {
+    "tokens": 5327,
+    "output_tokens": 8,
+    "request_sha256": "f5b6c7c94fe5df223e424c0b488a2219cf80867278b833ed3b2c80179a6cae1f",
+    "token_ids_sha256": "a6703bb408b17d44bdc6161aab4d37d1c7948c8cea8fc60079c52eb00df7d33b",
+    "description": "Compact public engineering-note reading/summarisation prompt with diverse real repository prose, no repeated filler or maximum-overlap synthetic construction."
+  },
+  "characterisation": {
+    "label": "Observer-on only; not the latency pair",
+    "selection_records": 36,
+    "union_page_read_fraction_range": [
+      0.12524366471734893,
+      0.20691652188301482
+    ],
+    "comparison": {
+      "label": "Both characterisation arms observer-on; no headline latency claim",
+      "exact_selected_histories": true,
+      "selection_records_control": 36,
+      "selection_records_candidate": 36,
+      "same_device_qsa_attn_envelopes_ms": {
+        "control": {
+          "0": 324.56717210000005,
+          "1": 259.24582290000006,
+          "2": 67.3411837
+        },
+        "candidate": {
+          "0": 1004.6983035000001,
+          "1": 756.2036171999999,
+          "2": 68.12047908
+        }
+      },
+      "warning": "Envelopes include all planner/gather/attention submission work and unchanged inverse V rotation; device clocks/timelines are never added into wall time."
+    },
+    "raw_control_selection": "/home/joshkirklin/strata-workspace/scratch/1cat-218/control-selections.bin",
+    "raw_initial_candidate_selection": "/home/joshkirklin/strata-workspace/scratch/1cat-218/candidate-selections.bin"
+  },
+  "workspace_price": {
+    "new_device_allocations_bytes": 0,
+    "reuse": "Larger of existing selection/decode scratch, exclusively ordered on the owning prefill stream; separate simultaneous stage arenas.",
+    "union_page_limit": 1026,
+    "metadata_bytes_per_group8": 73856,
+    "cached_cells_bytes_per_group8": 6435072,
+    "total_stride_bytes_per_group8": 6508928,
+    "selection_arena_formula": "sel_batch * (owning QSA max_cells / idx_block + 2) * sizeof(float)",
+    "decode_scratch_bytes_per_stage": 26163200,
+    "attention_dynamic_shared_bytes": 55504,
+    "compiled_kernel_resources": [
+      {
+        "arch": "sm_70",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb622prompt_attn_v70_kernelILi3ELb0EEEvPKfNS0_12QsaAttnPoolsEPKiS7_iifPfiNS1_12GroupCache70E:",
+        "resource": "REG:163 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:512 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_70",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb622prompt_attn_v70_kernelILi3ELb1EEEvPKfNS0_12QsaAttnPoolsEPKiS7_iifPfiNS1_12GroupCache70E:",
+        "resource": "REG:246 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:512 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_70",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb620group_pages70_gatherENS0_12QsaAttnPoolsEiNS1_12GroupCache70E:",
+        "resource": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:464 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_70",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb618group_pages70_planEPKiS3_S3_iNS1_12GroupCache70E:",
+        "resource": "REG:28 STACK:0 SHARED:24592 LOCAL:0 CONSTANT[0]:416 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_86",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb622prompt_attn_v70_kernelILi3ELb0EEEvPKfNS0_12QsaAttnPoolsEPKiS7_iifPfiNS1_12GroupCache70E:",
+        "resource": "REG:40 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:512 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_86",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb622prompt_attn_v70_kernelILi3ELb1EEEvPKfNS0_12QsaAttnPoolsEPKiS7_iifPfiNS1_12GroupCache70E:",
+        "resource": "REG:47 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:512 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_86",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb620group_pages70_gatherENS0_12QsaAttnPoolsEiNS1_12GroupCache70E:",
+        "resource": "REG:30 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:464 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      },
+      {
+        "arch": "sm_86",
+        "symbol": "Function _ZN6strata7kernels51_GLOBAL__N__14d7b2d4_18_qsa_prompt_attn_cu_a5983bb618group_pages70_planEPKiS3_S3_iNS1_12GroupCache70E:",
+        "resource": "REG:30 STACK:0 SHARED:24592 LOCAL:0 CONSTANT[0]:416 TEXTURE:0 SURFACE:0 SAMPLER:0"
+      }
+    ],
+    "resolved_prefill_buffers_bytes": {
+      "CUDA0": 1050673152,
+      "CUDA1": 1050673152,
+      "CUDA2": 1050673152
+    },
+    "prefill_buffers_exact_equal": true,
+    "session_and_cache_cuda0_bytes_exact_equal": true,
+    "all_stage_session_state_bytes": {
+      "CUDA0": 1365087744,
+      "CUDA1": 1117358080,
+      "CUDA2": 840210944
+    },
+    "all_stage_expert_cache_admission_grants_bytes": {
+      "CUDA0": 21506867200,
+      "CUDA1": 23096320000,
+      "CUDA2": 10942464000
+    },
+    "all_stage_session_and_expert_cache_grants_exact_equal": true,
+    "expert_residency": "Both fixture arms passed exactly 24576 resident experts; no prompt loans, no resized chunks."
+  },
+  "arithmetic": {
+    "class": "preserving",
+    "implementation": "Unchanged selected-cell/chunk order, q4_0-to-fp16 rounding, separate q/p hi/lo MMA chains and softmax reductions; cache copies only.",
+    "operators": {
+      "ok": true,
+      "count": 37,
+      "devices": [
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b"
+      ],
+      "coverage": [
+        "overlapping and disjoint pages",
+        "17/7/9-query counts",
+        "ragged causal tails",
+        "poisoned unused IDs",
+        "nonresident selected page",
+        "permuted physical pages (4/16/512)",
+        "unsupported page_size1 row fallback",
+        "different request page tables and CUDA streams",
+        "existing selection/top-k and hybrid KV fixtures",
+        "actual selected-history replay"
+      ],
+      "evidence": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/operators.json"
+    },
+    "model": {
+      "ok": true,
+      "rows": [
+        {
+          "position": 5326,
+          "token": 760,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5327,
+          "token": 1379,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5328,
+          "token": 2894,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5329,
+          "token": 18100,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5330,
+          "token": 19662,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5331,
+          "token": 369,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5332,
+          "token": 421,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        },
+        {
+          "position": 5333,
+          "token": 791,
+          "exact_token": true,
+          "exact_full_vocabulary_bits": true
+        }
+      ],
+      "files": {
+        "control": [
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-control.1.5326",
+            "sha256": "d369e2612356816c2e3a22fe6046d3ec1557017067d46e55dbd90aeb8b64fe9a",
+            "vocab": 248320,
+            "rows": 1
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-control.1.5327",
+            "sha256": "74272bfb7f0e476f1d51cdd7d3c8d8a2114015324feee722c15d5b2e2cfea59c",
+            "vocab": 248320,
+            "rows": 2
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-control.1.5329",
+            "sha256": "3be5095c3dc963a20eef6095af69f22f10a6d14fe9fcf187a3fdfb0ab4ce6b5e",
+            "vocab": 248320,
+            "rows": 4
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-control.1.5333",
+            "sha256": "264e0fe8b19ca70accc2cab1c59c8bc8b010d25ed7c732a9c1d15a09efa08693",
+            "vocab": 248320,
+            "rows": 1
+          }
+        ],
+        "candidate": [
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-candidate.1.5326",
+            "sha256": "d369e2612356816c2e3a22fe6046d3ec1557017067d46e55dbd90aeb8b64fe9a",
+            "vocab": 248320,
+            "rows": 1
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-candidate.1.5327",
+            "sha256": "74272bfb7f0e476f1d51cdd7d3c8d8a2114015324feee722c15d5b2e2cfea59c",
+            "vocab": 248320,
+            "rows": 2
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-candidate.1.5329",
+            "sha256": "3be5095c3dc963a20eef6095af69f22f10a6d14fe9fcf187a3fdfb0ab4ce6b5e",
+            "vocab": 248320,
+            "rows": 4
+          },
+          {
+            "path": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/committed-candidate.1.5333",
+            "sha256": "264e0fe8b19ca70accc2cab1c59c8bc8b010d25ed7c732a9c1d15a09efa08693",
+            "vocab": 248320,
+            "rows": 1
+          }
+        ]
+      },
+      "scope": "All eight committed emitted predictor rows on a matched serial diagnostic. This is exact applicable same-prefix evidence, not sampled-distribution or concurrent-slot qualification."
+    }
+  },
+  "actual_selection_microkernel": {
+    "label": "Real selected IDs from layer3 at context4096, Q/K/V synthetic; complete planner/gather/attention cost, not full-model latency.",
+    "queries": 2048,
+    "row_ms": 29.912,
+    "grouped_ms": 73.675,
+    "union_pages_last_group": 810,
+    "cache_enabled": true,
+    "exact_off_on": true,
+    "fp64_max_abs_error": 4.93e-06,
+    "evidence": "/home/joshkirklin/strata-workspace/scratch/1cat-218-v2/operator-gpu0-actual-selection-layer3.log"
+  },
+  "safety": {
+    "reserve_bytes": 8589934592,
+    "memory_max_bytes": 27917287424,
+    "thermal_limit_c": 83,
+    "mps_caps_bytes": [
+      33285996544,
+      33285996544,
+      22548578304
+    ],
+    "control_peaks": {
+      "samples": 30,
+      "mem_available_min_bytes": 48880132096,
+      "cpu_c_max": 75.0,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 51.0,
+          "power_max_w": 151.96
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 56.0,
+          "power_max_w": 201.82
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 50.0,
+          "power_max_w": 168.33
+        }
+      }
+    },
+    "candidate_peaks": {
+      "samples": 30,
+      "mem_available_min_bytes": 49181380608,
+      "cpu_c_max": 73.75,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 52.0,
+          "power_max_w": 156.24
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 57.0,
+          "power_max_w": 157.4
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 51.0,
+          "power_max_w": 130.75
+        }
+      }
+    },
+    "control_end_status": "stopped",
+    "candidate_end_status": "stopped",
+    "failures_control": [],
+    "failures_candidate": []
+  },
+  "donor": {
+    "pin": "be3722bc095b9792bf9833068595f0b1ef70ad37",
+    "pr": "https://github.com/1CatAI/1Cat-vLLM/pull/387",
+    "source": "https://github.com/1CatAI/1Cat-vLLM/blob/be3722bc095b9792bf9833068595f0b1ef70ad37/flash-attention-v100/kernel/flash_decode_paged.cu",
+    "notice": "Independent implementation inspired by the Page4 union/mask concept; no donor source copied. Six-head FP16/E4M3 or donor 8192-token chunks were not imported."
+  },
+  "issue89_reconciliation": "Live closed-stale ticket explicitly reports nothing built/run/changed. Current frozen launch70 is the control; no earlier qualified scheduling patch was assumed.",
+  "held_out": "Not triggered: both primary pairs regress and fail the predeclared >=3% gain gate.",
+  "unmet_required_evidence": [],
+  "limitations": [
+    "No kept optimization and no promotion",
+    "Exact model evidence is eight emitted full-vocabulary predictor rows for this fixed serial prefix, not broad sampled/task quality or whole-state equivalence",
+    "Model concurrency/pipeline qualification not claimed",
+    "HTTP wall is a full response interval, not measured first-token TTFT",
+    "No universal claim against every possible cooperative grouped-query kernel design"
+  ],
+  "rollback": "Leave adopted binary/daily profile unchanged; unset STRATA_PROMPT_GROUP_PAGES or set 0 in experimental binaries. Do not integrate the rejected candidate code.",
+  "commands": {
+    "build": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 218 --purpose \"218 corrective vector copy source964fb772; fresh matched SM70/SM86 build; preserve v1 binary\" --max-s 1800 -- /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/build.sh",
+    "operators": "/home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/queued.py operators /home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/operators.py",
+    "performance_pair": "/home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/queued.py performance /home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/arms.py performance",
+    "serial_pair": "/home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/queued.py serial /home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/arms.py serial",
+    "exact_model_comparison": "/home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/strata-workspace/scratch/1cat-218-v2/compare-serial.py",
+    "queue_receipts": "queue-*.json beneath each evidence root retain the exact window invocation, refusals/grant and raw exit outcomes; no payload ran outside window.py."
+  }
+}
