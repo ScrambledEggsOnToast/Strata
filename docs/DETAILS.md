@@ -370,6 +370,10 @@ and any unsupported MMQ layer reserves the expanded fallback capacity. Admission
 the same `moe_bufs` lifetime calculation. Fused/native-grouped/FP16 and resident-helper products retain
 their existing arithmetic and allocations. HIP/SYCL do not enable the new consumer. CUDA SM86 shares
 the opt-in consumer and requires explicit exact coverage, not an assumed unchanged path.
+Mixed packs with an enabled fused layer keep expanded Xq capacity: that layer's 80-byte/64-value
+activation representation is larger than MMQ's. It is not safe to price the smaller MMQ payload
+and then let the existing fused fallback write into it. `prefill_allocation_test --input-index-off`
+and `--input-index-on` expose the allocation prices for matched MMQ and fused-fallback checks.
 
 `prefill_fused_iq_test --mmq-indexed-only` checks quantized bytes (including padding), complete weighted
 FFN equality, empty/uneven groups, tails, nontrivial output maps, graph replay and isolated streams using

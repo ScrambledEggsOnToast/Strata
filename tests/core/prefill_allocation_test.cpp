@@ -33,7 +33,7 @@ void check(bool ok, const char* what) {
 }
 
 // Run in its own process: the prompt MMQ plan freezes the loaded artifact on first use.
-int native_bounds_regression(int grouping = -1) {
+int native_bounds_regression(int grouping = -1, int input_index = -1) {
     using namespace strata;
     if (!prefill::mmq::built() || !kernels::cpu::native_experts_available()) return 77;
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -64,6 +64,13 @@ int native_bounds_regression(int grouping = -1) {
 #else
     if (setenv("STRATA_PREFILL_MMQ", "1", 1) != 0) return 1;
 #endif
+    if (input_index >= 0) {
+#if defined(_WIN32)
+        if (_putenv_s("STRATA_PREFILL_MMQ_INDEXED", input_index ? "1" : "0") != 0) return 1;
+#else
+        if (setenv("STRATA_PREFILL_MMQ_INDEXED", input_index ? "1" : "0", 1) != 0) return 1;
+#endif
+    }
     if (grouping >= 0) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         return 77;   // the new route deliberately keeps HIP's existing host path
@@ -104,6 +111,12 @@ int native_bounds_regression(int grouping = -1) {
                      grouping, (unsigned long long) full_price, (unsigned long long) payload,
                      (unsigned long long) dynamic);
     }
+    if (input_index >= 0) {
+        const uint64_t price = prefill::Prefill::bytes_needed_from(g, facts, 2048, 8, fmt.bytes, 0, false, false);
+        check(price != UINT64_MAX && price > 0, "indexed/fallback allocation price is available");
+        std::printf("native_input_price indexed=%d chunk=2048 no_fused_layout=1 loanable=%llu\n",
+                    input_index, (unsigned long long) price);
+    }
     return failures ? 1 : 0;
 }
 }  // namespace
@@ -112,6 +125,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--native-bounds") return native_bounds_regression();
     if (argc == 2 && std::string(argv[1]) == "--native-host-grouping") return native_bounds_regression(0);
     if (argc == 2 && std::string(argv[1]) == "--native-device-grouping") return native_bounds_regression(1);
+    if (argc == 2 && std::string(argv[1]) == "--input-index-off") return native_bounds_regression(-1, 0);
+    if (argc == 2 && std::string(argv[1]) == "--input-index-on") return native_bounds_regression(-1, 1);
     using namespace strata;
     core::ModelGeometry g;                       // the artifact's fixed geometry (validated inside)
     kernels::cpu::ExpertLayout experts;          // canonical pack: default max_blob, no native tables

@@ -1112,12 +1112,17 @@ const MmqPlan& mmq_plan() {
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
                 p.fallback = true;
                 // the fused path's buffers (Xq, H) exist for it; a chunk it does not take (a small one) keeps the FP16 path
-                if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
+                if (on && lay.native && fused::native_supported(gt, dt)) {
+                    p.fo[(size_t) l] = 1; p.any = true; p.input_expanded = true;
+                }
                 continue;
             }
             p.layer[(size_t) l] = 1;
             p.any = true;
-            p.input_index[(size_t) l] = index_on && mmq::input_index_supported(gt, N);
+            // The fused 80-byte/64-value activation format is larger than MMQ's 144-byte/128-value
+            // payload. Leave its established full-capacity fallback lifetime alone, including mixed packs.
+            const bool fused_input = lay.native ? fused::native_supported(gt, dt) : fused::enabled();
+            p.input_index[(size_t) l] = index_on && !fused_input && mmq::input_index_supported(gt, N);
             p.input_expanded |= !p.input_index[(size_t) l];
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
