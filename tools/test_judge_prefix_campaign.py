@@ -114,7 +114,7 @@ class PrefixCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "independent"):
             campaign.validate_groups(groups)
         with self.assertRaisesRegex(ValueError, "3000"):
-            campaign.validate_groups(groups[:1200])
+            campaign.validate_groups(self.declared["groups"][:1200])
         wrong_primary = list(self.declared["groups"])
         wrong_primary[0] = {**wrong_primary[0], "primary_branch_id": "not-declared"}
         with self.assertRaisesRegex(ValueError, "preselected"):

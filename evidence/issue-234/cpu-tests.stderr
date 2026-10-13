@@ -1,0 +1,38 @@
+test_both_readout_families_and_complete_group_denominator (test_judge_reference.ReferenceTests.test_both_readout_families_and_complete_group_denominator) ... ok
+test_branch_call_uses_exact_full_token_common_prefix (test_judge_reference.ReferenceTests.test_branch_call_uses_exact_full_token_common_prefix) ... ok
+test_frozen_prompt_arguments_and_no_effort_reconstruction (test_judge_reference.ReferenceTests.test_frozen_prompt_arguments_and_no_effort_reconstruction) ... ok
+test_missing_human_corpus_and_mutated_freeze_are_refused (test_judge_reference.ReferenceTests.test_missing_human_corpus_and_mutated_freeze_are_refused) ... ok
+test_no_unprotected_capture (test_judge_reference.ReferenceTests.test_no_unprotected_capture) ... ok
+test_readout_requires_position_n_and_complete_ordered_vector (test_judge_reference.ReferenceTests.test_readout_requires_position_n_and_complete_ordered_vector) ... ok
+test_reused_readout_requires_restoration_and_call_timing (test_judge_reference.ReferenceTests.test_reused_readout_requires_restoration_and_call_timing) ... ok
+test_semantic_failure_stops_without_family_selection (test_judge_reference.ReferenceTests.test_semantic_failure_stops_without_family_selection) ... ok
+test_serial_changes_are_recorded_and_daily_not_mutated (test_judge_reference.ReferenceTests.test_serial_changes_are_recorded_and_daily_not_mutated) ... ok
+test_template_fallback_refused (test_judge_reference.ReferenceTests.test_template_fallback_refused) ... ok
+test_argmax_primary_failures_reject_even_when_all_row_magnitudes_pass (test_judge_prefix_campaign.PrefixCampaignTests.test_argmax_primary_failures_reject_even_when_all_row_magnitudes_pass) ... ok
+test_complete_fixture_matrix_and_fresh_control (test_judge_prefix_campaign.PrefixCampaignTests.test_complete_fixture_matrix_and_fresh_control) ... ok
+test_exact_one_sided_bound_and_primary_boundary (test_judge_prefix_campaign.PrefixCampaignTests.test_exact_one_sided_bound_and_primary_boundary) ... ok
+test_fresh_control_failure_is_not_reuse_evidence (test_judge_prefix_campaign.PrefixCampaignTests.test_fresh_control_failure_is_not_reuse_evidence) ... ok
+test_missing_and_duplicate_rows_do_not_shrink_denominator (test_judge_prefix_campaign.PrefixCampaignTests.test_missing_and_duplicate_rows_do_not_shrink_denominator) ... ok
+test_no_synthetic_declaration_or_missing_corpus (test_judge_prefix_campaign.PrefixCampaignTests.test_no_synthetic_declaration_or_missing_corpus) ... ok
+test_nonprimary_row_hard_gate_cannot_hide_behind_primary_pass (test_judge_prefix_campaign.PrefixCampaignTests.test_nonprimary_row_hard_gate_cannot_hide_behind_primary_pass) ... ok
+test_reuse_missing_state_position_finite_or_identity_is_blocked (test_judge_prefix_campaign.PrefixCampaignTests.test_reuse_missing_state_position_finite_or_identity_is_blocked) ... ok
+test_source_variants_cannot_count_as_independent_groups (test_judge_prefix_campaign.PrefixCampaignTests.test_source_variants_cannot_count_as_independent_groups) ... FAIL
+test_timing_load_and_pre_outcome_freeze_are_required (test_judge_prefix_campaign.PrefixCampaignTests.test_timing_load_and_pre_outcome_freeze_are_required) ... ok
+
+======================================================================
+FAIL: test_source_variants_cannot_count_as_independent_groups (test_judge_prefix_campaign.PrefixCampaignTests.test_source_variants_cannot_count_as_independent_groups)
+----------------------------------------------------------------------
+ValueError: duplicate group/source hash cannot count as an independent source
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/joshkirklin/strata-workspace/worktrees/judge-234/tools/test_judge_prefix_campaign.py", line 116, in test_source_variants_cannot_count_as_independent_groups
+    with self.assertRaisesRegex(ValueError, "3000"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: "3000" does not match "duplicate group/source hash cannot count as an independent source"
+
+----------------------------------------------------------------------
+Ran 20 tests in 2.909s
+
+FAILED (failures=1)

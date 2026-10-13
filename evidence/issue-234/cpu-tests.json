@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "evidence_scope": "CPU validation only, not restoration or numerical qualification",
+  "argv": [
+    "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python",
+    "-m",
+    "unittest",
+    "-v",
+    "test_judge_reference",
+    "test_judge_prefix_campaign"
+  ],
+  "cwd": "/home/joshkirklin/strata-workspace/worktrees/judge-234/tools",
+  "exit_code": 1,
+  "elapsed_s": 3.168404661002569,
+  "source_commit": "1b38d40d"
+}
