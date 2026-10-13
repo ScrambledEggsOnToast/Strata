@@ -804,7 +804,7 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
-    bool borrowed = false;
+    bool borrowed = false, initialized = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     core::OperationCanary canary;
@@ -1167,6 +1167,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
     Impl& m = *impl_;
+    m.initialized = false;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.original_ss = &ss;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
@@ -1311,7 +1312,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
-    return m.canary.init(err);
+    m.initialized = m.canary.init(err);
+    return m.initialized;
 }
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
@@ -1507,7 +1509,7 @@ bool Prefill::validate_rebind(const core::SessionState& ss, void* stream, uint64
     if (!request && &ss != m.original_ss) {
         err = "prefill: non-generation rebind requires a nonzero request canary"; return false;
     }
-    if (!m.ss || !m.g || m.device < 0 || m.borrowed || stream != m.cs ||
+    if (!m.initialized || !m.ss || !m.g || m.device < 0 || m.borrowed || stream != m.cs ||
         ss.allocation_device != m.device || !ss.allocation_id || ss.k != m.ss->k ||
         ss.layer_lo != stage_lb_ || ss.layer_hi != stage_le_ || ss.max_cells <= 0 ||
         ss.gdn_alloc != m.ss->gdn_alloc || ss.gdn_ord0 != m.ss->gdn_ord0 ||
