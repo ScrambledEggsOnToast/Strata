@@ -74,11 +74,17 @@ __device__ bool qsa_narrow_pivot(const float* scores, int64_t n_kv, int64_t n_bi
     }
     if (invalid) atomicExch(&s.invalid, 1);
     __syncthreads();
-    if (s.invalid) return false;  // NaNs use exactly the existing key-zero rule.
+    // Finish every shared decision read before the fallback reuses this union
+    // as 32 per-warp histograms, including the words holding these flags.
+    const bool invalid_row = s.invalid != 0;
+    __syncthreads();
+    if (invalid_row) return false;  // exactly the existing key-zero NaN rule
     qsa_narrow_choose_bin(s);
     // There is at most one partial block: ceil(cells / 4) is the exact block
     // count in this bucket. Never gather a bucket larger than the scratch.
-    if ((s.bucket_cells + R - 1) / R > QSA_NARROW_CAP) return false;
+    const bool overflow = (s.bucket_cells + R - 1) / R > QSA_NARROW_CAP;
+    __syncthreads();
+    if (overflow) return false;
     const int coarse_bin = s.bin;
     if (tx == 0) s.count = 0;
     __syncthreads();

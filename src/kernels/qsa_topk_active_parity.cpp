@@ -34,6 +34,9 @@ float score_value(int mode, int64_t j, float random) {
     if (mode == 7) return j % 2 ? 100.f + float(j % 31) * 0.00001f : 0.1f;  // overflow, diverse probe
     if (mode == 8) return std::exp2(random * (12.f / 200.f));
     if (mode == 9) return j % 53 == 0 ? (j % 3 ? 4000.f : 4096.f) : std::exp2(random * (11.f / 200.f));
+    // A NaN outside every probe tile must be found by the complete coarse scan.
+    if (mode == 10) return j == 10007 ? std::numeric_limits<float>::quiet_NaN() :
+                                      std::exp2(random * (12.f / 200.f));
     return random;
 }
 bool check(Case c) {
@@ -250,6 +253,7 @@ int main(int argc, char** argv) {
         {131072, 4, 8}, {131104, 32, 8}, {131105, 33, 8},
         {131075, 1, 9}, {262143, 4, 9}, {131075, 1, 5}, {262143, 4, 5},
         {131075, 1, 6}, {131075, 1, 7}, {262143, 4, 7},
+        {131075, 1, 10}, {262143, 4, 10},
     };
     for (const auto c : cases) if (!check(c)) return 1;
     if (!graph_check()) return 1;
