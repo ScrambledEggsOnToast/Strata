@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "half": "b",
+  "disposition": "blocked",
+  "blocking_issue": 224,
+  "reason": "Issue 224 has not frozen the 200 development source-state groups with genuinely independent human labels. Those labels cannot be manufactured by an agent. Easy anchors and pre-outcome screen gates must also be frozen with that corpus before candidate outcomes.",
+  "required_families": ["direct_letter_logits", "per_option_yes_no_log_odds"],
+  "required_development_groups": 200,
+  "screen_run": false,
+  "development_screen_result": null,
+  "family_selection": null,
+  "semantic_go_no_go": null,
+  "ready_implementation": {
+    "source": "tools/judge_reference.py",
+    "prepare_command": "python tools/judge_reference.py prepare-screen --shared-root PROJECT_ROOT --bundle-set PINNED_RAW_FAMILY_BUNDLES.json --corpus ISSUE_224_FROZEN_DEVELOPMENT.json --out screen-jobs.json",
+    "capture_seam": "capture(profile, compiled_request, unique_output_dir, check_safety, model_identity): token-only, fresh serial reference; every branch in a separately authorised bounded machine window",
+    "evaluate_command": "python tools/judge_reference.py screen --shared-root PROJECT_ROOT --bundle-set PINNED_RAW_FAMILY_BUNDLES.json --corpus ISSUE_224_FROZEN_DEVELOPMENT.json --jobs screen-jobs.json --receipts REFERENCE_RECEIPT_DIRECTORY --out development-screen.json",
+    "shared_authority": "All semantic prompt compilation and option-logit combination use issue 223's normalize_request, compile_request and score_call. Engine capture remains token-only; no duplicate serving/evaluation readout method.",
+    "denominator_policy": "All 200 independent groups and every item, declared option, yes/no pair and easy anchor are required. No inner join or partial family result.",
+    "failure_policy": "If neither family passes the corpus's predeclared gates, stop_program=true, family_selection=null, disposition=reject and exit status 1. No calibration or temperature repair is attempted."
+  },
+  "evidence_boundary": "CPU test fixtures and source-authored arithmetic/read-position/coverage probes are not issue-224 gold, not the 200-group semantic screen, and not grounds for a family selection.",
+  "not_authorised_or_done": ["manufacture gold labels", "invent development groups", "calibration", "held-out evaluation", "new quantization", "daily model/profile/release-manifest promotion", "deployment"]
+}

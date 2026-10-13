@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "test": "real shared method + retained-model identity negative",
+  "disposition": "failed",
+  "command": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python tools/test_judge_reference_shared.py --shared-root /home/joshkirklin/.omp/wt/t5961d0568/m --out evidence/issue-231/shared-method-cpu-test-2.json",
+  "failure": "tools.judge_scoring.IntegrityError: executable tokenizer, renderer, scorer or runtime skew",
+  "failed_before": "ref.screen_jobs -> scoring.compile_request:521 -> bundle.ensure_integrity:326, before the retained-model-skew negative was exercised",
+  "owner_notified": "JudgeSharedCompiler (issue 223)",
+  "previous_exercised_run": "shared-method-cpu-test.json passed on its recorded source digest",
+  "evidence_boundary": "Synthetic CPU fixtures, no engine/model/GPU calls, not a semantic screen. No guard is relaxed and the failure is not relabelled as a passing result."
+}

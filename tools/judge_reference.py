@@ -210,7 +210,8 @@ def capture(profile, request, output_dir, check_safety=None, model_identity=None
             raise ValueError("generation channel was emitted during no-decode capture")
         receipt = {**result, "branch_identity": {"id": request["branch_id"], "token_digest": request["token_digest"]},
                    "token_digest": request["token_digest"], "engine_incarnation": incarnation,
-                   "source": source, "binary": {"path": profile["binary"], "sha256": binary_hash},
+                   "source": {**source, "model": profile["name"]},
+                   "binary": {"path": profile["binary"], "sha256": binary_hash},
                    "profile_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
                    "model_identity": model_identity,
                    "environment": {key: value for key, value in environment.items()
@@ -245,8 +246,7 @@ def validate_corpus(corpus):
         raise ValueError("independent human label provenance and pre-outcome freeze binding required")
     if corpus["freeze_sha256"] != corpus_digest(corpus):
         raise ValueError("development corpus or predeclared gates changed after freeze")
-    groups = corpus.get("groups")
-    anchors = corpus.get("easy_anchors")
+    groups, anchors = corpus.get("groups"), corpus.get("easy_anchors")
     if not isinstance(groups, list) or len(groups) != 200 or len({g["group_id"] for g in groups}) != 200:
         raise ValueError("the full 200 independent development groups are required")
     if not isinstance(anchors, list) or not anchors:
@@ -255,48 +255,78 @@ def validate_corpus(corpus):
     if any(type(gate.get(k)) not in (int, float) or not 0 <= gate[k] <= 1 for k in
            ("minimum_group_accuracy", "minimum_anchor_accuracy")):
         raise ValueError("accuracy gates must be frozen before candidate outcomes")
-    if any(not isinstance(g.get("group_id"), str) or not g["group_id"] or g["group_id"] == "easy_anchor" for g in groups):
-        raise ValueError("independent group identities must be explicit and nonreserved")
     items = []
     for group in groups:
+        if not isinstance(group["group_id"], str) or not group["group_id"] or group["group_id"] == "easy_anchor":
+            raise ValueError("independent group identities must be explicit and nonreserved")
         if not isinstance(group.get("items"), list) or not group["items"]:
             raise ValueError("each source-state group must contain its complete typed items")
         items += [(group["group_id"], item) for item in group["items"]]
     items += [("easy_anchor", item) for item in anchors]
     if len({item["id"] for _, item in items}) != len(items):
         raise ValueError("duplicate branch identity")
-    for _, item in items:
-        options = item.get("options")
-        if not isinstance(options, list) or not 2 <= len(options) <= 26 or any(
-                not isinstance(o, dict) or not isinstance(o.get("text"), str) or not isinstance(o.get("id"), str)
-                for o in options) or len({o["id"] for o in options}) != len(options):
-            raise ValueError("complete unique declared options required")
-        if item.get("gold_option_id") not in {o["id"] for o in options}:
-            raise ValueError("missing independent gold option; no inner-join denominator shrink")
-        if not isinstance(item.get("messages"), list):
-            raise ValueError("explicit item messages required")
+    for group, item in items:
+        if (set(item) != {"schema_version", "id", "group_id", "request", "gold"} or
+                item["schema_version"] != 1 or item["group_id"] != group or
+                not isinstance(item["id"], str) or not item["id"] or
+                not isinstance(item["request"], dict) or not isinstance(item["gold"], dict)):
+            raise ValueError("shared evaluator's complete typed request/gold case is required")
     return items
 
 
-def screen_jobs(corpus, compiler):
+def screen_jobs(corpus, scoring, bundles):
+    """Compile through #223's sole method; this module does not author screen prompts."""
     jobs = []
-    for group, item in validate_corpus(corpus):
-        options = item["options"]
-        letters = [chr(65 + i) for i in range(len(options))]
-        listing = "\n".join(f"{letter}. {option['text']}" for letter, option in zip(letters, options))
-        direct = item["messages"] + [{"role": "user", "content":
-            "Choose the correct option. Reply with only its letter.\n" + listing}]
-        job = compiler.compile(item["id"] + ":direct", direct, [compiler.single_token(c) for c in letters])
-        jobs.append({**job, "family": FAMILIES[0], "group_id": group, "item_id": item["id"],
-                     "option_ids": [o["id"] for o in options]})
-        yes_no = [compiler.single_token(text) for text in ("Yes", "No")]
-        for option in options:
-            messages = item["messages"] + [{"role": "user", "content":
-                "Is the following option the correct answer? Reply only Yes or No.\n" + option["text"]}]
-            job = compiler.compile(item["id"] + ":yes_no:" + option["id"], messages, yes_no)
-            jobs.append({**job, "family": FAMILIES[1], "group_id": group, "item_id": item["id"],
-                         "option_id": option["id"]})
+    for family in FAMILIES:
+        bundle = bundles[family]
+        if bundle.identity["readout_family"] != family or bundle.temperature != 1.0:
+            raise ValueError("the categorical screen needs both pinned raw T=1 readout families")
+        for group, item in validate_corpus(corpus):
+            normalized = scoring.normalize_request(bundle, item["request"])
+            compiled = scoring.compile_request(bundle, normalized)
+            if set(item["gold"]) != {q.question.id for q in compiled.questions}:
+                raise ValueError("gold must cover every typed question, never an inner join")
+            for question in compiled.questions:
+                options = [o.id for o in question.question.options]
+                if item["gold"][question.question.id] not in options:
+                    raise ValueError("independent gold is outside the complete declared option set")
+                for plan in question.plans:
+                    branch = hashlib.sha256(json.dumps(
+                        [family, item["id"], plan.branch_id, plan.plan_sha256]).encode()).hexdigest()
+                    jobs.append({"schema_version": 1, "branch_id": branch, "family": family,
+                        "group_id": group, "item_id": item["id"], "question_id": question.question.id,
+                        "option_ids": options, "plan_branch_id": plan.branch_id,
+                        "plan_sha256": plan.plan_sha256, "bundle_sha256": compiled.bundle_sha256,
+                        "rendered_prompt": plan.prompt, "literal_spans": [list(span) for span in plan.literal_spans],
+                        "prompt_token_ids": list(plan.prompt_token_ids),
+                        "selected_token_ids": list(plan.selected_token_ids),
+                        "token_digest": token_digest(plan.prompt_token_ids),
+                        "prompt_contract": {"template_sha256": bundle.identity["artifact_sha256"]["chat_template"],
+                            "enable_thinking": False, "add_generation_prompt": True, "reasoning_effort_injection": False,
+                            "effort_at_end": False, "template_fallback": False}})
     return jobs
+
+def load_screen_method(shared_root, bundle_set):
+    import importlib
+    root = Path(shared_root).resolve()
+    source = root / "tools/judge_scoring.py"
+    if bundle_set.get("schema_version") != 1 or digest(source) != bundle_set.get("shared_code_sha256"):
+        raise ValueError("shared scoring implementation differs from the external pin")
+    sys.path.insert(0, str(root))
+    scoring = importlib.import_module("tools.judge_scoring")
+    if Path(scoring.__file__).resolve() != source:
+        raise ValueError("a different shared compiler is already imported")
+    declarations = bundle_set.get("families", {})
+    if set(declarations) != set(FAMILIES):
+        raise ValueError("both complete pinned family bundles are required")
+    bundles = {family: scoring.load_scoring_bundle(declarations[family]["path"],
+               expected_sha256=declarations[family]["sha256"]) for family in FAMILIES}
+    for bundle in bundles.values():
+        if (bundle.temperature != 1.0 or bundle.identity["artifact_sha256"]["chat_template"] !=
+                "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"):
+            raise ValueError("screen requires raw T=1 and the frozen IQ3_S pack template")
+    return scoring, bundles
+
 
 
 def softmax(values):
@@ -306,27 +336,11 @@ def softmax(values):
     return [value / denominator for value in masses]
 
 
-def evaluate_screen(corpus, jobs, receipts):
+def evaluate_screen(corpus, jobs, receipts, scoring, bundles):
     items = validate_corpus(corpus)
-    by_job = {job["branch_id"]: job for job in jobs}
-    expected = set()
-    for group, item in items:
-        direct_key = item["id"] + ":direct"
-        expected.add(direct_key)
-        direct = by_job.get(direct_key, {})
-        if (direct.get("family") != FAMILIES[0] or direct.get("group_id") != group or
-                direct.get("option_ids") != [o["id"] for o in item["options"]] or
-                len(direct.get("selected_token_ids", [])) != len(item["options"])):
-            raise ValueError("incomplete or reordered direct-letter declared-option vector")
-        for option in item["options"]:
-            key = item["id"] + ":yes_no:" + option["id"]
-            expected.add(key)
-            job = by_job.get(key, {})
-            if (job.get("family") != FAMILIES[1] or job.get("group_id") != group or
-                    job.get("option_id") != option["id"] or len(job.get("selected_token_ids", [])) != 2):
-                raise ValueError("missing declared option's complete yes/no pair")
-    if set(by_job) != expected or len(by_job) != len(jobs):
-        raise ValueError("missing, extra or duplicate development jobs")
+    # Recompile via the same shared method before accepting retained branches.
+    if jobs != screen_jobs(corpus, scoring, bundles):
+        raise ValueError("missing, reordered or mutated shared declared-option token plans")
     by_branch = {}
     for receipt in receipts:
         key = receipt["branch_identity"]["id"]
@@ -335,34 +349,49 @@ def evaluate_screen(corpus, jobs, receipts):
         by_branch[key] = receipt
     if set(by_branch) != {job["branch_id"] for job in jobs}:
         raise ValueError("missing or extra branches: full screen denominator required")
-    values = {}
     for job in jobs:
         receipt = by_branch[job["branch_id"]]
         validate_readout(receipt, job)
-        if receipt["token_digest"] != job["token_digest"] or not receipt.get("engine_incarnation") or not receipt.get("source"):
+        if (receipt["token_digest"] != job["token_digest"] or
+                receipt["branch_identity"].get("token_digest") != job["token_digest"] or
+                not receipt.get("engine_incarnation") or not receipt.get("source")):
             raise ValueError("unbound reference receipt")
-        if (receipt["branch_identity"].get("token_digest") != job["token_digest"] or
-                token_digest(job["prompt_token_ids"]) != job["token_digest"]):
-            raise ValueError("branch token digest mismatch")
-        values[job["branch_id"]] = receipt["logits"]
     families = {}
     for family in FAMILIES:
-        outcomes = []
-        grouped = {}
+        outcomes, grouped = [], {}
         for group, item in items:
-            if family == FAMILIES[0]:
-                logits = values[item["id"] + ":direct"]
-            else:
-                pairs = [values[item["id"] + ":yes_no:" + option["id"]] for option in item["options"]]
-                logits = [yes - no for yes, no in pairs]
-            probabilities = softmax(logits)
-            best = max(probabilities)
-            tied = sum(p == best for p in probabilities) != 1
-            selected = None if tied else item["options"][probabilities.index(best)]["id"]
-            correct = selected == item["gold_option_id"]
-            outcomes.append({"group_id": group, "item_id": item["id"], "probabilities": probabilities,
-                             "selected_option_id": selected, "gold_option_id": item["gold_option_id"], "correct": correct})
-            grouped.setdefault(group, []).append(correct)
+            table = {job["plan_sha256"]: job for job in jobs
+                     if job["family"] == family and job["item_id"] == item["id"]}
+            used = set()
+            class RetainedReference:
+                def validate_identity(self, identity):
+                    for job in table.values():
+                        receipt = by_branch[job["branch_id"]]
+                        if (receipt["source"].get("model") != identity["model"] or
+                                job["bundle_sha256"] != identity["bundle_sha256"]):
+                            raise ValueError("retained source/model or shared bundle identity mismatch")
+                def score(self, plan):
+                    if plan.plan_sha256 not in table or plan.plan_sha256 in used:
+                        raise ValueError("missing or duplicate canonical shared branch")
+                    job = table[plan.plan_sha256]
+                    used.add(plan.plan_sha256)
+                    receipt = by_branch[job["branch_id"]]
+                    return scoring.LogitRow(plan.plan_sha256, len(plan.prompt_token_ids),
+                        plan.selected_token_ids, tuple(receipt["logits"]), 0)
+            # Gold stays outside the shared compiler/backend. Only score_call
+            # combines direct logits or yes/no odds and normalises the options.
+            call = scoring.score_call(bundles[family], item["request"], RetainedReference())
+            if used != set(table):
+                raise ValueError("unused reference branches cannot disappear from the denominator")
+            for question, readout in zip(call.compiled.questions, call.readouts):
+                qid = question.question.id
+                tied = sum(p == max(readout.probabilities) for p in readout.probabilities) != 1
+                correct = not tied and readout.selected_id == item["gold"][qid]
+                outcomes.append({"group_id": group, "item_id": item["id"], "question_id": qid,
+                    "option_ids": list(readout.option_ids), "probabilities": list(readout.probabilities),
+                    "selected_option_id": readout.selected_id, "gold_option_id": item["gold"][qid],
+                    "correct": correct, "tied": tied})
+                grouped.setdefault(group, []).append(correct)
         anchor_accuracy = sum(grouped["easy_anchor"]) / len(grouped["easy_anchor"])
         group_accuracy = sum(all(values) for group, values in grouped.items() if group != "easy_anchor") / 200
         passed = (anchor_accuracy >= corpus["gate"]["minimum_anchor_accuracy"] and
@@ -373,7 +402,8 @@ def evaluate_screen(corpus, jobs, receipts):
     selected = max(passed, key=lambda f: (families[f]["group_accuracy"], families[f]["anchor_accuracy"], -FAMILIES.index(f))) if passed else None
     return {"schema_version": 1, "disposition": "keep" if selected else "reject", "family_selection": selected,
             "stop_program": not bool(selected), "corpus_freeze_sha256": corpus["freeze_sha256"], "families": families,
-            "calibration": "not applied; categorical-order gate only"}
+            "shared_bundles": {family: bundles[family].identity for family in FAMILIES},
+            "calibration": "not applied; categorical-order gate only (pinned T=1)"}
 
 
 def main():
@@ -393,10 +423,13 @@ def main():
     p.add_argument("--request", required=True, help="already compiled request (never retokenized)")
     p.add_argument("--out-dir", required=True)
     p = commands.add_parser("prepare-screen")
-    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--shared-root", required=True)
+    p.add_argument("--bundle-set", required=True)
     p.add_argument("--corpus", required=True)
     p.add_argument("--out", required=True)
     p = commands.add_parser("screen")
+    p.add_argument("--shared-root", required=True)
+    p.add_argument("--bundle-set", required=True)
     p.add_argument("--corpus", required=True)
     p.add_argument("--jobs", required=True)
     p.add_argument("--receipts", required=True, help="directory containing reference receipt.json files")
@@ -413,9 +446,12 @@ def main():
     elif args.command == "capture":
         capture(load(args.profile), load(args.request), args.out_dir)
     elif args.command == "prepare-screen":
-        save(args.out, screen_jobs(load(args.corpus), PromptCompiler(args.tokenizer)))
+        scoring, bundles = load_screen_method(args.shared_root, load(args.bundle_set))
+        save(args.out, screen_jobs(load(args.corpus), scoring, bundles))
     else:
-        result = evaluate_screen(load(args.corpus), load(args.jobs), [load(path) for path in Path(args.receipts).rglob("receipt.json")])
+        scoring, bundles = load_screen_method(args.shared_root, load(args.bundle_set))
+        result = evaluate_screen(load(args.corpus), load(args.jobs),
+            [load(path) for path in Path(args.receipts).rglob("receipt.json")], scoring, bundles)
         save(args.out, result)
         return 0 if result["disposition"] == "keep" else 1
     return 0

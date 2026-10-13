@@ -1693,17 +1693,26 @@ The CPU-only `prepare-screen` and `screen` commands cover all 200 independently
 human-labelled issue-224 development groups and their predeclared easy anchors.
 The corpus schema is version 1, `issue=224`, `fold=development`,
 `label_provenance=independent_human`, with `groups` (`group_id`, complete `items`)
-and `easy_anchors`. Each item has unique `id`, text-only `messages`, ordered
-`options` (`id`, `text`), and independent `gold_option_id`. `gate` fixes
+and `easy_anchors`. Items use #223's shared evaluator schema: `schema_version=1`,
+unique `id`, matching `group_id`, native typed `request` (`state`, `questions`,
+optional `model`) and `gold` mapping every question to its exact option ID. Gold
+never crosses the shared compiler or backend seam. `gate` fixes
 `minimum_group_accuracy` and `minimum_anchor_accuracy` before outcomes;
 `freeze_sha256` is SHA-256 of canonical sorted UTF-8 JSON excluding that field
 (compact separators, non-ASCII preserved). No thresholds are guessed.
 
-Both `direct_letter_logits` and `per_option_yes_no_log_odds` are prepared using
-the same prompt contract. The second reads Yes/No for every option and applies
-softmax to `yes_logit-no_logit` across the complete option set. Capture each
-prepared branch under its own bounded authorised window. `screen --corpus
-CORPUS --jobs JOBS --receipts DIRECTORY --out RESULT` rejects any missing,
+Both `direct_letter_logits` and `per_option_yes_no_log_odds` use the sole shared
+method in the project tools: `normalize_request`, `compile_request`, and
+`score_call`. This engine tool neither authors alternative screen prompts nor
+combines option logits. Give both commands `--shared-root PROJECT_ROOT
+--bundle-set PINNED_SET.json`. The set has `schema_version=1`,
+`shared_code_sha256` for `tools/judge_scoring.py`, and `families` mapping both
+family names to bundle `path`/`sha256`. Each externally pinned bundle must use
+the frozen pack template and raw `temperature=1`; no calibration is introduced.
+The shared method reads Yes/No labels for every option and normalises the
+complete log-odds vector. Capture each prepared branch under its own bounded
+authorised window. `screen --shared-root ROOT --bundle-set SET --corpus CORPUS
+--jobs JOBS --receipts DIRECTORY --out RESULT` rejects any missing,
 duplicate, reordered, extra or unbound branch rather than shrinking the
 denominator. A source group is correct only if all its items are correct; ties
 are incorrect. It records both families and selects a passing family by group

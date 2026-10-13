@@ -1,0 +1,7 @@
+strata generate: memory guard: limit 62.7 GiB (source: meminfo), current 15.2 GiB, reclaimable cache credited 0.0 GiB; available 47.5 GiB (MemAvailable 47.5 GiB), floor 2560 MiB
+strata generate: MPS client ceiling declared: 3 device(s), pipe /tmp/s231-528133
+strata generate: MPS device 0: cap 33285996544 B, uuid GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21
+strata generate: MPS device 1: cap 33285996544 B, uuid GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331
+strata generate: MPS device 2: cap 22548578304 B, uuid GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b
+strata generate: layer split across 3 GPUs: CUDA0, then CUDA1,2 (split 20,39)
+strata generate: MPS daemon returned an unreadable or zero device memory limit

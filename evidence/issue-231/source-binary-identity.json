@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "branch": "judge/231-readout-reference",
+  "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "upstream_base_donor_commit": "a0116b2782a5b82622358c04a06496485d12b2d6",
+  "implementation_commit": "4d24c59954053c7ebbaea6209c153cbc30092467",
+  "source_authorship": "New reference extraction and screen tooling on the adopted tree; no separate donor patch",
+  "tracked_delta_from_base_sha256": "5f5ccac76b553c460a7dbaf0bf44dbcebcafe84a9da5441386bee193d81d3993",
+  "files_sha256": {
+    "CMakeLists.txt": "0ecedda36fe023aa01f8bde2ca119f43de84db196b451034d06f268f62f83203",
+    "src/program/generate.cpp": "c6fb9d36057de337f7e2a48508e999226494e433fb86307935eab41fe380a934",
+    "include/strata/program/readout_reference.hpp": "026530037bd0f314f5eb6e4e40a6b5053a26849170740cfaa7bde2071d535849",
+    "tests/program/readout_reference_test.cpp": "7464e0743e37192e272b604abf344621e2b4768eeb713146c923688cd283acea",
+    "tools/judge_reference.py": "a4fa0c28664b7feb34dd27ee2ac1f620d4ed6d70805aaa468af13110e2d63c0a",
+    "tools/test_judge_reference.py": "fa5f7f5672f6d678d5f91f4311229d05da1feb4510afc38f1b9e62c75de7d795",
+    "docs/DETAILS.md": "8cb92c86b09deb7efc9e2df0913c3820bd2f3e07dc29e6cc74129580d4d36f59"
+  },
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-231-build/strata",
+    "sha256": "1e9aec92a40b9c0c523ac5d07b7baf74baa36b47ff782a60d5a7fd6981b34e86"
+  },
+  "gpu_configuration": "serial_solo / fresh; not the daily geometry"
+}

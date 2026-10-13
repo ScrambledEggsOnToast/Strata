@@ -114,6 +114,24 @@ def run(args):
                 subprocess.run([host.CONTROL, "-d"], env=os.environ, stdout=log, stderr=subprocess.STDOUT,
                                check=True, timeout=30)
             mps = True
+            def control(text, timeout=5):
+                return subprocess.run([host.CONTROL], input=text + "\n", text=True, env=os.environ,
+                                      capture_output=True, timeout=timeout, check=False)
+            # Match host.py: inherited client hints alone do not declare the
+            # daemon's default limits, which the engine independently verifies.
+            daemon_deadline = time.monotonic() + 20
+            while control("get_server_list").stderr.strip():
+                safety()
+                if time.monotonic() >= daemon_deadline:
+                    raise RuntimeError("owned MPS daemon did not come up")
+                time.sleep(0.5)
+            for ordinal, cap in enumerate(profile["mps_caps_bytes"]):
+                applied = control(f"set_default_device_pinned_mem_limit {ordinal} {cap // 2**20}M")
+                if applied.returncode or applied.stderr.strip():
+                    raise RuntimeError(f"owned MPS declaration refused for device {ordinal}: {applied.stderr}")
+            server = control("start_server", timeout=10)
+            if server.returncode or server.stderr.strip():
+                raise RuntimeError("owned MPS start_server refused: " + server.stderr)
             for request in ref.load(args.fixtures)["requests"]:
                 safety()
                 receipt = ref.capture(profile, request, out / request["branch_id"], check_safety=safety, model_identity=model)
