@@ -25,7 +25,7 @@ class ControlCancelTest(unittest.TestCase):
         eng.progress = None
         eng.prefill_tok_s_mean = None
         eng._last_done = None
-        eng._parse_done = lambda line: None
+        eng._parse_done = lambda line, slot=None: None
         return eng
 
     def test_stop_during_prompt_read(self):

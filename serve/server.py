@@ -1333,7 +1333,7 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
-    def _parse_done(self, line):
+    def _parse_done(self, line, slot=None):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
@@ -1347,6 +1347,7 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        self.last["legs"] = [_native_leg("admission" if slot is not None else "solo", self.last, slot)]
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1521,7 +1522,7 @@ class StrataEngine:
                     stopped = True
                 yield None
             elif line.startswith("DONE"):
-                self._parse_done(line)
+                self._parse_done(line, slot=slot)
                 self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
@@ -1578,7 +1579,7 @@ class StrataEngine:
                 fields = line.split()
                 self._yielded = (int(fields[1]), int(fields[2]))
             if line.startswith("DONE"):
-                self._parse_done(line)
+                self._parse_done(line, slot=slot)
             if line.startswith(("ERR", "REJECT")):
                 raise self._silent("engine refused while draining: " + line.strip())
             if line.startswith(until):
@@ -1586,10 +1587,15 @@ class StrataEngine:
         raise self._silent(f"the engine did not acknowledge {until} within {timeout:g} s")
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """`BDONE <slot> <produced> <finish> <ms> [draft_accepted=N draft_offered=N]` for this slot's request."""
         if len(f) >= 5 and isinstance(self.last, dict):
+            admission = _native_leg("admission", self.last, int(f[1]))
+            counters = dict(field.split("=", 1) for field in f[5:] if "=" in field)
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated"),
+                         "drafts_accepted": int(counters["draft_accepted"]) if "draft_accepted" in counters else None,
+                         "drafts_offered": int(counters["draft_offered"]) if "draft_offered" in counters else None}
+            self.last["legs"] = [{**_native_leg("batch", self.last, int(f[1])), "admission": admission}]
 
     def _bdone_after_eos(self, slot: int, owner, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -1655,6 +1661,7 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     tail = []
             if line.startswith("BDONE "):
+                self._apply_bdone(line.split())
                 if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                     tail = []
                 break
@@ -2179,40 +2186,43 @@ class StrataEngine:
                     if bd is not None:
                         self._apply_bdone(bd.split())
                         bdone_in = True
-                if reused0 is not None and isinstance(self.last, dict):
-                    self.last = {**self.last, "reused": reused0}
-                if carry and isinstance(self.last, dict):
-                    self.last = add_carry(carry, self.last)
                 if holding:
                     self.ctl.release()
                 if admit_wait:
                     with self.slot_cv:
                         self.admitting = max(0, self.admitting - 1)
-            if reserved is not None:
-                with self.slot_cv:
-                    slot_busy[reserved] = False
-                    slot_claims.discard(reserved)
-                    self.slot_cv.notify_all()
-            if slot is not None:
-                slot_live[slot] = None
-                slot_used[slot] = time.time()
-                if phase == "slot" and self.gen == born:
-                    if bdone_in:
-                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                        slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+            try:
+                if reserved is not None:
+                    with self.slot_cv:
+                        slot_busy[reserved] = False
+                        slot_claims.discard(reserved)
+                        self.slot_cv.notify_all()
+                if slot is not None:
+                    slot_live[slot] = None
+                    slot_used[slot] = time.time()
+                    if phase == "slot" and self.gen == born:
+                        if bdone_in:
+                            stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                            slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                            with self.slot_cv:
+                                slot_busy[slot] = False
+                                slot_claims.discard(slot)
+                                self.slot_cv.notify_all()
+                        else:
+                            slot_held[slot] = []
+                            stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                            self._release_slot_when_done(slot, stream, slot_owner)  # synchronous drain retires its claim
+                    else:
                         with self.slot_cv:
                             slot_busy[slot] = False
                             slot_claims.discard(slot)
                             self.slot_cv.notify_all()
-                    else:
-                        slot_held[slot] = []
-                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                        self._release_slot_when_done(slot, stream, slot_owner)  # synchronous drain retires its claim
-                else:
-                    with self.slot_cv:
-                        slot_busy[slot] = False
-                        slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+            finally:
+                # A synchronous BSTOP drain may replace the admission with its slot's BDONE.
+                if reused0 is not None and isinstance(self.last, dict):
+                    self.last = {**self.last, "reused": reused0}
+                if carry and isinstance(self.last, dict):
+                    self.last = add_carry(carry, self.last)
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -5035,6 +5045,8 @@ class Service:
                     with self.status_lock:
                         if st.get("busy"):
                             last = request_stats(segments)          # only this request's own DONEs count
+                            if lifecycle is not None:
+                                lifecycle.setdefault("_response_work", []).append({**last, "output_tokens": n})
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -5146,14 +5158,25 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
 
 
+def _native_leg(kind: str, figures: dict, slot=None) -> dict:
+    """Only native completion figures; a batch leg includes its admission token, so admission is nested detail."""
+    return {"kind": kind, **({"slot": slot} if slot is not None else {}),
+            **{key: figures.get(key) for key in ("generated", "prompt_tokens", "prompt_read", "prompt_ms", "decode_ms",
+                                               "drafts_accepted", "drafts_offered", "finish")}}
+
+
 def carry_leg(carry: dict, leg: dict) -> None:
     """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE, which
-    replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
+    replaces the engine's figures: keep each leg's decode time, tokens, drafts and prompt figures to add to it."""
     carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
     carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
     carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
     if leg.get("prompt_read") is not None:
         carry.setdefault("prompt_read", int(leg["prompt_read"]))
+    for key in ("drafts_accepted", "drafts_offered"):
+        if leg.get(key) is not None:
+            carry[key] = carry.get(key, 0) + int(leg[key])
+    carry.setdefault("legs", []).extend(leg.get("legs") or [_native_leg("solo", leg)])
 
 
 def add_carry(carry: dict, last: dict) -> dict:
@@ -5164,6 +5187,10 @@ def add_carry(carry: dict, last: dict) -> dict:
            "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
+    for key in ("drafts_accepted", "drafts_offered"):
+        if carry.get(key) is not None or last.get(key) is not None:
+            out[key] = int(last.get(key) or 0) + carry.get(key, 0)
+    out["legs"] = carry.get("legs", []) + (last.get("legs") or [_native_leg("solo", last)])
     return out
 
 
@@ -5205,7 +5232,23 @@ def request_stats(segments: list[dict]) -> dict:
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
+    result["legs"] = [leg for segment in segments for leg in
+                      (segment.get("legs") or [_native_leg("solo", segment)])]
     return result
+
+
+def _response_attribution(lifecycle: dict, path: str) -> dict:
+    """One HTTP response's work, including continuations/MCP rounds; bind by the existing request-id header."""
+    work = lifecycle.pop("_response_work", [])
+    figures = request_stats(work)
+    return {"request_id": lifecycle["id"], "path": path, "outcome": lifecycle["state"],
+            "finish": figures.get("finish"),
+            "committed_tokens": figures.get("generated"),
+            "output_tokens": sum(part["output_tokens"] for part in work),
+            "interval": {"started_at": lifecycle["started_at"], "finished_at": time.time(),
+                         "duration_s": lifecycle["completion_s"]},
+            "drafts_accepted": figures.get("drafts_accepted"), "drafts_offered": figures.get("drafts_offered"),
+            "legs": figures.get("legs", [])}
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -6265,6 +6308,11 @@ def make_handler(svc: Service):
                     self.lifecycle["_generators"] = []
                 if self.lifecycle is not None:
                     svc.finish_lifecycle(self.lifecycle)
+                    attribution = _response_attribution(self.lifecycle, path)
+                    with svc.status_lock:
+                        self.lifecycle["attribution"] = attribution
+                    print("[strata] response_attribution: " + json.dumps(attribution, separators=(",", ":")),
+                          flush=True)
                 record = self.record
                 if record is not None:
                     with svc.status_lock:

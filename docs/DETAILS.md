@@ -2625,6 +2625,25 @@ per record. `completion_s` includes response handling and drain; engine `timings
 waiting for the engine's serialized control owner. A first token is a native generated token, even if it
 is an end-of-turn marker or buffered by structured output rather than visible to the client.
 
+Each registered generation response logs one compact JSON line, `[strata] response_attribution: {...}`, after
+response handling and native drain. Its `request_id` matches `X-Strata-Request-Id`; use that identity, not a
+matching token count, to join engine work to a client request. The record contains the endpoint `path`, terminal
+`outcome`, last native `finish`, `committed_tokens` from native completion counts, and `output_tokens` from the
+frontend (which can also include inserted thinking-budget wrap-up tokens). The `interval` has Unix-second
+`started_at`/`finished_at` endpoints and a monotonic `duration_s`: registration through response handling and
+drain, including queue wait but not body upload. The private lifecycle record also retains it as `attribution`.
+
+`legs` keeps the native completion figures across solo/slot hand-backs and frontend continuations, with each
+batch leg's `slot`, generated count, native prompt/decode milliseconds, finish and draft counters. A batch leg
+nests its admission's `DONE` as `admission` detail: its `BDONE` generated count already includes the admission
+token, so **do not add the nested admission again**. The native slot's `draft_accepted=N draft_offered=N` fields
+populate `drafts_accepted`/`drafts_offered` in the record and `draft_n_accepted`/`draft_n` in Chat Completions
+`timings`, including the final streaming chunk. Counts survive solo/slot hand-backs. Explicit zero counters
+stay zero; an absent slot counter is unknown (`null` in the record, omitted from response timings), not the
+admission's zero. Where only some legs report counters, totals sum the reported counts and the leg detail
+retains the unknowns. Native leg intervals can overlap other requests; they are not exclusive GPU time.
+This frontend attribution does not enable native batch/pipeline profiling or price kernels, waits or transfers.
+
 JSON `/status`, `/metrics`, `/v1/status` and `/health` expose the same `admission` snapshot: `slots` (the effective
 count, at least one), `request_queue_limit`, `active` (admitted HTTP generations), `waiting` (generations waiting
 for HTTP admission), `executing` (submitted native request legs through drain), `native_waiting` (reserved

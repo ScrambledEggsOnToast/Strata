@@ -2,7 +2,10 @@
 
     python -m unittest serve.test_request_accounting -v
 """
+import contextlib
+import io
 import json
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -126,6 +129,25 @@ class RequestAccounting(unittest.TestCase):
         self.assert_original_input(response["usage"])
         self.assert_request_work(response["timings"], response["usage"]["completion_tokens"])
 
+    def test_continuations_emit_one_response_attribution_record(self):
+        prefix = "[strata] response_attribution: "
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            response = self.chat()
+            deadline = time.monotonic() + 2
+            while prefix not in log.getvalue() and time.monotonic() < deadline:
+                time.sleep(0.005)
+        records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
+                   if line.startswith(prefix)]
+        self.assertEqual(len(records), 1, log.getvalue())
+        record = records[0]
+        self.assertEqual(record["request_id"], self.svc.lifecycle_records()[0]["id"])
+        self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (15, 29))
+        self.assertEqual(len(record["legs"]), 2)
+        self.assertEqual([leg["drafts_offered"] for leg in record["legs"]], [18, 11])
+        self.assertEqual(record["output_tokens"], response["usage"]["completion_tokens"])
+        self.assertLess(record["committed_tokens"], record["output_tokens"],
+                        "frontend wrap-up tokens must not become native commits")
+
     def test_openai_stream_keeps_original_cache_and_all_segment_work(self):
         events = self.chat(stream=True)
         final = events[-1]
@@ -203,6 +225,27 @@ class SlotLegAccounting(unittest.TestCase):
         total = add_carry(carry, {"generated": 5, "decode_ms": 50.0, "prompt_ms": 1.0})
         self.assertEqual((total["generated"], total["decode_ms"], total["prompt_ms"]), (35, 450.0, 50.0))
         self.assertNotIn("prompt_read", total)
+
+    def test_drafts_and_attribution_legs_survive_two_hand_backs(self):
+        carry = {}
+        solo = {"generated": 3, "decode_ms": 30.0, "prompt_ms": 50.0,
+                "drafts_accepted": 2, "drafts_offered": 4}
+        batch = {"generated": 8, "decode_ms": 80.0, "prompt_ms": 1.0,
+                 "drafts_accepted": 7, "drafts_offered": 11}
+        final = {"generated": 4, "decode_ms": 40.0, "prompt_ms": 1.0,
+                 "drafts_accepted": 3, "drafts_offered": 5}
+        solo["legs"] = [{"kind": "solo", **solo}]
+        batch["legs"] = [{"kind": "batch", "slot": 1, **batch}]
+        final["legs"] = [{"kind": "solo", **final}]
+        carry_leg(carry, solo)
+        carry_leg(carry, batch)
+        total = add_carry(carry, final)
+        self.assertEqual((total["drafts_accepted"], total["drafts_offered"]), (12, 20))
+        self.assertEqual((total["generated"], total["decode_ms"]), (15, 150.0))
+        self.assertEqual([leg["kind"] for leg in total["legs"]], ["solo", "batch", "solo"])
+        self.assertEqual([leg["generated"] for leg in total["legs"]], [3, 8, 4])
+        self.assertEqual((request_timings(100, 15, total)["draft_n_accepted"],
+                          request_timings(100, 15, total)["draft_n"]), (12, 20))
 
     def test_prompt_n_is_what_was_read(self):
         # the slot already held the whole prompt: 1 token read, the conversation cache off (reused 0)

@@ -31,6 +31,7 @@ fail = "--fail-window" in args
 groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
 STEP = 0.02
 hold = args[args.index("--hold-replies") + 1] if "--hold-replies" in args else None
+drafts = [pair.split(",") for pair in args[args.index("--draft-counters") + 1].split(":")] if "--draft-counters" in args else None
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
 score_cancel = set()
@@ -51,6 +52,8 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+if "--says-multiplex" in args:
+    print("INFO resident_multiplex=1", flush=True)
 print("INFO score=1 score_version=1 score_max_prompt=4096 score_max_selected=256 score_max_pending=8", flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
@@ -96,7 +99,9 @@ def window():        # one batch window: every active slot one token
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
-            print(f"BDONE {b} {produced} {fin} 1.0", flush=True)
+            accepted, offered = drafts[b % len(drafts)] if drafts else (None, None)
+            counts = f" draft_accepted={accepted} draft_offered={offered}" if drafts else ""
+            print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             del active[b]
         else:
             active[b] = [left, max_new, produced]
@@ -115,6 +120,8 @@ while True:
         line = ""
     if line is None or line == "QUIT":
         break
+    if line.startswith("BPRIORITY "):
+        continue
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
     if line.startswith("BSTOP "):
@@ -700,6 +707,145 @@ class ParallelService(unittest.TestCase):
         tb.start()
         ta.join(30); tb.join(30)
         return out
+
+    def attributed_chat(self, *, max_tokens=4, stream=False, stop=None):
+        body = {"messages": [{"role": "user", "content": "hello"}], "max_tokens": max_tokens,
+                "reasoning_effort": "none", "stream": stream}
+        if stop is not None:
+            body["stop"] = stop
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            identity = response.headers["X-Strata-Request-Id"]
+            raw = response.read().decode()
+        result = ([json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")][-1]
+                  if stream else json.loads(raw))
+        return identity, result
+
+    def test_bdone_draft_counters_reach_the_http_response(self):
+        self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "79,107"))
+        identity, result = self.attributed_chat()
+        self.assertTrue(identity)
+        self.assertEqual((result["timings"]["draft_n_accepted"], result["timings"]["draft_n"]), (79, 107))
+        self.assertEqual(result["usage"]["completion_tokens"], 4)
+
+    def recorded_chat(self, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            identity, result = self.attributed_chat(**kwargs)
+            deadline = time.monotonic() + 2
+            prefix = "[strata] response_attribution: "
+            while prefix not in log.getvalue() and time.monotonic() < deadline:
+                time.sleep(0.005)
+        records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
+                   if line.startswith(prefix)]
+        self.assertEqual(len(records), 1, log.getvalue())
+        self.assertEqual(records[0]["request_id"], identity)
+        return result, records[0]
+
+    def test_bdone_response_record_binds_identity_interval_and_slot_work(self):
+        self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "79,107"))
+        result, record = self.recorded_chat()
+        self.assertEqual(record["path"], "/v1/chat/completions")
+        self.assertEqual((record["committed_tokens"], record["output_tokens"]), (4, 4))
+        self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (79, 107))
+        interval = record["interval"]
+        self.assertLessEqual(interval["started_at"], interval["finished_at"])
+        self.assertGreater(interval["duration_s"], 0)
+        self.assertEqual(len(record["legs"]), 1)
+        leg = record["legs"][0]
+        self.assertEqual((leg["kind"], leg["slot"], leg["generated"], leg["decode_ms"]), ("batch", 0, 4, 1.0))
+        self.assertEqual((leg["drafts_accepted"], leg["drafts_offered"]), (79, 107))
+        self.assertEqual(leg["admission"]["generated"], 1)
+        self.assertEqual(result["timings"]["draft_n"], 107)
+
+    def test_bdone_counters_survive_early_stop_and_synchronous_drain(self):
+        self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "1,2"))
+        result, record = self.recorded_chat(max_tokens=64, stop="ok")
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual((result["timings"]["draft_n_accepted"], result["timings"]["draft_n"]), (1, 2))
+        self.assertEqual((record["committed_tokens"], record["output_tokens"]), (3, 2))
+        self.assertEqual(record["legs"][0]["kind"], "batch")
+        self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (1, 2))
+
+    def test_bdone_counters_survive_streaming_eos_drain(self):
+        import serve.server as server
+        self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "7,9"))
+        with mock.patch.object(server, "EOS_IDS", {257}):
+            result, record = self.recorded_chat(max_tokens=64, stream=True)
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual((result["timings"]["draft_n_accepted"], result["timings"]["draft_n"]), (7, 9))
+        self.assertEqual((record["committed_tokens"], record["output_tokens"]), (10, 10))
+        self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (7, 9))
+        self.assertEqual(record["legs"][0]["generated"], 10)
+
+    def test_bdone_without_drafts_reports_explicit_zeros(self):
+        self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "0,0"))
+        result, record = self.recorded_chat()
+        self.assertEqual((result["timings"]["draft_n_accepted"], result["timings"]["draft_n"]), (0, 0))
+        self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (0, 0))
+        self.assertEqual((record["legs"][0]["drafts_accepted"], record["legs"][0]["drafts_offered"]), (0, 0))
+
+    def test_bdone_without_counters_does_not_borrow_the_admission_zeros(self):
+        self.start(2, more=("--resident-multiplex", "--says-multiplex"))
+        result, record = self.recorded_chat()
+        self.assertNotIn("draft_n", result["timings"])
+        self.assertNotIn("draft_n_accepted", result["timings"])
+        self.assertIsNone(record["drafts_accepted"])
+        self.assertIsNone(record["drafts_offered"])
+        self.assertIsNone(record["legs"][0]["drafts_offered"])
+        self.assertEqual(record["legs"][0]["admission"]["drafts_offered"], 0)
+
+    def test_equal_count_responses_keep_their_slot_counters_by_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "hold"
+            gate.touch()
+            self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "1,2:2,3",
+                                "--hold-replies", str(gate)))
+            responses, errors = [], []
+
+            def go():
+                try:
+                    responses.append(self.attributed_chat())
+                except Exception as error:
+                    errors.append(error)
+
+            prefix = "[strata] response_attribution: "
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                threads = [threading.Thread(target=go) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                try:
+                    deadline = time.monotonic() + 3
+                    ready = False
+                    while not ready and time.monotonic() < deadline:
+                        with self.engine.slot_cv:
+                            ready = sum(bool(slot) and slot["state"] == "decoding"
+                                        for slot in self.engine.slot_live) == 2
+                        if not ready:
+                            time.sleep(0.005)
+                    self.assertTrue(ready, "both requests must enter different native slots")
+                finally:
+                    gate.unlink(missing_ok=True)
+                    for thread in threads:
+                        thread.join(10)
+                deadline = time.monotonic() + 2
+                while log.getvalue().count(prefix) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(responses), 2)
+            records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
+                       if line.startswith(prefix)]
+            self.assertEqual(len(records), 2, log.getvalue())
+            by_id = {record["request_id"]: record for record in records}
+            self.assertEqual(len(by_id), 2)
+            self.assertEqual({record["legs"][0]["slot"] for record in records}, {0, 1})
+            for identity, response in responses:
+                record = by_id[identity]
+                slot = record["legs"][0]["slot"]
+                expected = (1, 2) if slot == 0 else (2, 3)
+                self.assertEqual((response["timings"]["draft_n_accepted"], response["timings"]["draft_n"]), expected)
+                self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), expected)
+                self.assertEqual((record["committed_tokens"], record["output_tokens"]), (4, 4))
 
     def test_bgen_refused_by_the_engine_is_retried_not_a_400(self):
         """#1994: the engine refuses a BGEN ("no such free slot") although the server saw the slot free: the request
