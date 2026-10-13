@@ -12714,6 +12714,20 @@ int main(int argc, char** argv) {
                                      "(admissions included)\n",
                              o.batch_groups, GS, (long long) bt_windows, (long long) bt_rows,
                              (long long) bt_tokens, wall, 1000.0 * bt_tokens / std::max(wall, 1e-9));
+                if (static const bool timing = [] {
+                        const char* v = std::getenv("STRATA_COMMIT_TIMING");
+                        return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
+                    }(); timing)
+                    for (int k = 0; k < n_pipe; ++k)
+                        for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                            const strata::core::Verifier& v = group_verifier(k, gi);
+                            if (v.windows == 0) continue;
+                            // Existing owner-lifetime counters, not just this batch cohort.
+                            std::fprintf(stderr, "strata commit timing: stage=%d group=%d device=%d scope=cumulative "
+                                                 "windows=%lld commit_ms=%.3f commit_ms_per_window=%.3f\n",
+                                         k, gi, k == 0 ? 0 : stages[(size_t) k - 1]->dev,
+                                         (long long) v.windows, v.ms_commit, v.ms_commit / (double) v.windows);
+                        }
                 bt_windows = bt_rows = bt_tokens = 0;
                 strata::core::progress().busy.store(false);
             }
@@ -14397,7 +14411,8 @@ int main(int argc, char** argv) {
                     return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
-                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // A zero legacy piece must not bypass time-budget quanta (notably piped groups).
+                if (!time_budget.enabled() && piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
                     const auto age = [&] {
                         return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
@@ -15796,11 +15811,19 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
+                static const bool admission_timing = [] {
+                    const char* v = std::getenv("STRATA_ADMISSION_TIMING");
+                    return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
+                }();
                 if (cont) {
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
                             std::equal(c.ids.begin(), c.ids.end(), live.begin())) best = &c;
+                    if (admission_timing)
+                        std::fprintf(stderr, "strata admission timing: slot=%d component=checkpoint_select device=-1 "
+                                             "items=%lld host_ms=%.3f\n", admit_slot, (long long) checks.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                     const strata::program::ResidentAdmission request{x, best, batch_mtp ? last_committed_residual : nullptr};
                     if (!resident.admit(admit_slot, live, request, err)) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
@@ -15808,8 +15831,12 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (cont) {
+                    const double admission_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc0).count();
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
-                                 (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
+                                 (long long) live.size(), admission_ms);
+                    if (admission_timing)
+                        std::fprintf(stderr, "strata admission timing: slot=%d component=total device=-1 items=%lld "
+                                             "host_ms=%.3f\n", admit_slot, (long long) live.size(), admission_ms);
                 }
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
                 std::fflush(stdout);

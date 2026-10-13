@@ -471,6 +471,12 @@ train a larger background chunk downward. The new geometry gets one cold indivis
 No workspace is enlarged, placement re-resolved, recurrent chunk resized, route changed or draft counted as output. Initial solo
 reads and pipelined groups reach the same parking/interleave path. Each pipeline group runs once per
 bounded decode round, then every stage drains before prompt/verifier scratch is reused.
+The legacy `batch_read_piece` helper still selects one whole run for pipelined groups; only budget `0`
+uses that selection to bypass the quantum loop. A positive budget instead selects quanta with `TimeBudget`.
+
+`ctest --test-dir <build> -R '^prefill_interleave_test$' --output-on-failure` checks this composed decision
+on the CPU by compiling the actual prompt-read loop with synthetic GPU work and a deterministic clock.
+It checks prefill/decode/prefill ordering and the original tail, not device arithmetic or pipeline-drain correctness.
 
 Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
 An indivisible decode-round overrun remains debt for later quanta. Background control entries get a
@@ -694,6 +700,61 @@ capture observer under `CUDA_VISIBLE_DEVICES=-1`; it does not replace the runtim
 `STRATA_IQ_MT_MIN=1` is legitimate CPU expert arithmetic/performance policy (consistent rounding across
 window widths), not instrumentation. `STRATA_PREFILL_RING=8` is the required bounded source-ring policy
 for windowed-expert prefill, not instrumentation. Both remain in the daily environment.
+
+#### Opt-in commit and admission host timing
+
+Set `STRATA_COMMIT_TIMING=1` to append the existing per-stage, per-group verifier commit counters to
+each pipelined batch-MTP completion report:
+
+```
+strata commit timing: stage=<n> group=<n> device=<n> scope=cumulative windows=<n> commit_ms=<ms> commit_ms_per_window=<ms>
+```
+
+`commit_ms` is the already-accumulated host commit term; the patch adds no commit clock or GPU
+measurement. `windows` is that owner's existing completed-window count and is the exact denominator
+of `commit_ms_per_window`. Owners with no windows produce no line. These counters are cumulative
+over the verifier owner's lifetime, not confined to the cohort in the preceding wall-time report.
+Group zero can also include earlier solo/admission windows; do not label its lifetime average as a
+pipeline-only cohort average. Each stage's counter excludes the recursive next-stage commit.
+
+Set `STRATA_ADMISSION_TIMING=1` for host-clock component lines alongside the existing `copied in`
+transaction total:
+
+```
+strata admission timing: slot=<n> component=<name> device=<n> items=<n> host_ms=<ms>
+```
+
+The components are `checkpoint_select` (retained checkpoints examined), `validation_idle`,
+`checkpoint_clone` (selected checkpoints cloned), `retire_checkpoint_bind`, `stage_sync`,
+`checkpoint_transfer` (checkpoint save plus restore, once per stage), `main_kv_transfer` (all main
+KV saves plus restores, once per stage), `draft_request_bind`, `draft_kv_transfer` (draft save plus
+restore through the existing operation finish), `slot_metadata`, `initial_proposal`,
+`context_canary_bind`, `publication`, and `total`. `device=-1` denotes host/control work.
+`items` gives the checkpoint count, KV layer count, or prefix-cell count where relevant; otherwise
+it is one operation (zero when no initial proposal was requested). Draft components are absent when
+there is no draft KV. `bind` also serves parked prefixes, so their component lines do not have a
+`BGEN` admission total. Only successful phases print; a failed transaction is not a complete sample.
+
+All times use milliseconds with three decimal places. No extra CUDA synchronization, CUDA events,
+GPU profiler, hashes, graph variant or persistent state is added. With both variables unset or `=0`, no
+new clocks or lines run; the env gates retain only fixed host checks and stack timestamps.
+The gates are cached once: unset or exactly `=0` is off; any other present value enables diagnostics.
+
+For a diagnostic capture, set the gates in the engine launcher's environment and retain stderr,
+for example `STRATA_COMMIT_TIMING=1 STRATA_ADMISSION_TIMING=1 <existing-engine-command> 2>host-timing.log`.
+The engine's stdout protocol is unchanged and remains unbuffered. These instrumented arms are
+**diagnostics only**: component printing is inside the existing admission transaction timer, and
+observer/hash surfaces and their existing synchronizations can perturb its breakdown. The total
+therefore includes logging, bookkeeping gaps and any separately enabled observers; it need not
+equal the rounded component sum and is not a PCIe transfer-only price. Make no rate or timing
+improvement claim from an instrumented arm against a clean baseline. Unset both gates, state hashing
+and verbose token traces in every rate arm.
+
+The draft-advance suffix is deliberately not timed. The current resident advance replays one
+pre-captured graph: clocks around `record_front`/`record_rest` would measure graph construction,
+not the removable replay suffix. Pricing that suffix requires a separate KV-only-suffix graph
+behaviour variant and a clean two-build A/B with matching slot positions and inputs, not this
+instrumentation patch.
 
 
 

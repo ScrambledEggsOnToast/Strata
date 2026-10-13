@@ -37,6 +37,20 @@ ResidentSlots::ResidentSlots(const core::ModelGeometry& geometry, std::vector<Re
 }
 
 namespace {
+bool admission_timing_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ADMISSION_TIMING");
+        return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
+    }();
+    return on;
+}
+
+void report_admission_timing(int slot, const char* component, int device, int64_t items, Clock::time_point start) {
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    std::fprintf(stderr, "strata admission timing: slot=%d component=%s device=%d items=%lld host_ms=%.3f\n",
+                 slot, component, device, (long long) items, ms);
+}
+
 bool same_request(const ResidentRequest& a, const ResidentRequest& b) {
     const auto& x = a.sampling;
     const auto& y = b.sampling;
@@ -284,6 +298,8 @@ bool ResidentSlots::park(int slot, const std::vector<int32_t>& prefix,
 
 bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request,
                          bool parked, bool from_start, std::string& error) {
+    const bool timing = admission_timing_enabled();
+    auto phase = timing ? Clock::now() : Clock::time_point{};
     if (working_failed_ || !available(slot) || !working_.request || prefix.empty() || prefix.size() >= (uint64_t) context_ ||
         (!parked && (input_.max_new <= 1 || destination_ != slot)) ||
         (parked && (!cache_ || input_.images || !working_prompt_ || (destination_ >= 0 && destination_ != slot) ||
@@ -300,8 +316,10 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
             error = "resident admission: request already owns another slot"; return false;
         }
     if (!idle(error)) return false;
+    if (timing) report_admission_timing(slot, "validation_idle", -1, 1, phase);
     auto& state = slots_[(size_t) slot];
     const bool continuing = state.request == working_.request && working_.resume_slot == slot;
+    if (timing) phase = Clock::now();
     // Capture possibly aliased checkpoint metadata before clearing the target.
     std::vector<core::ConversationCheckpoint> selected;
     try {
@@ -309,6 +327,8 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     } catch (const std::bad_alloc&) {
         error = "resident admission: checkpoint allocation failed"; return false;
     }
+    if (timing) report_admission_timing(slot, "checkpoint_clone", -1, (int64_t) selected.size(), phase);
+    if (timing) phase = Clock::now();
     // Retire before overwriting, but don't publish a new identity until every
     // consumer is bound. A yielded continuation keeps the existing owner.
     if (!continuing) retire(slot);
@@ -317,13 +337,19 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     touched_ = true;
     state.checks.swap(selected);
     selected.clear();
+    if (timing) report_admission_timing(slot, "retire_checkpoint_bind", -1, 1, phase);
     try {
-        if (!copy_to(slot, prefix, error) || (draft_.kv_state().max_cells > 0 &&
-            (!draft_.bind_request(slot, working_.request, error) ||
-             !draft_.save_slot(slot, (int64_t) prefix.size(), error)))) return fail(slot);
+        if (!copy_to(slot, prefix, error)) return fail(slot);
+        if (draft_.kv_state().max_cells > 0) {
+            if (timing) phase = Clock::now();
+            if (!draft_.bind_request(slot, working_.request, error)) return fail(slot);
+            if (timing) report_admission_timing(slot, "draft_request_bind", draft_.device(), 1, phase);
+            if (!draft_.save_slot(slot, (int64_t) prefix.size(), error)) return fail(slot);
+        }
     } catch (const std::bad_alloc&) {
         error = "resident admission: transfer allocation failed"; return fail(slot);
     }
+    if (timing) phase = Clock::now();
     state.ids.assign(prefix.begin(), prefix.end());
     if (parked) {
         state.prompt.assign(working_prompt_->begin(), working_prompt_->end());
@@ -342,8 +368,12 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.stop = false;
     state.partial_from0 = parked && from_start;
     dispatch_.slot_requests[slot] = working_.request;
+    if (timing) report_admission_timing(slot, "slot_metadata", -1, (int64_t) prefix.size(), phase);
+    if (timing) phase = Clock::now();
     if (request.residual && !draft_.propose_slot(slot, request.residual, state.x, state.p - 1,
                                                 state.draft, error)) return fail(slot);
+    if (timing) report_admission_timing(slot, "initial_proposal", draft_.device(), request.residual ? 1 : 0, phase);
+    if (timing) phase = Clock::now();
     if (!stages_[0].verifier->set_slot_context(slot, working_.request, state.sampling,
                                               &state.ids, state.cvec, error) ||
         (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(slot, working_.request,
@@ -354,25 +384,34 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
         if (!continuing) state.request = dispatch_.slot_requests[slot] = 0;
         return fail(slot);
     }
+    if (timing) report_admission_timing(slot, "context_canary_bind", -1, 1, phase);
+    if (timing) phase = Clock::now();
     if (!continuing) residency("start", slot);
     state.failed = false;
     state.active = !parked;
     state.cached = state.partial = parked;
     if (parked) residency("pause", slot);
+    if (timing) report_admission_timing(slot, "publication", -1, 1, phase);
     return true;
 }
 
 bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::string& error) {
     const int64_t upto = (int64_t) prefix.size();
+    const bool timing = admission_timing_enabled();
     for (const auto& stage : stages_) {
         auto& from = *stage.main;
         auto& to = *stage.slots[(size_t) slot];
         const core::OnDevice on(stage.device);
+        auto phase = timing ? Clock::now() : Clock::time_point{};
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch admission: device sync failed"; return false; }
+        if (timing) report_admission_timing(slot, "stage_sync", stage.device, 1, phase);
+        if (timing) phase = Clock::now();
         core::ConversationCheckpoint checkpoint;
         checkpoint.ids = prefix;
         if (!core::conversation_checkpoint_save(checkpoint, from, geometry_, error) ||
             !core::conversation_checkpoint_restore(checkpoint, to, geometry_, error)) return false;
+        if (timing) report_admission_timing(slot, "checkpoint_transfer", stage.device, 1, phase);
+        if (timing) phase = Clock::now();
         for (int64_t j = 0; j < from.qsa_alloc; ++j) {
             core::ConversationKv image;
             if (!core::conversation_kv_save(image, from.qsa_states[from.qsa_ord0 + j], geometry_, upto, true, error))
@@ -382,6 +421,7 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
                 return false;
         }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch admission: device sync failed"; return false; }
+        if (timing) report_admission_timing(slot, "main_kv_transfer", stage.device, from.qsa_alloc, phase);
     }
     return true;
 }

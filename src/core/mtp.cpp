@@ -1199,6 +1199,11 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         err = "mtp: invalid slot save"; return false;
     }
     const OnDevice on_device(device_);
+    static const bool timing = [] {
+        const char* v = std::getenv("STRATA_ADMISSION_TIMING");
+        return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
+    }();
+    const auto start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Operation operation(*this, err);
     if (!operation) return false;
     if (!idle(err)) return false;
@@ -1207,7 +1212,12 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         !conversation_kv_restore(image, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
     slots_[(size_t) slot].cells = cells;
     slots_[(size_t) slot].proposal = -1;
-    return operation.finish(err);
+    const bool ok = operation.finish(err);
+    if (timing && ok)
+        std::fprintf(stderr, "strata admission timing: slot=%d component=draft_kv_transfer device=%d items=%lld "
+                             "host_ms=%.3f\n", slot, device_, (long long) cells,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    return ok;
 }
 
 bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
