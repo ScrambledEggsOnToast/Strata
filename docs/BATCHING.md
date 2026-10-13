@@ -61,6 +61,37 @@ For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complet
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
 and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage and slot request IDs.
 
+### Static expert residency
+
+`--serve --batch` (including `--slots`, grouped MTP and resident multiplexing) assumes a **statically resident
+expert working set**. The adaptive residency planner is inert in batch windows: the async tier is disabled
+with batch slots, and the batch loop does not run the blocking planner. Neither `--adapt-swaps`, `--adapt-every`
+nor `--adapt-async` can enable batch adaptation. Aggregate routing usage still accumulates; it does not change
+the batch residency ranking. Misses therefore use the startup/first-use ordering for the whole batch run,
+not a cache that learns from the concurrent requests.
+
+After slot sessions, cache sizing/retries and all startup fills, the engine checks every `(layer, expert)`
+pair in the **resolved model geometry** against its owning stage's cache and the peer/helper tiers. It counts
+the union of actual pairs, not advertised slots, a sum that double-counts duplicate owners, or CUDA0 alone.
+A truncated profile or a short stage cache cannot be hidden by spare slots on another stage. Dense stage
+trimming does not reduce the model's expert set. If a profiled batch lacks any pair, or an unprofiled cache
+cannot hold the full set, startup **refuses with `limiting=batch:expert_residency` and exit status 1**, before
+`READY` or request admission. The refusal names static residency, the inert planner and the frozen miss ordering.
+Use a complete `--expert-profile` and sufficient cache capacity across the owners, or omit `--batch`/`--slots`.
+Fully resident batch profiles remain admitted without a new warning, including profiles with `--adapt-swaps 0`.
+
+Two legitimate cases retain a loud warning rather than a new availability restriction: a full-capacity
+unprofiled single-device cache still permits first-use filling, but does **not** claim established startup
+residency; an explicit `VRAM` release under `--vram-elastic` is still honored and warns once if it leaves the
+batch cache smaller than the expert set. Neither warning enables adaptive eviction. Outside batch serving,
+partial caches are not refused: one startup warning reports the adaptation flags, since the solo/pipelined
+planner is reachable there and still depends on those flags and its existing tier prerequisites.
+
+`batch_residency_test` is a CUDA-free CPU test of these exact refusal/warning messages and the fully resident
+24,576-pair regression, including split ownership, peer/helper unions and adaptation-flag independence.
+It is metadata/declaration coverage, not a real-model run, performance measurement or stress qualification.
+
+
 ### Adaptive solo MTP versus ordinary batches
 
 The default frontend policy is unchanged: alone, use `GEN` (solo MTP when loaded);

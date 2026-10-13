@@ -71,6 +71,7 @@
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/kv_residency_info.hpp"
+#include "strata/program/batch_residency.hpp"
 #include "strata/program/time_budget.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -925,6 +926,7 @@ void usage() {
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
+                 "                       assumes static expert residency; incomplete expert profiles refuse (no batch adaptation)\n"
                  "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
                  "  --foreground-budget-ms N  --serve --batch: measured-cost scheduling at existing chunk boundaries\n"
                  "                       (0 = legacy policy; positive N <= 60000 is a target, not a latency promise)\n"
@@ -7170,6 +7172,19 @@ int main(int argc, char** argv) {
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
     }
 
+    // Slot sessions, sizing retries and every startup tier fill have landed.
+    // Check real pair coverage: another stage's spare slots cannot cover this layer.
+    if (!strata::program::admit_batch_residency(stderr, o.serve, o.batch, g.n_layers, g.n_expert,
+            !o.expert_profile.empty(), xcache.slots(), o.adapt_every, o.adapt_swaps, o.adapt_async,
+            [&](int64_t l, int64_t e) {
+                const int st = multi_gpu ? stage_of(l) : 0;
+                const auto& owner = st > 0 ? stages[(size_t) st - 1]->cache : xcache;
+                if (owner.slot_of(l, e) >= 0 || (peer.valid() && peer.has(l, e))) return true;
+                for (const auto& remote : remote_experts)
+                    if (remote.holds(l, (int32_t) e)) return true;
+                return false;
+            })) return 1;
+
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     drive.d.remote.reserve(helper_count);
@@ -8347,7 +8362,7 @@ int main(int argc, char** argv) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
-    // --adapt-async (opt-in): where the asynchronous adaptive tier does not apply, the blocking tier runs, said once.
+    // --adapt-async: unsupported cases keep the blocking tier, except batch windows have no adaptive consumer.
     // It exchanges experts between the GPU caches and the resident RAM copy only (the copy is checked once it is
     // built, below).  Not beside the --batch slots (their windows run between a request's prompt chunks), a peer
     // tier or the helper GPUs' tier, which pick their swaps from the same table.  The pipelined decode loop
@@ -8355,7 +8370,8 @@ int main(int argc, char** argv) {
     // may still read wait for those windows (see adapt_tick); STRATA_PIPELINE_ADAPT_ASYNC=0 keeps the blocking tier
     // beside it instead.
     auto adapt_async_off = [&](const char* why) {
-        std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): the blocking adaptive tier\n", why);
+        std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): %s\n", why,
+                     o.batch > 0 ? strata::program::kBatchStaticResidency : "the blocking adaptive tier");
         o.adapt_async = 0;
     };
     if (o.adapt_async) {
@@ -10610,6 +10626,7 @@ int main(int argc, char** argv) {
         // again and puts each slot's expert back (or, when the adaptive tier already brought that one back, the
         // most-routed missing expert of the same layer); the adaptive tier carries on from there.
         std::vector<std::pair<int32_t, int32_t>> vram_evicted;   // (residency index, slot) the shrinks took
+        bool batch_resize_warned = false;
         const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
         auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
             if (pf_parts.empty() || pf_parts[0].first < 0) return;
@@ -10713,6 +10730,8 @@ int main(int argc, char** argv) {
                          (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
+            strata::program::warn_batch_residency_resize(stderr, o.batch, xcache.slots(),
+                                                         g.n_layers * g.n_expert, batch_resize_warned);
             std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
                         "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
