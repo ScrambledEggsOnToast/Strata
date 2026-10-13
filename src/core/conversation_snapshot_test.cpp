@@ -2,6 +2,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/program/session_fingerprint.hpp"
+#include "strata/program/serial_prefix.hpp"
 #include "../../tests/core/conversation_snapshot_equivalence.hpp"
 #include <cuda_runtime.h>
 
@@ -373,6 +374,88 @@ void full_session(int fmt, int mode, int experts) {
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
+
+void serial_prefix_restoration(int fmt, int mode, int tokens) {
+    Fixture fixture(fmt, mode);
+    auto& g = fixture.g;
+    g.n_layers = 4; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    SessionState session;
+    session.max_cells = 96; session.qsa_states = &fixture.state;
+    session.layer_hi = g.n_layers; session.gdn_alloc = g.n_gdn_layers(); session.qsa_alloc = g.n_qsa_layers();
+    ConversationStateSizes sizes;
+    std::string error;
+    check(conversation_session_sizes(g, session, sizes, error), "prefix restoration state sizes");
+    fixture.alloc(session.gdn_state, sizes.gdn); fixture.alloc(session.ple_hist, sizes.ple);
+    fixture.alloc(fixture.state.idx_tail, sizes.tail); fixture.alloc(fixture.state.idx_dead, sizes.dead);
+    fixture.alloc(fixture.state.idx_block_pos, sizes.block_pos);
+    const std::array<std::pair<void*, size_t>, 5> running{{
+        {session.gdn_state, sizes.gdn}, {session.ple_hist, sizes.ple}, {fixture.state.idx_tail, sizes.tail},
+        {fixture.state.idx_dead, sizes.dead}, {fixture.state.idx_block_pos, sizes.block_pos}}};
+    fixture.fill(13);
+    for (auto [pointer, bytes] : running) cuda_check(cudaMemset(pointer, 13, bytes));
+    const auto prefix_end = fixture.state.idx_pooled + (tokens / 4) * g.idx_key_dim;
+    cuda_check(cudaMemcpy(prefix_end, fixture.state.idx_dead, sizes.dead, cudaMemcpyDeviceToDevice));
+    std::vector<int32_t> prefix(size_t(tokens), 7);
+    prefix.back() = 19;
+    session.ple_prev[0] = tokens >= 2 ? prefix[size_t(tokens - 2)] : -1;
+    session.ple_prev[1] = session.ple_token = prefix.back();
+    strata::program::SerialPrefixBranch branch;
+    check(branch.capture(prefix, g, {&session}, error), "capture exact serial prefix oracle");
+    auto dirty_suffix = [&] {
+        for (auto [pointer, bytes] : running) cuda_check(cudaMemset(pointer, 177, bytes));
+        session.ple_prev[0] = 901; session.ple_prev[1] = 902; session.ple_token = 903;
+        cuda_check(cudaMemset(prefix_end, 177, (fixture.state.idx_pooled_rows - tokens / 4) * g.idx_key_dim * 4));
+        // Dirty only suffix cells: the unaligned prefix's final physical page
+        // contains both immutable prefix cells and cells this suffix may write.
+        for (size_t pool = 0; pool < 4; ++pool) {
+            if (!fixture.sizes[pool]) continue;
+            const size_t width = fixture.sizes[pool] / size_t(session.max_cells * g.n_head_kv);
+            for (int64_t cell = tokens; cell < session.max_cells; ++cell)
+                for (int64_t head = 0; head < g.n_head_kv; ++head) {
+                    const size_t offset = size_t((cell / 4 * g.n_head_kv + head) * 4 + cell % 4) * width;
+                    cuda_check(cudaMemset(static_cast<uint8_t*>(fixture.sources[pool]) + offset, 177, width));
+                }
+        }
+        cuda_check(cudaDeviceSynchronize());
+    };
+    dirty_suffix();
+    check(!branch.verify(error), "suffix state cannot masquerade as the prefix");
+    check(branch.restore(error) && branch.verify(error), "A/suffix/A exact running state and logical prefix KV");
+    dirty_suffix();
+    // Deliberately omit PLE from the restore: retain its suffix bytes while all
+    // other elements take the production restore. The same pre-suffix gate must
+    // reject it, even without relying on an argmax change in one selected row.
+    std::vector<uint8_t> omitted_ple(sizes.ple);
+    cuda_check(cudaMemcpy(omitted_ple.data(), session.ple_hist, sizes.ple, cudaMemcpyDefault));
+    check(branch.restore(error), "prepare deliberately incomplete restoration");
+    cuda_check(cudaMemcpy(session.ple_hist, omitted_ple.data(), sizes.ple, cudaMemcpyDefault));
+    check(!branch.verify(error) && error.find("PLE history") != std::string::npos,
+          "deliberately omitted mutable PLE history is detected");
+    check(branch.restore(error), "complete restoration recovers after PLE omission negative");
+    for (auto [pointer, bytes] : running) {
+        (void) bytes;
+        cuda_check(cudaMemset(pointer, 177, 1));
+        check(!branch.verify(error), "one-byte omission in every running-state element is detected");
+        check(branch.restore(error), "complete running-state restore remains exact");
+    }
+    session.ple_token = 903;
+    check(!branch.verify(error), "omitted PLE current-token scalar is detected");
+    check(branch.restore(error), "PLE current-token scalar is restored");
+    ++session.ple_prev[0];
+    check(!branch.verify(error), "omitted PLE previous-token scalar is detected");
+    check(branch.restore(error), "PLE previous-token window is restored");
+    cuda_check(cudaMemset(prefix_end, 177, 1));
+    check(!branch.verify(error), "omitted pooled boundary-row rebuild is detected");
+    check(branch.restore(error), "pooled boundary row is rebuilt before the next suffix");
+    cuda_check(cudaMemset(fixture.sources[0], 177, 1));
+    check(!branch.verify(error), "prefix KV identity contamination is detected");
+    if (mode == 0) check(!branch.restore(error), "resident prefix contamination cannot be silently repaired/reused");
+    else check(branch.restore(error), "streamed prefix image restores and rebuilds residency");
+    branch.release();
+    check(branch.tokens() == 0 && !branch.restore(error), "prefix is released after the serial call");
+    std::printf("PREFIX_RESTORATION fmt=%d mode=%d tokens=%d byte_exact=1 omission_detected=1 leg=fixture_only\n",
+                fmt, mode, tokens);
+}
 }
 
 int main() {
@@ -491,5 +574,7 @@ int main() {
         full_session(fmt,mode,experts);
     for (int mode : {0,1}) for (int experts : {256,512}) full_session(3,mode,experts);
     for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvHybrid}) for (int mode : {0,1,2}) release_reinit(fmt,mode);
+    for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvHybrid}) for (int mode : {0,1})
+        for (int prefix : {1,3,4,5,63,64,65}) serial_prefix_restoration(fmt,mode,prefix);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

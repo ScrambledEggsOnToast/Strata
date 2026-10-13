@@ -125,15 +125,23 @@ def validate_ids(ids, vocab=None):
         raise ValueError("complete nonempty in-vocabulary token ID set required")
 
 
-def validate_readout(result, request):
+def validate_readout(result, request, mode="fresh", prefix_tokens=0):
     n = len(request["prompt_token_ids"])
-    if (result.get("schema_version") != 1 or result.get("mode") != "fresh" or
+    if (mode not in ("fresh", "reused") or (mode == "fresh" and prefix_tokens != 0) or
+            (mode == "reused" and not 0 < prefix_tokens < n) or
+            result.get("schema_version") != 1 or result.get("mode") != mode or
             result.get("engine_mode") != "serial_solo" or result.get("position") != n or
             result.get("consumed_prompt_tokens") != n or result.get("row_position") != n - 1 or
-            result.get("prefix_tokens") != 0 or result.get("generated_tokens") != 0 or
+            result.get("prefix_tokens") != prefix_tokens or result.get("generated_tokens") != 0 or
             result.get("sampling") is not False or result.get("mtp") is not False or
             result.get("selected_token_ids") != request["selected_token_ids"]):
         raise ValueError("reference identity, read position or complete selected coverage mismatch")
+    if mode == "reused":
+        times = [result.get(key) for key in ("checkpoint_ms", "restore_ms", "call_elapsed_ms")]
+        if (result.get("restoration_verified") is not True or
+                any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in times) or
+                times[2] + 1e-4 < times[0] + times[1]):
+            raise ValueError("reused reference lacks restoration proof or complete call timing")
     values = result.get("logits")
     log_probs = result.get("log_probs")
     lse = result.get("vocab_logsumexp")
@@ -148,6 +156,30 @@ def validate_readout(result, request):
             raise ValueError("readout log probability differs from unscaled logit minus full-vocabulary LSE")
 
 
+def common_prefix(requests):
+    if not isinstance(requests, list) or not 2 <= len(requests) <= 64:
+        raise ValueError("a serial branch call needs 2..64 full token plans")
+    first = requests[0]["prompt_token_ids"]
+    prefix = len(first)
+    identities = set()
+    for request in requests:
+        ids = request["prompt_token_ids"]
+        validate_ids(ids)
+        if (len(ids) > 4096 or request.get("token_digest") != token_digest(ids) or
+                not request.get("branch_id") or request["branch_id"] in identities or
+                request.get("selected_token_ids") != requests[0]["selected_token_ids"]):
+            raise ValueError("branch identity, complete token plan or selected set differs")
+        identities.add(request["branch_id"])
+        prefix = min(prefix, len(ids))
+        for at in range(prefix):
+            if ids[at] != first[at]:
+                prefix = at
+                break
+    if prefix < 1 or any(prefix >= len(request["prompt_token_ids"]) for request in requests):
+        raise ValueError("serial branches need a positive strict common prefix")
+    return prefix
+
+
 def source_identity():
     def git(*args):
         return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True).strip()
@@ -157,12 +189,14 @@ def source_identity():
     source["dirty_diff_sha256"] = hashlib.sha256(changes).hexdigest()
     source["capture_source_sha256"] = {str(path.relative_to(ROOT)): digest(path) for path in
         (ROOT / "src/program/generate.cpp", ROOT / "include/strata/program/readout_reference.hpp",
+         ROOT / "include/strata/program/serial_prefix.hpp", ROOT / "src/core/conversation_state.cpp",
+         ROOT / "src/core/conversation_snapshot.cpp", ROOT / "include/strata/core/conversation_snapshot.hpp",
          Path(__file__).resolve())}
     return source
 
 
-def capture(profile, request, output_dir, check_safety=None, model_identity=None):
-    """Token-only seam used by the shared backend's fresh reference mode."""
+def capture(profile, request, output_dir, check_safety=None, model_identity=None, branch_requests=None):
+    """The sole serial GEN reference instrument, optionally one restored prefix call."""
     if os.environ.get("STRATA_SUPERVISED") != "1" or not os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
         raise ValueError("capture requires an approved inherited supervised MPS window")
     if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(profile["gpu_uuids"]):
@@ -171,8 +205,14 @@ def capture(profile, request, output_dir, check_safety=None, model_identity=None
     validate_ids(request["selected_token_ids"])
     if request.get("token_digest") != token_digest(request["prompt_token_ids"]):
         raise ValueError("compiled prompt token digest mismatch")
+    requests = branch_requests if branch_requests is not None else [request]
+    prefix = common_prefix(requests) if branch_requests is not None else 0
+    if requests[0] != request:
+        raise ValueError("first branch must equal the submitted reference request")
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=False)
+    for index, plan in enumerate(requests[1:], 1):
+        save(output / f"request.json.{index}", plan)
     save(output / "request.json", request)
     tokens = output / "prompt.tokens"
     with tokens.open("x") as stream:
@@ -180,6 +220,12 @@ def capture(profile, request, output_dir, check_safety=None, model_identity=None
     raw = output / "readout.json"
     argv = [profile["binary"], *profile["engine_args"], "--tokens-file", str(tokens),
             "--score-reference", str(raw), "--score-select", ",".join(map(str, request["selected_token_ids"]))]
+    if prefix:
+        plans = output / "branches.tokens"
+        with plans.open("x") as stream:
+            for plan in requests:
+                stream.write(",".join(map(str, plan["prompt_token_ids"])) + "\n")
+        argv += ["--score-branches", str(plans), "--score-prefix", str(prefix)]
     binary_hash = digest(profile["binary"])
     source = source_identity()
     began = time.monotonic()
@@ -203,24 +249,37 @@ def capture(profile, request, output_dir, check_safety=None, model_identity=None
                 time.sleep(1)
         if process.returncode:
             raise RuntimeError(f"reference engine exited {process.returncode}")
-        result = load(raw)
-        validate_readout(result, request)
         lines = (output / "engine.stdout").read_text().splitlines()
         if any(line.split(" ", 1)[0] in ("T", "BT", "DONE", "BDONE") for line in lines):
             raise ValueError("generation channel was emitted during no-decode capture")
-        receipt = {**result, "branch_identity": {"id": request["branch_id"], "token_digest": request["token_digest"]},
-                   "token_digest": request["token_digest"], "engine_incarnation": incarnation,
-                   "source": {**source, "model": profile["name"]},
-                   "binary": {"path": profile["binary"], "sha256": binary_hash},
-                   "profile_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
-                   "model_identity": model_identity,
-                   "environment": {key: value for key, value in environment.items()
-                                   if key.startswith(("STRATA_", "CUDA_", "LD_"))},
-                   "prompt_contract": request.get("prompt_contract"), "request_sha256": digest(output / "request.json"),
-                   "readout_sha256": digest(raw), "argv": argv, "elapsed_s": time.monotonic() - began,
-                   "exit_code": process.returncode}
-        save(output / "receipt.json", receipt)
-        return receipt
+        if prefix:
+            stderr = (output / "engine.stderr").read_text()
+            if "24576 resident experts" not in stderr or "prompt chunk " in stderr:
+                raise ValueError("branch fixture requires full expert residency and no silent chunk resize")
+        receipts = []
+        for index, plan in enumerate(requests):
+            suffix = f".{index}" if index else ""
+            raw_path = Path(str(raw) + suffix)
+            result = load(raw_path)
+            validate_readout(result, plan, mode="reused" if prefix else "fresh", prefix_tokens=prefix)
+            if prefix and result.get("branch_index") != index:
+                raise ValueError("serial branch output index differs")
+            receipt = {**result, "execution_leg": "serial_GEN",
+                       "branch_identity": {"id": plan["branch_id"], "token_digest": plan["token_digest"]},
+                       "token_digest": plan["token_digest"], "engine_incarnation": incarnation,
+                       "source": {**source, "model": profile["name"]},
+                       "binary": {"path": profile["binary"], "sha256": binary_hash},
+                       "profile_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
+                       "model_identity": model_identity,
+                       "environment": {key: value for key, value in environment.items()
+                                       if key.startswith(("STRATA_", "CUDA_", "LD_"))},
+                       "prompt_contract": plan.get("prompt_contract"),
+                       "request_sha256": digest(output / ("request.json" + suffix)),
+                       "readout_sha256": digest(raw_path), "argv": argv, "elapsed_s": time.monotonic() - began,
+                       "exit_code": process.returncode}
+            save(output / ("receipt.json" + suffix), receipt)
+            receipts.append(receipt)
+        return receipts if branch_requests is not None else receipts[0]
     except Exception as error:
         save(output / "failure.json", {"error": str(error), "argv": argv, "elapsed_s": time.monotonic() - began})
         raise

@@ -1799,6 +1799,65 @@ Without issue 224's frozen human corpus, the semantic screen and family selectio
 are **blocked**, not a partial result. CPU test fixtures and arithmetic capture
 anchors are not independent gold, calibration data or semantic qualification.
 
+**Serial prefix branching candidate (#234, reference-only).** Add
+`--score-branches /absolute/branches.tokens --score-prefix N` to the same #231
+serial `GEN` reference command. The file contains 2–64 complete comma-separated
+token plans, one per line; its first plan must equal `--tokens[-file]`. Every plan
+is at most 4,096 tokens, and `N` must be their exact, positive common prefix,
+strictly shorter than every plan. The usual no-MTP/no-batch/no-prefix-cache
+reference restrictions remain; elastic K/V and checkpoint-reread diagnostics are
+refused. This does not change SCORE v1, generation, routing, quantisation or any
+profile, and it is not an enabled serving reuse mode.
+
+The normal prompt reader consumes that prefix exactly once. A call-owned image
+captures each stage's GDN recurrence and convolution, PLE history and current
+token scalar, reconstructed two-token PLE window, QSA tail/dead/block-position
+state, authoritative prefix K/V codes/scales and pooled keys. Before **every**
+suffix, including the first, it restores the running state, rebuilds the pooled
+boundary row, and byte-compares every mutable element and every logical prefix
+K/V cell. Resident K/V remains in place, so contamination is an error rather than
+a silently repaired match. Streamed owners additionally restore their saved
+authoritative image and rebuild residency. Stale suffix cells in the unused end
+of a physical page are not prefix identity. Allocation identities and the full
+stage carve are checked, and a failed restore cannot produce a reused readout.
+The retained image is released after the call; it never enters a cross-call cache.
+
+The same final-position readout writes the initial output path and `.1`, `.2`,
+etc. Each row says `mode=reused`, `prefix_tokens=N`, `restoration_verified=true`,
+`branch_index`, and `generated_tokens=0`. Checkpoint, restore and cumulative
+whole-call wall times are retained; `tools/judge_reference.capture` binds every
+row to its full token plan, source/binary/model and shared engine incarnation,
+and names `execution_leg=serial_GEN`. The caller must also retain tokenisation
+and machine/admission queueing time. Observed forward time alone is not a call
+latency, and restoration observers are not observer-off performance evidence.
+
+`conversation_snapshot_test` exercises aligned and unaligned prefix lengths,
+every native K/V format, resident/streamed owners, all running-state fields,
+PLE scalars, the boundary rebuild and contamination. Its deliberate negative
+keeps suffix PLE bytes while restoring every other element: the same pre-suffix
+verification gate must reject the omitted history. GPU fixtures and a serial
+`GEN` A/B/A replay prove restoration only, never independent workload quality.
+
+The numerical campaign remains **blocked**, not kept or rejected. Ticket #234
+requires **3,000 independent source-state groups per workload and intended mode**;
+ticket #224 proposes **200 development + 400 calibration + 600 sealed = 1,200
+groups in total**, and has not supplied the independently human-labelled frozen
+corpus. Even a completed #224 corpus cannot meet #234's denominator; the operator
+must reconcile these contracts rather than duplicate states. The maximum-load
+leg also lacks contended logit dump wiring. Batch-slot head rows already exist,
+so that is a capability gap, not an architectural impossibility; adding the
+wiring is outside this change. No parallel-mode claim is made.
+
+`tools/judge_prefix_campaign.py` fixes corpus, source/binary identities, primary
+branches and all gates before evaluation, and evaluates the full declared
+denominator including fresh/fresh controls. A primary failure is an argmax change,
+max probability difference >0.02 or TV >0.05; each workload/mode needs the exact
+one-sided 95% upper failure-rate bound ≤1%. Every row must be complete, finite,
+correctly positioned, uncontaminated and zero-generation, with global max
+difference ≤0.05, max TV ≤0.10 and p95 TV ≤0.02. Missing evidence cannot be
+relabelled as a fresh or shared-mode pass. Rollback is to omit both branching
+flags and use the unchanged fresh #231 serial reference; no deployment occurs.
+
 ---
 
 ### Selected-logit scoring (SCORE v1)

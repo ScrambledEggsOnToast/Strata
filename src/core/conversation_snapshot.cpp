@@ -244,7 +244,8 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error,
+                            bool logical_prefix) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
@@ -263,10 +264,25 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     };
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto authoritative = pools(st);
-    for (size_t i = 0; i < saved.size(); ++i)
-        if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+    for (size_t i = 0; i < saved.size(); ++i) {
+        auto span = [&](size_t offset, size_t bytes) {
+            return saved[i]->visit(offset, bytes, [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
-            })) return false;
+            });
+        };
+        if (!logical_prefix || i == 4) {
+            if (!span(0, saved[i]->size())) return false;
+        } else if (!saved[i]->empty()) {
+            const size_t width = saved[i]->size() / (size_t(image.cells) * size_t(image.heads));
+            for (int64_t page = 0; page * image.page_size < upto; ++page) {
+                const size_t cells = size_t(std::min(image.page_size, upto - page * image.page_size));
+                for (int64_t head = 0; head < image.heads; ++head) {
+                    const size_t offset = size_t((page * image.heads + head) * image.page_size) * width;
+                    if (!span(offset, cells * width)) return false;
+                }
+            }
+        }
+    }
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;

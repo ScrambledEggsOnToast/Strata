@@ -78,6 +78,7 @@
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/serial_judge.hpp"
+#include "strata/program/serial_prefix.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -466,6 +467,8 @@ struct Options {
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     std::string score_reference;     // standalone fresh serial readout, not a generation request
     std::vector<int64_t> score_select;
+    std::vector<std::vector<int64_t>> score_branches; // one create-only serial GEN reference call
+    int64_t score_prefix = 0;
     int64_t max_new = 16;
     int64_t max_context = 4096;
     bool greedy = true;
@@ -875,6 +878,9 @@ void usage() {
                  "  --score-reference PATH  create a fresh serial final-position JSON readout, then exit; needs\n"
                  "                       --serve, --tokens[-file], --score-select, no MTP/batch/prefix cache\n"
                  "  --score-select LIST  every requested token ID, in output order (no top-k truncation)\n"
+                 "  --score-branches PATH  full token plans, one comma-separated line per serial suffix (2..64)\n"
+                 "  --score-prefix N     their exact common prefix; restoration-proved candidate, NOT qualified reuse\n"
+                 "                       writes PATH from --score-reference, then PATH.1, PATH.2, ...; no deployment\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
@@ -2173,6 +2179,25 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata reference: %s\n", e.c_str()); return 2;
             }
         }
+        else if (a == "--score-prefix") o.score_prefix = std::atoll(next("--score-prefix"));
+        else if (a == "--score-branches") {
+            std::ifstream input(next("--score-branches"), std::ios::binary);
+            std::string text, error;
+            if (!input) { std::fprintf(stderr, "strata reference: cannot open branch plans\n"); return 2; }
+            while (std::getline(input, text)) {
+                std::vector<int64_t> plan;
+                if (o.score_branches.size() >= 64 || text.find('\0') != std::string::npos ||
+                    !parse_i64_list(text.c_str(), plan, error)) {
+                    std::fprintf(stderr, "strata reference: invalid bounded branch plan: %s\n", error.c_str());
+                    return 2;
+                }
+                o.score_branches.push_back(std::move(plan));
+            }
+            if (input.bad()) { std::fprintf(stderr, "strata reference: cannot read branch plans\n"); return 2; }
+            if (o.score_branches.size() < 2) {
+                std::fprintf(stderr, "strata reference: a branch file needs at least two plans\n"); return 2;
+            }
+        }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
@@ -2623,7 +2648,7 @@ int main(int argc, char** argv) {
         }
         }
     }
-    if (!o.score_reference.empty() || !o.score_select.empty()) {
+    if (!o.score_reference.empty() || !o.score_select.empty() || !o.score_branches.empty() || o.score_prefix != 0) {
         if (o.score_reference.empty() || o.score_select.empty() || !have_tokens ||
             !std::filesystem::path(o.score_reference).is_absolute() ||
             std::filesystem::exists(o.score_reference) || !o.serve || o.spec < 2 ||
@@ -2638,6 +2663,33 @@ int main(int argc, char** argv) {
                                  "serial captured --serve --spec >= 2, real pool, no MTP/draft/batch/pipeline/"
                                  "adaptive swaps/prefix cache/sampling or diagnostic dumps\n");
             return 2;
+        }
+        if (!o.score_branches.empty() || o.score_prefix != 0) {
+            if (o.score_branches.size() < 2 || o.score_branches.front() != o.tokens || o.score_prefix < 1 ||
+                o.kv_grow || std::getenv("STRATA_KV_GROW") || std::getenv("STRATA_CKPT_REREAD")) {
+                std::fprintf(stderr, "strata reference: branching needs >=2 plans, first equal to --tokens, "
+                                     "positive exact prefix, stable KV allocation and no checkpoint reread\n");
+                return 2;
+            }
+            size_t common = o.score_branches.front().size();
+            for (const auto& plan : o.score_branches) {
+                if (plan.empty() || plan.size() > 4096 || plan.size() >= size_t(o.max_context)) {
+                    std::fprintf(stderr, "strata reference: every branch must fit the 4096-token short lane\n"); return 2;
+                }
+                common = std::min(common, plan.size());
+                size_t at = 0;
+                while (at < common && plan[at] == o.score_branches.front()[at]) ++at;
+                common = at;
+            }
+            if (common != size_t(o.score_prefix) ||
+                std::any_of(o.score_branches.begin(), o.score_branches.end(),
+                    [&](const auto& plan) { return plan.size() <= common; })) {
+                std::fprintf(stderr, "strata reference: declared prefix is not the exact strict common prefix\n"); return 2;
+            }
+            for (size_t branch = 1; branch < o.score_branches.size(); ++branch)
+                if (std::filesystem::exists(o.score_reference + "." + std::to_string(branch))) {
+                    std::fprintf(stderr, "strata reference: a branch output already exists\n"); return 2;
+                }
         }
         o.max_new = 1; // serve's internal admission placeholder; the readout never enters decode
     }
@@ -6905,6 +6957,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
+    for (const auto& plan : o.score_branches)
+        if (!strata::program::readout_reference::valid_ids(plan, n_vocab, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str()); return 2;
+        }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -12766,11 +12822,16 @@ int main(int argc, char** argv) {
         strata::program::score::Request score_request; // retain bounded host staging across scoring requests
         std::vector<float> score_values;
         bool reference_pending = !o.score_reference.empty();
+        size_t reference_index = 0;
+        strata::program::SerialPrefixBranch reference_prefix;
+        double reference_checkpoint_ms = 0, reference_restore_ms = 0;
+        const auto reference_call_t0 = reference_pending ? Clock::now() : Clock::time_point{};
         for (;;) {
             if (reference_pending) {
+                const auto& plan = o.score_branches.empty() ? o.tokens : o.score_branches[reference_index];
                 line = "GEN 1 ckpt=0 ";
-                for (size_t i = 0; i < o.tokens.size(); ++i)
-                    line += (i ? "," : "") + std::to_string(o.tokens[i]);
+                for (size_t i = 0; i < plan.size(); ++i)
+                    line += (i ? "," : "") + std::to_string(plan[i]);
                 reference_pending = false;
             } else
             if (batch_on() || (piped && pipe_inflight())) {
@@ -13936,6 +13997,16 @@ int main(int argc, char** argv) {
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+            if (!o.score_branches.empty() && reference_index > 0) {
+                const auto restore_t0 = Clock::now();
+                if (reference_prefix.tokens() != o.score_prefix || !reference_prefix.restore(err)) {
+                    std::fprintf(stderr, "strata reference: prefix restoration failed: %s\n", err.c_str()); return 1;
+                }
+                reference_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count();
+                resume = o.score_prefix; from_live = true;
+                std::fprintf(stderr, "PREFIX_RESTORE branch=%zu tokens=%lld verified=1 ms=%.3f leg=serial_GEN\n",
+                             reference_index, (long long) resume, reference_restore_ms);
+            }
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
@@ -14593,6 +14664,10 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            if (!o.score_branches.empty() && reference_index == 0) {
+                cuts.push_back(o.score_prefix);
+                std::sort(cuts.begin(), cuts.end());
+            }
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -14639,6 +14714,25 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                if (!o.score_branches.empty() && reference_index == 0 && to == o.score_prefix) {
+                    const auto checkpoint_t0 = Clock::now();
+                    const std::vector<int32_t> prefix(ids.begin(), ids.begin() + to);
+                    std::vector<strata::core::SessionState*> owners{&ss};
+                    for (auto& stage : stages) owners.push_back(&stage->ss);
+                    if (!reference_prefix.capture(prefix, g, owners, err)) {
+                        std::fprintf(stderr, "strata reference: prefix checkpoint failed: %s\n", err.c_str()); return 1;
+                    }
+                    reference_checkpoint_ms = std::chrono::duration<double, std::milli>(Clock::now() - checkpoint_t0).count();
+                    const auto restore_t0 = Clock::now();
+                    if (!reference_prefix.restore(err)) {
+                        std::fprintf(stderr, "strata reference: initial prefix restoration failed: %s\n", err.c_str()); return 1;
+                    }
+                    reference_restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count();
+                    std::fprintf(stderr, "PREFIX_CAPTURE tokens=%lld stages=%zu checked=1 ms=%.3f leg=serial_GEN\n",
+                                 (long long) to, owners.size(), reference_checkpoint_ms);
+                    std::fprintf(stderr, "PREFIX_RESTORE branch=0 tokens=%lld verified=1 ms=%.3f leg=serial_GEN\n",
+                                 (long long) to, reference_restore_ms);
+                }
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
@@ -14666,8 +14760,11 @@ int main(int argc, char** argv) {
             if (!o.score_reference.empty()) {
                 // The prompt reader stops at n-1. Consume its final input token,
                 // without a pick, to obtain the prediction for position n.
-                if (cancelled || nf_hit || resume != 0 || ids != o.tokens || at != n - 1) {
-                    std::fprintf(stderr, "strata reference: incomplete or nonfresh prompt read\n");
+                const auto& plan = o.score_branches.empty() ? o.tokens : o.score_branches[reference_index];
+                const int64_t expected_resume = reference_index > 0 ? o.score_prefix : 0;
+                if (cancelled || nf_hit || resume != expected_resume || ids != plan || at != n - 1 ||
+                    (!o.score_branches.empty() && reference_prefix.tokens() != o.score_prefix)) {
+                    std::fprintf(stderr, "strata reference: incomplete or incorrectly positioned prompt read\n");
                     return 1;
                 }
                 ver.set_head_sampling(false);
@@ -14678,15 +14775,47 @@ int main(int argc, char** argv) {
                 if (!ver.run(1, &last, n - 1, win_pool_fn, win_pool_user, &unused, err) ||
                     drive.d.failed || nonfinite_hit(ver, "reference") ||
                     !ver.read_logits_rows(0, 1, logits.data(), err) ||
-                    !ver.commit(1, err) || !ver.wait_commit(err) ||
-                    !strata::program::readout_reference::write(o.score_reference, logits.data(), n_vocab,
-                                                             n, o.score_select, err)) {
+                    !ver.commit(1, err) || !ver.wait_commit(err)) {
                     std::fprintf(stderr, "strata reference: %s\n", err.empty() ? "verification failed" : err.c_str());
                     return 1;
                 }
-                std::printf("REFERENCE position=%lld selected=%zu mode=fresh engine_mode=serial_solo generated_tokens=0\n",
-                            (long long) n, o.score_select.size());
+                if (!o.score_branches.empty()) {
+                    const strata::core::QsaState no_draft{};
+                    for (size_t stage = 0; stage <= stages.size(); ++stage) {
+                        const auto& state = stage == 0 ? ss : stages[stage - 1]->ss;
+                        strata::program::SessionFingerprint fingerprint;
+                        if (!strata::program::session_fingerprint(state, no_draft, g, n, fingerprint, err)) {
+                            std::fprintf(stderr, "strata reference: suffix state readback failed: %s\n", err.c_str()); return 1;
+                        }
+                        std::fprintf(stderr, "PREFIX_SUFFIX_STATE branch=%zu stage=%zu cells=%lld gdn=%016llx "
+                                             "ple=%016llx kv=%016llx leg=serial_GEN\n", reference_index, stage,
+                                     (long long) n, (unsigned long long) fingerprint.gdn,
+                                     (unsigned long long) strata::program::fingerprint_ple(fingerprint, state),
+                                     (unsigned long long) strata::program::fingerprint_kv(fingerprint));
+                    }
+                }
+                strata::program::readout_reference::BranchReadout branch;
+                if (!o.score_branches.empty()) {
+                    branch.prefix_tokens = o.score_prefix;
+                    branch.branch_index = (int64_t) reference_index;
+                    branch.restoration_verified = true;
+                    branch.checkpoint_ms = reference_checkpoint_ms;
+                    branch.restore_ms = reference_restore_ms;
+                    branch.call_elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - reference_call_t0).count();
+                }
+                const auto output = o.score_reference + (reference_index ? "." + std::to_string(reference_index) : "");
+                if (!strata::program::readout_reference::write(output, logits.data(), n_vocab, n, o.score_select, err, branch)) {
+                    std::fprintf(stderr, "strata reference: %s\n", err.c_str()); return 1;
+                }
+                std::printf("REFERENCE position=%lld selected=%zu mode=%s engine_mode=serial_solo generated_tokens=0 "
+                            "branch=%zu leg=serial_GEN\n", (long long) n, o.score_select.size(),
+                            o.score_branches.empty() ? "fresh" : "reused", reference_index);
                 std::fflush(stdout);
+                if (!o.score_branches.empty() && ++reference_index < o.score_branches.size()) {
+                    reference_pending = true;
+                    continue;
+                }
+                reference_prefix.release();
                 return 0;
             }
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next

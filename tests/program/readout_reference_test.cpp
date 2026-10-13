@@ -30,6 +30,22 @@ int main() {
     CHECK(json.find("\"vocab_logsumexp\":10000") != std::string::npos);
     CHECK(json.find("\"log_probs\":[-20000,-20000") != std::string::npos);
     CHECK(!ref::write(path, row.data(), row.size(), 7, selected, error)); // create-only
+    ref::BranchReadout branch;
+    branch.prefix_tokens = 3;
+    branch.checkpoint_ms = 2; branch.restore_ms = 1; branch.call_elapsed_ms = 5;
+    const std::string reused = (dir / "reused.json").string();
+    CHECK(!ref::write(reused, row.data(), row.size(), 7, selected, error, branch));
+    CHECK(!std::filesystem::exists(reused)); // no reuse record before restoration proof
+    branch.restoration_verified = true;
+    CHECK(ref::write(reused, row.data(), row.size(), 7, selected, error, branch));
+    std::ifstream reused_file(reused);
+    const std::string reused_json((std::istreambuf_iterator<char>(reused_file)), std::istreambuf_iterator<char>());
+    CHECK(reused_json.find("\"mode\":\"reused\"") != std::string::npos);
+    CHECK(reused_json.find("\"prefix_tokens\":3") != std::string::npos);
+    CHECK(reused_json.find("\"restoration_verified\":true") != std::string::npos);
+    CHECK(reused_json.find("\"generated_tokens\":0") != std::string::npos);
+    branch.call_elapsed_ms = 0; // a forward-only interval cannot contain checkpoint/restore
+    CHECK(!ref::write((dir / "bad-timing.json").string(), row.data(), row.size(), 7, selected, error, branch));
     const std::string refused = (dir / "refused.json").string();
     selected.push_back(1024);
     CHECK(!ref::write(refused, row.data(), row.size(), 7, selected, error));

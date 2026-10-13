@@ -29,7 +29,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error,
+                            bool logical_prefix = false);
+// logical_prefix compares only cells [0, upto), not the unused end of its final
+// page. The complete pooled prefix, including its rebuilt boundary row, is checked.
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,

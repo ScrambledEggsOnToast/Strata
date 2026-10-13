@@ -140,6 +140,33 @@ class ReferenceTests(unittest.TestCase):
             with self.subTest(patch=patch), self.assertRaises(ValueError):
                 ref.validate_readout({**result, **patch}, job)
 
+    def test_reused_readout_requires_restoration_and_call_timing(self):
+        job = {"branch_id": "x", "prompt_token_ids": [1, 2, 3], "token_digest": ref.token_digest([1, 2, 3]),
+               "selected_token_ids": [65, 66]}
+        result = {**readout(job, [1, 2]), "mode": "reused", "prefix_tokens": 2,
+                  "restoration_verified": True, "checkpoint_ms": 2, "restore_ms": 1, "call_elapsed_ms": 4}
+        ref.validate_readout(result, job, mode="reused", prefix_tokens=2)
+        with self.assertRaises(ValueError):
+            ref.validate_readout(result, job)  # a reused row cannot inherit fresh-path qualification
+        for patch in ({"mode": "fresh"}, {"restoration_verified": False}, {"restore_ms": float("nan")},
+                      {"call_elapsed_ms": 1}, {"prefix_tokens": 1}, {"generated_tokens": 1}):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                ref.validate_readout({**result, **patch}, job, mode="reused", prefix_tokens=2)
+
+    def test_branch_call_uses_exact_full_token_common_prefix(self):
+        def plan(identity, ids):
+            return {"branch_id": identity, "prompt_token_ids": ids, "token_digest": ref.token_digest(ids),
+                    "selected_token_ids": [65, 66]}
+        plans = [plan("A", [1, 2, 3, 4]), plan("B", [1, 2, 9]), plan("A-replay", [1, 2, 3, 4])]
+        self.assertEqual(ref.common_prefix(plans), 2)
+        for altered in ([plans[0]], [plans[0], {**plans[1], "token_digest": "wrong"}],
+                        [plans[0], {**plans[1], "branch_id": "A"}],
+                        [plans[0], {**plans[1], "selected_token_ids": [66, 65]}],
+                        [plans[0], plan("prefix-only", [1, 2])],
+                        [plans[0], plan("no-common", [9, 2, 3])]):
+            with self.subTest(altered=altered), self.assertRaises(ValueError):
+                ref.common_prefix(altered)
+
     def test_both_readout_families_and_complete_group_denominator(self):
         corpus = fixture_corpus()
         scoring, bundles = FakeScoring(), fake_bundles()
