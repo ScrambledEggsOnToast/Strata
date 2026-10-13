@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "branch_id": "arithmetic-sanity-direct",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 + 2? Reply only with the letter.\nA. 3\nB. 4\nC. 5\nD. 6"
+    }
+  ],
+  "rendered_prompt": "<|im_start|>user\nWhat is 2 + 2? Reply only with the letter.\nA. 3\nB. 4\nC. 5\nD. 6<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "prompt_token_ids": [
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    220,
+    17,
+    478,
+    220,
+    17,
+    30,
+    17308,
+    1132,
+    440,
+    279,
+    6321,
+    13,
+    198,
+    32,
+    13,
+    220,
+    18,
+    198,
+    33,
+    13,
+    220,
+    19,
+    198,
+    34,
+    13,
+    220,
+    20,
+    198,
+    35,
+    13,
+    220,
+    21,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+  ],
+  "token_digest": "a622c707ebebb194215d964aa3a839ef6f0d167c763e0810236d9dd17a34b292",
+  "selected_token_ids": [
+    32,
+    33,
+    34,
+    35
+  ],
+  "prompt_contract": {
+    "template": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "enable_thinking": false,
+    "add_generation_prompt": true,
+    "reasoning_effort_injection": false,
+    "effort_at_end": false,
+    "template_fallback": false
+  },
+  "tokenizer_sha256": {
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+    "merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+    "token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+    "tokenizer.json": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"
+  },
+  "family": "direct_letter_logits",
+  "declared_options": [
+    {
+      "id": "A",
+      "text": "3"
+    },
+    {
+      "id": "B",
+      "text": "4"
+    },
+    {
+      "id": "C",
+      "text": "5"
+    },
+    {
+      "id": "D",
+      "text": "6"
+    }
+  ],
+  "expected_sanity_option": "B",
+  "evidence_role": "arithmetic sanity only, not issue-224 human gold or semantic screen"
+}

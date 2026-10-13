@@ -1,0 +1,13 @@
+strata generate: memory guard: limit 62.7 GiB (source: meminfo), current 14.5 GiB, reclaimable cache credited 0.0 GiB; available 48.2 GiB (MemAvailable 48.2 GiB), floor 2560 MiB
+strata generate: MPS client ceiling declared: 3 device(s), pipe /tmp/s231-572102
+strata generate: MPS device 0: cap 33285996544 B, uuid GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21
+strata generate: MPS device 1: cap 33285996544 B, uuid GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331
+strata generate: MPS device 2: cap 22548578304 B, uuid GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b
+strata generate: layer split across 3 GPUs: CUDA0, then CUDA1,2 (split 20,39)
+strata MPS verified: client_pid=573156 server_pid=573159 device_caps=[{device=0,gpu_uuid=GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21,cap_bytes=33285996544,default_cap_bytes=33285996544,server_cap_bytes=33285996544,residual_free_bytes=32969000432,physical_free_bytes=34037825536,physical_free_measured=1,outside_client_allowance_bytes=67108864},{device=1,gpu_uuid=GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331,cap_bytes=33285996544,default_cap_bytes=33285996544,server_cap_bytes=33285996544,residual_free_bytes=0,physical_free_bytes=34037825536,physical_free_measured=1,outside_client_allowance_bytes=67108864},{device=2,gpu_uuid=GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b,cap_bytes=22548578304,default_cap_bytes=22548578304,server_cap_bytes=22548578304,residual_free_bytes=0,physical_free_bytes=22672310272,physical_free_measured=1,outside_client_allowance_bytes=67108864}] precontext=1
+strata generate: PCIe probe: 6.7 GB/s host->device (best of 6.7 6.7 6.7 6.7) -> pcie_frac 0.18 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-19 only
+strata generate: layer split admission: CUDA1 expert cache budget 25899827200 B (residual ceiling 32969000432 B, fixed 4332197504 B, headroom 734003200 B, profile bound 25899827200 B)
+strata generate: layer split admission: CUDA2 expert cache budget 12268339200 B (residual ceiling 22286907088 B, fixed 3797509184 B, headroom 734003200 B, profile bound 12268339200 B)
+strata generate: --host-native requires local memory telemetry, finite memory.max, windowed experts and opaque allowance
