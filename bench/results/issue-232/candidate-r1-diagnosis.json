@@ -1,0 +1,30 @@
+{
+  "observed": "candidate-r1 refused before serving with serial judge startup eligibility message; frontend exited 1",
+  "result_preserved": "result-candidate-r1.json",
+  "source_identity": "a2aae4a8",
+  "binary_sha256": "f07f49fb7fb45babcbe36c3ac9fa76123e42f48fdd4e27214258d92c5f85b237",
+  "ranked_hypotheses": [
+    {
+      "hypothesis": "unset pipeline_windows sentinel -1 evaluated as true before CUDA default resolves to zero",
+      "prediction": "numeric > 0 guard passes unchanged daily CUDA arguments",
+      "evidence": [
+        "generate.cpp pipeline_windows default -1",
+        "judge guard used truthiness"
+      ],
+      "disposition": "source-confirmed cause"
+    },
+    {
+      "hypothesis": "frontend discarded --no-prefill-borrow",
+      "prediction": "launch argv would lack the flag",
+      "disposition": "rejected by retained exact launch argv"
+    },
+    {
+      "hypothesis": "numeric --prefill 2048 left prefill_auto enabled",
+      "prediction": "numeric parser would not set auto=false",
+      "disposition": "rejected by source: prefill_auto = v == auto or auto prefix"
+    }
+  ],
+  "fix": "refuse only o.pipeline_windows > 0; no profile/geometry change",
+  "verification": "next candidate arm exercises original unchanged argument set and owns a new request fixture for rebuilt binary",
+  "safety": "failure was engine eligibility refusal, not a safety/telemetry incident; preserved launcher terminal and cleanup evidence"
+}

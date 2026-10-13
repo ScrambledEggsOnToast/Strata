@@ -1,0 +1,1272 @@
+{
+  "scope": "4096-cell serial ownership reconciliation under copied measurement configuration; not deployment or throughput qualification",
+  "evidence": {
+    "control_result": "bench/results/issue-232/result-control-r1.json",
+    "candidate_result": "bench/results/issue-232/result-candidate-r3.json",
+    "control_engine_log": "/home/joshkirklin/.local/state/strata-host/judge232-control-r1/engine.log",
+    "candidate_engine_log": "/home/joshkirklin/.local/state/strata-host/judge232-candidate-r3/engine.log"
+  },
+  "derived_static_stage_ledger": [
+    {
+      "device": "0",
+      "cells": "4096",
+      "session_device": "78718464",
+      "canary_device": "280",
+      "head_output_device": "0",
+      "allocator_padding_device": "3070184",
+      "session_pinned_host": "580",
+      "session_heap_host": "6264",
+      "canary_host": "108",
+      "checkpoint_host": "55602455",
+      "readback_host": "0",
+      "metadata_host": "872",
+      "init_host_transient": "1048576",
+      "library_allowance": "268435456"
+    },
+    {
+      "device": "1",
+      "cells": "4096",
+      "session_device": "74844160",
+      "canary_device": "280",
+      "head_output_device": "0",
+      "allocator_padding_device": "2750184",
+      "session_pinned_host": "464",
+      "session_heap_host": "6264",
+      "canary_host": "108",
+      "checkpoint_host": "55600146",
+      "readback_host": "0",
+      "metadata_host": "872",
+      "init_host_transient": "1048576",
+      "library_allowance": "268435456"
+    },
+    {
+      "device": "2",
+      "cells": "4096",
+      "session_device": "41552384",
+      "canary_device": "280",
+      "head_output_device": "993280",
+      "allocator_padding_device": "3591400",
+      "session_pinned_host": "348",
+      "session_heap_host": "6264",
+      "canary_host": "108",
+      "checkpoint_host": "22503182",
+      "readback_host": "993280",
+      "metadata_host": "872",
+      "init_host_transient": "1048576",
+      "library_allowance": "268435456"
+    }
+  ],
+  "complete_generation_and_judge_allocation_classes": [
+    "strata admission class: scope=CUDA0 name=weights_canonical bytes=686866560 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=WeightTable::pool_bytes (pack index header)",
+    "strata admission class: scope=CUDA0 name=weights_native_dense bytes=852000512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeDense::planned_bytes (GGUF headers)",
+    "strata admission class: scope=CUDA0 name=embedding_vram_fallback bytes=337715200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeEmbed::load: full native embedding if mapped pinned allocation fails",
+    "strata admission class: scope=CUDA0 name=session_state bytes=1365087744 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=session_bytes of the primary stage's own resolved layer range",
+    "strata admission class: scope=CUDA0 name=resident_slot_main_device bytes=5460350976 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested slots; session_bytes of the primary stage's own resolved layer range",
+    "strata admission class: scope=CUDA0 name=resident_verifier_device bytes=205088 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded per-slot commit/indexer/steering/penalty controls",
+    "strata admission class: scope=CUDA0 name=verifier_canary_device bytes=720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=shared verifier ownership records and device owner table",
+    "strata admission class: scope=CUDA0 name=operation_canary_device bytes=560 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one prefill and one MTP serialized scratch owner table per device; conservative for inactive paths",
+    "strata admission class: scope=CUDA0 name=decode_parts bytes=102400 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=cudaMalloc d_parts: K*n_embd FP32 partials",
+    "strata admission class: scope=CUDA0 name=embedding_row bytes=10240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=cudaMalloc d_emb FP32 row",
+    "strata admission class: scope=CUDA0 name=sampler_output bytes=4 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=cudaMalloc d_next",
+    "strata admission class: scope=CUDA0 name=graph_capture_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance inside the enforced MPS client ceiling; the allocation boundary, not this number, is what stops an overrun",
+    "strata admission class: scope=CUDA0 name=device_residency_table bytes=98308 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=graph hits table plus primary hit count",
+    "strata admission class: scope=CUDA0 name=prefill_buffers bytes=1050673152 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::allocation_needed: exact owned plus loanable allocation sequence; no unproven cache loan deducted",
+    "strata admission class: scope=CUDA0 name=prefill_library_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance inside the enforced MPS client ceiling; the allocation boundary, not this number, is what stops an overrun",
+    "strata admission class: scope=CUDA0 name=verify_windows bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=schedule-sized actual verifier arena, at least existing conservative window envelope",
+    "strata admission class: scope=CUDA0 name=batch_mtp_pipeline_replay bytes=67440368 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group owns an exact verifier arena, resident controls and independent canary owner",
+    "strata admission class: scope=CUDA0 name=batch_mtp_pipeline_graph bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group's bounded graph cache: another finite operator allowance inside the enforced MPS ceiling",
+    "strata admission class: scope=CUDA0 name=logits bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=pack index output.weight ne1 * sizeof(float)",
+    "strata admission class: scope=CUDA0 name=ple_buffers bytes=274352 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=the PLE row buffer + ple_run_scratch_bytes()",
+    "strata admission class: scope=CUDA0 name=hit_path_scratch bytes=165440 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=moe_hit_grouped_scratch_bytes + the R4 device buffers (the exact alloc set)",
+    "strata admission class: scope=CUDA0 name=expert_cache bytes=19818086400 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=concrete existing all-pair stage allocation: ExpertCache::open_sized 256-aligned blobs; original budget unchanged",
+    "strata admission class: scope=CUDA0 name=judge_generation_cache_granule bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed",
+    "strata admission class: scope=CUDA0 name=judge_short_session bytes=78718464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner: GDN/QSA/MoE/block/PLE, complete independent short arena",
+    "strata admission class: scope=CUDA0 name=judge_operation_canary bytes=280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 280 B per-stage operation owner; existing prefill canary also retained",
+    "strata admission class: scope=CUDA0 name=judge_head_output bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full vocabulary FP32 row on actual native-head device",
+    "strata admission class: scope=CUDA0 name=judge_allocator_granule bytes=3070184 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived separate session/canary/output allocations rounded to 2 MiB granules",
+    "strata admission class: scope=CUDA0 name=judge_shared_prefill_gemm_workspace bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver",
+    "strata admission class: scope=CUDA0 name=judge_shared_native_head bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same actual native weights/Q8_1 head scratch: generation native-head charge retained in full",
+    "strata admission class: scope=CUDA0 name=judge_library_first_use_driver bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained",
+    "strata admission class: scope=CUDA1 name=weights_canonical bytes=654499968 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=WeightTable::pool_bytes for this stage's actual skip set",
+    "strata admission class: scope=CUDA1 name=weights_native_dense bytes=872032512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeDense::planned_bytes for this stage's layer range",
+    "strata admission class: scope=CUDA1 name=session_state bytes=1117358080 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=session_bytes of this stage's own resolved layer range",
+    "strata admission class: scope=CUDA1 name=resident_slot_main_device bytes=4469432320 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested slots; session_bytes of this stage's own resolved layer range",
+    "strata admission class: scope=CUDA1 name=resident_verifier_device bytes=205088 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage resident controls",
+    "strata admission class: scope=CUDA1 name=verifier_canary_device bytes=720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage verifier ownership records",
+    "strata admission class: scope=CUDA1 name=operation_canary_device bytes=560 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded prefill/MTP scratch owner tables, conservatively per stage",
+    "strata admission class: scope=CUDA1 name=verify_windows bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=each stage's actual verifier arena, at least the conservative window envelope",
+    "strata admission class: scope=CUDA1 name=batch_mtp_pipeline_replay bytes=67440368 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group owns this stage's exact arena, resident controls and canary",
+    "strata admission class: scope=CUDA1 name=batch_mtp_pipeline_graph bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group's finite graph allowance, inside the enforced MPS ceiling",
+    "strata admission class: scope=CUDA1 name=graph_capture_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance inside the enforced MPS client ceiling",
+    "strata admission class: scope=CUDA1 name=prefill_buffers bytes=1050673152 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)",
+    "strata admission class: scope=CUDA1 name=prefill_library_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-device opaque cuBLAS/first-use allowance inside the enforced ceiling",
+    "strata admission class: scope=CUDA1 name=device_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=split graph hits residency table",
+    "strata admission class: scope=CUDA1 name=split_expert_caches bytes=20067123200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=concrete existing all-pair stage allocation: ExpertCache::open_sized 256-aligned blobs; original budget unchanged",
+    "strata admission class: scope=CUDA1 name=judge_generation_cache_granule bytes=524288 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed",
+    "strata admission class: scope=CUDA1 name=judge_short_session bytes=74844160 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner: GDN/QSA/MoE/block/PLE, complete independent short arena",
+    "strata admission class: scope=CUDA1 name=judge_operation_canary bytes=280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 280 B per-stage operation owner; existing prefill canary also retained",
+    "strata admission class: scope=CUDA1 name=judge_head_output bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full vocabulary FP32 row on actual native-head device",
+    "strata admission class: scope=CUDA1 name=judge_allocator_granule bytes=2750184 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived separate session/canary/output allocations rounded to 2 MiB granules",
+    "strata admission class: scope=CUDA1 name=judge_shared_prefill_gemm_workspace bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver",
+    "strata admission class: scope=CUDA1 name=judge_shared_native_head bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same actual native weights/Q8_1 head scratch: generation native-head charge retained in full",
+    "strata admission class: scope=CUDA1 name=judge_library_first_use_driver bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained",
+    "strata admission class: scope=CUDA2 name=weights_canonical bytes=354446592 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=WeightTable::pool_bytes for this stage's actual skip set",
+    "strata admission class: scope=CUDA2 name=weights_native_dense bytes=392938752 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeDense::planned_bytes for this stage's layer range",
+    "strata admission class: scope=CUDA2 name=weights_native_head bytes=521474880 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=last-stage native output head and Q8_1 scratch",
+    "strata admission class: scope=CUDA2 name=session_state bytes=840210944 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=session_bytes of this stage's own resolved layer range",
+    "strata admission class: scope=CUDA2 name=resident_slot_main_device bytes=3360843776 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested slots; session_bytes of this stage's own resolved layer range",
+    "strata admission class: scope=CUDA2 name=resident_verifier_device bytes=205088 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage resident controls",
+    "strata admission class: scope=CUDA2 name=resident_slot_draft_device bytes=1242576960 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=draft slot state on final stage",
+    "strata admission class: scope=CUDA2 name=verifier_canary_device bytes=720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage verifier ownership records",
+    "strata admission class: scope=CUDA2 name=operation_canary_device bytes=560 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded prefill/MTP scratch owner tables, conservatively per stage",
+    "strata admission class: scope=CUDA2 name=verify_windows bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=each stage's actual verifier arena, at least the conservative window envelope",
+    "strata admission class: scope=CUDA2 name=batch_mtp_pipeline_replay bytes=67440368 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group owns this stage's exact arena, resident controls and canary",
+    "strata admission class: scope=CUDA2 name=batch_mtp_pipeline_graph bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second group's finite graph allowance, inside the enforced MPS ceiling",
+    "strata admission class: scope=CUDA2 name=mtp_weights bytes=823887872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=MTP rt file sizes (last stage)",
+    "strata admission class: scope=CUDA2 name=resident_working_draft_device bytes=310644240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one working draft KV owner on final stage",
+    "strata admission class: scope=CUDA2 name=mtp_drafter_buffers bytes=737931760 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=remaining shared drafter/head envelope after named working KV",
+    "strata admission class: scope=CUDA2 name=graph_capture_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance inside the enforced MPS client ceiling",
+    "strata admission class: scope=CUDA2 name=prefill_buffers bytes=1050673152 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::allocation_needed on this device (its own cc/sms/shared config; no unproven cache loan deducted)",
+    "strata admission class: scope=CUDA2 name=prefill_library_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-device opaque cuBLAS/first-use allowance inside the enforced ceiling",
+    "strata admission class: scope=CUDA2 name=device_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=split graph hits residency table",
+    "strata admission class: scope=CUDA2 name=penalty_history_device bytes=131072 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=serving sampler history on head device",
+    "strata admission class: scope=CUDA2 name=split_expert_caches bytes=10407116800 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=concrete existing all-pair stage allocation: ExpertCache::open_sized 256-aligned blobs; original budget unchanged",
+    "strata admission class: scope=CUDA2 name=judge_generation_cache_granule bytes=1048576 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed",
+    "strata admission class: scope=CUDA2 name=judge_short_session bytes=41552384 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner: GDN/QSA/MoE/block/PLE, complete independent short arena",
+    "strata admission class: scope=CUDA2 name=judge_operation_canary bytes=280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 280 B per-stage operation owner; existing prefill canary also retained",
+    "strata admission class: scope=CUDA2 name=judge_head_output bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full vocabulary FP32 row on actual native-head device",
+    "strata admission class: scope=CUDA2 name=judge_allocator_granule bytes=3591400 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived separate session/canary/output allocations rounded to 2 MiB granules",
+    "strata admission class: scope=CUDA2 name=judge_shared_prefill_gemm_workspace bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver",
+    "strata admission class: scope=CUDA2 name=judge_shared_native_head bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same actual native weights/Q8_1 head scratch: generation native-head charge retained in full",
+    "strata admission class: scope=CUDA2 name=judge_library_first_use_driver bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained",
+    "strata admission class: scope=guest-runtime name=session_host_pinned bytes=1392 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges",
+    "strata admission class: scope=guest-runtime name=resident_working_draft_pinned bytes=116 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=working MTP QSA staging and possible full-context pinned backing; allocator-derived bound",
+    "strata admission class: scope=guest-runtime name=session_host_owner bytes=159744 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=ABI-checked owner/QSA envelopes",
+    "strata admission class: scope=guest-runtime name=judge_session_host_pinned bytes=580 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-runtime name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-runtime name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-runtime name=judge_branch_checkpoint_host bytes=55602455 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-runtime name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-runtime name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-runtime name=judge_session_host_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-runtime name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-runtime name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-runtime name=judge_branch_checkpoint_host bytes=55600146 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-runtime name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-runtime name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-runtime name=judge_session_host_pinned bytes=348 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-runtime name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-runtime name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-runtime name=judge_branch_checkpoint_host bytes=22503182 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-runtime name=judge_head_readback_host bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-runtime name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-runtime name=judge_opaque_runtime_host bytes=536870912 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling",
+    "strata admission class: scope=guest-runtime name=judge_request_input_host bytes=32768 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one bounded caller-owned prompt vector for the serial lane",
+    "strata admission class: scope=guest-runtime name=verifier_canary_host bytes=4656 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=mapped per-stage operation identity staging/readback",
+    "strata admission class: scope=guest-runtime name=operation_canary_host bytes=648 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=prefill and MTP independent owner staging/readback",
+    "strata admission class: scope=guest-runtime name=resident_slot_main_pinned bytes=5568 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges",
+    "strata admission class: scope=guest-runtime name=resident_slot_main_owner bytes=638976 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=ABI-checked resident owner envelopes",
+    "strata admission class: scope=guest-runtime name=resident_histories bytes=8388608 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two context-bounded ResidentSlot ids/prompt vectors per requested slot",
+    "strata admission class: scope=guest-runtime name=resident_checkpoints bytes=549855448 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=state-only stage-local checkpoint vectors and IDs; 12.5% whole-seat payload margin plus 4 KiB per stage",
+    "strata admission class: scope=guest-runtime name=resident_verifier_pinned bytes=528 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=mapped slot commit controls",
+    "strata admission class: scope=guest-runtime name=resident_verifier_history bytes=393216 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=4096 int32 history entries per slot",
+    "strata admission class: scope=guest-runtime name=resident_slot_draft_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested draft QSA staging and full logical ring backing",
+    "strata admission class: scope=guest-runtime name=resident_slot_draft_owner bytes=16480 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=draft slot owner envelope, weights and scratch shared",
+    "strata admission class: scope=guest-runtime name=host_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=graph hits host residency vector payload",
+    "strata admission class: scope=guest-runtime name=penalty_history_host bytes=131072 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=serving hist_stage vector payload",
+    "strata admission class: scope=guest-runtime name=expert_worker_ownership bytes=20736 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes",
+    "strata admission class: scope=guest-runtime name=expert_route_groups bytes=2048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one fixed request-owned route map shared by the global pool and all stages, never per slot",
+    "strata admission class: scope=guest-runtime name=expert_worker_helpers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two setup-only registries of exactly the configured helper count, shared by all stages",
+    "strata admission class: scope=guest-runtime name=expert_worker_scheduler bytes=1186 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one bounded ordered helper scheduler and diagnostic storage, drained before the next stage dispatch",
+    "strata admission class: scope=guest-runtime name=expert_source_lanes bytes=1240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one source owner per prefill stage plus its setup-only registry; no helper source lane",
+    "strata admission class: scope=guest-runtime name=expert_source_ring bytes=5511315456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage conservative direct-only ring",
+    "strata admission class: scope=guest-runtime name=expert_source_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=host cgroup-bounded reader metadata/stacks allowance",
+    "strata admission class: scope=guest-runtime name=embedding_pinned bytes=337715200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeEmbed full pinned table",
+    "strata admission class: scope=guest-runtime name=ple_direct_cache bytes=101056512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=PleReader RowCache data+keys+replacement, two-page inflight slab and latency ring",
+    "strata admission class: scope=guest-runtime name=prefill_host_staging bytes=256475136 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::init stager ring, two PLE row buffers, host routing and step tables",
+    "strata admission class: scope=guest-runtime name=prefill_host_payload bytes=62292 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags",
+    "strata admission class: scope=guest-runtime name=prefill_host_dynamic bytes=3296424 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit",
+    "strata admission class: scope=guest-runtime name=prefill_cpu_share_buffers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit",
+    "strata admission class: scope=guest-runtime name=stage_handoff bytes=335544320 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two Prefill mapped handoff buffers per stage boundary",
+    "strata admission class: scope=guest-runtime name=host_logits bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=host logits vector",
+    "strata admission class: scope=guest-runtime name=prefix_cost_model bytes=3048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded process-local prefix transfer and context/prefill observations",
+    "strata admission class: scope=guest-runtime name=runtime_host_staging bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=verify/pool mapped handoffs and metadata: at least the bounded eight-row mapped sequence when batch-MTP requested",
+    "strata admission class: scope=guest-runtime name=verifier_diagnostic_host bytes=786432 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit",
+    "strata admission class: scope=guest-runtime name=batch_mtp_pipeline_host bytes=303174720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging",
+    "strata admission class: scope=guest-runtime name=prefill_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance for the prefill run's opaque host-side storage (CUDA events/context/registration, thread stacks, allocator metadata); the enforced worker cgroup ceiling, not this number, is what bounds the guest",
+    "strata admission class: scope=guest-runtime name=file:embedding_upload bytes=337719296 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=mapped source beside pinned destination; retained without eviction proof",
+    "strata admission class: scope=guest-runtime name=file:native_dense_upload bytes=2118373376 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=each supported native GGUF source span page-rounded; retained after upload/unmap",
+    "strata admission class: scope=guest-runtime name=file:native_head_upload bytes=521478144 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=native GGUF output.weight source pages retained after upload/unmap",
+    "strata admission class: scope=guest-runtime name=file:canonical_upload bytes=1541935104 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=index source union across all stages; clean source cache retained after buffered-reader close",
+    "strata admission class: scope=guest-runtime name=file:mtp_upload bytes=823889920 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=MTP rt retained source pages beside device allocations",
+    "strata admission class: scope=guest-runtime name=resident_transfer_transient bytes=335165271 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=max(one stage checkpoint + one main layer image, later draft image); 12.5% plus 4 KiB margin",
+    "strata admission class: scope=guest-startup name=session_host_pinned bytes=1392 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges",
+    "strata admission class: scope=guest-startup name=resident_working_draft_pinned bytes=116 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=working MTP QSA staging and possible full-context pinned backing; allocator-derived bound",
+    "strata admission class: scope=guest-startup name=session_host_owner bytes=159744 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=ABI-checked owner/QSA envelopes",
+    "strata admission class: scope=guest-startup name=judge_session_host_pinned bytes=580 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-startup name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-startup name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-startup name=judge_branch_checkpoint_host bytes=55602455 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-startup name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-startup name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-startup name=judge_session_host_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-startup name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-startup name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-startup name=judge_branch_checkpoint_host bytes=55600146 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-startup name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-startup name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-startup name=judge_session_host_pinned bytes=348 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=guest-startup name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=guest-startup name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived 108 B per stage staging/readback",
+    "strata admission class: scope=guest-startup name=judge_branch_checkpoint_host bytes=22503182 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=guest-startup name=judge_head_readback_host bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=guest-startup name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=guest-startup name=judge_opaque_runtime_host bytes=536870912 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling",
+    "strata admission class: scope=guest-startup name=judge_request_input_host bytes=32768 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one bounded caller-owned prompt vector for the serial lane",
+    "strata admission class: scope=guest-startup name=verifier_canary_host bytes=4656 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=mapped per-stage operation identity staging/readback",
+    "strata admission class: scope=guest-startup name=operation_canary_host bytes=648 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=prefill and MTP independent owner staging/readback",
+    "strata admission class: scope=guest-startup name=resident_slot_main_pinned bytes=5568 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges",
+    "strata admission class: scope=guest-startup name=resident_slot_main_owner bytes=638976 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=ABI-checked resident owner envelopes",
+    "strata admission class: scope=guest-startup name=resident_histories bytes=8388608 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two context-bounded ResidentSlot ids/prompt vectors per requested slot",
+    "strata admission class: scope=guest-startup name=resident_checkpoints bytes=549855448 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=state-only stage-local checkpoint vectors and IDs; 12.5% whole-seat payload margin plus 4 KiB per stage",
+    "strata admission class: scope=guest-startup name=resident_verifier_pinned bytes=528 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=mapped slot commit controls",
+    "strata admission class: scope=guest-startup name=resident_verifier_history bytes=393216 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=4096 int32 history entries per slot",
+    "strata admission class: scope=guest-startup name=resident_slot_draft_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=requested draft QSA staging and full logical ring backing",
+    "strata admission class: scope=guest-startup name=resident_slot_draft_owner bytes=16480 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=draft slot owner envelope, weights and scratch shared",
+    "strata admission class: scope=guest-startup name=host_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=graph hits host residency vector payload",
+    "strata admission class: scope=guest-startup name=penalty_history_host bytes=131072 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=serving hist_stage vector payload",
+    "strata admission class: scope=guest-startup name=expert_worker_ownership bytes=20736 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes",
+    "strata admission class: scope=guest-startup name=expert_route_groups bytes=2048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one fixed request-owned route map shared by the global pool and all stages, never per slot",
+    "strata admission class: scope=guest-startup name=expert_worker_helpers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two setup-only registries of exactly the configured helper count, shared by all stages",
+    "strata admission class: scope=guest-startup name=expert_worker_scheduler bytes=1186 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one bounded ordered helper scheduler and diagnostic storage, drained before the next stage dispatch",
+    "strata admission class: scope=guest-startup name=expert_source_lanes bytes=1240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=one source owner per prefill stage plus its setup-only registry; no helper source lane",
+    "strata admission class: scope=guest-startup name=expert_source_ring bytes=5511315456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage conservative direct-only ring",
+    "strata admission class: scope=guest-startup name=expert_source_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=host cgroup-bounded reader metadata/stacks allowance",
+    "strata admission class: scope=guest-startup name=embedding_pinned bytes=337715200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=NativeEmbed full pinned table",
+    "strata admission class: scope=guest-startup name=ple_direct_cache bytes=101056512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=PleReader RowCache data+keys+replacement, two-page inflight slab and latency ring",
+    "strata admission class: scope=guest-startup name=prefill_host_staging bytes=256475136 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::init stager ring, two PLE row buffers, host routing and step tables",
+    "strata admission class: scope=guest-startup name=prefill_host_payload bytes=62292 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags",
+    "strata admission class: scope=guest-startup name=prefill_host_dynamic bytes=3296424 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit",
+    "strata admission class: scope=guest-startup name=prefill_cpu_share_buffers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit",
+    "strata admission class: scope=guest-startup name=stage_handoff bytes=335544320 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=two Prefill mapped handoff buffers per stage boundary",
+    "strata admission class: scope=guest-startup name=host_logits bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=host logits vector",
+    "strata admission class: scope=guest-startup name=prefix_cost_model bytes=3048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded process-local prefix transfer and context/prefill observations",
+    "strata admission class: scope=guest-startup name=runtime_host_staging bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=verify/pool mapped handoffs and metadata: at least the bounded eight-row mapped sequence when batch-MTP requested",
+    "strata admission class: scope=guest-startup name=verifier_diagnostic_host bytes=786432 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit",
+    "strata admission class: scope=guest-startup name=batch_mtp_pipeline_host bytes=303174720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging",
+    "strata admission class: scope=guest-startup name=prefill_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=operator-committed finite allowance for the prefill run's opaque host-side storage (CUDA events/context/registration, thread stacks, allocator metadata); the enforced worker cgroup ceiling, not this number, is what bounds the guest",
+    "strata admission class: scope=guest-startup name=file:embedding_upload bytes=337719296 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=mapped source beside pinned destination; retained without eviction proof",
+    "strata admission class: scope=guest-startup name=file:native_dense_upload bytes=2118373376 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=each supported native GGUF source span page-rounded; retained after upload/unmap",
+    "strata admission class: scope=guest-startup name=file:native_head_upload bytes=521478144 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=native GGUF output.weight source pages retained after upload/unmap",
+    "strata admission class: scope=guest-startup name=file:canonical_upload bytes=1541935104 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=index source union across all stages; clean source cache retained after buffered-reader close",
+    "strata admission class: scope=guest-startup name=file:mtp_upload bytes=823889920 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=MTP rt retained source pages beside device allocations",
+    "strata admission class: scope=guest-startup name=session_host_init_transient bytes=67108864 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=serial RoPE/page-table construction",
+    "strata admission class: scope=guest-startup name=judge_session_init_transient bytes=1048576 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=derived maximum serial short-owner RoPE/page-table construction payload, in addition to retained branch storage",
+    "strata admission class: scope=guest-startup name=canonical_upload_staging bytes=25165824 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=WeightTable CHUNK + 2*CHUNK pinned buffers; cudaFreeHost at end of WeightTable::load",
+    "strata admission class: scope=physical-host-runtime-incremental name=guest_unbacked_allocation bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=measured QEMU memfd allocation minus mincore resident backing; already-backed pages are in host MemAvailable",
+    "strata admission class: scope=physical-host-runtime-incremental name=session_host_pinned bytes=1392 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_working_draft_pinned bytes=116 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: working MTP QSA staging and possible full-context pinned backing; allocator-derived bound",
+    "strata admission class: scope=physical-host-runtime-incremental name=session_host_owner bytes=159744 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: ABI-checked owner/QSA envelopes",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_pinned bytes=580 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_branch_checkpoint_host bytes=55602455 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_branch_checkpoint_host bytes=55600146 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_pinned bytes=348 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_branch_checkpoint_host bytes=22503182 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_head_readback_host bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_opaque_runtime_host bytes=536870912 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling",
+    "strata admission class: scope=physical-host-runtime-incremental name=judge_request_input_host bytes=32768 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one bounded caller-owned prompt vector for the serial lane",
+    "strata admission class: scope=physical-host-runtime-incremental name=verifier_canary_host bytes=4656 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: mapped per-stage operation identity staging/readback",
+    "strata admission class: scope=physical-host-runtime-incremental name=operation_canary_host bytes=648 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: prefill and MTP independent owner staging/readback",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_slot_main_pinned bytes=5568 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_slot_main_owner bytes=638976 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: ABI-checked resident owner envelopes",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_histories bytes=8388608 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two context-bounded ResidentSlot ids/prompt vectors per requested slot",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_checkpoints bytes=549855448 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: state-only stage-local checkpoint vectors and IDs; 12.5% whole-seat payload margin plus 4 KiB per stage",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_verifier_pinned bytes=528 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: mapped slot commit controls",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_verifier_history bytes=393216 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: 4096 int32 history entries per slot",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_slot_draft_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: requested draft QSA staging and full logical ring backing",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_slot_draft_owner bytes=16480 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: draft slot owner envelope, weights and scratch shared",
+    "strata admission class: scope=physical-host-runtime-incremental name=host_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: graph hits host residency vector payload",
+    "strata admission class: scope=physical-host-runtime-incremental name=penalty_history_host bytes=131072 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: serving hist_stage vector payload",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_worker_ownership bytes=20736 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_route_groups bytes=2048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one fixed request-owned route map shared by the global pool and all stages, never per slot",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_worker_helpers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two setup-only registries of exactly the configured helper count, shared by all stages",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_worker_scheduler bytes=1186 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one bounded ordered helper scheduler and diagnostic storage, drained before the next stage dispatch",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_source_lanes bytes=1240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one source owner per prefill stage plus its setup-only registry; no helper source lane",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_source_ring bytes=5511315456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: per-stage conservative direct-only ring",
+    "strata admission class: scope=physical-host-runtime-incremental name=expert_source_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: host cgroup-bounded reader metadata/stacks allowance",
+    "strata admission class: scope=physical-host-runtime-incremental name=embedding_pinned bytes=337715200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: NativeEmbed full pinned table",
+    "strata admission class: scope=physical-host-runtime-incremental name=ple_direct_cache bytes=101056512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: PleReader RowCache data+keys+replacement, two-page inflight slab and latency ring",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefill_host_staging bytes=256475136 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: Prefill::init stager ring, two PLE row buffers, host routing and step tables",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefill_host_payload bytes=62292 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefill_host_dynamic bytes=3296424 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefill_cpu_share_buffers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit",
+    "strata admission class: scope=physical-host-runtime-incremental name=stage_handoff bytes=335544320 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two Prefill mapped handoff buffers per stage boundary",
+    "strata admission class: scope=physical-host-runtime-incremental name=host_logits bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: host logits vector",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefix_cost_model bytes=3048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: bounded process-local prefix transfer and context/prefill observations",
+    "strata admission class: scope=physical-host-runtime-incremental name=runtime_host_staging bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: verify/pool mapped handoffs and metadata: at least the bounded eight-row mapped sequence when batch-MTP requested",
+    "strata admission class: scope=physical-host-runtime-incremental name=verifier_diagnostic_host bytes=786432 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit",
+    "strata admission class: scope=physical-host-runtime-incremental name=batch_mtp_pipeline_host bytes=303174720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging",
+    "strata admission class: scope=physical-host-runtime-incremental name=prefill_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: operator-committed finite allowance for the prefill run's opaque host-side storage (CUDA events/context/registration, thread stacks, allocator metadata); the enforced worker cgroup ceiling, not this number, is what bounds the guest",
+    "strata admission class: scope=physical-host-runtime-incremental name=file:embedding_upload bytes=337719296 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: mapped source beside pinned destination; retained without eviction proof",
+    "strata admission class: scope=physical-host-runtime-incremental name=file:native_dense_upload bytes=2118373376 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: each supported native GGUF source span page-rounded; retained after upload/unmap",
+    "strata admission class: scope=physical-host-runtime-incremental name=file:native_head_upload bytes=521478144 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: native GGUF output.weight source pages retained after upload/unmap",
+    "strata admission class: scope=physical-host-runtime-incremental name=file:canonical_upload bytes=1541935104 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: index source union across all stages; clean source cache retained after buffered-reader close",
+    "strata admission class: scope=physical-host-runtime-incremental name=file:mtp_upload bytes=823889920 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: MTP rt retained source pages beside device allocations",
+    "strata admission class: scope=physical-host-runtime-incremental name=resident_transfer_transient bytes=335165271 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: max(one stage checkpoint + one main layer image, later draft image); 12.5% plus 4 KiB margin",
+    "strata admission class: scope=physical-host-startup-incremental name=guest_unbacked_allocation bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=measured QEMU memfd allocation minus mincore resident backing; already-backed pages are in host MemAvailable",
+    "strata admission class: scope=physical-host-startup-incremental name=session_host_pinned bytes=1392 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_working_draft_pinned bytes=116 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: working MTP QSA staging and possible full-context pinned backing; allocator-derived bound",
+    "strata admission class: scope=physical-host-startup-incremental name=session_host_owner bytes=159744 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: ABI-checked owner/QSA envelopes",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_pinned bytes=580 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_branch_checkpoint_host bytes=55602455 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_branch_checkpoint_host bytes=55600146 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_head_readback_host bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_pinned bytes=348 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived independent short SessionOwner mapped QSA controls",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_host_heap bytes=6264 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived SessionOwner plus global QsaState array ABI",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_operation_canary_host bytes=108 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived 108 B per stage staging/readback",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_branch_checkpoint_host bytes=22503182 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_head_readback_host bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived one full native-head row; no per-position full-logit matrix",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_metadata_host bytes=872 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_opaque_runtime_host bytes=536870912 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_request_input_host bytes=32768 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one bounded caller-owned prompt vector for the serial lane",
+    "strata admission class: scope=physical-host-startup-incremental name=verifier_canary_host bytes=4656 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: mapped per-stage operation identity staging/readback",
+    "strata admission class: scope=physical-host-startup-incremental name=operation_canary_host bytes=648 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: prefill and MTP independent owner staging/readback",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_slot_main_pinned bytes=5568 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_slot_main_owner bytes=638976 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: ABI-checked resident owner envelopes",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_histories bytes=8388608 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two context-bounded ResidentSlot ids/prompt vectors per requested slot",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_checkpoints bytes=549855448 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: state-only stage-local checkpoint vectors and IDs; 12.5% whole-seat payload margin plus 4 KiB per stage",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_verifier_pinned bytes=528 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: mapped slot commit controls",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_verifier_history bytes=393216 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: 4096 int32 history entries per slot",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_slot_draft_pinned bytes=464 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: requested draft QSA staging and full logical ring backing",
+    "strata admission class: scope=physical-host-startup-incremental name=resident_slot_draft_owner bytes=16480 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: draft slot owner envelope, weights and scratch shared",
+    "strata admission class: scope=physical-host-startup-incremental name=host_residency_table bytes=98304 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: graph hits host residency vector payload",
+    "strata admission class: scope=physical-host-startup-incremental name=penalty_history_host bytes=131072 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: serving hist_stage vector payload",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_worker_ownership bytes=20736 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_route_groups bytes=2048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one fixed request-owned route map shared by the global pool and all stages, never per slot",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_worker_helpers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two setup-only registries of exactly the configured helper count, shared by all stages",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_worker_scheduler bytes=1186 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one bounded ordered helper scheduler and diagnostic storage, drained before the next stage dispatch",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_source_lanes bytes=1240 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: one source owner per prefill stage plus its setup-only registry; no helper source lane",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_source_ring bytes=5511315456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: per-stage conservative direct-only ring",
+    "strata admission class: scope=physical-host-startup-incremental name=expert_source_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: host cgroup-bounded reader metadata/stacks allowance",
+    "strata admission class: scope=physical-host-startup-incremental name=embedding_pinned bytes=337715200 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: NativeEmbed full pinned table",
+    "strata admission class: scope=physical-host-startup-incremental name=ple_direct_cache bytes=101056512 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: PleReader RowCache data+keys+replacement, two-page inflight slab and latency ring",
+    "strata admission class: scope=physical-host-startup-incremental name=prefill_host_staging bytes=256475136 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: Prefill::init stager ring, two PLE row buffers, host routing and step tables",
+    "strata admission class: scope=physical-host-startup-incremental name=prefill_host_payload bytes=62292 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: Prefill::allocation_needed summed over actual stage hardware: token staging, routing, mapped/MMQ bounds and flags",
+    "strata admission class: scope=physical-host-startup-incremental name=prefill_host_dynamic bytes=3296424 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: per-stage counted init-bound stager jobs/ready, stream plan, grouping arrays and draft/init transients; no release credit",
+    "strata admission class: scope=physical-host-startup-incremental name=prefill_cpu_share_buffers bytes=0 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: resolved pool/share: chunk input, 2*min(chunk*K,n_expert*MAXT) output rows, both retained activation formats and exact job/selection/work arrays; no release credit",
+    "strata admission class: scope=physical-host-startup-incremental name=stage_handoff bytes=335544320 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: two Prefill mapped handoff buffers per stage boundary",
+    "strata admission class: scope=physical-host-startup-incremental name=host_logits bytes=993280 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: host logits vector",
+    "strata admission class: scope=physical-host-startup-incremental name=prefix_cost_model bytes=3048 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: bounded process-local prefix transfer and context/prefill observations",
+    "strata admission class: scope=physical-host-startup-incremental name=runtime_host_staging bytes=100663296 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: verify/pool mapped handoffs and metadata: at least the bounded eight-row mapped sequence when batch-MTP requested",
+    "strata admission class: scope=physical-host-startup-incremental name=verifier_diagnostic_host bytes=786432 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: bounded actual routing transcript plus 64-KiB full-logit streaming readback; no diagnostic release credit",
+    "strata admission class: scope=physical-host-startup-incremental name=batch_mtp_pipeline_host bytes=303174720 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging",
+    "strata admission class: scope=physical-host-startup-incremental name=prefill_runtime_storage bytes=268435456 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: operator-committed finite allowance for the prefill run's opaque host-side storage (CUDA events/context/registration, thread stacks, allocator metadata); the enforced worker cgroup ceiling, not this number, is what bounds the guest",
+    "strata admission class: scope=physical-host-startup-incremental name=file:embedding_upload bytes=337719296 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: mapped source beside pinned destination; retained without eviction proof",
+    "strata admission class: scope=physical-host-startup-incremental name=file:native_dense_upload bytes=2118373376 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: each supported native GGUF source span page-rounded; retained after upload/unmap",
+    "strata admission class: scope=physical-host-startup-incremental name=file:native_head_upload bytes=521478144 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: native GGUF output.weight source pages retained after upload/unmap",
+    "strata admission class: scope=physical-host-startup-incremental name=file:canonical_upload bytes=1541935104 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: index source union across all stages; clean source cache retained after buffered-reader close",
+    "strata admission class: scope=physical-host-startup-incremental name=file:mtp_upload bytes=823889920 unknown=0 meaning=clean-file host_mirror=1 clean_credit=1 source=same-machine physical host RAM: MTP rt retained source pages beside device allocations",
+    "strata admission class: scope=physical-host-startup-incremental name=session_host_init_transient bytes=67108864 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: serial RoPE/page-table construction",
+    "strata admission class: scope=physical-host-startup-incremental name=judge_session_init_transient bytes=1048576 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: derived maximum serial short-owner RoPE/page-table construction payload, in addition to retained branch storage",
+    "strata admission class: scope=physical-host-startup-incremental name=canonical_upload_staging bytes=25165824 unknown=0 meaning=anonymous host_mirror=0 clean_credit=0 source=same-machine physical host RAM: WeightTable CHUNK + 2*CHUNK pinned buffers; cudaFreeHost at end of WeightTable::load"
+  ],
+  "measured_shared_gemm_conversion_storage": [
+    {
+      "device": "0",
+      "gemm": "0x562e66440320",
+      "bf16_conversion_bytes": "85975040"
+    },
+    {
+      "device": "1",
+      "gemm": "0x562e65a658a0",
+      "bf16_conversion_bytes": "40099840"
+    },
+    {
+      "device": "2",
+      "gemm": "0x562e65b8dbc0",
+      "bf16_conversion_bytes": "0"
+    },
+    {
+      "device": "0",
+      "gemm": "0x562e66440320",
+      "bf16_conversion_bytes": "85975040"
+    },
+    {
+      "device": "1",
+      "gemm": "0x562e65a658a0",
+      "bf16_conversion_bytes": "40099840"
+    },
+    {
+      "device": "2",
+      "gemm": "0x562e65b8dbc0",
+      "bf16_conversion_bytes": "0"
+    }
+  ],
+  "measured_explicit_allocation_high_water": [
+    {
+      "phase": "before-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29289344112",
+      "explicit_high_water_bytes": "29289344112",
+      "allocations": "185"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28285844088",
+      "explicit_high_water_bytes": "28285844088",
+      "allocations": "165"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19602931080",
+      "explicit_high_water_bytes": "19602931080",
+      "allocations": "119"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28285844088",
+      "explicit_high_water_bytes": "28285844088",
+      "allocations": "165"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19602931080",
+      "explicit_high_water_bytes": "19602931080",
+      "allocations": "119"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28285844088",
+      "explicit_high_water_bytes": "28285844088",
+      "allocations": "165"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19602931080",
+      "explicit_high_water_bytes": "19602931080",
+      "allocations": "119"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28360688528",
+      "explicit_high_water_bytes": "28360688528",
+      "allocations": "167"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19602931080",
+      "explicit_high_water_bytes": "19602931080",
+      "allocations": "119"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28360688528",
+      "explicit_high_water_bytes": "28360688528",
+      "allocations": "167"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19602931080",
+      "explicit_high_water_bytes": "19602931080",
+      "allocations": "119"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "1",
+      "explicit_live_bytes": "28360688528",
+      "explicit_high_water_bytes": "28360688528",
+      "allocations": "167"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "2",
+      "explicit_live_bytes": "19644483744",
+      "explicit_high_water_bytes": "19644483744",
+      "allocations": "121"
+    },
+    {
+      "phase": "lane-ready",
+      "device": "0",
+      "explicit_live_bytes": "29368062856",
+      "explicit_high_water_bytes": "29368062856",
+      "allocations": "187"
+    },
+    {
+      "phase": "lane-ready",
+      "device": "1",
+      "explicit_live_bytes": "28360688528",
+      "explicit_high_water_bytes": "28360688528",
+      "allocations": "167"
+    },
+    {
+      "phase": "lane-ready",
+      "device": "2",
+      "explicit_live_bytes": "19645477024",
+      "explicit_high_water_bytes": "19645477024",
+      "allocations": "122"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "explicit_live_bytes": "19650850976",
+      "explicit_high_water_bytes": "19650850976",
+      "allocations": "123"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "2",
+      "explicit_live_bytes": "19650969644",
+      "explicit_high_water_bytes": "19650969644",
+      "allocations": "124"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "2",
+      "explicit_live_bytes": "19650969644",
+      "explicit_high_water_bytes": "19650969644",
+      "allocations": "124"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "0",
+      "explicit_live_bytes": "29459280776",
+      "explicit_high_water_bytes": "29459280776",
+      "allocations": "191"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "1",
+      "explicit_live_bytes": "28410618768",
+      "explicit_high_water_bytes": "28410618768",
+      "allocations": "171"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "2",
+      "explicit_live_bytes": "19650969644",
+      "explicit_high_water_bytes": "19650969644",
+      "allocations": "124"
+    }
+  ],
+  "measured_host_heap_rss_high_water": [
+    {
+      "phase": "before-state-init",
+      "pinned_live_bytes": "931684524",
+      "pinned_high_water_bytes": "931684524",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5805754976",
+      "rss_bytes": "1890041856",
+      "rss_high_water_bytes": "1890041856"
+    },
+    {
+      "phase": "after-state-init",
+      "pinned_live_bytes": "931685212",
+      "pinned_high_water_bytes": "931685212",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5855245296",
+      "rss_bytes": "1940123648",
+      "rss_high_water_bytes": "1940123648"
+    },
+    {
+      "phase": "before-state-init",
+      "pinned_live_bytes": "931685212",
+      "pinned_high_water_bytes": "931685212",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5855247200",
+      "rss_bytes": "1940123648",
+      "rss_high_water_bytes": "1940123648"
+    },
+    {
+      "phase": "after-state-init",
+      "pinned_live_bytes": "931685784",
+      "pinned_high_water_bytes": "931685784",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5904727392",
+      "rss_bytes": "1989550080",
+      "rss_high_water_bytes": "1989550080"
+    },
+    {
+      "phase": "before-state-init",
+      "pinned_live_bytes": "931685784",
+      "pinned_high_water_bytes": "931685784",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5904729296",
+      "rss_bytes": "1989550080",
+      "rss_high_water_bytes": "1989550080"
+    },
+    {
+      "phase": "after-state-init",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5924779456",
+      "rss_bytes": "2009612288",
+      "rss_high_water_bytes": "2009612288"
+    },
+    {
+      "phase": "lane-ready",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "5925776000",
+      "rss_bytes": "2009972736",
+      "rss_high_water_bytes": "2009972736"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422850544",
+      "rss_bytes": "2403717120",
+      "rss_high_water_bytes": "2403717120"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422850640",
+      "rss_bytes": "2403717120",
+      "rss_high_water_bytes": "2403717120"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422850800",
+      "rss_bytes": "2403717120",
+      "rss_high_water_bytes": "2403717120"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422852256",
+      "rss_bytes": "2406666240",
+      "rss_high_water_bytes": "2406666240"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422852256",
+      "rss_bytes": "2406666240",
+      "rss_high_water_bytes": "2406666240"
+    },
+    {
+      "phase": "first-use-complete",
+      "pinned_live_bytes": "931686240",
+      "pinned_high_water_bytes": "931686240",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6422852256",
+      "rss_bytes": "2406666240",
+      "rss_high_water_bytes": "2406666240"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "pinned_live_bytes": "931870444",
+      "pinned_high_water_bytes": "931870444",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6542541632",
+      "rss_bytes": "2489815040",
+      "rss_high_water_bytes": "2489815040"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "pinned_live_bytes": "931870444",
+      "pinned_high_water_bytes": "931870444",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6542541632",
+      "rss_bytes": "2489815040",
+      "rss_high_water_bytes": "2489815040"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "pinned_live_bytes": "931870444",
+      "pinned_high_water_bytes": "931870444",
+      "registered_live_bytes": "0",
+      "registered_high_water_bytes": "0",
+      "heap_live_bytes": "6542541632",
+      "rss_bytes": "2489815040",
+      "rss_high_water_bytes": "2489815040"
+    }
+  ],
+  "measured_mps_residual_observations": [
+    {
+      "phase": "before-state-init",
+      "device": "0",
+      "driver_used_bytes": "30418170000",
+      "driver_free_bytes": "3654389616"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "0",
+      "driver_used_bytes": "30496888464",
+      "driver_free_bytes": "3575671152"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "1",
+      "driver_used_bytes": "29414976144",
+      "driver_free_bytes": "4657583472"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "1",
+      "driver_used_bytes": "29489820304",
+      "driver_free_bytes": "4582739312"
+    },
+    {
+      "phase": "before-state-init",
+      "device": "2",
+      "driver_used_bytes": "22794901372",
+      "driver_free_bytes": "2633001092"
+    },
+    {
+      "phase": "after-state-init",
+      "device": "2",
+      "driver_used_bytes": "22836453756",
+      "driver_free_bytes": "2591448708"
+    },
+    {
+      "phase": "lane-ready",
+      "device": "2",
+      "driver_used_bytes": "22838550908",
+      "driver_free_bytes": "2589351556"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "driver_used_bytes": "30631098000",
+      "driver_free_bytes": "3441461616"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "driver_used_bytes": "29582742160",
+      "driver_free_bytes": "4489817456"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "driver_used_bytes": "22854410620",
+      "driver_free_bytes": "2573491844"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "0",
+      "driver_used_bytes": "30631098000",
+      "driver_free_bytes": "3441461616"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "1",
+      "driver_used_bytes": "29582742160",
+      "driver_free_bytes": "4489817456"
+    },
+    {
+      "phase": "first-use-complete",
+      "device": "2",
+      "driver_used_bytes": "22854410620",
+      "driver_free_bytes": "2573491844"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "0",
+      "driver_used_bytes": "30645687952",
+      "driver_free_bytes": "3426871664"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "1",
+      "driver_used_bytes": "29596447376",
+      "driver_free_bytes": "4476112240"
+    },
+    {
+      "phase": "generation-resumed-final",
+      "device": "2",
+      "driver_used_bytes": "22869541244",
+      "driver_free_bytes": "2558361220"
+    }
+  ],
+  "admission": {
+    "summary": [
+      {
+        "admit": "1",
+        "verified": "1",
+        "unknown_classes": "0",
+        "devices": "3",
+        "guest_fits": "1",
+        "host_fits": "1",
+        "guest_demand_bytes": "14397864436",
+        "host_demand_bytes": "14397864436",
+        "guest_ceiling_bytes": "23622320128",
+        "host_ceiling_bytes": "41679867904",
+        "runtime_allowance": "536870912"
+      }
+    ],
+    "devices": [
+      {
+        "device": "0",
+        "name": "CUDA0",
+        "demand_bytes": "30896265352",
+        "ceiling_bytes": "32969000432",
+        "headroom_bytes": "734003200",
+        "fits": "1"
+      },
+      {
+        "device": "1",
+        "name": "CUDA1",
+        "demand_bytes": "29551388304",
+        "ceiling_bytes": "32969000432",
+        "headroom_bytes": "734003200",
+        "fits": "1"
+      },
+      {
+        "device": "2",
+        "name": "CUDA2",
+        "demand_bytes": "21332212880",
+        "ceiling_bytes": "22286907088",
+        "headroom_bytes": "734003200",
+        "fits": "1"
+      }
+    ]
+  },
+  "operation_canary_and_lease_records": [
+    "JUDGE_REBIND_GUARDS device=0 geometry=1 device_owner=1 max_blocks=1 stream_owner=1 request_canary=1",
+    "JUDGE_REBIND_GUARDS device=1 geometry=1 device_owner=1 max_blocks=1 stream_owner=1 request_canary=1",
+    "JUDGE_REBIND_GUARDS device=2 geometry=1 device_owner=1 max_blocks=1 stream_owner=1 request_canary=1",
+    "STATE_SCRATCH resource=judge request=18446744073709551615 slot=8 epoch=1 checked=1 inputs=0",
+    "STATE_SCRATCH resource=judge request=18446744073709551615 slot=8 epoch=1 checked=1 inputs=0",
+    "STATE_SCRATCH resource=judge request=18446744073709551615 slot=8 epoch=1 checked=1 inputs=0",
+    "JUDGE_RESTORE request=18446744073709551615 cells=4096 stages=3 checked=1",
+    "STATE_SCRATCH resource=judge request=18446744073709551614 slot=8 epoch=2 checked=1 inputs=0",
+    "STATE_SCRATCH resource=judge request=18446744073709551614 slot=8 epoch=2 checked=1 inputs=0",
+    "STATE_SCRATCH resource=judge request=18446744073709551614 slot=8 epoch=2 checked=1 inputs=0",
+    "JUDGE_RESTORE request=18446744073709551614 cells=4096 stages=3 checked=1"
+  ],
+  "charges": {
+    "derived": [
+      "independent SessionOwner device/pinned/heap payload",
+      "280 B device/108 B host per-stage canary",
+      "one head output/readback row",
+      "retained GDN/PLE/indexer/ID branch checkpoint plus 12.5% capacity margin",
+      "stage/module metadata",
+      "per-allocation 2 MiB granule padding",
+      "bounded prompt input",
+      "serial RoPE/page-table construction transient"
+    ],
+    "measured": [
+      "link-wrapped explicit engine CUDA allocation live/peak payload",
+      "link-wrapped pinned/registration live/peak payload",
+      "existing Gemm BF16 conversion storage",
+      "glibc heap live bytes",
+      "process RSS and kernel VmHWM",
+      "MPS remaining-budget deltas",
+      "complete launcher safety telemetry"
+    ],
+    "allowances_not_measured_costs": [
+      "additional judge_library_first_use_driver (includes deferred conversion/MMQ workspaces)",
+      "additional judge_opaque_runtime_host",
+      "retained generation graph/prefill-library/host-runtime allowances"
+    ],
+    "shared_no_incremental_owner": [
+      "same actual initialized Prefill/Gemm/cuBLAS scratch/workspace (not zero deferred first-use storage)",
+      "same actual NativeHead weights/Q8_1 scratch"
+    ],
+    "limitations": [
+      "link wrapping excludes shared-library/driver internal allocations",
+      "MPS residual delta does not isolate cuBLAS from module loading or other opaque driver commitments",
+      "VmHWM covers the whole process, not one individually attributed host transient"
+    ]
+  },
+  "criteria": {
+    "verified_complete_admission": "keep",
+    "static_ownership_ledger_reconciled": "keep",
+    "same_actual_execution_owners_restored": "keep",
+    "all_24576_expert_pairs_resident": "keep",
+    "generation_capacity_non_regression": "keep",
+    "clean_authorised_lifecycle": "keep"
+  },
+  "stage_reconciliation": [
+    {
+      "device": 0,
+      "derived_incremental_explicit_device_bytes": 78718744,
+      "derived_device_granule_padding_bytes": 3070184,
+      "declared_incremental_driver_library_allowance_bytes": 268435456,
+      "measured_retained_gemm_bf16_conversion_bytes": 85975040,
+      "measured_incremental_explicit_device_bytes": 78718744,
+      "measured_first_use_explicit_extra_bytes": 91217920,
+      "measured_max_residual_budget_increment_bytes": 212928000,
+      "declared_incremental_device_envelope_bytes": 350224384,
+      "matched_incremental_explicit_payload": true,
+      "within_declared_incremental_envelope": true,
+      "full_run_explicit_device_high_water_bytes": 29459280776,
+      "measured_model_and_first_use_commitment_bytes": 29542128768,
+      "combined_generation_judge_admission_bytes": 30896265352,
+      "full_run_within_joint_admission": true
+    },
+    {
+      "device": 1,
+      "derived_incremental_explicit_device_bytes": 74844440,
+      "derived_device_granule_padding_bytes": 2750184,
+      "declared_incremental_driver_library_allowance_bytes": 268435456,
+      "measured_retained_gemm_bf16_conversion_bytes": 40099840,
+      "measured_incremental_explicit_device_bytes": 74844440,
+      "measured_first_use_explicit_extra_bytes": 49930240,
+      "measured_max_residual_budget_increment_bytes": 167766016,
+      "declared_incremental_device_envelope_bytes": 346030080,
+      "matched_incremental_explicit_payload": true,
+      "within_declared_incremental_envelope": true,
+      "full_run_explicit_device_high_water_bytes": 28410618768,
+      "measured_model_and_first_use_commitment_bytes": 28492888192,
+      "combined_generation_judge_admission_bytes": 29551388304,
+      "full_run_within_joint_admission": true
+    },
+    {
+      "device": 2,
+      "derived_incremental_explicit_device_bytes": 42545944,
+      "derived_device_granule_padding_bytes": 3591400,
+      "declared_incremental_driver_library_allowance_bytes": 268435456,
+      "measured_retained_gemm_bf16_conversion_bytes": 0,
+      "measured_incremental_explicit_device_bytes": 42545944,
+      "measured_first_use_explicit_extra_bytes": 5373952,
+      "measured_max_residual_budget_increment_bytes": 59509248,
+      "declared_incremental_device_envelope_bytes": 314572800,
+      "matched_incremental_explicit_payload": true,
+      "within_declared_incremental_envelope": true,
+      "full_run_explicit_device_high_water_bytes": 19650969644,
+      "measured_model_and_first_use_commitment_bytes": 19728545868,
+      "combined_generation_judge_admission_bytes": 21332212880,
+      "full_run_within_joint_admission": true
+    }
+  ],
+  "unknown_classes": [],
+  "host_reconciliation": {
+    "derived_retained_incremental_host_bytes": 134722187,
+    "derived_serial_initialization_transient_bytes": 1048576,
+    "derived_request_input_bytes": 32768,
+    "declared_additional_runtime_allowance_bytes": 536870912,
+    "declared_incremental_host_envelope_bytes": 672674443,
+    "measured_max_observed_heap_increment_bytes": 617097280,
+    "measured_rss_high_water_increment_bytes": 516624384,
+    "derived_incremental_pinned_bytes": 1716,
+    "measured_incremental_pinned_bytes": 1716,
+    "matched_pinned_payload": true,
+    "combined_generation_judge_host_admission_bytes": 14397864436,
+    "within_incremental_and_joint_envelopes": true,
+    "incremental_measurement_scope": "before-state-init through first-use-complete; ordinary generation is checked against the complete joint ledger",
+    "measured_full_run_host_heap_live_max_bytes": 6542541632,
+    "measured_full_run_host_rss_high_water_bytes": 2489815040,
+    "measured_full_run_host_heap_increment_bytes": 736786656,
+    "unattributed_generation_resume_heap_growth_bytes": 119689376,
+    "full_run_within_joint_admission": true,
+    "sampling_limit": "heap live is phase-sampled, not an allocator-wide transient peak; VmHWM is process-wide physical RSS high-water"
+  },
+  "generation_comparison": {
+    "matched_frozen_input": true,
+    "matched_text_reasoning_digests_and_usage": true,
+    "configured_capacity_unchanged": true,
+    "exercised_prompt_tokens": 1024,
+    "full_context_boundary_exercised": false,
+    "four_simultaneous_slots_exercised": false
+  },
+  "safety_peaks": {
+    "control": {
+      "samples": 29,
+      "mem_available_min_bytes": 48782544896,
+      "cpu_c_max": 73.875,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 47.0,
+          "power_max_w": 43.16
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 55.0,
+          "power_max_w": 156.82
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 47.0,
+          "power_max_w": 45.78
+        }
+      }
+    },
+    "candidate": {
+      "samples": 36,
+      "mem_available_min_bytes": 48628768768,
+      "cpu_c_max": 75.75,
+      "gpus": {
+        "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331": {
+          "temp_max_c": 52.0,
+          "power_max_w": 154.86
+        },
+        "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b": {
+          "temp_max_c": 56.0,
+          "power_max_w": 176.64
+        },
+        "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21": {
+          "temp_max_c": 52.0,
+          "power_max_w": 145.36
+        }
+      }
+    }
+  },
+  "failures": {
+    "control": [],
+    "candidate": []
+  },
+  "source_and_binary_identities": {
+    "control_fixture_files": {
+      "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/frontend.py": "a25d9337a4f8f202f9e86e9be153a040b3ef63ec6b2e463cfaa0dc3fe15fe28d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/server.py": "63349c03143cecbcf7bea690908c3f6cdd53765fa901d76b9ff36726c27acb0d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/tools/strata_tokenizer.py": "40595124e02c198e464c12cbe5fe6d4fb079daa3238263fc71ea8d2cf279ca12",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "candidate_fixture_files": {
+      "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test": "d3105b8f637dff3747be401013a0186670dea4b564524842986daa3fb8c63d6a",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/frontend.py": "a25d9337a4f8f202f9e86e9be153a040b3ef63ec6b2e463cfaa0dc3fe15fe28d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/serve/server.py": "63349c03143cecbcf7bea690908c3f6cdd53765fa901d76b9ff36726c27acb0d",
+      "/home/joshkirklin/strata-workspace/worktrees/daily-frontend-20261013/tools/strata_tokenizer.py": "40595124e02c198e464c12cbe5fe6d4fb079daa3238263fc71ea8d2cf279ca12",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    }
+  },
+  "disposition": "keep"
+}

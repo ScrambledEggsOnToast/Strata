@@ -1,0 +1,51 @@
+{
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "engine_source_commit": "2fafb0dd7f4279947439c30fab1990f55d4239c3",
+  "report_and_documentation_commit": "5e4ffaf172f7b62996cf474ded7151a088cf09c1",
+  "branch": "judge/232-ownership-admission",
+  "binaries_sha256": {
+    "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68",
+    "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata": "763f5ef9cee468096444254d61555891e2dee96da3aca93ddbb4f23bc4c1d3ab",
+    "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test": "d3105b8f637dff3747be401013a0186670dea4b564524842986daa3fb8c63d6a"
+  },
+  "source_files_sha256_at_delivery": {
+    "CMakeLists.txt": "8db36696ff9496a975130266c3c1a85907ed7eb6840467d997557fa9cb45eb85",
+    "docs/DETAILS.md": "0d0339232f1d5f4367438db806ec94a5433ff74155525c63fc871c7651b1ad3c",
+    "include/strata/core/session.hpp": "3c15a0ee9a02821594d4cdf8419c20eaadb8ba521717bbc767d1efb539aaa5ee",
+    "include/strata/prefill/prefill.hpp": "005a397b55095887f43865181cc250e792623e4947cb8520c004c66a3cd7e787",
+    "include/strata/program/serial_judge.hpp": "19103de3a96289d6f9fcf5489949d5c239d63b32f35ea6014a2bba7938dead1e",
+    "src/core/session.cpp": "6254dcd78a91c889122b73bd66b67f86fc23e2995d7a7d5160772166ac70a6bc",
+    "src/prefill/prefill.cpp": "a092ca9cbb38e6ecbb79f41f940cd2f13bc974ed96c87689baf4bb31375e1a83",
+    "src/program/generate.cpp": "30e4dfcc82d5fb5c452f18f77da829814cb36c08c3a1be96d99f5c867625504a",
+    "src/program/serial_judge.cpp": "c2a801cc8ee47088d782d58f7742c324cd0174aa6b9e575a1315496b192e378a",
+    "tests/core/judge_allocation_trace.cpp": "a887101cbd6682c0ff46c68a5e13d27ad4ca186cff3b234cd1b4c1f2f5552beb",
+    "tests/core/serial_judge_test.cpp": "81a4915443c2c67b4c0ea03efc32e21d8ce3e6e2a6147679eb0020d82759faf4",
+    "tools/judge_ownership_report.py": "6d246296bfb749a2b7885310165206393a9529468d85778ca7aa5a31903f0f52",
+    "include/strata/prefill/gemm.hpp": "7e07fa73c0aef606a3802cd5f593961e1b7f0ea282debfa5650c0282424a23f8",
+    "tools/test_judge_ownership_report.py": "57affde7109ae70f37b2e88fad1581c9bf6abb160f04d8744b95bfaccb97afda"
+  },
+  "dependency": {
+    "ggml_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "cuda_version": "12.9.86",
+    "host_gcc": "14.4.0",
+    "architectures": [
+      "70",
+      "86"
+    ]
+  },
+  "verification": {
+    "build": "pinned Release Make -j4 build passed; final rebuild 64.51 s",
+    "host_pricing_and_admission": "4/4 CTests passed, 0.14 s",
+    "offline_report_policy": "6/6 unittest cases passed after host phase-scope correction",
+    "gpu": "judge232-candidate-r3 authorised and cleanly stopped, failures []; two 4096-cell real leases and matched fresh 1024-token/8-output generation",
+    "reconciliation": "all six criteria keep in reconciliation-r3-corrected.json",
+    "unexercised": [
+      "full 262144-token generation boundary",
+      "four simultaneous generation requests",
+      "HIP/SYCL builds",
+      "in-flight negative guard injection",
+      "scoring numerical oracle/transport (separate tickets)",
+      "deployment/daily-profile performance qualification"
+    ]
+  }
+}

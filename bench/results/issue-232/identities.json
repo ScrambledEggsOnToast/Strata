@@ -1,0 +1,38 @@
+{
+  "source_commit": "a2aae4a8",
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "branch": "judge/232-ownership-admission",
+  "source_files_sha256": {
+    "CMakeLists.txt": "8db36696ff9496a975130266c3c1a85907ed7eb6840467d997557fa9cb45eb85",
+    "docs/DETAILS.md": "ba4367f29f2e489e425c159313e200e226c547544d3f72af3a847eec1869290c",
+    "include/strata/core/session.hpp": "3c15a0ee9a02821594d4cdf8419c20eaadb8ba521717bbc767d1efb539aaa5ee",
+    "include/strata/prefill/prefill.hpp": "d763847b838d067f45d43cc8b372a629be4d4965fd90fcccd63e37798c6c826e",
+    "include/strata/program/serial_judge.hpp": "578d2a9604470568cbb9b502068c51193bb9bf0b8f6e650fc73d87353cf7f8ba",
+    "src/core/session.cpp": "6254dcd78a91c889122b73bd66b67f86fc23e2995d7a7d5160772166ac70a6bc",
+    "src/prefill/prefill.cpp": "cfa49d9f2f0d6aa3f33903338c2503ca0561870120787ca44f579c89ca8114dc",
+    "src/program/generate.cpp": "479b7d71dfb9da0a7e69ae3e06a28330408567c89f61d2825a2c116e79e62311",
+    "src/program/serial_judge.cpp": "26e003a7d6331ac3b5bcd545a7bc3902652d7d1ae7d576e90aa24a906d1938b6",
+    "tests/core/judge_allocation_trace.cpp": "a887101cbd6682c0ff46c68a5e13d27ad4ca186cff3b234cd1b4c1f2f5552beb",
+    "tests/core/serial_judge_test.cpp": "81a4915443c2c67b4c0ea03efc32e21d8ce3e6e2a6147679eb0020d82759faf4",
+    "tools/judge_ownership_report.py": "adbc911ac880f7fcf70cd3f195d062846ac371a58fc11f143e155a2ac8f8333b"
+  },
+  "binaries_sha256": {
+    "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata": "0e58008fa674ae9fd16d367b15c854ec6e8245d4a949f1cda297826b886304fd",
+    "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test": "f07f49fb7fb45babcbe36c3ac9fa76123e42f48fdd4e27214258d92c5f85b237",
+    "/home/joshkirklin/strata-workspace/scratch/judge-232-build/serial_judge_test": "c969230e525610fa7ecc963664c534a2a10a0c4c24acb37b36cf90eaaa278bd6"
+  },
+  "dependency": {
+    "ggml_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "cuda_version": "12.9.86",
+    "host_gcc": "14.4.0",
+    "architectures": [
+      "70",
+      "86"
+    ]
+  },
+  "verification": {
+    "build": "full pinned Release Make build passed; final incremental lease guard build passed",
+    "host_tests": "4/4 passed: serial_judge_pricing, session_owner_pricing, resident_slots_preflight, plan_admission_test",
+    "gpu": "pending authorised reconciliation"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "daily_profile_sha256": "a2f6adf89e50b1848ec48c5496d6e6de336ed46163138c061f038cd0c1b15174",
+  "scope": "measurement configuration only; no daily-profile/release/deployment changes",
+  "common_against_daily": {
+    "timeout_s": [
+      0,
+      600
+    ],
+    "--prompt-cache": [
+      "6",
+      "0"
+    ],
+    "added_engine_args": [
+      "--no-prefill-borrow"
+    ],
+    "artifact_root": "/home/joshkirklin/strata-workspace/scratch/judge-232-runs",
+    "env_added": {
+      "TMPDIR": "/home/joshkirklin/strata-workspace/scratch",
+      "STRATA_STATE_HASH": "1"
+    }
+  },
+  "candidate_against_control": {
+    "binary": [
+      "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f",
+      "/home/joshkirklin/strata-workspace/scratch/judge-232-build/strata-judge-test"
+    ],
+    "added_engine_args": [
+      "--judge-context",
+      "4096",
+      "--judge-library-allowance-bytes",
+      "268435456",
+      "--judge-runtime-allowance-bytes",
+      "536870912"
+    ],
+    "env_added": {
+      "STRATA_JUDGE_OWNERSHIP_PROBE": "4096 repetitions of public token ID 1"
+    }
+  },
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "adopted_binary_sha256": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68",
+  "derived_allowances_not_measurements": {
+    "incremental_library_driver_per_device_bytes": 268435456,
+    "incremental_host_opaque_bytes": 536870912
+  },
+  "retained_caps_bytes": [
+    33285996544,
+    33285996544,
+    22548578304
+  ],
+  "retained_host_reserve_bytes": 8589934592,
+  "revision_reason": "r2 successful cold shared-owner lease measured about 497 MB additional host heap after lane initialization; 64 MiB host first-use allowance is not retained as a complete incremental reserve. r3 declares a separate 512 MiB host first-use allowance and records actual generation completion before frontend shutdown."
+}

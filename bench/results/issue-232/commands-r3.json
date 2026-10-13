@@ -1,0 +1,35 @@
+{
+  "configure": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 232 --purpose configure --max-s 1800 -- cmake -S /home/joshkirklin/strata-workspace/worktrees/judge-232 -B /home/joshkirklin/strata-workspace/scratch/judge-232-build -G \"Unix Makefiles\" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-cc -DCMAKE_CXX_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-g++ -DCMAKE_C_COMPILER_AR=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ar -DCMAKE_CXX_COMPILER_AR=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ar -DCMAKE_C_COMPILER_RANLIB=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ranlib -DCMAKE_CXX_COMPILER_RANLIB=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-gcc-ranlib -DCMAKE_CUDA_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/nvcc -DCMAKE_CUDA_HOST_COMPILER=/home/joshkirklin/strata-workspace/toolchains/cuda129/bin/x86_64-conda-linux-gnu-g++ -DCMAKE_CUDA_ARCHITECTURES=\"70;86\" -DCUDAToolkit_ROOT=/home/joshkirklin/strata-workspace/toolchains/cuda129 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_GGML_DIR=/home/joshkirklin/strata-workspace/scratch/repin-0.1.40.1-ggml -DSTRATA_PLE_FIXTURE_DIR=/home/joshkirklin/strata-workspace/worktrees/judge-232/bench/micro",
+  "build": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class build --ticket 232 --purpose \"Rebuild final admission and full-run ownership observations\" --max-s 1800 -- cmake --build /home/joshkirklin/strata-workspace/scratch/judge-232-build -j4",
+  "host_tests": "env CUDA_VISIBLE_DEVICES=-1 ctest --test-dir /home/joshkirklin/strata-workspace/scratch/judge-232-build -R '^(serial_judge_pricing|session_owner_pricing|resident_slots_preflight|plan_admission_test)$' --output-on-failure",
+  "fixture_control": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-control.json --prepare-request bench/results/issue-232/request-control.json --prompt-tokens 1024",
+  "fixture_candidate": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-candidate-r3.json --prepare-request bench/results/issue-232/request-candidate-r3.json --prompt-tokens 1024",
+  "measure_control": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class measure --ticket 232 --purpose control --max-s 1800 -- /home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-control.json --run-id judge232-control-r1 --request-json bench/results/issue-232/request-control.json --out bench/results/issue-232/result-control-r1.json",
+  "measure_candidate": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class measure --ticket 232 --purpose \"Reconcile complete shared-owner device host and generation high-water\" --max-s 1800 -- /home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile bench/results/issue-232/profile-candidate-r3.json --run-id judge232-candidate-r3 --request-json bench/results/issue-232/request-candidate-r3.json --out bench/results/issue-232/result-candidate-r3.json",
+  "offline_report": "env PYTHONDONTWRITEBYTECODE=1 python3 tools/judge_ownership_report.py --control bench/results/issue-232/result-control-r1.json --candidate bench/results/issue-232/result-candidate-r3.json --out bench/results/issue-232/reconciliation-r3-corrected.json",
+  "commands_are_reproducible": true,
+  "cwd": "/home/joshkirklin/strata-workspace/worktrees/judge-232",
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "ggml_pin": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "configured_build_identity": {
+    "generator": "Unix Makefiles",
+    "cuda": "12.9.86",
+    "host_gcc": "14.4.0",
+    "architectures": [
+      "70",
+      "86"
+    ]
+  },
+  "retained_rejected_attempt": {
+    "result": "result-candidate-r1.json",
+    "cause": "unset -1 pipeline sentinel used as boolean before default resolution; source fixed, profile unchanged"
+  },
+  "engine_source_commit": "2fafb0dd7f4279947439c30fab1990f55d4239c3",
+  "report_source_commit": "5e4ffaf172f7b62996cf474ded7151a088cf09c1",
+  "offline_policy_tests": "env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.test_judge_ownership_report",
+  "retained_rejected_reports": {
+    "reconciliation-r3.json": "offline host comparator incorrectly treated later generation allocation growth as isolated judge first-use; corrected without a GPU rerun or discarding any observed charge",
+    "reconciliation-r2.json": "old collection omitted PLAN stdout (consumed by frontend) and destructor-based full-run snapshots (frontend stops child before destruction)"
+  },
+  "immutable_outputs": "Commands are exact exercised invocations. Retained output paths refuse overwrite; for a new run use fresh run-id/request/result/report paths and rebind fixture to the rebuilt binary."
+}
