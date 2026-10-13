@@ -1,0 +1,41 @@
+{
+  "issue": 231,
+  "schema_version": 1,
+  "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-231-build/strata",
+    "sha256": "1e9aec92a40b9c0c523ac5d07b7baf74baa36b47ff782a60d5a7fd6981b34e86"
+  },
+  "build": {
+    "disposition": "pass",
+    "queue_class": "build",
+    "queue_id": "58f8521b0719",
+    "output_artifact": "artifact://184",
+    "observed_compilers": "CUDA 12.9.86; GNU host 14.4.0",
+    "architecture": "70;86",
+    "ggml_pin": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "targets": ["strata", "readout_reference_test"]
+  },
+  "checks": [
+    {
+      "command": "/home/joshkirklin/strata-workspace/scratch/judge-231-build/readout_reference_test",
+      "disposition": "pass",
+      "covers": ["300 selected IDs in requested order (beyond diagnostic cap 256)", "all-or-nothing invalid late target refusal", "nonfinite unselected vocabulary entry refusal", "create-only output", "stable full-vocabulary logsumexp and log probabilities", "position/count/no-generation metadata"]
+    },
+    {
+      "command": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python -m unittest discover -s tools -p test_judge_reference.py",
+      "disposition": "pass",
+      "tests": 8,
+      "covers": ["serial difference set and daily input immutability", "missing pack template refusal", "thinking disabled and generation prompt enabled without reasoning-effort reconstruction", "final-position n and complete ordered vector refusal checks", "both readout-family formulas", "full 200-group denominator refusal", "semantic failure yields stop_program and no selected family", "corpus freeze mutation refusal", "unprotected capture refusal"],
+      "test_data": "Synthetic CPU unit fixtures only. Never independent human gold or real-model semantic screen evidence."
+    },
+    {
+      "command": "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python -m unittest serve.test_frontend serve.test_context_overflow serve.test_logit_bias",
+      "disposition": "pass",
+      "tests": 28,
+      "covers": ["existing generation frontend", "existing context-overflow refusal", "existing logit-bias handling"],
+      "observed_warnings": "Existing ResourceWarning messages from serve/telemetry.py unclosed /proc/stat, /proc/cpuinfo and /proc/meminfo file reads. All tests passed."
+    }
+  ],
+  "not_exercised": ["HIP and SYCL builds unavailable in this assigned CUDA configuration", "200 independent-human-labelled development groups and family selection (blocked on issue 224)", "calibration, held-out evaluation, daily-profile promotion, concurrent scoring and deployment"]
+}

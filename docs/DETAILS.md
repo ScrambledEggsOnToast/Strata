@@ -1656,6 +1656,63 @@ adaptation are refused. Layer splits are supported. The boundary capture is limi
 to the native 2560-width, 512-expert, top-10 geometry. Keep the same observers in matched
 arms and do not interpret their runtime as observer-off performance.
 
+**Fresh no-decode scoring reference (#231, opt-in).** Run the executable with
+`--serve --tokens-file /absolute/prompt.tokens --score-reference /absolute/readout.json
+--score-select ID,ID,...` in a separately authorised serial configuration. It
+requires captured `--spec >=2` verification, the real expert pool, `--adapt-swaps 0`,
+`--suffix-draft 0`, `--prompt-cache 0`, no conversation cache, MTP, batch slots,
+pipelined windows, sampling or logit diagnostic environment variables. Layer
+splits remain supported. `spec` sets prompt verification workspace, not drafting.
+The normal prompt reader consumes positions `[0,n-1)`; a sampling-disabled
+one-token verification window then consumes the last prompt input, commits it
+and reads its full-vocabulary head. The readout is the prediction at position
+`n`, not the last prefill row. The process exits without entering decode or
+emitting generation terminals.
+
+The create-only JSON has `mode=fresh`, `engine_mode=serial_solo`, `position=n`,
+`consumed_prompt_tokens=n`, `prefix_tokens=0`, and `generated_tokens=0`. It contains
+every submitted selected token in order, with unscaled FP32 logits,
+full-vocabulary log-sum-exp and log probabilities. Invalid IDs or any nonfinite
+vocabulary entry refuse the whole vector; there is no top-k cap or skipped target.
+Existing batch head buffers also contain logits, but the diagnostic file wiring
+is serial-only. This reference does not add batch capture or qualify concurrency.
+
+`tools/judge_reference.py profile` copies the daily profile and records the full
+difference set: candidate binary/frontend, finite lifetime, batch 4 to 0, groups
+2 to 1, prompt cache 6 to 0, removed batch-MTP switches and MTP weights, explicit
+serial `--pipeline-windows 0 --serve`, and `--no-prefill-borrow`. The latter changes
+placement by reserving prompt workspace; this is a serial reference claim, never
+a daily-profile or performance claim. `prepare` uses only the pack template with
+`enable_thinking=false` and `add_generation_prompt=true`, refuses missing-template
+fallback, and does not inject or reconstruct reasoning effort. `capture` takes
+already-compiled tokens inside an inherited supervised MPS window and binds the
+source/binary, branch, little-endian int32 token SHA-256 and engine incarnation.
+It never provisions MPS or changes the daily profile.
+
+The CPU-only `prepare-screen` and `screen` commands cover all 200 independently
+human-labelled issue-224 development groups and their predeclared easy anchors.
+The corpus schema is version 1, `issue=224`, `fold=development`,
+`label_provenance=independent_human`, with `groups` (`group_id`, complete `items`)
+and `easy_anchors`. Each item has unique `id`, text-only `messages`, ordered
+`options` (`id`, `text`), and independent `gold_option_id`. `gate` fixes
+`minimum_group_accuracy` and `minimum_anchor_accuracy` before outcomes;
+`freeze_sha256` is SHA-256 of canonical sorted UTF-8 JSON excluding that field
+(compact separators, non-ASCII preserved). No thresholds are guessed.
+
+Both `direct_letter_logits` and `per_option_yes_no_log_odds` are prepared using
+the same prompt contract. The second reads Yes/No for every option and applies
+softmax to `yes_logit-no_logit` across the complete option set. Capture each
+prepared branch under its own bounded authorised window. `screen --corpus
+CORPUS --jobs JOBS --receipts DIRECTORY --out RESULT` rejects any missing,
+duplicate, reordered, extra or unbound branch rather than shrinking the
+denominator. A source group is correct only if all its items are correct; ties
+are incorrect. It records both families and selects a passing family by group
+accuracy, then anchor accuracy, then direct-letter order. If neither passes,
+`stop_program=true`, no family is selected, and exit status is 1.
+Without issue 224's frozen human corpus, the semantic screen and family selection
+are **blocked**, not a partial result. CPU test fixtures and arithmetic capture
+anchors are not independent gold, calibration data or semantic qualification.
+
 ---
 
 ### The Responses API and Codex CLI
