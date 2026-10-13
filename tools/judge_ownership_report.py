@@ -95,6 +95,25 @@ def reconcile(control_path, candidate_path):
                          matched_incremental_explicit_payload=increment == expected, within_declared_incremental_envelope=driver_increment <= allowed)
             exact = exact and increment == expected
             priced_peak = priced_peak and driver_increment <= allowed
+            final_allocations = [row for row in allocations if row.get('phase') == 'generation-resumed-final' and row.get('device') == device]
+            final_driver = [row for row in memories if row.get('phase') == 'generation-resumed-final' and row.get('device') == device]
+            caps = candidate.get('profile_snapshot', {}).get('mps_caps_bytes', [])
+            if final_allocations and final_driver and plans and int(device) < len(caps):
+                budget = int(plans[-1][f'device{device}_demand_bytes'])
+                ceiling = int(plans[-1][f'device{device}_ceiling_bytes'])
+                peak = integer(final_allocations[-1], 'explicit_high_water_bytes')
+                cap = int(caps[int(device)])
+                client_spent = cap - integer(final_driver[-1], 'driver_free_bytes')
+                context_spent = cap - ceiling
+                model_spent = client_spent - context_spent
+                entry.update(full_run_explicit_device_high_water_bytes=peak,
+                             measured_model_and_first_use_commitment_bytes=model_spent,
+                             combined_generation_judge_admission_bytes=budget,
+                             full_run_within_joint_admission=peak <= budget and model_spent <= budget)
+                priced_peak = priced_peak and peak <= budget and model_spent <= budget
+            else:
+                entry['missing_complete_generation_high_water'] = True
+                priced_peak = False
         else:
             entry['missing_allocation_or_residual_observation'] = True
             exact = priced_peak = False

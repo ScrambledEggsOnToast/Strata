@@ -141,10 +141,13 @@ bool judge_stage_bytes(const core::ModelGeometry& g, int64_t cells, int64_t k,
 }
 
 SerialJudgeLane::SerialJudgeLane() : impl_(std::make_unique<Impl>()) {}
-SerialJudgeLane::~SerialJudgeLane() = default;
+SerialJudgeLane::~SerialJudgeLane() {
+    if (impl_->initialized && !impl_->poisoned && !impl_->running.load())
+        for (const auto& stage : impl_->stages) observe("generation-resumed-final", stage->session.device());
+}
 bool SerialJudgeLane::ready() const { return impl_->initialized && !impl_->poisoned && !impl_->running.load(); }
 int64_t SerialJudgeLane::vocab() const { return impl_->vocabulary; }
-const float* SerialJudgeLane::logits() const { return impl_->row_ready ? impl_->readback.data() : nullptr; }
+const float* SerialJudgeLane::logits() const { return ready() && impl_->row_ready ? impl_->readback.data() : nullptr; }
 
 bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t k, int64_t vocab,
                            const plan::QsaPlacement& placement, const std::vector<JudgeStage>& bindings,
