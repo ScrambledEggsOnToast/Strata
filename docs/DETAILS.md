@@ -834,6 +834,55 @@ for an overfull context. `--admission-headroom-mib` sets explicit device headroo
 hypothetical future capacities that are reported but never admitted - as the document
 `schemas/memory-plan.schema.json` describes.
 
+### Serial judge execution ownership
+
+`--judge-context N` (1..4096, off by default) admits one independent short
+`SessionOwner` per existing stage, outside the generation slots and MTP slot
+vectors. `SerialJudgeLane` leases the actual serving `Prefill` objects, their
+existing `Gemm`/cuBLAS handle and workspace, and the existing native head.
+It does not create a second prefill chain, borrow expert-cache storage, or
+change generation context, slot count or prompt chunk size.
+
+The initial lane requires native weights, resident nonelastic KV, fixed
+`--prefill` and `--no-prefill-borrow`, with no adaptive/peer/helper/vision
+paths. Generation submitters must be stopped at a quiescent serial boundary.
+Every stage validates the original device/stream, immutable allocation
+geometry, layer range, KV format, page/indexer extent, retained max-block
+scratch and request canary before rebinding. Verifiers and the drafter must
+also be idle. Generation callbacks, PLE history bindings, request identity
+and per-device RoPE registration are restored before generation resumes.
+An operation or restoration failure refuses reuse; it is not a fallback to
+the generation session or a smaller scoring state.
+
+The admission ledger names the complete independent session device/pinned/
+heap payload, 280-byte device and 108-byte host canary per stage, one head
+output/readback row, retained host branch checkpoint, object metadata,
+device allocation-granule padding, request input and initialization
+transients. Shared workspace/head rows have a derived zero *incremental*
+price; their full generation charges remain. Original expert-cache budgets
+are retained, while the opt-in demand prices the concrete 256-aligned blobs
+for every resident pair and verifies those cache extents before creating
+the lane. Exactly 24,576 resident pairs and unchanged generation geometry
+are required; no expert residency is available to pay for scoring.
+
+`--judge-library-allowance-bytes` and `--judge-runtime-allowance-bytes` supply
+additional finite first-use/driver and host allocator/runtime commitments.
+Omitting either leaves an unknown class and refuses admission. These are
+declared bounds, not measured costs; they supplement, never replace, the
+existing generation allowances and measured ceilings.
+
+For an authorized allocation-reconciliation run, `strata-judge-test` wraps
+the engine's explicit CUDA allocation/free and host registration calls.
+`JUDGE_STATIC`, `JUDGE_OWNER`, `JUDGE_ALLOC`, `JUDGE_HOST` and `JUDGE_MEMORY`
+separate source-derived payloads, explicit allocation high-water marks,
+host RSS high-water and MPS residual-budget observations. Shared-library
+and driver allocations are not claimed as link-wrapped payloads.
+`STRATA_JUDGE_OWNERSHIP_PROBE=<bounded token CSV>` runs two fresh serial
+leases before `READY`, requires identical native-head bytes and verified
+generation restoration, then permits ordinary serving. This is an
+ownership/reconciliation seam, not a scoring transport, numerical
+qualification, throughput claim or deployment.
+
 ### A declared MPS client ceiling
 
 When a protected supervisor launches the engine inside an NVIDIA MPS client it fixes the
