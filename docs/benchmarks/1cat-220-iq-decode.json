@@ -2,7 +2,7 @@
   "ticket": 220,
   "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
   "donor": "https://github.com/1CatAI/1Cat-vLLM/tree/be3722bc095b9792bf9833068595f0b1ef70ad37",
-  "disposition": "blocked on admitted machine window after worker's two queue-busy retries; built/source-prepared, not numerical or runtime qualified; not a source-incompatibility or performance rejection",
+  "disposition": "reject \u2014 on measured primary C1 performance regression; no promotion. Numerical scope is limited below; natural-M correct census is unexercised (prior attempted override was inert), not proved unobtainable. Coordinator explicitly accepted this completed negative performance screen with disclosed evidence limitations.",
   "candidate": {
     "mechanism": "IQ2_S planar shared-memory codebook words; separate lower/upper 1024-word planes make all 32 banks addressable for either word",
     "donor_reference": "csrc/sm70_turbomind/ops/gguf_dp4a.cuh LatticeDot::initialize/word BankAware Type22",
@@ -25,7 +25,7 @@
     "down_combine": "native_down_multi_kernel uses grouped original IQ4_NL/Q2_0 weights and full640 intermediates; mode7/8 native_down_lds_kernel stages Hq. verify.cpp post combines routed FP32 outputs with CPU/PCIe/shared contributions; hits may already be folded into combine",
     "graphs": "Verifier captures per-stage/per-T graphs with runtime group counts, route entries and pointers. #193 retained completed-replay exposure T1-4 and eight capture keys on its serial64K/MTP profile; not actual per-expert row count evidence for this screen",
     "current_profile": "daily profile env has no STRATA_SM70_TABLE, so current decoder uses established mode0. Historical #193 +6.4802% is qualified only for separate serial split26/64K/MTP geometry, not daily three-GPU configuration",
-    "graph_tests": "iq_multi_parity now adds IQ2_S/IQ4_NL and IQ2_S/Q2_0 graph replay with changed activations, duplicate token mappings, changed group count and two interleaved private workspaces; existing grouped cases cover counts0..11 and unused destinations. Not yet exercised until a queued run succeeds",
+    "graph_tests": "iq_multi_parity added IQ2_S/IQ4_NL and IQ2_S/Q2_0 replay with changed activations, duplicate token maps, changed group count and two interleaved private workspaces. These passed exact old-control comparison on SM70 off/on and SM86. Existing grouped cases exercised counts0..11, unused destinations and smaller unsupported geometries.",
     "not_touched": "router probabilities, route sorting/grouping, sampler, proposal acceptance and rollback, shared expert, CPU/PCIe weights, prefill/indexed MMQ #219"
   },
   "donor_incompatibilities": {
@@ -37,24 +37,80 @@
     "not_local_gains": "published23.257->20.679ms C1 and51.672->44.380ms C4 compare donor FP16-activation controls on four V100 TP4. Dense27B #966 mixed-pair1.5x is not Flash-Next expert evidence"
   },
   "full_ffn_accounting": {
-    "geometry": {"hidden":2560,"expert_ff":640,"experts_per_layer":512,"layers":48,"top_k":10},
+    "geometry": {
+      "hidden": 2560,
+      "expert_ff": 640,
+      "experts_per_layer": 512,
+      "layers": 48,
+      "top_k": 10
+    },
     "official_native_expert_index": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/native_experts.txt",
     "original_all_expert_bytes": 50292326400,
     "format_pairs": [
-      {"gu":"IQ3_XXS","down":"IQ4_NL","layers":14,"gu_bytes":1254400,"down_bytes":921600,"total_bytes":2176000},
-      {"gu":"IQ3_XXS","down":"Q2_0","layers":3,"gu_bytes":1254400,"down_bytes":460800,"total_bytes":1715200},
-      {"gu":"IQ3_S","down":"IQ4_NL","layers":9,"gu_bytes":1408000,"down_bytes":921600,"total_bytes":2329600},
-      {"gu":"IQ3_S","down":"Q2_0","layers":1,"gu_bytes":1408000,"down_bytes":460800,"total_bytes":1868800},
-      {"gu":"IQ2_S","down":"IQ4_NL","layers":15,"gu_bytes":1049600,"down_bytes":921600,"total_bytes":1971200},
-      {"gu":"IQ2_S","down":"Q2_0","layers":5,"gu_bytes":1049600,"down_bytes":460800,"total_bytes":1510400},
-      {"gu":"IQ4_XS","down":"IQ4_NL","layers":1,"gu_bytes":1740800,"down_bytes":921600,"total_bytes":2662400}
+      {
+        "gu": "IQ3_XXS",
+        "down": "IQ4_NL",
+        "layers": 14,
+        "gu_bytes": 1254400,
+        "down_bytes": 921600,
+        "total_bytes": 2176000
+      },
+      {
+        "gu": "IQ3_XXS",
+        "down": "Q2_0",
+        "layers": 3,
+        "gu_bytes": 1254400,
+        "down_bytes": 460800,
+        "total_bytes": 1715200
+      },
+      {
+        "gu": "IQ3_S",
+        "down": "IQ4_NL",
+        "layers": 9,
+        "gu_bytes": 1408000,
+        "down_bytes": 921600,
+        "total_bytes": 2329600
+      },
+      {
+        "gu": "IQ3_S",
+        "down": "Q2_0",
+        "layers": 1,
+        "gu_bytes": 1408000,
+        "down_bytes": 460800,
+        "total_bytes": 1868800
+      },
+      {
+        "gu": "IQ2_S",
+        "down": "IQ4_NL",
+        "layers": 15,
+        "gu_bytes": 1049600,
+        "down_bytes": 921600,
+        "total_bytes": 1971200
+      },
+      {
+        "gu": "IQ2_S",
+        "down": "Q2_0",
+        "layers": 5,
+        "gu_bytes": 1049600,
+        "down_bytes": 460800,
+        "total_bytes": 1510400
+      },
+      {
+        "gu": "IQ4_XS",
+        "down": "IQ4_NL",
+        "layers": 1,
+        "gu_bytes": 1740800,
+        "down_bytes": 921600,
+        "total_bytes": 2662400
+      }
     ],
     "complete_projection_work_per_routed_entry": "three H*FF dots =4915200 multiplies/adds (9830400 nominal FLOPs), plus640 SiLU products, activation quantization and K-weighted FP32 combine; none saved by candidate",
     "weight_read_floor": "for group entry count m, each original blob contains above GU+down bytes. Unique-active bytes sum once per active expert; repeated-route read bound multiplies each expert's bytes by m; do not call total token count GEMM M or label nominal route bytes unique-source bandwidth",
-    "default_transient_traffic_per_entry": "GU write5120bytes; fused SwiGLU reads5120 and writes Hq720; down writes10240 FP32 routed output; combine reads10240; mode8 eliminates GU global write/read but still Hq720 and routed output. Candidate changes none of these",
+    "default_transient_traffic_per_entry": "Minimum global materialization: GU writes5120bytes; fused SwiGLU reads5120 and writesHq720; down writes10240FP32 routed output; combine reads10240. This is not total DRAM traffic: cache-dependent/repeated activation, codebook and weight reads are separate. Native down stages the720-byte Hq per output-row block (80blocks forIQ4_NL,160forQ2_0 atfull width), nominal57600/115200repeated global-load bytes, often cache-served. Mode8 eliminates GU global write/read but retainsHq and routed-output allocation. Candidate changes none of these materializations.",
     "existing_scratch": "3*align256(cap*640*4)+align256(cap*20*36); cap40=336128bytes, cap80=672000bytes, plus input Q8_1=2880bytes per token and routed output10240bytes per route. Reserved float planes remain even in mode8; do not count unused traffic as removed allocation",
     "donor_canonical_duplication": "Lattice canonical GU uses2bits/value plus8-byte metadata/group32 for IQ3_XXS/IQ3_S, or4-byte metadata/group16 for IQ2_S:1638400bytes per full-width gate+up pair in addition to retained original GU. Canonical IQ4_NL down819200codes+102400scales=921600bytes; Q2_0 group32 down409600codes+204800half2stats=614400bytes. Also two16-byte descriptors per projection per expert (96bytes/FFN) and16byte metadata/projection. Donor retains canonical GU while dp4a reads original GU, and canonical down instead of original down; importing canonical banks into Strata without discarding original representation would add these costs and may evict resident experts. Candidate imports no canonical/scalar-LUT bank",
-    "expanded_scalar_lut_rejected": "20bytes/32values would cost2048000bytes gate+up/expert, greater than every original IQ2/IQ3 pair, before canonical banks; not the selected no-persistent-storage mechanism"
+    "expanded_scalar_lut_rejected": "20bytes/32values would cost2048000bytes gate+up/expert, greater than every original IQ2/IQ3 pair, before canonical banks; not the selected no-persistent-storage mechanism",
+    "donor_raw_padding": "Original lattice GU rows in donor are8-byte padded: IQ3_XXS980->984,IQ3_S1100->1104,IQ2_S820->824 atK2560. Full640 gate+up adds5120bytes/expert over unpadded original Strata GU. Across47lattice layers x512experts this is123207680additional bytes if that raw layout were imported, separately from canonical-bank duplication. Candidate does not import it."
   },
   "predeclared_gates": {
     "numerical": "official-weight native_expert_parity layers0,1,2,17,21,47 uses independent ggml to_float complete FFN plus exact old-vs-new GPU check. Applicable exact equality:0 differing bytes, finite outputs, identical Q8_1 handoff and every same-prefix full-vocabulary committed model row; no mismatch tolerance for candidate. Existing3e-2 activation-vs-float bound is baseline oracle context, not permission for off/on differences",
@@ -68,24 +124,215 @@
   },
   "measurement_difference_set": {
     "profiles": "/home/joshkirklin/strata-workspace/scratch/1cat-220/profile-0.json and profile-1.json",
-    "versus_daily": ["binary points to candidate", "timeout_s900 instead of0", "prompt-cache0 instead of6", "no-prefill-borrow (placement reserve, not pure hygiene)", "artifact_root on scratch volume", "STRATA_IQ2_PLANAR_BOOK0/1"],
-    "between_latency_arms": ["env.STRATA_IQ2_PLANAR_BOOK only"],
+    "versus_daily": [
+      "binary points to candidate",
+      "timeout_s900 instead of0",
+      "prompt-cache0 instead of6",
+      "no-prefill-borrow (placement reserve, not pure hygiene)",
+      "artifact_root on scratch volume",
+      "STRATA_IQ2_PLANAR_BOOK0/1"
+    ],
+    "between_latency_arms": [
+      "env.STRATA_IQ2_PLANAR_BOOK only"
+    ],
     "scope": "measurement configuration, not daily qualification; C1 sole request takes solo GEN leg, not concurrent pipeline evidence"
   },
   "runtime_results": [
-    {"kind":"numerical-window","executed":false,"attempts":3,"backoff_s":[120,120],"exits":[75,75,75],"reasons":["machine busy: build, build, build","machine busy: build","machine busy: measure"],"receipt":"/home/joshkirklin/strata-workspace/scratch/1cat-220/queue-refusals.json","next_command":"CHECKPOINT-220.md"}
+    {
+      "kind": "numerical-window",
+      "executed": false,
+      "attempts": 3,
+      "backoff_s": [
+        120,
+        120
+      ],
+      "exits": [
+        75,
+        75,
+        75
+      ],
+      "reasons": [
+        "machine busy: build, build, build",
+        "machine busy: build",
+        "machine busy: measure"
+      ],
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/queue-refusals.json",
+      "next_command": "CHECKPOINT-220.md"
+    },
+    {
+      "kind": "official-weight-and-grouped-graph",
+      "executed": true,
+      "queue_id": "c1ee309021f2",
+      "exit": 0,
+      "device": "SM70 V100-PCIE-32GB",
+      "opt_in": 1,
+      "official_layers": [
+        0,
+        1,
+        2,
+        17,
+        21,
+        47
+      ],
+      "native_expert_parity_failures": 0,
+      "iq_multi_parity_failures": 0,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/oracle-sm70-on.json"
+    },
+    {
+      "kind": "off-and-SM86-fallback",
+      "executed": true,
+      "queue_id": "b7557e552d5a",
+      "exit": 0,
+      "iq_multi_parity_failures_each": 0,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/off-sm86-parity.json"
+    },
+    {
+      "kind": "missing-official-format",
+      "queue_id": "f00cc1b7bc37",
+      "layer": 20,
+      "format": "IQ3_XXS/Q2_0",
+      "exit": 0,
+      "native_expert_parity_failures": 0,
+      "evidence": "/home/joshkirklin/strata-workspace/scratch/1cat-220/diag-window.log"
+    },
+    {
+      "kind": "cheap-frozen-C1",
+      "queue_id": "c7c88cce7d62",
+      "off_on_ok": true,
+      "committed_each": 8,
+      "off_decode_ms": 105,
+      "on_decode_ms": 106,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/cheap-comparison.json"
+    },
+    {
+      "kind": "complete-committed-logits-and-exposure",
+      "queue_id": "f00cc1b7bc37",
+      "finite_rows_each": 8,
+      "full_vocabulary_logits_each": 1986560,
+      "differing_bytes": 0,
+      "same_prefix_tokens_exact": true,
+      "candidate_IQ2_node_occurrences": 57,
+      "replay_widths": [
+        1,
+        4
+      ],
+      "SM86_old_IQ2_occurrences_on": 3,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/complete-logits-comparison.json"
+    },
+    {
+      "kind": "matched-observer-free-C1",
+      "queue_id": "c7fe204ce2fc",
+      "case": "decode_32k",
+      "prompt_tokens": 32069,
+      "committed_outputs_each": 192,
+      "off_decode_ms": 2095,
+      "on_decode_ms": 2146,
+      "gain_percent": -2.3765144454799603,
+      "proposals_each": 147,
+      "accepted_each": 113,
+      "rejected_each": 34,
+      "max_fresh_prefill_regression_percent": 1.0799389599718268,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/c1-comparison.json"
+    },
+    {
+      "kind": "admitted-C2-response-window",
+      "queue_id": "023953b9ddd5",
+      "committed_outputs_each": 192,
+      "off_window_s": 2.409889471,
+      "on_window_s": 2.416012806,
+      "gain_percent": -0.25344795295757505,
+      "own_response_counts_timings_request_ids_retained": true,
+      "returned_choices_exact_each": true,
+      "draft_n_each_request": 0,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/cohort-comparison.json"
+    },
+    {
+      "kind": "route-census-default-hook-and-inert-control-finding",
+      "queue_id": "023953b9ddd5",
+      "natural_M_histogram_available": false,
+      "default_and_VERIFY_RESIDENT_0_dump_bytes_each": 0,
+      "operator_actual_group_counts": [
+        1,
+        3,
+        4,
+        5,
+        0,
+        8,
+        2,
+        11,
+        1
+      ],
+      "operator_entries": 35,
+      "receipt": "/home/joshkirklin/strata-workspace/scratch/1cat-220/route-capability-finding.json",
+      "attempted_control": "STRATA_VERIFY_RESIDENT=0 (not read by pinned verifier)",
+      "correct_control_unexercised": "STRATA_VERIFY_ALL_RESIDENT=0"
+    }
   ],
   "binary_identity": {
     "path": "/home/joshkirklin/strata-workspace/scratch/1cat-220-build/strata",
     "sha256": "1bedc578776d2fb8523c7998e8454848697bb7b7ea06e617a6cd155f42401bed",
-    "source_candidate": "c7bccc9a",
+    "source_candidate": "c7bccc9a48a70322ca6e7a1625c70dafcff9350b",
     "compiler": "CUDA12.9.86, conda GNU14.4.0 host and CXX",
-    "arch": ["70", "86"],
+    "arch": [
+      "70",
+      "86"
+    ],
     "ggml": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
     "build": "queued build d818e45b6a6d, exit0,309.56s; targets strata/native_expert_parity/native_expert_bench/native_grouped_parity/iq_multi_parity",
     "build_evidence": "artifact://174; CMakeCache and CMakeFiles/CMakeConfigureLog.yaml retained at scratch/1cat-220-build",
-    "preparatory_failures": ["CUDA-enable omitted: no strata target, exit2", "CUDA host pin omitted: system glibc cospi/sinpi exception-spec mismatch, exit1", "corrected recipe initially refused active launcher, exit75; resumed only after coordinator explicitly superseded transient-refusal rule"],
+    "preparatory_failures": [
+      "CUDA-enable omitted: no strata target, exit2",
+      "CUDA host pin omitted: system glibc cospi/sinpi exception-spec mismatch, exit1",
+      "corrected recipe initially refused active launcher, exit75; resumed only after coordinator explicitly superseded transient-refusal rule"
+    ],
     "retained_build_output": "/home/joshkirklin/strata-workspace/scratch/1cat-220/build-output.txt"
   },
-  "unmet_acceptance": ["official-weight exact numerical oracle", "changed-input/duplicate/private graph tests", "SM86 runtime fallback", "same-prefix complete model logits", "actual routed-M/exposure", "matched C1", "affected admitted concurrency", "held-out if promising"]
+  "unmet_acceptance": [
+    "No natural per-expert M distribution retained: default dump hook bypassed; attempted override was wrong, correctly configured alternative unexercised",
+    "Official-pack full-FFN oracle on SM86 not exercised",
+    "Direct intermediate payload/padding equality not separately dumped",
+    "No separate independent weighted-combine operator oracle; full weighted model logits exact over8captured rows"
+  ],
+  "numerical_scope": {
+    "arithmetic": "preserving: only codebook address layout changes; no original weights, activation quantizer, scale formula, summation tree, sampling or MTP state change",
+    "SM70": "Official-weight independent ggml dequantization/full-FFN oracle on all seven actual-pack pairs passed its established baseline activation-rounding bound. GPU candidate vs old per-entry FFN output was bitwise equal; GPU dequantization vs official to_float differed in0bits. Do not call the unquantized FP32 float FFN reference equal to the Q8_1 computation: its measured relative error remains1.07e-2..1.26e-2.",
+    "SM86": "Exact grouped/graph synthetic format and unsupported-shape fallback matrix passed; NOT the independent official-pack full-FFN oracle on SM86.",
+    "complete_weighted_model": "All8emitted predictor rows/1,986,560FP32logits across the three-GPU full weighted model were finite and byte-identical, including initial and terminal windows. Long C1 returned response hashes and proposal/acceptance counts matched; no192-row logit dump is claimed. The extra census-diagnostic pair duplicated the default execution because its override was inert; cross-planning exactness is not claimed.",
+    "operator_cases": "Hand-built routed-group counts[1,3,4,5,0,8,2,11,1],35entries; empty/uneven/partial/tail groups, duplicate token routes, unused destinations, changed inputs/counts under graph replay and interleaved request-private buffers. Smaller unsupported geometry and SM86 fallback exercised. No direct intermediate-payload/padding dump or independent weighted-combine operator oracle is claimed.",
+    "MTP": "Serial C1 exercised147proposals,113accepted and34rejected each, with proposal/rejection overhead in committed decode wall. Complete-logit diagnostics included terminal partial output3rows of a4rowverification. C2 returned draft_n0 and does not qualify concurrent speculative acceptance/rollback; those mechanisms were not modified.",
+    "rejection_consequence": "Measured regression suffices for coordinator-approved rejection, not full numerical qualification. Missing official SM86/intermediate evidence is retained as a limitation and cannot be quoted as passed."
+  },
+  "route_evidence_limit": "No measured natural per-expert M histogram. Default zero-doorbell routing dumps were empty. The attempted override used STRATA_VERIFY_RESIDENT=0 from a stale adjacent comment, but actual pinned verify.cpp:1391 reads STRATA_VERIFY_ALL_RESIDENT. That attempted control was inert; do not infer natural-M capture is impossible. Correct control exists in source but was not exercised before operator machine ownership. T1/T4 is verification width, not GEMM M; the35-entry operator fixture is hand-built, not a sampled workload.",
+  "heldout": "Not triggered: prespecified useful C1 gate>=3percent failed, with -2.3765percent primary regression. The short8-output cases showed small positive timing deltas but were not substituted for the predeclared192-output primary. No held-out or additional GPU work after operator hold.",
+  "safety_and_lifecycle": {
+    "successful_model_arms": 10,
+    "all_stopped": true,
+    "full_expert_residency_each": 24576,
+    "physical_host_reserve_bytes": 8589934592,
+    "unchanged_power_limits_w": [
+      150,
+      150,
+      420
+    ],
+    "no_new_GPU_or_build_requests_after_operator_hold": true,
+    "limits": "One matched pair; integer-ms native decode counters; no confidence interval/general slowdown claim. C2 uses response-bound client window, not one-token admission timing or count-matched engine logs.",
+    "evidence": "/home/joshkirklin/strata-workspace/scratch/1cat-220/lifecycle-safety.json",
+    "physical_host_available_min_bytes": 41570025472
+  },
+  "acceptance_decision": "Coordinator explicitly authorized measured-performance rejection with the above numerical/capability limitations; this record must not be read as full numerical or serving qualification of a kept candidate.",
+  "evidence_root": "/home/joshkirklin/strata-workspace/scratch/1cat-220",
+  "retained_commands": [
+    "/home/joshkirklin/strata-workspace/scratch/1cat-220/diag-window.log",
+    "/home/joshkirklin/strata-workspace/scratch/1cat-220/c1-window.log",
+    "/home/joshkirklin/strata-workspace/scratch/1cat-220/route-cohort-window.log"
+  ],
+  "unexercised_correct_census": {
+    "control": "STRATA_VERIFY_ALL_RESIDENT=0",
+    "source": "src/core/verify.cpp:1391",
+    "status": "source-prepared only, no GPU request under operator ownership; not guaranteed admitted or qualified",
+    "profile": "/home/joshkirklin/strata-workspace/scratch/1cat-220/profile-census-correct-0.json",
+    "exact_future_command": "/home/joshkirklin/ai-optimise/tools/host-inference/window.py run --class measure --ticket 220 --purpose \"Unexercised correct natural-M census, only after operator authorization\" --max-s 1800 -- /home/joshkirklin/ai-optimise/.venv/bin/python /home/joshkirklin/ai-optimise/tools/host-inference/measure.py --profile /home/joshkirklin/strata-workspace/scratch/1cat-220/profile-census-correct-0.json --run-id iq220-census-correct-off-r1 --out /home/joshkirklin/strata-workspace/scratch/1cat-220/census-correct-off-r1.json --request-json /home/joshkirklin/strata-workspace/scratch/1cat-220/fixture-1024.json",
+    "permission": "Do not execute while operator owns the GPUs; future explicit operator authorization required. This is not needed to reject the measured regressing candidate."
+  },
+  "historical_routing_evidence": "Before this study, retained real runtime group-pricing/capture evidence covered only serialT1 groups. This study adds hand-built operator groups and liveT1/T4 graph exposure, not a natural-M census. The attempted override name was wrong; source-correct control remains unexercised."
 }

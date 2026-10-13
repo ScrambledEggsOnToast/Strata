@@ -136,30 +136,60 @@ contraction risk before enabling the route; it is not a new locally measured par
 ## Original-byte IQ small-batch study (#220)
 
 The pinned [1Cat reader](https://github.com/1CatAI/1Cat-vLLM/blob/be3722bc095b9792bf9833068595f0b1ef70ad37/csrc/sm70_turbomind/ops/gguf_dp4a.cuh)
-has one small scheduling experiment worth isolating: store IQ2_S's two codebook
-words in separate shared-memory planes, so each word can address all 32 banks
-instead of just even or odd banks. `STRATA_IQ2_PLANAR_BOOK=1` opts into this
+supplied one isolated scheduling hypothesis: store IQ2_S's two codebook words in
+separate shared-memory planes, so either word can address all 32 banks instead of
+just even or odd banks. `STRATA_IQ2_PLANAR_BOOK=1` opts into this
 layout only for SM70's established grouped gate/up kernel at 2560 × 640.
 Unset or `0` keeps the established path. Other architectures, formats, unsupported
 shapes, disabled grid staging, per-entry kernels and tuned mode 8 keep their paths.
 No expert bank, activation boundary, dot formula, summation tree or MTP state
-changes; the per-block codebook remains 8 KiB. This is a candidate, not an adopted
-daily optimization. Restart with the flag unset to roll it back.
+changes; the per-block codebook remains 8 KiB. The bounded screen rejected this
+candidate on measured performance; it is not an adopted daily optimization.
+Restart with the flag unset to roll it back.
 
 Quantizing each input once, grouped activation indexing, two-row lane scheduling
 and fused gate/up/SwiGLU/intermediate encoding already exist in Strata. The donor's
 complete direct-route FFN is not a drop-in replacement: its policy admits only
-M5/M20 with 160-wide TP4 experts, and its down operator refuses widths above256.
-Strata's experts are640 wide and its projections/activation are FP32 between Q8_1
+M5/M20 with 160-wide TP4 experts, and its down operator refuses widths above 256.
+Strata's experts are 640 wide and its projections/activation are FP32 between Q8_1
 boundaries, unlike the donor's explicit FP16 projection/SiLU/down boundaries.
 The donor's published C1/C4 gains are against its FP16-activation control, not
 against Strata. Their numerical thresholds do not qualify this engine.
 
 The source map, full-FFN storage and predeclared exactness/performance gates are in
 [`benchmarks/1cat-220-iq-decode.json`](benchmarks/1cat-220-iq-decode.json).
-`native_expert_parity SHARD 0 1 2 17 21 47` consumes the official split GGUF
-weights and independent ggml dequantization; `iq_multi_parity` includes uneven
-groups, duplicate token routes, unused destinations, changed graph inputs and
-interleaved request-private workspaces. Run each with the flag off and on through
-the machine queue. A source inspection or a successful build is not numerical
-or real-model qualification; consult that record's disposition and unmet gates.
+`native_expert_parity SHARD 0 1 2 17 20 21 47` consumed the official split GGUF
+weights and independent ggml dequantization on SM70, covering all seven pack
+pairs. Its established float-FFN activation-rounding bound passed, while GPU
+candidate/control outputs and dequantized weight values were bitwise equal.
+`iq_multi_parity` passed the synthetic grouped/graph matrix on SM70 off/on and
+SM86, including uneven and empty groups, duplicate token routes, unused outputs,
+changed graph inputs and interleaved request-private workspaces. The official
+pack oracle was not run on SM86. Direct intermediate-payload/padding equality
+was not separately dumped; neither limitation is claimed as qualification.
+
+The same-binary, observer-free off/on pair retained 24,576 experts and committed
+192 outputs after an identical 32,069-token prompt: 2,095 ms off versus 2,146 ms
+on, a −2.3765% committed-decode throughput screen. Both arms proposed 147 draft
+tokens, accepted 113 and rejected 34; that overhead is included in decode wall.
+The predeclared useful threshold was +3%, not a short-output probe's result.
+The admitted two-request cohort committed 192 outputs in 2.409889471 s off versus
+2.416012806 s on (−0.25345%), measured from monotonic first submit to last response.
+Counts, request IDs and each response's own timings were retained; no batched
+one-token admission interval was called whole-request throughput.
+
+All eight captured emitted predictor rows (1,986,560 full-vocabulary logits)
+were finite and byte-identical across the three-GPU model. Completed diagnostic
+replays exposed 57 candidate IQ2 nodes at verification widths T1/T4. Those widths
+are not per-expert GEMM M. No natural histogram was retained: the default routing
+dump bypassed the host hook, and the attempted override used `STRATA_VERIFY_RESIDENT`
+from a stale comment instead of the actual `STRATA_VERIFY_ALL_RESIDENT` control.
+That attempted control was inert. Correctly configured census is unexercised,
+not proved unavailable. Its future command is retained in `CHECKPOINT-220.md`.
+Only the actual hand-built operator counts `[1,3,4,5,0,8,2,11,1]` (35 entries) are
+retained, not a sampled natural routing distribution. Empty artifacts remain.
+
+This is a performance rejection, not full numerical or serving qualification.
+One matched pair has no variance estimate. No held-out confirmation was triggered
+by the regressing primary, and no flag or profile was promoted. Exact commands,
+binary identity, raw run paths and the evidence limitations remain in the record.
