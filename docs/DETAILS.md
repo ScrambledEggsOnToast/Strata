@@ -28,7 +28,7 @@ argmax run on thread-block clusters (RTX 50, sm_90+; other cards keep the previo
 IQ3 packs about even; on HIP they run on gfx11 and on gfx1200 / gfx1201, see AMD_HIP.md); `STRATA_QSA_CLUSTER=0` / `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. The tables
 below are 0.1.26's.
 
-**Experimental V100 selection (#217).** `STRATA_QSA_NARROW=1` enables exact
+**Rejected V100 selection experiment (#217).** `STRATA_QSA_NARROW=1` enables exact
 candidate narrowing only on SM70, inside the existing wide selector's dispatch,
 with at most 32 query rows and at least 32,768 live score blocks. This applies to
 decode/verification and any small-row prompt call with that shape; it is not a
@@ -45,6 +45,21 @@ solo verification's last-layer scores and steps on each V100 for
 `qsa_topk_active_parity --snapshot FILE`. Neither observer belongs in latency
 arms. This opt-in experiment is not a default promotion or a measured daily
 profile gain.
+
+The [screen record](../bench/results/issue-217-result.json) rejects the candidate:
+at a frozen 131,073-token prefix, the observer-off containing committed decode
+interval was 120 → 118 ms for eight outputs (1.67%), below the prospectively fixed
+3% useful-gain threshold. The 1,024-token control was 107 → 106 ms, so it acquired
+no measured material overhead. This is one fresh solo `GEN` leg on a measurement
+configuration (finite lifetime, no prompt cache or prefill borrowing), not a
+daily-profile or concurrent-serving gain. Exact cell IDs passed on 42 adversarial
+cases, 24 changed-length graph rows and both V100 real score rows; the literal
+candidate's full-vocabulary first verified logit row was byte-identical at the
+same long prefix (248,320 FP32 values). The serving graph exposed 1- and 4-query
+candidate kernels on both V100s, and kept the original selector on SM86.
+Both normal kernels use 32 registers and 33,040 bytes of shared memory on SM70.
+No held-out timing followed a failed useful-gain screen, and no default or
+profile was promoted. The source and binary remain experimental evidence only.
 
 ### Prompt processing (tokens/s)
 
