@@ -1,0 +1,1 @@
+{"schema_version":1,"mode":"fresh","engine_mode":"serial_solo","position":36,"consumed_prompt_tokens":36,"row_position":35,"prefix_tokens":0,"generated_tokens":0,"sampling":false,"mtp":false,"n_vocab":248320,"vocab_logsumexp":24.121592335848703,"selected_token_ids":[9175,2665],"logits":[16.4824905,24.1198959],"log_probs":[-7.639101796297922,-0.0016964007901094647]}

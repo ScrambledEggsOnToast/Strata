@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "issue": 231,
+  "dispositions": {
+    "half_a": "keep",
+    "half_b": "blocked",
+    "blocking_issue": 224,
+    "semantic_screen_run": false,
+    "family_selection": null,
+    "semantic_go_no_go": null
+  },
+  "half_b_reason": "The 200 development source-state groups with genuinely independent human labels are issue 224's unfrozen deliverable. No corpus or labels are fabricated, and no partial screen is reported.",
+  "source": {
+    "branch": "judge/231-readout-reference",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "engine_implementation_commit": "4d24c59954053c7ebbaea6209c153cbc30092467",
+    "qualified_capture_source_commit": "6214f5b8d0e7fe1045b3583db3c65aaa3b556eb8",
+    "qualified_dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "generate_cpp_sha256": "c6fb9d36057de337f7e2a48508e999226494e433fb86307935eab41fe380a934",
+    "readout_reference_hpp_sha256": "026530037bd0f314f5eb6e4e40a6b5053a26849170740cfaa7bde2071d535849",
+    "judge_reference_py_sha256": "24f9ab3fa75cab77bef1a4fd181ee40ba39bc6d1089e4d127841c2e5bcf4280d",
+    "binary_path": "/home/joshkirklin/strata-workspace/scratch/judge-231-build/strata",
+    "binary_sha256": "1e9aec92a40b9c0c523ac5d07b7baf74baa36b47ff782a60d5a7fd6981b34e86"
+  },
+  "capture": {
+    "queue_id": "41baf37ff487",
+    "queue_class": "measure",
+    "unit": "strata-ref231-c3-20261013.service",
+    "unit_invocation_id": "3ac8598db3eb4390b95d3b2f813a5966",
+    "command_record": "commands.json: capture_scoped",
+    "result": "capture-3/result.json",
+    "model_identity": "capture-3/model-identity.json",
+    "profile_differences": "profile-differences.json",
+    "runtime_scope": "runtime-scope.json",
+    "receipts": 7,
+    "mode": "fresh",
+    "engine_mode": "serial_solo",
+    "generated_tokens_per_receipt": 0,
+    "sampling": false,
+    "mtp": false,
+    "complete_option_capture": "All A/B/C/D IDs 32/33/34/35 are present in submitted order. Every per-option Yes/No pair is present.",
+    "coverage_beyond_diagnostic_cap": "selected-coverage-beyond-256 contains exactly 300 requested IDs, 300 FP32 logits and 300 log probabilities; its first four logits exactly match the separate four-option capture.",
+    "final_position_probe": {
+      "prompt_tokens": 1093,
+      "prefill_stdout": "PP 1092 1093 1495 730.2",
+      "reference_stdout": "REFERENCE position=1093 selected=4 mode=fresh engine_mode=serial_solo generated_tokens=0",
+      "position": 1093,
+      "consumed_prompt_tokens": 1093,
+      "row_position": 1092,
+      "prefix_tokens": 0,
+      "token_digest": "426a58dd43a6985ac247d74233c7b0fcb571e5a7d9fcb56a7dce17c5a2ab7da9",
+      "receipt": "capture-3/prefill-plus-final-input/receipt.json"
+    },
+    "engine_incarnations": "Each receipt binds its own UUID, actual PID, process start ticks and boot ID; branch identity, token digest, source/binary/profile/model/prompt identities are retained.",
+    "no_generation_channel": "Capture wrapper checked every stdout file and rejected any T, BT, DONE or BDONE line. None was emitted.",
+    "actual_residency": "24576 resident experts; layer split 100% resident",
+    "cgroup_memory_guard": "limit 26.0 GiB, source cgroup",
+    "elapsed_s": 402.24829128501005,
+    "mps_cleanup_exit_code": 0,
+    "mps_cleanup_stderr": "",
+    "unit_exit": "0/SUCCESS",
+    "unit_memory_peak_observed": "23.6G",
+    "unit_swap_observed": "0B"
+  },
+  "prompt_contract": {
+    "template": "pack/tokenizer/chat_template.jinja",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "enable_thinking": false,
+    "add_generation_prompt": true,
+    "reasoning_effort_injection": false,
+    "effort_at_end_reconstruction": false,
+    "template_fallback": "refused; CPU negative exercised"
+  },
+  "safety": {
+    "telemetry": "capture-3/telemetry.jsonl",
+    "samples": 348,
+    "min_host_available_bytes": 49176707072,
+    "required_host_reserve_bytes": 8589934592,
+    "peak_cpu_c": 79.0,
+    "gpu_peaks": [
+      {"uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21", "temperature_c": 52, "power_w": 50.52, "uncorrected_volatile_ecc": "0"},
+      {"uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331", "temperature_c": 51, "power_w": 135.75, "uncorrected_volatile_ecc": "0"},
+      {"uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b", "temperature_c": 62, "power_w": 153.73, "uncorrected_volatile_ecc": "[N/A]"}
+    ],
+    "safety_excursion": false,
+    "power_clock_thermal_or_existing_mps_changes": false,
+    "gpu_reset": false
+  },
+  "verification": "verification.json and shared-method-cpu-test-2.json",
+  "shared_backend_reference": "Issue 223's FreshStrataBackend invokes the token-only CLI; screen preparation and evaluation use its sole normalize_request/compile_request/score_call method. Both pinned raw T=1 families and Choice/Noul/Score were exercised with 2010 synthetic CPU retained branches, not human gold or a real semantic screen.",
+  "retained_failures": {
+    "capture-1": "Refused because the acceptance capsule initially omitted daemon default-limit declarations; fixed to host.py's normal owned lifecycle at the unchanged caps.",
+    "capture-2": "MPS caps verified; --host-native refused absent finite cgroup memory.max. Fixed by the same frozen MemoryMax/CPUQuota/bounded properties as host.py, without dropping --host-native.",
+    "shared-method-cpu-test-2-failure.json": "Shared source changed during a CPU integration run and its marshal-v4 fingerprint was also unstable. Issue-223 owner froze the closure and corrected protocol; the same integration plus model-skew negative passed on recorded SHA 1464d1c4..."
+  },
+  "evidence_boundary": "The elementary arithmetic probes selected B=4 with both observational readouts, but are sanity-only observations. They are not issue-224 human gold and cannot select a family, qualify semantics, calibrate, promote or deploy the model/profile.",
+  "not_exercised": ["200-group semantic development screen and family selection", "native generation parity on GPU (existing 28 frontend regression tests passed)", "HIP/SYCL builds", "calibration/holdout/controller-policy qualification", "batch or concurrent scoring qualification", "daily-profile performance or promotion", "deployment"],
+  "unchanged_on_disk": ["daily profile", "daily release manifest", "model quantization/shards/pack", "evidence/issue-222"]
+}
