@@ -2,7 +2,7 @@
   "ticket": 220,
   "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
   "donor": "https://github.com/1CatAI/1Cat-vLLM/tree/be3722bc095b9792bf9833068595f0b1ef70ad37",
-  "disposition": "pending numerical and runtime gates; not qualified or promoted",
+  "disposition": "blocked on admitted machine window after worker's two queue-busy retries; built/source-prepared, not numerical or runtime qualified; not a source-incompatibility or performance rejection",
   "candidate": {
     "mechanism": "IQ2_S planar shared-memory codebook words; separate lower/upper 1024-word planes make all 32 banks addressable for either word",
     "donor_reference": "csrc/sm70_turbomind/ops/gguf_dp4a.cuh LatticeDot::initialize/word BankAware Type22",
@@ -72,7 +72,20 @@
     "between_latency_arms": ["env.STRATA_IQ2_PLANAR_BOOK only"],
     "scope": "measurement configuration, not daily qualification; C1 sole request takes solo GEN leg, not concurrent pipeline evidence"
   },
-  "runtime_results": [],
-  "binary_identity": null,
-  "unmet_acceptance": ["build", "official-weight exact numerical oracle", "changed-input/duplicate/private graph tests", "SM86 runtime fallback", "same-prefix complete model logits", "actual routed-M/exposure", "matched C1", "affected admitted concurrency", "held-out if promising"]
+  "runtime_results": [
+    {"kind":"numerical-window","executed":false,"attempts":3,"backoff_s":[120,120],"exits":[75,75,75],"reasons":["machine busy: build, build, build","machine busy: build","machine busy: measure"],"receipt":"/home/joshkirklin/strata-workspace/scratch/1cat-220/queue-refusals.json","next_command":"CHECKPOINT-220.md"}
+  ],
+  "binary_identity": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/1cat-220-build/strata",
+    "sha256": "1bedc578776d2fb8523c7998e8454848697bb7b7ea06e617a6cd155f42401bed",
+    "source_candidate": "c7bccc9a",
+    "compiler": "CUDA12.9.86, conda GNU14.4.0 host and CXX",
+    "arch": ["70", "86"],
+    "ggml": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+    "build": "queued build d818e45b6a6d, exit0,309.56s; targets strata/native_expert_parity/native_expert_bench/native_grouped_parity/iq_multi_parity",
+    "build_evidence": "artifact://174; CMakeCache and CMakeFiles/CMakeConfigureLog.yaml retained at scratch/1cat-220-build",
+    "preparatory_failures": ["CUDA-enable omitted: no strata target, exit2", "CUDA host pin omitted: system glibc cospi/sinpi exception-spec mismatch, exit1", "corrected recipe initially refused active launcher, exit75; resumed only after coordinator explicitly superseded transient-refusal rule"],
+    "retained_build_output": "/home/joshkirklin/strata-workspace/scratch/1cat-220/build-output.txt"
+  },
+  "unmet_acceptance": ["official-weight exact numerical oracle", "changed-input/duplicate/private graph tests", "SM86 runtime fallback", "same-prefix complete model logits", "actual routed-M/exposure", "matched C1", "affected admitted concurrency", "held-out if promising"]
 }
