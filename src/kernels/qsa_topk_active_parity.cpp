@@ -139,7 +139,10 @@ bool graph_check() {
         for (int64_t row = 0; row < nq; ++row) {
             const int64_t n = lengths[replay][row];
             auto* st = steps.data() + row * k::kStepCount;
-            k::qsa_step_fill(st, n - 1, s);
+            // qsa_step_fill describes a token, so it correctly refuses pos=-1.
+            // The selector also accepts empty rows: construct that record directly.
+            if (n == 0) std::fill(st, st + k::kStepCount, 0);
+            else k::qsa_step_fill(st, n - 1, s);
             for (int64_t b = 0; b <= n / 4; ++b)
                 scores[(size_t)(row * stride + b)] = score_value(modes[replay], b, random(rng));
             if (n % 4) scores[(size_t)(row * stride + n / 4)] += 1e9f;
