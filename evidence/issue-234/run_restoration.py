@@ -40,12 +40,15 @@ def prepare(args):
                 "prefix_tokens": prefix, "tokenisation_s": time.monotonic() - started}
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    profile_path = out / "serial-profile.json"
+    if profile_path != Path(args.profile).resolve():
+        ref.save(profile_path, profile)
     ref.save(out / "restoration-fixtures.json", fixtures)
     plan = {"schema_version": 1, "issue": 234, "fixed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "evidence_scope": "restoration only; one owned synthetic source with A/B/A variants, not qualification",
             "execution_leg": "serial_GEN", "source": ref.source_identity(),
             "binary": {"path": profile["binary"], "sha256": ref.digest(profile["binary"])},
-            "profile_sha256": ref.digest(args.profile),
+            "profile_sha256": ref.digest(profile_path),
             "fixtures_sha256": ref.digest(out / "restoration-fixtures.json"),
             "mps_caps_bytes": profile["mps_caps_bytes"], "reserve_bytes": profile["reserve_bytes"],
             "memory_max_bytes": profile["memory_max_bytes"], "timeout_s": profile["timeout_s"],

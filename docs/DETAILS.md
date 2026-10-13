@@ -1858,6 +1858,20 @@ difference ≤0.05, max TV ≤0.10 and p95 TV ≤0.02. Missing evidence cannot b
 relabelled as a fresh or shared-mode pass. Rollback is to omit both branching
 flags and use the unchanged fresh #231 serial reference; no deployment occurs.
 
+Retained restoration evidence is in `evidence/issue-234/`. The 56 native
+format/mode/prefix fixture cases passed, including every deliberately incomplete
+restore rejection (6,360 total snapshot-suite assertions). The real-model serial
+`GEN` probe consumed 1,093 tokens per branch, captured its 1,056-token prefix once,
+then restored before A/B/A. A replay had identical selected FP32 logits and
+identical committed GDN/PLE/KV fingerprints on all three stages. Fresh/fresh A
+was identical; observed fresh/reused max probability differences were 0.0045137332
+(A) and 0.0032865588 (B), with TV 0.0045137332 and 0.0034453530 and no argmax
+changes. These are **one owned synthetic source and two token-plan variants**,
+not the 3,000-group numerical campaign or a maximum-load pass. `model-1/result.json`
+retains complete-call, tokenisation, queue, checkpoint and restore times, frozen
+MPS cap declarations and clean private-daemon teardown. No performance gain,
+semantic qualification, parallel claim or serving promotion follows from it.
+
 ---
 
 ### Selected-logit scoring (SCORE v1)

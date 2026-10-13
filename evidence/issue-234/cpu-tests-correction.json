@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "argv": [
+    "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python",
+    "-m",
+    "unittest",
+    "-v",
+    "test_judge_prefix_campaign.PrefixCampaignTests.test_source_variants_cannot_count_as_independent_groups"
+  ],
+  "cwd": "/home/joshkirklin/strata-workspace/worktrees/judge-234/tools",
+  "exit_code": 0,
+  "elapsed_s": 0.6147825859952718,
+  "source_commit": "8ebc2398",
+  "evidence_scope": "Retry only the failed CPU test; no model or GPU claim",
+  "first_run": "cpu-tests.json"
+}

@@ -1,0 +1,49 @@
+Running as unit: strata-prefix234-model-1791899689.service; invocation ID: 0fd2eb3360754547bb3cb7fc84fc6cda
+{
+  "sampled_at": 1791899690.0209947,
+  "basis": "nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order",
+  "scope": "physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides",
+  "devices": [
+    {
+      "cuda_device": 0,
+      "gpu_uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+      "free_bytes": 34072428544,
+      "ceiling_bytes": 33285996544,
+      "outside_client_allowance_bytes": 67108864,
+      "ceiling_plus_allowance_bytes": 33353105408,
+      "margin_bytes": 719323136,
+      "max_fitting_ceiling_bytes": 34005319680,
+      "max_fitting_whole_gib": 31,
+      "physical_envelope_prediction": "would_fit"
+    },
+    {
+      "cuda_device": 1,
+      "gpu_uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+      "free_bytes": 34072428544,
+      "ceiling_bytes": 33285996544,
+      "outside_client_allowance_bytes": 67108864,
+      "ceiling_plus_allowance_bytes": 33353105408,
+      "margin_bytes": 719323136,
+      "max_fitting_ceiling_bytes": 34005319680,
+      "max_fitting_whole_gib": 31,
+      "physical_envelope_prediction": "would_fit"
+    },
+    {
+      "cuda_device": 2,
+      "gpu_uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+      "free_bytes": 22684893184,
+      "ceiling_bytes": 22548578304,
+      "outside_client_allowance_bytes": 67108864,
+      "ceiling_plus_allowance_bytes": 22615687168,
+      "margin_bytes": 69206016,
+      "max_fitting_ceiling_bytes": 22617784320,
+      "max_fitting_whole_gib": 21,
+      "physical_envelope_prediction": "would_fit"
+    }
+  ]
+}
+Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+Service runtime: 4min 28.272s
+CPU time consumed: 2min 27.187s
+Memory peak: 11.1G (swap: 0B)

@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "disposition": "blocked for released reuse; keep restoration mechanism and its bounded evidence",
+  "criteria": {
+    "exact_prefix_once_restore_every_suffix_release_after_call": "keep on scoped restoration evidence",
+    "checkpoint_completeness_and_deliberate_omission_detection": "keep on scoped byte fixtures and serial GEN replay",
+    "final_position_complete_finite_identity_bound_zero_generation": "keep for the six retained restoration/sanity readouts only",
+    "prospective_3000_independent_groups_per_workload_per_mode": "blocked",
+    "exact_95_upper_failure_rate_at_most_1_percent": "blocked; qualifying denominator is absent",
+    "all_qualified_rows_global_max_tv_p95_gates": "blocked; no qualifying campaign rows",
+    "idle_and_maximum_declared_coexistence_paired_modes": "blocked; only the serial GEN restoration probe was exercised",
+    "timing_includes_checkpoint_restore_tokenisation_queueing": "keep for retained restoration probe timing; no performance claim",
+    "fresh_control_and_rollback": "keep; fresh/fresh A identical in probe, fresh #231 path remains the rollback",
+    "released_reuse_mode": "blocked; no deployment or promotion"
+  },
+  "source": {
+    "branch": "judge/234-prefix-branching",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "prerequisite_integration": "011e8cb1",
+    "implementation_commit": "1b38d40d",
+    "measured_source_commit": "8ebc2398a8bb6da1a13373ba1299d2a9857a7029",
+    "measured_dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capture_source_sha256": {
+      "src/program/generate.cpp": "8c91e63071b467eb2bd1329d6eb9cdd06605fab7599d07f166cc8916e641cfe4",
+      "include/strata/program/readout_reference.hpp": "8bbb9df79fe609ff41478564cb6efe543a298eceabff87572dd2a1d83c70695b",
+      "include/strata/program/serial_prefix.hpp": "709ed0410f73baf2bfeec94573e94cb4810e33d764be2d1423eb58ca9e8ecad6",
+      "src/core/conversation_state.cpp": "a16bf095d2349141fb07bcea9230be11c5c90f1d805a13de50cc262752a28814",
+      "src/core/conversation_snapshot.cpp": "5041bf71ef95241591b4b8a875610a14574907bfd36ef2a216a89b3db9298313",
+      "include/strata/core/conversation_snapshot.hpp": "7f4a9f209e552a08afeb297275d0c4bac2c521d0fa6b78613d1461ff5c15e973",
+      "tools/judge_reference.py": "a65ac0280f191a12a11db25514a0842f8035eb1924f601ee7d2d64682b283632"
+    },
+    "candidate_binary": {
+      "path": "/home/joshkirklin/strata-workspace/scratch/judge-234-build/strata",
+      "sha256": "1aad797984efaecd58994b9237aedd343b9b4c6b78d6a4f00b8846dbe9c7762f"
+    },
+    "adopted_control_binary": {
+      "path": "/home/joshkirklin/strata-workspace/scratch/s043/strata-repin-32e14d4f",
+      "sha256": "5862438577303ac56ce4f385499100732f0e65ccd42540021991c3d4a7868b68"
+    }
+  },
+  "predeclaration": {
+    "numerical_gate_fixed_utc": "2026-10-13T13:49:06.624615+00:00",
+    "numerical_plan": "numerical-plan.json",
+    "restoration_plan_fixed_utc": "2026-10-13T13:50:08Z",
+    "restoration_plan_sha256": "186739a8c6cf9ccc1bcd70a9160e835fb7494ccb23cf9a454410cddc9cd0dbc1",
+    "full_campaign_declaration": "blocked on missing source pool and arrival traces; no fabricated primary selections"
+  },
+  "observed_scope": {
+    "fixture_cases": 56,
+    "snapshot_assertions": 6360,
+    "fixture_formats": [
+      "f16",
+      "int8",
+      "q4",
+      "k8v4"
+    ],
+    "fixture_kv_modes": [
+      0,
+      1
+    ],
+    "fixture_prefix_lengths": [
+      1,
+      3,
+      4,
+      5,
+      63,
+      64,
+      65
+    ],
+    "model_source_groups": 1,
+    "model_source_provenance": "owned synthetic arithmetic/background context, not independently human-labelled workload corpus",
+    "model_distinct_full_token_plans": 2,
+    "model_readouts": 6,
+    "model_execution_leg": "serial_GEN",
+    "model_tokens": 1093,
+    "prefix_tokens": 1056,
+    "prefix_prefills": 1,
+    "pre_suffix_restores": 3,
+    "model_stage_count": 3,
+    "reused_A_replay_selected_fp32_logits_equal": true,
+    "reused_A_replay_stage_gdn_ple_kv_fingerprints_equal": true,
+    "qualifying_source_groups": 0,
+    "qualifying_campaign_rows": 0
+  },
+  "observational_drift": {
+    "fresh_fresh_A": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0,
+      "tv": 0.0,
+      "max_logit_difference": 0.0
+    },
+    "fresh_reused_A": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0045137332167269895,
+      "tv": 0.004513733216727052,
+      "max_logit_difference": 2.0145655
+    },
+    "fresh_reused_B": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0032865587945648533,
+      "tv": 0.003445352966357854,
+      "max_logit_difference": 0.8676825000000008
+    },
+    "reused_A_replay": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0,
+      "tv": 0.0,
+      "max_logit_difference": 0.0
+    }
+  },
+  "timing": {
+    "tokenisation_s": 0.3554059669841081,
+    "queueing_s": 0.22748470306396484,
+    "fresh_call_s": [
+      50.03554481099127,
+      48.94586028897902,
+      48.946070702018915
+    ],
+    "reused_call_s": 52.0735808419995,
+    "checkpoint_ms": 291.034301,
+    "restore_ms": [
+      241.854001,
+      287.377512,
+      242.715892
+    ]
+  },
+  "timing_warning": "Whole-process calls include model startup and restoration observers. These are not resident-lane performance comparisons or an observer-off speed claim.",
+  "verification": {
+    "exact_cuda_build": "build-1/result.json (arch 70;86, CUDA 12.9.86, GNU 14.4.0, supplied make recipe, exit 0)",
+    "cpp_cpu_tests": "cpp-cpu-tests.json: 3/3 passed with CUDA_VISIBLE_DEVICES=-1",
+    "python_cpu_tests": "cpu-tests.json: 19/20 initial pass; retained fixture-setup failure corrected, failed test alone passes in cpu-tests-correction.json; all 20 named CPU tests exercised successfully across those runs",
+    "fixture_gpu_proof": "fixture-1/result.json",
+    "model_gpu_proof": "model-1/result.json",
+    "cpu_replay_helper_check": "replay-preparation-cpu-test.json (preparation/help only)"
+  },
+  "safety": {
+    "samples": 209,
+    "min_host_available_bytes": 43729100800,
+    "required_host_reserve_bytes": 8589934592,
+    "peak_cpu_c": 79.5,
+    "devices": [
+      {
+        "uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+        "peak_temperature_c": 51.0,
+        "peak_power_w": 158.86,
+        "ecc": [
+          "0"
+        ]
+      },
+      {
+        "uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+        "peak_temperature_c": 60.0,
+        "peak_power_w": 165.26,
+        "ecc": [
+          "[N/A]"
+        ]
+      },
+      {
+        "uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+        "peak_temperature_c": 50.0,
+        "peak_power_w": 150.91,
+        "ecc": [
+          "0"
+        ]
+      }
+    ],
+    "mps_caps_bytes": [
+      33285996544,
+      33285996544,
+      22548578304
+    ],
+    "mps_declarations_equal_frozen": true,
+    "mps_cleanup": {
+      "exit_code": 0,
+      "stderr": ""
+    },
+    "unit_result": "success",
+    "unit_memory_peak_observed": "11.1G",
+    "unit_swap_observed": "0B",
+    "power_clock_thermal_existing_daemon_changes": false,
+    "gpu_reset": false
+  },
+  "blockers": [
+    "No qualifying frozen independent-human-labelled source-state corpus exists (#224; confirmed by coordinator).",
+    "#224 specifies 200 development + 400 calibration + 600 sealed = 1200 groups TOTAL; #234 requires 3000 per workload and intended mode. Operator reconciliation is required.",
+    "Maximum-load contended logit dump wiring is absent. Batch-slot head rows exist; this is a capability gap, not an architectural limit. Adding the seam is outside #234."
+  ],
+  "not_exercised": [
+    "3000-group independent-source numerical campaign for any workload or mode",
+    "maximum-coexistence readout/arrival campaign",
+    "contended/batch-slot logits seam",
+    "semantic corpus/family selection/calibration/holdout/controller policies",
+    "HIP/SYCL builds",
+    "ordinary-generation GPU parity/performance",
+    "released serving reuse, deployment, profile or manifest promotion"
+  ],
+  "unchanged": [
+    "daily profile and release manifest",
+    "model quantisation/weights/pack/tokenizer",
+    "routing configuration",
+    "evidence/issue-222",
+    "Strata main tree and ai-optimise sources"
+  ],
+  "rollback": "Omit --score-branches and --score-prefix; use the fresh #231 serial GEN reference. The adopted control binary is retained.",
+  "evidence_index": [
+    "state-inventory.json",
+    "numerical-plan.json",
+    "restoration-plan.json",
+    "restoration-fixtures.json",
+    "profile-differences.json",
+    "build-1/command.json",
+    "fixture-1-queue/command.json",
+    "model-1-queue/command.json",
+    "model-1/model-identity.json",
+    "model-1/telemetry.jsonl",
+    "model-1/reused-A-B-A/engine.stderr",
+    "model-1/reused-A-B-A/receipt.json",
+    "model-1/reused-A-B-A/receipt.json.1",
+    "model-1/reused-A-B-A/receipt.json.2"
+  ],
+  "claim_record": {
+    "Statement": "The frozen serial GEN prefix branch restores the named persistent prefix state before each suffix and reproduces the selected FP32 A readout after A/B/A within the retained restoration scope.",
+    "Assumptions": [
+      "A1: measured source 8ebc2398 and binary 1aad7979... match retained identities",
+      "A2: frozen model/pack hashes, native routing and serial no-MTP/no-batch configuration are unchanged",
+      "A3: complete 1093-token plans and exact 1056-token common prefix are hash-bound prospectively",
+      "A4: exclusive machine queue ownership, valid safety telemetry and clean private MPS lifecycle"
+    ],
+    "Scope": "56 byte-state format/mode/prefix fixtures plus one owned synthetic three-stage serial GEN A/B/A model probe; not a universal or independent-workload numerical claim",
+    "Notation": [
+      "P := consumed common-prefix tokens (1056 in model probe)",
+      "n := consumed full prompt tokens (1093)",
+      "TV := half the L1 distance of raw T=1 selected-option probability vectors"
+    ],
+    "Evidence": [
+      "prefix saved once; each pre-suffix restore byte-verifies GDN/convolution, PLE history/scalars, indexer tail/dead/block position, pooled boundary and logical prefix KV",
+      "deliberately retaining suffix PLE while all other state restores is rejected in all 56 fixture cases",
+      "A/B/A selected FP32 logits and committed stage fingerprints match; fresh/fresh A delta is zero; fresh/reused drift is separately reported"
+    ],
+    "Status": "numerical",
+    "Falsifier": "Any missing mutable state element, pre-suffix byte mismatch, wrong-position/identity/generated result, or repeated A selected-logit mismatch in the declared scope",
+    "Open items": [
+      "No qualifying frozen independent-human-labelled source-state corpus exists (#224; confirmed by coordinator).",
+      "#224 specifies 200 development + 400 calibration + 600 sealed = 1200 groups TOTAL; #234 requires 3000 per workload and intended mode. Operator reconciliation is required.",
+      "Maximum-load contended logit dump wiring is absent. Batch-slot head rows exist; this is a capability gap, not an architectural limit. Adding the seam is outside #234."
+    ]
+  }
+}

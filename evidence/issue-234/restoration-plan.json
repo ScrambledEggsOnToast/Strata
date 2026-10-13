@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "fixed_utc": "2026-10-13T13:50:08Z",
+  "evidence_scope": "restoration only; one owned synthetic source with A/B/A variants, not qualification",
+  "execution_leg": "serial_GEN",
+  "source": {
+    "branch": "judge/234-prefix-branching",
+    "commit": "8ebc2398a8bb6da1a13373ba1299d2a9857a7029",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capture_source_sha256": {
+      "src/program/generate.cpp": "8c91e63071b467eb2bd1329d6eb9cdd06605fab7599d07f166cc8916e641cfe4",
+      "include/strata/program/readout_reference.hpp": "8bbb9df79fe609ff41478564cb6efe543a298eceabff87572dd2a1d83c70695b",
+      "include/strata/program/serial_prefix.hpp": "709ed0410f73baf2bfeec94573e94cb4810e33d764be2d1423eb58ca9e8ecad6",
+      "src/core/conversation_state.cpp": "a16bf095d2349141fb07bcea9230be11c5c90f1d805a13de50cc262752a28814",
+      "src/core/conversation_snapshot.cpp": "5041bf71ef95241591b4b8a875610a14574907bfd36ef2a216a89b3db9298313",
+      "include/strata/core/conversation_snapshot.hpp": "7f4a9f209e552a08afeb297275d0c4bac2c521d0fa6b78613d1461ff5c15e973",
+      "tools/judge_reference.py": "a65ac0280f191a12a11db25514a0842f8035eb1924f601ee7d2d64682b283632"
+    }
+  },
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-234-build/strata",
+    "sha256": "1aad797984efaecd58994b9237aedd343b9b4c6b78d6a4f00b8846dbe9c7762f"
+  },
+  "profile_sha256": "2336b2b551047e2fb0b47510ff92eeeabf5eed32b8e0125c05f9893809cfae29",
+  "fixtures_sha256": "15f1b35e9f70ffc53be74937ccc56355c960fbd77a7417571e09fcd27a720b85",
+  "mps_caps_bytes": [
+    33285996544,
+    33285996544,
+    22548578304
+  ],
+  "reserve_bytes": 8589934592,
+  "memory_max_bytes": 27917287424,
+  "timeout_s": 900,
+  "prefix_tokens": 1056,
+  "branches": [
+    {
+      "id": "restoration-A",
+      "token_digest": "426a58dd43a6985ac247d74233c7b0fcb571e5a7d9fcb56a7dce17c5a2ab7da9",
+      "tokens": 1093
+    },
+    {
+      "id": "restoration-B",
+      "token_digest": "e319eef9596fcd04a9cdee2d9a0991c9e86bad849828b7fecddef6db46a8929c",
+      "tokens": 1093
+    },
+    {
+      "id": "restoration-A-replay",
+      "token_digest": "426a58dd43a6985ac247d74233c7b0fcb571e5a7d9fcb56a7dce17c5a2ab7da9",
+      "tokens": 1093
+    }
+  ],
+  "fixture_matrix": {
+    "formats": [
+      "f16",
+      "int8",
+      "q4",
+      "k8v4"
+    ],
+    "kv_modes": [
+      0,
+      1
+    ],
+    "prefix_lengths": [
+      1,
+      3,
+      4,
+      5,
+      63,
+      64,
+      65
+    ],
+    "cases": 56,
+    "negative": "retain suffix PLE history while restoring every other element; production verification must reject",
+    "other_negatives": [
+      "one-byte GDN/PLE/tail/dead/block-position omission",
+      "PLE current and prior token scalars",
+      "pooled boundary rebuild omission",
+      "prefix KV contamination",
+      "reuse after release"
+    ]
+  },
+  "model_sequence": [
+    "fresh A",
+    "fresh A control",
+    "fresh B",
+    "one prefix prefill then restored A/B/A"
+  ],
+  "restoration_criteria": [
+    "all 56 GPU fixture cases pass their positive and deliberate rejection assertions",
+    "every reused serial GEN row has full coverage, correct position, restoration_verified and no generated answer",
+    "one PREFIX_CAPTURE, three PREFIX_RESTORE; complete stage suffix-state inventory",
+    "A replay has identical FP32 selected logits and identical committed GDN/PLE/KV fingerprints on every stage",
+    "all safety telemetry valid; private MPS caps exactly equal daily values and clean teardown"
+  ],
+  "timing_scope": "retained tokenisation + measured queue wait + complete process/call wall time including checkpoint and restore",
+  "numerical_campaign": {
+    "disposition": "blocked",
+    "required_groups_per_workload_per_mode": 3000,
+    "primary": "one preselected branch per independent source group",
+    "modes": [
+      "idle",
+      "maximum_coexistence"
+    ],
+    "maximum_coexistence": {
+      "generation_slots": 4,
+      "concurrent_submitted_judgments": 2
+    },
+    "failure": "argmax change OR max abs delta probability >0.02 OR TV>0.05",
+    "upper_bound": "exact one-sided 95% failure-rate upper bound <=0.01",
+    "all_rows": {
+      "max_difference": 0.05,
+      "max_tv": 0.1,
+      "p95_tv": 0.02,
+      "missing_nonfinite_wrong_position_identity_contamination_generated_answer": 0
+    },
+    "fresh_fresh_control": "required on identical full token plans",
+    "blockers": [
+      "#224 independent-human-labelled frozen source-state corpus is absent",
+      "contract conflict: #224 200+400+600=1200 groups total cannot supply #234 3000 per workload and mode",
+      "maximum-load contended logits dump wiring is absent; head rows exist, but extending wiring is outside #234"
+    ],
+    "no_parallel_claim": true,
+    "no_synthetic_qualification": true
+  }
+}

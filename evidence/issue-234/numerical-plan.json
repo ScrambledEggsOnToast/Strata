@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "fixed_utc": "2026-10-13T13:49:06.624615+00:00",
+  "disposition": "blocked",
+  "evaluation_started": false,
+  "qualifying_source_groups": 0,
+  "qualifying_rows": 0,
+  "source_commit": "8ebc2398",
+  "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "integrated_prerequisite_tip": "011e8cb1",
+  "intended_modes": [
+    "idle",
+    "maximum_coexistence"
+  ],
+  "maximum_coexistence": {
+    "generation_slots": 4,
+    "concurrent_submitted_judgments": 2
+  },
+  "required_groups_per_workload_per_mode": 3000,
+  "primary": "One branch preselected per independent source group before outcomes; no branch/group selection has been fabricated in the absence of a corpus",
+  "full_token_plan": "Identical compiled full prompt token arrays and complete requested-token sets fresh vs reused and fresh vs fresh",
+  "primary_failure": "argmax change OR max absolute probability difference > 0.02 OR TV > 0.05",
+  "rate_gate": "one-sided exact 95% upper failure-rate bound <= 0.01 for every workload/mode",
+  "all_rows": {
+    "missing": 0,
+    "nonfinite": 0,
+    "wrong_position": 0,
+    "identity_contamination": 0,
+    "generated_answer": 0,
+    "max_difference_le": 0.05,
+    "max_tv_le": 0.1,
+    "p95_tv_le": 0.02
+  },
+  "timing": "tokenisation + queueing + complete call including checkpoint and restore; no forward-only claim",
+  "probability_basis": "raw T=1 softmax of complete submitted selected-logit vectors, with no calibration or model/routing change",
+  "control": "fresh/fresh on identical full plans",
+  "blockers": [
+    "No qualifying frozen independent-human-labelled source-state corpus exists (#224; confirmed by coordinator).",
+    "#224 specifies 200 development + 400 calibration + 600 sealed = 1200 groups TOTAL; #234 requires 3000 per workload and intended mode. Operator reconciliation is required.",
+    "Maximum-load contended logit dump wiring is absent. Batch-slot head rows exist; this is a capability gap, not an architectural limit. Adding the seam is outside #234."
+  ],
+  "declaration_status": "Criteria are fixed prospectively, but a completed hash-bound campaign declaration is blocked on the missing source pool and traces. No partial or synthetic campaign is evaluated.",
+  "rollback": "Omit --score-branches and --score-prefix and use the fresh #231 serial GEN reference. No released serving reuse mode is enabled.",
+  "no_parallel_claim": true
+}

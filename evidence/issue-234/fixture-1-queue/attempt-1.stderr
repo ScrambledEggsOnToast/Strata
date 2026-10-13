@@ -1,0 +1,6 @@
+Running as unit: strata-prefix234-fixture-1791899522.service; invocation ID: 0d684a9f9a9c4dfc820a908ce13c653a
+Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+Service runtime: 2.390s
+CPU time consumed: 2.336s
+Memory peak: 93.8M (swap: 0B)

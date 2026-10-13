@@ -1,0 +1,7 @@
+{
+  "granted": true,
+  "id": "e5fe611a51b7",
+  "class": "measure",
+  "deadline_s": 1800.0
+}
+{"disposition": "keep", "error": null, "out": "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1"}

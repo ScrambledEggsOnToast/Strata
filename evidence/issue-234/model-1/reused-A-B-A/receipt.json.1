@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "mode": "reused",
+  "engine_mode": "serial_solo",
+  "position": 1093,
+  "consumed_prompt_tokens": 1093,
+  "row_position": 1092,
+  "prefix_tokens": 1056,
+  "generated_tokens": 0,
+  "sampling": false,
+  "mtp": false,
+  "n_vocab": 248320,
+  "vocab_logsumexp": 20.94163108800063,
+  "selected_token_ids": [
+    32,
+    33,
+    34,
+    35
+  ],
+  "logits": [
+    15.4538469,
+    12.9040699,
+    20.8833427,
+    14.1436615
+  ],
+  "log_probs": [
+    -5.4877841565431105,
+    -8.037561187487935,
+    -0.058288345080708126,
+    -6.7979695889771925
+  ],
+  "branch_index": 1,
+  "restoration_verified": true,
+  "checkpoint_ms": 291.034301,
+  "restore_ms": 287.377512,
+  "call_elapsed_ms": 3493.13022,
+  "execution_leg": "serial_GEN",
+  "branch_identity": {
+    "id": "restoration-B",
+    "token_digest": "e319eef9596fcd04a9cdee2d9a0991c9e86bad849828b7fecddef6db46a8929c"
+  },
+  "token_digest": "e319eef9596fcd04a9cdee2d9a0991c9e86bad849828b7fecddef6db46a8929c",
+  "engine_incarnation": {
+    "id": "fb3cdd10-7e92-4f1f-bf4c-972823dfc14c",
+    "pid": 916891,
+    "proc_start_ticks": "23946890",
+    "boot_id": "1dd458db-252e-4cbd-b3ff-5a80efebcbd4"
+  },
+  "source": {
+    "branch": "judge/234-prefix-branching",
+    "commit": "8ebc2398a8bb6da1a13373ba1299d2a9857a7029",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capture_source_sha256": {
+      "src/program/generate.cpp": "8c91e63071b467eb2bd1329d6eb9cdd06605fab7599d07f166cc8916e641cfe4",
+      "include/strata/program/readout_reference.hpp": "8bbb9df79fe609ff41478564cb6efe543a298eceabff87572dd2a1d83c70695b",
+      "include/strata/program/serial_prefix.hpp": "709ed0410f73baf2bfeec94573e94cb4810e33d764be2d1423eb58ca9e8ecad6",
+      "src/core/conversation_state.cpp": "a16bf095d2349141fb07bcea9230be11c5c90f1d805a13de50cc262752a28814",
+      "src/core/conversation_snapshot.cpp": "5041bf71ef95241591b4b8a875610a14574907bfd36ef2a216a89b3db9298313",
+      "include/strata/core/conversation_snapshot.hpp": "7f4a9f209e552a08afeb297275d0c4bac2c521d0fa6b78613d1461ff5c15e973",
+      "tools/judge_reference.py": "a65ac0280f191a12a11db25514a0842f8035eb1924f601ee7d2d64682b283632"
+    },
+    "model": "swift-1.5-flash-next-256k-host"
+  },
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-234-build/strata",
+    "sha256": "1aad797984efaecd58994b9237aedd343b9b4c6b78d6a4f00b8846dbe9c7762f"
+  },
+  "profile_sha256": "00d6116bb67eb1a8f361fa8738b841a2de4464dfd01d884199b4eced0cb95b99",
+  "model_identity": {
+    "release_manifest_sha256": "4709129f5a749d3926a990593fd1ee0ce4972dbac00b4bed2f0bba96bbce7989",
+    "revision": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
+    "quantization": "GSQ-RCO IQ3_S",
+    "files": {
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": {
+        "sha256": "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b",
+        "bytes": 44900816736
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": {
+        "sha256": "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608",
+        "bytes": 38842920384
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/index.txt": {
+        "sha256": "d83b66e10838fbe6fbfe5be3d027403644382e79b05680001134a661a2ecd092",
+        "bytes": 93691
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/conversions.json": {
+        "sha256": "13a6e8387ae050d148db1277d20b51402ec916b88d8547eb83f9d35cc1a9c5d6",
+        "bytes": 35627
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/native_experts.txt": {
+        "sha256": "540776d2ccbfa5006631e8813341ceb1d7f19b8c96a5d6dacd39bac871bdcb69",
+        "bytes": 5370
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/dense.bin": {
+        "sha256": "d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13",
+        "bytes": 1538035200
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": {
+        "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+        "bytes": 744960
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": {
+        "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+        "bytes": 3353258
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": {
+        "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+        "bytes": 5737005
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": {
+        "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        "bytes": 8952
+      },
+      "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/tokenizer.json": {
+        "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf",
+        "bytes": 541
+      }
+    }
+  },
+  "environment": {
+    "LD_LIBRARY_PATH": "/home/joshkirklin/strata-workspace/toolchains/cuda129/lib",
+    "STRATA_PREFILL_RING": "8",
+    "STRATA_IQ_MT_MIN": "1",
+    "CUDA_VISIBLE_DEVICES": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21,GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331,GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_MODULE_LOADING": "LAZY",
+    "STRATA_SUPERVISED": "1",
+    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/s234-911187",
+    "CUDA_MPS_LOG_DIRECTORY": "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/mps-log",
+    "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT": "0=33285996544,1=33285996544,2=22548578304"
+  },
+  "prompt_contract": {
+    "template": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "enable_thinking": false,
+    "add_generation_prompt": true,
+    "reasoning_effort_injection": false,
+    "effort_at_end": false,
+    "template_fallback": false
+  },
+  "request_sha256": "ce442d64b17dc990b4b84c8a5c486c88c2c7826d4b1395a73d2905f62c7c764f",
+  "readout_sha256": "3fd5750c831f425e92e59cf3e3ed23f5d825f86a2a056f495178df8a6f544860",
+  "argv": [
+    "/home/joshkirklin/strata-workspace/scratch/judge-234-build/strata",
+    "--pack",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack",
+    "--native",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+    "--expert-cache",
+    "auto",
+    "--expert-profile",
+    "/home/joshkirklin/strata-workspace/worktrees/daily-cutover-20261009/Strata/data/expert-profile.bin",
+    "--prefill",
+    "2048",
+    "--max-context",
+    "262144",
+    "--windowed-experts",
+    "--adapt-swaps",
+    "0",
+    "--pool-workers",
+    "4",
+    "--spec",
+    "4",
+    "--suffix-draft",
+    "0",
+    "--mps-cap-bytes",
+    "33285996544,33285996544,22548578304",
+    "--mps-outside-client-allowance-bytes",
+    "67108864",
+    "--graph-capture-allowance-bytes",
+    "268435456",
+    "--prefill-library-allowance-bytes",
+    "268435456",
+    "--guest-opaque-allowance-bytes",
+    "268435456",
+    "--kv",
+    "k8v4",
+    "--prompt-cache",
+    "0",
+    "--conversation-cache-mib",
+    "0",
+    "--greedy",
+    "--batch",
+    "0",
+    "--batch-groups",
+    "1",
+    "--trim-stage-weights",
+    "--layer-split",
+    "20,39",
+    "--split-device",
+    "1,2",
+    "--host-native",
+    "--rope-scaling",
+    "none",
+    "--spec-min-p",
+    "0.5",
+    "--no-prefill-borrow",
+    "--pipeline-windows",
+    "0",
+    "--serve",
+    "--tokens-file",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/prompt.tokens",
+    "--score-reference",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/readout.json",
+    "--score-select",
+    "32,33,34,35",
+    "--score-branches",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/branches.tokens",
+    "--score-prefix",
+    "1056"
+  ],
+  "elapsed_s": 52.07326226402074,
+  "exit_code": 0
+}

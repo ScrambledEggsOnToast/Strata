@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "evidence_scope": "CPU replay preparation/argument parsing only; no engine, queue or GPU action",
+  "prepare": {
+    "argv": [
+      "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python",
+      "evidence/issue-234/run_restoration.py",
+      "prepare",
+      "--profile",
+      "evidence/issue-234/serial-profile.json",
+      "--out",
+      "evidence/issue-234/replay-preparation-cpu-test"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"fixed_utc\": \"2026-10-13T14:41:45Z\", \"prefix_tokens\": 1056, \"plan_sha256\": \"01c86fc2a91526cf9a5cf551be63a9d49d60947df67dc662e2c5023428bec2ed\"}\n",
+    "stderr": ""
+  },
+  "measure_help": {
+    "argv": [
+      "/home/joshkirklin/strata-workspace/toolchains/mm-het002/bin/python",
+      "evidence/issue-234/measure.py",
+      "--help"
+    ],
+    "exit_code": 0,
+    "stdout": "usage: measure.py [-h] --out OUT [--plan-root PLAN_ROOT] {fixture,model}\n\nRun the fixed #234 restoration arm through the exclusive machine queue.\n\npositional arguments:\n  {fixture,model}\n\noptions:\n  -h, --help            show this help message and exit\n  --out OUT\n  --plan-root PLAN_ROOT\n",
+    "stderr": ""
+  }
+}

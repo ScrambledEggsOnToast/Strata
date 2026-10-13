@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "kind": "model",
+  "disposition": "keep",
+  "plan_sha256": "186739a8c6cf9ccc1bcd70a9160e835fb7494ccb23cf9a454410cddc9cd0dbc1",
+  "profile_sha256": "2336b2b551047e2fb0b47510ff92eeeabf5eed32b8e0125c05f9893809cfae29",
+  "execution_leg": "serial_GEN",
+  "queueing_s": 0.22748470306396484,
+  "numerical_qualification": "blocked; no campaign rows",
+  "source": {
+    "branch": "judge/234-prefix-branching",
+    "commit": "8ebc2398a8bb6da1a13373ba1299d2a9857a7029",
+    "base_commit": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+    "dirty_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capture_source_sha256": {
+      "src/program/generate.cpp": "8c91e63071b467eb2bd1329d6eb9cdd06605fab7599d07f166cc8916e641cfe4",
+      "include/strata/program/readout_reference.hpp": "8bbb9df79fe609ff41478564cb6efe543a298eceabff87572dd2a1d83c70695b",
+      "include/strata/program/serial_prefix.hpp": "709ed0410f73baf2bfeec94573e94cb4810e33d764be2d1423eb58ca9e8ecad6",
+      "src/core/conversation_state.cpp": "a16bf095d2349141fb07bcea9230be11c5c90f1d805a13de50cc262752a28814",
+      "src/core/conversation_snapshot.cpp": "5041bf71ef95241591b4b8a875610a14574907bfd36ef2a216a89b3db9298313",
+      "include/strata/core/conversation_snapshot.hpp": "7f4a9f209e552a08afeb297275d0c4bac2c521d0fa6b78613d1461ff5c15e973",
+      "tools/judge_reference.py": "a65ac0280f191a12a11db25514a0842f8035eb1924f601ee7d2d64682b283632"
+    }
+  },
+  "binary": {
+    "path": "/home/joshkirklin/strata-workspace/scratch/judge-234-build/strata",
+    "sha256": "1aad797984efaecd58994b9237aedd343b9b4c6b78d6a4f00b8846dbe9c7762f"
+  },
+  "receipts": [
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/fresh-A/receipt.json",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/fresh-A-control/receipt.json",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/fresh-B/receipt.json",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/receipt.json",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/receipt.json.1",
+    "/home/joshkirklin/strata-workspace/worktrees/judge-234/evidence/issue-234/model-1/reused-A-B-A/receipt.json.2"
+  ],
+  "mps_preflight": {
+    "sampled_at": 1791899690.0209947,
+    "basis": "nvidia-smi memory.free, whole MiB converted to bytes, mapped by UUID to profile CUDA order",
+    "scope": "physical-envelope prediction only; snapshot is not a reservation; the engine re-samples and decides",
+    "devices": [
+      {
+        "cuda_device": 0,
+        "gpu_uuid": "GPU-f65777f5-e0a8-44d8-7a60-e0a06e0c7d21",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 1,
+        "gpu_uuid": "GPU-5459ca09-fe84-8db7-8d3e-9943e1a99331",
+        "free_bytes": 34072428544,
+        "ceiling_bytes": 33285996544,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 33353105408,
+        "margin_bytes": 719323136,
+        "max_fitting_ceiling_bytes": 34005319680,
+        "max_fitting_whole_gib": 31,
+        "physical_envelope_prediction": "would_fit"
+      },
+      {
+        "cuda_device": 2,
+        "gpu_uuid": "GPU-91dcf482-34bf-83fb-ff50-8a523e2a5b6b",
+        "free_bytes": 22684893184,
+        "ceiling_bytes": 22548578304,
+        "outside_client_allowance_bytes": 67108864,
+        "ceiling_plus_allowance_bytes": 22615687168,
+        "margin_bytes": 69206016,
+        "max_fitting_ceiling_bytes": 22617784320,
+        "max_fitting_whole_gib": 21,
+        "physical_envelope_prediction": "would_fit"
+      }
+    ]
+  },
+  "mps_declarations": [
+    {
+      "command": "set_default_device_pinned_mem_limit 0 31744M",
+      "cap_bytes": 33285996544,
+      "frozen_cap_bytes": 33285996544,
+      "exit_code": 0,
+      "stderr": ""
+    },
+    {
+      "command": "set_default_device_pinned_mem_limit 1 31744M",
+      "cap_bytes": 33285996544,
+      "frozen_cap_bytes": 33285996544,
+      "exit_code": 0,
+      "stderr": ""
+    },
+    {
+      "command": "set_default_device_pinned_mem_limit 2 21504M",
+      "cap_bytes": 22548578304,
+      "frozen_cap_bytes": 22548578304,
+      "exit_code": 0,
+      "stderr": ""
+    }
+  ],
+  "suffix_states": [
+    {
+      "branch": 0,
+      "stage": 0,
+      "cells": "1093",
+      "gdn": "a2bd096eeceb60f3",
+      "ple": "924fe89efdc4cd80",
+      "kv": "1a805a819d83d855"
+    },
+    {
+      "branch": 0,
+      "stage": 1,
+      "cells": "1093",
+      "gdn": "f8e74713fc993fc7",
+      "ple": "f942672b2d804abe",
+      "kv": "d3e62d89feaec0a5"
+    },
+    {
+      "branch": 0,
+      "stage": 2,
+      "cells": "1093",
+      "gdn": "6ae222e8c5ca8cc8",
+      "ple": "f942672b2d804abe",
+      "kv": "4f4745fed2576179"
+    },
+    {
+      "branch": 1,
+      "stage": 0,
+      "cells": "1093",
+      "gdn": "14bcbc1ae5485446",
+      "ple": "a312487c255d5229",
+      "kv": "02a5dee09d5ae06c"
+    },
+    {
+      "branch": 1,
+      "stage": 1,
+      "cells": "1093",
+      "gdn": "984d527d3343f961",
+      "ple": "f942672b2d804abe",
+      "kv": "1e6ec85f5e7f5489"
+    },
+    {
+      "branch": 1,
+      "stage": 2,
+      "cells": "1093",
+      "gdn": "042c97685dfbd3f9",
+      "ple": "f942672b2d804abe",
+      "kv": "4b9fff0ff9c4dbae"
+    },
+    {
+      "branch": 2,
+      "stage": 0,
+      "cells": "1093",
+      "gdn": "a2bd096eeceb60f3",
+      "ple": "924fe89efdc4cd80",
+      "kv": "1a805a819d83d855"
+    },
+    {
+      "branch": 2,
+      "stage": 1,
+      "cells": "1093",
+      "gdn": "f8e74713fc993fc7",
+      "ple": "f942672b2d804abe",
+      "kv": "d3e62d89feaec0a5"
+    },
+    {
+      "branch": 2,
+      "stage": 2,
+      "cells": "1093",
+      "gdn": "6ae222e8c5ca8cc8",
+      "ple": "f942672b2d804abe",
+      "kv": "4f4745fed2576179"
+    }
+  ],
+  "observational_drift": {
+    "fresh_fresh_A": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0,
+      "tv": 0.0,
+      "max_logit_difference": 0.0
+    },
+    "fresh_reused_A": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0045137332167269895,
+      "tv": 0.004513733216727052,
+      "max_logit_difference": 2.0145655
+    },
+    "fresh_reused_B": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0032865587945648533,
+      "tv": 0.003445352966357854,
+      "max_logit_difference": 0.8676825000000008
+    },
+    "reused_A_replay": {
+      "argmax_change": false,
+      "max_probability_difference": 0.0,
+      "tv": 0.0,
+      "max_logit_difference": 0.0
+    }
+  },
+  "timing": {
+    "tokenisation_s": 0.3554059669841081,
+    "queueing_s": 0.22748470306396484,
+    "fresh_call_s": [
+      50.03554481099127,
+      48.94586028897902,
+      48.946070702018915
+    ],
+    "reused_call_s": 52.0735808419995,
+    "checkpoint_ms": 291.034301,
+    "restore_ms": [
+      241.854001,
+      287.377512,
+      242.715892
+    ]
+  },
+  "claim": "one synthetic serial GEN A/B/A restoration probe only; not numerical workload qualification",
+  "mps_cleanup": {
+    "exit_code": 0,
+    "stderr": ""
+  },
+  "elapsed_s": 268.1086049709993
+}

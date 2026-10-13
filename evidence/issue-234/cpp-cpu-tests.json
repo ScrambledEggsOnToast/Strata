@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "argv": [
+    "ctest",
+    "--test-dir",
+    "/home/joshkirklin/strata-workspace/scratch/judge-234-build",
+    "--output-on-failure",
+    "-R",
+    "^(readout_reference_test|score_protocol_test|serial_judge_pricing)$"
+  ],
+  "exit_code": 0,
+  "elapsed_s": 0.11402679400634952,
+  "evidence_scope": "C++ CPU readout/protocol/pricing tests with CUDA_VISIBLE_DEVICES=-1; no restoration/model claim",
+  "source_commit": "8ebc2398"
+}

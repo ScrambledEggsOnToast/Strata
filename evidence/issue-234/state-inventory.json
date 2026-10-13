@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "issue": 234,
+  "source_commit": "8ebc2398a8bb6da1a13373ba1299d2a9857a7029",
+  "reanchored_against": "32e14d4f plus unified prerequisite integration 011e8cb1 and prefix implementation 1b38d40d",
+  "restoration_owner": "include/strata/program/serial_prefix.hpp: SerialPrefixBranch",
+  "inventoried_elements": [
+    {"element": "SessionState.gdn_state", "meaning": "Owned GDN recurrent matrices AND convolution history", "save_restore": "src/core/conversation_state.cpp:155-185; sizes from conversation_session_sizes and plan::checkpoint_state_bytes", "verification": "Exact byte comparison to call-owned prefix image; each stage's carve only", "negative": "One-byte omission rejected in every fixture case"},
+    {"element": "SessionState.ple_hist", "meaning": "Normalized rolling PLE history", "save_restore": "conversation_checkpoint_save/restore", "verification": "Exact byte comparison", "negative": "Deliberately retain suffix PLE bytes while restoring all other fields; production verification must reject, retained in fixture source and 56 passing rejection assertions"},
+    {"element": "SessionState.ple_prev[2]", "meaning": "Two preceding token IDs, oldest first", "save_restore": "src/core/conversation_state.cpp:191-194 reconstructs from the captured complete prefix IDs", "verification": "Capture checks the actual window describes the prefix; restore checks both scalars", "negative": "Omitted previous-token scalar rejected"},
+    {"element": "SessionState.ple_token", "meaning": "Current-token host scalar", "save_restore": "SerialPrefixBranch::Stage saves it explicitly; restore writes it before the next suffix", "verification": "Scalar equality to captured prefix", "negative": "Omitted current-token scalar rejected"},
+    {"element": "QsaState.idx_tail", "meaning": "Open indexer block's keys", "save_restore": "conversation_checkpoint_save/restore, per owned QSA layer", "verification": "Exact byte comparison", "negative": "One-byte omission rejected"},
+    {"element": "QsaState.idx_dead", "meaning": "Sequence dead/spare key", "save_restore": "conversation_checkpoint_save/restore", "verification": "Exact byte comparison", "negative": "One-byte omission rejected even though normal same-sequence dead keys are constant"},
+    {"element": "QsaState.idx_block_pos", "meaning": "Indexer block-position record; preserve its actual bytes, do not canonicalize a path-dependent value", "save_restore": "conversation_checkpoint_save/restore", "verification": "Exact byte comparison", "negative": "One-byte omission rejected"},
+    {"element": "QsaState.idx_pooled", "meaning": "Completed prefix blocks plus moving boundary/spare row", "save_restore": "Completed rows preserved by positional ownership; src/core/conversation_state.cpp:186-188 rebuilds row prefix_tokens/idx_block from captured idx_dead", "verification": "Exact complete pooled-prefix comparison including boundary", "negative": "Omitted boundary-row rebuild rejected"},
+    {"element": "QSA K/V codes and scales", "meaning": "Authoritative logical cells [0,prefix_tokens)", "save_restore": "Call-owned conversation_snapshot_save image; resident K/V is left in place, streamed K/V restored via conversation_snapshot_restore", "verification": "conversation_kv_verify(logical_prefix=true): exact logical prefix, not stale suffix cells in its final physical page", "negative": "Contamination rejected; resident restore cannot silently repair it"},
+    {"element": "Streamed K/V residency", "meaning": "VRAM lookup slots/map derived from authoritative host pools", "save_restore": "conversation_kv_restore rebuilds residency with kv_stream_reset or kv_ring_restore", "verification": "Full authoritative image plus existing native residency tests; new matrix exercises main modes 0 and 1", "negative": "Rebuilt streamed image recovers while resident contamination remains fatal"},
+    {"element": "Allocation identity and layer carve", "meaning": "Prefix belongs to the same session/device/geometry and every model stage", "save_restore": "Captured SessionState allocation_id/device and SavedConversation geometry/range", "verification": "Validate every stage before any restore writes", "negative": "Released prefix cannot be restored"}
+  ],
+  "not_checkpointed": [
+    {"element": "Verifier residual/head rows, session/block scratch, step/position upload staging", "reason": "Operation scratch rewritten from each suffix's explicit input/position before consumers; suffix must contain at least one input token. Complete prefix recurrence/indexer/PLE state is restored. A/B/A replay independently checks repeated committed suffix state/logits."},
+    {"element": "RoPE tables, model weights, PLE table/staging ownership and geometry", "reason": "Immutable text-only reference configuration; same execution owners and stable KV allocation. Elastic KV, MTP/draft, batch, pipeline and asynchronous/adaptive swap modes are refused."},
+    {"element": "Draft state", "reason": "MTP/drafting is disabled and refused in this serial reference mode; no claim for draft/parallel reuse."}
+  ],
+  "evidence_boundary": "State inventory and GPU fixture byte comparisons are not an independent-source numerical campaign, and serial GEN evidence does not qualify batch-slot arithmetic."
+}

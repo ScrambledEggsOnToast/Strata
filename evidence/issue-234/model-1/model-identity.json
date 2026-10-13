@@ -1,0 +1,51 @@
+{
+  "release_manifest_sha256": "4709129f5a749d3926a990593fd1ee0ce4972dbac00b4bed2f0bba96bbce7989",
+  "revision": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
+  "quantization": "GSQ-RCO IQ3_S",
+  "files": {
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": {
+      "sha256": "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b",
+      "bytes": 44900816736
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf": {
+      "sha256": "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608",
+      "bytes": 38842920384
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/index.txt": {
+      "sha256": "d83b66e10838fbe6fbfe5be3d027403644382e79b05680001134a661a2ecd092",
+      "bytes": 93691
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/conversions.json": {
+      "sha256": "13a6e8387ae050d148db1277d20b51402ec916b88d8547eb83f9d35cc1a9c5d6",
+      "bytes": 35627
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/native_experts.txt": {
+      "sha256": "540776d2ccbfa5006631e8813341ceb1d7f19b8c96a5d6dacd39bac871bdcb69",
+      "bytes": 5370
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/dense.bin": {
+      "sha256": "d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13",
+      "bytes": 1538035200
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/token_type.json": {
+      "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b",
+      "bytes": 744960
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/merges.txt": {
+      "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332",
+      "bytes": 3353258
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/vocab.json": {
+      "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4",
+      "bytes": 5737005
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/chat_template.jinja": {
+      "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "bytes": 8952
+    },
+    "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/tokenizer/tokenizer.json": {
+      "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf",
+      "bytes": 541
+    }
+  }
+}
