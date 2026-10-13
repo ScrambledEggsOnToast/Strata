@@ -740,7 +740,8 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
 };
 template<> inline constexpr bool kSplit<22> = true;
 template<> struct Split<22> : SplitLs2 {   // IQ2_S
-    template<bool STAGE_GRID = false>
+    // 2 is the opt-in planar shared codebook; 0/1 retain the established layout.
+    template<int STAGE_GRID = 0>
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
         const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
@@ -756,11 +757,16 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
         r.ls1 = bq2->scales[iqs / 2] >> 4;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+            const int index = qs[l0 / 2] | ((qh << (8 - l0)) & 0x300);
+            int2 grid_pos;
+            if constexpr (STAGE_GRID == 2)
+                grid_pos = make_int2(s_grid[index], s_grid[1024 + index]);
+            else
+                grid_pos = ((const int2*) grid_lut)[index];
             const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
-            r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
-            r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
+            r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+            r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
         }
         r.dw = __half2float(bq2->d);
         return r;
@@ -967,7 +973,7 @@ template<> struct Split<42> {   // Q2_0
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
 // summed in the same order, then the same warp_sum.  Only the weight side moves out of the per-activation loop.
-template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false>
+template<int TY, int NC, bool EXACT_N = false, int STAGE_GRID = 0>
 __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                               int nb, int lane, float (&s)[NC], const uint32_t* __restrict__ s_grid = nullptr) {
     using F = Fmt<TY>;
@@ -1083,7 +1089,7 @@ __device__ __forceinline__ void row_dot_20_sub16(const uint8_t* row, const block
 
 // 16-lane sub-warp row dot for K = nb * ipb == 80 (all kSplit gate/up formats with n_embd == 2560):
 // 2 rows per warp (16 rows per 256-thread block), 100% active lanes, bitwise identical addition tree to row_dot_multi.
-template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false>
+template<int TY, int NC, bool EXACT_N = false, int STAGE_GRID = 0>
 __device__ __forceinline__ void row_dot_80_sub16(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                                  int t, float (&s)[NC], const uint32_t* __restrict__ s_grid = nullptr) {
     using F = Fmt<TY>;
@@ -1117,7 +1123,7 @@ __device__ __forceinline__ void row_dot_80_sub16(const uint8_t* row, const block
     }
 }
 
-template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
+template<int TY, int STAGE_GRID = kStageIqGrid<TY>>
 __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int tid, int nthreads) {
     if constexpr (!STAGE_GRID) {
         return nullptr;
@@ -1134,9 +1140,16 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         __syncthreads();
         return s_buf;
     } else if constexpr (TY == 22) {
-        uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq2s_grid;
-        for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
+        if constexpr (STAGE_GRID == 2) {
+            for (int i = tid; i < 1024; i += nthreads) {
+                s_buf[i] = src[i].x;
+                s_buf[1024 + i] = src[i].y;
+            }
+        } else {
+            uint2* dst = (uint2*) s_buf;
+            for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
+        }
         __syncthreads();
         return s_buf;
     } else if constexpr (TY == 29) {
@@ -1150,7 +1163,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
     }
 }
 
-template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
+template<int TY, int STAGE_GRID = kStageIqGrid<TY>>
 struct IqGridWords {
     static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17) ? 1024 : (TY == 16) ? 512 : 4;
 };
@@ -1238,7 +1251,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
 constexpr int GRP_NC = 4;
 
-template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
+template<int TG, int STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
 __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -1960,6 +1973,28 @@ bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
     return v == nullptr || v[0] == '\0' || v[0] != '0';
 }();
+
+// #220: split IQ2_S's two 32-bit codebook words into separate planes, as in
+// 1Cat's BankAware reader. Same 8 KiB and integers; only SM70's grouped default
+// kernel is screened. Tuned mode 8 and every other architecture retain their path.
+bool iq2_planar_book_on() {
+#if !defined(__HIPCC__)
+    static const bool enabled = env_on("STRATA_IQ2_PLANAR_BOOK");
+    if (!enabled) return false;
+    static int per_dev[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
+        per_dev[dev] = major == 7 && minor == 0 ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return false;
+#endif
+}
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
 // expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
@@ -2674,6 +2709,13 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
+        }
+        if constexpr (TG == 22) {
+            if (L.n_embd == 2560 && L.n_ff == 640 && iq2_planar_book_on()) {
+                if (g_no_sub16_gu) native_gu_multi_kernel<TG, 2, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                else native_gu_multi_kernel<TG, 2, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                return;
+            }
         }
         if (g_no_sub16_gu) native_gu_multi_kernel<TG, true, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
         else native_gu_multi_kernel<TG, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);

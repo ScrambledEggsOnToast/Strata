@@ -132,3 +132,34 @@ change other GPUs. Restarting with the bundle flag set to `0` restores the estab
 Mode 8 now makes the CUDA SwiGLU product's rounding explicit with `__fmul_rn`, as the separate
 SwiGLU/q8_1 pass already does (HIP disables contraction in that epilogue). This closes a source-level
 contraction risk before enabling the route; it is not a new locally measured parity or speed result.
+
+## Original-byte IQ small-batch study (#220)
+
+The pinned [1Cat reader](https://github.com/1CatAI/1Cat-vLLM/blob/be3722bc095b9792bf9833068595f0b1ef70ad37/csrc/sm70_turbomind/ops/gguf_dp4a.cuh)
+has one small scheduling experiment worth isolating: store IQ2_S's two codebook
+words in separate shared-memory planes, so each word can address all 32 banks
+instead of just even or odd banks. `STRATA_IQ2_PLANAR_BOOK=1` opts into this
+layout only for SM70's established grouped gate/up kernel at 2560 × 640.
+Unset or `0` keeps the established path. Other architectures, formats, unsupported
+shapes, disabled grid staging, per-entry kernels and tuned mode 8 keep their paths.
+No expert bank, activation boundary, dot formula, summation tree or MTP state
+changes; the per-block codebook remains 8 KiB. This is a candidate, not an adopted
+daily optimization. Restart with the flag unset to roll it back.
+
+Quantizing each input once, grouped activation indexing, two-row lane scheduling
+and fused gate/up/SwiGLU/intermediate encoding already exist in Strata. The donor's
+complete direct-route FFN is not a drop-in replacement: its policy admits only
+M5/M20 with 160-wide TP4 experts, and its down operator refuses widths above256.
+Strata's experts are640 wide and its projections/activation are FP32 between Q8_1
+boundaries, unlike the donor's explicit FP16 projection/SiLU/down boundaries.
+The donor's published C1/C4 gains are against its FP16-activation control, not
+against Strata. Their numerical thresholds do not qualify this engine.
+
+The source map, full-FFN storage and predeclared exactness/performance gates are in
+[`benchmarks/1cat-220-iq-decode.json`](benchmarks/1cat-220-iq-decode.json).
+`native_expert_parity SHARD 0 1 2 17 21 47` consumes the official split GGUF
+weights and independent ggml dequantization; `iq_multi_parity` includes uneven
+groups, duplicate token routes, unused destinations, changed graph inputs and
+interleaved request-private workspaces. Run each with the flag off and on through
+the machine queue. A source inspection or a successful build is not numerical
+or real-model qualification; consult that record's disposition and unmet gates.

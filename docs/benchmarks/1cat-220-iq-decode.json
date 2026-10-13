@@ -1,0 +1,78 @@
+{
+  "ticket": 220,
+  "source_base": "32e14d4febdd026b5f50901c8c76b5be0b128ac5",
+  "donor": "https://github.com/1CatAI/1Cat-vLLM/tree/be3722bc095b9792bf9833068595f0b1ef70ad37",
+  "disposition": "pending numerical and runtime gates; not qualified or promoted",
+  "candidate": {
+    "mechanism": "IQ2_S planar shared-memory codebook words; separate lower/upper 1024-word planes make all 32 banks addressable for either word",
+    "donor_reference": "csrc/sm70_turbomind/ops/gguf_dp4a.cuh LatticeDot::initialize/word BankAware Type22",
+    "donor_production_caveat": "bank_aware defaults false and production _expert_dp4a does not pass true; this is a source-derived scheduling hypothesis, not donor's published model treatment",
+    "switch": "STRATA_IQ2_PLANAR_BOOK=0/1",
+    "scope": "SM70 only, IQ2_S, n_embd2560/n_ff640, existing default grouped gate/up with staged grid and decode-once; mode8 unchanged",
+    "arithmetic_class": "arithmetic-preserving: identical original codebook words, signs, integers, original scales, Q8_1 input/intermediate boundaries, FP32 activation and reduction order",
+    "fallback": "unset/0, other architectures/formats/shapes, disabled staged grid, old per-entry kernels, tuned mode8 all retain established dispatch",
+    "new_persistent_expert_bytes": 0,
+    "shared_book_bytes_before_and_after": 8192,
+    "request_or_mtp_state_change": "none; codebook is block-private shared memory, input/output/scratch ownership and graph addresses unchanged",
+    "rollback": "unset or set STRATA_IQ2_PLANAR_BOOK=0 and restart; no weights/profile conversion"
+  },
+  "source_map": {
+    "original_resident_blob": "src/kernels/cuda/iq_kernels.cu native_expert_layout; gate rows | up rows | down rows; src/core/expert_source.cpp load_experts_gguf copies original slices, no permanent canonical bank",
+    "quantize_once_caller": "src/core/verify.cpp:2319-2343: native Q8_1 rows produced once before resident/PCIe grouped calls; shared-expert dedup is a separate existing opt-in",
+    "actual_M": "grp_start[g+1]-grp_start[g], not prompt chunk size and not total routes n*K. src/kernels/cuda/iq_kernels.cu native_gu_multi_kernel batches actual entries by GRP_NC4, reading ent_tok; native_gu_fused_kernel uses LDS_NT4",
+    "lane_schedule": "row_dot_80_sub16 already has two rows/warp at K2560 and preserves old 32-lane reduction tree; source comment and split partial sums show that importing donor's simple 16-lane shuffle tree is not arithmetic-preserving",
+    "fused_gate_up": "native_expert_grouped default combines gate/up projection in one kernel then fused SwiGLU/Q8_1 pass; STRATA_SM70_TABLE opt-in enables mode8 native_gu_fused_kernel for IQ3_XXS/IQ3_S/IQ2_S and other supported formats, writing Q8_1 directly with no gate/up/H global traffic",
+    "down_combine": "native_down_multi_kernel uses grouped original IQ4_NL/Q2_0 weights and full640 intermediates; mode7/8 native_down_lds_kernel stages Hq. verify.cpp post combines routed FP32 outputs with CPU/PCIe/shared contributions; hits may already be folded into combine",
+    "graphs": "Verifier captures per-stage/per-T graphs with runtime group counts, route entries and pointers. #193 retained completed-replay exposure T1-4 and eight capture keys on its serial64K/MTP profile; not actual per-expert row count evidence for this screen",
+    "current_profile": "daily profile env has no STRATA_SM70_TABLE, so current decoder uses established mode0. Historical #193 +6.4802% is qualified only for separate serial split26/64K/MTP geometry, not daily three-GPU configuration",
+    "graph_tests": "iq_multi_parity now adds IQ2_S/IQ4_NL and IQ2_S/Q2_0 graph replay with changed activations, duplicate token mappings, changed group count and two interleaved private workspaces; existing grouped cases cover counts0..11 and unused destinations. Not yet exercised until a queued run succeeds",
+    "not_touched": "router probabilities, route sorting/grouping, sampler, proposal acceptance and rollback, shared expert, CPU/PCIe weights, prefill/indexed MMQ #219"
+  },
+  "donor_incompatibilities": {
+    "policy": "vllm/model_executor/kernels/gguf.py dp4a_expert_capabilities admits M5/M20 only and exact(k,n,experts)=(2560,160,512); ours=(2560,640,512)",
+    "kernel_down_width": "gguf_dp4a_down_unroute_sm70_out requires fp16 K<=256 or Q8_1 groups<=8; full640 needs20 groups, rejected",
+    "activation_boundaries": "donor quantizes FP16 input to Q8_1 and rounds gate/up, SiLU, multiply, down and final route sum to FP16; Strata starts FP32 and retains FP32 between Q8_1 boundaries",
+    "direct_route": "donor maps ids directly into all-expert contiguous original GU bank and canonical down descriptors, recomputing each route independently. Strata consumes resident/cache/PCIe pointers and groups repeated experts for reuse; direct route would require explicit residency and request maps rather than copying caller",
+    "reader_arithmetic": "donor IQ3_XXS and IQ2_S apply floating .25/.125 scale factors after integer dot; Strata SplitLs2/DotG preserve existing integer division/truncation. Even preserving source weights does not make replacement arithmetic exact",
+    "not_local_gains": "published23.257->20.679ms C1 and51.672->44.380ms C4 compare donor FP16-activation controls on four V100 TP4. Dense27B #966 mixed-pair1.5x is not Flash-Next expert evidence"
+  },
+  "full_ffn_accounting": {
+    "geometry": {"hidden":2560,"expert_ff":640,"experts_per_layer":512,"layers":48,"top_k":10},
+    "official_native_expert_index": "/srv/development/models/swift-1.5-flash-next-iq3-s/pack/native_experts.txt",
+    "original_all_expert_bytes": 50292326400,
+    "format_pairs": [
+      {"gu":"IQ3_XXS","down":"IQ4_NL","layers":14,"gu_bytes":1254400,"down_bytes":921600,"total_bytes":2176000},
+      {"gu":"IQ3_XXS","down":"Q2_0","layers":3,"gu_bytes":1254400,"down_bytes":460800,"total_bytes":1715200},
+      {"gu":"IQ3_S","down":"IQ4_NL","layers":9,"gu_bytes":1408000,"down_bytes":921600,"total_bytes":2329600},
+      {"gu":"IQ3_S","down":"Q2_0","layers":1,"gu_bytes":1408000,"down_bytes":460800,"total_bytes":1868800},
+      {"gu":"IQ2_S","down":"IQ4_NL","layers":15,"gu_bytes":1049600,"down_bytes":921600,"total_bytes":1971200},
+      {"gu":"IQ2_S","down":"Q2_0","layers":5,"gu_bytes":1049600,"down_bytes":460800,"total_bytes":1510400},
+      {"gu":"IQ4_XS","down":"IQ4_NL","layers":1,"gu_bytes":1740800,"down_bytes":921600,"total_bytes":2662400}
+    ],
+    "complete_projection_work_per_routed_entry": "three H*FF dots =4915200 multiplies/adds (9830400 nominal FLOPs), plus640 SiLU products, activation quantization and K-weighted FP32 combine; none saved by candidate",
+    "weight_read_floor": "for group entry count m, each original blob contains above GU+down bytes. Unique-active bytes sum once per active expert; repeated-route read bound multiplies each expert's bytes by m; do not call total token count GEMM M or label nominal route bytes unique-source bandwidth",
+    "default_transient_traffic_per_entry": "GU write5120bytes; fused SwiGLU reads5120 and writes Hq720; down writes10240 FP32 routed output; combine reads10240; mode8 eliminates GU global write/read but still Hq720 and routed output. Candidate changes none of these",
+    "existing_scratch": "3*align256(cap*640*4)+align256(cap*20*36); cap40=336128bytes, cap80=672000bytes, plus input Q8_1=2880bytes per token and routed output10240bytes per route. Reserved float planes remain even in mode8; do not count unused traffic as removed allocation",
+    "donor_canonical_duplication": "Lattice canonical GU uses2bits/value plus8-byte metadata/group32 for IQ3_XXS/IQ3_S, or4-byte metadata/group16 for IQ2_S:1638400bytes per full-width gate+up pair in addition to retained original GU. Canonical IQ4_NL down819200codes+102400scales=921600bytes; Q2_0 group32 down409600codes+204800half2stats=614400bytes. Also two16-byte descriptors per projection per expert (96bytes/FFN) and16byte metadata/projection. Donor retains canonical GU while dp4a reads original GU, and canonical down instead of original down; importing canonical banks into Strata without discarding original representation would add these costs and may evict resident experts. Candidate imports no canonical/scalar-LUT bank",
+    "expanded_scalar_lut_rejected": "20bytes/32values would cost2048000bytes gate+up/expert, greater than every original IQ2/IQ3 pair, before canonical banks; not the selected no-persistent-storage mechanism"
+  },
+  "predeclared_gates": {
+    "numerical": "official-weight native_expert_parity layers0,1,2,17,21,47 uses independent ggml to_float complete FFN plus exact old-vs-new GPU check. Applicable exact equality:0 differing bytes, finite outputs, identical Q8_1 handoff and every same-prefix full-vocabulary committed model row; no mismatch tolerance for candidate. Existing3e-2 activation-vs-float bound is baseline oracle context, not permission for off/on differences",
+    "format_screen": "IQ3_XXS/IQ4_NL, IQ2_S/Q2_0, IQ2_S/IQ4_NL, IQ3_S/IQ4_NL, IQ3_S/Q2_0, IQ4_XS/IQ4_NL official layers; iq_multi_parity covers all IQ3/IQ2 and both down formats, uneven0..11groups and fallback shapes",
+    "C1": "same candidate binary opt-in0vs1, matched cache-free profiles, diagnostics off, fixed case generator and committed counts. C1 first via measure.py --cases placement, report decode32K committed interval and response window separately, including proposal/rejection overhead where native log counters expose it",
+    "route_exposure": "separate labelled diagnostic off/on with STRATA_VERIFY_NODES and completed VERIFY_REPLAY plus dump-routing; use actual grp_start differences or reconstruct per-window expert multiplicities from bounded routing records, never prompt chunk size. Do not use diagnostic durations as latency",
+    "performance": "require>=3percent C1 committed-decode improvement with no>2percent fresh-prefill regression, no expert-residency loss, same committed output counts and exact numerical gate; reject immaterial/regressing screen only after required evidence is complete",
+    "concurrency": "because default grouped kernel can serve admitted batched requests, exercise one admitted2-4request cohort at response-bound window, not count-matched engine log heuristic; preserve per-request usage/request IDs and counts. Then compact held-out confirmation only if promising",
+    "state": "MTP private buffers and acceptance/rollback are not modified; require model runs with original loaded-MTP configuration and retained proposal/acceptance counters rather than asserting sampler validation from greedy equality",
+    "safety": "all builds/GPU operations through window.py, <=1800s/window, existing8GiBhost reserve and UUID hardware envelopes, no resets/clock/power/MPS-policy changes"
+  },
+  "measurement_difference_set": {
+    "profiles": "/home/joshkirklin/strata-workspace/scratch/1cat-220/profile-0.json and profile-1.json",
+    "versus_daily": ["binary points to candidate", "timeout_s900 instead of0", "prompt-cache0 instead of6", "no-prefill-borrow (placement reserve, not pure hygiene)", "artifact_root on scratch volume", "STRATA_IQ2_PLANAR_BOOK0/1"],
+    "between_latency_arms": ["env.STRATA_IQ2_PLANAR_BOOK only"],
+    "scope": "measurement configuration, not daily qualification; C1 sole request takes solo GEN leg, not concurrent pipeline evidence"
+  },
+  "runtime_results": [],
+  "binary_identity": null,
+  "unmet_acceptance": ["build", "official-weight exact numerical oracle", "changed-input/duplicate/private graph tests", "SM86 runtime fallback", "same-prefix complete model logits", "actual routed-M/exposure", "matched C1", "affected admitted concurrency", "held-out if promising"]
+}

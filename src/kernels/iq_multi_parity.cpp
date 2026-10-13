@@ -269,6 +269,50 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
     }
 }
 
+// #220: replay must read the current input/routes, not retain values from capture;
+// interleave two request-private fixtures to expose accidental shared workspace.
+void check_grouped_graph(int dt, cudaStream_t s, std::mt19937& rng) {
+    Grouped a(22, dt, 2560, 640, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng);
+    Grouped b(22, dt, 2560, 640, {2, 1, 7, 0, 3}, 8, rng);
+    auto capture = [&](Grouped& g) {
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal), "begin capture");
+        ck(cudaMemsetAsync(g.dout, 0xFF, g.out_floats * 4, s), "graph sentinel");
+        g.run(false, s);
+        ck(cudaStreamEndCapture(s, &graph), "end capture");
+        ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
+        ck(cudaGraphDestroy(graph), "destroy graph");
+        return exec;
+    };
+    const cudaGraphExec_t ga = capture(a), gb = capture(b);
+    int bad = 0;
+    for (int epoch = 0; epoch < 3; ++epoch) {
+        for (Grouped* g : {&a, &b}) {
+            const auto x = random_x((size_t) g->n_tok * g->L.n_embd, rng);
+            std::vector<int32_t> tok(g->n_ent);
+            for (int e = 0; e < g->n_ent; ++e) tok[e] = epoch == 0 ? 0 : (e + epoch) % g->n_tok;
+            const int ng = epoch == 2 ? g->n_groups - 1 : g->n_groups;
+            ck(cudaMemcpy(g->dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "changed input");
+            ck(cudaMemcpy(g->dtok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice), "duplicate routes");
+            ck(cudaMemcpy(g->dn, &ng, 4, cudaMemcpyHostToDevice), "changed group count");
+        }
+        const auto ra = a.result(true, s), rb = b.result(true, s);
+        ck(cudaGraphLaunch(gb, s), "private graph b");
+        ck(cudaGraphLaunch(ga, s), "private graph a");
+        ck(cudaStreamSynchronize(s), "graph replay sync");
+        std::vector<float> oa(a.out_floats), ob(b.out_floats);
+        ck(cudaMemcpy(oa.data(), a.dout, oa.size() * 4, cudaMemcpyDeviceToHost), "graph output a");
+        ck(cudaMemcpy(ob.data(), b.dout, ob.size() * 4, cudaMemcpyDeviceToHost), "graph output b");
+        bad += std::memcmp(ra.data(), oa.data(), oa.size() * 4) != 0;
+        bad += std::memcmp(rb.data(), ob.data(), ob.size() * 4) != 0;
+    }
+    ck(cudaGraphExecDestroy(ga), "destroy exec a");
+    ck(cudaGraphExecDestroy(gb), "destroy exec b");
+    std::printf("iq2_s/%s changed-input/private grouped graphs: %s\n", name_of(dt), bad ? "FAIL" : "bitwise equal");
+    g_fail += bad;
+}
+
 // ------------------------------------------------------------------------------------------------ --bench
 float time_ms(cudaStream_t s, int it, const auto& fn) {
     cudaEvent_t e0, e1;
@@ -417,6 +461,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
+    check_grouped_graph(20, s, rng);
+    check_grouped_graph(42, s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
