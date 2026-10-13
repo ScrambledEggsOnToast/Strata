@@ -149,6 +149,7 @@ public:
     bool rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err);
     core::SessionState* bound_session() const;
     const void* gemm_owner() const;
+    uint64_t bf16_conversion_bytes() const;
     void* stream() const;
     uint64_t bound_request() const;
 

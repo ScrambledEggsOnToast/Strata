@@ -48,6 +48,8 @@ public:
     const float* logits() const;
     int64_t vocab() const;
     bool ready() const;
+    /// Capture complete-run allocation high-water before a serving frontend can stop the child.
+    void observe_generation() const;
 private:
     friend bool judge_stage_bytes(const core::ModelGeometry&, int64_t, int64_t, int64_t, int64_t,
                                   int64_t, bool, const plan::QsaPlacement&, JudgeStageBytes&);

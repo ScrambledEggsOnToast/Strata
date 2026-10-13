@@ -4656,11 +4656,11 @@ int main(int argc, char** argv) {
                     demand.add("judge_operation_canary", bytes.device_canary, "derived 280 B per-stage operation owner; existing prefill canary also retained");
                     demand.add("judge_head_output", bytes.device_head_output, "derived one full vocabulary FP32 row on actual native-head device");
                     demand.add("judge_allocator_granule", bytes.device_allocator_padding, "derived separate session/canary/output allocations rounded to 2 MiB granules");
-                    demand.add("judge_shared_prefill_gemm_workspace", 0, "same actual Prefill/Gemm/cuBLAS scratch/workspace: generation prefill_buffers charge retained in full");
+                    demand.add("judge_shared_prefill_gemm_workspace", 0, "same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver");
                     demand.add("judge_shared_native_head", 0, "same actual native weights/Q8_1 head scratch: generation native-head charge retained in full");
                     if (o.judge_library_allowance_bytes)
                         demand.add("judge_library_first_use_driver", o.judge_library_allowance_bytes,
-                            "additional finite first-use/driver commitment, separate from retained generation library allowance; reconciled at authorised run");
+                            "additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained");
                     else demand.add_unknown("judge_library_first_use_driver", "no incremental first-use/driver bound supplied");
                     judge_host_init_peak = std::max(judge_host_init_peak, bytes.session.host_transient);
                     std::fprintf(stderr, "JUDGE_STATIC device=%d cells=%lld session_device=%llu canary_device=%llu head_output_device=%llu "
@@ -5259,6 +5259,26 @@ int main(int argc, char** argv) {
                     (unsigned long long) admission.host_ceiling_bytes,
                     (unsigned long long) admitted_cache_bytes, admission.limiting_term.c_str());
         std::fflush(stdout);
+        if (o.judge_context > 0) {
+            std::fprintf(stderr, "JUDGE_ADMISSION admit=%d verified=%d unknown_classes=%zu devices=%zu "
+                                 "guest_fits=%d host_fits=%d guest_demand_bytes=%llu host_demand_bytes=%llu "
+                                 "guest_ceiling_bytes=%llu host_ceiling_bytes=%llu runtime_allowance=%llu\n",
+                         admission.admitted ? 1 : 0, admission.verified ? 1 : 0, admission.unknown_classes.size(),
+                         admission.devices.size(), admission.guest_fits ? 1 : 0, admission.host_fits ? 1 : 0,
+                         (unsigned long long)admission.guest_demand_bytes,
+                         (unsigned long long)admission.host_demand_bytes,
+                         (unsigned long long)admission.guest_ceiling_bytes,
+                         (unsigned long long)admission.host_ceiling_bytes,
+                         (unsigned long long)o.judge_runtime_allowance_bytes);
+            for (size_t i = 0; i < admission.devices.size(); ++i) {
+                const auto& line = admission.devices[i];
+                std::fprintf(stderr, "JUDGE_DEVICE_ADMISSION device=%zu name=%s demand_bytes=%llu "
+                                     "ceiling_bytes=%llu headroom_bytes=%llu fits=%d\n",
+                             i, line.name.c_str(), (unsigned long long)line.demand_bytes,
+                             (unsigned long long)line.ceiling_bytes, (unsigned long long)line.headroom_bytes,
+                             line.fits ? 1 : 0);
+            }
+        }
         if (!admission.admitted) {
             for (const auto& r : admission.reasons)
                 std::fprintf(stderr, "strata generate: admission refused: limiting=%s %s\n",
@@ -11979,6 +11999,7 @@ int main(int argc, char** argv) {
             auto& counts = batch_drafts[b];
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            if (judge_lane) judge_lane->observe_generation();
             std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
                         b, (long long) sl.produced, reason, ms,
                         (long long) counts.accepted, (long long) counts.offered);
@@ -15506,6 +15527,7 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            if (judge_lane) judge_lane->observe_generation();
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
                         (long long) produced_n,

@@ -59,6 +59,11 @@ public:
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
 
+    /// Retained first-use BF16 conversion buffers, distinct from the borrowed initialized workspace.
+    uint64_t bf16_conversion_bytes() const {
+        return (uint64_t)(tc_w_elems_ + tc_x_elems_) * sizeof(uint16_t);
+    }
+
 private:
     void* handle_ = nullptr;
     void* stream_ = nullptr;

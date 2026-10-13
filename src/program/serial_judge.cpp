@@ -141,13 +141,15 @@ bool judge_stage_bytes(const core::ModelGeometry& g, int64_t cells, int64_t k,
 }
 
 SerialJudgeLane::SerialJudgeLane() : impl_(std::make_unique<Impl>()) {}
-SerialJudgeLane::~SerialJudgeLane() {
-    if (impl_->initialized && !impl_->poisoned && !impl_->running.load())
-        for (const auto& stage : impl_->stages) observe("generation-resumed-final", stage->session.device());
-}
+SerialJudgeLane::~SerialJudgeLane() = default;
 bool SerialJudgeLane::ready() const { return impl_->initialized && !impl_->poisoned && !impl_->running.load(); }
 int64_t SerialJudgeLane::vocab() const { return impl_->vocabulary; }
 const float* SerialJudgeLane::logits() const { return ready() && impl_->row_ready ? impl_->readback.data() : nullptr; }
+void SerialJudgeLane::observe_generation() const {
+    if (!ready()) return;
+    for (const auto& stage : impl_->stages)
+        observe("generation-resumed-final", stage->session.device());
+}
 
 bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t k, int64_t vocab,
                            const plan::QsaPlacement& placement, const std::vector<JudgeStage>& bindings,
@@ -300,6 +302,9 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
         if (!core::conversation_checkpoint_save(stage->branch, stage->session.state(), m.geometry, error)) {
             m.poisoned = true; return false;
         }
+        std::fprintf(stderr, "JUDGE_FIRST_USE_WORKSPACE device=%d gemm=%p bf16_conversion_bytes=%llu\n",
+                     stage->session.device(), stage->binding.prompt->gemm_owner(),
+                     (unsigned long long)stage->binding.prompt->bf16_conversion_bytes());
         observe("first-use-complete", stage->session.device());
     }
     if (!m.row_ready) { m.poisoned = true; error = "judge: final head row not produced"; return false; }

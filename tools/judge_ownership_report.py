@@ -40,26 +40,33 @@ def reconcile(control_path, candidate_path):
     probes = rows(lines, 'JUDGE_PROBE')
     guards = rows(lines, 'JUDGE_REBIND_GUARDS')
     capacity = rows(lines, 'JUDGE_CAPACITY')
-    plans = [fields(line) for line in lines if line.startswith('PLAN admit=')]
+    plans = rows(lines, 'JUDGE_ADMISSION')
+    device_plans = rows(lines, 'JUDGE_DEVICE_ADMISSION')
+    workspaces = rows(lines, 'JUDGE_FIRST_USE_WORKSPACE')
     report = {
         'scope': '4096-cell serial ownership reconciliation under copied measurement configuration; not deployment or throughput qualification',
         'evidence': {'control_result': str(control_path), 'candidate_result': str(candidate_path),
                      'control_engine_log': control_log, 'candidate_engine_log': candidate_log},
         'derived_static_stage_ledger': static,
+        'complete_generation_and_judge_allocation_classes': [line for line in lines if line.startswith('strata admission class:')],
+        'measured_shared_gemm_conversion_storage': workspaces,
         'measured_explicit_allocation_high_water': allocations,
         'measured_host_heap_rss_high_water': hosts,
         'measured_mps_residual_observations': memories,
-        'admission': plans,
+        'admission': {'summary': plans, 'devices': device_plans},
         'operation_canary_and_lease_records': [line for line in lines if line.startswith(('STATE_SCRATCH resource=judge ', 'JUDGE_RESTORE ', 'JUDGE_REBIND_GUARDS '))],
         'charges': {
             'derived': ['independent SessionOwner device/pinned/heap payload', '280 B device/108 B host per-stage canary',
                         'one head output/readback row', 'retained GDN/PLE/indexer/ID branch checkpoint plus 12.5% capacity margin',
                         'stage/module metadata', 'per-allocation 2 MiB granule padding', 'bounded prompt input', 'serial RoPE/page-table construction transient'],
             'measured': ['link-wrapped explicit engine CUDA allocation live/peak payload', 'link-wrapped pinned/registration live/peak payload',
-                         'glibc heap live bytes', 'process RSS and kernel VmHWM', 'MPS remaining-budget deltas', 'complete launcher safety telemetry'],
-            'allowances_not_measured_costs': ['additional judge_library_first_use_driver', 'additional judge_opaque_runtime_host',
+                         'existing Gemm BF16 conversion storage', 'glibc heap live bytes', 'process RSS and kernel VmHWM',
+                         'MPS remaining-budget deltas', 'complete launcher safety telemetry'],
+            'allowances_not_measured_costs': ['additional judge_library_first_use_driver (includes deferred conversion/MMQ workspaces)',
+                                           'additional judge_opaque_runtime_host',
                                            'retained generation graph/prefill-library/host-runtime allowances'],
-            'shared_no_incremental_owner': ['same actual Prefill/Gemm/cuBLAS scratch/workspace', 'same actual NativeHead weights/Q8_1 scratch'],
+            'shared_no_incremental_owner': ['same actual initialized Prefill/Gemm/cuBLAS scratch/workspace (not zero deferred first-use storage)',
+                                            'same actual NativeHead weights/Q8_1 scratch'],
             'limitations': ['link wrapping excludes shared-library/driver internal allocations',
                             'MPS residual delta does not isolate cuBLAS from module loading or other opaque driver commitments',
                             'VmHWM covers the whole process, not one individually attributed host transient'],
@@ -68,7 +75,9 @@ def reconcile(control_path, candidate_path):
     }
     unknown = [line for line in lines if line.startswith('strata admission class:') and ' unknown=1 ' in line]
     report['unknown_classes'] = unknown
-    admitted = bool(plans and plans[-1].get('admit') == '1' and not unknown)
+    admitted = bool(plans and plans[-1].get('admit') == plans[-1].get('verified') == '1' and
+                    plans[-1].get('unknown_classes') == '0' and not unknown and
+                    len(device_plans) == len(static) and all(row.get('fits') == '1' for row in device_plans))
     report['criteria']['verified_complete_admission'] = 'keep' if admitted else 'reject' if plans else 'blocked'
     all_stages = bool(static) and len(static) == len(guards) == len(rows(lines, 'JUDGE_OWNER'))
     exact = all_stages
@@ -84,6 +93,9 @@ def reconcile(control_path, candidate_path):
         entry = {'device': int(device), 'derived_incremental_explicit_device_bytes': expected,
                  'derived_device_granule_padding_bytes': integer(price, 'allocator_padding_device'),
                  'declared_incremental_driver_library_allowance_bytes': integer(price, 'library_allowance')}
+        stage_workspaces = [row for row in workspaces if row.get('device') == device]
+        if stage_workspaces:
+            entry['measured_retained_gemm_bf16_conversion_bytes'] = max(integer(row, 'bf16_conversion_bytes') for row in stage_workspaces)
         if before and ready and used and before_driver and after_driver:
             increment = integer(ready[-1], 'explicit_live_bytes') - integer(before, 'explicit_live_bytes')
             first_use_explicit = integer(used[-1], 'explicit_live_bytes') - integer(ready[-1], 'explicit_live_bytes')
@@ -98,9 +110,10 @@ def reconcile(control_path, candidate_path):
             final_allocations = [row for row in allocations if row.get('phase') == 'generation-resumed-final' and row.get('device') == device]
             final_driver = [row for row in memories if row.get('phase') == 'generation-resumed-final' and row.get('device') == device]
             caps = candidate.get('profile_snapshot', {}).get('mps_caps_bytes', [])
-            if final_allocations and final_driver and plans and int(device) < len(caps):
-                budget = int(plans[-1][f'device{device}_demand_bytes'])
-                ceiling = int(plans[-1][f'device{device}_ceiling_bytes'])
+            stage_plan = next((row for row in device_plans if row.get('device') == device), None)
+            if final_allocations and final_driver and stage_plan and int(device) < len(caps):
+                budget = integer(stage_plan, 'demand_bytes')
+                ceiling = integer(stage_plan, 'ceiling_bytes')
                 peak = integer(final_allocations[-1], 'explicit_high_water_bytes')
                 cap = int(caps[int(device)])
                 client_spent = cap - integer(final_driver[-1], 'driver_free_bytes')
@@ -118,6 +131,39 @@ def reconcile(control_path, candidate_path):
             entry['missing_allocation_or_residual_observation'] = True
             exact = priced_peak = False
         report['stage_reconciliation'].append(entry)
+    before_host = next((row for row in hosts if row.get('phase') == 'before-state-init'), None)
+    ready_hosts = [row for row in hosts if row.get('phase') == 'lane-ready']
+    used_hosts = [row for row in hosts if row.get('phase') in ('first-use-complete', 'generation-resumed-final')]
+    host_exact = host_priced = False
+    if before_host and ready_hosts and used_hosts and static and plans:
+        derived_host = sum(integer(price, key) for price in static for key in
+                           ('session_pinned_host', 'session_heap_host', 'canary_host', 'checkpoint_host', 'readback_host', 'metadata_host'))
+        transient = max(integer(price, 'init_host_transient') for price in static)
+        input_bytes = max(integer(price, 'cells') for price in static) * 8
+        runtime_bound = integer(plans[-1], 'runtime_allowance')
+        envelope = derived_host + transient + input_bytes + runtime_bound
+        heap_increment = max(integer(row, 'heap_live_bytes') for row in used_hosts) - integer(before_host, 'heap_live_bytes')
+        rss_increment = max(integer(row, 'rss_high_water_bytes') for row in used_hosts) - integer(before_host, 'rss_high_water_bytes')
+        expected_pinned = sum(integer(price, key) for price in static for key in ('session_pinned_host', 'canary_host'))
+        pinned_increment = integer(ready_hosts[-1], 'pinned_live_bytes') - integer(before_host, 'pinned_live_bytes')
+        joint_host = integer(plans[-1], 'guest_demand_bytes')
+        joint_fits = (max(integer(row, 'heap_live_bytes') for row in used_hosts) <= joint_host and
+                      max(integer(row, 'rss_high_water_bytes') for row in used_hosts) <= joint_host)
+        host_exact = pinned_increment == expected_pinned
+        host_priced = heap_increment <= envelope and rss_increment <= envelope and joint_fits
+        report['host_reconciliation'] = {
+            'derived_retained_incremental_host_bytes': derived_host, 'derived_serial_initialization_transient_bytes': transient,
+            'derived_request_input_bytes': input_bytes, 'declared_additional_runtime_allowance_bytes': runtime_bound,
+            'declared_incremental_host_envelope_bytes': envelope, 'measured_max_observed_heap_increment_bytes': heap_increment,
+            'measured_rss_high_water_increment_bytes': rss_increment, 'derived_incremental_pinned_bytes': expected_pinned,
+            'measured_incremental_pinned_bytes': pinned_increment, 'matched_pinned_payload': host_exact,
+            'combined_generation_judge_host_admission_bytes': joint_host, 'within_incremental_and_joint_envelopes': host_priced,
+            'sampling_limit': 'heap live is phase-sampled, not an allocator-wide transient peak; VmHWM is process-wide physical RSS high-water',
+        }
+    else:
+        report['host_reconciliation'] = {'missing_host_pricing_or_high_water': True}
+    exact = exact and host_exact
+    priced_peak = priced_peak and host_priced
     report['criteria']['static_ownership_ledger_reconciled'] = 'keep' if exact and priced_peak else 'reject' if static and allocations else 'blocked'
     restore = rows(lines, 'JUDGE_RESTORE')
     canaries = [line for line in lines if line.startswith('STATE_SCRATCH resource=judge ') and ' checked=1 ' in line]

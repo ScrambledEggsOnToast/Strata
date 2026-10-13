@@ -1499,6 +1499,7 @@ bool Prefill::bind_request(uint64_t request, std::string& err) {
 
 core::SessionState* Prefill::bound_session() const { return impl_->ss; }
 const void* Prefill::gemm_owner() const { return &impl_->gemm; }
+uint64_t Prefill::bf16_conversion_bytes() const { return impl_->gemm.bf16_conversion_bytes(); }
 void* Prefill::stream() const { return impl_->cs; }
 uint64_t Prefill::bound_request() const { return impl_->bound_request; }
 

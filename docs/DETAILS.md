@@ -858,9 +858,12 @@ The admission ledger names the complete independent session device/pinned/
 heap payload, 280-byte device and 108-byte host canary per stage, one head
 output/readback row, retained host branch checkpoint, object metadata,
 device allocation-granule padding, request input and initialization
-transients. Shared workspace/head rows have a derived zero *incremental*
-price; their full generation charges remain. Original expert-cache budgets
-are retained, while the opt-in demand prices the concrete 256-aligned blobs
+transients. The already-initialized shared workspace/head rows have a derived
+zero *incremental owner* price; their full generation charges remain.
+This is not zero first-use cost: the same Gemm's lazy BF16 conversion
+buffers and MMQ pool are included in the additional device first-use
+envelope, alongside library/driver commitments.
+Original expert-cache budgets are retained, while the opt-in demand prices the concrete 256-aligned blobs
 for every resident pair and verifies those cache extents before creating
 the lane. Exactly 24,576 resident pairs and unchanged generation geometry
 are required; no expert residency is available to pay for scoring.
@@ -875,8 +878,14 @@ For an authorized allocation-reconciliation run, `strata-judge-test` wraps
 the engine's explicit CUDA allocation/free and host registration calls.
 `JUDGE_STATIC`, `JUDGE_OWNER`, `JUDGE_ALLOC`, `JUDGE_HOST` and `JUDGE_MEMORY`
 separate source-derived payloads, explicit allocation high-water marks,
-host RSS high-water and MPS residual-budget observations. Shared-library
-and driver allocations are not claimed as link-wrapped payloads.
+host RSS high-water and MPS residual-budget observations.
+The existing Gemm's retained conversion bytes are reported separately;
+unattributed explicit first-use bytes are not called library allocations.
+Admission and complete-run high-water are retained on stderr before
+`DONE`/MTP `BDONE`, rather than relying on a frontend to preserve protocol
+stdout or run child destructors. The offline reconciliation also checks
+the incremental host heap/RSS envelope, not only device payloads.
+Shared-library and driver allocations are not claimed as link-wrapped payloads.
 `STRATA_JUDGE_OWNERSHIP_PROBE=<bounded token CSV>` runs two fresh serial
 leases before `READY`, requires identical native-head bytes and verified
 generation restoration, then permits ordinary serving. This is an
