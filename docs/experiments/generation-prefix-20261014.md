@@ -284,8 +284,8 @@ this source document does not grant qualification to unexercised combinations,
 hardware backends or long-context quality.
 
 The integration review also requires SYCL checkpoint writers to request mutable
-payloads and SYCL restore definitions to match the shared selected-cut API.
-Source compatibility repairs do not establish a successful SYCL build. Combined
+payloads, price sealed owners and retained capacity, and match restore definitions
+to the shared selected-cut API. Source compatibility repairs do not establish a successful SYCL build. Combined
 qualification must cover shared-prefix donor isolation during selected restore
 and repark, and retained-prefill cancellation with the third owner active;
 individual feature results do not establish those interactions.

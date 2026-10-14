@@ -110,6 +110,12 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
     for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
         if (!add(total, n)) return false;
+    if (immutable_checkpoints_enabled())
+        for (const auto* payload : {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos}) {
+            const size_t extra = payload->sealed() ? payload->bytes() - payload->size() :
+                                 payload->empty() ? 0 : CheckpointBytes::owner_bytes;
+            if (!add(total, extra)) return false;
+        }
     return true;
 }
 } // namespace
@@ -220,6 +226,12 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    if (immutable_checkpoints_enabled()) {
+        // The live checkpoint is sealed after capture, before publication.
+        const size_t payloads = (z.gdn != 0) + (ss.ple_hist && z.ple != 0) +
+                                (tails != 0) + (dead != 0) + (positions != 0);
+        if (!add(bytes, payloads * CheckpointBytes::owner_bytes)) return fail(error, "checkpoint owner overflow");
+    }
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
