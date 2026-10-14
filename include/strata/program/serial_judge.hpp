@@ -1,6 +1,7 @@
 #pragma once
 #include "strata/core/session.hpp"
 #include "strata/plan/admission.hpp"
+#include <functional>
 #include <memory>
 
 namespace strata::prefill { class Prefill; }
@@ -44,7 +45,9 @@ public:
               const plan::QsaPlacement& placement, const std::vector<JudgeStage>& stages,
               const core::NativeHead& head, core::MtpDrafter* draft,
               const plan::AdmissionDecision& admission, std::string& error);
-    bool run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error);
+    // A clean cancellation returns true with no logits, after every owner has drained.
+    bool run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error,
+             const std::function<bool()>& cancelled = {});
     const float* logits() const;
     int64_t vocab() const;
     bool ready() const;

@@ -12960,9 +12960,19 @@ int main(int argc, char** argv) {
                     score_finish(id, "CANCELLED", nullptr, nullptr, "cancelled before prompt read");
                     continue;
                 }
+                const float* score_row = logits.data();
                 auto run_score = [&]() -> bool {
-                    if (!adapt_tick(true) || !resident.begin_score(score_error) ||
-                        !ver.set_logit_bias({}, score_error)) return false;
+                    if (!adapt_tick(true) || !resident.begin_score(score_error)) return false;
+                    if (judge_lane && request.prompt.size() <= (size_t)o.judge_context) {
+                        std::printf("SADMIT %s v1 prompt_tokens=%zu selected_tokens=%zu\n",
+                                    request.id.c_str(), request.prompt.size(), request.selected.size());
+                        std::fflush(stdout);
+                        if (!judge_lane->run(resident.working().request, request.prompt.data(),
+                                             (int64_t)request.prompt.size(), score_error, cancelled)) return false;
+                        score_row = judge_lane->logits();
+                        return cancelled() || score_row != nullptr;
+                    }
+                    if (!ver.set_logit_bias({}, score_error)) return false;
                     ver.set_history(nullptr, 0);
                     // The transient working state is never a cached generation prefix.
                     live_ok = false;
@@ -13045,7 +13055,7 @@ int main(int argc, char** argv) {
                 try {
                     ok = run_score();
                     if (ok && !cancelled())
-                        ok = score::select_logits(logits.data(), n_vocab, request.selected, values, score_error);
+                        ok = score::select_logits(score_row, n_vocab, request.selected, values, score_error);
                 } catch (const std::exception& failure) {
                     score_error = failure.what();
                 }

@@ -1832,9 +1832,27 @@ cancellation or expiry allows at most another 30 s to drain. Ordinary `REJECT` i
 An unknown, wrong, duplicate, missing or mismatched terminal, incomplete result, or device/state
 `ERROR` retires the process; ambiguous state is never reused.
 
-The working session is reset for scoring and is not published as a reusable generation prefix.
-Resident generation keeps its own owners and may decode between score windows. No release
-manifest, daily profile or deployment changes are needed for this opt-in interface.
+With `--judge-context N`, prompts that fit the admitted short lane use its bulk
+prefill and final-row native head. Every generation binding is restored before
+the reply; scoring does not clear the generation conversation cache. Without an
+admitted lane, or for prompts larger than that lane, the existing verifier-window
+path resets the working session and permits resident generation between windows.
+`--spec` controls those verifier windows, not the bulk judge prefill.
+
+`STRATA_JUDGE_PREFIX_CACHE=1` explicitly enables one private judge prefix checkpoint
+per stage (off otherwise). It is intended for a dedicated, single-trust-domain
+scoring process, not an untrusted shared service: SCORE v1 has no per-user cache
+scope. This cache never enters the generation conversation cache. Reuse requires
+an exact token-prefix match and restores every stage's GDN, PLE and indexer state;
+positional K/V stays in the lane's private session. A changed prefix is reread,
+and at least one suffix token is always consumed to obtain the final head row.
+The already-admitted checkpoint storage is reused; a bounded previous-prompt
+token vector adds at most 32 KiB to the host ledger. Clean cancellation drains and
+restores owners without poisoning the lane; device or restoration failures remain
+fatal. Prefix splits can change arithmetic grouping, so byte-identical logits are
+not promised across cache settings.
+
+No release manifest or daily profile is changed by enabling the scoring interface.
 `serve.test_parallel.ScoreTransport` exercises the real adapter against the existing scripted engine;
 `score_protocol_test` exercises the production native parser, owner bounds and FP32 serialization.
 These are CPU transport/contract checks, not GPU arithmetic, placement or performance evidence.

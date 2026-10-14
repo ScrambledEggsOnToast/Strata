@@ -4,13 +4,16 @@
 #include "strata/core/operation_canary.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/plan/resident.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <string_view>
 
 #if defined(__linux__) && !defined(STRATA_USE_HIP)
 extern "C" void strata_judge_trace_phase(const char*) __attribute__((weak));
@@ -62,6 +65,9 @@ struct SerialJudgeLane::Impl {
     float* device_logits = nullptr;
     std::vector<float> readback;
     std::atomic<bool> running{false};
+    std::vector<int64_t> last_tokens;
+    int64_t prefix_tokens = 0;
+    bool prefix_cache = false;
     bool initialized = false, poisoned = false, row_ready = false;
     ~Impl() {
         if (running.load()) std::terminate();
@@ -134,6 +140,7 @@ bool judge_stage_bytes(const core::ModelGeometry& g, int64_t cells, int64_t k,
         rounded(bytes.device_head_output) - bytes.device_head_output;
     bytes.host_checkpoint = checkpoint.bytes + (checkpoint.bytes + 7) / 8;
     bytes.host_metadata = sizeof(SerialJudgeLane::Impl::Stage) + sizeof(void*) + sizeof(SerialJudgeLane::Impl);
+    if (head_stage) bytes.host_metadata += (uint64_t)cells * sizeof(int64_t);
     // SessionOwner is included by session.host_heap; do not charge it twice.
     bytes.host_metadata -= sizeof(core::SessionOwner);
     out = bytes;
@@ -161,6 +168,9 @@ bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t 
         error = "judge: requires verified complete admission and existing native execution owners"; return false;
     }
     m.geometry = g; m.cells = cells; m.vocabulary = vocab; m.head = &head; m.draft = draft;
+    const char* cache = std::getenv("STRATA_JUDGE_PREFIX_CACHE");
+    m.prefix_cache = cache && std::string_view(cache) == "1";
+    if (m.prefix_cache) m.last_tokens.reserve((size_t)cells);
     m.stages.reserve(bindings.size());
     int64_t lo = 0;
     for (const auto& binding : bindings) {
@@ -233,7 +243,8 @@ bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t 
     return true;
 }
 
-bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error) {
+bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error,
+                          const std::function<bool()>& cancelled) {
     auto& m = *impl_;
     if (!m.initialized || !request || !tokens || count < 1 || count > m.cells || m.running.exchange(true)) {
         error = "judge: invalid, unadmitted or concurrent scoring request"; return false;
@@ -252,6 +263,19 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
             return false;
         }
     }
+    int64_t boundary = 0;
+    if (m.prefix_cache) {
+        if (m.last_tokens.empty()) boundary = count - 1;
+        else while (boundary < count - 1 && boundary < (int64_t)m.last_tokens.size() &&
+                    m.last_tokens[(size_t)boundary] == tokens[boundary]) ++boundary;
+    }
+    bool reuse = m.prefix_cache && m.prefix_tokens > 0 && m.prefix_tokens <= boundary;
+    for (const auto& stage : m.stages) {
+        if (reuse && ((int64_t)stage->branch.ids.size() != m.prefix_tokens ||
+            !std::equal(stage->branch.ids.begin(), stage->branch.ids.end(), tokens))) reuse = false;
+    }
+    const int64_t reused = reuse ? m.prefix_tokens : 0;
+    if (!reuse) m.prefix_tokens = 0;  // invalidate before zeroing any positional K/V
     struct Restore {
         Impl& owner;
         bool restored = false;
@@ -263,18 +287,26 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
         stage->saved_request = prompt.bound_request(); stage->saved_gemm = prompt.gemm_owner();
         stage->saved_chunk = std::move(prompt.on_chunk); stage->saved_stage_chunk = std::move(prompt.on_stage_chunk);
         stage->saved_stop = std::move(prompt.should_stop); stage->saved_embeddings = prompt.embd_rows;
+        prompt.should_stop = [&cancelled] { return cancelled && cancelled(); };
         stage->rebound = true; prompt.embd_rows = nullptr;
         if (!prompt.rebind_session(stage->session.state(), stage->binding.stream, request, error) ||
             !stage->canary.bind(8, request, error)) { m.poisoned = true; return false; }
         stage->session.bind_rope();
         auto& state = stage->session.state();
-        stage->canary.begin(8, (cudaStream_t)stage->binding.stream, (int32_t)tokens[0], 0);
-        core::session_zero(state, m.geometry, nullptr, stage->binding.stream);
+        stage->canary.begin(8, (cudaStream_t)stage->binding.stream, (int32_t)tokens[reused], (int32_t)reused);
+        if (reuse) {
+            if (!core::conversation_checkpoint_restore(stage->branch, state, m.geometry, error)) {
+                m.poisoned = true; return false;
+            }
+        } else {
+            core::session_zero(state, m.geometry, nullptr, stage->binding.stream);
+        }
         if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess) {
             m.poisoned = true; error = "judge: short-state initialization failed"; return false;
         }
     }
     m.stages.back()->binding.prompt->on_chunk = [&m](const float* residual, int64_t rows, int64_t position, std::string& why) {
+        core::progress_beat();
         if (position + rows != m.request_tokens) return true;
         auto& last = *m.stages.back();
         core::BlockBuffers block = last.session.state().block;
@@ -291,27 +323,56 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
         m.row_ready = true;
         return true;
     };
-    if (!m.stages.front()->binding.prompt->run(tokens, count, 0, error)) { m.poisoned = true; return false; }
+    auto read = [&](int64_t begin, int64_t end) {
+        return begin == end || m.stages.front()->binding.prompt->run(tokens + begin, end - begin, begin, error);
+    };
+    auto cancelled_read = [&]() {
+        m.row_ready = false; m.prefix_tokens = 0; m.last_tokens.clear();
+        // A concurrent SCANCEL must never disguise a device error. "cancelled"
+        // is Prefill's drained outcome; every stage must also be unpoisoned/idle.
+        if (error != "cancelled" || !cancelled || !cancelled() || !m.idle(error)) {
+            m.poisoned = true; return false;
+        }
+        restore.restored = true;
+        if (!m.restore(error)) return false;
+        error.clear();
+        return true;
+    };
+    int64_t position = reused;
+    if (m.prefix_cache && boundary > position) {
+        if (!read(position, boundary)) return cancelled_read();
+        for (auto& stage : m.stages) {
+            const core::OnDevice on(stage->session.device());
+            stage->branch.ids.resize((size_t)boundary);
+            std::copy_n(tokens, (size_t)boundary, stage->branch.ids.begin());
+            if (!core::conversation_checkpoint_save(stage->branch, stage->session.state(), m.geometry, error)) {
+                m.poisoned = true; return false;
+            }
+        }
+        m.prefix_tokens = boundary;
+        position = boundary;
+    }
+    if (!read(position, count)) return cancelled_read();
     for (auto& stage : m.stages) {
         const core::OnDevice on(stage->session.device());
         stage->canary.check(8, (cudaStream_t)stage->binding.stream);
         if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess ||
             !stage->canary.validate("judge", error)) { m.poisoned = true; return false; }
-        stage->branch.ids.resize((size_t)count);
-        for (int64_t t = 0; t < count; ++t) stage->branch.ids[(size_t)t] = (int32_t)tokens[t];
-        if (!core::conversation_checkpoint_save(stage->branch, stage->session.state(), m.geometry, error)) {
-            m.poisoned = true; return false;
+        if (std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE")) {
+            std::fprintf(stderr, "JUDGE_FIRST_USE_WORKSPACE device=%d gemm=%p bf16_conversion_bytes=%llu\n",
+                         stage->session.device(), stage->binding.prompt->gemm_owner(),
+                         (unsigned long long)stage->binding.prompt->bf16_conversion_bytes());
+            observe("first-use-complete", stage->session.device());
         }
-        std::fprintf(stderr, "JUDGE_FIRST_USE_WORKSPACE device=%d gemm=%p bf16_conversion_bytes=%llu\n",
-                     stage->session.device(), stage->binding.prompt->gemm_owner(),
-                     (unsigned long long)stage->binding.prompt->bf16_conversion_bytes());
-        observe("first-use-complete", stage->session.device());
     }
     if (!m.row_ready) { m.poisoned = true; error = "judge: final head row not produced"; return false; }
+    if (m.prefix_cache) m.last_tokens.assign(tokens, tokens + count);
     restore.restored = true;
     if (!m.restore(error)) return false;
     std::fprintf(stderr, "JUDGE_RESTORE request=%llu cells=%lld stages=%zu checked=1\n",
                  (unsigned long long)request, (long long)count, m.stages.size());
+    std::fprintf(stderr, "JUDGE_SCORE request=%llu tokens=%lld reused=%lld path=bulk_prefill generated_tokens=0\n",
+                 (unsigned long long)request, (long long)count, (long long)reused);
     return true;
 }
 } // namespace strata::program
