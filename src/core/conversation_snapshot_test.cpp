@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/prefix_extent_probe.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "../../tests/core/conversation_snapshot_equivalence.hpp"
@@ -257,6 +258,64 @@ void full_session(int fmt, int mode, int experts) {
     SavedConversation a,b,restored;
     check(conversation_snapshot_save(a,view,ss,g,draft.state,err),"capture complete A");
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
+    if (prefix_backing_enabled() && fmt == kKvF16 && mode == 0 && experts == 512) {
+        // One completed 64-token prefix spans a whole immutable extent in each
+        // main K/V pool. Draft's last uncomputed cell keeps its prefix private.
+        SavedConversation donor = a;
+        donor.scope = ConversationScope{{1}};
+        auto selected = donor.live;
+        selected.ids.resize(64);
+        selected.gdn.write()[0] = 37;
+        selected.dead.write()[0] = 71;
+        if (immutable_checkpoints_enabled()) selected.seal();
+        donor.checkpoints.push_back(std::move(selected));
+        const SavedConversation before = donor;
+        SavedConversation sibling = donor;
+        sibling.live.ids.back() += 100;
+        check(sibling.kv[0].k.visit(ConversationBuffer::prefix_extent_bytes, 1,
+                  [](uint8_t* p, size_t, size_t) { *p = 29; return true; }),
+              "make branch tail distinct beyond the completed shared prefix");
+        check(std::string_view(share_prefix_extents(sibling, donor).status) == "equal",
+              "authorize shared sibling backing at the completed cut");
+        check(probe_prefix_extents(sibling, donor).aliased_bytes ==
+                  2 * ConversationBuffer::prefix_extent_bytes,
+              "main K/V retain shared extents while draft's incomplete extent stays private");
+        const auto& cut = sibling.checkpoints.back();
+        fill(177);
+        check(conversation_snapshot_restore(sibling, ss, g, &draft.state, err, &cut) ==
+                  ConversationRestore::restored,
+              "restore selected checkpoint from a shared sibling");
+        std::vector<uint8_t> recurrent(sizes.gdn), spare(sizes.dead);
+        cuda_check(cudaMemcpy(recurrent.data(), ss.gdn_state, sizes.gdn, cudaMemcpyDeviceToHost));
+        cuda_check(cudaMemcpy(spare.data(), main.state.idx_pooled + 16 * g.idx_key_dim,
+                              sizes.dead, cudaMemcpyDeviceToHost));
+        check(recurrent == cut.gdn && spare == cut.dead &&
+                  ss.ple_prev[0] == 63 && ss.ple_prev[1] == 64,
+              "shared selected restore uses cut recurrence, spare row and PLE history");
+        uint64_t fingerprint = 0;
+        check(conversation_kv_verify(sibling.kv.back(), draft.state, g, 64, false,
+                                    fingerprint, err, 65),
+              "shared selected restore refills the earlier draft-ring pages");
+        const ConversationView cut_view{cut.ids, sibling.live.imgs, sibling.checkpoints, sibling.cvec};
+        ConversationKvReuse reuse{std::move(sibling.kv), 65, 64};
+        SavedConversation reparked;
+        size_t peak = 0, reused = 0;
+        check(conversation_snapshot_capture_bytes(reuse, cut_view, ss, g, draft.state, peak, err),
+              "price shared sibling repark before consuming its retained storage");
+        check(conversation_snapshot_save(reparked, cut_view, ss, g, draft.state, err,
+                                         std::move(reuse), &reused),
+              "repark the selected sibling with retained shared backing");
+        check(reparked.bytes() <= peak && reparked.live.ids == cut.ids &&
+                  reparked.live.gdn == cut.gdn && reparked.live.dead == cut.dead,
+              "repark preserves selected running state within its admitted peak");
+        check(reparked.kv[0].k.visit(0, 1,
+                  [](uint8_t* p, size_t, size_t) { *p = 91; return true; }),
+              "rewrite the reparked branch through copy-on-write");
+        check(same_snapshot(donor, before),
+              "selected restore, shrink, repark and subsequent rewrite leave donor unchanged");
+        check(conversation_snapshot_restore(a, ss, g, draft.state, err) == ConversationRestore::restored,
+              "restore independent full-session reference after shared-sibling boundary");
+    }
     {
         // Whole-session residency migration in both directions, including the
         // process's actual draft format (INT8, not K8V4, for a hybrid main).

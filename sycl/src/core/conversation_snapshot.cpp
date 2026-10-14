@@ -215,12 +215,17 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 }
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+                             int64_t upto, bool index, std::string& error, int64_t captured_tokens) {
+    if (captured_tokens < 0) captured_tokens = upto;
+    if (upto < 0 || upto > captured_tokens ||
+        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+    Layout cut{};
+    if (!layout(st, g, upto, index, cut, error) || !valid(st, cut, upto, error)) return false;
+    const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+        if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
     // VRAM slots still contain the outgoing conversation. Resolve must refill
@@ -280,8 +285,13 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error, int64_t captured_tokens) {
+    if (captured_tokens < 0) captured_tokens = upto;
+    if (upto < 0 || upto > captured_tokens ||
+        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+    Layout cut{};
+    if (!layout(st, g, upto, index, cut, error)) return false;
+    const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
@@ -300,16 +310,16 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
-        if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+        if (!saved[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
             })) return false;
-    if (st.kv_mode == 2 && image.cells > 0) {
+    if (st.kv_mode == 2 && cut.cells > 0) {
         const auto resident = pools(st, true);
-        const int64_t end = image.cells / image.page_size;
+        const int64_t end = cut.cells / image.page_size;
         const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
         for (size_t i = 0; i < 4; ++i) {
             if (saved[i]->empty()) continue;
-            const size_t page_bytes = saved[i]->size() / size_t(end);
+            const size_t page_bytes = sizes[i] / size_t(end);
             for (int64_t page = begin; page < end; ++page)
                 if (!saved[i]->visit(size_t(page) * page_bytes, page_bytes,
                         [&](const uint8_t* p, size_t n, size_t at) {
