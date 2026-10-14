@@ -893,6 +893,18 @@ release and drain. Helper, borrowed and shared-device paths are refused.
 serving mode; it cannot be combined with overlap. Cancellation invalidates
 scoring reuse and drains descendants before returning.
 
+**Resident MMQ gathers.** The existing default-on `STRATA_PREFILL_GROUP_GATHER`
+also batches byte copies when the entire routed local expert order is resident.
+It reuses the existing group buffers and copy kernel, preserving expert order,
+quantized bytes and arithmetic. Mixed routed walks keep their existing staging
+lifetimes; unaligned copies retain the individual fallback. A one-time per-owner
+`resident MMQ group gather` line identifies successful grouped submissions.
+Set `STRATA_PREFILL_GROUP_GATHER=0` for the individual-copy control.
+Two opposite-order on/off pairs on the three-GPU overlap256 scoring configuration
+reduced mean complete three-question decision latency by 0.39–0.42 seconds
+(3.24–3.47%), with four generation streams completing. This is a bounded result,
+not installed-client deadline, tail-latency or daily-profile qualification.
+
 **Opt-in bounded observers.** `STRATA_JUDGE_TIMING=1` emits host span and
 request timings, a bounded 8,192-record generation-commit buffer, and
 outstanding-stream witnesses. Commit records are timestamped before token
