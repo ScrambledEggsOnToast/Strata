@@ -3,6 +3,8 @@
 // cudaHostGetDevicePointer,cudaMemcpy,cudaDeviceSynchronize (one -Wl,--wrap=NAME per symbol), and define
 // STRATA_SESSION_TEST_WRAP. Wrappers forward to the REAL runtime; they count and inject allocation failures.
 // --gpu also requires STRATA_ROPE_TABLE=1 (set before process start) to observe registration ownership.
+// --shared-rope-gpu is an explicit bounded host-monitor diagnostic, never a CTest GPU workload.
+// It requires STRATA_SHARED_ROPE=1 and STRATA_ROPE_TABLE=1 and retains one admitted table until exit.
 #include "strata/core/session.hpp"
 #include "strata/plan/admission.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -175,15 +177,21 @@ int main(int argc, char** argv) {
     SessionState manual;
     session_release(manual);   // no CUDA calls for an empty/manual view
     if (argc == 1) return failures ? 1 : 0;
-    if (argc != 2 || std::strcmp(argv[1], "--gpu") != 0) return 2;
+    const bool shared_test = argc == 2 && std::strcmp(argv[1], "--shared-rope-gpu") == 0;
+    if (argc != 2 || (!shared_test && std::strcmp(argv[1], "--gpu") != 0)) return 2;
+    if (shared_test != shared_rope_enabled()) {
+        std::fprintf(stderr, "use --shared-rope-gpu with STRATA_SHARED_ROPE=1; --gpu requires it off\n");
+        return 2;
+    }
 #ifndef STRATA_SESSION_TEST_WRAP
     std::fprintf(stderr, "--gpu requires the real-runtime allocation wrapper target\n");
     return 2;
 #else
-    if (!std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0) {
+    if (!shared_test && (!std::getenv("STRATA_SUPERVISED") || std::strcmp(std::getenv("STRATA_SUPERVISED"), "1") != 0)) {
         std::fprintf(stderr, "--gpu requires the protected supervisor\n"); return 2;
     }
-    if (!strata::platform::acknowledge_protected_test()) return 2;
+    // The new explicit mode runs under the ordinary bounded host monitor (ADR 0002).
+    if (!shared_test && !strata::platform::acknowledge_protected_test()) return 2;
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess) return 1;
     static float rope_canary[1];
@@ -195,6 +203,87 @@ int main(int argc, char** argv) {
     }
     strata::kernels::rope_table_release(rope_canary);
     std::string error;
+    if (shared_test) {
+        // One finite real-runtime proof, separate from all timing measurements.
+        auto ok = [&](cudaError_t result) {
+            if (result != cudaSuccess) {
+                std::fprintf(stderr, "shared RoPE CUDA failure: %s\n", cudaGetErrorString(result));
+                std::exit(1);
+            }
+        };
+        constexpr int cells = 65;
+        const auto table_bytes = shared_rope_device_bytes(g, cells);
+        for (int fail = 0; fail < 2; ++fail) {
+            SessionOwner failed;
+            fail_copy = fail; // cosine or sine upload, before publication
+            check(!failed.init(g, cells, 10, error), "partial shared upload refused");
+            fail_copy = -1;
+            check(device_live.empty() && host_live.empty(), "unpublished table and failed owner reclaimed");
+        }
+        {
+            SessionOwner failed;
+            fail_device = 1; // arena succeeds, separate table allocation fails
+            check(!failed.init(g, cells, 10, error), "shared table allocation failure propagated");
+            fail_device = -1;
+            check(device_live.empty() && host_live.empty(), "failed table allocation leaves no owner");
+        }
+        std::vector<std::unique_ptr<SessionOwner>> owners;
+        float *cosine = nullptr, *sine = nullptr;
+        uint64_t arenas = 0;
+        for (int i = 0; i < 5; ++i) {
+            auto owner = std::make_unique<SessionOwner>();
+            if (!owner->init(g, cells, 10, error)) {
+                std::fprintf(stderr, "%s\n", error.c_str()); return 1;
+            }
+            const auto& q = owner->state().qsa_states[owner->state().qsa_primary()];
+            if (!i) { cosine = q.cos_tab; sine = q.sin_tab; }
+            check(q.cos_tab == cosine && q.sin_tab == sine && !q.owns_rope,
+                  "working plus four slots share immutable process-owned addresses");
+            arenas += owner->memory().device;
+            check(bytes(device_live) == arenas + table_bytes, "one table plus exactly priced arenas");
+            owners.push_back(std::move(owner));
+        }
+        std::vector<float> expected(table_bytes / sizeof(float)), observed(expected.size());
+        const size_t half = expected.size() / 2;
+        strata::kernels::build_rope_table(64, strata::kernels::rope_scaling(), cells,
+                                          expected.data(), expected.data() + half);
+        float* copy = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        ok(cudaMalloc(&copy, table_bytes));
+        ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        ok(cudaMemcpyAsync(copy, cosine, table_bytes / 2, cudaMemcpyDeviceToDevice, stream));
+        ok(cudaMemcpyAsync(copy + half, sine, table_bytes / 2, cudaMemcpyDeviceToDevice, stream));
+        ok(cudaStreamEndCapture(stream, &graph));
+        ok(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        ok(cudaGraphDestroy(graph));
+        owners.clear(); // graph outlives EVERY session that supplied its table addresses
+        check(host_live.empty(), "all session pinned storage retired");
+        {
+            SessionOwner failed;
+            fail_copy = 0; // reused shared table, first page-table upload fails
+            check(!failed.init(g, cells, 10, error), "post-publication session failure propagated");
+            fail_copy = -1;
+            check(!failed.init(g, cells + 1, 10, error), "second context geometry refused without replacement");
+        }
+        ok(cudaGraphLaunch(exec, stream));
+        ok(cudaStreamSynchronize(stream));
+        ok(cudaMemcpy(observed.data(), copy, table_bytes, cudaMemcpyDeviceToHost));
+        check(std::memcmp(expected.data(), observed.data(), table_bytes) == 0,
+              "captured table survives owner retirement and failures byte-exactly");
+        check(strata::kernels::rope_table_for(strata::kernels::rope_scaling()).cos == cosine,
+              "session retirement preserves shared registry");
+        ok(cudaGraphExecDestroy(exec));
+        ok(cudaStreamDestroy(stream));
+        ok(cudaFree(copy));
+        check(bytes(device_live) == table_bytes && device_live.size() == 1 && host_live.empty(),
+              "only the explicitly admitted process-lifetime table remains");
+        std::printf("SHARED_ROPE owners=5 captured_exact=1 retained_bytes=%llu failures=%d\n",
+                    (unsigned long long) table_bytes, failures);
+        return failures ? 1 : 0;
+    }
     const uint64_t host_kv_before = qsa_kv_host_bytes();
     auto empty = [&] {
         check(device_live.empty(), "no leaked device arena");

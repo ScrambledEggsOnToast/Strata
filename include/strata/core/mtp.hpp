@@ -208,7 +208,7 @@ private:
     OperationCanary canary_;
     bool draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                     float* probs, float min_p, int* n_drafts);
-    void restore_ring(int64_t upto);
+    bool restore_ring(int64_t upto, std::string& err);
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err,
                         const QsaState* state = nullptr);
     bool prepare_slots(std::string& err);

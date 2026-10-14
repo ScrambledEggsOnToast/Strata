@@ -9,6 +9,24 @@
 
 namespace strata::core {
 
+// Native resident handoff experiment. Only the exact value "1" enables it.
+bool resident_direct_copy_enabled();
+// Copy between existing same-device owners, using their authoritative pools (which
+// may already be mapped host pools). No intermediate image or CPU fallback.
+// Caller joins all consumers and synchronizes before copying and after all layers;
+// false after a write invalidates the destination. Validation performs no CUDA calls.
+bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                                   int64_t upto, bool include_index, std::string& error);
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error);
+// KV first, then live running state or the selected host checkpoint, so a cut's
+// spare pooled row is repaired after copying rows from the longer-lived source.
+// Caller joins consumers and keeps owner metadata stable; this function owns
+// the entry device fence, after all-layer validation, and completion fences.
+bool conversation_session_copy(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                               const std::vector<int32_t>& ids, const ConversationCheckpoint* at,
+                               std::string& error);
+
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
@@ -24,12 +42,14 @@ bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                             int64_t upto, bool include_index, std::string& error);
+                             int64_t upto, bool include_index, std::string& error,
+                             int64_t captured_tokens = -1);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error,
+                            int64_t captured_tokens = -1);
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
@@ -111,6 +131,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const ConversationCheckpoint* selected = nullptr);
 
 } // namespace strata::core

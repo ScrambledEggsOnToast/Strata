@@ -4716,6 +4716,12 @@ bool Prefill::drain_pipeline(std::string& err) {
     return ok;
 }
 
+bool Prefill::run_retained(const int64_t*, int64_t, int64_t, std::string& err,
+                          const std::function<bool(Prefill*, int64_t, std::string&)>&, bool) {
+    err = "prefill: retained layer scheduling is not implemented for SYCL";
+    return false;
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     const bool body_ok = run_impl(tokens, n, pos0, err);
 

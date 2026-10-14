@@ -1,4 +1,5 @@
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/prefix_extent_probe.hpp"
 #include "strata/program/prefix_selection.hpp"
 
 #include <cstdio>
@@ -27,6 +28,256 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
 }
 
 int main() {
+    {
+        auto make = [] {
+            auto s = image({1,2,3,4,5,6,7,8,9});
+            auto cut = s.live; cut.ids.resize(5); s.checkpoints.push_back(cut);
+            for (int fmt : {3,1}) { // current profile: K8V4 main, INT8 draft
+                const bool index = fmt == 3;
+                auto shape = strata::kernels::qsa_real_shapes();
+                shape.n_head_kv=1; shape.head_dim=64; shape.idx_dim=8;
+                strata::plan::QsaImageBytes bytes;
+                check(strata::plan::qsa_image_bytes(shape,9,fmt,index,bytes), "probe fixture layout");
+                ConversationKv kv;
+                kv.format=fmt; kv.cells=bytes.cells; kv.page_size=shape.page_size;
+                kv.heads=1; kv.head_dim=64; kv.idx_dim=8; kv.pooled_rows=bytes.pooled_rows;
+                kv.k.resize(bytes.k,7); kv.v.resize(bytes.v,7);
+                kv.k_scale.resize(bytes.k_scale,7); kv.v_scale.resize(bytes.v_scale,7);
+                kv.pooled.resize(bytes.pooled,7);
+                s.kv.push_back(std::move(kv));
+            }
+            return s;
+        };
+        auto a=make(), b=make();
+        b.live.ids[6]=17; // sibling branch after an actual common checkpoint
+        auto r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="equal" && r.cut==5 && r.eligible_bytes==968 &&
+              r.duplicate_bytes==968 && r.aliased_bytes==0 && r.compared_bytes==968,
+              "independent backing counted for complete K8V4 and draft pages plus completed index row");
+        auto change = [](ConversationBuffer& data, size_t at) {
+            check(data.visit(at,1,[](uint8_t* p,size_t,size_t) { *p=23; return true; }), "probe fixture mutation");
+        };
+        change(b.kv[0].k,4*64); change(b.kv[0].pooled,32); change(b.kv[1].k,4*64);
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="equal" && r.duplicate_bytes==968,
+              "partial pages, moving index row and draft tail excluded from duplicate witness");
+        change(b.kv[0].k,0);
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="different" && r.duplicate_bytes==0 && r.compared_bytes>0,
+              "equal token prefixes cannot hide unequal authoritative KV");
+        b=make(); b.scope=ConversationScope{{2}};
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="scope" && r.compared_bytes==0, "foreign scope never reads KV");
+        b=make(); b.cvec=!a.cvec;
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="scope" && r.compared_bytes==0, "steering mismatch never reads KV");
+        b=make(); b.checkpoints.clear();
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="no-cut" && r.compared_bytes==0, "equal tokens do not manufacture recurrent cut");
+        b=make(); b.kv[1].v.pop_back();
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)!="equal" && r.compared_bytes==0, "malformed final draft payload rejected before comparisons");
+        b=make();
+        r=probe_prefix_extents(a,b,1);
+        check(std::string_view(r.status)=="limit" && r.compared_bytes==0, "budget refusal is not a zero-opportunity finding");
+        r=probe_prefix_extents(a,a);
+        check(std::string_view(r.status)=="equal" && r.duplicate_bytes==0 && r.aliased_bytes==968,
+              "already shared backing never counted as duplicated allocation");
+        a.checkpoints[0].ids.resize(4); b.checkpoints[0].ids.resize(4);
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="equal" && r.duplicate_bytes==440,
+              "draft final page stays private even when recurrent cut aligns to page boundary");
+        a.stage_images.push_back(make()); b.stage_images.push_back(make());
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="no-cut", "every stage must hold the same recurrent cut");
+        a.checkpoints[0].ids.push_back(5); b.checkpoints[0].ids.push_back(5);
+        r=probe_prefix_extents(a,b);
+        check(std::string_view(r.status)=="equal" && r.duplicate_bytes==1936,
+              "complete staged siblings include each stage exactly once");
+        const size_t charged=a.bytes();
+        const auto* payload=a.live.gdn.data();
+        (void) probe_prefix_extents(a,b);
+        check(a.bytes()==charged && a.live.gdn.data()==payload && a.kv[0].k==b.kv[0].k,
+              "observer does not change accounting, ownership or contents");
+    }
+    {
+        auto make_segmented = [](bool shifted) {
+            auto s = image({});
+            s.live.ids.assign(4097, 1);
+            s.checkpoints.push_back(s.live);
+            s.checkpoints.back().ids.resize(4096);
+            auto shape = strata::kernels::qsa_real_shapes();
+            shape.n_head_kv = 129; shape.head_dim = 64; shape.idx_dim = 8;
+            strata::plan::QsaImageBytes bytes;
+            check(strata::plan::qsa_image_bytes(shape, 4097, 3, true, bytes), "segmented probe layout");
+            ConversationKv kv;
+            kv.format = 3; kv.cells = bytes.cells; kv.page_size = shape.page_size;
+            kv.heads = 129; kv.head_dim = 64; kv.idx_dim = 8; kv.pooled_rows = bytes.pooled_rows;
+            if (shifted) kv.k.resize(17, 7);
+            kv.k.resize(bytes.k, 7); kv.v.resize(bytes.v, 7);
+            kv.k_scale.resize(bytes.k_scale, 7); kv.v_scale.resize(bytes.v_scale, 7);
+            kv.pooled.resize(bytes.pooled, 7);
+            s.kv.push_back(std::move(kv));
+            return s;
+        };
+        auto a = make_segmented(false), b = make_segmented(true);
+        auto r = probe_prefix_extents(a, b);
+        check(std::string_view(r.status) == "equal" && r.cut == 4096,
+              "equal eligible bytes survive different segment boundaries");
+        check(b.kv[0].k.visit(2 * ConversationBuffer::segment_bytes + 7, 1,
+                             [](uint8_t* p, size_t, size_t) { *p = 23; return true; }),
+              "third segment mutation lies inside the eligible prefix");
+        r = probe_prefix_extents(a, b);
+        check(std::string_view(r.status) == "different" && r.duplicate_bytes == 0,
+              "a third-segment mismatch invalidates the complete-cut witness");
+    }
+    {
+        // Explicit buffer policy keeps the rest of this executable on its normal
+        // default path; no environment-dependent expectations in these fixtures.
+        auto make = [](int branch) {
+            auto s = image({});
+            s.live.ids.assign(2305, 1);
+            s.live.ids[2100] = branch;
+            auto root = s.live; root.ids.resize(2048); s.checkpoints.push_back(root);
+            auto deep = s.live; deep.ids.resize(2304); s.checkpoints.push_back(deep);
+            for (int fmt : {3, 1}) {
+                const bool index = fmt == 3;
+                auto shape = strata::kernels::qsa_real_shapes();
+                shape.n_head_kv = 1; shape.head_dim = 64; shape.idx_dim = 8;
+                strata::plan::QsaImageBytes bytes;
+                check(strata::plan::qsa_image_bytes(shape, 2305, fmt, index, bytes), "sharing fixture layout");
+                ConversationKv kv;
+                kv.format = fmt; kv.cells = bytes.cells; kv.page_size = shape.page_size;
+                kv.heads = 1; kv.head_dim = 64; kv.idx_dim = 8; kv.pooled_rows = bytes.pooled_rows;
+                const std::array<ConversationBuffer*, 5> parts{&kv.k,&kv.v,&kv.k_scale,&kv.v_scale,&kv.pooled};
+                const std::array<uint64_t, 5> sizes{bytes.k,bytes.v,bytes.k_scale,bytes.v_scale,bytes.pooled};
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    *parts[i] = ConversationBuffer(true);
+                    parts[i]->resize(size_t(sizes[i]), 7);
+                }
+                s.kv.push_back(std::move(kv));
+            }
+            return s;
+        };
+        auto pointer = [](const ConversationBuffer& b, size_t at) {
+            const uint8_t* out = nullptr;
+            b.visit(at, 1, [&](const uint8_t* p, size_t, size_t) { out = p; return true; });
+            return out;
+        };
+        auto a = make(2), b = make(3), c = make(4);
+        PrefixBackingLedger before; before.add(a); before.add(b); before.add(c);
+        const auto* tail = pointer(b.kv[0].k, 2048 * 64);
+        auto r = share_prefix_extents(b, a);
+        check(std::string_view(r.status) == "equal", "authorized completed common cut accepted");
+        share_prefix_extents(c, a);
+        auto aliases = probe_prefix_extents(a, b);
+        check(aliases.aliased_bytes > 0 && aliases.duplicate_bytes > 0,
+              "complete allocations share; subextent scales and private tails remain separate");
+        PrefixBackingLedger after; after.add(a); after.add(b); after.add(c);
+        check(!after.truncated && after.unique_payload < before.unique_payload &&
+              before.unique_payload - after.unique_payload == 2 * aliases.aliased_bytes &&
+              after.logical_payload == before.logical_payload,
+              "unique allocation ledger counts three siblings once, not three repeated pairs");
+        check(pointer(b.kv[0].k, 2048 * 64) == tail,
+              "sharing frees full prefix allocations without relocating the private tail");
+        check(pointer(a.kv[1].k, 2044 * 64) != pointer(b.kv[1].k, 2044 * 64),
+              "draft last possible uncomputed page stays private at aligned cut");
+        const size_t peak = b.kv[0].k.allocation_peak(b.kv[0].k.size());
+        check(peak >= b.kv[0].k.bytes() + 2 * ConversationBuffer::prefix_extent_bytes,
+              "same-size rewrite admission includes every shared extent replacement");
+        const auto* original = pointer(a.kv[0].k, 0);
+        check(b.kv[0].k.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 29; return true; }),
+              "mutable visitor can rewrite a shared prefix after detaching");
+        check(*pointer(a.kv[0].k, 0) == 7 && *pointer(c.kv[0].k, 0) == 7 &&
+              pointer(b.kv[0].k, 0) != original && *pointer(b.kv[0].k, 0) == 29,
+              "prefix mutation leaves both other branches and their backing intact");
+        check(peak >= b.kv[0].k.bytes(), "detachment stays inside admitted buffer peak");
+        check(c.kv[0].k.allocation_peak(17) >= c.kv[0].k.bytes() + ConversationBuffer::prefix_extent_bytes,
+              "partial shrink prices detachment before changing segment length");
+        c.kv[0].k.resize(17);
+        check(a.kv[0].k.size() > 17 && *pointer(a.kv[0].k, 0) == 7,
+              "shrinking shared prefix cannot truncate the donor");
+        for (int mismatch = 0; mismatch < 6; ++mismatch) {
+            auto isolated = make(5);
+            if (mismatch == 0) isolated.scope = ConversationScope{{2}};
+            if (mismatch == 1) isolated.cvec = !a.cvec;
+            if (mismatch == 2) isolated.geometry[0] = 1;
+            if (mismatch == 3) isolated.layer_hi = 1;
+            if (mismatch == 4) isolated.checkpoints.erase(isolated.checkpoints.begin());
+            if (mismatch == 5) isolated.kv.back().v.pop_back();
+            const auto* own = pointer(isolated.kv[0].k, 0);
+            auto refused = share_prefix_extents(isolated, a);
+            check(std::string_view(refused.status) != "equal" && refused.compared_bytes == 0 &&
+                  pointer(isolated.kv[0].k, 0) == own,
+                  "scope, steering, geometry, carve, checkpoint and format-size refusals preserve ownership");
+        }
+        auto unequal = make(6);
+        unequal.kv.back().v.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 99; return true; });
+        const auto* unchanged = pointer(unequal.kv[0].k, 0);
+        r = share_prefix_extents(unequal, a);
+        check(std::string_view(r.status) == "different" && pointer(unequal.kv[0].k, 0) == unchanged,
+              "late-layer mismatch rejects entire cut before sharing earlier layers");
+        auto staged_a = make(2), staged_b = make(3);
+        staged_a.stage_images.push_back(make(2)); staged_b.stage_images.push_back(make(3));
+        staged_b.stage_images[0].checkpoints.erase(staged_b.stage_images[0].checkpoints.begin());
+        r = share_prefix_extents(staged_b, staged_a);
+        check(std::string_view(r.status) != "equal" && probe_prefix_extents(staged_a, staged_b).aliased_bytes == 0,
+              "missing checkpoint on one stage prevents sharing every stage");
+        staged_b.stage_images[0] = make(3);
+        r = share_prefix_extents(staged_b, staged_a);
+        check(std::string_view(r.status) == "equal" &&
+              probe_prefix_extents(staged_a, staged_b).aliased_bytes == 2 * aliases.aliased_bytes,
+              "all-stage identity shares each stage exactly once");
+        auto owner = make(2), survivor = make(3);
+        share_prefix_extents(survivor, owner);
+        const auto* surviving = pointer(survivor.kv[0].k, 0);
+        ConversationCache cache(32u << 20, 4);
+        check(cache.put(std::move(owner)) && cache.put(std::move(survivor)), "shared siblings occupy original cache slots");
+        check(cache.evict_oldest(), "donor can be evicted with live sibling references");
+        auto remaining = cache.take(0);
+        check(pointer(remaining.kv[0].k, 0) == surviving && *surviving == 7,
+              "eviction and take preserve exactly the surviving allocation");
+        cache.retain(std::move(remaining.kv), 2305);
+        auto active = cache.take_reuse();
+        check(pointer(active.kv[0].k, 0) == surviving, "active retained reuse keeps the same backing");
+        const auto* same = pointer(active.kv[0].k, 0);
+        active.kv[0].k.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 31; return true; });
+        check(pointer(active.kv[0].k, 0) == same && *same == 31,
+              "last surviving owner writes without a redundant detach allocation");
+        auto limited = make(7);
+        r = share_prefix_extents(limited, a, 1);
+        check(std::string_view(r.status) == "limit" && r.compared_bytes == 0,
+              "comparison limit refuses sharing without a partial publication");
+        PrefixBackingLedger bounded;
+        for (size_t i = 0; i <= PrefixBackingLedger::max_backings; ++i) bounded.add(a.kv[0].k);
+        check(bounded.truncated, "diagnostic reference bound reports incomplete coverage explicitly");
+    }
+    {
+        auto source = image({1, 2, 3});
+        source.live.stage_parts.resize(1);
+        source.live.stage_parts[0].gdn.assign(32, 9);
+        source.live.seal();
+        const auto* root = source.live.gdn.data();
+        const auto* stage = source.live.stage_parts[0].gdn.data();
+        auto reader = source.live;
+        check(reader.gdn.data()==root && reader.stage_parts[0].gdn.data()==stage,
+              "sealed checkpoint copies retain exact root and stage allocations");
+        reader.used = 17; reader.pinned = true;
+        check(source.live.used!=reader.used && !source.live.pinned,
+              "shared payload does not share LRU or pin metadata");
+        reader.gdn.write()[0] = 42;
+        check(reader.gdn.data()!=root && source.live.gdn[0]==7 && reader.gdn[0]==42,
+              "mutating a sealed checkpoint detaches without changing another branch");
+        auto survivor = source.live;
+        source = {};
+        check(survivor.gdn.data()==root && survivor.stage_parts[0].gdn.data()==stage,
+              "evicting source preserves held root and stage readers");
+        const size_t payload_charge = survivor.gdn.bytes();
+        auto another = survivor;
+        check(another.gdn.bytes()==payload_charge && payload_charge>=survivor.gdn.size(),
+              "each shared reference retains its conservative payload charge");
+    }
+
     {
         ConversationScope scope;
         check(conversation_scope_parse("0100000000000000000000000000000000000000000000000000000000000000", scope) &&
@@ -179,7 +430,7 @@ int main() {
         check(cache.retained_bytes() > 0, "a retained K/V before clear()");
         check(cache.clear() == 2, "clear() reports how many were parked");
         check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "clear() leaves nothing parked");
-        check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a cleared cache matches nothing");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true, test_scope).tokens == 0, "a cleared cache matches nothing");
         check(cache.clear() == 0, "clear() on an empty cache");
     }
     {

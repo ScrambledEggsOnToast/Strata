@@ -1654,6 +1654,25 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
 }
 
 int main(int argc, char **argv) try {
+    if (const char* retained = std::getenv("STRATA_PREFILL_RETAINED_LAYERS")) {
+        if (std::strcmp(retained, "0") != 0) {
+            std::fprintf(stderr, "strata retained prefill: not implemented for SYCL\n");
+            return 2;
+        }
+    }
+    if (const char* direct = std::getenv("STRATA_RESIDENT_DIRECT_COPY")) {
+        if (std::strcmp(direct, "1") == 0) {
+            std::fprintf(stderr, "strata resident direct copy: CUDA/HIP only\n");
+            return 2;
+        }
+    }
+    if (const char* observer = std::getenv("STRATA_ADMISSION_COPY_BYTES")) {
+        if (std::strcmp(observer, "0") != 0) {
+            std::fprintf(stderr, "strata admission copy observer: CUDA/HIP only\n");
+            return 2;
+        }
+    }
+
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.

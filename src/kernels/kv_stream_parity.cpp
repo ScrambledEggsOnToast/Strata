@@ -218,7 +218,11 @@ bool run(int fmt) {
         ring.alloc(R, s, fmt, false);
         int32_t* rt = dalloc<int32_t>(n_blocks);
         k::kv_ring_table(rt, n_blocks, R, nullptr);
-        k::kv_ring_restore(ring.attn(rt), host.p, fmt, b0, b1, R, s, nullptr);
+        std::string error;
+        if (!k::kv_ring_restore(ring.attn(rt), host.p, fmt, b0, b1, R, s, nullptr, error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            std::exit(2);
+        }
         const int64_t width = cap;
         std::vector<int32_t> hids((size_t) cap), hst = {(int32_t) (N - 1), (int32_t) N, (int32_t) (N / 4), (int32_t) width};
         for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);   // the window's last cells

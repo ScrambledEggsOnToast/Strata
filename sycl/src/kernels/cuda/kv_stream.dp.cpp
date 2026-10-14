@@ -408,9 +408,9 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
     check("ring table");
 }
 
-void kv_ring_restore(const QsaAttnPools &slots, const KvHostPools &host,
+bool kv_ring_restore(const QsaAttnPools &slots, const KvHostPools &host,
                      int fmt, int64_t b0, int64_t b1, int64_t n_slots,
-                     const QsaShapes &s, void *stream) try {
+                     const QsaShapes &s, void *stream, std::string &error) try {
     const Runs r = runs_of(slots, host, fmt, s);
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
@@ -421,17 +421,15 @@ void kv_ring_restore(const QsaAttnPools &slots, const KvHostPools &host,
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
-            if (DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(
-                    r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a],
-                    (size_t)(run * r.len[a]))) != 0)
-                check("ring restore");
+            strata::q_of(stream)->memcpy(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a],
+                                         (size_t)(run * r.len[a]));
         b += run;
     }
+    return true;
 }
 catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    error = std::string("kv_stream ring restore: ") + exc.what();
+    return false;
 }
 
 void kv_stage_from_host(const QsaAttnPools &stage, const KvHostPools &host,

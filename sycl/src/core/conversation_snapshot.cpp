@@ -230,8 +230,9 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
         const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
-        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+        if (!strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                             std::max<int64_t>(0, end - st.n_slots), end, st.n_slots,
+                                             shapes, nullptr, error)) return false;
     }
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the

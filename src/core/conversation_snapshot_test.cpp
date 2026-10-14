@@ -132,6 +132,51 @@ bool empty_map(const QsaState& st) {
            counters.calls==0 && counters.lookups==0 && counters.misses==0 && counters.overflow==0;
 }
 
+void direct_kv(int fmt, int source_mode, int target_mode) {
+    Fixture source(fmt,source_mode), target(fmt,target_mode);
+    const bool index=source_mode!=2 && target_mode!=2;
+    std::string err;
+    for (int64_t upto : {0,3,4,5,65}) {
+        source.fill(29); target.fill(181);
+        cuda_check(cudaDeviceSynchronize());
+        ConversationKv expected, before, after;
+        check(conversation_kv_save(expected,source.state,source.g,upto,index,err),"direct source reference");
+        check(conversation_kv_save(before,target.state,target.g,96,index,err),"direct destination guard reference");
+        const auto pointers=target.sources;
+        if (target_mode==1) {
+            const int32_t zero=0;
+            cuda_check(cudaMemcpy(target.state.map.page_table,&zero,4,cudaMemcpyHostToDevice));
+            cuda_check(cudaMemcpy(target.state.map.slot_block,&zero,4,cudaMemcpyHostToDevice));
+        }
+        check(conversation_kv_copy(source.state,target.state,source.g,upto,index,err),"direct authoritative pool copy");
+        cuda_check(cudaDeviceSynchronize());
+        uint64_t hash=0;
+        check(conversation_kv_verify(expected,target.state,source.g,upto,index,hash,err),
+              "direct copy preserves partial pages, scale runs, pooled rows and draft ring");
+        check(target.sources==pointers,"direct copy keeps stationary pool addresses");
+        if (target_mode==1) check(empty_map(target.state),"direct copy invalidates old streamed pages");
+        check(conversation_kv_save(after,target.state,target.g,96,index,err),"read direct destination guards");
+        const std::array<const ConversationBuffer*,5> full={&before.k,&before.v,&before.k_scale,&before.v_scale,&before.pooled};
+        const std::array<const ConversationBuffer*,5> copied={&expected.k,&expected.v,&expected.k_scale,&expected.v_scale,&expected.pooled};
+        const std::array<const ConversationBuffer*,5> got={&after.k,&after.v,&after.k_scale,&after.v_scale,&after.pooled};
+        for (size_t i=0;i<full.size();++i) {
+            const size_t offset=copied[i]->size(), bytes=full[i]->size()-offset;
+            std::vector<uint8_t> want(bytes), actual(bytes);
+            check(full[i]->read(want.data(),offset,bytes) && got[i]->read(actual.data(),offset,bytes) && want==actual,
+                  "direct copy leaves pages and index rows beyond the rounded extent untouched");
+        }
+        ConversationKv source_after;
+        check(conversation_kv_save(source_after,source.state,source.g,upto,index,err) && equal(source_after,expected),
+              "direct copy leaves source authoritative payload intact");
+        // Format identity (including INT8 rotation) is checked before any write.
+        auto incompatible=target.state;
+        incompatible.kv_rot=!incompatible.kv_rot;
+        if (fmt==kKvInt8)
+            check(!conversation_kv_copy(source.state,incompatible,source.g,upto,index,err),
+                  "direct transfer refuses rotated/unrotated mismatch");
+    }
+}
+
 void release_reinit(int fmt, int mode) {
     Fixture source(fmt,0);
     source.fill(37);
@@ -229,6 +274,27 @@ void full_session(int fmt, int mode, int experts) {
                   {destination.state.idx_dead,sizes.dead},{destination.state.idx_block_pos,sizes.block_pos}}})
             cuda_check(cudaMemset(p,177,n));
         if (!mode) check(empty_map(destination.state),"resident-to-streamed destination map is initially empty");
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_session_copy(ss,target,g,ids,nullptr,err) &&
+              conversation_kv_copy(draft.state,destination_draft.state,g,65,false,err),
+              "direct full-session handoff across residency modes");
+        cuda_check(cudaDeviceSynchronize());
+        SavedConversation direct;
+        check(conversation_snapshot_save(direct,view,target,g,destination_draft.state,err) && same_snapshot(direct,a),
+              "direct session handoff equals host snapshot for GDN, PLE, KV, index and draft");
+        check(target.ple_prev[0]==64 && target.ple_prev[1]==65,"direct handoff reconstructs PLE token window");
+        const auto& cut=a.checkpoints[0];
+        // The source has advanced past this row: the selected checkpoint's dead
+        // key must win over its later pooled row, including at a partial page.
+        cuda_check(cudaMemset(main.state.idx_pooled,177,sizes.dead));
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_session_copy(ss,target,g,cut.ids,&cut,err),"direct selected-cut handoff");
+        std::vector<uint8_t> spare(sizes.dead);
+        cuda_check(cudaMemcpy(spare.data(),destination.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
+        check(spare==cut.dead && target.ple_prev[0]==2 && target.ple_prev[1]==3,
+              "selected cut repairs spare row after copying the longer-lived source pools");
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,
+              "restore source after selected-cut discriminator");
         check(conversation_snapshot_restore(a,target,g,destination_draft.state,err)==ConversationRestore::restored,
               mode?"streamed-to-resident complete snapshot":"resident-to-streamed complete snapshot");
         SavedConversation migrated;
@@ -485,11 +551,24 @@ int main() {
                 bad=a; bad.k.pop_back();
                 check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject malformed payload");
             }
+            if (upto==65 && mode==2) {
+                // Two cuts cover complete and partial pages after the old ring has wrapped.
+                for (int64_t cut : {4,5}) {
+                    f.fill(177);
+                    check(conversation_kv_restore(a,f.state,f.g,cut,false,err,upto),
+                          "restore selected draft prefix from longer wrapped image");
+                    cuda_check(cudaDeviceSynchronize());
+                    check(conversation_kv_verify(a,f.state,f.g,cut,false,fingerprint,err,upto),
+                          "selected draft prefix authoritative bytes and resident ring agree");
+                }
+            }
         }
     }
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int mode : {0,1}) for (int experts : {256,512}) full_session(3,mode,experts);
+    for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvHybrid})
+        for (int source : {0,1,2}) for (int target : {0,1,2}) direct_kv(fmt,source,target);
     for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvHybrid}) for (int mode : {0,1,2}) release_reinit(fmt,mode);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

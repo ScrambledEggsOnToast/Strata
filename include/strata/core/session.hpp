@@ -129,6 +129,8 @@ struct SessionAllocationBytes {
 /// False/zero output on invalid inputs or unsupported geometry: positive dimensions no larger than defaults,
 /// context and KV-resident cells <= INT32_MAX, k in [1,64]. Call before allocating ANY resident slots.
 /// Excludes weights, verifier/prefill/MTP scratch, request containers and allocator/driver overhead.
+/// With shared_rope_enabled(), also admit shared_rope_device_bytes once per device and
+/// shared_rope_host_bytes once per process; those immutable allocations outlive all sessions.
 bool session_allocation_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
                               SessionAllocationBytes& out, int64_t layer_lo = 0, int64_t layer_hi = -1,
                               const strata::plan::QsaPlacement* placement = nullptr);

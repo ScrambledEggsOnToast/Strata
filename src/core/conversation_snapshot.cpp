@@ -1,11 +1,13 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
+#include "strata/core/admission_copy_observer.hpp"
 #include "strata/plan/qsa_memory.hpp"
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -17,6 +19,7 @@ struct Layout {
     int64_t cells, pooled_rows, page_size;
     size_t data, scales, pooled, value_data, value_scales;
 };
+static_assert(sizeof(Layout) <= 80, "direct copy layout must remain fixed-size metadata");
 
 bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
     const int64_t page = strata::kernels::qsa_real_shapes().page_size;
@@ -99,16 +102,106 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+bool transfer(void* dst, const void* src, size_t n, std::string& error, admission_copy::Part part, admission_copy::Direction direction) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
+    admission_copy::Transfer observed(part, direction, n);
     const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    observed.finish(e == cudaSuccess);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
+bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    // VRAM slots still contain the outgoing conversation. Resolve must refill
+    // them from the restored authoritative pools before any attention reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        if (!strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                             std::max<int64_t>(0, end - st.n_slots), end, st.n_slots,
+                                             shapes, nullptr, error)) return false;
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+    return false;
+}
+
+bool copy_layout(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                 int64_t upto, bool index, Layout& source, std::string& error) {
+    Layout target{};
+    if (!layout(from, g, upto, index, source, error) || !valid(from, source, upto, error) ||
+        !layout(to, g, upto, index, target, error) || !valid(to, target, upto, error)) return false;
+    if (source.format != target.format || source.cells != target.cells ||
+        source.page_size != target.page_size || source.pooled_rows != target.pooled_rows ||
+        source.data != target.data || source.value_data != target.value_data ||
+        source.scales != target.scales || source.value_scales != target.value_scales ||
+        source.pooled != target.pooled) {
+        error = "resident direct copy: incompatible K/V layouts";
+        return false;
+    }
+    return true;
+}
+
+bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                  int64_t upto, const Layout& l, std::string& error) {
+    const auto src = pools(from), dst = pools(to);
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        // Keep the snapshot path's bounded transfer/progress cadence without
+        // allocating its segments. The destination is always the real owner.
+        for (size_t at = 0; at < sizes[i];) {
+            const size_t bytes = std::min(ConversationBuffer::segment_bytes, sizes[i] - at);
+            if (!transfer(static_cast<uint8_t*>(dst[i]) + at, static_cast<const uint8_t*>(src[i]) + at,
+                          bytes, error, static_cast<admission_copy::Part>(admission_copy::key + i),
+                          admission_copy::direct)) return false;
+            at += bytes;
+        }
+    }
+    if (!restore_residency(to, g, upto, error)) return false;
+    // Repairs run on the default stream; MTP's consumer stream is nonblocking.
+    // Do not publish the copied owner until its map/ring repair has completed.
+    if (to.kv_mode != 0) {
+        const auto status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+            error = std::string("resident direct copy residency synchronize: ") + cudaGetErrorString(status);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
+
+bool resident_direct_copy_enabled() {
+    const char* value = std::getenv("STRATA_RESIDENT_DIRECT_COPY");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                                   int64_t upto, bool index, std::string& error) {
+    Layout source{};
+    return copy_layout(from, to, g, upto, index, source, error);
+}
+
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error) {
+    Layout source{};
+    return copy_layout(from, to, g, upto, index, source, error) &&
+           copy_payload(from, to, g, upto, source, error);
+}
+
+bool conversation_detail::copy_prevalidated_kv(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                                              int64_t upto, bool index, std::string& error) {
+    // The session already validated every layer before its entry fence. Rebuild
+    // only this layer's byte counts, without a context-sized array of layouts.
+    Layout source{};
+    return layout(from, g, upto, index, source, error) && copy_payload(from, to, g, upto, source, error);
+}
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                    int64_t upto, bool index, size_t& bytes, std::string& error) {
@@ -162,7 +255,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::capture);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -191,28 +284,20 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 }
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+                             int64_t upto, bool index, std::string& error, int64_t captured_tokens) {
+    if (captured_tokens < 0) captured_tokens = upto;
+    if (upto < 0 || upto > captured_tokens ||
+        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+    Layout cut{};
+    if (!layout(st, g, upto, index, cut, error) || !valid(st, cut, upto, error)) return false;
+    const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+        if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::restore);
             })) return false;
-    // VRAM slots still contain the outgoing conversation. Resolve must refill
-    // them from the restored authoritative pools before any attention reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
-    if (st.kv_mode == 2 && upto > 0) {
-        auto shapes = strata::kernels::qsa_real_shapes();
-        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
-        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
-        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
-    }
-    const auto status = cudaGetLastError();
-    if (status == cudaSuccess) return true;
-    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
-    return false;
+    return restore_residency(st, g, upto, error);
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
@@ -236,7 +321,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     auto why = std::make_shared<std::string>();
     s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why, static_cast<admission_copy::Part>(admission_copy::key + part), admission_copy::capture);
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -244,14 +329,19 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error, int64_t captured_tokens) {
+    if (captured_tokens < 0) captured_tokens = upto;
+    if (upto < 0 || upto > captured_tokens ||
+        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+    Layout cut{};
+    if (!layout(st, g, upto, index, cut, error)) return false;
+    const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
         for (size_t offset = 0; offset < bytes;) {
             const size_t n = std::min(buffer.size(), bytes - offset);
-            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
+            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error, admission_copy::other, admission_copy::capture)) return false;
             if (std::memcmp(buffer.data(), expected + offset, n) != 0) {
                 error = "conversation snapshot: restored K/V bytes differ";
                 return false;
@@ -264,16 +354,16 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
-        if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+        if (!saved[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
             })) return false;
-    if (st.kv_mode == 2 && image.cells > 0) {
+    if (st.kv_mode == 2 && cut.cells > 0) {
         const auto resident = pools(st, true);
-        const int64_t end = image.cells / image.page_size;
+        const int64_t end = cut.cells / image.page_size;
         const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
         for (size_t i = 0; i < 4; ++i) {
             if (saved[i]->empty()) continue;
-            const size_t page_bytes = saved[i]->size() / size_t(end);
+            const size_t page_bytes = sizes[i] / size_t(end);
             for (int64_t page = begin; page < end; ++page)
                 if (!saved[i]->visit(size_t(page) * page_bytes, page_bytes,
                         [&](const uint8_t* p, size_t n, size_t at) {

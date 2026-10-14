@@ -289,6 +289,13 @@ strata::plan::QsaPlacement qsa_state_placement(const ModelGeometry& g, int64_t m
                                              bool draft = false);
 strata::plan::QsaRolePlacements qsa_role_placements(const ModelGeometry& g, int64_t max_cells,
                                                    int64_t slot_window, int64_t draft_window, int64_t max_t);
+/// Opt-in process-lifetime immutable table: one exact geometry/scaling per device.
+/// Retained through session destruction because captured graphs can still borrow its addresses.
+/// Pricing is separate from every session arena; callers admit it once per device.
+bool shared_rope_enabled();
+uint64_t shared_rope_device_bytes(const ModelGeometry& g, int64_t max_cells);
+uint64_t shared_rope_host_bytes();
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
                          const strata::plan::QsaPlacement* placement = nullptr);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,

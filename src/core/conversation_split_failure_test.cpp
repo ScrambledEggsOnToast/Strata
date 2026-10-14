@@ -18,6 +18,61 @@ bool equal(const ConversationCheckpoint& a,const ConversationCheckpoint& b) {
     return true;
 }
 int main() {
+    {
+        strata::core::CheckpointBytes source({1,2,3});
+        source.seal();
+        auto reader=source;
+        const auto* storage=source.data();
+        fail_after=0;
+        bool refused=false;
+        try { reader.write()[0]=9; } catch(const std::bad_alloc&) { refused=true; }
+        fail_after=-1;
+        if(!refused || source.data()!=storage || reader.data()!=storage || source[0]!=1 || reader[0]!=1) return 9;
+    }
+
+    // Every allocation failure while detaching a shared prefix preserves both
+    // readers; sharing itself needs no new allocation after capture admission.
+    for (bool shrink : {false, true}) for (size_t extents : {size_t{1}, size_t{2}}) {
+        bool finished = false;
+        int faults = 0;
+        for (int n = 0; n < 16 && !finished; ++n) {
+            strata::core::ConversationBuffer source(true), reader(true);
+            const size_t extent = strata::core::ConversationBuffer::prefix_extent_bytes;
+            const size_t original_size = extents * extent;
+            source.resize(extent, 7); reader.resize(original_size, 7);
+            fail_after = 0;
+            try {
+                if (reader.share_prefix(source, extent) != extent) return 10;
+            } catch (const std::bad_alloc&) { return 11; }
+            fail_after = -1;
+            auto address = [](const auto& buffer) {
+                const uint8_t* result = nullptr;
+                buffer.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { result = p; return true; });
+                return result;
+            };
+            const auto* original = address(source);
+            const size_t charged = reader.bytes();
+            const size_t admitted = reader.allocation_peak(shrink ? 17 : original_size);
+            fail_after = n;
+            try {
+                if (shrink) reader.resize(17);
+                else reader.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 9; return true; });
+                fail_after = -1;
+                if (address(reader) == original || reader.bytes() > admitted) return 12;
+                finished = true;
+            } catch (const std::bad_alloc&) {
+                fail_after = -1;
+                ++faults;
+                if (address(reader) != original || reader.size() != original_size || reader.bytes() != charged) return 13;
+                if (!std::as_const(reader).visit(0, reader.size(), [](const uint8_t* p, size_t n, size_t) {
+                        return std::all_of(p, p + n, [](uint8_t byte) { return byte == 7; });
+                    })) return 16;
+            }
+            if (address(source) != original || source.size() != extent || *original != 7) return 14;
+        }
+        if (!finished || !faults) return 15;
+    }
+
     // #752: every stage count a layer split runs (1-3), with one checkpoint that has no stage parts (it stays in `rest`)
     long total_faults=0;
     for(size_t stages=1;stages<=3;++stages) {

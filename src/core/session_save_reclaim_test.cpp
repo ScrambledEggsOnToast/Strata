@@ -33,6 +33,7 @@ static bool same(const ConversationCheckpoint& a, const ConversationCheckpoint& 
 }
 static void park(ConversationCache& cache, int tokens, bool pin = false) {
     SavedConversation c; c.live = checkpoint(tokens);
+    c.scope.value[0] = 1;
     c.checkpoints.push_back(checkpoint(tokens - 1, pin));
     // Distinct histories, so put() does not remove superseded entries.
     c.live.ids[0] = tokens; c.checkpoints[0].ids[0] = tokens;

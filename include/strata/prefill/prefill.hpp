@@ -265,6 +265,16 @@ public:
     bool run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
                     const std::function<bool(Prefill*, std::string&)>& step);
 
+    /// One arithmetic chunk, with the live stack/arena retained at layer boundaries.
+    /// step runs on the caller thread before each stage and after each layer's
+    /// compute/copy completion. It must return with that device's decode work
+    /// drained; other devices may retain verifier leases. No owner may rebind,
+    /// relayout or recursively run this prompt while step is executing.
+    /// Stage handoffs are serial in this experiment; no second bulk arena exists.
+    bool run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                      const std::function<bool(Prefill*, int64_t, std::string&)>& step,
+                      bool layer_yields = true);
+
     const PrefillStats& stats() const { return stats_; }
 
     /// The CUDA device this prompt path's buffers live on (-1 before `init`), for callers that price or route
@@ -365,6 +375,9 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    const std::function<bool(Prefill*, int64_t, std::string&)>* retained_step_ = nullptr;
+    bool retained_layer_yields_ = true;
+    bool retained_boundary(int64_t next_layer, std::string& err, bool bulk_complete = true);
     bool local_idle(std::string& err) const;
     std::atomic<bool> public_running_{false};
 

@@ -24,6 +24,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 
 #include <cstdint>
+#include <string>
 
 namespace strata::kernels {
 
@@ -93,9 +94,11 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);
 
 /// Copy blocks [b0, b1) of the host copy into the pool pages `page_table` names (host-side table `phys(b)`
-/// computed as `b % n_slots`: the ring restore). Not capturable.
-void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
-                     int64_t n_slots, const QsaShapes& s, void* stream);
+/// computed as `b % n_slots`: the ring restore). Not capturable. Reports the first
+/// failed submission in error; false leaves a possibly partial ring that must not
+/// be published. The caller still owns synchronization of successful submissions.
+[[nodiscard]] bool kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
+                                  int64_t n_slots, const QsaShapes& s, void* stream, std::string& error);
 
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
 /// path's staging of one layer. Not capturable (DMA).

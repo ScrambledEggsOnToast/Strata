@@ -20,6 +20,9 @@ struct ResidentStage {
     int device = -1;
     // Optional second group owner: the same private slot states, distinct retained replay scratch.
     core::Verifier* batch_peer = nullptr;
+    // Optional third chain owns its own replay and two worker ledgers per stage lane.
+    core::Verifier* batch_third = nullptr;
+    int third_worker_lane = -1;
 };
 
 struct ResidentRequest {
@@ -120,7 +123,7 @@ public:
     bool admit(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request, std::string& error);
     bool park(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request,
               bool from_start, std::string& error);
-    // No transfers, synchronization or owner mutation. Prices the actual host-bounced
+    // No transfers, synchronization or owner mutation. Prices the selected
     // copy path and prevalidates all checkpoint parts before any working-state write.
     bool resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
                      PrefixWork& work, std::string& error) const;

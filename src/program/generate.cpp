@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/prefix_extent_probe.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -150,6 +151,9 @@ int resident_model_checks(strata::program::ResidentSlots&, strata::core::ExpertD
                           const strata::core::ModelGeometry&, strata::core::SessionState&,
                           strata::core::SessionState&, strata::core::SessionState&, strata::core::MtpDrafter&,
                           strata::core::Verifier&, strata::core::PoolMultiFn, void*);
+int resident_host_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
+                               const strata::core::ModelGeometry&, const std::vector<strata::program::ResidentStage>&,
+                               strata::core::MtpDrafter&);
 #endif
 #ifdef STRATA_RESIDENCY_MODEL_TEST
 #include "strata/platform/protected_test.hpp"
@@ -773,6 +777,8 @@ struct Options {
     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
+    bool batch_mtp_third = false; ///< opt-in independent third owner, four stationary states
+    bool batch_mtp_floating = false; ///< opt-in: two owners lease four stationary states
     bool batch_mtp_pipeline = false; ///< separate opt-in: two group-owned replay chains on a layer split
     std::string spec_oracle;
     int spec_corrupt = 0;
@@ -1027,6 +1033,8 @@ void usage() {
                  "                       selects synchronous windows; private slot draft K/V needs VRAM\n"
                  "  --batch-mtp-pipeline --batch-mtp with a distinct-device layer split: effective even 2..8 slots,\n"
                  "                       --batch-groups 2, no resident multiplexing; target equality/prefix commit still apply\n"
+                 "  --batch-mtp-third    --batch-mtp-floating: add an admitted third owner, fixed 2+1+1 seat packets\n"
+                 "  --batch-mtp-floating --batch-mtp-pipeline with exactly four slots: float two owners over ready states\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 3+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
@@ -1358,6 +1366,7 @@ bool drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
 struct SplitDrive {
     static constexpr int kMax = 8;
     Drive* base = nullptr;
+    int worker_lane_offset = 0;                   ///< optional independent verifier chain ledgers
     int n = 0;                                    ///< stages
     int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
     strata::core::GpuPlanSink* plan[kMax] = {};
@@ -1373,7 +1382,7 @@ bool drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     }
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
-    if (lane != st) return false; // a stage cannot publish into another stage's ownership ledger
+    if (lane != st + s->worker_lane_offset) return false; // a stage cannot publish into another stage's ownership ledger
     Drive& d = *s->base;
     d.d.plan = s->plan[st];
     d.d.cache_base = s->cache_base[st];
@@ -2481,6 +2490,8 @@ int main(int argc, char** argv) {
             else o.batch_groups = std::atoi(bgv);
         }
         else if (a == "--batch-mtp") o.batch_mtp = true;
+        else if (a == "--batch-mtp-third") o.batch_mtp_third = true;
+        else if (a == "--batch-mtp-floating") o.batch_mtp_floating = true;
         else if (a == "--batch-mtp-pipeline") o.batch_mtp_pipeline = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
@@ -3094,9 +3105,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
     }
+    if (o.batch_mtp_third && (!o.serve || !o.batch_mtp_floating || !o.batch_mtp_pipeline ||
+            o.batch != 4 || o.batch_groups != 2 || o.pipeline_windows > 0 || o.judge_context ||
+            !multi_gpu || split_auto || split_same || split_devs.size() != 2 || o.split_skip_if_fits ||
+            o.spec != 4 || o.prefill_chunk != 2048 ||
+            o.resident_multiplex || o.adapt_swaps != 0 || o.adapt_async || o.peer_device >= 1 ||
+            o.remote_expert_opt || o.prefill_helpers || o.expert_profile.empty())) {
+        std::fprintf(stderr, "strata generate: --batch-mtp-third requires serving floating four-slot/two-group MTP, "
+                             "explicit distinct-device split, --spec 4 --prefill 2048 and static full local residency; "
+                             "no judge, multiplex, pipeline-windows, adaptive or helper composition\n");
+        return 2;
+    }
     const size_t helper_count = (size_t) std::count_if(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                                     [](int slots) { return slots > 0; });
     const bool remote_caches = helper_count != 0;
+    if (o.batch_mtp_third && remote_caches) {
+        std::fprintf(stderr, "strata third owner: helper caches are outside the full-local-residency experiment\n"); return 2;
+    }
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     if (o.resident_cpu_experts && remote_caches) {
@@ -3973,6 +3998,11 @@ int main(int argc, char** argv) {
     // One startup resolution for every owner role. Captured graph keys omit residency;
     // these values feed both admission prices and fresh-owner carves, never live rebinding.
     const int draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+    if (strata::core::shared_rope_enabled() && o.judge_context && o.judge_context != o.max_context) {
+        std::fprintf(stderr, "strata generate: STRATA_SHARED_ROPE requires one context geometry per device; "
+                             "a different --judge-context is unsupported\n");
+        return 1;
+    }
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
     const bool batch_requested = o.batch > 0; // keep admission intent even if runtime eligibility disables it
@@ -4240,6 +4270,9 @@ int main(int argc, char** argv) {
             v0.add("mtp_drafter_buffers", working_draft < envelope ? envelope - working_draft : 0,
                    "remaining shared drafter/head envelope after named working KV");
         }
+        if (strata::core::shared_rope_enabled())
+            v0.add("shared_rope", strata::core::shared_rope_device_bytes(g, o.max_context),
+                   "one immutable process-lifetime table per device; outside session arenas");
         v0.add("session_state", session_allocation.device,
                split_auto ? "session_bytes upper bound until the split search places the ranges"
                           : "session_bytes of the primary stage's own resolved layer range");
@@ -4344,6 +4377,18 @@ int main(int argc, char** argv) {
                        "second group's bounded graph cache: another finite operator allowance inside the enforced MPS ceiling");
             else v0.add_unknown("batch_mtp_pipeline_graph", "second group's opaque retained graph storage needs a finite allowance");
         }
+        if (o.batch_mtp_third) {
+            const uint64_t replay = strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows);
+            if (replay == UINT64_MAX) v0.add_unknown("batch_mtp_third_replay", "third verifier arena geometry unavailable");
+            else v0.add("batch_mtp_third_replay", byte_add(replay,
+                        byte_add(byte_add(resident.verifier_device, strata::core::kVerifyCanaryDeviceBytes),
+                                 byte_mul(byte_mul((uint64_t)split_at.front(), (uint64_t)g.n_expert), sizeof(uint64_t)))),
+                        "third group owns an exact verifier arena, resident controls, canary and full-stage slot offsets");
+            if (o.graph_capture_allowance_bytes)
+                v0.add("batch_mtp_third_graph", o.graph_capture_allowance_bytes,
+                       "third group's bounded graph cache: another finite operator allowance inside the enforced MPS ceiling");
+            else v0.add_unknown("batch_mtp_third_graph", "third group's opaque retained graph storage needs a finite allowance");
+        }
         if (n_vocab > 0)
             v0.add("logits", byte_mul((uint64_t) n_vocab, 4), "pack index output.weight ne1 * sizeof(float)");
         else
@@ -4414,6 +4459,9 @@ int main(int argc, char** argv) {
                                          "reason=stage working-session pricing failed\n", split_devs[i]);
                     return 1;
                 }
+                if (strata::core::shared_rope_enabled())
+                    ds.vram.add("shared_rope", strata::core::shared_rope_device_bytes(g, o.max_context),
+                                "one immutable process-lifetime table per device; outside session arenas");
                 ds.vram.add("session_state", working.device,
                             split_auto ? "session_bytes upper bound until the split search places the ranges"
                                        : "session_bytes of this stage's own resolved layer range");
@@ -4457,6 +4505,19 @@ int main(int argc, char** argv) {
                         ds.vram.add("batch_mtp_pipeline_graph", o.graph_capture_allowance_bytes,
                                     "second group's finite graph allowance, inside the enforced MPS ceiling");
                     else ds.vram.add_unknown("batch_mtp_pipeline_graph", "second stage graph cache lacks a finite allowance");
+                }
+                if (o.batch_mtp_third) {
+                    const uint64_t replay = strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows);
+                    if (replay == UINT64_MAX)
+                        ds.vram.add_unknown("batch_mtp_third_replay", "third stage verifier arena geometry unavailable");
+                    else ds.vram.add("batch_mtp_third_replay", byte_add(replay,
+                                    byte_add(byte_add(resident.verifier_device, strata::core::kVerifyCanaryDeviceBytes),
+                                             byte_mul(byte_mul((uint64_t)(layer_end - layer_begin), (uint64_t)g.n_expert), sizeof(uint64_t)))),
+                                    "third group owns this stage's exact arena, resident controls, canary and slot offsets");
+                    if (o.graph_capture_allowance_bytes)
+                        ds.vram.add("batch_mtp_third_graph", o.graph_capture_allowance_bytes,
+                                    "third group's finite graph allowance, inside the enforced MPS ceiling");
+                    else ds.vram.add_unknown("batch_mtp_third_graph", "third stage graph cache lacks a finite allowance");
                 }
                 if (profile_requested) {
                     if (profile_bytes == UINT64_MAX || o.pipeline_windows > 0 || o.batch > 0)
@@ -4715,11 +4776,12 @@ int main(int argc, char** argv) {
 
         // #232: retain the already committed cache BUDGETS. Price their concrete all-pair
         // allocations, rather than spending the residual budget a second time or taking
-        // any residency to fund the judge. Runtime proves these exact extents/residency.
+        // any residency to fund the judge or third replay owner. Runtime proves these exact extents/residency.
         uint64_t judge_host_init_peak = 0;
-        if (o.judge_context) {
+        if (o.judge_context || o.batch_mtp_third) {
             if (split_auto || split_same || !native_pack || g.n_layers * g.n_expert != 24576) {
-                v0.add_unknown("judge_execution_geometry", "requires native frozen geometry and explicit stage ranges");
+                v0.add_unknown(o.batch_mtp_third ? "third_execution_geometry" : "judge_execution_geometry",
+                               "requires native frozen geometry and explicit stage ranges");
             } else {
                 const auto& layout = strata::kernels::cpu::expert_layout();
                 for (size_t st = 0; st <= split_devs.size(); ++st) {
@@ -4735,14 +4797,16 @@ int main(int argc, char** argv) {
                     auto cache = std::find_if(demand.classes.begin(), demand.classes.end(),
                         [&](const auto& allocation) { return allocation.name == cache_class; });
                     if (!layout.native || cache == demand.classes.end() || cache->bytes < full_cache) {
-                        demand.add_unknown("judge_generation_capacity", "unchanged cache budget cannot retain every existing expert pair");
+                        demand.add_unknown(o.batch_mtp_third ? "third_generation_capacity" : "judge_generation_capacity",
+                                           "cache budget cannot retain every existing expert pair");
                     } else {
                         cache->bytes = full_cache;
                         cache->source = "concrete existing all-pair stage allocation: ExpertCache::open_sized 256-aligned blobs; original budget unchanged";
                         judge_generation_cache_bytes[st] = full_cache;
-                        demand.add("judge_generation_cache_granule", ((full_cache + (2ull << 20) - 1) / (2ull << 20)) * (2ull << 20) - full_cache,
+                        demand.add(o.batch_mtp_third ? "third_generation_cache_granule" : "judge_generation_cache_granule", ((full_cache + (2ull << 20) - 1) / (2ull << 20)) * (2ull << 20) - full_cache,
                                    "existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed");
                     }
+                    if (!o.judge_context) continue; // third owner preserves the same concrete full expert cache
                     auto& bytes = admitted_judge_bytes[st];
                     if (!strata::program::judge_stage_bytes(g, o.judge_context, K, lo, hi, n_vocab,
                             hi == g.n_layers, judge_placement, bytes)) {
@@ -4802,6 +4866,9 @@ int main(int argc, char** argv) {
         }
         ram("session_host_owner", byte_mul(stage_count, strata::plan::kResidentOwnerBytes +
             (uint64_t) g.n_qsa_layers() * strata::plan::kResidentQsaBytes), "ABI-checked owner/QSA envelopes");
+        if (strata::core::shared_rope_enabled())
+            ram("shared_rope_registry", strata::core::shared_rope_host_bytes(),
+                "fixed device registry and initialization mutex; no per-session heap entries");
         startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
         if (o.judge_context) {
             for (size_t stage = 0; stage < stage_count; ++stage) {
@@ -4865,7 +4932,7 @@ int main(int argc, char** argv) {
         if (o.serve)
             ram("penalty_history_host", 4096ull * strata::kernels::kVerifyMaxT * sizeof(int32_t),
                 "serving hist_stage vector payload");
-        ram("expert_worker_ownership", byte_mul(2 * (split_devs.size() + 1),
+        ram("expert_worker_ownership", byte_mul((o.batch_mtp_third ? 4 : 2) * (split_devs.size() + 1),
             strata::core::ExpertCompletion::planned_bytes(strata::core::ExpertCompletion::kCapacity) +
             sizeof(strata::core::ExpertCompletion) + sizeof(strata::core::ExpertOperation) + sizeof(strata::core::GraphExpertWorker)),
             "two bounded group ledgers per verifier stage lane; helpers share one drained registry, not new stage lanes");
@@ -5108,6 +5175,16 @@ int main(int argc, char** argv) {
                 byte_add(resident.verifier_pinned, byte_add(resident.verifier_history,
                     byte_add(strata::core::kVerifyCanaryHostBytes, 262144))))),
                 "second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging");
+        if (o.batch_mtp_third)
+            ram("batch_mtp_third_host", byte_mul(stage_count,
+                byte_add(std::max(grouped_host, (uint64_t) kWindowMib << 20),
+                byte_add(resident.verifier_pinned, byte_add(resident.verifier_history,
+                    byte_add(strata::core::kVerifyCanaryHostBytes, 262144))))),
+                "third owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging");
+        if (o.batch_mtp_third)
+            ram("batch_mtp_third_metadata", byte_add(sizeof(SplitDrive),
+                byte_mul(stage_count, sizeof(strata::core::Verifier) + sizeof(std::unique_ptr<strata::core::Verifier>))),
+                "third verifier objects, pointer vector payload and independent split dispatch metadata");
         if (o.resident_cpu_experts)
             ram("resident_exchange_staging", byte_mul((uint64_t) std::max(o.adapt_swaps, 0), blob_gate),
                 "FileExpertSource::reserve_exchanges: swaps * max_blob");
@@ -5778,7 +5855,8 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers,
                                                                          &kv_roles.working_main);
-            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
+            const int64_t held_back = session + (int64_t) strata::core::shared_rope_device_bytes(g, o.max_context) +
+                                      (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20); // drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
             cudaDeviceProp dp{};
             cudaGetDeviceProperties(&dp, 0);
@@ -6112,6 +6190,7 @@ int main(int argc, char** argv) {
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
             return cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le,
                                                                          &kv_roles.working_main) -
+                   (int64_t) strata::core::shared_rope_device_bytes(g, o.max_context) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
         };
         std::vector<double> layer_ms((size_t) ns);
@@ -6850,6 +6929,10 @@ int main(int argc, char** argv) {
                         : o.resident_multiplex ? "resident multiplexing is a different schedule" : nullptr;
         if (why) { std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: %s\n", why); return 1; }
     }
+    if (o.batch_mtp_floating && (!batch_mtp_pipeline || o.batch != 4 || o.batch_groups != 2)) {
+        std::fprintf(stderr, "strata generate: --batch-mtp-floating needs --batch-mtp-pipeline --batch 4 --batch-groups 2\n");
+        return 1;
+    }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -6916,6 +6999,10 @@ int main(int argc, char** argv) {
     if (batch_mtp_pipeline && (!strata::program::batch_groups::pipeline_slots_supported(o.batch, strata::kernels::kVerifyMaxT) ||
                                o.batch_groups != 2)) {
         std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: two supported resident groups did not fit\n");
+        return 1;
+    }
+    if (o.batch_mtp_floating && o.batch != 4) {
+        std::fprintf(stderr, "strata generate: --batch-mtp-floating refused: four resident states did not fit\n");
         return 1;
     }
     // Resident init, partial failure and stage-count trimming can retire the latest
@@ -8047,11 +8134,27 @@ int main(int argc, char** argv) {
                 return false;
             })) return 1;
 
+    if (o.batch_mtp_third) {
+        for (size_t st = 0; st <= stages.size(); ++st) {
+            const auto& cache = st ? stages[st - 1]->cache : xcache;
+            if ((uint64_t)cache.bytes() != judge_generation_cache_bytes[st]) {
+                std::fprintf(stderr, "strata third owner: concrete full expert allocation differs from admission\n"); return 1;
+            }
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) for (int64_t e = 0; e < g.n_expert; ++e) {
+            const int st = stage_of(l);
+            const auto& cache = st ? stages[(size_t)st - 1]->cache : xcache;
+            if (cache.slot_of(l, e) < 0) {
+                std::fprintf(stderr, "strata third owner: full local expert residency did not fit; refusing\n");
+                return 1;
+            }
+        }
+    }
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     drive.d.remote.reserve(helper_count);
     drive.d.workers.reserve(helper_count);
-    const size_t ownership_groups = 2 * (split_devs.size() + 1);
+    const size_t ownership_groups = (o.batch_mtp_third ? 4 : 2) * (split_devs.size() + 1);
     drive.d.completion.reserve(ownership_groups);
     drive.d.operation.resize(ownership_groups);
     drive.d.primary_workers.resize(ownership_groups);
@@ -9889,8 +9992,8 @@ int main(int argc, char** argv) {
             int dev = 0;
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
-                if (o.judge_context) {
-                    std::fprintf(stderr, "strata judge: generation prefill geometry does not fit; refusing, never resizing it\n");
+                if (o.judge_context || o.batch_mtp_third) {
+                    std::fprintf(stderr, "strata fixed-capacity mode: generation prefill geometry does not fit; refusing, never resizing it\n");
                     return 1;
                 }
                 int64_t c = 0;
@@ -9911,8 +10014,8 @@ int main(int argc, char** argv) {
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
-            if (o.judge_context) {
-                std::fprintf(stderr, "strata judge: %s; refusing, never retrying with reduced generation capacity\n", err.c_str());
+            if (o.judge_context || o.batch_mtp_third) {
+                std::fprintf(stderr, "strata fixed-capacity mode: %s; refusing, never retrying with reduced generation capacity\n", err.c_str());
                 return 1;
             }
             int64_t next = 0;
@@ -10088,6 +10191,33 @@ int main(int argc, char** argv) {
         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
         strata::core::Verifier ver_b;
+        if (o.batch_mtp_third) {
+            if (n_stages != 3 || o.batch != 4 || o.prefill_chunk != 2048 || sp.chunk() != 2048 ||
+                std::any_of(stages.begin(), stages.end(), [](const auto& stage) { return stage->sp.chunk() != 2048; }) ||
+                host_res.size() != (size_t)(g.n_layers * g.n_expert) ||
+                !std::all_of(host_res.begin(), host_res.end(), [](int32_t slot) { return slot >= 0; })) {
+                std::fprintf(stderr, "strata third owner: fixed generation geometry or full residency did not survive prompt setup\n");
+                return 1;
+            }
+            if (std::getenv("STRATA_STATE_HASH"))
+                for (size_t st = 0; st <= stages.size(); ++st) {
+                    const auto& cache = st ? stages[st - 1]->cache : xcache;
+                    std::fprintf(stderr, "STATE_THIRD_CAPACITY stage=%zu cache_bytes=%llu slots=%d context=%lld chunk=%lld\n",
+                                 st, (unsigned long long)cache.bytes(), o.batch, (long long)o.max_context, (long long)o.prefill_chunk);
+                }
+        }
+        std::vector<std::unique_ptr<strata::core::Verifier>> third_verifiers;
+        std::unique_ptr<SplitDrive> third_drive;
+        if (o.batch_mtp_third) {
+            third_verifiers.reserve((size_t)n_stages);
+            if (third_verifiers.capacity() != (size_t)n_stages) {
+                std::fprintf(stderr, "strata third owner: pointer storage exceeds admitted bound\n"); return 1;
+            }
+            for (int st = 0; st < n_stages; ++st)
+                third_verifiers.push_back(std::make_unique<strata::core::Verifier>());
+            third_drive = std::make_unique<SplitDrive>();
+        }
+        auto stage_third = [&](int st) -> strata::core::Verifier& { return *third_verifiers[(size_t)st]; };
         auto stage_peer = [&](int st) -> strata::core::Verifier& { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; };
         const int batch_compute_rows = batch_mtp && !batch_mtp_pipeline ? strata::kernels::kVerifyMaxT
                                      : batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4)) : std::max(o.spec, o.batch);
@@ -10134,6 +10264,10 @@ int main(int argc, char** argv) {
                     stage_peer(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1],
                         st + 1 < n_stages ? split_at[(size_t) st] : -1,
                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (o.batch_mtp_third)
+                    stage_third(st).set_stage(st == 0 ? 0 : split_at[(size_t)st - 1],
+                        st + 1 < n_stages ? split_at[(size_t)st] : -1,
+                        st == 0 ? nullptr : hand[(size_t)st - 1], st + 1 < n_stages ? hand[(size_t)st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -10163,6 +10297,11 @@ int main(int argc, char** argv) {
                         ok_s = gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                             batch_compute_rows, err);
                     }
+                    if (ok_s && o.batch_mtp_third) {
+                        stage_third(st).set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+                        ok_s = stage_third(st).init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
+                                                  batch_compute_rows, err);
+                    }
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -10175,6 +10314,9 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
             if (batch_mtp_pipeline)
                 for (int st = 0; st + 1 < n_stages; ++st) stage_peer(st).set_next(&stage_peer(st + 1), &split_drive_b);
+            if (o.batch_mtp_third)
+                for (int st = 0; st + 1 < n_stages; ++st)
+                    stage_third(st).set_next(&stage_third(st + 1), third_drive.get());
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -10239,6 +10381,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        if (o.batch_mtp_third) {
+            stage_third(0).set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+            if (!stage_third(0).init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                                     batch_compute_rows, err)) {
+                std::fprintf(stderr, "strata third owner: primary verifier: %s\n", err.c_str()); return 1;
+            }
+        }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -10256,10 +10405,17 @@ int main(int argc, char** argv) {
             stage.verifier = k == 0 ? &ver : &stages[k - 1]->ver;
             stage.device = k == 0 ? 0 : stages[k - 1]->dev;
             if (batch_mtp_pipeline) stage.batch_peer = &stage_peer((int) k);
+            if (o.batch_mtp_third) {
+                stage.batch_third = &stage_third((int)k);
+                stage.third_worker_lane = n_stages + (int)k;
+            }
             if (k < bslot_ss.size())
                 for (auto& owner : bslot_ss[k]) stage.slots.push_back(&owner->state());
             resident_stages.push_back(std::move(stage));
         }
+#ifdef STRATA_RESIDENT_MODEL_TEST
+        const auto test_resident_stages = resident_stages;
+#endif
         strata::program::ResidentSlots resident(g, std::move(resident_stages), mtp, sp, drive.d,
                                                o.max_context, o.prompt_cache > 0);
         if (o.batch > 0 && !resident.init_resources(err)) {
@@ -10267,6 +10423,13 @@ int main(int argc, char** argv) {
             return 1;
         }
 #ifdef STRATA_RESIDENT_MODEL_TEST
+        if (o.host_native) {
+            if (test_resident_stages.size() != 3 || o.batch != 4 || !batch_mtp_pipeline) {
+                std::fprintf(stderr, "host resident fixture requires three stages, four slots and two owners\n");
+                return 1;
+            }
+            return resident_host_model_checks(resident, drive.d, g, test_resident_stages, mtp);
+        }
         if (stages.size() || bslot_ss.size() != 1 || bslot_ss[0].size() != 2 ||
             !std::getenv("STRATA_SUPERVISED")) {
             std::fprintf(stderr, "resident model tests require protected single-device two-slot startup\n");
@@ -10293,6 +10456,20 @@ int main(int argc, char** argv) {
         if (batch_mtp_pipeline) {
             split_drive_b = split_drive;
             for (int st = 0; st < n_stages; ++st) split_drive_b.plan[st] = stage_peer(st).plan_sink();
+        }
+        if (o.batch_mtp_third) {
+            *third_drive = split_drive;
+            third_drive->worker_lane_offset = n_stages;
+            for (int st = 0; st < n_stages; ++st) {
+                auto& owner = stage_third(st);
+                owner.set_worker_lane(n_stages + st);
+                owner.set_split(o.spec_split);
+                owner.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                third_drive->plan[st] = owner.plan_sink();
+                if (std::getenv("STRATA_STATE_HASH"))
+                    std::fprintf(stderr, "STATE_THIRD_OWNER stage=%d primary=%p peer=%p third=%p worker_lane=%d base=6 rows=2\n",
+                                 st, (void*)&stage_ver(st), (void*)&stage_peer(st), (void*)&owner, n_stages + st);
+            }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
             split_drive_b = split_drive;
@@ -10628,7 +10805,17 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_current_body = [&](size_t held) -> bool {
+        static const bool extent_probe_on = [] {
+            const char* v = std::getenv("STRATA_PREFIX_EXTENT_PROBE");
+            return v && std::atoi(v) != 0;
+        }();
+        static const bool backing_probe_on = [] {
+            const char* v = std::getenv("STRATA_PREFIX_BACKING_PROBE");
+            return v && std::atoi(v) != 0;
+        }();
+        const bool backing_on = strata::core::prefix_backing_enabled();
+        uint64_t extent_probe_epoch = 0;
+        auto park_current_body = [&](size_t held, const strata::core::SavedConversation* held_image) -> bool {
             if (!conversations.enabled() || !live_ok || !live_scope.valid() || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -10714,6 +10901,12 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
+            // Bounded unique-allocation diagnostic scratch coexists with the
+            // captured image. Both the cache budget and physical reserve price it.
+            if (backing_probe_on) {
+                if (estimate > SIZE_MAX - sizeof(strata::core::PrefixBackingLedger)) return true;
+                estimate += sizeof(strata::core::PrefixBackingLedger);
+            }
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
@@ -10736,7 +10929,8 @@ int main(int argc, char** argv) {
                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
                 // Evict the least recently active parked conversations until it fits, or until none are
                 // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
+                // allocation on the legacy path. Opt-in small shared extents may remain in the
+                // allocator or another owner after eviction; the next check still reads
                 // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
                 // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
@@ -10760,6 +10954,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                auto backing_ledger = backing_probe_on ? std::make_unique<strata::core::PrefixBackingLedger>() : nullptr;
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
@@ -10783,11 +10978,98 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                auto valid_image = [&](const auto& candidate) {
+                    std::string why;
+                    if (candidate.stage_images.size() != stages.size() ||
+                        !strata::core::conversation_snapshot_validate(candidate, ss, g, draft0, why)) return false;
+                    for (size_t k = 0; k < stages.size(); ++k)
+                        if (!strata::core::conversation_snapshot_validate(candidate.stage_images[k],
+                                stages[k]->ss, g, draft_of(k), why)) return false;
+                    return true;
+                };
+                // Capture is complete: only retained allocations can be saved.
+                // Never credit this operation to reused_bytes or transfer timing.
+                // At most eight sources and 64 MiB of exact comparisons, plus
+                // at most the same bytes rechecked by whole-extent replacement.
+                if (backing_on && valid_image(image)) {
+                    uint64_t remaining = 64u << 20;
+                    size_t peers = 0;
+                    bool shared = false;
+                    auto share = [&](const auto& source) {
+                        if (shared || peers++ >= 8 || !image.scope.matches(source.scope) ||
+                            image.cvec != source.cvec || !valid_image(source)) return;
+                        const auto r = strata::core::share_prefix_extents(image, source, remaining);
+                        remaining -= std::min(remaining, r.compared_bytes);
+                        shared = std::string_view(r.status) == "equal";
+                    };
+                    // Parked donors first: a held incoming image is transient.
+                    conversations.for_each_image([&](size_t, const auto& source) { share(source); });
+                    if (held_image) share(*held_image);
+                }
                 const size_t snapshot_bytes = image.bytes();
                 // Normalize by the copied extent, not the retained pages we did not transfer.
                 if (park_work.bytes != UINT64_MAX && reused_bytes <= park_work.bytes)
                     park_work.bytes -= reused_bytes;
+                // At most 128 MiB compared and eight pairs per park; no retained observer state.
+                uint64_t probe_budget = 128u << 20;
+                size_t probe_pairs = 0;
+                const auto probe_epoch = extent_probe_on || backing_probe_on ? ++extent_probe_epoch : 0;
+                auto observe = [&](const char* phase, size_t index, const auto& left, const auto& right) {
+                    if (probe_pairs++ >= 8) return;
+                    auto r = strata::core::PrefixExtentProbe{};
+                    // Observer failure must not change capture/publication behavior.
+                    try {
+                        // Namespace check precedes even structural validation of another scope.
+                        if (!left.scope.matches(right.scope) || left.cvec != right.cvec) r.status = "scope";
+                        else if (!valid_image(left) || !valid_image(right)) r.status = "source-invalid";
+                        else r = strata::core::probe_prefix_extents(left, right, probe_budget);
+                    } catch (const std::bad_alloc&) {
+                        r = {};
+                        r.status = "allocation-failed";
+                    }
+                    probe_budget -= std::min(probe_budget, r.compared_bytes);
+                    std::fprintf(stderr, "strata serve: PREFIX_EXTENT_PROBE epoch=%llu phase=%s peer=%zu status=%s "
+                        "cut=%lld eligible_bytes=%llu compared_bytes=%llu duplicate_bytes=%llu aliased_bytes=%llu\n",
+                        (unsigned long long) probe_epoch, phase, index, r.status, (long long) r.cut,
+                        (unsigned long long) r.eligible_bytes, (unsigned long long) r.compared_bytes,
+                        (unsigned long long) r.duplicate_bytes, (unsigned long long) r.aliased_bytes);
+                };
+                if (extent_probe_on && held_image) observe("held-incoming", 0, image, *held_image);
                 const bool stored = conversations.put(std::move(image), held);
+                if (extent_probe_on && stored) {
+                    conversations.for_each_image([&](size_t newest, const auto& current) {
+                        if (newest + 1 != conversations.size()) return;
+                        conversations.for_each_image([&](size_t prior, const auto& other) {
+                            if (prior < newest) observe("retained", prior, current, other);
+                        });
+                    });
+                }
+                if (extent_probe_on)
+                    std::fprintf(stderr, "strata serve: PREFIX_EXTENT_PROBE epoch=%llu phase=summary stored=%d "
+                        "parked=%zu pairs=%zu truncated=%d compared_bytes=%llu\n",
+                        (unsigned long long) probe_epoch, int(stored), conversations.size(),
+                        std::min<size_t>(probe_pairs, 8), int(probe_pairs > 8),
+                        (unsigned long long) ((128u << 20) - probe_budget));
+                if (backing_probe_on && stored) {
+                    auto& ledger = backing_ledger;
+                    conversations.for_each_image([&](size_t, const auto& current) { ledger->add(current); });
+                    // Report parked-only ownership before adding the held incoming.
+                    auto report = [&](const char* phase) {
+                        std::fprintf(stderr, "strata serve: PREFIX_EXTENT_PROBE epoch=%llu phase=%s "
+                            "complete=%d references=%llu unique_backings=%zu logical_payload_bytes=%llu "
+                            "unique_payload_bytes=%llu alias_payload_bytes=%llu logical_owner_bytes=%llu "
+                            "unique_owner_bytes=%llu charged_buffer_bytes=%llu cache_charged_bytes=%zu capture_copy_credit_bytes=0 "
+                            "restore_copy_credit_bytes=0\n",
+                            (unsigned long long) probe_epoch, phase, int(!ledger->truncated),
+                            (unsigned long long) ledger->references, ledger->count,
+                            (unsigned long long) ledger->logical_payload, (unsigned long long) ledger->unique_payload,
+                            (unsigned long long) (ledger->logical_payload - ledger->unique_payload),
+                            (unsigned long long) ledger->logical_owner, (unsigned long long) ledger->unique_owner,
+                            (unsigned long long) ledger->charged_buffers, conversations.bytes());
+                    };
+                    report("backing-retained");
+                    if (held_image) { ledger->add(*held_image); report("backing-with-held"); }
+                }
                 if (o.prefix_cost_selection)
                     prefix_costs.transfer(PrefixTransfer::park, park_work,
                         std::chrono::duration<double, std::milli>(Clock::now() - park_t0).count());
@@ -10804,8 +11086,8 @@ int main(int argc, char** argv) {
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
-        auto park_current = [&](size_t held) -> bool {
-            try { return park_current_body(held); }
+        auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image) -> bool {
+            try { return park_current_body(held, held_image); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
@@ -12480,11 +12762,35 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
                                  "one eight-row quantum retained through target acceptance and prefix commit; "
                                  "--batch-groups %d requested, effective groups=1 (no group pipeline).\n", o.batch_groups);
-        if (batch_mtp_pipeline)
+        if (o.batch_mtp_third)
+            std::fprintf(stderr, "strata generate: --batch-mtp-third: three independent replay chains, "
+                                 "four stationary states, packet seats 2/1/1, handoff bases 0/4/6\n");
+        else if (batch_mtp_pipeline)
             std::fprintf(stderr, "strata generate: --batch-mtp-pipeline: two group-owned replay chains, "
                                  "%d compute rows per owner, physical handoff bases 0/%d; "
                                  "accepted-prefix commit before either group reuses its owner.\n",
                                  batch_compute_rows, std::min(o.batch, 4));
+        const bool retained_prefill = [] {
+            const char* value = std::getenv("STRATA_PREFILL_RETAINED_LAYERS");
+            return value && std::strcmp(value, "0") != 0;
+        }();
+        // The full-residency path can resolve every prompt arena to owned
+        // storage even when borrowing was requested. Gate the actual bindings.
+        if (retained_prefill && (!batch_mtp_pipeline || !piped || split_same || o.batch != 4 ||
+            o.batch_groups != 2 || o.prefill_chunk != 2048 || any_loan || sp.chunk() != 2048 ||
+            !std::all_of(stages.begin(), stages.end(), [](const auto& st) { return st->sp.chunk() == 2048; }) ||
+            o.adapt_async || o.adapt_swaps != 0 || o.peer_device >= 0 || o.spec_split ||
+            o.foreground_budget_ms > 0 ||
+            !std::all_of(host_res.begin(), host_res.end(), [](int32_t slot) { return slot >= 0; }))) {
+            std::fprintf(stderr, "strata retained prefill: requires four slots, two MTP groups, distinct devices, "
+                                 "owned 2048 scratch, complete residency and no adaptation/peer/budget\n");
+            return 2;
+        }
+        const bool retained_layer_yields = [] {
+            const char* value = std::getenv("STRATA_PREFILL_RETAINED_LAYERS");
+            return !value || std::strcmp(value, "stage") != 0;
+        }();
+        int retained_blocked_stage = -1;
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         struct PGroup {
             bool inflight = false;
@@ -12497,12 +12803,24 @@ int main(int argc, char** argv) {
             int64_t since = 0;              ///< tick it started waiting (fairness)
             bool round_started = false;
         };
-        std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+        std::vector<PGroup> pg((size_t) (piped ? (o.batch_mtp_third ? 3 : o.batch_groups) : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
         bool bounded_round = false;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+        // Packet leases survive target acceptance, recursive prefix commit and
+        // synchronous private-draft advance. Only metadata moves between owners.
+        int64_t seat_served[4] = {};
+        auto seat_leased = [&](int b) {
+            for (const auto& owner : pg) if (owner.inflight)
+                for (int t = 0; t < owner.count; ++t) if (owner.rows[t] == b) return true;
+            return false;
+        };
         auto group_active = [&](int gi) {
+            if (o.batch_mtp_floating) {
+                for (int b = 0; b < 4; ++b) if (bs[(size_t)b].active && !seat_leased(b)) return true;
+                return false;
+            }
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
             return false;
         };
@@ -12623,9 +12941,9 @@ int main(int argc, char** argv) {
             return true;
         };
         // Each in-flight group owns a distinct replay/metadata/canary lease on every stage.
-        // Only its slot states are shared, and the two groups' slot sets and handoff ranges are disjoint.
+        // Only slot states are shared; all live owners' seat sets and handoff ranges are disjoint.
         auto group_verifier = [&](int stage, int group) -> strata::core::Verifier& {
-            return group == 0 ? stage_verifier(stage) : stage_peer(stage);
+            return group == 0 ? stage_verifier(stage) : group == 1 ? stage_peer(stage) : stage_third(stage);
         };
         auto pump_mtp = [&](bool may_start, int released_stages = INT_MAX, bool may_retire = true) -> bool {
             ++pipe_tick;
@@ -12634,9 +12952,12 @@ int main(int argc, char** argv) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
                 const int r = group_verifier(k, gi).batch_poll(win_pool_fn,
-                    gi == 0 ? win_pool_user : (void*) &split_drive_b, err);
+                    gi == 0 ? win_pool_user : gi == 1 ? (void*)&split_drive_b : (void*)third_drive.get(), err);
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (!r) continue;
+                if (o.batch_mtp_third && batch_mtp_trace)
+                    std::fprintf(stderr, "STATE_THIRD_STAGE_DONE tick=%lld stage=%d owner=%d\n",
+                                 (long long)pipe_tick, k, gi);
                 stage_group[(size_t) k] = -1;
                 pg[(size_t) gi].stage = k + 1;
                 pg[(size_t) gi].since = pipe_tick;
@@ -12712,10 +13033,13 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++bt_windows;
                 bt_rows += G.count;
+                if (o.batch_mtp_floating && batch_mtp_trace)
+                    std::fprintf(stderr, "STATE_FLOAT_RELEASE tick=%lld owner=%d rows=%d\n",
+                                 (long long)pipe_tick, gi, G.count);
                 G.inflight = false;
             }
             for (int k = n_pipe - 1; k >= 0; --k) {
-                if (k >= released_stages) continue;
+                if (k >= released_stages || k == retained_blocked_stage) continue;
                 if (stage_group[(size_t) k] >= 0) continue;
                 int pick = -1;
                 if (k > 0) {
@@ -12729,8 +13053,9 @@ int main(int argc, char** argv) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (!may_retire) {
                             bool stopped = false;
-                            for (int t = 0; t < GS; ++t) {
-                                const auto& slot = bs[(size_t)(gi * GS + t)];
+                            for (int t = 0; t < (o.batch_mtp_floating ? 4 : GS); ++t) {
+                                if (o.batch_mtp_floating && seat_leased(t)) continue;
+                                const auto& slot = bs[(size_t)(o.batch_mtp_floating ? t : gi * GS + t)];
                                 stopped = stopped || (slot.active && slot.stop);
                             }
                             if (stopped) continue; // retain the group's bounded-round opportunity until retirement is safe
@@ -12743,7 +13068,45 @@ int main(int argc, char** argv) {
                     PGroup& G = pg[(size_t) pick];
                     G.round_started = bounded_round;
                     G.count = 0;
-                    if (GS > 2) {
+                    if (o.batch_mtp_floating) {
+                        int ready[4] = {}, n = 0;
+                        for (int b = 0; b < 4; ++b) {
+                            const BSlot& sl = bs[(size_t)b];
+                            if (!sl.active || seat_leased(b)) continue;
+                            if (sl.stop) {
+                                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                                print_mtp_done(b, "cancel");
+                                continue;
+                            }
+                            ready[n++] = b;
+                        }
+                        // Oldest last service first, with deterministic seat-number ties.
+                        std::sort(ready, ready + n, [&](int a, int b) {
+                            return seat_served[a] != seat_served[b] ? seat_served[a] < seat_served[b] : a < b;
+                        });
+                        int idle = 1; // this owner has already consumed its round opportunity
+                        for (int gi = 0; gi < (int)pg.size(); ++gi)
+                            if (gi != pick && !pg[(size_t)gi].inflight &&
+                                (!bounded_round || !pg[(size_t)gi].round_started)) ++idle;
+                        // Reserve one ready seat for each other idle owner, never wait to fill.
+                        const int capacity = o.batch_mtp_third && pick != 0 ? 1 : 2;
+                        const int take = n == 0 ? 0 : std::min(capacity, std::max(1, n - (idle - 1)));
+                        // Canonical pairs keep all depth-one/two shapes within 32 graph keys.
+                        std::sort(ready, ready + take);
+                        for (int t = 0; t < take; ++t) {
+                            const int b = ready[t];
+                            const BSlot& sl = bs[(size_t)b];
+                            if (sl.draft < 0) { std::printf("ERR batch MTP: live slot has no proposal\n"); return false; }
+                            if (batch_mtp_trace)
+                                std::fprintf(stderr, "STATE_FLOAT_LEASE tick=%lld owner=%d slot=%d position=%lld\n",
+                                             (long long)pipe_tick, pick, b, (long long)sl.p);
+                            seat_served[b] = pipe_tick;
+                            G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
+                            if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
+                                G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
+                            }
+                        }
+                    } else if (GS > 2) {
                         int selected[2] = {}, n = 0, scanned = 0;
                         for (; scanned < GS && n < 2; ++scanned) {
                             const int b = pick * GS + (G.cursor + scanned) % GS;
@@ -12793,19 +13156,26 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::Verifier& owner = group_verifier(k, pick);
                 strata::core::progress().busy.store(true);
-                if (!owner.batch_launch(pick * std::min(2 * GS, 4), G.rows, G.count, G.tok, G.pos, err,
+                const int handoff_base = o.batch_mtp_third ? (pick == 0 ? 0 : pick == 1 ? 4 : 6)
+                                                          : pick * std::min(2 * GS, 4);
+                if (!owner.batch_launch(handoff_base, G.rows, G.count, G.tok, G.pos, err,
                                         strata::core::Verifier::BatchCommit::deferred)) {
                     std::printf("ERR %s\n", err.c_str()); return false;
                 }
+                if (o.batch_mtp_third && batch_mtp_trace)
+                    std::fprintf(stderr, "STATE_THIRD_LAUNCH tick=%lld stage=%d owner=%d base=%d rows=%d verifier=%p\n",
+                                 (long long)pipe_tick, k, pick, handoff_base, G.count, (void*)&owner);
                 stage_group[(size_t) k] = pick;
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {
                 const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
-                std::fprintf(stderr, "strata batch MTP (pipelined, %d groups of %d): %lld group-steps, "
-                                     "%lld verifier rows, %lld committed tokens in %.0f ms = %.1f committed tok/s "
-                                     "(admissions included)\n",
-                             o.batch_groups, GS, (long long) bt_windows, (long long) bt_rows,
+                std::fprintf(stderr, o.batch_mtp_third
+                    ? "strata batch MTP (pipelined, %d owners over %d states): %lld group-steps, "
+                      "%lld verifier rows, %lld committed tokens in %.0f ms = %.1f committed tok/s (admissions included)\n"
+                    : "strata batch MTP (pipelined, %d groups of %d): %lld group-steps, "
+                      "%lld verifier rows, %lld committed tokens in %.0f ms = %.1f committed tok/s (admissions included)\n",
+                             o.batch_mtp_third ? 3 : o.batch_groups, o.batch_mtp_third ? 4 : GS, (long long) bt_windows, (long long) bt_rows,
                              (long long) bt_tokens, wall, 1000.0 * bt_tokens / std::max(wall, 1e-9));
                 if (static const bool timing = [] {
                         const char* v = std::getenv("STRATA_COMMIT_TIMING");
@@ -12876,7 +13246,7 @@ int main(int argc, char** argv) {
             }
             return command.rfind("BYIELD", 0) == 0;
         };
-        auto score_controls = [&]() {
+        auto score_controls = [&](bool consume_yield = true) {
             // Do not lift slot-number controls past admissions: that would cancel
             // the wrong incarnation. Only consume a contiguous control prefix.
             for (;;) {
@@ -12886,7 +13256,7 @@ int main(int argc, char** argv) {
                     if (in_lines.empty()) break;
                     const auto& front = in_lines.front();
                     if (front.rfind("BSTOP ", 0) != 0 && front.rfind("BPRIORITY ", 0) != 0 &&
-                        front.rfind("BYIELD", 0) != 0) break;
+                        (!consume_yield || front.rfind("BYIELD", 0) != 0)) break;
                     control = std::move(in_lines.front());
                     in_lines.pop_front();
                 }
@@ -13099,7 +13469,8 @@ int main(int argc, char** argv) {
             if (resident_control(line)) continue;
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
-                if (batch_on()) verr = "VRAM: not while batch slots are decoding";
+                if (o.batch_mtp_third) verr = "VRAM: third-owner experiment retains full expert residency";
+                else if (batch_on()) verr = "VRAM: not while batch slots are decoding";
                 else vram_command(line, verr);
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
                 std::fflush(stdout);
@@ -14027,6 +14398,30 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
+            // Experimental direct cut: resolve every stage before touching any destination.
+            // Reread remains its own diagnostic path. Source selection is deliberately unchanged.
+            static const bool direct_cut_on = [] {
+                const char* v = std::getenv("STRATA_SNAPSHOT_DIRECT_CUT");
+                return v && std::atoi(v) != 0;
+            }();
+            bool direct_cut = incoming && !parked.live && direct_cut_on &&
+                std::getenv("STRATA_CKPT_REREAD") == nullptr;
+            std::vector<const ConvCheckpoint*> incoming_cuts;
+            if (direct_cut) {
+                auto find_cut = [&](const strata::core::SavedConversation& image) -> const ConvCheckpoint* {
+                    for (const auto& c : image.checkpoints)
+                        if ((int64_t) c.ids.size() == parked.tokens && starts_with(c.ids, c.imgs)) return &c;
+                    return nullptr;
+                };
+                incoming_cuts.push_back(find_cut(*incoming));
+                for (const auto& part : incoming->stage_images) incoming_cuts.push_back(find_cut(part));
+                if (std::any_of(incoming_cuts.begin(), incoming_cuts.end(), [](auto c) { return c == nullptr; })) {
+                    std::fprintf(stderr, "strata serve: conversation cache: discard missing selected cut\n");
+                    incoming.reset();
+                    incoming_cuts.clear();
+                    direct_cut = false;
+                }
+            }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
@@ -14038,7 +14433,7 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0, incoming ? &*incoming : nullptr)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -14087,10 +14482,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (incoming) {
-                const PrefixWork restore_work = session_work((int64_t) incoming->live.ids.size(), false);
+                const PrefixWork restore_work = session_work(direct_cut ? parked.tokens : (int64_t) incoming->live.ids.size(), false);
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
+                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err,
+                        direct_cut ? incoming_cuts[0] : nullptr) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -14100,7 +14496,8 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err,
+                            direct_cut ? incoming_cuts[i + 1] : nullptr) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -14113,7 +14510,8 @@ int main(int argc, char** argv) {
                     const auto& draft_kv = stages.empty() ? incoming->kv.back() : incoming->stage_images.back().kv.back();
                     const strata::core::OnDevice on_d(stages.empty() ? 0 : stages.back()->dev);
                     if (!strata::core::conversation_kv_verify(draft_kv, mtp.kv_state(), g,
-                            int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
+                            direct_cut ? parked.tokens : int64_t(incoming->live.ids.size()), false, draft_hash, err,
+                            int64_t(incoming->live.ids.size()))) {
                         std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
                         return 1;
                     }
@@ -14135,18 +14533,26 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 live_scope = incoming->scope;
                 resume = parked.tokens;
-                from_live = parked.live;
+                from_live = parked.live || direct_cut;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                }
+                if (direct_cut) {
+                    // Retained K/V still describes the full captured allocation; only this prefix is unchanged.
+                    conversations.limit_reuse(resume);
+                    live.resize((size_t) resume);
+                    live_imgs.erase(std::remove_if(live_imgs.begin(), live_imgs.end(),
+                        [&](const auto& key) { return key.start >= resume; }), live_imgs.end());
+                    for (auto& c : checks) if ((int64_t) c.ids.size() == resume) c.used = ++check_clock;
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 if (o.prefix_cost_selection)
                     prefix_costs.transfer(PrefixTransfer::parked, restore_work,
                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
-                             (long long) resume, from_live ? "live" : "checkpoint",
+                             (long long) resume, direct_cut ? "direct-checkpoint" : from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
@@ -14633,6 +15039,60 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
                 }();
+                if (retained_prefill) {
+                    // Stackful prefill owns one arena per device. Decode can
+                    // retain other stage leases while this device resumes bulk.
+                    const std::function<bool(strata::prefill::Prefill*, int64_t, std::string&)> step =
+                        [&](strata::prefill::Prefill* owner, int64_t next_layer, std::string& why) {
+                            int stage = owner == &sp ? 0 : -1;
+                            for (size_t k = 0; k < stages.size(); ++k)
+                                if (owner == &stages[k]->sp) stage = (int)k + 1;
+                            if (stage < 0) { why = "retained prefill: unknown device owner"; return false; }
+                            score_controls(false);
+                            // Offer at most one launch per stage at this boundary.
+                            // Then close only the lease on the device bulk needs.
+                            if (!pump_mtp(true)) { why = err; batch_fatal = true; return false; }
+                            retained_blocked_stage = stage;
+                            while (stage_group[(size_t)stage] >= 0) {
+                                if (!pump_mtp(false)) {
+                                    retained_blocked_stage = -1;
+                                    why = err; batch_fatal = true; return false;
+                                }
+                            }
+                            retained_blocked_stage = -1;
+                            static const bool witness = [] {
+                                const char* v = std::getenv("STRATA_PREFILL_RETAINED_TRACE");
+                                return v && std::strcmp(v, "0") != 0;
+                            }();
+                            if (witness) {
+                                int inflight = 0, running = 0;
+                                for (const auto& group : pg) inflight += group.inflight;
+                                for (int occupied : stage_group) running += occupied >= 0;
+                                std::fprintf(stderr, "RETAINED_PREFILL stage=%d next_layer=%lld "
+                                                     "local_idle=1 inflight_groups=%d other_running_stages=%d\n",
+                                             stage, (long long)next_layer, inflight, running);
+                            }
+                            strata::core::progress().busy.store(true);
+                            return true;
+                        };
+                    bool okay = true;
+                    for (int64_t q = a0; okay && q < b0; q += 2048)
+                        okay = sp.run_retained(ids.data() + q, std::min<int64_t>(2048, b0 - q), q, e, step, retained_layer_yields);
+                    // e can alias the pipeline's err; a successful peer drain
+                    // must not replace the bulk run's terminal outcome.
+                    const std::string prefill_error = okay ? std::string{} : e;
+                    if (!okay) e.clear();
+                    // Admission/publication still requires the existing full idle
+                    // fence, once at the end of this prompt span, including failure.
+                    if (!pipe_drain()) { batch_fatal = true; e = err; return false; }
+                    // STOP must not disguise a callback, publication or cleanup
+                    // failure as an intentional, fully drained cancellation.
+                    if (!okay) {
+                        e = prefill_error;
+                        if (e != "cancelled") batch_fatal = true;
+                    }
+                    return okay;
+                }
                 if (o.batch <= 0 || (!time_budget.enabled() &&
                     (piped || (!stages.empty() && !batch_on()))))
                     return sp.run(ids.data() + a0, b0 - a0, a0, e);
@@ -14741,7 +15201,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // No second seed resolution: begin() owns automatic seeds and resumed request policy.
-            if (!ver.set_logit_bias(req_bias, err) || ((pipe || batch_mtp_pipeline) && !ver_b.set_logit_bias(req_bias, err))) {
+            if (!ver.set_logit_bias(req_bias, err) || ((pipe || batch_mtp_pipeline) && !ver_b.set_logit_bias(req_bias, err)) ||
+                (o.batch_mtp_third && !stage_third(0).set_logit_bias(req_bias, err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -14766,6 +15227,11 @@ int main(int argc, char** argv) {
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe || batch_mtp_pipeline) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            if (o.batch_mtp_third) {
+                stage_third(0).set_sampling(resident.working().sampling);
+                stage_third(0).set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+                for (int st = 0; st < split_drive.n; ++st) third_drive->pcie_num[st] = split_drive.pcie_num[st];
+            }
             bool cancelled = false;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>

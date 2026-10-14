@@ -682,7 +682,7 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
-    o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
+    o.vec(c.gdn.read()); o.vec(c.ple.read()); o.vec(c.tails.read()); o.vec(c.dead.read()); o.vec(c.block_pos.read());
     o.u64(c.used);
 }
 
@@ -758,8 +758,8 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
-    return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+    return in.vec(c.gdn.write(), m[0]) && in.vec(c.ple.write(), m[1]) && in.vec(c.tails.write(), m[2]) && in.vec(c.dead.write(), m[3]) &&
+           in.vec(c.block_pos.write(), m[4]) && in.u64(c.used);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -1018,7 +1018,8 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
 }
 
 uint64_t session_read_peak_bytes(uint64_t file_bytes) {
-    const uint64_t segments = file_bytes / kBlock + 1;
+    const uint64_t extent = prefix_backing_enabled() ? ConversationBuffer::prefix_extent_bytes : kBlock;
+    const uint64_t segments = file_bytes / extent + 1;
     // the parsed image (about the payload), the read buffer, a page per buffer segment, the small vectors
     return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
 }

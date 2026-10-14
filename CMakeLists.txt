@@ -696,7 +696,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(strata-resident-test PRIVATE STRATA_RESIDENT_MODEL_TEST=1)
     target_include_directories(strata-resident-test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(strata-resident-test PRIVATE strata_resident strata_spec ${_strata_gpu_runtime_target})
-    target_link_options(strata-resident-test PRIVATE "-Wl,--wrap=cudaMemcpy")
+    target_link_options(strata-resident-test PRIVATE "-Wl,--wrap=cudaMemcpy" "-Wl,--wrap=cudaMemcpyAsync")
     # #232: allocation-reconciliation executable; same engine, traced explicit CUDA payloads.
     add_executable(strata-judge-test src/program/generate.cpp tests/core/judge_allocation_trace.cpp)
     target_include_directories(strata-judge-test PRIVATE ${_strata_gpu_include_directories})

@@ -2,6 +2,7 @@
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/admission_copy_observer.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/resident_memory.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -138,7 +139,8 @@ ResidentSlots::~ResidentSlots() {
     // verifier are destroyed, including on a failed transition/early return.
     if (touched_) for (const auto& stage : stages_) {
         if (!stage.verifier->release_gpu_waits(5000) ||
-            (stage.batch_peer && !stage.batch_peer->release_gpu_waits(5000))) std::terminate();
+            (stage.batch_peer && !stage.batch_peer->release_gpu_waits(5000)) ||
+            (stage.batch_third && !stage.batch_third->release_gpu_waits(5000))) std::terminate();
     }
     if (touched_) for (const auto& stage : stages_) {
         const core::OnDevice on(stage.device);
@@ -196,7 +198,8 @@ bool ResidentSlots::idle(std::string& error) {
     }
     for (const auto& stage : stages_)
         if (!stage.verifier->context_idle(error) ||
-            (stage.batch_peer && !stage.batch_peer->context_idle(error))) return false;
+            (stage.batch_peer && !stage.batch_peer->context_idle(error)) ||
+            (stage.batch_third && !stage.batch_third->context_idle(error))) return false;
     return draft_.context_idle(error) && prompt_.context_idle(error);
 }
 
@@ -206,10 +209,19 @@ bool ResidentSlots::slot_idle(int slot, std::string& error) {
         for (size_t group = 2 * k; group < std::min(2 * k + 2, dispatch_.completion.size()); ++group)
             expert_pending = expert_pending || dispatch_.completion[group].active();
         const auto& stage = stages_[k];
+        bool third_pending = false;
+        if (stage.batch_third) {
+            const size_t lane = (size_t)stage.third_worker_lane;
+            if (stage.third_worker_lane < 0 || 2 * lane + 1 >= dispatch_.completion.size()) {
+                error = "resident third owner: missing worker lane"; return false;
+            }
+            third_pending = dispatch_.completion[2 * lane].active() || dispatch_.completion[2 * lane + 1].active();
+        }
         if (!stage.verifier->slot_consumers_idle(slot, expert_pending &&
                 (!stage.batch_peer || stage.verifier->batch_busy()), error) ||
             (stage.batch_peer && !stage.batch_peer->slot_consumers_idle(slot,
-                expert_pending && stage.batch_peer->batch_busy(), error))) return false;
+                expert_pending && stage.batch_peer->batch_busy(), error)) ||
+            (stage.batch_third && !stage.batch_third->slot_consumers_idle(slot, third_pending, error))) return false;
     }
     // A pipelined operation for other rows may continue. Its snapshots don't
     // borrow this slot's history and its stage reports no consumer for this row.
@@ -222,7 +234,8 @@ bool ResidentSlots::init_resources(std::string& error) {
     }
     if (!idle(error)) return false;
     for (const auto& stage : stages_)
-        if (stage.verifier->n_slots() != 0 || (stage.batch_peer && stage.batch_peer->n_slots() != 0)) {
+        if (stage.verifier->n_slots() != 0 || (stage.batch_peer && stage.batch_peer->n_slots() != 0) ||
+            (stage.batch_third && stage.batch_third->n_slots() != 0)) {
             error = "resident resources: verifier already has slot bindings"; return false;
         }
     // Failed partial allocation must still drain before borrowed histories die.
@@ -231,7 +244,8 @@ bool ResidentSlots::init_resources(std::string& error) {
     for (const auto& stage : stages_) {
         const core::OnDevice on(stage.device);
         if (!stage.verifier->init_slots(stage.slots, error) ||
-            (stage.batch_peer && !stage.batch_peer->init_slots(stage.slots, error))) {
+            (stage.batch_peer && !stage.batch_peer->init_slots(stage.slots, error)) ||
+            (stage.batch_third && !stage.batch_third->init_slots(stage.slots, error))) {
             resources_ = Resources::failed; return false;
         }
     }
@@ -241,6 +255,8 @@ bool ResidentSlots::init_resources(std::string& error) {
         if (!stages_[0].verifier->set_slot_context((int) b, slot.request, slot.sampling,
                                                   &slot.ids, slot.cvec, error) ||
             (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context((int) b, slot.request,
+                                                  slot.sampling, &slot.ids, slot.cvec, error)) ||
+            (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context((int)b, slot.request,
                                                   slot.sampling, &slot.ids, slot.cvec, error))) {
             resources_ = Resources::failed; return false;
         }
@@ -256,7 +272,8 @@ bool ResidentSlots::release_resources(std::string& error) {
     }
     if (!idle(error)) return false;
     if (!stages_[0].verifier->release_batch_resources(error) ||
-        (stages_[0].batch_peer && !stages_[0].batch_peer->release_batch_resources(error))) {
+        (stages_[0].batch_peer && !stages_[0].batch_peer->release_batch_resources(error)) ||
+        (stages_[0].batch_third && !stages_[0].batch_third->release_batch_resources(error))) {
         resources_ = Resources::failed; return false;
     }
     resources_ = Resources::released;
@@ -378,6 +395,8 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
                                               &state.ids, state.cvec, error) ||
         (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(slot, working_.request,
                                               state.sampling, &state.ids, state.cvec, error)) ||
+        (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context(slot, working_.request,
+                                              state.sampling, &state.ids, state.cvec, error)) ||
         !observe(continuing ? "resume" : "admit", slot, (int64_t) prefix.size(), error)) {
         // Retain a continuing identity for balanced failure/release receipts.
         // A new request has not published its start yet.
@@ -402,7 +421,16 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
         auto& from = *stage.main;
         auto& to = *stage.slots[(size_t) slot];
         const core::OnDevice on(stage.device);
+        core::admission_copy::Scope observed("main_admit", slot, stage.device, upto);
         auto phase = timing ? Clock::now() : Clock::time_point{};
+        if (core::resident_direct_copy_enabled()) {
+            // idle() joined consumers; session copy validates all layers before
+            // owning the entry device fence on this stage's selected device.
+            if (!core::conversation_session_copy(from, to, geometry_, prefix, nullptr, error)) return false;
+            if (timing) report_admission_timing(slot, "main_direct_transfer", stage.device, from.qsa_alloc, phase);
+            observed.complete();
+            continue;
+        }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch admission: device sync failed"; return false; }
         if (timing) report_admission_timing(slot, "stage_sync", stage.device, 1, phase);
         if (timing) phase = Clock::now();
@@ -422,6 +450,7 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
         }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch admission: device sync failed"; return false; }
         if (timing) report_admission_timing(slot, "main_kv_transfer", stage.device, from.qsa_alloc, phase);
+        observed.complete();
     }
     return true;
 }
@@ -439,6 +468,8 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         error = "resident resume: checkpoint is not a retained prefix"; return false;
     }
     const int64_t cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
+    const bool direct = core::resident_direct_copy_enabled();
+    if (direct) work.path(-1, -2); // don't reuse host-bounce cost samples
     for (size_t k = 0; k < stages_.size(); ++k) {
         const auto& stage = stages_[k];
         const auto& from = *stage.slots[(size_t) slot];
@@ -454,7 +485,7 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         const uint64_t state = z.gdn + (from.ple_hist ? z.ple : 0) +
             uint64_t(from.qsa_alloc) * (z.tail + z.dead + z.block_pos);
         work.add(state);
-        if (!checkpoint) work.add(state); // live recurrence is captured then restored
+        if (!checkpoint && !direct) work.add(state); // live host bounce captures then restores
         work.add(uint64_t(from.qsa_alloc) * z.dead); // restore refreshes the moving pooled row too
         for (int64_t j = 0; j < from.qsa_alloc; ++j) {
             const auto& qsa = from.qsa_states[from.qsa_ord0 + j];
@@ -465,7 +496,7 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
             const auto& target = stage.main->qsa_states[stage.main->qsa_ord0 + j];
             work.path(stage.device, target.kv_mode);
             work.path(stage.device, int(target.n_slots));
-            for (uint64_t n : parts) { work.add(n); work.add(n); } // save/restore, not a direct D2D copy
+            for (uint64_t n : parts) { work.add(n); if (!direct) work.add(n); }
         }
     }
     if (draft_.kv_state().max_cells > 0) {
@@ -476,7 +507,7 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         work.path(draft_.device(), int(from->n_slots));
         work.path(draft_.device(), draft_.kv_state().kv_mode);
         work.path(draft_.device(), int(draft_.kv_state().n_slots));
-        for (uint64_t n : parts) { work.add(n); work.add(n); }
+        for (uint64_t n : parts) { work.add(n); if (!direct) work.add(n); }
     }
     return work.bytes != UINT64_MAX;
 }
@@ -510,6 +541,13 @@ bool ResidentSlots::copy_from(int slot, const core::ConversationCheckpoint* at, 
         auto& from = *stage.slots[(size_t) slot];
         auto& to = *stage.main;
         const core::OnDevice on(stage.device);
+        core::admission_copy::Scope observed(at ? "main_resume_cut" : "main_resume_live", slot, stage.device, upto);
+        if (core::resident_direct_copy_enabled()) {
+            const auto* part = at ? (k == 0 ? at : &at->stage_parts[k - 1]) : nullptr;
+            if (!core::conversation_session_copy(from, to, geometry_, prefix, part, error)) return false;
+            observed.complete();
+            continue;
+        }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch slot restore: device sync failed"; return false; }
         if (at) {
             if (!core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, geometry_, error))
@@ -529,6 +567,7 @@ bool ResidentSlots::copy_from(int slot, const core::ConversationCheckpoint* at, 
                 return false;
         }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch slot restore: device sync failed"; return false; }
+        observed.complete();
     }
     return true;
 }

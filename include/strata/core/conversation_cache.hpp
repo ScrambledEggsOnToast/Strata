@@ -3,6 +3,7 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/checkpoint_bytes.hpp"
 
 #include <algorithm>
 #include <array>
@@ -55,7 +56,7 @@ struct ConversationImageKey {
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
+    CheckpointBytes gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
@@ -65,9 +66,14 @@ struct ConversationCheckpoint {
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
+    void seal() {
+        gdn.seal(); ple.seal(); tails.seal(); dead.seal(); block_pos.seal();
+        for (auto& part : stage_parts) part.seal();
+    }
+
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+               gdn.bytes() + ple.bytes() + tails.bytes() + dead.bytes() + block_pos.bytes() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;
@@ -299,6 +305,11 @@ public:
             if (match.tokens > best.tokens) best = match;
         });
         return best;
+    }
+
+    // Functional observers borrow only synchronous const references; never retain them across cache mutation.
+    template<class Visitor> void for_each_image(Visitor&& visit) const {
+        for (size_t i = 0; i < entries_.size(); ++i) visit(i, entries_[i]);
     }
 
     SavedConversation take(size_t index) {

@@ -190,6 +190,31 @@ int main() {
         check(read == written, "read reports the file size");
         check(same(original, back), "round trip is identical");
     }
+    {
+        auto shared = original;
+        auto& buffer = shared.kv[0].k;
+        buffer = ConversationBuffer(true);
+        buffer.resize(original.kv[0].k.size());
+        check(buffer.visit(0, buffer.size(), [&](uint8_t* p, size_t n, size_t at) {
+            return original.kv[0].k.read(p, at, n);
+        }), "shared file fixture copies fixed golden payload");
+        auto donor = buffer;
+        check(buffer.share_prefix(donor, buffer.size()) > 0, "file fixture has actual shared backing");
+        const uint8_t* alias = nullptr;
+        std::as_const(buffer).visit(0, 1, [&](const uint8_t* p, size_t, size_t) { alias = p; return true; });
+        const fs::path path = dir / "shared.bin";
+        check(session_file_write(path.string(), shared, id, written, error), "serialize shared immutable extents");
+        check(slurp(path) == slurp(good), "shared backing preserves the exact frozen file bytes");
+        std::as_const(buffer).visit(0, 1, [&](const uint8_t* p, size_t, size_t) {
+            check(p == alias, "serialization reads without detaching shared backing"); return true;
+        });
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(path.string(), id, back, read, error) && same(original, back),
+              "shared snapshot round trip recreates independent writable payload");
+        back.kv[0].k.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p ^= 1; return true; });
+        check(*alias == 0, "loaded payload mutation leaves original shared file source intact");
+    }
     // writing twice produces the same bytes (deterministic format)
     {
         const fs::path again = dir / "again.bin";

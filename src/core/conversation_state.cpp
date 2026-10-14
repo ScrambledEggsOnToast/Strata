@@ -2,6 +2,7 @@
 #include "conversation_checked.hpp"
 #include "strata/plan/resident.hpp"
 #include "conversation_copy.hpp"
+#include "strata/core/admission_copy_observer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,10 +32,12 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
+bool copy(void* dst, const void* src, size_t bytes, std::string& error, admission_copy::Part part, admission_copy::Direction direction) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
+    admission_copy::Transfer observed(part, direction, bytes);
     const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
+    observed.finish(status == cudaSuccess);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -101,6 +104,12 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
     for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
         if (!add(total, n)) return false;
+    if (immutable_checkpoints_enabled())
+        for (const auto* payload : {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos}) {
+            const size_t extra = payload->sealed() ? payload->bytes() - payload->size() :
+                                 payload->empty() ? 0 : CheckpointBytes::owner_bytes;
+            if (!add(total, extra)) return false;
+        }
     return true;
 }
 } // namespace
@@ -159,14 +168,15 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    if (!copy(c.gdn.write().data(), ss.gdn_state, c.gdn.size(), error, admission_copy::gdn, admission_copy::capture) ||
+        !copy(c.ple.write().data(), ss.ple_hist, c.ple.size(), error, admission_copy::ple, admission_copy::capture)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.tails.write().data() + j * z.tail, st.idx_tail, z.tail, error, admission_copy::index_tail, admission_copy::capture) ||
+            !copy(c.dead.write().data() + j * z.dead, st.idx_dead, z.dead, error, admission_copy::index_dead, admission_copy::capture) ||
+            !copy(c.block_pos.write().data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, admission_copy::index_position, admission_copy::capture)) return false;
     }
+    if (immutable_checkpoints_enabled()) c.seal();
     return true;
 }
 
@@ -176,21 +186,66 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error, admission_copy::gdn, admission_copy::restore) ||
+        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error, admission_copy::ple, admission_copy::restore)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error, admission_copy::index_tail, admission_copy::restore) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error, admission_copy::index_dead, admission_copy::restore) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error, admission_copy::index_position, admission_copy::restore)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error, admission_copy::index_repair, admission_copy::restore)) return false;
         }
     }
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
+    return sync(error);
+}
+
+bool conversation_session_copy(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                               const std::vector<int32_t>& ids, const ConversationCheckpoint* at,
+                               std::string& error) {
+    ConversationStateSizes source, target;
+    if (!checkpoint_targets(from, g, ids.size(), source, error) ||
+        !checkpoint_targets(to, g, ids.size(), target, error)) return false;
+    if (from.layer_lo != to.layer_lo || from.layer_hi != to.layer_hi ||
+        from.gdn_ord0 != to.gdn_ord0 || from.gdn_alloc != to.gdn_alloc ||
+        from.qsa_ord0 != to.qsa_ord0 || from.qsa_alloc != to.qsa_alloc ||
+        bool(from.ple_hist) != bool(to.ple_hist) ||
+        from.allocation_device != to.allocation_device)
+        return fail(error, "incompatible direct running-state owners");
+    if (at && (at->ids != ids || !conversation_checkpoint_validate(*at, to, g, error)))
+        return fail(error, "invalid direct-copy checkpoint");
+    // Reject a late-layer mismatch before the first write. No layout conversion
+    // or host-image fallback is allowed in this path.
+    for (size_t j = 0; j < owned_qsa(from); ++j)
+        if (!conversation_kv_copy_validate(owned(from, j), owned(to, j), g, (int64_t) ids.size(), true, error))
+            return false;
+    if (!sync(error)) return false;
+    for (size_t j = 0; j < owned_qsa(from); ++j)
+        if (!conversation_detail::copy_prevalidated_kv(owned(from, j), owned(to, j), g,
+                                                       (int64_t) ids.size(), true, error)) return false;
+    if (at) return conversation_checkpoint_restore(*at, to, g, error);
+    if (!copy(to.gdn_state, from.gdn_state, source.gdn, error, admission_copy::gdn, admission_copy::direct) ||
+        !copy(to.ple_hist, from.ple_hist, from.ple_hist ? source.ple : 0, error,
+              admission_copy::ple, admission_copy::direct)) return false;
+    for (size_t j = 0; j < owned_qsa(from); ++j) {
+        const auto& src = owned(from, j);
+        const auto& dst = owned(to, j);
+        if (!copy(dst.idx_tail, src.idx_tail, source.tail, error, admission_copy::index_tail, admission_copy::direct) ||
+            !copy(dst.idx_dead, src.idx_dead, source.dead, error, admission_copy::index_dead, admission_copy::direct) ||
+            !copy(dst.idx_block_pos, src.idx_block_pos, source.block_pos, error,
+                  admission_copy::index_position, admission_copy::direct)) return false;
+        if (!ids.empty()) {
+            const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            if (!copy(dst.idx_pooled + row * g.idx_key_dim, src.idx_dead, source.dead, error,
+                      admission_copy::index_repair, admission_copy::direct)) return false;
+        }
+    }
+    to.ple_prev[0] = ids.size() >= 2 ? ids[ids.size() - 2] : -1;
+    to.ple_prev[1] = ids.size() >= 1 ? ids.back() : -1;
     return sync(error);
 }
 
@@ -210,6 +265,12 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    if (immutable_checkpoints_enabled()) {
+        // The live checkpoint is sealed after capture, before publication.
+        const size_t payloads = (z.gdn != 0) + (ss.ple_hist && z.ple != 0) +
+                                (tails != 0) + (dead != 0) + (positions != 0);
+        if (!add(bytes, payloads * CheckpointBytes::owner_bytes)) return fail(error, "checkpoint owner overflow");
+    }
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
@@ -346,15 +407,24 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const ConversationCheckpoint* selected) {
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    // A cut is an existing sealed checkpoint of this exact image, never an arbitrary token junction.
+    if (selected && std::none_of(image.checkpoints.begin(), image.checkpoints.end(),
+            [&](const auto& c) { return &c == selected; })) {
+        fail(error, "selected checkpoint does not belong to image");
+        return ConversationRestore::invalid;
+    }
     if (!sync(error)) return ConversationRestore::transfer_failed;
-    const int64_t upto = (int64_t) image.live.ids.size();
+    const auto& running = selected ? *selected : image.live;
+    const int64_t upto = (int64_t) running.ids.size();
+    const int64_t captured = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, captured))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
-        !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, captured)) ||
+        !conversation_checkpoint_restore(running, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
 

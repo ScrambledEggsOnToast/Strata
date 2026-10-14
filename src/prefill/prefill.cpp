@@ -57,6 +57,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <future>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -811,6 +812,8 @@ struct Prefill::Impl {
     uint64_t bound_request = 0;
     std::atomic<bool> running{false};
     bool poisoned = false;
+    const std::function<bool()>* retained_stop = nullptr;
+    bool retained_cancel_requested = false, retained_cancelled = false;
     std::thread::id callback_thread;
     std::thread::id release_thread;
     uint64_t generation_request = 0;
@@ -2758,11 +2761,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     const core::OnDevice on_device(m.device);
     if (m.running.exchange(true)) { err = "prefill: scratch already in flight"; return false; }
+    m.retained_cancel_requested = m.retained_cancelled = false;
     struct RunLease {
         Impl& m;
+        std::string& err;
         bool complete = false;
+        bool canary_started = false, groups_started = false;
         ~RunLease() {
             if (!complete) {
+                const core::OnDevice owner(m.device);
                 auto drain_helper = [&](PeerPrefill& helper) {
                     const core::OnDevice input(helper.input_device);
                     if (helper.x_stream && cudaStreamSynchronize(helper.x_stream) != cudaSuccess)
@@ -2773,21 +2780,43 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 };
                 for (auto& helper : m.pps) drain_helper(*helper);
                 if (m.help_pp) drain_helper(*m.help_pp);
-                for (cudaStream_t stream : {m.cs, m.copy})
+                for (cudaStream_t stream : {m.cs, m.copy, m.kv_copy})
                     if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
-                m.poisoned = true;
+                // Cancellation is not successful prefill. Only a deliberate
+                // retained stop, after every host producer and stream joins,
+                // may leave the arena reusable; errors never clear poison.
+                bool cancelled = m.retained_cancel_requested && !m.poisoned &&
+                                 std::uncaught_exceptions() == 0;
+                if (cancelled && canary_started) {
+                    m.canary.check(8, m.cs);
+                    if (cudaStreamSynchronize(m.cs) != cudaSuccess) std::terminate();
+                    cancelled = m.canary.validate("prefill cancellation", err);
+                }
+                if (cancelled && groups_started) {
+                    int32_t status[4] = {};
+                    if (cudaMemcpy(status, m.native_count, sizeof(status), cudaMemcpyDeviceToHost) != cudaSuccess ||
+                        status[1]) {
+                        err = "prefill: invalid resident device grouping during cancellation";
+                        cancelled = false;
+                    }
+                }
+                if (cancelled && !m.gemm.collect_native_profile(err)) cancelled = false;
+                m.retained_cancelled = cancelled;
+                if (!cancelled) m.poisoned = true;
             }
             m.callback_thread = {};
             m.running.store(false);
         }
-    } lease{m};
+    } lease{m, err};
     if (m.poisoned) { err = "prefill: scratch poisoned by failed work"; return false; }
     m.pe_last = nullptr;
     for (auto& helper : m.pps) {
         helper->layers = helper->experts = helper->rows = helper->over_cap = helper->ps_experts = helper->engaged = 0;
         helper->bytes_act = helper->bytes_meta = helper->bytes_out = helper->bytes_staged = 0;
     }
+    if (retained_step_ && !retained_boundary(stage_lb_, err, false)) return false;
     m.canary.begin(8, m.cs, n > 0 ? (int32_t) tokens[0] : 0, (int32_t) pos0);
+    lease.canary_started = true;
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     int wmma_cc = 0;
@@ -2827,7 +2856,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // An early return must drain DMA before the caller refills the borrowed expert slots.
     struct KvDrain {
         cudaStream_t stream;
-        ~KvDrain() { if (stream) cudaStreamSynchronize(stream); }
+        ~KvDrain() { if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate(); }
     } kv_drain{kv_prefetch ? m.kv_copy : nullptr};
     int64_t kv_prefetches = 0;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
@@ -2905,6 +2934,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             err = "prefill: resident device grouping setup";
             return false;
         }
+        lease.groups_started = true;
     }
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
@@ -2935,10 +2965,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     };
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
+    // A future destructor waits but discards failure. On a retained stop its
+    // result is part of the reuse proof, even if layer 1 never consumed it.
+    struct RetainedPleJoin {
+        Impl& m;
+        std::future<bool>& pending;
+        std::string& why;
+        std::string& err;
+        ~RetainedPleJoin() {
+            if (!m.retained_stop || !pending.valid()) return;
+            try {
+                if (pending.get()) return;
+                err = why.empty() ? "prefill: retained PLE gather failed" : why;
+            } catch (...) {
+                err = "prefill: retained PLE gather threw during drain";
+            }
+            m.retained_cancel_requested = false;
+            m.poisoned = true;
+        }
+    } retained_ple_join{m, ple_next, ple_next_err, err};
     int ple_buf = 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) {
+            if (retained_step_) {
+                m.retained_cancel_requested = true;
+                err = "cancelled";
+                return false;
+            }
             m.canary.check(8, m.cs);
             if (cudaStreamSynchronize(m.cs) != cudaSuccess || !m.canary.validate("prefill", err)) return false;
             lease.complete = true; err = "cancelled"; return false;
@@ -5078,7 +5132,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
+            // Do not manufacture a shorter layer range: normed, grs, xn16 and
+            // xn16_lo are the fused NEXT layer's inputs and remain in this arena.
+            if (retained_step_ && retained_layer_yields_ && !retained_boundary(l + 1, err)) return false;
         }
+        if (retained_step_ && !retained_layer_yields_ && !retained_boundary(LE, err)) return false;
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
             issuer.join();
@@ -5119,7 +5177,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_err_.clear();
             next_->hand_in_ = h;
             next_->single_chunk_ = single_chunk;
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+            if (retained_step_) {
+                if (!next_->run_impl(tokens + c0, T, p0, err)) {
+                    if (next_->impl_->retained_cancelled) {
+                        // The child has joined and validated its cancellation.
+                        // Its callbacks may have leased our device to decode;
+                        // reacquire it before RunLease waits on shared streams.
+                        err.clear();
+                        if (retained_boundary(LE, err, false))
+                            m.retained_cancel_requested = true;
+                    }
+                    return false;
+                }
+                // Descendant callbacks may have leased this device to decode.
+                // Reacquire it before the parent's canary/checkpoint epilogue.
+                if (!retained_boundary(LE, err, false)) return false;
+            } else next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
                 strata::aux_cpus::pin_current_thread();
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
@@ -5227,7 +5300,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (m.native_expert_ptrs)
         std::fprintf(stderr, "strata: resident device grouping: %lld layers, %llu selected expert groups\n",
                      (long long) device_group_layers, accounted_device_groups);
-    lease.complete = true;
     if (kv_prefetch) {
         if (const cudaError_t cst = cudaStreamSynchronize(m.kv_copy); cst != cudaSuccess) {
             err = std::string("prefill: KV prefetch stream: ") + cudaGetErrorString(cst);
@@ -5236,6 +5308,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
+    lease.complete = true;
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();
@@ -5302,10 +5375,22 @@ bool Prefill::drain_pipeline(std::string& err) {
     bool ok = true;
 
     if (next_run_.valid()) {
-        if (!next_run_.get()) {
-            err = next_err_;
+        try {
+            if (!next_run_.get()) {
+                err = next_err_;
+                ok = false;
+            }
+        } catch (const std::exception& failure) {
+            err = failure.what();
             ok = false;
+            impl_->poisoned = true;
+        } catch (...) {
+            err = "prefill: descendant threw during drain";
+            ok = false;
+            impl_->poisoned = true;
         }
+        // Never let a failed future skip grandchildren or authorize reuse.
+        if (!ok && retained_step_) impl_->poisoned = true;
     }
 
     if (next_ != nullptr) {
@@ -5313,6 +5398,7 @@ bool Prefill::drain_pipeline(std::string& err) {
         if (!next_->drain_pipeline(tail_err)) {
             if (ok) err = tail_err;
             ok = false;
+            if (retained_step_) impl_->poisoned = true;
         }
     }
 
@@ -5326,7 +5412,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         ~PublicLease() { running.store(false); }
     } lease{public_running_};
     const int64_t attribution_begin = prefill_attribution_requested() ? prefill_host_ns() : 0;
-    const bool body_ok = run_impl(tokens, n, pos0, err);
+    bool body_ok = false;
+    try {
+        body_ok = run_impl(tokens, n, pos0, err);
+    } catch (const std::exception& failure) {
+        err = failure.what();
+        impl_->poisoned = true;
+    } catch (...) {
+        err = "prefill: execution or callback exception";
+        impl_->poisoned = true;
+    }
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
@@ -5338,12 +5433,99 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                      (long long) pos0, (long long) n, (long long) attribution_begin,
                      (long long) prefill_host_ns(), body_ok && drain_ok ? "true" : "false");
 
-    if (!body_ok) return false;
     if (!drain_ok) {
         err = drain_err;
         return false;
     }
+    if (!body_ok) return false;
     return true;
+}
+
+bool Prefill::retained_boundary(int64_t next_layer, std::string& err, bool bulk_complete) {
+    Impl& m = *impl_;
+    // Only these local streams can write the retained arena in the admitted
+    // all-resident/no-helper path. KV prefetch is independently joined as well.
+    // Entry has not submitted prompt work yet. Poll the prior verifier owner
+    // before waiting on its stream (a doorbell graph can require host progress).
+    if (bulk_complete)
+        for (cudaStream_t stream : {m.cs, m.copy, m.kv_copy})
+            if (stream && cudaStreamSynchronize(stream) != cudaSuccess) {
+                err = "prefill: retained layer completion failed"; return false;
+            }
+    if (!(*retained_step_)(this, next_layer, err)) return false;
+    if (cudaSetDevice(m.device) != cudaSuccess) {
+        err = "prefill: retained device restoration failed"; return false;
+    }
+    if (m.retained_stop && *m.retained_stop && (*m.retained_stop)()) {
+        m.retained_cancel_requested = true;
+        err = "cancelled";
+        return false;
+    }
+    return true;
+}
+
+bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                          const std::function<bool(Prefill*, int64_t, std::string&)>& step, bool layer_yields) {
+    if (!step || n < 1) {
+        err = "prefill: retained run requires a callback and a chunk";
+        return false;
+    }
+    for (Prefill* owner = this; owner; owner = owner->next_) {
+        const auto& m = *owner->impl_;
+        // GPU streams can still belong to decode; the entry callback returns
+        // that device's lease before run_impl submits any prompt operation.
+        if (owner->public_running_.load() || owner->next_run_.valid() || m.running.load() || m.poisoned) {
+            err = "prefill: retained bulk owner is already active or poisoned"; return false;
+        }
+        if (m.T != 2048 || n > m.T || m.borrowed || owner->helper_ ||
+            m.help_pp || !m.pps.empty() || cpu_share_enabled() || !m.host_res) {
+            err = "prefill: retained run requires owned 2048 scratch without helpers"; return false;
+        }
+        for (int64_t l = owner->stage_lb_; l < owner->stage_le_; ++l)
+            for (int64_t e = 0; e < m.g->n_expert; ++e)
+                if (m.host_res[l * m.g->n_expert + e] < 0) {
+                    err = "prefill: retained run requires complete local expert residency"; return false;
+                }
+        for (int64_t j = 0; j < m.ss->qsa_alloc; ++j)
+            if (m.ss->qsa_states[m.ss->qsa_ord0 + j].kv_mode != 0) {
+                err = "prefill: retained run requires resident KV"; return false;
+            }
+        for (Prefill* previous = this; previous != owner; previous = previous->next_)
+            if (previous->device() == owner->device()) {
+                err = "prefill: retained run requires distinct stage devices"; return false;
+            }
+    }
+    // A stackful continuation: no residual copy, re-preparation, changed layer
+    // range, chunk subdivision, or extra device allocation. run() keeps its
+    // existing public lease, failure poisoning and descendant drain.
+    struct Reset {
+        Prefill* first;
+        ~Reset() {
+            for (Prefill* owner = first; owner; owner = owner->next_) {
+                owner->retained_step_ = nullptr;
+                owner->retained_layer_yields_ = true;
+                owner->impl_->retained_stop = nullptr;
+            }
+        }
+    } reset{this};
+    for (Prefill* owner = this; owner; owner = owner->next_) {
+        owner->retained_step_ = &step;
+        owner->retained_layer_yields_ = layer_yields;
+        owner->impl_->retained_stop = &should_stop;
+        owner->impl_->retained_cancel_requested = owner->impl_->retained_cancelled = false;
+    }
+    const bool okay = run(tokens, n, pos0, err);
+    if (!okay) {
+        bool cancelled = impl_->retained_cancelled;
+        for (Prefill* owner = this; owner; owner = owner->next_)
+            if (owner->impl_->poisoned || owner->impl_->running.load() || owner->next_run_.valid())
+                cancelled = false;
+        // A callback's text (or STOP racing an error) is not a cancellation
+        // receipt. Only the joined, validated chain may report this outcome.
+        if (cancelled) err = "cancelled";
+        else if (err.empty() || err == "cancelled") err = "prefill: retained cancellation cleanup failed";
+    }
+    return okay;
 }
 
 bool Prefill::run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,

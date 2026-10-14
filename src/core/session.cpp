@@ -270,7 +270,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
-    // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
+    // supplies the RoPE table that the others, prefill and MTP borrow. With STRATA_SHARED_ROPE=1
+    // the table has process lifetime and is priced outside this arena; otherwise the primary owns it.
     const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, &resolved);
     const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, &resolved);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);

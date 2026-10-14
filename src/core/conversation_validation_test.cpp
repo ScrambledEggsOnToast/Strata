@@ -15,7 +15,7 @@
 // initializing CUDA or deliberately poisoning a real device context. This is
 // host-backend fault injection, not a claim of hardware-failure recovery.
 namespace {
-int copy_calls = 0, sync_calls = 0, fail_copy = 0, fail_sync = 0;
+int copy_calls = 0, sync_calls = 0, stream_sync_calls = 0, fail_copy = 0, fail_sync = 0;
 size_t copied_bytes = 0;
 }
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
@@ -32,7 +32,7 @@ extern "C" cudaError_t __wrap_cudaStreamCreateWithFlags(cudaStream_t* s, unsigne
 extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t) {
     return __wrap_cudaMemcpy(dst, src, n, cudaMemcpyDefault);
 }
-extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { ++stream_sync_calls; return cudaSuccess; }
 extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
@@ -112,6 +112,9 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         return c;
     };
     image.live = checkpoint(9); image.checkpoints.push_back(checkpoint(5));
+    image.checkpoints[0].gdn.assign(z.gdn, 17);
+    image.checkpoints[0].dead.assign(g.n_qsa_layers() * z.dead, 19);
+    if (immutable_checkpoints_enabled()) { image.live.seal(); image.checkpoints[0].seal(); }
     image.kv.reserve((size_t) g.n_qsa_layers() + 1);
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
@@ -175,12 +178,48 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_state_sizes(bad_geometry,z,error), "zero layer interval rejected before division");
     bad_geometry = g; bad_geometry.n_head_kv = std::numeric_limits<int64_t>::max();
     check(conversation_kv_bytes(draft.st,bad_geometry,9,false)==0, "KV byte overflow rejected");
+    {
+        auto foreign=ss;
+        foreign.gdn_ord0++;
+        check(!conversation_session_copy(ss,foreign,g,image.live.ids,nullptr,error) && unchanged(),
+              "direct session refuses a foreign carve before any CUDA call or write");
+        auto short_target=draft.st;
+        short_target.max_cells=8;
+        check(!conversation_kv_copy(first.st,short_target,g,9,false,error) && unchanged(),
+              "direct K/V refuses an undersized destination without fallback");
+        if (!zero_qsa) {
+            Pools source_first(g,format), source_last(g,format);
+            for (auto* p : {&source_first,&source_last})
+                for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0x3c);
+            std::array<QsaState,2> source_layers{source_first.st,source_last.st};
+            std::vector<uint8_t> source_gdn(gdn.size(),0x3c), source_history(history.size(),0x3c);
+            auto source=ss;
+            source.qsa_states=source_layers.data(); source.gdn_state=(float*)source_gdn.data();
+            source.ple_hist=ple?(float*)source_history.data():nullptr;
+            source.ple_prev[0]=7; source.ple_prev[1]=8;
+            for (bool invalid_target : {false,true}) {
+                auto& late=invalid_target?layers.back():source_layers.back();
+                const auto saved=late;
+                late.kv_q4=true; late.kv_hybrid=true;
+#if defined(CONVERSATION_TEST_TRANSFERS)
+                copy_calls=sync_calls=stream_sync_calls=0;
+#endif
+                check(!conversation_session_copy(source,ss,g,image.live.ids,nullptr,error) && unchanged(),
+                      "late direct source/target rejection leaves distinct destination bytes unchanged");
+#if defined(CONVERSATION_TEST_TRANSFERS)
+                check(!copy_calls && !sync_calls && !stream_sync_calls,
+                      "late direct source/target rejection performs zero transfers or synchronizations");
+#endif
+                late=saved;
+            }
+        }
+    }
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
         std::fill(gdn.begin(),gdn.end(),0xa5); std::fill(history.begin(),history.end(),0xa5);
         ss.ple_prev[0] = ss.ple_prev[1] = -1;
-        copy_calls = sync_calls = fail_copy = fail_sync = 0;
+        copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
     };
     reset(); fail_sync = 1;
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::transfer_failed,
@@ -211,10 +250,42 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     fail_copy = copy_calls + 1;
     check(!conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back transfer failure is not a successful fingerprint");
     reset(); copied_bytes = 0;
+    check(conversation_snapshot_restore(image,ss,g,&draft.st,error,&image.checkpoints[0])==ConversationRestore::restored,
+          "selected checkpoint restores directly from its longer parent");
+    const size_t cut_copies = copied_bytes;
+    check(gdn==image.checkpoints[0].gdn && history==image.checkpoints[0].ple &&
+          ss.ple_prev[0]==4 && ss.ple_prev[1]==5, "direct cut installs recurrent and PLE state at selected position");
+    check(conversation_kv_verify(image.kv.back(),draft.st,g,5,false,fingerprint,error,9),
+          "direct cut restores only the selected draft extent");
+    const size_t draft_cut_bytes = draft.data[0].size() / 96 * 8;
+    check(draft.data[0][draft_cut_bytes]==0xa5, "direct cut leaves suffix past rounded page untouched");
+    if (!zero_qsa) {
+        const auto& c = image.checkpoints[0];
+        check(std::memcmp(first.data[4].data()+g.idx_key_dim*4,c.dead.data(),z.dead)==0,
+              "selected checkpoint repairs moving pooled row");
+    }
+    reset(); copied_bytes = 0;
+    check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored &&
+          conversation_checkpoint_restore(image.checkpoints[0],ss,g,error), "baseline whole image then rewind");
+    check(cut_copies < copied_bytes, "direct cut removes transfer bytes versus full image plus rewind");
+    check(gdn==image.checkpoints[0].gdn && history==image.checkpoints[0].ple &&
+          ss.ple_prev[0]==4 && ss.ple_prev[1]==5, "baseline rewind reaches the same selected running state");
+    reset();
+    auto foreign_cut = image.checkpoints[0];
+    check(conversation_snapshot_restore(image,ss,g,&draft.st,error,&foreign_cut)==ConversationRestore::invalid &&
+          !copy_calls && !sync_calls && unchanged(), "foreign checkpoint rejected before any CUDA or writes");
+    reset(); fail_copy = 2;
+    check(conversation_snapshot_restore(image,ss,g,&draft.st,error,&image.checkpoints[0])==ConversationRestore::transfer_failed,
+          "direct cut partial transfer failure is fatal");
+    reset(); copied_bytes = 0;
     const ConversationView view{image.live.ids,image.live.imgs,image.checkpoints,true};
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
+    check((full.checkpoints[0].gdn.data()==image.checkpoints[0].gdn.data()) == immutable_checkpoints_enabled(),
+          "capture shares immutable checkpoint payload only in the enabled arm");
+    check(full.checkpoints[0].gdn==image.checkpoints[0].gdn,
+          "capture preserves checkpoint payload in either ownership arm");
     ConversationKvReuse reuse{full.kv,9,9};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
@@ -238,12 +309,70 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    reset();
+    Pools direct_source(g,format);
+    for (auto& bytes : direct_source.data) std::fill(bytes.begin(),bytes.end(),0x3c);
+    fail_copy=2;
+    check(!conversation_kv_copy(direct_source.st,draft.st,g,9,false,error),
+          "direct copy reports failure after a successful key transfer");
+    check(copy_calls==2 && draft.data[0][0]==0x3c && draft.data[1][0]==0xa5,
+          "failed direct transfer leaves partial destination and never falls back through a host image");
+    reset(); copied_bytes=0;
+    std::array<uint64_t,5> parts{};
+    check(conversation_kv_part_sizes(direct_source.st,g,9,false,parts,error),"price direct prefix payload");
+    uint64_t expected_bytes=0;
+    for (uint64_t n : parts) expected_bytes+=n;
+    check(conversation_kv_copy(direct_source.st,draft.st,g,9,false,error) && copied_bytes==expected_bytes,
+          "direct handoff copies each payload once, including rounded pages and scales");
+    reset(); fail_sync=1;
+    check(!conversation_session_copy(ss,ss,g,image.live.ids,nullptr,error) && !copy_calls && unchanged(),
+          "direct session pre-copy drain failure leaves all destination state unchanged");
 #endif
 }
+
+#if defined(CONVERSATION_TEST_TRANSFERS)
+void ring_refusal(int format) {
+    ModelGeometry g;
+    g.n_head_kv=1; g.head_dim=64; g.idx_key_dim=8;
+    for (bool direct : {false,true}) {
+        Pools source(g,format), authoritative(g,format), ring(g,format);
+        for (auto& bytes : source.data) std::fill(bytes.begin(),bytes.end(),0x3c);
+        ring.st.kv_mode=2; ring.st.n_slots=2;
+        std::array<int32_t,24> table{};
+        ring.st.page_table=table.data();
+        ring.st.host.k_pool=authoritative.st.k_pool; ring.st.host.v_pool=authoritative.st.v_pool;
+        ring.st.host.k_q=authoritative.st.k_q; ring.st.host.v_q=authoritative.st.v_q;
+        ring.st.host.k_scale=authoritative.st.k_scale; ring.st.host.v_scale=authoritative.st.v_scale;
+        ring.st.host.k_q4=authoritative.st.k_q4; ring.st.host.v_q4=authoritative.st.v_q4;
+        std::string error;
+        ConversationKv image;
+        check(conversation_kv_save(image,source.st,g,9,false,error),"capture ring refusal source");
+        const int authoritative_calls=format==1?4:2;
+        copy_calls=sync_calls=stream_sync_calls=fail_sync=0;
+        // With three pages and two slots, page 1 lands at slot 1 before wrapping.
+        // Refuse its V copy after its K copy succeeds. The injected error never
+        // enters CUDA's last-error slot (__wrap_cudaGetLastError returns success).
+        fail_copy=authoritative_calls+2;
+        const bool ok=direct?conversation_kv_copy(source.st,ring.st,g,9,false,error)
+                            :conversation_kv_restore(image,ring.st,g,9,false,error);
+        check(!ok && error.find(cudaGetErrorString(cudaErrorInvalidValue))!=std::string::npos,
+              "ring refusal preserves the actual copy error with a clear last-error slot");
+        const size_t page_bytes=source.data[0].size()/24;
+        check(copy_calls==fail_copy && !sync_calls &&
+              authoritative.data[0][0]==0x3c && authoritative.data[1][0]==0x3c &&
+              ring.data[0][page_bytes]==0x3c && ring.data[1][page_bytes]==0xa5 && ring.data[0][0]==0xa5,
+              "ring failure stops after a partial repair and never submits the wrapped page");
+        fail_copy=0;
+    }
+}
+#endif
 }
 
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+#if defined(CONVERSATION_TEST_TRANSFERS)
+    for (int format : {0,1,2}) ring_refusal(format);
+#endif
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

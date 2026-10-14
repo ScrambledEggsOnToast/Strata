@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/admission_copy_observer.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
@@ -1199,6 +1200,7 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         err = "mtp: invalid slot save"; return false;
     }
     const OnDevice on_device(device_);
+    admission_copy::Scope observed("draft_admit", slot, device_, cells);
     static const bool timing = [] {
         const char* v = std::getenv("STRATA_ADMISSION_TIMING");
         return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
@@ -1207,12 +1209,17 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
     Operation operation(*this, err);
     if (!operation) return false;
     if (!idle(err)) return false;
-    ConversationKv image;
-    if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
-        !conversation_kv_restore(image, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+    if (resident_direct_copy_enabled()) {
+        if (!conversation_kv_copy(st_, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+    } else {
+        ConversationKv image;
+        if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
+            !conversation_kv_restore(image, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+    }
     slots_[(size_t) slot].cells = cells;
     slots_[(size_t) slot].proposal = -1;
     const bool ok = operation.finish(err);
+    if (ok) observed.complete();
     if (timing && ok)
         std::fprintf(stderr, "strata admission timing: slot=%d component=draft_kv_transfer device=%d items=%lld "
                              "host_ms=%.3f\n", slot, device_, (long long) cells,
@@ -1225,14 +1232,21 @@ bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
         err = "mtp: invalid slot resume extent"; return false;
     }
     const OnDevice on_device(device_);
+    admission_copy::Scope observed("draft_resume", slot, device_, cells);
     if (!idle(err)) return false;
     Operation operation(*this, err);
     if (!operation) return false;
-    ConversationKv image;
-    if (!conversation_kv_save(image, slots_[(size_t) slot].state, *g_, cells, false, err) ||
-        !conversation_kv_restore(image, st_, *g_, cells, false, err)) return false;
-    restore_ring(cells);
-    return operation.finish(err);
+    if (resident_direct_copy_enabled()) {
+        if (!conversation_kv_copy(slots_[(size_t) slot].state, st_, *g_, cells, false, err)) return false;
+    } else {
+        ConversationKv image;
+        if (!conversation_kv_save(image, slots_[(size_t) slot].state, *g_, cells, false, err) ||
+            !conversation_kv_restore(image, st_, *g_, cells, false, err)) return false;
+    }
+    if (!restore_ring(cells, err)) return false;
+    const bool ok = operation.finish(err);
+    if (ok) observed.complete();
+    return ok;
 }
 
 bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_token,
@@ -1485,18 +1499,24 @@ void MtpDrafter::kv_restore(int64_t upto) {
     std::string err;
     Operation operation(*this, err);
     if (!operation) std::terminate();
-    restore_ring(upto);
+    if (!restore_ring(upto, err)) std::terminate();
     if (!operation.finish(err)) std::terminate();
 }
 
-void MtpDrafter::restore_ring(int64_t upto) {
+bool MtpDrafter::restore_ring(int64_t upto, std::string& err) {
     const OnDevice on_device(device_);
-    if (st_.kv_mode != 2 || upto <= 0) return;
+    if (st_.kv_mode != 2 || upto <= 0) return true;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
-    strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) std::terminate();
+    if (!strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_),
+                                         b0, b1, st_.n_slots, s, cs_, err)) return false;
+    const auto status = cudaStreamSynchronize(cs_);
+    if (status != cudaSuccess) {
+        err = std::string("mtp ring restore synchronize: ") + cudaGetErrorString(status);
+        return false;
+    }
+    return true;
 }
 
 bool MtpDrafter::prepare_prefill(std::string& err) {

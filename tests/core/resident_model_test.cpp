@@ -30,6 +30,19 @@ extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size
     return __real_cudaMemcpy(dst, src, size, kind);
 }
 
+// Snapshot transfers use a private stream. Forward async calls to the real
+// runtime too, so the existing partial-write fixture reaches today's copy path.
+extern "C" cudaError_t __real_cudaMemcpyAsync(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t);
+extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t size,
+                                               cudaMemcpyKind kind, cudaStream_t stream) {
+    if (dst == fail_destination && size) {
+        fail_destination = nullptr;
+        transfer_failed = true;
+        return cudaErrorInvalidValue;
+    }
+    return __real_cudaMemcpyAsync(dst, src, size, kind, stream);
+}
+
 int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
                           const strata::core::ModelGeometry& geometry, strata::core::SessionState& main,
                           strata::core::SessionState& a, strata::core::SessionState& b,
@@ -262,7 +275,20 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         checkpoint.ids = prefix;
         require(core::conversation_checkpoint_save(checkpoint, main, geometry, error), "save real working checkpoint");
         program::ResidentAdmission admission{33, &checkpoint};
+        const auto* main_gdn=main.gdn_state;
+        const auto* slot_gdn=a.gdn_state;
+        const auto* slot_qsa=a.qsa_states;
+        core::SavedConversation opening, parked;
+        const std::vector<core::ConversationImageKey> images;
+        const std::vector<core::ConversationCheckpoint> checks_at_open;
+        const core::ConversationView view{prefix,images,checks_at_open,true};
+        require(core::conversation_snapshot_save(opening,view,main,geometry,draft.kv_state(),error),
+                "capture real working state before resident admission");
         require(owner.park(0, prefix, admission, true, error), "park request A");
+        require(core::conversation_snapshot_save(parked,view,a,geometry,*draft.slot_state(0),error) &&
+                same_snapshot(opening,parked), "resident admission preserves every main and draft payload byte");
+        require(main.gdn_state==main_gdn && a.gdn_state==slot_gdn && a.qsa_states==slot_qsa,
+                "resident admission preserves working and stationary slot addresses");
         const auto* history = &owner.slots()[0].ids;
         require(!owner.park(1, prefix, admission, true, error), "same request cannot own two slots");
         require(owner.slots()[1].request == 0 && owner.slots()[1].ids.empty(), "duplicate refusal leaves B empty");
@@ -273,6 +299,10 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
                 "released solo resend retains identity and automatic seed");
         require(!owner.begin(0, prompt, request, error), "released scratch still refuses BGEN admission");
         require(owner.resume(0, nullptr, error), "restore same yielded solo while scratch is released");
+        core::SavedConversation resumed;
+        require(core::conversation_snapshot_save(resumed,view,main,geometry,draft.kv_state(),error) &&
+                same_snapshot(opening,resumed) && main.gdn_state==main_gdn && a.gdn_state==slot_gdn,
+                "resident resume preserves payloads and addresses while scratch is released");
         require(owner.init_resources(error), "reinitialize retained contexts");
         require(owner.park(0, prefix, admission, true, error), "retain solo continuation before promotion");
         require(owner.begin(1, prompt, request, error) && owner.working().request != aid &&
@@ -323,6 +353,57 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         program::SessionFingerprint before, after;
         require(program::session_fingerprint(b, *draft.slot_state(1), geometry, 2, before, error), "fingerprint B before failed A transition");
         require(owner.begin(0, prompt, request, error), "begin replacement A");
+        if (std::getenv("STRATA_TEST_RING_COPY_REFUSAL")) {
+            // A terminal fixture: a failed draft operation intentionally keeps
+            // its scratch lease poisoned, so no later lifecycle test can reuse it.
+            const auto* ring=draft.slot_state(0);
+            require(ring && ring->kv_mode==2,"ring refusal needs an actual host-backed draft slot");
+            auto payload=[](const core::QsaState& st, bool value, bool resident) -> void* {
+                const bool host=st.kv_mode!=0 && !resident;
+                if (st.kv_q4 || (st.kv_hybrid && value))
+                    return value?(host?st.host.v_q4:st.v_q4):(host?st.host.k_q4:st.k_q4);
+                if (st.kv_int8 || st.kv_hybrid)
+                    return value?(host?st.host.v_q:st.v_q):(host?st.host.k_q:st.k_q);
+                return value?(host?st.host.v_pool:st.v_pool):(host?st.host.k_pool:st.k_pool);
+            };
+            void* ring_k=payload(*ring,false,true);
+            void* ring_v=payload(*ring,true,true);
+            const uint32_t marker=0x3c3c3c3c;
+            require(cudaMemcpy(payload(draft.kv_state(),false,false),&marker,sizeof(marker),cudaMemcpyDefault)==cudaSuccess &&
+                    cudaMemcpy(payload(draft.kv_state(),true,false),&marker,sizeof(marker),cudaMemcpyDefault)==cudaSuccess &&
+                    cudaMemset(ring_k,0xa5,sizeof(marker))==cudaSuccess &&
+                    cudaMemset(ring_v,0xa5,sizeof(marker))==cudaSuccess && cudaDeviceSynchronize()==cudaSuccess,
+                    "distinguish real ring pages from the incoming authoritative draft");
+            require(cudaGetLastError()==cudaSuccess,"ring refusal starts with a clear runtime error slot");
+            fail_destination=ring_v;
+            transfer_failed=false;
+            require(!owner.admit(0,prefix,admission,error) && transfer_failed &&
+                    error.find(cudaGetErrorString(cudaErrorInvalidValue))!=std::string::npos,
+                    "actual draft ring copy refusal reaches resident admission");
+            require(cudaDeviceSynchronize()==cudaSuccess && cudaGetLastError()==cudaSuccess,
+                    "software refusal leaves no runtime error for a second last-error read");
+            uint32_t key=0,value=0;
+            require(cudaMemcpy(&key,ring_k,sizeof(key),cudaMemcpyDeviceToHost)==cudaSuccess &&
+                    cudaMemcpy(&value,ring_v,sizeof(value),cudaMemcpyDeviceToHost)==cudaSuccess &&
+                    key==marker && value==0xa5a5a5a5,
+                    "ring refusal happened after key mutation and before value mutation");
+            require(owner.slots()[0].failed && !owner.slots()[0].active && !owner.available(0) &&
+                    !owner.slots()[0].request && !dispatch.slot_requests[0],
+                    "failed draft ring cannot publish its resident target");
+            require(!draft.context_idle(error) && !draft.bind_request(0,999,error) &&
+                    !draft.bind_request(8,999,error) && !draft.save_slot(0,2,error) &&
+                    !draft.restore_slot(0,2,error),
+                    "poisoned draft scratch refuses both rebinding and save/restore reuse");
+            require(!owner.begin(-1,prompt,request,error) && !owner.admit(0,prefix,admission,error),
+                    "resident owner cannot reuse a poisoned draft through a successor request");
+            require(program::session_fingerprint(b,*draft.slot_state(1),geometry,2,after,error) &&
+                    before.gdn==after.gdn && before.ple==after.ple && before.kv==after.kv && before.draft==after.draft &&
+                    before.tail==after.tail && before.dead==after.dead && before.pooled==after.pooled &&
+                    owner.slots()[1].request==bid && owner.slots()[1].active && owner.slots()[1].ids==prefix,
+                    "draft ring refusal preserves independent peer state and identity");
+            std::printf("RESIDENT_RING_REFUSAL checks=%d poisoned=1 rebind_refused=1 reuse_refused=1 failures=0\n",checks);
+            return 0;
+        }
         // GDN is copied before PLE. Mark it so the partial write is observable.
         require(cudaMemset(main.gdn_state, 0x3c, sizeof(float)) == cudaSuccess, "mark source state");
         fail_destination = a.ple_hist;
@@ -354,6 +435,199 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
     } catch (const std::exception& exception) {
         fail_destination = nullptr;
         std::fprintf(stderr, "RESIDENT_MODEL_CHECKS checks=%d failures=1 error=%s\n", checks, exception.what());
+        return 1;
+    }
+}
+
+// Host counterpart of the single-device fixture: retain the actual three-stage,
+// four-seat allocation and read each payload on its owning device. No inference
+// performance or mixed/ring residency claim is made by this lifecycle fixture.
+int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
+                               const strata::core::ModelGeometry& geometry,
+                               const std::vector<strata::program::ResidentStage>& stages,
+                               strata::core::MtpDrafter& draft) {
+    using namespace strata;
+    std::string error;
+    int checks = 0;
+    auto require = [&](bool ok, const char* message) {
+        ++checks;
+        if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
+    };
+    auto device = [&](int ordinal) {
+        require(cudaSetDevice(ordinal) == cudaSuccess, "select actual payload device");
+        require(cudaDeviceSynchronize() == cudaSuccess, "join payload device");
+    };
+    try {
+        require(stages.size() == 3 && owner.slots().size() == 4, "retain three stages and four seats");
+        const std::vector<int32_t> prefix{11, 22};
+        const std::vector<int64_t> prompt{11, 22, 33, 44};
+        const std::vector<core::ConversationImageKey> images;
+        const std::vector<core::ConversationCheckpoint> empty_checks;
+        const core::ConversationView view{prefix, images, empty_checks, true};
+        size_t snapshot_bytes = core::conversation_kv_bytes(draft.kv_state(), geometry, 2, false);
+        for (const auto& stage : stages) {
+            require(stage.main && stage.slots.size() == 4, "complete stationary stage owners");
+            size_t bytes = 0;
+            require(core::conversation_snapshot_bytes(view, *stage.main, geometry, nullptr, bytes, error),
+                    "price full-model diagnostic image");
+            require(bytes <= SIZE_MAX - snapshot_bytes, "bounded diagnostic image sum");
+            snapshot_bytes += bytes;
+        }
+        constexpr uint64_t fixture_allowance = uint64_t{2} << 30;
+        uint64_t available = 0, physical = 0;
+        // Eight complete images conservatively cover the retained comparisons,
+        // checkpoint copies and an in-progress capture. No admission credit.
+        require(snapshot_bytes <= fixture_allowance / 8 &&
+                core::available_memory_bytes(available, nullptr, &physical) &&
+                available >= fixture_allowance && physical >= fixture_allowance + (uint64_t{8} << 30),
+                "diagnostic images fit explicit 2 GiB allowance above 8 GiB reserve");
+        struct Image {
+            std::array<core::SavedConversation, 3> main;
+            core::ConversationKv draft;
+        };
+        auto capture = [&](int slot) {
+            Image result;
+            for (size_t i = 0; i < stages.size(); ++i) {
+                device(stages[i].device);
+                auto* state = slot < 0 ? stages[i].main : stages[i].slots[slot];
+                require(core::conversation_snapshot_save(result.main[i], view, *state, geometry, nullptr, error),
+                        "capture all authoritative stage payloads");
+            }
+            device(stages.back().device);
+            const auto* state = slot < 0 ? &draft.kv_state() : draft.slot_state(slot);
+            require(state && core::conversation_kv_save(result.draft, *state, geometry, 2, false, error),
+                    "capture actual draft owner on final device");
+            return result;
+        };
+        auto equal = [](const Image& a, const Image& b) {
+            for (size_t i = 0; i < a.main.size(); ++i)
+                if (!same_snapshot(a.main[i], b.main[i])) return false;
+            return test::equal(a.draft, b.draft);
+        };
+        std::array<std::array<const void*, 3>, 3> addresses{};
+        for (size_t i = 0; i < stages.size(); ++i)
+            addresses[i] = {stages[i].main->gdn_state, stages[i].slots[0]->gdn_state, stages[i].slots[0]->qsa_states};
+        auto stationary = [&] {
+            for (size_t i = 0; i < stages.size(); ++i)
+                require(addresses[i] == std::array<const void*, 3>{
+                            stages[i].main->gdn_state, stages[i].slots[0]->gdn_state, stages[i].slots[0]->qsa_states},
+                        "all graph-facing owner addresses remain stationary");
+        };
+        program::ResidentRequest request;
+        request.max_new = 8;
+        request.scope.value[0] = 1;
+        request.sampling.seed = 0;
+        request.sampling.penalty_last_n = 2;
+        require(!owner.init_resources(error), "repeated initialization refuses");
+        const core::ExpertOperation operation{71, 0, 0, 1, 1};
+        auto& ledger = dispatch.completion.at(0);
+        require(ledger.begin(operation, 0) && ledger.retain_submission(operation), "retain real consumer");
+        require(!owner.begin(0, prompt, request, error), "live consumer prevents rebinding");
+        ledger.cancel();
+        require(!owner.begin(0, prompt, request, error), "cancel is not consumer retirement");
+        require(ledger.drain_submission(operation) && ledger.release(operation), "retire retained consumer");
+        require(owner.begin(-1, prompt, request, error), "begin working request");
+        const auto identity = owner.working().request, seed = owner.working().sampling.seed;
+        require(seed != 0, "resolved seed retained across yields");
+        core::ConversationCheckpoint checkpoint;
+        checkpoint.ids = prefix;
+        device(stages[0].device);
+        require(core::conversation_checkpoint_save(checkpoint, *stages[0].main, geometry, error),
+                "capture first-stage checkpoint");
+        checkpoint.stage_parts.resize(stages.size() - 1);
+        for (size_t i = 1; i < stages.size(); ++i) {
+            device(stages[i].device);
+            checkpoint.stage_parts[i - 1].ids = prefix;
+            require(core::conversation_checkpoint_save(checkpoint.stage_parts[i - 1], *stages[i].main, geometry, error),
+                    "capture every later-stage checkpoint");
+        }
+        program::ResidentAdmission admission{33, &checkpoint};
+        auto opening = capture(-1);
+        require(owner.park(0, prefix, admission, true, error), "park working request");
+        require(equal(opening, capture(0)), "admission preserves every stage and draft payload");
+        stationary();
+        require(!owner.park(1, prefix, admission, true, error) && !owner.slots()[1].request,
+                "one request cannot own two seats");
+        require(owner.release_resources(error) && !owner.release_resources(error), "release exactly once");
+        require(owner.begin(-1, prompt, request, error) && owner.working().request == identity &&
+                owner.working().sampling.seed == seed, "released resend preserves identity and seed");
+        require(owner.resume(0, nullptr, error) && equal(opening, capture(-1)),
+                "live resume preserves every stage and draft payload");
+        require(owner.init_resources(error) && owner.park(0, prefix, admission, true, error),
+                "reinitialize and retain the continuation");
+        require(owner.begin(0, prompt, request, error) && owner.working().request == identity &&
+                owner.working().sampling.seed == seed && owner.resume(0, &checkpoint, error) &&
+                equal(opening, capture(-1)), "selected-cut resume preserves payload and identity");
+        stationary();
+        owner.cancel(0);
+        require(owner.begin(0, prompt, request, error) && owner.working().request > identity &&
+                owner.working().resume_slot == -1 && owner.admit(0, prefix, admission, error),
+                "cancelled identity cannot resurrect in successor");
+        owner.cancel(0);
+        require(owner.finish(0, error), "finish cancelled successor with no submitted row consumer");
+        require(owner.begin(1, prompt, request, error) && owner.admit(1, prefix, admission, error),
+                "admit independent peer");
+        opening = capture(1);
+        const auto peer_identity = owner.slots()[1].request;
+        require(owner.begin(0, prompt, request, error), "begin replacement before injected failure");
+        transfer_failed = false;
+        const bool draft_failure = std::getenv("STRATA_TEST_DRAFT_COPY_REFUSAL") != nullptr;
+        if (draft_failure) {
+            device(stages.back().device);
+            const auto* target = draft.slot_state(0);
+            require(target && target->kv_mode == 0 && draft.kv_state().kv_mode == 0,
+                    "draft refusal exercises canonical resident owners, not a changed ring profile");
+            auto payload = [](const core::QsaState& state, bool value) -> void* {
+                if (state.kv_q4 || (state.kv_hybrid && value)) return value ? state.v_q4 : state.k_q4;
+                if (state.kv_int8 || state.kv_hybrid) return value ? state.v_q : state.k_q;
+                return value ? state.v_pool : state.k_pool;
+            };
+            require(cudaMemset(payload(draft.kv_state(), false), 0x3c, 4) == cudaSuccess &&
+                    cudaMemset(payload(*target, false), 0xa5, 4) == cudaSuccess &&
+                    cudaMemset(payload(*target, true), 0xa5, 4) == cudaSuccess &&
+                    cudaDeviceSynchronize() == cudaSuccess, "mark distinct draft key/value payloads");
+            fail_destination = payload(*target, true);
+            require(!owner.admit(0, prefix, admission, error) && transfer_failed, "partial draft admission refuses");
+            device(stages.back().device);
+            uint32_t key = 0, value = 0;
+            require(cudaMemcpy(&key, payload(*target, false), 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    cudaMemcpy(&value, payload(*target, true), 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    key == 0x3c3c3c3c && value == 0xa5a5a5a5, "draft refusal follows K mutation, before V mutation");
+            require(!draft.context_idle(error) && !draft.bind_request(0, 999, error) &&
+                    !draft.save_slot(0, 2, error) && !draft.restore_slot(0, 2, error) &&
+                    !owner.begin(-1, prompt, request, error), "partial draft poisons all owner reuse");
+        } else {
+            device(stages[0].device);
+            require(cudaMemset(stages[0].main->gdn_state, 0x3c, 4) == cudaSuccess, "mark main source");
+            fail_destination = stages[0].slots[0]->ple_hist;
+            require(fail_destination && !owner.admit(0, prefix, admission, error) && transfer_failed,
+                    "partial main admission refuses");
+            device(stages[0].device);
+            uint32_t changed = 0;
+            require(cudaMemcpy(&changed, stages[0].slots[0]->gdn_state, 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    changed == 0x3c3c3c3c, "main refusal follows real destination mutation");
+        }
+        require(owner.slots()[0].failed && !owner.slots()[0].active && !owner.available(0) &&
+                equal(opening, capture(1)) && owner.slots()[1].request == peer_identity && owner.slots()[1].active,
+                "partial target is unavailable and every peer stage remains intact");
+        if (!draft_failure) {
+            owner.cancel(1);
+            require(owner.finish(1, error) && owner.release_resources(error) && owner.init_resources(error) &&
+                    !owner.available(0) && owner.available(1), "reinitialize only valid contexts");
+            require(owner.begin(1, prompt, request, error), "select peer for working-resume failure");
+            transfer_failed = false;
+            fail_destination = stages[0].main->ple_hist;
+            require(!owner.resume(1, nullptr, error) && transfer_failed &&
+                    !owner.begin(-1, prompt, request, error) && !owner.available(1),
+                    "partial working resume poisons reuse");
+            require(owner.release_resources(error), "release fixture resources");
+        }
+        std::printf("RESIDENT_HOST_MODEL_CHECKS stages=3 seats=4 checks=%d draft_failure=%d failures=0\n",
+                    checks, draft_failure);
+        return 0;
+    } catch (const std::exception& exception) {
+        fail_destination = nullptr;
+        std::fprintf(stderr, "RESIDENT_HOST_MODEL_CHECKS checks=%d failures=1 error=%s\n", checks, exception.what());
         return 1;
     }
 }

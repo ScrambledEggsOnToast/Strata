@@ -233,17 +233,23 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
     check("ring table");
 }
 
-void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
-                     int64_t n_slots, const QsaShapes& s, void* stream) {
+bool kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
+                     int64_t n_slots, const QsaShapes& s, void* stream, std::string& error) {
     const Runs r = runs_of(slots, host, fmt, s);
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
-        for (int a = 0; a < r.n; ++a)
-            if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
-                                cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
-                check("ring restore");
+        for (int a = 0; a < r.n; ++a) {
+            const auto status = cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a],
+                                                (size_t) (run * r.len[a]), cudaMemcpyDefault,
+                                                (cudaStream_t) stream);
+            if (status != cudaSuccess) {
+                error = std::string("kv_stream ring restore: ") + cudaGetErrorString(status);
+                return false;
+            }
+        }
         b += run;
     }
+    return true;
 }
 
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,

@@ -8,11 +8,23 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
 
+namespace strata::core {
+struct QsaState;
+struct ModelGeometry;
+}
+
 namespace strata::core::conversation_detail {
+
+// Internal session-copy second pass only: every source/target layer has passed
+// conversation_kv_copy_validate, consumers are joined, and owner metadata stays
+// unchanged through this call. Standalone/draft callers use conversation_kv_copy.
+bool copy_prevalidated_kv(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                         int64_t upto, bool index, std::string& error);
 
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
@@ -68,15 +80,37 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
     ConversationCheckpoint o;
     o.ids = copy_beating(c.ids);
     o.imgs = copy_beating(c.imgs);
-    o.gdn = copy_beating(c.gdn);
-    o.ple = copy_beating(c.ple);
-    o.tails = copy_beating(c.tails);
-    o.dead = copy_beating(c.dead);
-    o.block_pos = copy_beating(c.block_pos);
+    o.gdn = immutable_checkpoints_enabled() && c.gdn.sealed()
+        ? c.gdn : CheckpointBytes(copy_beating(c.gdn.read()));
+    o.ple = immutable_checkpoints_enabled() && c.ple.sealed()
+        ? c.ple : CheckpointBytes(copy_beating(c.ple.read()));
+    o.tails = immutable_checkpoints_enabled() && c.tails.sealed()
+        ? c.tails : CheckpointBytes(copy_beating(c.tails.read()));
+    o.dead = immutable_checkpoints_enabled() && c.dead.sealed()
+        ? c.dead : CheckpointBytes(copy_beating(c.dead.read()));
+    o.block_pos = immutable_checkpoints_enabled() && c.block_pos.sealed()
+        ? c.block_pos : CheckpointBytes(copy_beating(c.block_pos.read()));
     o.used = c.used;
     o.pinned = c.pinned;
     o.stage_parts.reserve(c.stage_parts.size());
     for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
+    if (immutable_checkpoints_enabled()) o.seal();
+    static const bool trace = [] {
+        const char* value = std::getenv("STRATA_CHECKPOINT_COPY_TRACE");
+        return value && std::atoi(value) != 0;
+    }();
+    if (trace) {
+        const CheckpointBytes* source[] = {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos};
+        const CheckpointBytes* destination[] = {&o.gdn, &o.ple, &o.tails, &o.dead, &o.block_pos};
+        size_t shared = 0, copied = 0;
+        for (size_t i = 0; i < 5; ++i) {
+            if (source[i]->empty()) continue;
+            if (source[i]->data() == destination[i]->data()) shared += source[i]->size();
+            else copied += source[i]->size();
+        }
+        std::fprintf(stderr, "CHECKPOINT_COPY cells=%lld shared_bytes=%llu copied_bytes=%llu\n",
+                     (long long)c.used, (unsigned long long)shared, (unsigned long long)copied);
+    }
     return o;
 }
 
