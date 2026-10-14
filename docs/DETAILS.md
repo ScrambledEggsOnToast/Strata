@@ -845,12 +845,12 @@ change generation context, slot count or prompt chunk size.
 
 The initial lane requires native weights, resident nonelastic KV, fixed
 `--prefill` and `--no-prefill-borrow`, with no adaptive/peer/helper/vision
-paths. Generation submitters must be stopped at a quiescent serial boundary.
+paths. The lane is acquired with generation submitters at a quiescent boundary.
 Every stage validates the original device/stream, immutable allocation
 geometry, layer range, KV format, page/indexer extent, retained max-block
 scratch and request canary before rebinding. Verifiers and the drafter must
 also be idle. Generation callbacks, PLE history bindings, request identity
-and per-device RoPE registration are restored before generation resumes.
+and per-device RoPE registration are restored before that stage resumes generation.
 An operation or restoration failure refuses reuse; it is not a fallback to
 the generation session or a smaller scoring state.
 
@@ -873,6 +873,46 @@ additional finite first-use/driver and host allocator/runtime commitments.
 Omitting either leaves an unknown class and refuses admission. These are
 declared bounds, not measured costs; they supplement, never replace, the
 existing generation allowances and measured ceilings.
+
+**Experimental scheduling controls.** The default `--judge-quantum 0` keeps
+whole-request serial scoring. A positive quantum (at most the admitted judge
+context) divides scoring into bounded token spans. Between spans, including the
+final span, the cooperative mode restores every generation binding, services
+the contiguous queued stop/priority/yield controls, and permits one bounded
+generation round. The logical scoring owner and its private recurrent/KV state
+remain reserved; this is not an extra generation slot. Smaller spans repeat
+projection/expert work and can substantially increase complete decision latency.
+
+`--judge-overlap` additionally permits a released stage to execute generation
+while later stages finish the same scoring span. It requires distinct stage
+devices, batch MTP pipelining, multiple groups, and a quantum no larger than
+the prefill chunk. Each stage restores its generation state before release.
+Global retirement, drafter work and the next scoring span wait for complete
+release and drain. Helper, borrowed and shared-device paths are refused.
+`STRATA_JUDGE_NO_PEER=1` is a same-partition diagnostic control, not a faster
+serving mode; it cannot be combined with overlap. Cancellation invalidates
+scoring reuse and drains descendants before returning.
+
+**Opt-in bounded observers.** `STRATA_JUDGE_TIMING=1` emits host span and
+request timings, a bounded 8,192-record generation-commit buffer, and
+outstanding-stream witnesses. Commit records are timestamped before token
+printing and flushed at drained boundaries. Dropped records make a capture
+incomplete. Head time is nested in span time; overlap spans include the
+generation callbacks. Outstanding streams are not proof of simultaneous GPU
+kernel execution.
+
+`STRATA_NATIVE_PROJECTION_PROFILE=1` separately instruments the native F16
+dequantization/GEMM path. Each Gemm owner preallocates 512 three-event slots
+and 8,192 host records; explicit host storage is admitted, while existing
+library/runtime allowances remain responsible for opaque event backing.
+Collection uses existing stream joins and output waits for the public
+prefill drain. `NATIVE_PROFILE_OWNER`, `NATIVE_PROJECTION` and
+`NATIVE_PROFILE_END` identify owners, shapes, host enqueue brackets and
+device-event envelopes. This includes captured generation prefill, not just
+scoring. It does not cover every projection implementation or isolate pure
+kernel time. Missing footers, overflow, invalid or unclosed records refuse
+complete attribution. Keep observers off for headline latency comparisons;
+neither observer enables the legacy prefill attribution mode.
 
 For an authorized allocation-reconciliation run, `strata-judge-test` wraps
 the engine's explicit CUDA allocation/free and host registration calls.

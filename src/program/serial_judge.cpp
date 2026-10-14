@@ -331,9 +331,11 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
                 } else {
                     core::session_zero(state, m.geometry, nullptr, stage->binding.stream);
                 }
-                if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess) {
-                    m.poisoned = true; error = "judge: short-state initialization failed"; return false;
-                }
+            }
+            // Reacquisition also launches the canary. Complete it before the
+            // next span's idle preflight or cancellation/restoration can run.
+            if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess) {
+                m.poisoned = true; error = "judge: short-state acquisition failed"; return false;
             }
         }
         return true;
