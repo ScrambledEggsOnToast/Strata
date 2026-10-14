@@ -1155,7 +1155,7 @@ class StrataEngine:
                     self.score_waiters -= 1
                     self.slot_cv.notify_all()
                 if acquired:
-                    self.ctl.release()
+                    self._release_control()
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -1738,6 +1738,12 @@ class StrataEngine:
     def _can_yield(self, times):
         return getattr(self, "foreground_budget_s", 0) > 0 or times < self.YIELDS_MAX
 
+    def _release_control(self):
+        """Publish control availability before waking the next FIFO owner."""
+        with self.slot_cv:
+            self.ctl.release()
+            self.slot_cv.notify_all()
+
 
     def _take_control(self, cancel, plen: int, on_control=None, on_wait=None,
                       priority="foreground", background_due=None, slot_ready=None, foreground_pending=None):
@@ -1773,7 +1779,7 @@ class StrataEngine:
                             self.ctl.acquire(blocking=False)):
                         if self.alive():
                             break
-                        self.ctl.release()
+                        self._release_control()
                     left = entry[3] - time.monotonic()
                     wait_s = min(0.5, left) if priority == "background" and left > 0 else 0.5
                     self.slot_cv.wait(timeout=wait_s)
@@ -1967,7 +1973,7 @@ class StrataEngine:
                             if holding:
                                 if callable(on_wait):
                                     on_wait()
-                                self.ctl.release()
+                                self._release_control()
                                 holding = False
                             with self.slot_cv:
                                 if self.pick_slot(prompt, scope) is None:
@@ -2006,7 +2012,7 @@ class StrataEngine:
                         yields += 1
                         if self.foreground_budget_s and priority == "background":
                             background_due = self._background_next(control_started)
-                        self.ctl.release()
+                        self._release_control()
                         holding = False
                         ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority,
                                                            background_due, slot_ready, foreground_pending)
@@ -2087,7 +2093,7 @@ class StrataEngine:
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
-                self.ctl.release()
+                self._release_control()
                 holding = False
                 if not cont:
                     return
@@ -2187,7 +2193,7 @@ class StrataEngine:
                         self._apply_bdone(bd.split())
                         bdone_in = True
                 if holding:
-                    self.ctl.release()
+                    self._release_control()
                 if admit_wait:
                     with self.slot_cv:
                         self.admitting = max(0, self.admitting - 1)
@@ -4002,7 +4008,7 @@ class Service:
             return {"status": "ok", **out}
         finally:
             if ctl is not None:
-                ctl.release()
+                self.engine._release_control()
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:

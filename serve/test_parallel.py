@@ -509,6 +509,44 @@ class ControlBudget(unittest.TestCase):
         self.assertEqual(list(engine.control_waiters), [])
         engine.ctl.release()
 
+    def test_releasing_control_wakes_a_blocked_owner_without_a_poll_timeout(self):
+        import collections
+        waiting, wakeups = threading.Event(), []
+        class WaitingCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                notified = super().wait(timeout=2)
+                wakeups.append(notified)
+                return notified
+        engine = object.__new__(StrataEngine)
+        engine.slot_cv = WaitingCondition()
+        engine.ctl = threading.Lock()
+        engine.ctl.acquire()
+        engine.ctl_epoch, engine.waiting = 0, 0
+        engine.wait_lens, engine.control_waiters = [], collections.deque()
+        engine.alive = lambda: True
+        results = []
+        def request():
+            def turn():
+                results.append((yield from engine._take_control(threading.Event(), 77)))
+            list(turn())
+        thread = threading.Thread(target=request)
+        thread.start()
+        try:
+            self.assertTrue(waiting.wait(2))
+            engine._release_control()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results, [True])
+            self.assertEqual(wakeups, [True], "ownership must wake on release, not the polling timeout")
+            self.assertEqual(list(engine.control_waiters), [])
+        finally:
+            with engine.slot_cv:
+                engine.slot_cv.notify_all()
+            thread.join(3)
+            if engine.ctl.locked():
+                engine.ctl.release()
+
     def test_http_foreground_waiter_is_visible_but_cannot_starve_due_background(self):
         import collections
         service = object.__new__(Service)

@@ -1822,6 +1822,10 @@ queue limits. Admission status counts all requests in `active`/`waiting` and ide
 the score subset with `score_active`/`score_waiting` (`score_slots:1`).
 This separates admission, not GPU execution: a bulk judge read still pauses generation
 until it restores the shared execution bindings at a drained scheduler boundary.
+Releasing the native control lease notifies its waiting owners after publishing the
+unlocked state. FIFO handoffs do not wait for the fallback condition-poll timeout;
+generation admission, scoring, yielding, cleanup and explicit VRAM control use the
+same release operation.
 
 Native framing is `SCORE <id> v1 prompt=<comma-separated IDs> selected=<comma-separated IDs>`.
 IDs are 1–64 ASCII letters, digits, underscores or hyphens. The engine may emit
