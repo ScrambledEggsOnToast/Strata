@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -68,6 +69,8 @@ struct SerialJudgeLane::Impl {
     std::vector<int64_t> last_tokens;
     int64_t prefix_tokens = 0;
     bool prefix_cache = false;
+    bool timing = false;
+    int64_t head_us = 0;
     bool initialized = false, poisoned = false, row_ready = false;
     ~Impl() {
         if (running.load()) std::terminate();
@@ -91,26 +94,29 @@ struct SerialJudgeLane::Impl {
         }
         return true;
     }
+    bool restore_stage(Stage& stage, std::string& error) {
+        if (!stage.rebound) return true;
+        auto& prompt = *stage.binding.prompt;
+        const core::OnDevice on(stage.session.device());
+        if (!prompt.rebind_session(stage.binding.generation->state(), stage.binding.stream,
+                                   stage.saved_request, error)) { poisoned = true; return false; }
+        stage.binding.generation->bind_rope();
+        prompt.on_chunk = std::move(stage.saved_chunk);
+        prompt.on_stage_chunk = std::move(stage.saved_stage_chunk);
+        prompt.should_stop = std::move(stage.saved_stop);
+        prompt.embd_rows = stage.saved_embeddings;
+        if (prompt.gemm_owner() != stage.saved_gemm ||
+            prompt.bound_session() != &stage.binding.generation->state() ||
+            prompt.bound_request() != stage.saved_request) {
+            poisoned = true; error = "judge: failed restoring generation ownership; no resume permitted";
+            return false;
+        }
+        stage.rebound = false;
+        return true;
+    }
     bool restore(std::string& error) {
         bool okay = true;
-        for (auto& stage : stages) {
-            auto& prompt = *stage->binding.prompt;
-            if (stage->rebound) {
-                const core::OnDevice on(stage->session.device());
-                if (!prompt.rebind_session(stage->binding.generation->state(), stage->binding.stream,
-                                           stage->saved_request, error)) okay = false;
-                stage->binding.generation->bind_rope();
-                prompt.on_chunk = std::move(stage->saved_chunk);
-                prompt.on_stage_chunk = std::move(stage->saved_stage_chunk);
-                prompt.should_stop = std::move(stage->saved_stop);
-                prompt.embd_rows = stage->saved_embeddings;
-                if (prompt.gemm_owner() != stage->saved_gemm ||
-                    prompt.bound_session() != &stage->binding.generation->state() ||
-                    prompt.bound_request() != stage->saved_request) okay = false;
-                stage->rebound = false;
-            }
-        }
-        if (!okay) { poisoned = true; error = "judge: failed restoring generation ownership; no resume permitted"; }
+        for (auto& stage : stages) if (!restore_stage(*stage, error)) okay = false;
         return okay;
     }
 };
@@ -244,12 +250,26 @@ bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t 
 }
 
 bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error,
-                          const std::function<bool()>& cancelled) {
+                          const std::function<bool()>& cancelled, int64_t quantum,
+                          const std::function<bool(std::string&)>& peer,
+                          const std::function<bool(size_t, std::string&)>& overlap) {
     auto& m = *impl_;
-    if (!m.initialized || !request || !tokens || count < 1 || count > m.cells || m.running.exchange(true)) {
+    if (!m.initialized || !request || !tokens || count < 1 || count > m.cells ||
+        quantum < 0 || quantum > m.cells || ((peer || overlap) && quantum == 0) ||
+        (peer && overlap) || (overlap && m.stages.size() < 2) || m.running.exchange(true)) {
         error = "judge: invalid, unadmitted or concurrent scoring request"; return false;
     }
     struct Running { std::atomic<bool>& flag; ~Running() { flag.store(false); } } running{m.running};
+    using Clock = std::chrono::steady_clock;
+    const char* timing = std::getenv("STRATA_JUDGE_TIMING");
+    const bool profile = timing && std::string_view(timing) == "1";
+    m.timing = profile;
+    m.head_us = 0;
+    const auto started = profile ? Clock::now() : Clock::time_point{};
+    const auto micros = [](Clock::duration duration) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    };
+    int64_t spans = 0, yields = 0, span_us = 0, peer_us = 0, handoff_us = 0;
     m.row_ready = false;
     m.request_tokens = count;
     for (int64_t t = 0; t < count; ++t) if (tokens[t] < 0 || tokens[t] >= m.vocabulary) {
@@ -281,33 +301,49 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
         bool restored = false;
         ~Restore() { if (!restored) { std::string error; if (!owner.restore(error)) std::terminate(); } }
     } restore{m};
-    for (auto& stage : m.stages) {
-        auto& prompt = *stage->binding.prompt;
-        const core::OnDevice on(stage->session.device());
-        stage->saved_request = prompt.bound_request(); stage->saved_gemm = prompt.gemm_owner();
-        stage->saved_chunk = std::move(prompt.on_chunk); stage->saved_stage_chunk = std::move(prompt.on_stage_chunk);
-        stage->saved_stop = std::move(prompt.should_stop); stage->saved_embeddings = prompt.embd_rows;
-        prompt.should_stop = [&cancelled] { return cancelled && cancelled(); };
-        stage->rebound = true; prompt.embd_rows = nullptr;
-        if (!prompt.rebind_session(stage->session.state(), stage->binding.stream, request, error) ||
-            !stage->canary.bind(8, request, error)) { m.poisoned = true; return false; }
-        stage->session.bind_rope();
-        auto& state = stage->session.state();
-        stage->canary.begin(8, (cudaStream_t)stage->binding.stream, (int32_t)tokens[reused], (int32_t)reused);
-        if (reuse) {
-            if (!core::conversation_checkpoint_restore(stage->branch, state, m.geometry, error)) {
+    auto acquire = [&](bool initialize, int64_t position) {
+        if (!m.idle(error)) return false;
+        restore.restored = false;
+        for (auto& stage : m.stages) {
+            auto& prompt = *stage->binding.prompt;
+            const core::OnDevice on(stage->session.device());
+            if (!prompt.validate_rebind(stage->session.state(), stage->binding.stream, request, error)) {
                 m.poisoned = true; return false;
             }
-        } else {
-            core::session_zero(state, m.geometry, nullptr, stage->binding.stream);
+            stage->saved_request = prompt.bound_request(); stage->saved_gemm = prompt.gemm_owner();
+            stage->saved_chunk = std::move(prompt.on_chunk); stage->saved_stage_chunk = std::move(prompt.on_stage_chunk);
+            stage->saved_stop = std::move(prompt.should_stop); stage->saved_embeddings = prompt.embd_rows;
+            // A staged span finishes on every device before observing cancellation:
+            // no descendant can strand an already-launched generation prefix.
+            if (overlap) prompt.should_stop = {};
+            else prompt.should_stop = [&cancelled] { return cancelled && cancelled(); };
+            stage->rebound = true; prompt.embd_rows = nullptr;
+            if (!prompt.rebind_session(stage->session.state(), stage->binding.stream, request, error) ||
+                !stage->canary.bind(8, request, error)) { m.poisoned = true; return false; }
+            stage->session.bind_rope();
+            stage->canary.begin(8, (cudaStream_t)stage->binding.stream, (int32_t)tokens[position], (int32_t)position);
+            if (initialize) {
+                auto& state = stage->session.state();
+                if (reuse) {
+                    if (!core::conversation_checkpoint_restore(stage->branch, state, m.geometry, error)) {
+                        m.poisoned = true; return false;
+                    }
+                } else {
+                    core::session_zero(state, m.geometry, nullptr, stage->binding.stream);
+                }
+                if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess) {
+                    m.poisoned = true; error = "judge: short-state initialization failed"; return false;
+                }
+            }
         }
-        if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess) {
-            m.poisoned = true; error = "judge: short-state initialization failed"; return false;
-        }
-    }
-    m.stages.back()->binding.prompt->on_chunk = [&m](const float* residual, int64_t rows, int64_t position, std::string& why) {
+        return true;
+    };
+    if (!acquire(true, reused)) return false;
+    const int64_t init_us = profile ? micros(Clock::now() - started) : 0;
+    const auto head_row = [&m](const float* residual, int64_t rows, int64_t position, std::string& why) {
         core::progress_beat();
         if (position + rows != m.request_tokens) return true;
+        const auto head_begin = m.timing ? Clock::now() : Clock::time_point{};
         auto& last = *m.stages.back();
         core::BlockBuffers block = last.session.state().block;
         block.R = const_cast<float*>(residual) + (rows - 1) * m.geometry.hc_dim();
@@ -321,10 +357,88 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
         }
         for (float value : m.readback) if (!std::isfinite(value)) { why = "judge: nonfinite head output"; return false; }
         m.row_ready = true;
+        if (m.timing)
+            m.head_us += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - head_begin).count();
         return true;
     };
+    m.stages.back()->binding.prompt->on_chunk = head_row;
+    auto drain_canaries = [&]() {
+        for (auto& stage : m.stages) {
+            const core::OnDevice on(stage->session.device());
+            stage->canary.check(8, (cudaStream_t)stage->binding.stream);
+            if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess ||
+                !stage->canary.validate("judge", error)) { m.poisoned = true; return false; }
+        }
+        return m.idle(error);
+    };
     auto read = [&](int64_t begin, int64_t end) {
-        return begin == end || m.stages.front()->binding.prompt->run(tokens + begin, end - begin, begin, error);
+        while (begin < end) {
+            if (cancelled && cancelled()) { error = "cancelled"; return false; }
+            const int64_t next = quantum ? begin + std::min(quantum, end - begin) : end;
+            const auto span_begin = profile ? Clock::now() : Clock::time_point{};
+            if (overlap) {
+                size_t released = 0;
+                if (!overlap(0, error)) { m.poisoned = true; return false; }
+                auto release_stage = [&](prefill::Prefill* owner, std::string& why) {
+                    if (owner) {
+                        if (released >= m.stages.size() || m.stages[released]->binding.prompt != owner) {
+                            why = "judge: out-of-order stage release"; return false;
+                        }
+                        auto& stage = *m.stages[released];
+                        const core::OnDevice on(stage.session.device());
+                        stage.canary.check(8, (cudaStream_t)stage.binding.stream);
+                        if (cudaStreamSynchronize((cudaStream_t)stage.binding.stream) != cudaSuccess ||
+                            !stage.canary.validate("judge-stage", why) || !m.restore_stage(stage, why)) return false;
+                        ++released;
+                    }
+                    return overlap(released, why);
+                };
+                const std::function<bool(prefill::Prefill*, std::string&)> step =
+                    [&release_stage](prefill::Prefill* owner, std::string& why) { return release_stage(owner, why); };
+                if (!m.stages.front()->binding.prompt->run_staged(tokens + begin, next - begin, begin, error, step) ||
+                    released != m.stages.size() || !m.idle(error)) {
+                    m.poisoned = true; return false;
+                }
+                restore.restored = true;
+                ++yields;
+            } else if (!m.stages.front()->binding.prompt->run(tokens + begin, next - begin, begin, error) ||
+                       !drain_canaries()) return false;
+            ++spans;
+            if (profile) {
+                const auto span_end = Clock::now();
+                const auto elapsed = micros(span_end - span_begin);
+                span_us += elapsed;
+                std::fprintf(stderr, "JUDGE_SPAN request=%llu span=%lld pos_begin=%lld pos_end=%lld "
+                                     "start_ns=%lld end_ns=%lld wall_us=%lld overlap=%d\n",
+                             (unsigned long long)request, (long long)spans, (long long)begin, (long long)next,
+                             (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(span_begin.time_since_epoch()).count(),
+                             (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(span_end.time_since_epoch()).count(),
+                             (long long)elapsed, overlap ? 1 : 0);
+            }
+            begin = next;
+            // Final-span cancellation must invalidate the row/cache too. Execution
+            // failures above take precedence over a concurrent SCANCEL.
+            if (cancelled && cancelled()) { error = "cancelled"; return false; }
+            if (peer) {
+                auto handoff_begin = profile ? Clock::now() : Clock::time_point{};
+                restore.restored = true;
+                if (!m.restore(error)) return false;
+                if (profile) handoff_us += micros(Clock::now() - handoff_begin);
+                if (cancelled && cancelled()) { error = "cancelled"; return false; }
+                const auto peer_begin = profile ? Clock::now() : Clock::time_point{};
+                if (!peer(error)) { m.poisoned = true; return false; }
+                ++yields;
+                if (profile) peer_us += micros(Clock::now() - peer_begin);
+                if (cancelled && cancelled()) { error = "cancelled"; return false; }
+            }
+            if (begin < count && (peer || overlap)) {
+                const auto handoff_begin = profile ? Clock::now() : Clock::time_point{};
+                if (!acquire(false, begin)) { m.poisoned = true; return false; }
+                m.stages.back()->binding.prompt->on_chunk = head_row;
+                if (profile) handoff_us += micros(Clock::now() - handoff_begin);
+            }
+        }
+        return true;
     };
     auto cancelled_read = [&]() {
         m.row_ready = false; m.prefix_tokens = 0; m.last_tokens.clear();
@@ -355,9 +469,6 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
     if (!read(position, count)) return cancelled_read();
     for (auto& stage : m.stages) {
         const core::OnDevice on(stage->session.device());
-        stage->canary.check(8, (cudaStream_t)stage->binding.stream);
-        if (cudaStreamSynchronize((cudaStream_t)stage->binding.stream) != cudaSuccess ||
-            !stage->canary.validate("judge", error)) { m.poisoned = true; return false; }
         if (std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE")) {
             std::fprintf(stderr, "JUDGE_FIRST_USE_WORKSPACE device=%d gemm=%p bf16_conversion_bytes=%llu\n",
                          stage->session.device(), stage->binding.prompt->gemm_owner(),
@@ -373,6 +484,13 @@ bool SerialJudgeLane::run(uint64_t request, const int64_t* tokens, int64_t count
                  (unsigned long long)request, (long long)count, m.stages.size());
     std::fprintf(stderr, "JUDGE_SCORE request=%llu tokens=%lld reused=%lld path=bulk_prefill generated_tokens=0\n",
                  (unsigned long long)request, (long long)count, (long long)reused);
+    if (profile)
+        std::fprintf(stderr, "JUDGE_TIMING request=%llu tokens=%lld reused=%lld quantum=%lld spans=%lld yields=%lld "
+                             "init_us=%lld span_us=%lld head_in_span_us=%lld peer_us=%lld handoff_us=%lld total_us=%lld\n",
+                     (unsigned long long)request, (long long)count, (long long)reused, (long long)quantum,
+                     (long long)spans, (long long)yields, (long long)init_us, (long long)span_us,
+                     (long long)m.head_us, (long long)peer_us, (long long)handoff_us,
+                     (long long)micros(Clock::now() - started));
     return true;
 }
 } // namespace strata::program

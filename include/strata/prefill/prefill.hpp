@@ -257,6 +257,13 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// One bounded private-state span. A non-null callback argument certifies that
+    /// stage's complete local execution; only that callback may restore its original
+    /// generation binding while descendants retain their handoffs. Null calls pump
+    /// already-released peers. The callback must drain peers on the final release.
+    /// All descendants are joined on every return, including callback failures.
+    bool run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                    const std::function<bool(Prefill*, std::string&)>& step);
 
     const PrefillStats& stats() const { return stats_; }
 
@@ -358,6 +365,7 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    bool local_idle(std::string& err) const;
     std::atomic<bool> public_running_{false};
 
     int64_t stage_lb_ = 0, stage_le_ = -1;

@@ -11,6 +11,7 @@
 #include <string>
 
 namespace strata::prefill {
+struct NativeProjectionProfile;
 
 class Gemm {
 public:
@@ -64,7 +65,17 @@ public:
         return (uint64_t)(tc_w_elems_ + tc_x_elems_) * sizeof(uint16_t);
     }
 
+    /// Opt-in native dequant/GEMM event envelopes; fixed storage, no added joins.
+    static uint64_t native_profile_host_bytes();
+    void native_profile_context(uint64_t request, int64_t position);
+    void native_profile_label(const char* name) { if (profile_) profile_label_ = name; }
+    bool collect_native_profile(std::string& error);
+    void flush_native_profile(bool complete);
+
 private:
+    bool init_native_profile(std::string& error);
+    NativeProjectionProfile* profile_ = nullptr;
+    const char* profile_label_ = nullptr;
     void* handle_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;

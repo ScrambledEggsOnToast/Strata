@@ -812,6 +812,8 @@ struct Prefill::Impl {
     std::atomic<bool> running{false};
     bool poisoned = false;
     std::thread::id callback_thread;
+    std::thread::id release_thread;
+    uint64_t generation_request = 0;
     bool draft_active = false;
     std::vector<void*> owned;
     // chunk buffers
@@ -1472,9 +1474,9 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 
-bool Prefill::context_idle(std::string& err) const {
+bool Prefill::local_idle(std::string& err) const {
     const Impl& m = *impl_;
-    if (public_running_.load() || m.running.load() || m.poisoned || next_run_.valid()) {
+    if (m.running.load() || m.poisoned) {
         err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
     }
     if (m.device >= 0) {
@@ -1486,7 +1488,14 @@ bool Prefill::context_idle(std::string& err) const {
             }
         }
     }
-    return !next_ || next_->context_idle(err);
+    return true;
+}
+
+bool Prefill::context_idle(std::string& err) const {
+    if (public_running_.load() || next_run_.valid()) {
+        err = "prefill: owner rebind while pipeline is in flight"; return false;
+    }
+    return local_idle(err) && (!next_ || next_->context_idle(err));
 }
 
 bool Prefill::bind_request(uint64_t request, std::string& err) {
@@ -1506,7 +1515,12 @@ uint64_t Prefill::bound_request() const { return impl_->bound_request; }
 bool Prefill::validate_rebind(const core::SessionState& ss, void* stream, uint64_t request,
                              std::string& err) const {
     const Impl& m = *impl_;
-    if (!context_idle(err)) return false;
+    if (m.release_thread == std::this_thread::get_id()) {
+        if (&ss != m.original_ss || request != m.generation_request || !local_idle(err)) {
+            if (err.empty()) err = "prefill: stage release permits only the saved generation binding";
+            return false;
+        }
+    } else if (!context_idle(err)) return false;
     if (!request && &ss != m.original_ss) {
         err = "prefill: non-generation rebind requires a nonzero request canary"; return false;
     }
@@ -1576,6 +1590,7 @@ bool Prefill::validate_rebind(const core::SessionState& ss, void* stream, uint64
 bool Prefill::rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err) {
     if (!validate_rebind(ss, stream, request, err)) return false;
     Impl& m = *impl_;
+    if (m.ss == m.original_ss && &ss != m.original_ss) m.generation_request = m.bound_request;
     if (!m.canary.bind(8, request, err)) return false;
     m.ss = &ss;
     m.bound_request = request;
@@ -2493,7 +2508,9 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    gm.native_profile_label(name.c_str());
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    gm.native_profile_label(nullptr);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2927,6 +2944,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        m.gemm.native_profile_context(m.bound_request, p0);
         pt.begin_chunk(m.device, LB, LE, p0, T, m.borrowed, cs);
         if (pt.attribution) {
             pt.attribution->streamed = stats_.experts_streamed;
@@ -5077,6 +5095,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (!collect_device_groups()) return false;
+            if (!m.gemm.collect_native_profile(err)) return false;
             if (pt.attribution) pt.attribution->download_end = prefill_host_ns();
             pt.fold();   // the existing hand-off sync completed every mark; no new synchronization
             // Wait only for the DIRECT successor's previous chunk. That successor
@@ -5139,6 +5158,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (!collect_device_groups()) return false;
+            if (!m.gemm.collect_native_profile(err)) return false;
             const auto toc2 = Clock::now();
             if (pt.attribution) pt.attribution->finish_sync_end = prefill_host_ns();
             pt.fold();   // use the chunk's existing completion join, including timing-only observation
@@ -5190,6 +5210,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return false;
     }
     if (!m.canary.validate("prefill", err)) return false;
+    if (!m.gemm.collect_native_profile(err)) return false;
     if (!collect_device_groups()) return false;
     if (m.native_expert_ptrs)
         std::fprintf(stderr, "strata: resident device grouping: %lld layers, %llu selected expert groups\n",
@@ -5297,6 +5318,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+    for (Prefill* owner = this; owner; owner = owner->next_)
+        owner->impl_->gemm.flush_native_profile(body_ok && drain_ok);
     if (prefill_attribution_requested())
         std::fprintf(stderr, "strata prefill attribution: {\"kind\":\"run\",\"pos\":%lld,\"tokens\":%lld,"
                      "\"begin_ns\":%lld,\"end_ns\":%lld,\"complete\":%s}\n",
@@ -5309,6 +5332,82 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return false;
     }
     return true;
+}
+
+bool Prefill::run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                        const std::function<bool(Prefill*, std::string&)>& step) {
+    if (!step || n < 1 || !context_idle(err)) {
+        if (err.empty()) err = "prefill: staged run requires a bounded private span";
+        return false;
+    }
+    for (Prefill* owner = this; owner; owner = owner->next_) {
+        const auto& state = *owner->impl_;
+        if (n > state.T || state.ss == state.original_ss || state.borrowed ||
+            owner->helper_ || state.help_pp || !state.pps.empty()) {
+            err = "prefill: staged run refuses shared/helper/borrowed or oversized execution"; return false;
+        }
+        for (Prefill* previous = this; previous != owner; previous = previous->next_)
+            if (previous->impl_->device == state.device) {
+                err = "prefill: staged release requires distinct devices"; return false;
+            }
+    }
+    if (public_running_.exchange(true)) { err = "prefill: public run already in flight"; return false; }
+    struct PublicLease {
+        std::atomic<bool>& running;
+        ~PublicLease() { running.store(false); }
+    } lease{public_running_};
+    bool okay = false;
+    try {
+        okay = run_impl(tokens, n, pos0, err);
+        for (Prefill* owner = this; okay;) {
+            if (!owner->local_idle(err)) { okay = false; break; }
+            {
+                struct Release {
+                    Impl& state;
+                    explicit Release(Impl& value) : state(value) {
+                        state.release_thread = std::this_thread::get_id();
+                    }
+                    ~Release() { state.release_thread = {}; }
+                } release{*owner->impl_};
+                okay = step(owner, err);
+            }
+            if (!okay || !owner->next_) break;
+            if (!owner->next_run_.valid()) {
+                err = "prefill: staged successor did not retain its completion owner"; okay = false; break;
+            }
+            while (owner->next_run_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                if (!step(nullptr, err)) { okay = false; break; }
+                std::this_thread::yield();
+            }
+            if (!okay) break;
+            if (!owner->next_run_.get()) {
+                err = owner->next_err_; okay = false; break;
+            }
+            owner = owner->next_;
+        }
+    } catch (const std::exception& failure) {
+        err = failure.what(); okay = false;
+    } catch (...) {
+        err = "prefill: staged callback or execution exception"; okay = false;
+    }
+    // Retain the public lease and every handoff until all captured descendants end.
+    // A broken generation peer is not resumed; the caller's scoring path fails closed.
+    std::string drain_error;
+    try {
+        if (!drain_pipeline(drain_error)) {
+            if (okay) err = drain_error;
+            okay = false;
+        }
+    } catch (...) {
+        // A future exception cannot skip the recursive descendants it may have launched.
+        for (Prefill* owner = next_; owner; owner = owner->next_) {
+            try { if (owner->next_run_.valid()) owner->next_run_.get(); } catch (...) {}
+        }
+        err = "prefill: staged descendant failed during drain"; okay = false;
+    }
+    for (Prefill* owner = this; owner; owner = owner->next_)
+        owner->impl_->gemm.flush_native_profile(okay);
+    return okay;
 }
 
 // ====================== FORK (HET-017): the admission gate's hooks ======================
@@ -5382,6 +5481,7 @@ bool Prefill::host_allocation_from(const core::ModelGeometry& g, const PrefillFa
         add(dynamic, 1, sizeof(PfAttribution) + sizeof(cudaEvent_t));
         // Runtime event backing remains within the existing opaque prefill-library allowance.
     }
+    add(dynamic, 1, Gemm::native_profile_host_bytes());
     if (f.kv_mode == 1) add(dynamic, (uint64_t) f.n_pages, sizeof(int32_t));  // the streaming identity page table
     return ok;
 }

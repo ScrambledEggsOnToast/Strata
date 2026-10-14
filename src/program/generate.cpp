@@ -282,6 +282,37 @@ bool refill_blocking() {
 
 using Clock = std::chrono::steady_clock;
 
+struct JudgeCommitTrace {
+    struct Record {
+        int64_t ns = 0, position = 0, committed = 0;
+        uint64_t request = 0;
+        int slot = -1;
+    };
+    std::array<Record, 8192> records{};
+    size_t used = 0;
+    uint64_t dropped = 0;
+    void add(int slot, uint64_t request, int64_t position, int64_t committed) {
+        if (used == records.size()) { ++dropped; return; }
+        records[used++] = {
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(),
+            position, committed, request, slot};
+    }
+    void flush() {
+        if (!used && !dropped) return;
+        const auto begin = Clock::now();
+        for (size_t i = 0; i < used; ++i) {
+            const auto& r = records[i];
+            std::fprintf(stderr, "JUDGE_GEN ns=%lld request=%llu slot=%d position=%lld committed=%lld\n",
+                         (long long)r.ns, (unsigned long long)r.request, r.slot,
+                         (long long)r.position, (long long)r.committed);
+        }
+        std::fprintf(stderr, "JUDGE_GEN_END records=%zu dropped=%llu complete=%d write_us=%lld\n",
+                     used, (unsigned long long)dropped, dropped == 0 ? 1 : 0,
+                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count());
+        used = 0; dropped = 0;
+    }
+};
+
 struct HostAdmissionSnapshot {
     uint64_t available = 0, allocation = 0, resident = 0;
     uint64_t host_reserve = 0, guest_reserve = 0, worker_limit = 0;
@@ -574,6 +605,8 @@ struct Options {
     /// supervisor's measured worker limit and refuses without it.
     uint64_t guest_opaque_allowance_bytes = 0;      // --guest-opaque-allowance-bytes
     int64_t judge_context = 0;                      // --judge-context: one independent serial state, not a slot
+    int64_t judge_quantum = 0;                     // optional complete-prefill span before a drained peer round
+    bool judge_overlap = false;                   // distinct-device stage leases, not simultaneous same-device owners
     uint64_t judge_library_allowance_bytes = 0;     // incremental first-use/driver allowance; unknown if absent
     uint64_t judge_runtime_allowance_bytes = 0;     // incremental host allocator/driver/test instrumentation
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
@@ -872,6 +905,8 @@ void usage() {
                  "  --judge-context N    opt-in serial short scoring state (1..4096); shares actual prompt/head owners\n"
                  "  --judge-library-allowance-bytes N  additional per-device first-use/driver bound (required)\n"
                  "  --judge-runtime-allowance-bytes N  additional host opaque-storage bound (required)\n"
+                 "  --judge-quantum N    yield between scoring spans of N tokens (1..4096); 0 keeps serial scoring\n"
+                 "  --judge-overlap      overlap released generation stages with scoring tails; needs quantum and batch MTP pipeline\n"
                  "  --score-reference PATH  create a fresh serial final-position JSON readout, then exit; needs\n"
                  "                       --serve, --tokens[-file], --score-select, no MTP/batch/prefix cache\n"
                  "  --score-select LIST  every requested token ID, in output order (no top-k truncation)\n"
@@ -2294,6 +2329,12 @@ int main(int argc, char** argv) {
             if (cells < 1 || cells > 4096) { std::fprintf(stderr, "--judge-context requires 1..4096 cells\n"); return 2; }
             o.judge_context = (int64_t)cells;
         }
+        else if (a == "--judge-quantum") {
+            const auto quantum = bytes_flag(next("--judge-quantum"), "--judge-quantum");
+            if (quantum > 4096) { std::fprintf(stderr, "--judge-quantum requires 0..4096 tokens\n"); return 2; }
+            o.judge_quantum = (int64_t)quantum;
+        }
+        else if (a == "--judge-overlap") o.judge_overlap = true;
         else if (a == "--judge-library-allowance-bytes")
             o.judge_library_allowance_bytes = bytes_flag(next("--judge-library-allowance-bytes"), "--judge-library-allowance-bytes");
         else if (a == "--judge-runtime-allowance-bytes")
@@ -2681,6 +2722,20 @@ int main(int argc, char** argv) {
         o.pipeline_windows > 0 || o.prefill_helpers || o.peer_device >= 0 || o.vision)) {
         std::fprintf(stderr, "strata judge: needs serial --serve, fixed --prefill, --no-prefill-borrow, "
                              "resident nonelastic KV, no adaptive/peer/helper/vision paths; generation geometry is never reduced\n");
+        return 2;
+    }
+    const char* judge_no_peer = std::getenv("STRATA_JUDGE_NO_PEER");
+    if (judge_no_peer && std::strcmp(judge_no_peer, "0") != 0 && std::strcmp(judge_no_peer, "1") != 0) {
+        std::fprintf(stderr, "STRATA_JUDGE_NO_PEER requires 0 or 1\n"); return 2;
+    }
+    if (o.judge_quantum > o.judge_context || (judge_no_peer && !o.judge_quantum)) {
+        std::fprintf(stderr, "strata judge: quantum requires --judge-context and must fit it; "
+                             "STRATA_JUDGE_NO_PEER requires a nonzero quantum\n"); return 2;
+    }
+    const bool judge_cooperate = !judge_no_peer || std::strcmp(judge_no_peer, "0") == 0;
+    if (o.judge_overlap && (!o.judge_quantum || o.judge_quantum > o.prefill_chunk ||
+                            !judge_cooperate || o.batch <= 0 || o.batch_groups <= 1 || !o.batch_mtp_pipeline)) {
+        std::fprintf(stderr, "strata judge: overlap needs a quantum within prefill, enabled peers and batch MTP groups\n");
         return 2;
     }
     if (!o.judge_context && (o.judge_library_allowance_bytes || o.judge_runtime_allowance_bytes ||
@@ -4757,6 +4812,10 @@ int main(int argc, char** argv) {
             ram("judge_request_input_host", (uint64_t)o.judge_context * sizeof(int64_t),
                 "one bounded caller-owned prompt vector for the serial lane");
         }
+        if (const char* timing = std::getenv("STRATA_JUDGE_TIMING");
+            requested_slots && timing && std::strcmp(timing, "1") == 0)
+            ram("judge_commit_trace", sizeof(JudgeCommitTrace),
+                "fixed 8192-record host buffer; overflow marks the diagnostic incomplete, never wraps");
         if (o.spec > 0 || !o.mtp.empty() || requested_slots)
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
@@ -12102,6 +12161,16 @@ int main(int argc, char** argv) {
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        const char* judge_timing_env = std::getenv("STRATA_JUDGE_TIMING");
+        const bool judge_timing = judge_timing_env && std::strcmp(judge_timing_env, "1") == 0;
+        const auto judge_commits = judge_timing && o.batch > 0 ? std::make_unique<JudgeCommitTrace>() : nullptr;
+        auto emit_batch_token = [&](int slot, int32_t token) {
+            if (judge_commits) {
+                const auto& state = bs[(size_t)slot];
+                judge_commits->add(slot, state.request, state.p, state.produced);
+            }
+            std::printf("BT %d %d\n", slot, (int)token);
+        };
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
         std::vector<double> bt_stage_wait0, bt_stage_pool0;
@@ -12306,7 +12375,7 @@ int main(int argc, char** argv) {
                     if (!resident.committed(b, y, last_residual, err)) {
                         std::printf("ERR %s\n", err.c_str()); return false;
                     }
-                    std::printf("BT %d %d\n", b, (int) y);
+                    emit_batch_token(b, y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -12387,12 +12456,16 @@ int main(int argc, char** argv) {
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
+                if (judge_commits) judge_commits->flush();
             }
             return true;
         };
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1 && !synchronous_batch_mtp;
+        if (o.judge_overlap && (!piped || !batch_mtp_pipeline || split_same)) {
+            std::fprintf(stderr, "strata judge: overlap requires the distinct-device batch-MTP pipeline\n"); return 2;
+        }
         if (synchronous_batch_mtp)
             std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
                                  "one eight-row quantum retained through target acceptance and prefix commit; "
@@ -12463,7 +12536,7 @@ int main(int argc, char** argv) {
                     if (!resident.committed(G.rows[t], y, vk.final_R(t), err, false)) {
                         std::printf("ERR %s\n", err.c_str()); return false;
                     }
-                    std::printf("BT %d %d\n", G.rows[t], (int) y);
+                    emit_batch_token(G.rows[t], y);
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -12534,6 +12607,7 @@ int main(int argc, char** argv) {
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_windows = bt_rows = 0;
+                if (judge_commits) judge_commits->flush();
                 strata::core::progress().busy.store(false);
             }
             return true;
@@ -12543,10 +12617,10 @@ int main(int argc, char** argv) {
         auto group_verifier = [&](int stage, int group) -> strata::core::Verifier& {
             return group == 0 ? stage_verifier(stage) : stage_peer(stage);
         };
-        auto pump_mtp = [&](bool may_start) -> bool {
+        auto pump_mtp = [&](bool may_start, int released_stages = INT_MAX, bool may_retire = true) -> bool {
             ++pipe_tick;
             if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
-            for (int k = 0; k < n_pipe; ++k) {
+            for (int k = 0; k < std::min(n_pipe, released_stages); ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
                 const int r = group_verifier(k, gi).batch_poll(win_pool_fn,
@@ -12565,7 +12639,7 @@ int main(int argc, char** argv) {
                 if (gi >= 0) host_experts_running = host_experts_running ||
                     group_verifier(k, gi).batch_uses_host_experts();
             }
-            if (!host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
+            if (may_retire && !host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
                 PGroup& G = pg[(size_t) gi];
                 if (!G.inflight || G.stage != n_pipe) continue;
                 strata::core::Verifier& head = group_verifier(n_pipe - 1, gi);
@@ -12608,7 +12682,7 @@ int main(int argc, char** argv) {
                         if (!resident.committed(b, y, residual, err, batch_mtp_trace)) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
-                        std::printf("BT %d %d\n", b, (int) y);
+                        emit_batch_token(b, y);
                         ++bt_tokens;
                         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         const char* finish = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -12631,6 +12705,7 @@ int main(int argc, char** argv) {
                 G.inflight = false;
             }
             for (int k = n_pipe - 1; k >= 0; --k) {
+                if (k >= released_stages) continue;
                 if (stage_group[(size_t) k] >= 0) continue;
                 int pick = -1;
                 if (k > 0) {
@@ -12642,6 +12717,14 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
+                        if (!may_retire) {
+                            bool stopped = false;
+                            for (int t = 0; t < GS; ++t) {
+                                const auto& slot = bs[(size_t)(gi * GS + t)];
+                                stopped = stopped || (slot.active && slot.stop);
+                            }
+                            if (stopped) continue; // retain the group's bounded-round opportunity until retirement is safe
+                        }
                         if (!pg[(size_t) gi].inflight && group_active(gi) &&
                             (!bounded_round || !pg[(size_t) gi].round_started)) pick = gi;
                     }
@@ -12695,7 +12778,7 @@ int main(int argc, char** argv) {
                     G.inflight = true;
                     G.stage = 0;
                     drive.d.failed = false;
-                    apply_pending(false);
+                    if (may_retire) apply_pending(false);
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::Verifier& owner = group_verifier(k, pick);
@@ -12729,6 +12812,7 @@ int main(int argc, char** argv) {
                                          (long long) v.windows, v.ms_commit, v.ms_commit / (double) v.windows);
                         }
                 bt_windows = bt_rows = bt_tokens = 0;
+                if (judge_commits) judge_commits->flush();
                 strata::core::progress().busy.store(false);
             }
             return true;
@@ -12762,6 +12846,139 @@ int main(int argc, char** argv) {
                 time_budget.decoded(std::chrono::duration<double, std::milli>(last_decode - begin).count(), charge);
             return true;
         };
+        auto resident_control = [&](const std::string& command) {
+            if (command.rfind("BSTOP ", 0) == 0) {
+                resident.cancel(std::atoi(command.c_str() + 6));
+                return true;
+            }
+            if (command.rfind("BPRIORITY ", 0) == 0) {
+                char* end = nullptr;
+                const long b = std::strtol(command.c_str() + 10, &end, 10);
+                const bool valid_slot = end != command.c_str() + 10 && b >= 0 && b < (long)bs.size();
+                if (!valid_slot || (std::strcmp(end, " foreground") != 0 && std::strcmp(end, " background") != 0)) {
+                    std::printf("ERR BPRIORITY: expected slot and foreground|background\n");
+                    std::fflush(stdout);
+                } else {
+                    resident.priority((int)b, std::strcmp(end, " foreground") == 0);
+                    if ((size_t)b == resident_cursor) resident_credit = 0;
+                }
+                return true;
+            }
+            return command.rfind("BYIELD", 0) == 0;
+        };
+        auto score_controls = [&]() {
+            // Do not lift slot-number controls past admissions: that would cancel
+            // the wrong incarnation. Only consume a contiguous control prefix.
+            for (;;) {
+                std::string control;
+                {
+                    std::lock_guard<std::mutex> lock(in_mu);
+                    if (in_lines.empty()) break;
+                    const auto& front = in_lines.front();
+                    if (front.rfind("BSTOP ", 0) != 0 && front.rfind("BPRIORITY ", 0) != 0 &&
+                        front.rfind("BYIELD", 0) != 0) break;
+                    control = std::move(in_lines.front());
+                    in_lines.pop_front();
+                }
+                resident_control(control);
+            }
+        };
+        auto score_peer_round = [&](std::string& why) {
+            score_controls();
+            if (batch_on() && !decode_round(false)) {
+                why = err.empty() ? "score peer decode failed" : err;
+                return false;
+            }
+            strata::core::progress().busy.store(true);
+            strata::core::progress_at("scoring prompt");
+            return true;
+        };
+        // One pointer-sized capture; do not allocate a new callback per span.
+        const std::function<bool(std::string&)> judge_peer =
+            [&score_peer_round](std::string& why) { return score_peer_round(why); };
+        const std::function<bool(std::string&)> no_judge_peer;
+        bool score_overlap_seen = false;
+        int score_overlap_device = -1, generation_overlap_device = -1;
+        int64_t overlap_query_begin = 0, overlap_query_end = 0;
+        auto score_stage_progress = [&](size_t released, std::string& why) {
+            if (released > (size_t)n_pipe) { why = "score released-stage range invalid"; return false; }
+            if (released == 0) {
+                if (pipe_inflight()) { why = "score overlap entered with live generation owners"; return false; }
+                score_controls();
+                bounded_round = true;
+                for (auto& group : pg) group.round_started = false;
+                score_overlap_seen = false;
+                score_overlap_device = generation_overlap_device = -1;
+                overlap_query_begin = overlap_query_end = 0;
+                return true;
+            }
+            const bool all_released = released == (size_t)n_pipe;
+            score_controls();
+            do {
+                if (!pump_mtp(true, (int)released, all_released)) {
+                    why = err.empty() ? "score overlapped generation failed" : err;
+                    return false;
+                }
+                // A bounded diagnostic witness: both streams outstanding during
+                // the same host query bracket, not synchronized GPU-clock arithmetic.
+                if (judge_timing && !all_released && !score_overlap_seen) {
+                    for (int k = 0; k < (int)released && !score_overlap_seen; ++k) {
+                        const int gi = stage_group[(size_t)k];
+                        if (gi < 0) continue;
+                        auto& generation = group_verifier(k, gi);
+                        for (int s = (int)released; s < n_pipe && !score_overlap_seen; ++s) {
+                            auto& scoring = stages[(size_t)s - 1]->sp;
+                            const auto begin = Clock::now();
+                            cudaError_t first, middle, last;
+                            {
+                                const strata::core::OnDevice on(scoring.device());
+                                first = cudaStreamQuery((cudaStream_t)scoring.stream());
+                            }
+                            {
+                                const strata::core::OnDevice on(generation.device());
+                                middle = cudaStreamQuery(generation.stream());
+                            }
+                            {
+                                const strata::core::OnDevice on(scoring.device());
+                                last = cudaStreamQuery((cudaStream_t)scoring.stream());
+                            }
+                            for (cudaError_t status : {first, middle, last})
+                                if (status != cudaSuccess && status != cudaErrorNotReady) {
+                                    why = "score overlap stream observation failed"; return false;
+                                }
+                            if (first == cudaErrorNotReady && middle == cudaErrorNotReady && last == cudaErrorNotReady) {
+                                score_overlap_seen = true;
+                                score_overlap_device = scoring.device();
+                                generation_overlap_device = generation.device();
+                                overlap_query_begin = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    begin.time_since_epoch()).count();
+                                overlap_query_end = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    Clock::now().time_since_epoch()).count();
+                            }
+                        }
+                    }
+                }
+                if (!all_released) return true;
+                bool pending = pipe_inflight();
+                for (size_t group = 0; group < pg.size(); ++group)
+                    pending = pending || (group_active((int)group) && !pg[group].round_started);
+                if (!pending) break;
+            } while (true);
+            bounded_round = false;
+            last_decode = Clock::now();
+            strata::core::progress().busy.store(true);
+            strata::core::progress_at("scoring prompt");
+            if (judge_timing)
+                std::fprintf(stderr, "JUDGE_OVERLAP request=%llu observed=%d scoring_device=%d generation_device=%d "
+                                     "query_begin_ns=%lld query_end_ns=%lld scope=outstanding_streams\n",
+                             (unsigned long long)resident.working().request, score_overlap_seen ? 1 : 0,
+                             score_overlap_device, generation_overlap_device,
+                             (long long)overlap_query_begin, (long long)overlap_query_end);
+            return true;
+        };
+        const std::function<bool(size_t, std::string&)> judge_overlap =
+            [&score_stage_progress](size_t released, std::string& why) { return score_stage_progress(released, why); };
+        const std::function<bool(size_t, std::string&)> no_judge_overlap;
         uint64_t working_capacity = 0, resident_capacity = 0;
         for (size_t k = 0; k <= stages.size(); ++k) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
@@ -12869,25 +13086,7 @@ int main(int argc, char** argv) {
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
-            if (line.rfind("BPRIORITY ", 0) == 0) {
-                char* end = nullptr;
-                const long b = std::strtol(line.c_str() + 10, &end, 10);
-                const bool valid_slot = end != line.c_str() + 10 && b >= 0 && b < (long) bs.size();
-                if (!valid_slot || (std::strcmp(end, " foreground") != 0 && std::strcmp(end, " background") != 0)) {
-                    std::printf("ERR BPRIORITY: expected slot and foreground|background\n");
-                    std::fflush(stdout);
-                } else {
-                    resident.priority((int) b, std::strcmp(end, " foreground") == 0);
-                    if ((size_t) b == resident_cursor) resident_credit = 0;
-                }
-                continue;
-            }
-            if (line.rfind("BSTOP ", 0) == 0) {
-                const int b = std::atoi(line.c_str() + 6);
-                resident.cancel(b);
-                continue;
-            }
-            if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (resident_control(line)) continue;
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
@@ -12967,8 +13166,16 @@ int main(int argc, char** argv) {
                         std::printf("SADMIT %s v1 prompt_tokens=%zu selected_tokens=%zu\n",
                                     request.id.c_str(), request.prompt.size(), request.selected.size());
                         std::fflush(stdout);
+                        if (judge_timing)
+                            std::fprintf(stderr, "JUDGE_DISPATCH wire=%s request=%llu ns=%lld\n", request.id.c_str(),
+                                         (unsigned long long)resident.working().request,
+                                         (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             Clock::now().time_since_epoch()).count());
                         if (!judge_lane->run(resident.working().request, request.prompt.data(),
-                                             (int64_t)request.prompt.size(), score_error, cancelled)) return false;
+                                             (int64_t)request.prompt.size(), score_error, cancelled, o.judge_quantum,
+                                             o.judge_quantum && judge_cooperate && !o.judge_overlap && batch_on()
+                                                 ? judge_peer : no_judge_peer,
+                                             o.judge_overlap && batch_on() ? judge_overlap : no_judge_overlap)) return false;
                         score_row = judge_lane->logits();
                         return cancelled() || score_row != nullptr;
                     }

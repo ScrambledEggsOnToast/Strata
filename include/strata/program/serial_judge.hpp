@@ -30,11 +30,12 @@ struct JudgeStage {
     void* stream = nullptr;
 };
 
-// One host submitter, at a drained scheduler boundary (no active generation
-// requests). Borrows the actual generation execution owners, not a second chain.
+// One host submitter, at a drained scheduler boundary (no in-flight generation
+// consumers). Borrows the actual generation execution owners, not a second chain.
 // Every state owner, checkpoint and readback is allocated before request admission.
 // No scoring owner enters the generation slot/MTP vectors. Failure poisons the
-// lane; generation can resume only after every binding/callback/RoPE table restores.
+// lane. Stage-local generation may run after its binding/callback/RoPE restoration;
+// global retirement, MTP and the next scoring span require complete release/drain.
 class SerialJudgeLane {
 public:
     SerialJudgeLane();
@@ -46,8 +47,13 @@ public:
               const core::NativeHead& head, core::MtpDrafter* draft,
               const plan::AdmissionDecision& admission, std::string& error);
     // A clean cancellation returns true with no logits, after every owner has drained.
+    // quantum bounds complete Prefill spans, not generation geometry. A peer callback
+    // runs only with all generation bindings restored and must return fully drained.
+    // Supplying a quantum without a peer provides the same-partition diagnostic control.
     bool run(uint64_t request, const int64_t* tokens, int64_t count, std::string& error,
-             const std::function<bool()>& cancelled = {});
+             const std::function<bool()>& cancelled = {}, int64_t quantum = 0,
+             const std::function<bool(std::string&)>& peer = {},
+             const std::function<bool(size_t, std::string&)>& overlap = {});
     const float* logits() const;
     int64_t vocab() const;
     bool ready() const;

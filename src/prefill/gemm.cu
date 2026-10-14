@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "native_projection_profile.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/moe_mmq.hpp"
@@ -374,7 +375,42 @@ bool prompt_f16() {
 #endif
 }
 
+namespace {
+bool native_profile_requested() {
+    const char* value = std::getenv("STRATA_NATIVE_PROJECTION_PROFILE");
+    return value && std::strcmp(value, "1") == 0;
+}
+}
+
+uint64_t Gemm::native_profile_host_bytes() {
+    return native_profile_requested() ? sizeof(NativeProjectionProfile) : 0;
+}
+
+bool Gemm::init_native_profile(std::string& error) {
+    if (!native_profile_requested()) return true;
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+    error = "native projection profile: CUDA native-f16 path only"; return false;
+#else
+    profile_ = new (std::nothrow) NativeProjectionProfile;
+    if (!profile_) { error = "native projection profile: bounded host allocation failed"; return false; }
+    return profile_->init(error);
+#endif
+}
+
+void Gemm::native_profile_context(uint64_t request, int64_t position) {
+    if (profile_) { profile_->request = request; profile_->position = position; }
+}
+
+bool Gemm::collect_native_profile(std::string& error) {
+    return !profile_ || profile_->collect(error);
+}
+
+void Gemm::flush_native_profile(bool complete) {
+    if (profile_) profile_->flush(complete);
+}
+
 Gemm::~Gemm() {
+    delete profile_;
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
@@ -410,7 +446,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
 #endif
-    return true;
+    return init_native_profile(err);
 }
 
 void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
@@ -456,7 +492,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
         }
     }
     scratch_elems_ = scratch_elems;
-    return true;
+    return init_native_profile(err);
 }
 
 #if !defined(__HIPCC__)
@@ -854,6 +890,27 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
+    auto project = [&](int64_t first, int64_t rows) {
+        NativeProjectionProfile::Pending* observation = nullptr;
+        if (profile_) {
+            profile_->label = profile_label_;
+            observation = profile_->begin(ggml_type, T, N, K, first, rows, ldx, ldy, beta, (cudaStream_t)stream_);
+        }
+        if (observation) observation->record.dequant_begin_ns = NativeProjectionProfile::now_ns();
+        strata::kernels::dequant_f16(ggml_type, W_blocks, first, rows, K, scratch_, stream_);
+        if (observation) {
+            observation->record.dequant_end_ns = NativeProjectionProfile::now_ns();
+            observation->valid = cudaEventRecord(observation->events[1], (cudaStream_t)stream_) == cudaSuccess &&
+                                 observation->valid;
+            observation->record.gemm_begin_ns = NativeProjectionProfile::now_ns();
+        }
+        f16(X, scratch_, Y + first, T, rows, K, ldy, beta);
+        if (observation) {
+            observation->record.gemm_end_ns = NativeProjectionProfile::now_ns();
+            observation->valid = cudaEventRecord(observation->events[2], (cudaStream_t)stream_) == cudaSuccess &&
+                                 observation->valid;
+        }
+    };
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
@@ -861,13 +918,11 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+            project(r0, n);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy, beta);
+    project(0, N);
 }
 
 }  // namespace strata::prefill
