@@ -850,6 +850,7 @@ struct Prefill::Impl {
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
+    bool reported_resident_group_gather = false;
     unsigned long long* native_ptrs = nullptr;
     int32_t* native_count = nullptr;
     uint8_t* native_resident = nullptr;
@@ -4621,11 +4622,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
+                        bool resident_only = !stream_all && m.host_res && m.cache;
                         if (!stream_all) {
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                resident_only = false;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
@@ -4673,13 +4676,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // wait and a record per expert put ~10 us of GPU bubble each on the compute stream under WDDM
                         // (226 ms of a 32K prompt on an NVFP4 pack).  The same bytes into the same group slots.  A ring
                         // entry the routing skipped inside an open group first gathers what the group holds so far
-                        // (`flush`), so no more than a group's entries are ever held back from the issuer.
+                        // (`flush`), so no more than a group's entries are ever held back from the issuer. An
+                        // entirely resident routed walk has no staging-slot lifetime to extend and uses the same gather.
                         // STRATA_PREFILL_GROUP_GATHER=0: one gather, one wait and one record per expert.
                         static const bool group_env = [] {
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = (mmq_plan().native_grouped || (group_env && stream_all)) &&
+                        const bool group_gather = (mmq_plan().native_grouped ||
+                                                   (group_env && (stream_all || resident_only))) &&
                                                   use_mmq && lay.native && MMQ_GROUP <= mmq::kGatherGroupMax;
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
@@ -4717,12 +4722,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     a.dispatch_max_entries = std::max<int64_t>(a.dispatch_max_entries, nr);
                                     a.dispatch_grid_groups = MMQ_GROUP;
                                 }
-                            } else if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db,
-                                                                 m.grp_gu, mmq_gub, m.grp_d, mmq_db, m.cs)) {
-                                for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
-                                    const uint8_t* b = gg.blob[i];
-                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
-                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                            } else {
+                                const bool grouped = mmq::gather_native_group(gg, f.up_off, mmq_gub / 2,
+                                    f.down_off, mmq_db, m.grp_gu, mmq_gub, m.grp_d, mmq_db, m.cs);
+                                if (!grouped) {
+                                    for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
+                                        const uint8_t* b = gg.blob[i];
+                                        mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                                           m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                    }
+                                } else if (resident_only && !m.reported_resident_group_gather) {
+                                    std::fprintf(stderr, "strata: resident MMQ group gather on CUDA%d "
+                                        "(%d experts, unchanged bytes and arithmetic)\n", m.device, gg.n - gg.first);
+                                    m.reported_resident_group_gather = true;
                                 }
                             }
                             if (gg_nslots > 0) {
