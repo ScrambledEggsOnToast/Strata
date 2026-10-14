@@ -1302,12 +1302,19 @@ print(r.choices[0].message.content)
 what the engine holds: the live session, a resident slot, or a checkpoint in RAM (up to `--prompt-cache N`, taken
 at assistant-turn boundaries and every `--prompt-cache-every` tokens). Prefix tokens, image identities and steering
 mode must still match. Supply a stable `"strata_conversation_id": "your-thread-id"` (a nonempty UTF-8 string of
-at most 256 bytes) on every turn. The server binds it to the authenticated principal, loaded model, tokenizer and
-template, then sends a fixed 32-byte `scope` to the native engine. Codex's explicit session/thread turn metadata
-also identifies a conversation; its `prompt_cache_key` alone does not, because forks can share that grouping key.
-The web chat supplies and persists its own ID, rotating it for New chat. Missing identity is request-private:
-identical text in another conversation never authorizes reuse. Scope metadata is process-local, not a durable
-session credential. Changed scopes discard the live checkpoint chain; resident and parked searches require an
+at most 256 bytes) on every turn; it is the strongest identity and the one to use when the client has real
+conversations. The server binds it to the authenticated principal, loaded model, tokenizer and template, then
+sends a fixed 32-byte `scope` to the native engine. Codex's explicit session/thread turn metadata also identifies
+a conversation; its `prompt_cache_key` alone does not, because forks can share that grouping key. The web chat
+supplies and persists its own ID, rotating it for New chat. A client that identifies nothing is named by its
+**opening** - the system/instruction text and the first user turn - so an ordinary OpenAI-compatible client reuses
+its own prefix instead of re-reading the whole prompt on every turn. Two conversations that open the same way
+share that name, which is what makes a long shared system prompt computable once rather than per conversation, and
+the name still carries the authenticated principal, so one client's conversations never share a namespace with
+another's. What a shared name can hand over is a **prefix**, never a later turn: the engine still requires the same
+tokens from the start of the prompt, so text after the first difference is never taken from the other conversation.
+A body with no opening at all (no system text, no user turn) stays request-private. Scope metadata is process-local,
+not a durable session credential. Changed scopes discard the live checkpoint chain; resident and parked searches require an
 exact scope match before token/image matching. Existing snapshot geometry, format and model/config checks remain.
 The oldest checkpoint remains a root **within that conversation**, not a shared system-prompt cache. Other leaves
 rotate by LRU. Options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no root

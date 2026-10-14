@@ -4427,8 +4427,58 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    @staticmethod
+    def conversation_opening(req: dict) -> str:
+        """The conversation's opening: its system/instruction material and its first user turn.
+
+        A conversation keeps this across its turns, so a client that sends no `strata_conversation_id`
+        - every plain OpenAI-compatible client - still names a stable conversation and can reuse its
+        own prefix. Two conversations that open the same way share the name, which is exactly when
+        sharing a prefix means anything: the reuse itself still requires the same tokens from the start
+        of the prompt, so what follows the shared opening is never taken from the other conversation.
+        """
+        def text_of(value) -> str:
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                return " ".join(text_of(item) for item in value)
+            if isinstance(value, dict):
+                if "text" in value:
+                    return text_of(value["text"])
+                if value.get("type") == "image":
+                    return "[image]"
+                return " ".join(text_of(value[key]) for key in ("content", "input", "output") if key in value)
+            return ""
+
+        parts = []
+        for key in ("instructions", "system"):        # /v1/responses, /v1/messages carry it at the top
+            if req.get(key):
+                parts.append(text_of(req[key]))
+        messages = req.get("messages")
+        if messages is None:
+            messages = req.get("input")               # /v1/responses
+        for message in messages or []:
+            if not isinstance(message, dict):
+                break
+            role = message.get("role")
+            if role in ("system", "developer"):
+                parts.append(text_of(message.get("content")))
+                continue
+            if role == "user":
+                parts.append(text_of(message.get("content")))
+            break
+        # The opening only has to identify the conversation, so it is bounded: a client with a very
+        # long system prompt must not make every request hash megabytes.
+        return "\n".join(part for part in parts if part)[:65536]
+
     def cache_scope(self, req: dict, principal: str) -> str:
-        """A fixed namespace, not a growing conversation registry or token-similarity key."""
+        """A fixed namespace, not a growing conversation registry or token-similarity key.
+
+        The conversation is named by an explicit `strata_conversation_id`, by a Codex turn, or - for
+        clients that send neither - by the request's own opening.  `principal` stays in the identity,
+        so one authenticated client's conversations never share a namespace with another's; what a
+        same-key conversation can pick up is a prefix it also sends, never another question's text.
+        """
         conversation = req.get("strata_conversation_id")
         if conversation is not None:
             if not isinstance(conversation, str) or not 1 <= len(conversation.encode("utf-8")) <= 256:
@@ -4436,7 +4486,14 @@ class Service:
             conversation = ("explicit", conversation)
         else:
             _, codex = responses_api._codex_turn(req)
-            conversation = ("codex", *codex) if codex else ("request", uuid.uuid4().hex)
+            if codex:
+                conversation = ("codex", *codex)
+            else:
+                opening = self.conversation_opening(req)
+                # Nothing to name it by: keep this request private rather than hand every such
+                # request one shared namespace.
+                conversation = ("opening", hashlib.sha256(opening.encode("utf-8")).hexdigest()) if opening \
+                    else ("request", uuid.uuid4().hex)
         # Model/config/geometry and resolved placement cannot change inside a
         # loaded engine. Replacement tokenizer/template objects or template source
         # invalidate this namespace before native token/image/steering validation.

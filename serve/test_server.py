@@ -1524,6 +1524,90 @@ class ConversationScopes(unittest.TestCase):
         self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
         self.assertNotEqual(self.svc.cache_scope({}, "principal-a"), self.svc.cache_scope({}, "principal-a"))
 
+    def test_a_client_without_an_identity_is_named_by_its_opening(self):
+        """A plain OpenAI-compatible client (no strata_conversation_id) is named by what it opens with.
+
+        Without this every request is its own namespace, so such a client re-prefills its whole prompt -
+        system prompt included - on every turn of one conversation.
+        """
+        def turn(user, history=(), system="You are a careful assistant."):
+            return {"messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": user}, *history]}
+        first = self.svc.cache_scope(turn("first question"), "principal-a")
+        answered = [{"role": "assistant", "content": "an answer"}, {"role": "user", "content": "and a follow-up"}]
+        self.assertEqual(first, self.svc.cache_scope(turn("first question", answered), "principal-a"),
+                         "a later turn of the same conversation keeps its namespace")
+        self.assertNotEqual(first, self.svc.cache_scope(turn("another question"), "principal-a"),
+                            "a different opening is a different conversation")
+        self.assertNotEqual(first, self.svc.cache_scope(turn("first question"), "principal-b"),
+                            "the authenticated client is part of the namespace")
+        self.assertNotEqual(first, self.svc.cache_scope(turn("first question", system="Another system prompt."),
+                                                       "principal-a"),
+                            "the system prompt is part of the opening")
+
+    def test_every_dialect_names_the_conversation_by_its_opening(self):
+        """Anthropic's top-level system and Responses' instructions/in-input count as the opening too."""
+        cases = {
+            "chat": ({"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]},
+                     {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"},
+                                   {"role": "assistant", "content": "A"}, {"role": "user", "content": "again"}]},
+                     {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "other"}]}),
+            "anthropic": ({"system": "S", "messages": [{"role": "user", "content": "U"}]},
+                          {"system": "S", "messages": [{"role": "user", "content": "U"},
+                                                       {"role": "assistant", "content": "A"},
+                                                       {"role": "user", "content": "again"}]},
+                          {"system": "S", "messages": [{"role": "user", "content": "other"}]}),
+            "responses": ({"instructions": "S", "input": [{"role": "user", "content": "U"}]},
+                          {"instructions": "S", "input": [{"role": "user", "content": "U"},
+                                                          {"role": "assistant", "content": "A"},
+                                                          {"role": "user", "content": "again"}]},
+                          {"instructions": "S", "input": [{"role": "user", "content": "other"}]}),
+            "content blocks": ({"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
+                                             {"role": "user", "content": [{"type": "text", "text": "U"}]}]},
+                               {"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
+                                             {"role": "user", "content": [{"type": "text", "text": "U"}]},
+                                             {"role": "assistant", "content": "A"},
+                                             {"role": "user", "content": "again"}]},
+                               {"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
+                                             {"role": "user", "content": [{"type": "text", "text": "other"}]}]}),
+        }
+        for dialect, (opening, later, other) in cases.items():
+            with self.subTest(dialect=dialect):
+                self.assertEqual(self.svc.cache_scope(opening, ""), self.svc.cache_scope(later, ""))
+                self.assertNotEqual(self.svc.cache_scope(opening, ""), self.svc.cache_scope(other, ""))
+
+    def test_a_request_with_nothing_to_name_it_by_stays_private(self):
+        """No opening means no conversation: such requests keep their own namespace rather than share one."""
+        for body in ({}, {"messages": []}, {"messages": [{"role": "tool", "content": "t"}]}):
+            with self.subTest(body=body):
+                self.assertNotEqual(self.svc.cache_scope(body, "principal-a"),
+                                    self.svc.cache_scope(body, "principal-a"))
+
+    def test_http_derives_the_namespace_without_a_client_identity(self):
+        """The derived namespace is what reaches the engine, for a client that sends no identity at all."""
+        self.svc.api_key = "principal-a"
+        httpd = serve(self.svc, port=0)
+        try:
+            def request(user, history=()):
+                body = {"messages": [{"role": "system", "content": "You are a careful assistant."},
+                                     {"role": "user", "content": user}, *history], "max_tokens": 8}
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                             data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json",
+                                                      "Authorization": "Bearer principal-a"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    json.load(response)
+                return self.engine.last_cache_scope
+            first = request("first question")
+            self.assertRegex(first, r"[0-9a-f]{64}")
+            answered = [{"role": "assistant", "content": "an answer"}]
+            self.assertEqual(first, request("first question", answered))
+            self.assertNotEqual(first, request("another question"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
     def test_codex_forks_do_not_share_a_grouping_key(self):
         def req(thread):
             return {"prompt_cache_key": "parent-group",
