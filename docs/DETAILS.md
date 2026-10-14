@@ -1302,18 +1302,19 @@ print(r.choices[0].message.content)
 what the engine holds: the live session, a resident slot, or a checkpoint in RAM (up to `--prompt-cache N`, taken
 at assistant-turn boundaries and every `--prompt-cache-every` tokens). Prefix tokens, image identities and steering
 mode must still match. Supply a stable `"strata_conversation_id": "your-thread-id"` (a nonempty UTF-8 string of
-at most 256 bytes) on every turn; it is the strongest identity and the one to use when the client has real
-conversations. The server binds it to the authenticated principal, loaded model, tokenizer and template, then
-sends a fixed 32-byte `scope` to the native engine. Codex's explicit session/thread turn metadata also identifies
-a conversation; its `prompt_cache_key` alone does not, because forks can share that grouping key. The web chat
-supplies and persists its own ID, rotating it for New chat. A client that identifies nothing is named by its
-**opening** - the system/instruction text and the first user turn - so an ordinary OpenAI-compatible client reuses
-its own prefix instead of re-reading the whole prompt on every turn. Two conversations that open the same way
-share that name, which is what makes a long shared system prompt computable once rather than per conversation, and
-the name still carries the authenticated principal, so one client's conversations never share a namespace with
-another's. What a shared name can hand over is a **prefix**, never a later turn: the engine still requires the same
-tokens from the start of the prompt, so text after the first difference is never taken from the other conversation.
-A body with no opening at all (no system text, no user turn) stays request-private. Scope metadata is process-local,
+at most 256 bytes) on every turn when a client keeps separate conversations: it is that client's **declared
+group**. The server binds it to the **tenant**, the loaded model,
+the tokenizer and the template, then sends a fixed 32-byte `scope` to the native engine. Codex's explicit
+session/thread turn metadata also declares a group; its `prompt_cache_key` alone does not, because forks can share
+that grouping key. The web chat supplies and persists its own ID, rotating it for New chat.
+The tenant is the caller: the API key that request authenticated with, or — when it carries the tenant token
+(`tenant_token` in the config, `--tenant-token`, `$STRATA_TENANT_TOKEN` or a `tenant_token_file`) — the label a
+gateway attests in `X-Strata-Tenant`. That is how a gateway's clients stay separate from one another although they
+all reach the engine under its single credential; a caller without the token may not name a tenant, and a header it
+sends is ignored. A request that declares no group belongs to its tenant's single content space, where what it may
+reuse is still only a **prefix it also sends**: the engine requires the same tokens from the start of the prompt,
+so text after the first difference is never taken from another conversation, and one tenant never shares a
+namespace with another. Scope metadata is process-local,
 not a durable session credential. Changed scopes discard the live checkpoint chain; resident and parked searches require an
 exact scope match before token/image matching. Existing snapshot geometry, format and model/config checks remain.
 The oldest checkpoint remains a root **within that conversation**, not a shared system-prompt cache. Other leaves

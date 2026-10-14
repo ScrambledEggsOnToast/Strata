@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
-                          PP_DONE_TAIL, Service,
+                          PP_DONE_TAIL, Service, TENANT_HEADER,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
@@ -897,6 +897,58 @@ class ConfigApiKey(unittest.TestCase):
         self.assertNotIn("is empty", err)
 
 
+class ConfigTenantToken(unittest.TestCase):
+    """The tenant token: a literal in the config, or the lines of a protected file the config names."""
+
+    def run_main(self, cfg, directory):
+        """-> (return code, the tenant tokens the service got or None if main() stopped, stderr)."""
+        import serve.server as S
+        seen = {}
+
+        def fake_serve(svc, host=None, port=None):
+            seen["token"] = svc.tenant_token
+            raise _Reached
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ), mock.patch.object(S, "serve", fake_serve), \
+                mock.patch.object(sys, "stderr", new=err):
+            os.environ.pop("STRATA_TENANT_TOKEN", None)
+            p = Path(directory) / "cfg.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["server.py", "--engine", "mock", "--port", "0", "--config", str(p)]):
+                try:
+                    code = S.main()
+                except _Reached:
+                    code = 0
+        return code, seen.get("token"), err.getvalue()
+
+    def test_a_file_is_read_one_token_per_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            secret = Path(d) / "tenant-token"
+            secret.write_text("koko-token\n", encoding="utf-8")     # a file keeps its line end
+            code, token, err = self.run_main({"tenant_token_file": str(secret)}, d)
+            self.assertEqual((code, token), (0, ["koko-token"]))
+            self.assertNotIn("koko-token", err, "the token is never written out")
+            secret.write_text("one\ntwo\n", encoding="utf-8")
+            self.assertEqual(self.run_main({"tenant_token_file": str(secret)}, d)[1], ["one", "two"])
+
+    def test_a_path_relative_to_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "token").write_text("relative-token", encoding="utf-8")
+            self.assertEqual(self.run_main({"tenant_token_file": "token"}, d)[1], ["relative-token"])
+
+    def test_a_file_that_cannot_be_read_stops_before_serving(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, token, err = self.run_main({"tenant_token_file": "absent"}, d)
+            self.assertEqual((code, token), (2, None))
+            self.assertIn("tenant_token_file", err)
+
+    def test_a_literal_or_no_token_at_all(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.run_main({"tenant_token": "one,two"}, d)[1], ["one", "two"])
+            self.assertEqual(self.run_main({}, d)[1], [])
+
+
 class ApiKeyForms(unittest.TestCase):
     """#725: a key no client could send (spaces or a line end around it), and a key outside ASCII."""
 
@@ -1508,102 +1560,80 @@ class ConversationScopes(unittest.TestCase):
         self.engine = RecordingEngine(self.tok, "blue", max_context=CTX)
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
 
-    def test_same_conversation_and_changed_identity(self):
+    def test_a_tenant_is_a_key_and_the_model_identity_invalidates_it(self):
         req = {"strata_conversation_id": "A", "seed": 17}
-        first = self.svc.cache_scope(req, "principal-a")
-        self.assertEqual(first, self.svc.cache_scope({**req, "seed": 99}, "principal-a"))
-        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-b"))
-        self.assertNotEqual(first, self.svc.cache_scope({**req, "strata_conversation_id": "B"}, "principal-a"))
+        first = self.svc.cache_scope(req, "tenant-a")
+        self.assertEqual(first, self.svc.cache_scope({**req, "seed": 99}, "tenant-a"),
+                         "sampling is not part of the namespace")
+        self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-b"), "two keys are two tenants")
+        self.assertNotEqual(first, self.svc.cache_scope({**req, "strata_conversation_id": "B"}, "tenant-a"),
+                            "a declared group separates conversations inside one tenant")
         self.svc.template.source += "\n"
-        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
+        self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a"))
         self.svc.template.source = self.svc.template.source[:-1]
         self.svc.tok = ByteTokenizer()
-        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
+        self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a"))
         self.svc.tok = self.tok
         self.svc.model = "another-model"
-        self.assertNotEqual(first, self.svc.cache_scope(req, "principal-a"))
-        self.assertNotEqual(self.svc.cache_scope({}, "principal-a"), self.svc.cache_scope({}, "principal-a"))
+        self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a"))
 
-    def test_a_client_without_an_identity_is_named_by_its_opening(self):
-        """A plain OpenAI-compatible client (no strata_conversation_id) is named by what it opens with.
+    def test_without_a_declared_group_a_tenant_has_one_content_space(self):
+        """No group is not a private request: the tenant's requests share a namespace, and what such a
+        request may reuse is decided by the exact token-prefix match, never by the namespace alone."""
+        body = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]}
+        first = self.svc.cache_scope(body, "tenant-a")
+        self.assertEqual(first, self.svc.cache_scope(body, "tenant-a"))
+        self.assertEqual(first, self.svc.cache_scope({}, "tenant-a"), "the body's text is not part of it")
+        self.assertEqual(first, self.svc.cache_scope({**body, "strata_conversation_id": None}, "tenant-a"),
+                         "null is no group")
+        self.assertNotEqual(first, self.svc.cache_scope({**body, "strata_conversation_id": "A"}, "tenant-a"))
+        self.assertNotEqual(first, self.svc.cache_scope(body, "tenant-b"))
+        for invalid in ("", 1, True, "x" * 257):
+            with self.assertRaises(ValueError):
+                self.svc.cache_scope({"strata_conversation_id": invalid}, "tenant-a")
 
-        Without this every request is its own namespace, so such a client re-prefills its whole prompt -
-        system prompt included - on every turn of one conversation.
-        """
-        def turn(user, history=(), system="You are a careful assistant."):
-            return {"messages": [{"role": "system", "content": system},
-                                 {"role": "user", "content": user}, *history]}
-        first = self.svc.cache_scope(turn("first question"), "principal-a")
-        answered = [{"role": "assistant", "content": "an answer"}, {"role": "user", "content": "and a follow-up"}]
-        self.assertEqual(first, self.svc.cache_scope(turn("first question", answered), "principal-a"),
-                         "a later turn of the same conversation keeps its namespace")
-        self.assertNotEqual(first, self.svc.cache_scope(turn("another question"), "principal-a"),
-                            "a different opening is a different conversation")
-        self.assertNotEqual(first, self.svc.cache_scope(turn("first question"), "principal-b"),
-                            "the authenticated client is part of the namespace")
-        self.assertNotEqual(first, self.svc.cache_scope(turn("first question", system="Another system prompt."),
-                                                       "principal-a"),
-                            "the system prompt is part of the opening")
+    def test_the_declared_group_is_the_only_conversation_identity(self):
+        """The opening is no longer part of the identity, and neither is the body: the declared group
+        separates conversations, and one group is one conversation in whichever dialect it arrives."""
+        chat = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]}
+        anthropic = {"system": "S", "messages": [{"role": "user", "content": "U"}]}
+        responses = {"instructions": "S", "input": [{"role": "user", "content": "U"}]}
+        spaces = {self.svc.cache_scope(body, "tenant-a") for body in (chat, anthropic, responses, {})}
+        self.assertEqual(len(spaces), 1, "without a group these are one tenant's content space")
+        self.assertEqual(self.svc.cache_scope({**chat, "strata_conversation_id": "A"}, "tenant-a"),
+                         self.svc.cache_scope({**anthropic, "strata_conversation_id": "A"}, "tenant-a"),
+                         "one declared group is one conversation, in either dialect")
 
-    def test_every_dialect_names_the_conversation_by_its_opening(self):
-        """Anthropic's top-level system and Responses' instructions/in-input count as the opening too."""
-        cases = {
-            "chat": ({"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]},
-                     {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"},
-                                   {"role": "assistant", "content": "A"}, {"role": "user", "content": "again"}]},
-                     {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "other"}]}),
-            "anthropic": ({"system": "S", "messages": [{"role": "user", "content": "U"}]},
-                          {"system": "S", "messages": [{"role": "user", "content": "U"},
-                                                       {"role": "assistant", "content": "A"},
-                                                       {"role": "user", "content": "again"}]},
-                          {"system": "S", "messages": [{"role": "user", "content": "other"}]}),
-            "responses": ({"instructions": "S", "input": [{"role": "user", "content": "U"}]},
-                          {"instructions": "S", "input": [{"role": "user", "content": "U"},
-                                                          {"role": "assistant", "content": "A"},
-                                                          {"role": "user", "content": "again"}]},
-                          {"instructions": "S", "input": [{"role": "user", "content": "other"}]}),
-            "content blocks": ({"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
-                                             {"role": "user", "content": [{"type": "text", "text": "U"}]}]},
-                               {"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
-                                             {"role": "user", "content": [{"type": "text", "text": "U"}]},
-                                             {"role": "assistant", "content": "A"},
-                                             {"role": "user", "content": "again"}]},
-                               {"messages": [{"role": "system", "content": [{"type": "text", "text": "S"}]},
-                                             {"role": "user", "content": [{"type": "text", "text": "other"}]}]}),
-        }
-        for dialect, (opening, later, other) in cases.items():
-            with self.subTest(dialect=dialect):
-                self.assertEqual(self.svc.cache_scope(opening, ""), self.svc.cache_scope(later, ""))
-                self.assertNotEqual(self.svc.cache_scope(opening, ""), self.svc.cache_scope(other, ""))
-
-    def test_a_request_with_nothing_to_name_it_by_stays_private(self):
-        """No opening means no conversation: such requests keep their own namespace rather than share one."""
-        for body in ({}, {"messages": []}, {"messages": [{"role": "tool", "content": "t"}]}):
-            with self.subTest(body=body):
-                self.assertNotEqual(self.svc.cache_scope(body, "principal-a"),
-                                    self.svc.cache_scope(body, "principal-a"))
-
-    def test_http_derives_the_namespace_without_a_client_identity(self):
-        """The derived namespace is what reaches the engine, for a client that sends no identity at all."""
-        self.svc.api_key = "principal-a"
+    def test_http_trusts_an_attested_tenant_only_from_the_token_that_may_name_one(self):
+        """The header naming a tenant is honoured only when the request carries the gateway's own
+        token; from a client that merely holds a key of its own it is ignored, not rejected."""
+        self.svc.api_key = "client-key,gateway-token"
+        self.svc.tenant_token = ["gateway-token"]
         httpd = serve(self.svc, port=0)
+        body = {"messages": [{"role": "system", "content": "You are a careful assistant."},
+                             {"role": "user", "content": "first question"}], "max_tokens": 8}
         try:
-            def request(user, history=()):
-                body = {"messages": [{"role": "system", "content": "You are a careful assistant."},
-                                     {"role": "user", "content": user}, *history], "max_tokens": 8}
+            def request(token, attested=None):
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+                if attested is not None:
+                    headers[TENANT_HEADER] = attested
                 req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
-                                             data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json",
-                                                      "Authorization": "Bearer principal-a"})
+                                             data=json.dumps(body).encode(), headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as response:
                     self.assertEqual(response.status, 200)
                     json.load(response)
                 return self.engine.last_cache_scope
-            first = request("first question")
-            self.assertRegex(first, r"[0-9a-f]{64}")
-            answered = [{"role": "assistant", "content": "an answer"}]
-            self.assertEqual(first, request("first question", answered))
-            self.assertNotEqual(first, request("another question"))
+            own = self.svc.cache_scope(body, "client-key")
+            self.assertEqual(request("client-key"), own)
+            self.assertEqual(request("client-key", attested="somebody-else"), own,
+                             "a client cannot name a tenant")
+            attested = request("gateway-token", attested="josh-macbook")
+            self.assertEqual(attested, self.svc.cache_scope(body, "josh-macbook"))
+            self.assertNotEqual(attested, request("gateway-token", attested="pi-debian-host"),
+                                "two attested labels are two tenants")
+            self.assertEqual(request("gateway-token"), self.svc.cache_scope(body, "gateway-token"),
+                             "the gateway's own key is its identity when it attests nothing")
+            self.assertNotEqual(attested, own, "the gateway's clients do not share the gateway's space")
         finally:
             httpd.shutdown()
             httpd.server_close()
