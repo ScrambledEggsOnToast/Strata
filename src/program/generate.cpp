@@ -4189,6 +4189,12 @@ int main(int argc, char** argv) {
             devs.back().name = name;
             return devs.back();
         };
+        // --control-vector-scaled: the tables `cvec_upload` builds and `cvec_replicate` copies to every
+        // stage device - each layer's unit direction (n_layers * n_embd f32), its scale (n_layers f32) and
+        // the on-flag.  Priced on the primary device and on every split stage, which is where they live.
+        const uint64_t cvec_device_bytes = o.cvec_files.empty() ? 0 : byte_add(
+            byte_mul(byte_mul((uint64_t) g.n_layers, (uint64_t) g.n_embd), sizeof(float)),
+            byte_add(byte_mul((uint64_t) g.n_layers, sizeof(float)), sizeof(int)));
         // The primary device (or the only device): canonical pool, native dense/head, MTP, session,
         // logits, PLE buffers, an explicit expert cache and the R4 hit path.  With a layer split the
         // MTP drafter and its head live on the LAST stage, so their classes move there.
@@ -4358,8 +4364,9 @@ int main(int argc, char** argv) {
         if (o.vision)
             v0.add("vision_positions", byte_mul(byte_add((uint64_t) o.max_context, 64), 3 * sizeof(int32_t)),
                    "--vision m-rope table, max_context + 64 cells");
-        if (!o.cvec_files.empty())
-            v0.add_unknown("control_vector", "--control-vector files: the accounting cannot price them");
+        if (cvec_device_bytes)
+            v0.add("control_vector", cvec_device_bytes,
+                   "--control-vector files: cvec_upload's per-layer direction and scale tables");
         d0.headroom_bytes = byte_mul((uint64_t) headroom_mib, 1ull << 20);
 
         // Explicit stage devices price their actual session ranges; auto keeps
@@ -4373,6 +4380,9 @@ int main(int argc, char** argv) {
             const size_t last = split_devs.size() - 1;
             for (size_t i = 0; i < split_devs.size(); ++i) {
                 strata::plan::DeviceCost& ds = add_device("CUDA" + std::to_string(split_devs[i]));
+                if (cvec_device_bytes)
+                    ds.vram.add("control_vector", cvec_device_bytes,
+                                "--control-vector files: cvec_replicate's copy on this stage");
                 const int64_t layer_begin = split_auto ? 0 : split_at[i];
                 const int64_t layer_end = !split_auto && i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
                 ds.vram.add("weights_canonical", split_auto ? pool_bytes : split_stage_pool_bytes[i],

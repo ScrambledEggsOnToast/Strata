@@ -3491,6 +3491,9 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # A token (or several) that may name the tenant a request is for, in the X-Strata-Tenant
+        # header - the gateway's own key.  It never gates access: it authorises the claim only.
+        self.tenant_token = []                          # see tenant_token / --tenant-token
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -4427,20 +4430,29 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def cache_scope(self, req: dict, principal: str) -> str:
-        """A fixed namespace, not a growing conversation registry or token-similarity key."""
-        conversation = req.get("strata_conversation_id")
-        if conversation is not None:
-            if not isinstance(conversation, str) or not 1 <= len(conversation.encode("utf-8")) <= 256:
+    def cache_scope(self, req: dict, tenant: str) -> str:
+        """A fixed namespace per (tenant, declared group) - not a conversation registry, and not a
+        token-similarity key.
+
+        `tenant` is what the transport decided the caller is: the key label a trusted gateway
+        attests for the client key it authenticated, or the caller's own key (`principal`). The
+        group is the client's opt-in `strata_conversation_id`, or a Codex turn. Without a group a
+        tenant has one content space, where reuse still requires the same tokens from the start of
+        the prompt: what a request can pick up is a prefix it also sends, never another
+        conversation's text.
+        """
+        group = req.get("strata_conversation_id")
+        if group is not None:
+            if not isinstance(group, str) or not 1 <= len(group.encode("utf-8")) <= 256:
                 raise ValueError("strata_conversation_id must be a nonempty string of at most 256 UTF-8 bytes")
-            conversation = ("explicit", conversation)
+            group = ("declared", group)
         else:
             _, codex = responses_api._codex_turn(req)
-            conversation = ("codex", *codex) if codex else ("request", uuid.uuid4().hex)
+            group = ("codex", *codex) if codex else None
         # Model/config/geometry and resolved placement cannot change inside a
         # loaded engine. Replacement tokenizer/template objects or template source
         # invalidate this namespace before native token/image/steering validation.
-        identity = [principal, conversation, self.model, id(self.tok), self.template.source]
+        identity = [tenant, group, self.model, id(self.tok), self.template.source]
         return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
@@ -6229,11 +6241,20 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/score"):
                     auth = self.headers.get("Authorization", "")
-                    principal = (auth[7:].strip() if auth.lower().startswith("bearer ") else
-                                 self.headers.get("x-api-key", "")) if svc.api_key else ""
+                    given = (auth[7:].strip() if auth.lower().startswith("bearer ") else
+                             self.headers.get("x-api-key", ""))
+                    principal = given if svc.api_key else ""
+                    # A tenant is a key. The label a gateway attests is trusted only from the token
+                    # only the gateway holds; a header from anyone else is ignored, not rejected, so
+                    # one request shape serves trusted and direct callers alike.
+                    tenant = principal
+                    if svc.tenant_token and key_matches(given, svc.tenant_token):
+                        attested = self.headers.get(TENANT_HEADER, "").strip()
+                        if attested:
+                            tenant = attested
                     # Never trust a client-supplied internal scope or cache grouping key.
                     if path != "/v1/score":        # scores never reuse a conversation prefix
-                        req["_strata_cache_scope"] = svc.cache_scope(req, principal)
+                        req["_strata_cache_scope"] = svc.cache_scope(req, tenant)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
@@ -7031,6 +7052,12 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
+# The header a trusted gateway uses to attest which client key a request belongs to.  Only a caller
+# holding a configured tenant token may name a tenant (see cache_scope and the "tenant_token"
+# option); from anyone else the header is ignored.
+TENANT_HEADER = "X-Strata-Tenant"
+
+
 def key_list(value) -> list[str]:
     """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
@@ -7376,6 +7403,10 @@ def main() -> int:
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
+    ap.add_argument("--tenant-token", default=os.environ.get("STRATA_TENANT_TOKEN", ""),
+                    help="a token that may name the tenant its request belongs to, in the " + TENANT_HEADER +
+                         " header (the gateway's own key; also \"tenant_token\" in the config, or "
+                         "$STRATA_TENANT_TOKEN). Several tokens: separate them with commas. It never gates access")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -7536,6 +7567,22 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    svc.tenant_token = key_list(a.tenant_token or cfg.get("tenant_token", ""))
+    if cfg.get("tenant_token_file"):
+        # One token per line, from a protected file - the same value the gateway keeps as its own
+        # upstream credential.  A path is configuration; a token never is, so the run's recorded
+        # config may name the file and must not contain the secret.
+        path = Path(cfg["tenant_token_file"]).expanduser()
+        if not path.is_absolute() and a.config:
+            path = Path(a.config).resolve().parent / path
+        try:
+            svc.tenant_token += key_list(path.read_text().replace("\n", ","))
+        except OSError as e:
+            print(f"[strata] cannot read tenant_token_file {cfg['tenant_token_file']}: {e}", file=sys.stderr)
+            return 2
+    if svc.tenant_token:
+        print(f"[strata] {len(svc.tenant_token)} tenant token(s) configured: a request bearing one may name its tenant "
+              f"in {TENANT_HEADER} (the token is the gateway's own key; it does not gate access)", flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
