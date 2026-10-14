@@ -264,6 +264,65 @@ class RequestAdmission(unittest.TestCase):
         self.assertEqual(public["state"], "cancelled")
         self.assertFalse(any(key.startswith("_") for key in public))
 
+    def test_score_admission_preserves_all_generation_reservations(self):
+        svc = self.service()
+        svc.engine.batch = 4
+        svc.request_queue_limit = 0
+        generation = [svc.register_lifecycle({}, threading.Event()) for _ in range(4)]
+        for record in generation:
+            svc.acquire_request(record)
+        score = svc.register_lifecycle({}, threading.Event(), score=True)
+        score["_deadline"] = time.perf_counter() + 0.25  # a regression fails, rather than hanging
+        svc.acquire_request(score)
+        snapshot = svc._admission_snapshot()
+        self.assertEqual((snapshot["slots"], snapshot["active"], snapshot["score_active"]), (4, 5, 1))
+        with self.assertRaises(AdmissionError):
+            svc.register_lifecycle({}, threading.Event())
+        svc.finish_lifecycle(generation.pop())
+        successor = svc.register_lifecycle({}, threading.Event())
+        successor["_deadline"] = time.perf_counter() + 0.25
+        svc.acquire_request(successor)
+        self.assertEqual(len(svc.admission_active), 5)
+        for record in [*generation, successor, score]:
+            svc.finish_lifecycle(record)
+
+    def test_score_queue_is_bounded_and_cancelled_waiter_releases_its_place(self):
+        svc = self.service()
+        svc.engine.info = {"score_max_pending": 2}
+        first = svc.register_lifecycle({}, threading.Event(), score=True)
+        svc.acquire_request(first)
+        cancelled = svc.register_lifecycle({}, threading.Event(), score=True)
+        with self.assertRaises(AdmissionError):
+            svc.register_lifecycle({}, threading.Event(), score=True)
+        self.assertTrue(svc.cancel_request(cancelled["id"]))
+        with self.assertRaises(AdmissionError) as error:
+            svc.acquire_request(cancelled)
+        self.assertEqual(error.exception.status, 409)
+        svc.finish_lifecycle(cancelled)
+        successor = svc.register_lifecycle({}, threading.Event(), score=True)
+        svc.finish_lifecycle(first)
+        svc.acquire_request(successor)
+        svc.finish_lifecycle(successor)
+        self.assertEqual((svc.admission_active, svc.admission_waiters, svc.status["queued"]), ({}, [], 0))
+
+    def test_other_lane_cannot_reset_background_fairness(self):
+        for score in (False, True):
+            with self.subTest(score=score):
+                svc = self.service()
+                records = [svc.register_lifecycle({"strata_priority": priority}, threading.Event(), score=score)
+                           for priority in ("foreground", "foreground", "foreground", "foreground", "background")]
+                for record in records[:3]:
+                    svc.acquire_request(record)
+                    svc.finish_lifecycle(record)
+                    other = svc.register_lifecycle({"strata_priority": "background"}, threading.Event(), score=not score)
+                    svc.acquire_request(other)
+                    svc.finish_lifecycle(other)
+                for index in (4, 3):
+                    records[index]["_deadline"] = time.perf_counter() + 0.25
+                    svc.acquire_request(records[index])
+                    svc.finish_lifecycle(records[index])
+                self.assertEqual(svc.admission_waiters, [])
+
 
 
 if __name__ == "__main__":

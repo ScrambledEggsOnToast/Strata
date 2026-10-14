@@ -1814,7 +1814,14 @@ The complete response contains `version`, the server-owned `request_id`, `prompt
 `selected_tokens`, `logit_passes:1`, `dtype:"float32"` and `scale:1`.
 The request ID is also its `/requests` lifecycle ID. `/health` publishes `scoring.available`,
 the protocol version and limits; an engine without SCORE v1 cannot answer scores.
-The existing API-key/Host/Origin checks, priority, deadline and bounded admission queue apply.
+The existing API-key/Host/Origin checks, priority and deadline apply. HTTP scores have one
+active reservation and a separate bounded queue, capped by `scoring.max_pending` including
+the active score. They do not consume generation reservations or wait for a generation
+stream to finish when all slots are occupied. Generation keeps its original slot and
+queue limits. Admission status counts all requests in `active`/`waiting` and identifies
+the score subset with `score_active`/`score_waiting` (`score_slots:1`).
+This separates admission, not GPU execution: a bulk judge read still pauses generation
+until it restores the shared execution bindings at a drained scheduler boundary.
 
 Native framing is `SCORE <id> v1 prompt=<comma-separated IDs> selected=<comma-separated IDs>`.
 IDs are 1–64 ASCII letters, digits, underscores or hyphens. The engine may emit

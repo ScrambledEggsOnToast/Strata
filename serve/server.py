@@ -3525,7 +3525,7 @@ class Service:
         self.admission_cv = threading.Condition(self.status_lock)
         self.admission_waiters = []
         self.admission_active = {}
-        self.admission_foreground = 0
+        self.admission_foreground = {False: 0, True: 0}  # independent generation / score fairness
         self._foreground_pending = False
         self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
         self.request_timeout_s = 600.0
@@ -3666,7 +3666,7 @@ class Service:
         self.lifecycle_api = cfg.get("lifecycle_api") is True
 
     def _admission_snapshot(self):
-        """Generation reservations and bounded retry hint; caller holds status_lock."""
+        """Request reservations and bounded retry hint; caller holds status_lock."""
         now = time.perf_counter()
         oldest_wait = round(max((now - r["_clock"] for r in self.admission_waiters), default=0.0), 6)
         # HTTP Retry-After uses whole seconds. Subsecond request timeouts still get its mandatory 1 s floor.
@@ -3692,6 +3692,9 @@ class Service:
         return {"slots": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                 "request_queue_limit": self.request_queue_limit,
                 "active": len(self.admission_active), "waiting": len(self.admission_waiters),
+                "score_slots": 1,
+                "score_active": sum(bool(r.get("_score")) for r in self.admission_active.values()),
+                "score_waiting": sum(bool(r.get("_score")) for r in self.admission_waiters),
                 "executing": sum(bool(r.get("_executing")) for r in self.admission_active.values()),
                 "native_waiting": sum(r["state"] == "engine_wait" for r in self.admission_active.values()),
                 "oldest_wait_s": oldest_wait, "request_timeout_s": self.request_timeout_s,
@@ -3703,7 +3706,7 @@ class Service:
         self._foreground_pending = any(r["priority"] == "foreground" for r in self.admission_waiters) or any(
             r["priority"] == "foreground" and not r.get("_executing") for r in self.admission_active.values())
 
-    def register_lifecycle(self, req, cancel):
+    def register_lifecycle(self, req, cancel, *, score=False):
         priority = req.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
@@ -3711,13 +3714,17 @@ class Service:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= self.request_timeout_s:
             raise ValueError("strata_timeout_s must be positive and no greater than request_timeout_s")
         now = time.perf_counter()
-        record: dict[str, Any] = {"id": uuid.uuid4().hex, "priority": priority, "state": "queued", "started_at": time.time(),
+        record: dict[str, Any] = {"id": uuid.uuid4().hex, "_score": score, "priority": priority, "state": "queued", "started_at": time.time(),
                   "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
                   "events": [{"state": "queued", "elapsed_s": 0.0}], "_clock": now,
                   "_deadline": now + timeout, "_cancel": cancel}
         with self.admission_cv:
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
-            if len(self.admission_active) + len(self.admission_waiters) >= capacity + self.request_queue_limit:
+            # SCORE uses its own bounded control lane, not a generation reservation.
+            limit = score_api.capabilities(self.engine)["max_pending"] if score else capacity + self.request_queue_limit
+            pending = (sum(bool(r.get("_score")) == score for r in self.admission_active.values()) +
+                       sum(bool(r.get("_score")) == score for r in self.admission_waiters))
+            if pending >= limit:
                 record.update(state="rejected", error="request queue is full", completion_s=0.0)
                 record["events"].append({"state": "rejected", "elapsed_s": 0.0})
                 self.lifecycles.append(record)
@@ -3748,14 +3755,18 @@ class Service:
                     record["cancel_reason"] = "timeout"
                     record["_cancel"].set()
                     raise AdmissionError("request timed out while queued", 408)
-                foreground = next((r for r in self.admission_waiters if r["priority"] == "foreground"), None)
-                background = next((r for r in self.admission_waiters if r["priority"] == "background"), None)
-                chosen = background if background is not None and (foreground is None or self.admission_foreground >= 3) else foreground
-                capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
-                if chosen is record and len(self.admission_active) < capacity:
+                score = bool(record.get("_score"))
+                foreground = next((r for r in self.admission_waiters
+                                   if bool(r.get("_score")) == score and r["priority"] == "foreground"), None)
+                background = next((r for r in self.admission_waiters
+                                   if bool(r.get("_score")) == score and r["priority"] == "background"), None)
+                chosen = background if background is not None and (foreground is None or self.admission_foreground[score] >= 3) else foreground
+                capacity = 1 if score else max(1, int(getattr(self.engine, "batch", 0) or 0))
+                active = sum(bool(r.get("_score")) == score for r in self.admission_active.values())
+                if chosen is record and active < capacity:
                     self.admission_waiters.remove(record)
                     self.admission_active[record["id"]] = record
-                    self.admission_foreground = self.admission_foreground + 1 if record["priority"] == "foreground" else 0
+                    self.admission_foreground[score] = self.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
                     self.status["queued"] -= 1
                     record["queue_s"] = round(time.perf_counter() - record["_clock"], 6)
                     self.admission_cv.notify_all()
@@ -6219,7 +6230,7 @@ def make_handler(svc: Service):
                         req["_strata_cache_scope"] = svc.cache_scope(req, principal)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
-                    self.lifecycle = svc.register_lifecycle(req, self.request_cancel)
+                    self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
                     # A client that stops consuming must not hold a resident slot forever in a socket write.
                     self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
                     self._watch_client(self.request_cancel)

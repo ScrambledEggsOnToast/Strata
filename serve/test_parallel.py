@@ -1966,7 +1966,8 @@ class ScoreTransport(unittest.TestCase):
         thread = threading.Thread(target=successor)
         thread.start()
         try:
-            self.wait_for(lambda: len(self.svc.admission_active) == 2, "successor admitted behind the draining owner")
+            self.wait_for(lambda: len(self.svc.admission_waiters) == 1, "successor waits behind the draining score owner")
+            self.assertEqual(list(self.svc.admission_active), [request_id])
             self.assertEqual(sum(line.startswith("SCORE ") for line in self.log.read_text().splitlines()), 1)
         finally:
             gate.unlink(missing_ok=True)
@@ -1979,13 +1980,14 @@ class ScoreTransport(unittest.TestCase):
         self.assertFalse(self.engine.score_q)
         self.assertTrue(self.engine.alive())
 
-    def test_http_score_uses_existing_bounded_admission_queue(self):
+    def test_http_score_uses_its_own_bounded_admission_queue(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         gate = Path(directory.name) / "hold"
         gate.touch()
         self.start(2, more=("--score-hold-file", str(gate)))
         self.svc.request_queue_limit = 0
+        self.engine.info["score_max_pending"] = 2
         results, errors = [], []
         def request():
             try:
@@ -1996,7 +1998,8 @@ class ScoreTransport(unittest.TestCase):
         for thread in threads:
             thread.start()
         try:
-            self.wait_for(lambda: len(self.svc.admission_active) == 2, "two requests own the effective capacity")
+            self.wait_for(lambda: len(self.svc.admission_active) == 1 and len(self.svc.admission_waiters) == 1,
+                          "one score owns control and the other occupies its bounded queue")
             with self.assertRaises(urllib.error.HTTPError) as rejected:
                 self.score()
             with rejected.exception as response:
