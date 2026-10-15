@@ -205,6 +205,13 @@ private:
 // draft), max_image_bytes/max_stream_bytes from the admitted image budget, max_checkpoints from the checkpoint
 // policy.  Nothing here promises more than that admitted budget - it only stops an incidental cap from silently
 // refusing a long admitted image.
+//
+// These figures describe *this run's* admitted capacity.  They decide whether this run may create or serve a record -
+// never whether an existing record is kept.  A store root is shared by every profile that opens it, so records
+// captured under other figures (another stage count, another checkpoint policy, another image budget) are retained,
+// indexed and left on disk; a run that cannot serve one refuses the read or the publication (refused_limits) instead
+// of treating it as corrupt.  The retention figures are derived by the store from the one shared quota and the
+// configured ceilings, so this contract cannot be widened or narrowed by an owner by accident.
 struct ConversationStoreLimits {
     uint64_t max_image_bytes = uint64_t(16) << 30;
     uint64_t max_stream_bytes = uint64_t(8) << 30;
@@ -269,7 +276,7 @@ enum class ConversationStoreReadStatus : uint8_t {
     stale,        // the execution-domain epoch advanced before it completed
     refused_budget,   // the read allowance did not admit it (prefetch only)
     refused_quota,    // the store is full: skip storage, keep serving
-    refused_limits,   // the record exceeds ConversationStoreLimits
+    refused_limits,   // the record exceeds ConversationStoreLimits: refused, never discarded (it may belong to another profile)
     failed,       // I/O or allocation failure
     disabled,     // persistence is off; this is always a miss
 };
@@ -460,7 +467,8 @@ public:
                                                const std::vector<ConversationImageKey>& images) const;
     bool manifest_info(uint64_t head_id, ConversationStoreManifestInfo& out) const;
     // The stream table of a retained head, read from its manifest (bounded, read-only, no catalog lock held): for
-    // planning reuse intervals.  It exposes no payload and authorizes nothing.
+    // planning reuse intervals.  It exposes no payload and authorizes nothing.  Decoded under the store's retention
+    // figures, so a head another profile captured is still readable as long as it is structurally sound.
     bool manifest_streams(uint64_t head_id, std::vector<ConversationStoreStreamInfo>& out) const;
 
     // --- reads --------------------------------------------------------------------------------------------

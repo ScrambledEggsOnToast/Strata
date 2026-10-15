@@ -575,6 +575,12 @@ struct ConversationStore::Impl {
     // ---- configuration (immutable after construction) ----
     ConversationStoreOptions options;
     ConversationStoreLimits limits;
+    // The figures a record must satisfy to be *kept* and indexed, as opposed to the ones `limits` puts on creating
+    // and serving one (see conversation_store_detail::retention_limits): a root is shared by every profile that opens
+    // it, so a record another profile captured is retained, accounted and left on disk.  Recovery, the publication
+    // planner and the stream-table diagnostic decode under these; every read and publication is admitted against
+    // `limits` itself.
+    ConversationStoreLimits retained_limits;
     std::string root;                 // diagnostics only: every access goes through `dirs`
     RootDirs dirs;
     uint32_t reader_threads = 1;
@@ -1480,7 +1486,12 @@ bool ConversationStore::Impl::load_manifest_of(uint64_t head_id, uint64_t epoch_
         std::lock_guard<std::mutex> guard(mutex);
         counters.bytes_read += raw.size();
     }
-    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, out, why)) return false;
+    // Decoded under the *retention* figures rather than this run's admitted ones: this is where the soundness of a
+    // record this run did not write is decided - for recovery, for the shared physical ledger and for the publication
+    // planner - and a record another profile captured is not corrupt merely because this run could not have created
+    // it (a different stage count, a different checkpoint policy, a different image budget).  Whether this run may
+    // *serve* the record is a separate decision, made against `limits` on the read and publication paths themselves.
+    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), retained_limits, out, why)) return false;
     if (!(out.manifest_id == manifest_id) || out.epoch != epoch_now) {
         why = "that manifest does not belong to this execution-domain epoch";
         return false;
@@ -2445,6 +2456,25 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
     conversation_store_detail::ManifestMeta meta;
     if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, meta, why) ||
         !(meta.manifest_id == manifest_id)) {
+        // Two different things can refuse a record here and they must never be confused.  A record that this run's
+        // admitted figures do not cover - more stages, more retained checkpoints, a longer image than this profile
+        // serves from - is *refused*: it stays on disk, stays indexed and stays readable by the profile that wrote
+        // it, because the figures it exceeds are this run's capacity, not a defect in the record.  Only a record that
+        // is not structurally sound at all is corrupt, so the retention decode decides between them: it is strictly
+        // wider on the capacity figures and identical on every parsing and consistency check.
+        // The failed attempt's partial decode is released first: this read's reservation counts one decoded manifest
+        // at a time, so two of them are never alive together.
+        meta = conversation_store_detail::ManifestMeta{};
+        conversation_store_detail::ManifestMeta retained;
+        std::string retained_why;
+        if (conversation_store_detail::manifest_decode(raw.data(), raw.size(), retained_limits, retained,
+                                                       retained_why) &&
+            retained.manifest_id == manifest_id) {
+            stop_with(ConversationStoreReadStatus::refused_limits,
+                      "the stored record exceeds this run's admitted figures: " +
+                          (why.empty() ? std::string("ConversationStoreLimits") : why));
+            return;
+        }
         stop_with(ConversationStoreReadStatus::corrupt, why.empty() ? "the manifest does not match its identity" : why);
         return;
     }
@@ -3383,6 +3413,11 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
     Impl& self = *impl_;
     self.options = std::move(options);
     self.limits = limits;
+    // The retention figures are derived here, from the shared quota and the configured ceilings, and are the only
+    // ones the recovery/index paths use: an owner cannot widen or narrow what may be kept by accident, and a root
+    // shared by profiles with different admitted figures never loses a record to the difference (see
+    // conversation_store_detail::retention_limits).
+    self.retained_limits = conversation_store_detail::retention_limits(self.options, limits);
     self.root = self.options.root;
     self.ram_budget = self.options.read_budget_bytes;
     const uint32_t wanted = self.options.max_reads ? self.options.max_reads : 1;
@@ -3562,7 +3597,8 @@ bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<Conversat
     if (!read_file(self.dirs.manifests, sha256_hex(manifest_id), self.limits.max_manifest_bytes, raw, why))
         return false;
     conversation_store_detail::ManifestMeta meta;
-    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), self.limits, meta, why)) return false;
+    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), self.retained_limits, meta, why))
+        return false;
     out = conversation_store_detail::manifest_stream_infos(meta);
     return true;
 }

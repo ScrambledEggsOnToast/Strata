@@ -1530,6 +1530,16 @@ an image's identity, so both layouts borrow the same capacity. Refusals are ordi
 floor that cannot be met, a busy writer or an unhealthy root skips the write or the read and the request completes as
 it would without persistence.
 
+**One root, several profiles: kept is not the same as servable.** The quota and the head ceiling are shared, but the
+figures that describe a single run's admitted capacity - the stage count of its split, its checkpoint policy
+(`--prompt-cache`), its image budget and its maximum context - are not, and two serving profiles that point at the same
+root differ in exactly those. They decide what a run may **create or serve**, never whether an existing record is kept.
+A record another profile captured is retained, indexed and charged to the shared quota as long as it is *structurally*
+sound - its checksum, lengths, canonical stream order and cut order, and every one of its objects present - and a run
+that cannot serve one refuses the read or the publication (`refused_limits`) while leaving every byte where it is.
+`refused` is an ordinary miss, `corrupt` is a defect, and only a record that fails its own structural validation, has
+lost a file, or belongs to a retired epoch or an unclean run is ever reclaimed.
+
 *What is stored.* One **immutable manifest per complete image** and immutable 1 MiB payload objects, with a small
 checksummed binary **root catalog** as the only authority (atomically replaced; flush file data, then the immutable
 manifest, then the catalog). Files that the catalog does not authorize are accounted and then deleted - a corrupt

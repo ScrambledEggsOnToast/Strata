@@ -105,6 +105,17 @@ struct ImageLayout {
 // being large.  A restore path never uses this - it is derived from the caller's admitted figures.
 ConversationStoreLimits unconstrained_limits();
 
+// The limits a *retained* record must satisfy: the figures under which a record this run did not write may still be
+// kept on disk and indexed for the shared physical ledger.  Derived from the one shared quota and the format's own
+// structural ceilings, never narrower than `configured` (a run always keeps what it can itself create) and bounded
+// rather than unbounded: no parsing ceiling is relaxed (the manifest, container and stream caps stay exactly as
+// configured, and every count is still checked against the bytes left in the file), the byte figures are bounded by
+// the quota every layout is charged to, and the per-element counts by what a file within the configured ceilings
+// could encode.  The recovery, index and planner paths decode with these; every read and every publication is
+// admitted against `configured` itself, and a record a run may not serve is refused there rather than discarded here.
+ConversationStoreLimits retention_limits(const ConversationStoreOptions& options,
+                                        const ConversationStoreLimits& configured);
+
 // Canonical container/stream/cut enumeration of one image tree.  Fails (with a reason) on anything the format cannot
 // represent exactly: a stage deeper than one level, a record's own parts having parts, duplicate stream identities,
 // a malformed id/image byte count, a record missing one of its five state streams, or an exceeded limit.

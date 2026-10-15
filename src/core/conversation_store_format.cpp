@@ -48,6 +48,17 @@ constexpr size_t kTrailer = 32;
 // Hard ceilings for a structure that has no configured limit (the catalog): a corrupt file can still not make the
 // parser allocate an unbounded table.
 constexpr uint32_t kCatalogCeiling = 1u << 22;
+// The format's own structural ceilings: what a record can represent at all, whatever figures the run that wrote it had
+// admitted.  A stage part belongs to an image stage and never owns further parts, so one level of parts below the
+// image is everything the format encodes and the deepest stage index it can name is this bound.
+constexpr uint32_t kFormatMaxStages = 64;
+// The smallest encoded form of the two per-element counts a manifest carries: one checkpoint record (its token count,
+// its retained size, its pin flag and its part count) and one K/V layer's metadata (seven geometry fields and five
+// part lengths).  A manifest that fits `max_manifest_bytes` cannot hold more of either than that ceiling divided by
+// these, so they are the widest ceilings a retention read can use without accepting a count the file's own bytes do
+// not justify (Reader::count bounds every count by the bytes left in the file as well).
+constexpr uint64_t kCheckpointEncodedMin = 21;
+constexpr uint64_t kKvLayerEncodedMin = 96;
 
 class Writer {
 public:
@@ -1070,7 +1081,7 @@ ConversationStoreLimits unconstrained_limits() {
     limits.max_checkpoints = std::numeric_limits<uint32_t>::max() / 2;
     limits.max_kv_layers = std::numeric_limits<uint32_t>::max() / 2;
     limits.max_streams = std::numeric_limits<uint32_t>::max() / 2;
-    limits.max_stages = 64;
+    limits.max_stages = kFormatMaxStages;
     limits.max_images = std::numeric_limits<uint32_t>::max() / 2;
     return limits;
 }
@@ -1232,6 +1243,15 @@ namespace {
 uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 uint64_t sat_mul(uint64_t a, uint64_t b) {
     return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
+
+// The most elements of `min_entry` encoded bytes a file within `ceiling` bytes could hold, saturating at half the
+// count a uint32 count field can carry (the decoder derives the cut ceiling as this plus one, and unconstrained_limits
+// saturates the same way).  Past this the file's own length is the binding bound, never this figure.
+uint32_t encoded_ceiling(uint64_t ceiling, uint64_t min_entry) {
+    const uint64_t count = min_entry ? ceiling / min_entry : ceiling;
+    constexpr uint64_t kCeiling = std::numeric_limits<uint32_t>::max() / 2;
+    return count > kCeiling ? uint32_t(kCeiling) : uint32_t(count);
 }
 
 // One record's streams: its token ids, its image keys and its five running-state arrays.  `parts` are counted by the
@@ -1661,7 +1681,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         }
         c.cvec = flag != 0;
         uint32_t checkpoints = 0;
-        if (!r.count(checkpoints, limits.max_checkpoints, 21)) {
+        if (!r.count(checkpoints, limits.max_checkpoints, kCheckpointEncodedMin)) {
             why = "a manifest container's checkpoint count is invalid";
             return false;
         }
@@ -1676,7 +1696,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
             c.checkpoints.push_back(record);
         }
         uint32_t layers = 0;
-        if (!r.count(layers, limits.max_kv_layers, 96)) {
+        if (!r.count(layers, limits.max_kv_layers, kKvLayerEncodedMin)) {
             why = "a manifest container's K/V layer count is invalid";
             return false;
         }
@@ -1766,9 +1786,45 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
     return check_manifest(out, limits, why);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Retention: the figures a record must satisfy to be *kept*, as opposed to the figures that decide whether a run may
+// create or serve it
+// ---------------------------------------------------------------------------------------------------------------
+
+// A store root is shared by every serving profile that opens it, so a record's own figures and the *current* run's
+// admitted ones disagree in the ordinary case: another profile captures a different stage count, keeps a different
+// number of checkpoints and serves from a different image budget (see ConversationStoreLimits).  Whether such a
+// record exists at all is a structural question and is answered from the record itself; whether this run may serve it
+// is answered from the configured figures and is enforced on every read and every publication.  A recovery pass that
+// mixed the two would delete a history this profile cannot read but the profile that wrote it still can.
+//
+// Retention is bounded by what is shared and physical rather than by what this run admitted:
+//   * the byte figures (image, stream and state) by the one quota every layout's bytes are charged to - a record that
+//     claims more than the whole store could hold has no bytes behind it;
+//   * the token ceiling by that same quota, because a token id is four bytes of a stream charged to it;
+//   * the stage depth by the format's own structural ceiling;
+//   * the two per-element counts (checkpoints and K/V layers) by what a manifest within the configured manifest
+//     ceiling could encode at all - the manifest is read under that ceiling, so nothing wider can be observed.
+// Nothing here widens a parsing ceiling: the manifest, container, stream and image caps stay exactly as configured,
+// and every count is still bounded by the bytes actually left in the file.
+ConversationStoreLimits retention_limits(const ConversationStoreOptions& options,
+                                        const ConversationStoreLimits& configured) {
+    ConversationStoreLimits kept = configured;
+    const uint64_t envelope = options.quota_bytes;
+    kept.max_image_bytes = std::max(configured.max_image_bytes, envelope);
+    kept.max_stream_bytes = std::max(configured.max_stream_bytes, envelope);
+    kept.max_state_bytes = std::max(configured.max_state_bytes, envelope);
+    kept.max_tokens = std::max(configured.max_tokens, envelope / uint64_t(sizeof(int32_t)));
+    kept.max_stages = std::max(configured.max_stages, kFormatMaxStages);
+    kept.max_checkpoints =
+        std::max(configured.max_checkpoints, encoded_ceiling(configured.max_manifest_bytes, kCheckpointEncodedMin));
+    kept.max_kv_layers =
+        std::max(configured.max_kv_layers, encoded_ceiling(configured.max_manifest_bytes, kKvLayerEncodedMin));
+    return kept;
+}
+
 std::vector<ConversationStoreStreamInfo> manifest_stream_infos(const ManifestMeta& meta) {
     std::vector<ConversationStoreStreamInfo> out;
-    out.reserve(meta.streams.size());
     for (size_t i = 0; i < meta.streams.size(); ++i) {
         ConversationStoreStreamInfo info;
         info.id = meta.streams[i].id;

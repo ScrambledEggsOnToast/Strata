@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <functional>
+#include <memory>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -169,6 +170,35 @@ ConversationStoreOptions options_for(const std::string& root, uint64_t quota, ui
     options.max_pending_publishes = 1;
     options.read_budget_bytes = uint64_t(64) << 20;
     return options;
+}
+
+// One serving profile's admitted figures: the stage count and the checkpoint policy it captures and restores under,
+// and the image budget it serves from.  Two profiles that share one store root differ exactly here, and the same
+// root must hold records from both, so this is what a cross-profile recovery test varies.
+ConversationStoreLimits profile_limits(uint32_t stages, uint32_t checkpoints, uint64_t budget) {
+    ConversationStoreLimits limits;
+    limits.max_tokens = uint64_t(1) << 20;
+    limits.max_kv_layers = 4;
+    limits.max_stages = stages;
+    limits.max_checkpoints = checkpoints;
+    limits.max_image_bytes = budget;
+    limits.max_stream_bytes = budget;
+    limits.max_state_bytes = budget;
+    return limits;
+}
+
+// Opens the shared root under one profile's admitted figures and asserts the invariants every switch must satisfy:
+// the store comes up enabled and healthy, every retained head is still there, and not one record was called corrupt
+// or evicted by the difference in figures.  The caller runs its own checks with the returned store open.
+std::unique_ptr<ConversationStore> open_profile(const std::string& root, uint64_t quota,
+                                               const ConversationStoreLimits& limits, uint64_t heads) {
+    auto store = std::make_unique<ConversationStore>(options_for(root, quota, 0), limits);
+    check(store->enabled(), "the shared root opens under this profile's admitted figures");
+    check(store->healthy(), "the profile switch leaves the store healthy");
+    check_eq(store->counters().heads, heads, "every retained head survives the profile switch");
+    check_eq(store->counters().corrupt_records, 0, "a retained head is not called corrupt by a different profile");
+    check_eq(store->counters().evictions, 0, "a profile switch evicts nothing");
+    return store;
 }
 
 // One image with a live record, one pinned checkpoint, two K/V layers and no stage split: enough to exercise every
@@ -437,6 +467,7 @@ void check_layout();
 void check_identity();
 void check_manifest();
 void check_round_trip();
+void check_profile_recovery();
 void check_multi_stage_restore();
 void check_native_split_restore();
 void check_request_specific();
@@ -473,6 +504,7 @@ int main() {
     check_identity();
     check_manifest();
     check_round_trip();
+    check_profile_recovery();
     check_multi_stage_restore();
     check_native_split_restore();
     check_request_specific();
@@ -1044,6 +1076,182 @@ void check_round_trip() {
         store.release_read(9, 1);
         store.close();
     }
+}
+
+// One store root, shared by profiles whose *admitted* figures differ the way two serving profiles' do: the same
+// execution domain and the same physical quota, but a different stage count, a different checkpoint policy and a
+// different image budget.  A record one profile captured must survive every other profile's clean open - retained,
+// indexed, still on disk - because those figures describe what a run may serve, not whether a record exists at all.
+// A profile that cannot serve one refuses the read and refuses to *create* one of that shape; it deletes nothing,
+// reports nothing corrupt, and the profile that wrote the record reads it back byte for byte.  This is the
+// regression for the cross-profile data loss where a two-stage profile, opening a root a three-stage profile had
+// published into, counted every one of those heads as corrupt and discarded them at startup.
+void check_profile_recovery() {
+    TempRoot root;
+    const uint64_t quota = uint64_t(1) << 30;
+    const SavedConversation triple = split_fixture(401, 128, 3);   // the three-stage profile's own image
+    const SavedConversation pair = split_fixture(402, 256, 2);     // the two-stage profile's own image
+    const uint64_t payload = std::max(image_payload_bytes(triple), image_payload_bytes(pair));
+    check(payload > 0, "both fixtures have a payload");
+    if (payload == 0) return;
+    const uint64_t retained_heads = 2;
+
+    // The profile that writes both records: it serves from a budget that covers them, keeps several checkpoints and
+    // splits across the deeper stage count.
+    const ConversationStoreLimits wide = profile_limits(3, 6, payload * 2);
+    // Three ways a later profile differs, each of which used to be read as corruption:
+    //   fewer_stages        a shallower split: the three-stage record is not representable in this run at all;
+    //   fewer_checkpoints   a shorter checkpoint policy: the record keeps more checkpoints than this run admits;
+    //   smaller_budget      a smaller image budget: the record's image is larger than this run's admitted image.
+    const ConversationStoreLimits fewer_stages = profile_limits(2, 6, payload * 2);
+    const ConversationStoreLimits fewer_checkpoints = profile_limits(3, 1, payload * 2);
+    const ConversationStoreLimits smaller_budget = profile_limits(3, 6, payload / 2);
+
+    std::vector<std::string> inventory;
+    std::string catalog_digest;
+    uint64_t triple_head = 0, pair_head = 0;
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, wide, 0);
+        if (!store->enabled()) return;
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(*store, triple, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the three-stage profile stores its own image");
+        triple_head = stored.head_id;
+        check(publish_and_wait(*store, pair, 2, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the three-stage profile stores the two-stage image as well");
+        pair_head = stored.head_id;
+        check(triple_head != 0 && pair_head != 0 && triple_head != pair_head, "both records have their own head");
+        check_eq(store->counters().heads, retained_heads, "the root holds both records");
+        // A clean close: the run intent is cleared and the epoch does not advance, so both records stay eligible for
+        // the profiles that follow.
+        store->close();
+    }
+    inventory = file_inventory(root.path);
+    catalog_digest = file_digest(root.path + "/catalog");
+    check(!inventory.empty(), "the published root holds files");
+
+    // A profile that splits across fewer stages: the three-stage record is foreign to it, and it must be retained
+    // rather than retired as corrupt.  Its own two-stage record still restores, so the switch is not merely refusing
+    // everything.
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, fewer_stages, retained_heads);
+        if (!store->enabled()) return;
+        const ConversationStoreQuery query = query_of(pair, 21, 1);
+        check(!store->matches(query.selector, query.tokens, query.images).empty(),
+              "the two-stage record is still indexed under the shallower split");
+        ConversationStoreManifestInfo info;
+        check(store->manifest_info(triple_head, info) && info.stages == 3,
+              "the foreign three-stage head is still catalog-authorized here");
+        std::string why;
+        check(store->demand(query, why), "the two-stage demand is admitted under the shallower split");
+        ConversationStoreRead read;
+        check(store->wait_ready(21, 1, read, 5000), "the two-stage demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "a record this profile can serve is served");
+        check(read.image && images_equal(*read.image, pair, why), "the served image is byte-identical to its fixture");
+        store->release_read(21, 1);
+        // The three-stage record is the one this profile cannot serve: it is *refused* as beyond this run's stages -
+        // never corrupt, never deleted - and it stays indexed and catalog-authorized above.
+        const ConversationStoreQuery foreign = query_of(triple, 22, 1);
+        check(store->demand(foreign, why), "the demand for the foreign three-stage record is admitted");
+        ConversationStoreRead refused;
+        check(store->wait_ready(22, 1, refused, 5000), "the foreign demand settles");
+        check(refused.status == ConversationStoreReadStatus::refused_limits,
+              "a record this profile cannot represent is refused as such");
+        check(refused.image == nullptr, "the refused foreign record hands out no image");
+        check_eq(store->counters().reads_corrupt, 0, "a stage-count difference is never reported as corruption");
+        check_eq(store->counters().heads, retained_heads, "the refused foreign record is still retained");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the shallower split deleted and wrote nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the shallower split rewrote no authority");
+
+    // A profile with a shorter checkpoint policy: the record is still indexed and matched, and the read is *refused*
+    // as beyond this run's figures - never called corrupt, never deleted.
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, fewer_checkpoints, retained_heads);
+        if (!store->enabled()) return;
+        const ConversationStoreQuery query = query_of(pair, 31, 1);
+        check(!store->matches(query.selector, query.tokens, query.images).empty(),
+              "a record beyond this run's checkpoint policy stays matchable");
+        std::string why;
+        check(store->demand(query, why), "the demand for a record beyond this profile's policy is admitted");
+        ConversationStoreRead read;
+        check(store->wait_ready(31, 1, read, 5000), "the refused demand settles");
+        check(read.status == ConversationStoreReadStatus::refused_limits,
+              "a record beyond this run's admitted figures is refused as such");
+        check(read.image == nullptr, "a refused record hands out no image");
+        check_eq(store->counters().reads_corrupt, 0, "a capacity refusal is never reported as corruption");
+        check_eq(store->counters().heads, retained_heads, "the refused record is still retained");
+        // Publication admission stays strict as well: this run never creates a record of a shape it cannot serve.
+        auto image = std::make_shared<SavedConversation>(triple);
+        ConversationStorePublish request;
+        request.request_id = 32;
+        request.generation = 1;
+        check(!store->publish(image, request, why), "this profile refuses to publish a record it cannot serve");
+        check(store->counters().refused_limits > 0, "the refused publication is counted as a limit refusal");
+        check_eq(store->counters().heads, retained_heads, "the refused publication authorizes no head");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the shorter checkpoint policy deleted and wrote nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the shorter checkpoint policy rewrote no authority");
+
+    // A profile with a smaller image budget: the record's image is larger than this run admits, so the read is
+    // refused for that reason alone - and the record stays on disk, charged to the shared quota, for a profile that
+    // can pay for it.
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, smaller_budget, retained_heads);
+        if (!store->enabled()) return;
+        const ConversationStoreQuery query = query_of(pair, 41, 1);
+        std::string why;
+        check(store->demand(query, why), "the demand for an oversized record is admitted");
+        ConversationStoreRead read;
+        check(store->wait_ready(41, 1, read, 5000), "the oversized demand settles");
+        check(read.status == ConversationStoreReadStatus::refused_limits,
+              "a record larger than this run's image budget is refused as such");
+        check_eq(store->counters().reads_corrupt, 0, "an oversized record is never reported as corruption");
+        check_eq(store->counters().heads, retained_heads, "the oversized record is still retained");
+        check(store->disk_charged_bytes() > 0, "the retained record still holds its charge in the shared quota");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the smaller budget deleted and wrote nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the smaller budget rewrote no authority");
+
+    // Back under the profile that wrote both records: they are still there, still matchable, and both restore byte
+    // for byte - including the three-stage one every other profile above could not serve.
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, wide, retained_heads);
+        if (!store->enabled()) return;
+        ConversationStoreQuery live = query_of(triple, 51, 1);
+        std::vector<ConversationStoreStreamInfo> streams;
+        check(store->manifest_streams(triple_head, streams) && !streams.empty(),
+              "the three-stage record's stream table is still readable");
+        check(!store->matches(live.selector, live.tokens, live.images).empty(),
+              "the three-stage record is still indexed by its own profile");
+        std::string why;
+        check(store->demand(live, why), "the three-stage demand is admitted again");
+        ConversationStoreRead read;
+        check(store->wait_ready(51, 1, read, 5000), "the three-stage demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "the retained three-stage record restores again");
+        check(read.image && images_equal(*read.image, triple, why),
+              "the restored three-stage image is byte-identical to the one that was published");
+        store->release_read(51, 1);
+        ConversationStoreQuery second = query_of(pair, 52, 1);
+        check(store->demand(second, why), "the two-stage demand is admitted again");
+        check(store->wait_ready(52, 1, read, 5000), "the two-stage demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "the retained two-stage record restores again");
+        check(read.image && images_equal(*read.image, pair, why),
+              "the restored two-stage image is byte-identical to the one that was published");
+        store->release_read(52, 1);
+        ConversationStoreManifestInfo info;
+        check(store->manifest_info(triple_head, info) && info.stages == 3 &&
+                  info.cuts.size() == 1 + triple.checkpoints.size(),
+              "the three-stage head is still catalog-authorized with every cut it advertised");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the original profile's own open changed nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the original profile's own open rewrote no authority");
 }
 
 void check_request_specific() {
