@@ -1578,7 +1578,13 @@ envelope is skipped instead of over-committing it. A restore hands the engine an
 it was captured from - the same authorized scope and the same token prefix, checked by hash - so a divergent sibling
 keeps its own head, a one-shot descendant (a `ckpt=0` request) neither consumes nor supersedes its donor, and a stale
 completion cannot overwrite a newer covered descendant. `generation` is assigned at capture ordering, not worker
-completion. The store keeps one admitted writer and coalesces pending publications per bucket.
+completion. The store keeps one admitted writer and coalesces pending publications per bucket. The engine hands the
+queued captures to that writer from its own thread at every seam that can run long with no request boundary in it - a
+prefill chunk boundary, the serving loop's own decode iteration, and the command wait - not only where a request
+begins or ends: a prompt read of tens of seconds, a batch that keeps decoding, or an idle engine all keep the one
+admitted writer busy instead of parking the queue behind the next request. Each seam is CPU-only and non-blocking (a
+reap of finished results plus one handover), and a whole-prompt read with no per-chunk seam on that thread (the
+no-slot bypass, and a layer split with no time budget) keeps the previous once-per-request handover.
 
 *Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the
