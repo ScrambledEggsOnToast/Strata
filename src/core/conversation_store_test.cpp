@@ -488,6 +488,7 @@ void check_identity();
 void check_manifest();
 void check_round_trip();
 void check_profile_recovery();
+void check_full_catalog_profile_restart();
 void check_dedup_beyond_the_quota();
 void check_dense_manifest_workspace_refusal();
 void check_damaged_manifest_is_still_reclaimed();
@@ -536,6 +537,7 @@ int main() {
     check_manifest();
     check_round_trip();
     check_profile_recovery();
+    check_full_catalog_profile_restart();
     check_dedup_beyond_the_quota();
     check_dense_manifest_workspace_refusal();
     check_damaged_manifest_is_still_reclaimed();
@@ -2129,6 +2131,65 @@ void check_pinned_branch() {
           "an older capture can never cover a newer descendant");
     check(store.counters().refusals_stale > 0, "the stale refusal is counted");
     store.close();
+}
+
+void check_full_catalog_profile_restart() {
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 2;
+    const auto limits = profile_limits(3, 2, uint64_t(64) << 20);
+    const auto pair = split_fixture(171, 128, 2);
+    const auto triple = split_fixture(173, 128, 3);
+    ConversationStorePublishResult pair_head, triple_head, replaced;
+    std::string why;
+    {
+        ConversationStore store(options, limits);
+        check(publish_and_wait(store, pair, 1, 1, pair_head), "store the two-stage history");
+        check(publish_and_wait(store, triple, 2, 2, triple_head), "store the three-stage history");
+        auto image = std::make_shared<SavedConversation>(pair);
+        ConversationStorePublish cover;
+        cover.request_id = 3;
+        cover.generation = 3;
+        cover.supersedes = pair_head.head_id;
+        cover.cover = true;
+        check(store.publish(image, cover, why) == kAccepted, "admit replacement in the full shared catalog");
+        check(store.wait_publish(replaced, 5000) &&
+                  replaced.status == ConversationStorePublishStatus::replaced,
+              "replace the pair without borrowing a third head slot");
+        store.close();
+    }
+    const auto restore = [&](ConversationStore& store, const SavedConversation& expected, uint64_t request) {
+        ConversationStoreRead read;
+        check(store.demand(query_of(expected, request, 1), why), "admit retained layout after restart");
+        check(store.wait_ready(request, 1, read, 5000) && read.image &&
+                  images_equal(*read.image, expected, why),
+              "restart restores every stage byte of the retained history");
+        if (read.image) store.confirmed_restore(read.head_id);
+        read.image.reset();
+        store.release_read(request, 1);
+    };
+    {
+        ConversationStore store(options, limits);
+        restore(store, pair, 10);
+        restore(store, triple, 11);
+        // A genuinely new branch must still obey the same two-head bound. The pair is older.
+        const auto incoming = split_fixture(175, 128, 2);
+        ConversationStorePublishResult added;
+        check(publish_and_wait(store, incoming, 12, 4, added), "admit a new branch under bounded eviction");
+        ConversationStoreManifestInfo info;
+        check(!store.manifest_info(replaced.head_id, info), "real head pressure evicts the older unpinned pair");
+        check(store.manifest_info(triple_head.head_id, info), "real head pressure preserves the newer triple");
+        check_eq(store.counters().heads, 2, "shared catalog stays at its head bound");
+        store.close();
+    }
+    {
+        ConversationStore store(options, limits);
+        restore(store, triple, 20);
+        restore(store, split_fixture(175, 128, 2), 21);
+        ConversationStoreManifestInfo info;
+        check(!store.manifest_info(replaced.head_id, info), "restart never resurrects the evicted pair");
+        store.close();
+    }
 }
 
 void check_tight_ram() {
