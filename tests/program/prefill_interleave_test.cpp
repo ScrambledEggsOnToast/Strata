@@ -2,8 +2,10 @@
 // Only GPU work and the clock are synthetic. This proves control-flow reachability, not device/state exactness.
 #include "strata/program/batch_read.hpp"
 #include "strata/program/time_budget.hpp"
+#include "strata/program/serve_controls.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -68,8 +70,9 @@ struct Prefill {
 };
 }
 namespace strata::core {
-struct Progress { struct Busy { void store(bool) { throw std::logic_error("unexpected device callback"); } } busy; };
+struct Progress { struct Busy { void store(bool) {} } busy; };
 inline Progress& progress() { static Progress p; return p; }
+inline void progress_at(const char*) {}
 }
 
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
@@ -84,6 +87,10 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     std::vector<std::unique_ptr<Stage>> stages(split ? 2 : 0);
     strata::program::TimeBudget time_budget(budget_ms, 0.25);
     auto last_decode = Clock::now();
+    double credited_prefill_ms = 0;
+    std::atomic<bool> stop_req{false};
+    const auto credit_service = [] {};
+    const auto retire_stopped = [] { return true; };
     const auto batch_on = [&] { return active; };
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
     const bool retained_prefill = retained_error != nullptr, retained_layer_yields = true;
@@ -92,7 +99,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     struct Group { bool inflight = false; };
     std::vector<Group> pg(2);
     std::string err;
-    const auto score_controls = [](bool) { throw std::logic_error("unexpected retained callback"); };
+    const auto score_controls = [](bool) {};
     const auto pump_mtp = [](bool) -> bool { throw std::logic_error("unexpected retained callback"); };
     const auto pipe_drain = [&] {
         ++result.drains;
@@ -113,8 +120,11 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     double il_ms = 0;
     int yielded_slot = -1;
     std::mutex in_mu;
-    std::vector<std::string> in_lines;
+    std::deque<std::string> in_lines;
     NoControlRequests resident;
+    const auto resident_control = [&](const std::string& command) {
+        if (command.rfind("BSTOP ", 0) == 0) resident.cancel(std::atoi(command.c_str() + 6));
+    };
     const int admit_slot = -1;
     const std::vector<int> req_imgs;
     const std::vector<ConvCheckpoint> checks;

@@ -651,6 +651,28 @@ void test_measured_prefill_quanta_and_bounded_decode_share() {
     busy.decoded(10000, false);
     busy.prefilled(50, 1, 2048);
     require(busy.decode_allowed(0), "decode-only time accumulated background debt");
+
+    TimeBudget warm(100, .25);
+    double warm_service = 0, resident_service = 0;
+    int last_round = 0;
+    for (int admission = 1; admission <= 100; ++admission) {
+        warm.background_work(10); // restoration/admission only: no sp.run
+        warm_service += 10;
+        if (warm.decode_due(0, 2048) && warm.decode_allowed(0)) {
+            warm.decoded(40);
+            resident_service += 40;
+            last_round = admission;
+        }
+        require(admission - last_round <= 1, "warm-only admissions starved resident decoding");
+    }
+    require(resident_service <= warm_service * 3 + 40, "warm service forgave indivisible decode debt");
+    require(warm.prefill_tokens(10000, 2048, 0) == 2048,
+            "restoration time invented a trained bulk-prefill chunk cost");
+    warm.decoded(1000);
+    warm.background_work(-100);
+    warm.background_work(std::numeric_limits<double>::quiet_NaN());
+    warm.background_work(std::numeric_limits<double>::infinity());
+    require(!warm.decode_allowed(0), "invalid service samples forgave outstanding decode debt");
 }
 
 }  // namespace

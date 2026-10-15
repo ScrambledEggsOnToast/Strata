@@ -2105,7 +2105,8 @@ class StrataEngine:
                         if self.gen != born:
                             phase = "none"
                             raise EngineDied("the engine restarted during this batch request")
-                        line = slot_queues[slot].get(timeout=10.0)
+                        # Poll cancellation independently of output, just as _control does.
+                        line = slot_queues[slot].get(timeout=0.5)
                     except queue.Empty:
                         if not self.alive():
                             phase = "none"

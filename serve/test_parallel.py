@@ -992,6 +992,55 @@ class ParallelService(unittest.TestCase):
         self.assertIsNone(self.engine.proc)
 
 
+    def test_quiet_resident_cancel_does_not_wait_for_another_output_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "hold"
+            gate.touch()
+            self.start(2, more=("--hold-replies", str(gate)))
+            engine = self.engine
+            engine.slot_busy[1] = True
+            engine.slot_claims.add(1)  # another owner prevents solo promotion
+            cancel, admitted, stop_written = threading.Event(), threading.Event(), threading.Event()
+            errors, commands = [], []
+            send = engine._send
+
+            def observe(command):
+                send(command)
+                commands.append(command)
+                if command.startswith("BSTOP "):
+                    stop_written.set()
+
+            output = engine.generate_batched(list(b"LONGREPLY"), 64, {}, cancel)
+            def consume():
+                try:
+                    for token in output:
+                        if isinstance(token, int):
+                            cancel.set()  # admission token; the peer withholds every resident BT
+                            admitted.set()
+                except Exception as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=consume, daemon=True)
+            with mock.patch.object(engine, "_send", side_effect=observe):
+                worker.start()
+                try:
+                    self.assertTrue(admitted.wait(2), "the request never reached its resident phase")
+                    self.assertTrue(stop_written.wait(2), "quiet cancellation waited for output or the old ten-second poll")
+                    self.assertTrue(worker.is_alive(), "ownership was released before the peer's terminal")
+                    self.assertIn(0, engine.slot_claims)
+                finally:
+                    gate.unlink(missing_ok=True)  # permit the peer's matching cancellation terminal
+                    worker.join(3)
+                    engine.slot_busy[1] = False
+                    engine.slot_claims.discard(1)
+                    if not worker.is_alive():
+                        output.close()
+            self.assertFalse(worker.is_alive(), "the cancellation lifecycle did not drain")
+            self.assertEqual(errors, [])
+            self.assertNotIn("STOP", commands, "resident cancellation must not stop another owner's prompt read")
+            self.assertNotIn(0, engine.slot_claims)
+            self.assertEqual(self.chat("successor")["choices"][0]["message"]["content"], "ok, done.")
+
     def test_early_close_does_not_release_successor_reservation(self):
         self.start(2)
         engine = self.engine

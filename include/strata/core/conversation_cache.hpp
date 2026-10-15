@@ -6,12 +6,14 @@
 #include "strata/core/checkpoint_bytes.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <utility>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace strata::core {
@@ -107,24 +109,38 @@ struct ConversationKvReuse {
 
 /// Layer-split parking: each running checkpoint holds the first stage's state and, in `stage_parts`, one part per
 /// later stage; a parked conversation keeps them in one image per stage.  `split` MOVES the checkpoints apart (no
-/// running state is copied): the complete ones (a part for each of `stages` stages) into `stage0` and `parts[k]`,
-/// every part carrying the checkpoint's ids / images / LRU stamp, the others aside; `merge` puts them back in their
-/// original order.  merge(split(x)) == x.
+/// running state is copied): selected complete checkpoints into `stage0` and `parts[k]`,
+/// every part carrying ids / images / LRU / pins, the others aside. `merge` restores
+/// the entire original chain, including cuts omitted from the parked image.
 struct ConversationCheckpointSplit {
     std::vector<ConversationCheckpoint> stage0;
     std::vector<std::vector<ConversationCheckpoint>> parts;   ///< [stage][checkpoint]
-    std::vector<ConversationCheckpoint> rest;                 ///< not split (no complete set of stage parts)
+    std::vector<ConversationCheckpoint> rest;                 ///< incomplete or not selected for capture
     std::vector<bool> complete;                               ///< per original position: in stage0/parts or in rest
 };
+enum class ConversationCheckpointRetention { all, parked_history };
 
 inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<ConversationCheckpoint>&& checks,
-                                                                  size_t stages) {
+                                                                  size_t stages, ConversationCheckpointRetention retention) {
     ConversationCheckpointSplit out;
     out.parts.resize(stages);
     out.complete.reserve(checks.size());
+    size_t root = checks.size(), newest = checks.size();
+    if (retention == ConversationCheckpointRetention::parked_history) {
+        for (size_t i = 0; i < checks.size(); ++i) {
+            if (checks[i].stage_parts.size() != stages) continue;
+            if (root == checks.size()) root = i;
+            if (newest == checks.size() || checks[i].ids.size() >= checks[newest].ids.size()) newest = i;
+        }
+    }
     size_t whole = 0;
-    for (const auto& c : checks) {
-        const bool complete = c.stage_parts.size() == stages;
+    for (size_t i = 0; i < checks.size(); ++i) {
+        const auto& c = checks[i];
+        // Keep the root, latest cut and every explicit pin in RAM parking.
+        // Older unpinned rewind cuts stay working but need not multiply across
+        // every queued history. This never manufactures a recurrent state.
+        const bool complete = c.stage_parts.size() == stages &&
+            (retention == ConversationCheckpointRetention::all || i == root || i == newest || c.pinned);
         out.complete.push_back(complete);
         whole += complete ? 1 : 0;
     }
@@ -133,8 +149,9 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
     for (auto& parts : out.parts) parts.reserve(whole);
     // Allocate and copy identity metadata before moving any running state.
     // If allocation fails, every input checkpoint remains usable by the caller.
-    for (const auto& c : checks) {
-        if (c.stage_parts.size() != stages) continue;
+    for (size_t i = 0; i < checks.size(); ++i) {
+        const auto& c = checks[i];
+        if (!out.complete[i]) continue;
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
@@ -142,8 +159,9 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         }
     }
     size_t w = 0;
-    for (auto& c : checks) {
-        if (c.stage_parts.size() != stages) { out.rest.push_back(std::move(c)); continue; }
+    for (size_t i = 0; i < checks.size(); ++i) {
+        auto& c = checks[i];
+        if (!out.complete[i]) { out.rest.push_back(std::move(c)); continue; }
         for (size_t k = 0; k < stages; ++k) {
             auto& dst = out.parts[k][w];
             auto& src = c.stage_parts[k];
@@ -319,12 +337,13 @@ public:
         return out;
     }
 
-    // Reserve before allocating a snapshot. held is an incoming image removed
-    // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
+    // Admit capture bytes, not a published entry. A full entry table must not
+    // evict a queued history before capture can fail or replace its older image.
+    // held is a taken incoming image, still alive and fully charged during capture.
+    bool reserve_snapshot(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+        while (!entries_.empty() && bytes_ > budget_ - held - incoming) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             if (!evict_oldest()) return false;
@@ -332,11 +351,8 @@ public:
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    // Release the oldest unpinned image for byte/physical-memory pressure.
+    // Buffer extents are released before the caller resamples available memory.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
@@ -360,52 +376,98 @@ public:
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
 
-    // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
-    // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
-    // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
-    // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
-    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
-    // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
-    // shares the system prompt's root with it), is kept.  Returns how many were dropped.
-    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
-                           const ConversationScope& scope) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
-        size_t dropped = 0;
-        for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.scope.matches(scope) && e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                ++dropped;
-                continue;
-            }
-            ++i;
-        }
-        superseded_ += dropped;
-        return dropped;
-    }
+    // Latest-history retention, not state-equivalent deduplication: an older
+    // unpinned rewind cut may cold-read after an exact live-prefix extension.
+    // Divergent branches and every explicitly pinned cut remain protected.
     size_t superseded() const { return superseded_; }
 
     bool put(SavedConversation&& image, size_t held = 0) {
+        static_assert(std::is_nothrow_move_constructible_v<SavedConversation>);
+        static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
+        static_assert(std::is_nothrow_destructible_v<SavedConversation>);
         const size_t n = image.bytes();
         if (!enabled() || !image.scope.valid() || held > budget_ || n > budget_ - held) return false;
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, image.scope);
-        if (!make_room(n, held)) return false;
+        const size_t limit = budget_ - held - n;
+        size_t count = entries_.size(), remaining = bytes_, replaced = 0, victims = 0;
+        for (const auto& old : entries_) if (replaces(old, image)) {
+            --count;
+            remaining -= old.bytes();
+            ++replaced;
+        }
+        const size_t reuse_bytes = reuse_.bytes();
+        const bool discard_reuse = remaining > limit || reuse_bytes > limit - remaining;
+        const size_t payload_limit = discard_reuse ? limit : limit - reuse_bytes;
+        for (const auto& old : entries_) {
+            if (count < slots_ && remaining <= payload_limit) break;
+            if (!old.pinned() && !replaces(old, image)) {
+                --count;
+                remaining -= old.bytes();
+                ++victims;
+            }
+        }
+        if (count >= slots_ || remaining > payload_limit) return false;
+
+        // Allocate/construct publication storage before destroying any old image.
+        // noexcept movement keeps the candidate unchanged if deque growth fails.
+        const size_t old_count = entries_.size();
         entries_.push_back(std::move(image));
-        bytes_ += n;
+        const auto& next = entries_.back();
+        size_t write = 0, ordinary_left = victims;
+        // Compact old entries without erase/pop: next stays at its stable final
+        // index until every comparison is done, and each survivor moves at most once.
+        for (size_t read = 0; read < old_count; ++read) {
+            const auto& old = entries_[read];
+            if (replaces(old, next)) continue;
+            if (ordinary_left && !old.pinned()) { --ordinary_left; continue; }
+            if (write != read) entries_[write] = std::move(entries_[read]);
+            ++write;
+        }
+        assert(ordinary_left == 0);
+        if (write != old_count) entries_[write] = std::move(entries_.back());
+        while (entries_.size() > write + 1) entries_.pop_back();
+        if (discard_reuse) reuse_ = {};
+        bytes_ = remaining + n;
+        superseded_ += replaced;
+        evictions_ += victims;
         return true;
     }
 
 private:
+    static bool same_pin(const ConversationCheckpoint& a, const ConversationCheckpoint& b) noexcept {
+        if (a.pinned != b.pinned || a.ids != b.ids || a.imgs != b.imgs ||
+            a.stage_parts.size() != b.stage_parts.size()) return false;
+        for (size_t i = 0; i < a.stage_parts.size(); ++i)
+            if (!same_pin(a.stage_parts[i], b.stage_parts[i])) return false;
+        return true;
+    }
+    static bool covered_live(const SavedConversation& old, const SavedConversation& next) noexcept {
+        return !old.live.ids.empty() &&
+            ((old.live.ids == next.live.ids && old.live.imgs == next.live.imgs) ||
+             conversation_prefix(old.live, next.live.ids, next.live.imgs) > 0);
+    }
+    static bool compatible_pins(const SavedConversation& old, const SavedConversation& next) noexcept {
+        if (!covered_live(old, next) || old.geometry != next.geometry || old.layer_lo != next.layer_lo ||
+            old.layer_hi != next.layer_hi || old.cvec != next.cvec || old.kv.size() != next.kv.size() ||
+            old.stage_images.size() != next.stage_images.size()) return false;
+        for (size_t i = 0; i < old.kv.size(); ++i) {
+            const auto& a = old.kv[i];
+            const auto& b = next.kv[i];
+            if (a.format != b.format || a.heads != b.heads || a.head_dim != b.head_dim ||
+                a.page_size != b.page_size || a.idx_dim != b.idx_dim) return false;
+        }
+        for (const auto& pin : old.checkpoints) {
+            if (!pin.pinned) continue;
+            if (std::none_of(next.checkpoints.begin(), next.checkpoints.end(),
+                             [&](const auto& candidate) { return same_pin(pin, candidate); })) return false;
+        }
+        for (size_t i = 0; i < old.stage_images.size(); ++i)
+            if (!compatible_pins(old.stage_images[i], next.stage_images[i])) return false;
+        return true;
+    }
+    static bool replaces(const SavedConversation& old, const SavedConversation& next) noexcept {
+        return old.scope.matches(next.scope) && compatible_pins(old, next);
+    }
+
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first

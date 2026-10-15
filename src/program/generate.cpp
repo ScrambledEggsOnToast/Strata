@@ -71,6 +71,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/batch_read.hpp"
+#include "strata/program/serve_controls.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/score_protocol.hpp"
 #include "strata/program/readout_reference.hpp"
@@ -10837,11 +10838,6 @@ int main(int argc, char** argv) {
             }
             const auto park_t0 = Clock::now();
             PrefixWork park_work = session_work((int64_t) live.size(), true);
-            // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
-            // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached, live_scope))
-                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -10851,7 +10847,8 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
             strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st,
+                strata::core::ConversationCheckpointRetention::parked_history); // allocation failure leaves checks whole
             struct MergeBack {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
@@ -10907,13 +10904,11 @@ int main(int argc, char** argv) {
                 if (estimate > SIZE_MAX - sizeof(strata::core::PrefixBackingLedger)) return true;
                 estimate += sizeof(strata::core::PrefixBackingLedger);
             }
-            // A park carrying its own retained K/V replaces memory the cache
-            // already held, so capacity is make_room's call - it runs next either
-            // way, and put()'s accounting still bounds the budget. The with-reuse
-            // estimate must stay uncapped: it counts the retained buffers'
-            // capacity and directories, and put() charges that same true size -
-            // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            // Reserve the full capture footprint, including retained buffers and
+            // the held incoming image. Entry replacement happens only after a
+            // valid capture is ready to publish; resource-pressure eviction here
+            // remains permitted and is not a transactional-capture guarantee.
+            if (!conversations.reserve_snapshot(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -11035,7 +11030,11 @@ int main(int argc, char** argv) {
                         (unsigned long long) r.duplicate_bytes, (unsigned long long) r.aliased_bytes);
                 };
                 if (extent_probe_on && held_image) observe("held-incoming", 0, image, *held_image);
+                const size_t previous_superseded = conversations.superseded();
                 const bool stored = conversations.put(std::move(image), held);
+                if (const size_t dropped = conversations.superseded() - previous_superseded)
+                    std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                                         "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
                 if (extent_probe_on && stored) {
                     conversations.for_each_image([&](size_t newest, const auto& current) {
                         if (newest + 1 != conversations.size()) return;
@@ -13205,6 +13204,7 @@ int main(int argc, char** argv) {
         };
         strata::program::TimeBudget time_budget(o.foreground_budget_ms, o.background_share);
         auto last_decode = Clock::now();
+        double credited_prefill_ms = 0, resident_round_ms = 0;
         // A complete round uses the selected scheduler, including pipelined groups,
         // then drains every consumer before prefill may reuse verifier/cache scratch.
         auto decode_round = [&](bool charge = true) -> bool {
@@ -13222,8 +13222,11 @@ int main(int argc, char** argv) {
                 bounded_round = false;
             } else if (!batch_step()) return false;
             last_decode = Clock::now();
-            if (time_budget.enabled())
-                time_budget.decoded(std::chrono::duration<double, std::milli>(last_decode - begin).count(), charge);
+            if (time_budget.enabled()) {
+                const double wall_ms = std::chrono::duration<double, std::milli>(last_decode - begin).count();
+                resident_round_ms += wall_ms;
+                time_budget.decoded(wall_ms, charge);
+            }
             return true;
         };
         auto resident_control = [&](const std::string& command) {
@@ -13253,15 +13256,31 @@ int main(int argc, char** argv) {
                 std::string control;
                 {
                     std::lock_guard<std::mutex> lock(in_mu);
-                    if (in_lines.empty()) break;
-                    const auto& front = in_lines.front();
-                    if (front.rfind("BSTOP ", 0) != 0 && front.rfind("BPRIORITY ", 0) != 0 &&
-                        (!consume_yield || front.rfind("BYIELD", 0) != 0)) break;
-                    control = std::move(in_lines.front());
-                    in_lines.pop_front();
+                    if (!strata::program::pop_control_prefix(in_lines, control, consume_yield)) break;
                 }
                 resident_control(control);
             }
+        };
+        auto retire_stopped = [&]() -> bool {
+            if (std::none_of(bs.begin(), bs.end(), [](const BSlot& sl) { return sl.active && sl.stop; })) return true;
+            // Finish existing consumers without launching a replacement packet.
+            // Drain may already have emitted a terminal, so rescan afterward.
+            if (pipe_inflight()) {
+                const auto begin = time_budget.enabled() ? Clock::now() : Clock::time_point{};
+                if (!pipe_drain()) return false;
+                if (time_budget.enabled())
+                    resident_round_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+            }
+            for (int b = 0; b < (int)bs.size(); ++b) {
+                const auto& sl = bs[(size_t)b];
+                if (!sl.active || !sl.stop) continue;
+                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                if (split_batch_mtp || batch_mtp_pipeline) print_mtp_done(b, "cancel");
+                else std::printf("BDONE %d %lld cancel %.1f\n", b, (long long)sl.produced,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+            }
+            std::fflush(stdout);
+            return true;
         };
         auto score_peer_round = [&](std::string& why) {
             score_controls();
@@ -13378,6 +13397,25 @@ int main(int argc, char** argv) {
         std::vector<float> score_values;
         bool reference_pending = !o.score_reference.empty();
         for (;;) {
+            if (time_budget.enabled()) {
+                score_controls();
+                if (!retire_stopped()) return 1;
+                bool generation_waiting = false;
+                {
+                    std::lock_guard<std::mutex> lock(in_mu);
+                    if (!in_lines.empty()) {
+                        const auto& next = in_lines.front();
+                        generation_waiting = next.rfind("GEN ", 0) == 0 || next.rfind("GENI ", 0) == 0 ||
+                                             next.rfind("BGEN ", 0) == 0 || next.rfind("BGENI ", 0) == 0;
+                    }
+                }
+                const double age = std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                // One charged opportunity, then admit the queued request. The
+                // prior admission has published and no final_R borrow survives.
+                if (generation_waiting && batch_on() &&
+                    time_budget.decode_due(age, std::max<int64_t>(sp.chunk(), 1)) &&
+                    time_budget.decode_allowed(0) && !decode_round(true)) return 1;
+            }
             if (reference_pending) {
                 line = "GEN 1 ckpt=0 ";
                 for (size_t i = 0; i < o.tokens.size(); ++i)
@@ -13401,6 +13439,27 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            const bool budget_service = time_budget.enabled() &&
+                (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0 ||
+                 line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0);
+            auto service_at = budget_service ? Clock::now() : Clock::time_point{};
+            double prefill_mark = credited_prefill_ms, resident_mark = resident_round_ms;
+            auto credit_service = [&] {
+                if (!budget_service) return;
+                const auto now = Clock::now();
+                const double elapsed = std::chrono::duration<double, std::milli>(now - service_at).count();
+                time_budget.background_work(std::max(0.0, elapsed - (credited_prefill_ms - prefill_mark) -
+                                                                  (resident_round_ms - resident_mark)));
+                service_at = now;
+                prefill_mark = credited_prefill_ms;
+                resident_mark = resident_round_ms;
+            };
+            // Every continue/error/admission path accounts non-overlapping work;
+            // never include idle input waiting or count a resident round twice.
+            struct CreditOnExit {
+                decltype(credit_service)& account;
+                ~CreditOnExit() { account(); }
+            } credit_on_exit{credit_service};
             if (std::getenv("STRATA_BATCH_DIAGNOSTICS") && line == "BINERT") {
                 if (batch_on() || piped || bs.empty()) {
                     std::printf("ERR BINERT: requires idle single-stage resident slots\n");
@@ -14449,16 +14508,24 @@ int main(int argc, char** argv) {
                     return 1;
                 } else {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
-                    // a read that gave way, the same request again (into its own slot): on with it - its segments and
-                    // checkpoints as if it had not stopped
-                    if (yielded_source == slot_source) {
+                    // Keep this owner's valid rewind/pin cuts on a live hit too,
+                    // not only when resuming a yielded prompt. Never import a
+                    // checkpoint beyond the restored cut or from another branch.
+                    if (yielded_source == slot_source)
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
-                    }
+                    for (const ConvCheckpoint& c : bs[(size_t)slot_source].checks)
+                        if ((int64_t)c.ids.size() <= slot_tokens &&
+                            strata::core::conversation_prefix(c, ids, req_imgs) > 0) checks.push_back(c);
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
-                        checks.push_back(*slot_ck);   // the main session's chain has it now
-                        checks.back().used = ++check_clock;
+                        auto found = std::find_if(checks.begin(), checks.end(), [&](const auto& c) {
+                            return c.ids == slot_ck->ids && c.imgs == slot_ck->imgs;
+                        });
+                        if (found == checks.end()) {
+                            checks.push_back(*slot_ck);
+                            found = checks.end() - 1;
+                        }
+                        found->used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
@@ -15032,6 +15099,25 @@ int main(int argc, char** argv) {
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+            auto prompt_boundary = [&](std::string& e) -> bool {
+                if (!time_budget.enabled()) return true;
+                credit_service();
+                const auto begin = Clock::now();
+                score_controls(false); // a BYIELD stays ordered until it can park
+                const bool was_reading = in_prompt_read;
+                in_prompt_read = true;
+                bool okay = retire_stopped();
+                const double age = std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                if (okay && !stop_req.load() && batch_on() &&
+                    time_budget.decode_due(age, std::max<int64_t>(sp.chunk(), 1)) &&
+                    time_budget.decode_allowed(0)) okay = decode_round();
+                in_prompt_read = was_reading;
+                il_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+                strata::core::progress().busy.store(true);
+                strata::core::progress_at("reading the prompt");
+                if (!okay) { batch_fatal = true; e = "a resident control/decode boundary failed"; }
+                return okay;
+            };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
@@ -15104,10 +15190,8 @@ int main(int argc, char** argv) {
                     const auto age = [&] {
                         return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
                     };
-                    if (time_budget.enabled() && batch_on() && time_budget.decode_due(age(), C) &&
-                        time_budget.decode_allowed(0)) {
-                        if (!decode_round()) { batch_fatal = true; e = "a decode round failed"; return false; }
-                    }
+                    if (!prompt_boundary(e)) return false;
+                    if (stop_req.load()) { e = "cancelled"; return false; }
                     const int64_t quantum = time_budget.enabled()
                         ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
                         : std::min(C, b0 - q);
@@ -15116,32 +15200,30 @@ int main(int argc, char** argv) {
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     if (time_budget.enabled()) {
-                        time_budget.prefilled(chunk_wall_ms, quantum / C + (quantum % C != 0), C);
+                        if (quantum % C == 0) time_budget.prefilled(chunk_wall_ms, quantum / C, C);
+                        else time_budget.background_work(chunk_wall_ms); // a tail cannot train a full chunk cheaper
+                        credited_prefill_ms += chunk_wall_ms;
                         std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
                                              "estimate_ms=%.3f budget_ms=%.3f%s\n",
                                      (long long) q, (long long) r, (long long) C, chunk_wall_ms,
                                      time_budget.chunk_ms(), o.foreground_budget_ms,
-                                     time_budget.chunk_ms() > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
+                                     quantum <= C && chunk_wall_ms > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
                     }
                     q = r;
                     if (q >= b0) continue;
-                    int ys = -1;
-                    {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
-                        std::lock_guard<std::mutex> lk(in_mu);
-                        for (auto it = in_lines.begin(); it != in_lines.end();) {
-                            if (it->rfind("BSTOP ", 0) == 0) {
-                                const int b = std::atoi(it->c_str() + 6);
-                                resident.cancel(b);
-                                it = in_lines.erase(it);
-                            } else if (it->rfind("BYIELD ", 0) == 0) {
-                                ys = std::atoi(it->c_str() + 7);
-                                it = in_lines.erase(it);
-                            } else {
-                                ++it;
-                            }
+                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    for (;;) {
+                        std::string control;
+                        {
+                            std::lock_guard<std::mutex> lk(in_mu);
+                            if (!strata::program::pop_control_prefix(in_lines, control, true)) break;
                         }
-                    }
-                    if (ys >= 0) {
+                        if (control.rfind("BYIELD ", 0) != 0) {
+                            resident_control(control);
+                            continue;
+                        }
+                        const int ys = std::atoi(control.c_str() + 7);
+                        if (ys < 0) continue;
                         // only where the rest is read the same way after it (more than a chunk and more than a short
                         // read left), text only, and into a slot that is not decoding
                         const bool can = resident.available(ys) &&
@@ -15173,12 +15255,14 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
+                    if (!retire_stopped()) { batch_fatal = true; e = "resident cancellation failed"; return false; }
+                    strata::core::progress().busy.store(true);
                     if (!batch_on() || (!time_budget.enabled() && decode_share <= 0.0)) continue;
                     const double budget = decode_share * chunk_wall_ms;
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     double decoded_ms = 0;
-                    while (batch_on() && (time_budget.enabled()
+                    while (batch_on() && !stop_req.load() && (time_budget.enabled()
                         ? time_budget.decode_due(age(), C) && time_budget.decode_allowed(0)
                         : decoded_ms == 0 || decoded_ms < budget)) {
                         if (!decode_round()) { in_prompt_read = false; batch_fatal = true; e = "a decode round failed"; return false; }
@@ -15347,6 +15431,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                // read_windows has consumed its residual and restored sampling;
+                // read_part has drained its final quantum. No borrowed final_R
+                // for the first generated token exists at this boundary.
+                if (!prompt_boundary(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                if (stop_req.load()) { cancelled = true; break; }
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());

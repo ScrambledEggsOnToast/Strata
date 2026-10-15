@@ -32,7 +32,12 @@ public:
         // A short request's smaller admitted chunk cannot train a larger chunk's cost downward.
         chunk_ms_ = std::max(wall_ms / (double) chunks, chunk_tokens_ == memory_chunk ? chunk_ms_ * 0.9 : 0.0);
         chunk_tokens_ = memory_chunk;
-        // Bounded credit: idle/background-only work cannot buy an unbounded decode burst.
+        background_work(wall_ms);
+    }
+    // Restore, admission and short-window service earn the same bounded credit,
+    // without falsely training the cost of a memory-admitted prefill chunk.
+    void background_work(double wall_ms) {
+        if (!enabled() || !std::isfinite(wall_ms) || wall_ms <= 0) return;
         decode_credit_ms_ = std::min(foreground_ms_, decode_credit_ms_ +
                                     wall_ms * (1.0 - background_share_) / background_share_);
     }

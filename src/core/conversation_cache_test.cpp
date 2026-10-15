@@ -371,7 +371,7 @@ int main() {
         check(cache.retained_bytes() == retained && cache.size() == 1 && cache.evictions() == 0,
               "optional reuse admission does not evict or release anything");
         check(!cache.can_fit(SIZE_MAX) && !cache.can_fit(1,SIZE_MAX),"non-mutating reservation rejects overflow");
-        check(cache.make_room(parked), "reservation can discard optional active buffers");
+        check(cache.reserve_snapshot(parked), "reservation can discard optional active buffers");
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
@@ -447,8 +447,6 @@ int main() {
         check(cache.best(std::vector<int64_t>{1, 2}, {}, true, test_scope).tokens == 0, "equal-length checkpoint cannot consume last token");
         check(cache.best(std::vector<int64_t>{1}, {}, true, test_scope).tokens == 0, "short prompt cannot match");
         check(cache.best(std::vector<int64_t>{}, {}, true, test_scope).tokens == 0, "empty prompt cannot match");
-        cache.put(image({1, 2, 3}));
-        check(cache.best(a, {}, true, test_scope).index == 1, "ties prefer most recently parked");
     }
     {
         auto s = image({1, 2, 3});
@@ -467,21 +465,137 @@ int main() {
         cache.put(image({1,2,3})); cache.put(image({9,8,7}));
         check(cache.bytes() == one*2, "budget holds two exact-sized images");
         auto held = cache.take(cache.best(a, {}, true, test_scope).index);
-        check(cache.make_room(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
+        check(cache.reserve_snapshot(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
         check(cache.size() == 0, "in-flight reservation evicts otherwise fitting B");
         check(cache.put(image({5,6,7}), held.bytes()), "insert with in-flight accounting");
         check(cache.bytes()+held.bytes() <= one*2, "exchange obeys byte budget");
-        check(!cache.make_room(one+1, one), "oversized exchange rejected");
+        check(!cache.reserve_snapshot(one+1, one), "oversized exchange rejected");
         check(cache.size() == 1, "oversized snapshot does not evict useful entries");
         auto huge = image({1}); huge.live.gdn.resize(one*3);
         check(!cache.put(std::move(huge)), "oversized image rejected");
         check(cache.size() == 1, "oversized put leaves cache unchanged");
-        check(!cache.make_room(0, one*2+1), "held larger than budget cannot underflow");
+        check(!cache.reserve_snapshot(0, one*2+1), "held larger than budget cannot underflow");
     }
     {
-        // #342: MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
-        // (its reply as generated, which the next request re-rendered) with a chain that holds that turn's
-        // boundary checkpoint; the copy a turn back adds only that stale tail and is dropped, so MAIN survives.
+        ConversationCache cache(1 << 20, 4);
+        auto first = image({1, 2, 3, 8});
+        auto root = first.live;
+        root.ids = {1, 2};
+        first.checkpoints = {root};
+        auto second = image({1, 2, 4, 9});
+        second.checkpoints = {root};
+        check(cache.put(std::move(first)) && cache.put(std::move(second)), "park no-ID root siblings");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 8, 10}, {}, true, test_scope).tokens == 4 &&
+              cache.best(std::vector<int32_t>{1, 2, 4, 9, 10}, {}, true, test_scope).tokens == 4,
+              "unrelated histories sharing their sole root retain their own complete prefixes");
+    }
+    {
+        ConversationCache cache(1 << 20, 1);
+        auto first = image({1, 2, 3, 8});
+        auto pin = first.live;
+        pin.ids = {1, 2, 3};
+        pin.pinned = true;
+        first.checkpoints = {pin};
+        check(cache.put(std::move(first)), "park explicitly pinned history");
+        auto second = image({1, 2, 3, 8, 9});
+        pin.pinned = false;
+        second.checkpoints = {pin};
+        check(!cache.put(std::move(second)), "a matching but unpinned cut cannot displace the only pinned history");
+        bool preserved = false;
+        cache.for_each_image([&](size_t, const SavedConversation& saved) { preserved = saved.pinned(); });
+        check(preserved && cache.best(std::vector<int32_t>{1, 2, 3, 7}, {}, true, test_scope).tokens == 3,
+              "refused replacement leaves the explicitly pinned prefix available");
+    }
+    {
+        ConversationCache cache(1 << 20, 2);
+        check(cache.put(image({9, 8, 7})) && cache.put(image({1, 2, 3})), "fill the published entry table");
+        auto next = image({1, 2, 3, 4});
+        check(cache.reserve_snapshot(next.bytes()), "admit capture bytes at a full entry limit");
+        check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3 &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 5}, {}, true, test_scope).tokens == 3,
+              "a failed or abandoned capture has not spent a published history entry");
+        check(cache.put(std::move(next)), "publish a checkpoint-free prefix extension");
+        check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3 &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true, test_scope).tokens == 4,
+              "replacement retains the unrelated waiting history and advances its own prefix");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 99}, {}, true, test_scope).tokens == 0,
+              "an old unpinned fork cold-reads rather than fabricating a recurrent checkpoint");
+        check(cache.put(image({1, 2, 3, 4})), "publish an equal live snapshot");
+        check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3,
+              "equal live snapshots do not consume the unrelated history's entry");
+    }
+    {
+        ConversationCache cache(1 << 20, 1);
+        auto first = image({1, 2, 3, 8});
+        auto pin = first.live;
+        pin.ids = {1, 2, 3}; pin.pinned = true;
+        first.checkpoints = {pin};
+        check(cache.put(std::move(first)), "fill a pinned entry table");
+        auto next = image({1, 2, 3, 8, 9});
+        next.checkpoints = {pin};
+        check(cache.put(std::move(next)), "a full pinned table permits a pin-preserving lineage replacement");
+        bool kept_pin = false;
+        cache.for_each_image([&](size_t, const SavedConversation& saved) { kept_pin = saved.pinned(); });
+        check(kept_pin && cache.best(std::vector<int32_t>{1, 2, 3, 99}, {}, true, test_scope).tokens == 3 &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 8, 9, 99}, {}, true, test_scope).tokens == 5,
+              "replacement retains the real pinned cut and the latest complete history");
+    }
+    for (int change = 0; change < 10; ++change) {
+        ConversationCache cache(1 << 20, 4);
+        auto old = image({1, 2, 3, 4}), next = image({1, 2, 3, 4, 5});
+        std::vector<ConversationImageKey> query_images;
+        switch (change) {
+        case 0: next.scope = ConversationScope{{2}}; break;
+        case 1: next.cvec = false; break;
+        case 2:
+            old.live.imgs = {{1, 42}}; next.live.imgs = {{1, 43}};
+            query_images = old.live.imgs; break;
+        case 3: next.live.imgs = {{1, 42}}; break;
+        case 4: next.geometry[0] = 1; break;
+        case 5: next.layer_hi = 1; break;
+        case 6:
+            old.kv.resize(1); next.kv.resize(1);
+            old.kv[0].format = 1; next.kv[0].format = 2; break;
+        case 7: next.stage_images.push_back(image({1, 2, 3, 4, 5})); break;
+        case 8:
+            old.stage_images = {image({1, 2, 3, 4}), image({1, 2, 3, 4})};
+            next.stage_images = {image({1, 2, 3, 4, 5}), image({1, 2, 3, 4, 5})};
+            old.stage_images[0].layer_hi = next.stage_images[1].layer_hi = 1;
+            old.stage_images[1].layer_hi = next.stage_images[0].layer_hi = 2; break;
+        case 9: next.live.ids.back() = 99; next.live.ids[3] = 8; break;
+        }
+        check(cache.put(std::move(old)) && cache.put(std::move(next)), "park non-equivalent replacement candidates");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 99}, query_images, true, test_scope).tokens == 4,
+              "scope, mode, image, shape, stage and branch mismatches preserve the earlier history");
+    }
+    {
+        ConversationCache cache(1 << 20, 1);
+        auto old = image({1, 2, 3, 4}), next = image({1, 2, 3, 4, 5});
+        next.live.imgs = {{4, 42}}; // an image after the old cut does not change that prefix
+        check(cache.put(std::move(old)) && cache.put(std::move(next)), "later images permit a complete prefix extension");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 5, 99}, {{4, 42}}, true, test_scope).tokens == 5,
+              "the newly extended image history restores its actual image identity");
+    }
+    for (int missing = 0; missing < 4; ++missing) {
+        ConversationCache cache(1 << 20, 1);
+        auto old = image({1, 2, 3, 4}), next = image({1, 2, 3, 4, 5});
+        auto pin = old.live; pin.ids = {1, 2, 3}; pin.pinned = true;
+        old.checkpoints = next.checkpoints = {pin};
+        old.stage_images.push_back(image({1, 2, 3, 4}));
+        next.stage_images.push_back(image({1, 2, 3, 4, 5}));
+        old.stage_images[0].scope = next.stage_images[0].scope = {};
+        old.stage_images[0].checkpoints = next.stage_images[0].checkpoints = {pin};
+        if (missing == 1) next.checkpoints.clear(); // live prefix alone is not a retained pin
+        if (missing == 2) next.stage_images[0].checkpoints.clear();
+        if (missing == 3) next.stage_images[0].checkpoints[0].pinned = false;
+        check(cache.put(std::move(old)), "park a pinned layered history");
+        check(cache.put(std::move(next)) == (missing == 0), "every stage must preserve the explicit pinned cut");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 99}, {}, true, test_scope).tokens == 3,
+              "layered replacement or refusal leaves a real pinned prefix available");
+    }
+    {
+        // A genuinely appended history replaces its older live-prefix snapshots,
+        // leaving the unrelated parent reusable even after many child turns.
         auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
         auto with = [](std::vector<int32_t> prefix, std::initializer_list<int32_t> more) {
             prefix.insert(prefix.end(), more); return prefix;
@@ -493,26 +607,23 @@ int main() {
         const size_t big = 1 << 20;
         ConversationCache cache(big, 4);
         check(cache.put(std::move(main)), "park MAIN");
-        std::vector<int32_t> history = with(root, {20});         // SUB's conversation so far, re-rendered
+        std::vector<int32_t> history = with(root, {20});
         std::vector<ConversationCheckpoint> chain = {cp(root)};
         for (int turn = 1; turn <= 9; ++turn) {
             chain.push_back(cp(history));                        // the turn boundary the next request resumes from
             SavedConversation sub = image({});
-            sub.live.ids = with(history, {900, (int32_t) turn});   // + the reply with its thinking (stale tail)
+            sub.live.ids = with(history, {900, (int32_t) turn});
             sub.checkpoints = chain;
             check(cache.put(std::move(sub)), "park SUB turn");
-            check(cache.size() <= 2, "one parked copy of SUB at a time");
-            history = with(history, {30, (int32_t) turn});       // the reply as the next request renders it
+            history = with(history, {900, (int32_t) turn});
         }
-        check(cache.evictions() == 0 && cache.superseded() == 8, "8 superseded copies dropped, nothing evicted");
         const auto m = cache.best(with(with(root, {10, 11, 12}), {13, 14, 15}), {}, true, test_scope);
         check(m.tokens == 9 && m.live, "MAIN still restores in full");
         const auto s = cache.best(with(history, {40}), {}, true, test_scope);
-        check(s.tokens == (int64_t) history.size() - 2, "SUB resumes from its last turn boundary");
+        check(s.tokens == (int64_t) history.size() && s.live, "SUB resumes its complete appended history");
     }
     {
-        // what is NOT superseded: another conversation sharing only the root, an entry without checkpoints, the
-        // other steering mode, a branch whose deepest checkpoint the new chain does not hold
+        // Shared roots and shorter rewind cuts do not replace complete divergent histories.
         auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
         ConversationCache cache(1 << 20, 8);
         SavedConversation other = image({1, 2, 3, 4, 50, 51, 52});
@@ -531,13 +642,15 @@ int main() {
         check(cache.size() == 5 && cache.superseded() == 0, "none of them is superseded");
         SavedConversation same_state = image({1, 2, 3, 4, 60, 70});   // live equal to the branch's deepest point
         same_state.checkpoints = {cp({1, 2, 3, 4})};
-        check(cache.put(std::move(same_state)) && cache.superseded() == 1 && cache.size() == 5,
-              "the live state equal to an entry's deepest checkpoint supersedes it");
+        check(cache.put(std::move(same_state)), "park a shorter rewind branch");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 60, 70, 71, 99}, {}, true, test_scope).tokens == 7,
+              "a rewind matching only an older checkpoint preserves the longer branch");
         SavedConversation huge = image({1, 2, 3, 4, 60, 80});
         huge.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
         huge.live.gdn.resize(2 << 20);
-        check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
-              "an oversized put drops nothing");
+        check(!cache.put(std::move(huge)) &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 4, 60, 80, 81, 99}, {}, true, test_scope).tokens == 7,
+              "oversized replacement preserves the useful complete branch");
     }
     {
         ConversationCache disabled(0,4), no_slots(1024,0);
@@ -584,7 +697,7 @@ int main() {
         const auto original = checks;
         const uint8_t* gdn0 = checks[0].gdn.data();
         const uint8_t* part1 = checks[2].stage_parts[1].gdn.data();
-        auto split = conversation_checkpoints_split(std::move(checks), 2);
+        auto split = conversation_checkpoints_split(std::move(checks), 2, ConversationCheckpointRetention::all);
         check(checks.empty() && split.stage0.size() == 2 && split.rest.size() == 1 && split.parts.size() == 2 &&
               split.parts[0].size() == 2 && split.parts[1].size() == 2, "split: complete checkpoints apart, the other aside");
         check(split.stage0[0].stage_parts.empty() && split.parts[1][1].ids == original[2].ids &&
@@ -605,10 +718,10 @@ int main() {
         check(same, "merge(split(x)) == x, in the original order");
         check(back[0].gdn.data() == gdn0 && back[2].stage_parts[1].gdn.data() == part1, "merge moves them back too");
 
-        auto torn = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(original), 2);
+        auto torn = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(original), 2, ConversationCheckpointRetention::all);
         torn.parts[1].pop_back();
         check(!conversation_checkpoints_merge(std::move(torn), back) && back.empty(), "a stage short of a part is refused");
-        auto mixed = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(original), 2);
+        auto mixed = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(original), 2, ConversationCheckpointRetention::all);
         mixed.parts[0][0].ids = {9, 9};
         check(!conversation_checkpoints_merge(std::move(mixed), back) && back.empty(), "a part of another checkpoint is refused");
         // a restored image: stage 0's checkpoints and each stage's, with no record of an incomplete one
@@ -618,8 +731,50 @@ int main() {
         for (auto& p : restored.parts) { auto c = running({4, 5}, 12, 0); p.push_back(std::move(c)); }
         check(conversation_checkpoints_merge(std::move(restored), back) && back.size() == 1 &&
               back[0].stage_parts.size() == 2, "a restored image's parts are all whole");
-        auto none = conversation_checkpoints_split({}, 3);
+        auto none = conversation_checkpoints_split({}, 3, ConversationCheckpointRetention::all);
         check(conversation_checkpoints_merge(std::move(none), back) && back.empty(), "no checkpoints: nothing to do");
+    }
+    for (int pins = 0; pins <= 2; ++pins) {
+        std::vector<ConversationCheckpoint> working(6);
+        for (size_t i = 0; i < working.size(); ++i) {
+            auto& cut = working[i];
+            cut.ids.resize(i + 2);
+            for (size_t j = 0; j < cut.ids.size(); ++j) cut.ids[j] = (int32_t)j + 1;
+            cut.gdn = {(uint8_t)i}; cut.used = i;
+            cut.pinned = (pins >= 1 && i == 1) || (pins == 2 && i == 3);
+            cut.stage_parts.resize(2);
+            for (auto& part : cut.stage_parts) {
+                part.ids = cut.ids; part.used = cut.used; part.pinned = cut.pinned;
+                part.gdn = {(uint8_t)(i + 10)};
+            }
+        }
+        const auto original = working;
+        auto selected = conversation_checkpoints_split(std::move(working), 2,
+                                                       ConversationCheckpointRetention::parked_history);
+        size_t at = 0;
+        for (size_t i = 0; i < original.size(); ++i) {
+            if (i != 0 && i + 1 != original.size() && !original[i].pinned) continue;
+            check(at < selected.stage0.size() && selected.stage0[at].ids == original[i].ids &&
+                  selected.stage0[at].gdn == original[i].gdn && selected.stage0[at].pinned == original[i].pinned,
+                  "parked history contains its actual root, latest cut and every explicit pin");
+            for (size_t stage = 0; stage < 2; ++stage)
+                check(selected.parts[stage][at].ids == original[i].ids &&
+                      selected.parts[stage][at].pinned == original[i].pinned &&
+                      selected.parts[stage][at].gdn == original[i].stage_parts[stage].gdn,
+                      "every retained cut keeps matching stage state and pin metadata");
+            ++at;
+        }
+        check(at == selected.stage0.size(), "older unpinned cuts do not multiply across parked histories");
+        check(conversation_checkpoints_merge(std::move(selected), working) && working.size() == original.size(),
+              "capture restores the complete working checkpoint chain");
+        for (size_t i = 0; i < original.size(); ++i) {
+            check(working[i].ids == original[i].ids && working[i].gdn == original[i].gdn &&
+                  working[i].pinned == original[i].pinned, "working rewind cuts and pins survive selective parking");
+            for (size_t stage = 0; stage < 2; ++stage)
+                check(working[i].stage_parts[stage].gdn == original[i].stage_parts[stage].gdn &&
+                      working[i].stage_parts[stage].pinned == original[i].pinned,
+                      "omitted and retained stage payloads both return to their working owners");
+        }
     }
     {
         // the later stages' retained K/V, kept with the first stage's and limited together
@@ -758,16 +913,8 @@ int main() {
         deep.checkpoints.back().ids = {1,2,3};
         check(cache.put(std::move(shallow)) && cache.put(std::move(deep)), "park cost-selection branches");
         const size_t bytes = cache.bytes();
+        const size_t size_before = cache.size(), evictions_before = cache.evictions();
         int visits = 0;
-        std::vector<int64_t> order;
-        cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope,
-            [&](auto, const auto&, const auto& c) { ++visits; order.push_back((int64_t) c.ids.size()); });
-        check(visits == 3 && order == std::vector<int64_t>({4,3,2}),
-              "all live/checkpoint candidates visit newest first in the old tie order");
-        check(cache.size() == 2 && cache.bytes() == bytes && cache.evictions() == 0 &&
-              cache.best(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope).tokens == 4,
-              "candidate enumeration changes no history, byte accounting or lifecycle state");
-        visits = 0;
         auto denied = [&](auto, const auto&, const auto&) { ++visits; };
         cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, ConversationScope{{2}}, denied);
         cache.for_each_match(std::vector<int32_t>{1,2,3,4,5}, {}, true, {}, denied);
@@ -786,6 +933,9 @@ int main() {
         check(economics(test_scope) == 1, "same-conversation long beneficial prefix stays reusable with cost on");
         check(economics(ConversationScope{{2}}) == 0 && economics({}) == 0,
               "even an attractive measured reuse gain cannot authorize a different or absent conversation");
+        check(cache.size() == size_before && cache.bytes() == bytes && cache.evictions() == evictions_before &&
+              cache.best(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope).tokens == 4,
+              "economic ranking leaves parked history, byte accounting and lifecycle state unchanged");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

@@ -1,5 +1,6 @@
 // batch_read_piece: the pieces of a --batch prompt read (synthetic: no model, no GPU).
 #include "strata/program/batch_read.hpp"
+#include "strata/program/serve_controls.hpp"
 
 #include <cstdio>
 
@@ -27,6 +28,27 @@ int main() {
     // a piece is always a multiple of the chunk
     for (int64_t c : {256, 1000, 2048, 4096})
         for (int64_t k : {1, 3, 8, 16}) CHECK(batch_read_piece(true, false, true, false, c, k) % c == 0);
+    {
+        using strata::program::pop_control_prefix;
+        std::deque<std::string> pending{"BGEN 0 next-owner", "BSTOP 0"};
+        std::string control = "unchanged";
+        CHECK(!pop_control_prefix(pending, control, true));
+        CHECK(control == "unchanged" && pending.front() == "BGEN 0 next-owner" && pending.size() == 2);
+        pending = {"BSTOP 0", "BGEN 0 next-owner", "BSTOP 0"};
+        CHECK(pop_control_prefix(pending, control, true) && control == "BSTOP 0");
+        CHECK(!pop_control_prefix(pending, control, true) && pending.size() == 2);
+        pending = {"BYIELD 1", "BSTOP 1", "BYIELD 2"};
+        CHECK(!pop_control_prefix(pending, control, false) && pending.size() == 3);
+        CHECK(pop_control_prefix(pending, control, true) && control == "BYIELD 1");
+        CHECK(pending.front() == "BSTOP 1"); // caller can park/return before touching this incarnation
+        CHECK(pop_control_prefix(pending, control, false) && control == "BSTOP 1");
+        CHECK(!pop_control_prefix(pending, control, false) && pending.front() == "BYIELD 2");
+        CHECK(pop_control_prefix(pending, control, true) && control == "BYIELD 2");
+        CHECK(!pop_control_prefix(pending, control, true));
+        pending = {"BPRIORITY 2 background", "GEN 1 another-owner"};
+        CHECK(pop_control_prefix(pending, control, false) && control == "BPRIORITY 2 background");
+        CHECK(!pop_control_prefix(pending, control, true) && pending.front() == "GEN 1 another-owner");
+    }
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
