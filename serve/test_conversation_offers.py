@@ -5,8 +5,7 @@ and the transport it is offered on.
 
 Nothing here needs a GPU or the native engine: the native side of the channel is played by this test's own socket
 peer (a HELLO, then whatever the frontend sends), and the engine by a scripted stand-in that can hold its first
-requests open so a real queue forms.  One test does spawn a real child process, to prove the descriptor and the
-environment the engine inherits are the ones this channel needs.
+requests open so a real queue forms.
 """
 import array
 import fcntl
@@ -14,6 +13,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import struct
@@ -35,6 +35,16 @@ TEMPLATE = ROOT / "serve/chat_template.jinja"
 KEY = bytes(range(32))            # the issuer key this test's native side hands out
 
 
+def prompt_text(tokens) -> str:
+    """The text a byte-tokenized prompt was made of (a special token is one placeholder byte): a test can then name
+    the request an offered payload belongs to without re-rendering it."""
+    out = bytearray()
+    for t in tokens:
+        t = int(t)
+        out.extend(t.to_bytes(1, "little") if 0 <= t < 256 else b"\x00")
+    return out.decode("utf-8", "replace")
+
+
 class OtherTokenizer(ByteTokenizer):
     """The byte tokenizer under another name: a different tokenizer identity (Service.render_identity)."""
 
@@ -44,6 +54,7 @@ class NativePeer:
 
     def __init__(self, link, *, generation=41, frontier=1, metadata_bytes=1 << 20, enabled=True, key=KEY):
         assert link.child_socket is not None
+        self.link = link
         self.sock: socket.socket = link.child_socket
         self.hello = Hello(generation=generation, frontier=frontier, metadata_bytes=metadata_bytes, enabled=enabled,
                            issuer_key=key)
@@ -100,7 +111,7 @@ class NativePeer:
             self.offers.append({"request_id": request_id, "generation": generation, "deadline_ns": deadline_ns,
                                 "tokens": list(struct.unpack(f"<{count}i", raw)), "scope": scope,
                                 "want_cvec": bool(flags & conversation_offers.FLAG_WANT_CVEC),
-                                "seals": fcntl.fcntl(fd, fcntl.F_GET_SEALS),
+                                "seals": fcntl.fcntl(fd, conversation_offers.F_GET_SEALS),
                                 "writable": fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY})
             os.close(fd)
             return "offer"
@@ -162,11 +173,15 @@ class ChannelTestCase(unittest.TestCase):
                                enabled=self.enabled, key=self.key)
         self.link.start()
         self.peer.start()
-        self.engine = QueuedEngine(self.tok, link=self.link, batch=self.batch, hold=self.hold)
+        self.engine = self.engine_for()
         self.svc = Service(self.engine, self.tok, ChatTemplate(TEMPLATE))
         self.httpd = serve(self.svc, port=0)
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
+
+    def engine_for(self):
+        """The scripted engine this case's service runs on (one that holds its first request open by default)."""
+        return QueuedEngine(self.tok, link=self.link, batch=self.batch, hold=self.hold)
 
     def start_request(self, text="hello", body=None, path="/v1/chat/completions"):
         """Send one request on its own thread; -> (thread, outcome dict).  A queued request never returns here."""
@@ -201,6 +216,17 @@ class ChannelTestCase(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"never saw {count} queued requests (queued={self.svc.status['queued']})")
 
+    def wait_prompts(self, count, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(self.engine.prompts) >= count:
+                return
+            time.sleep(0.01)
+        self.fail(f"the engine never ran {count} requests (ran {len(self.engine.prompts)})")
+
+    def keys_of(self, sampling: dict) -> str:
+        return StrataEngine.sampling_keys(sampling)
+
 
 class HelloWire(unittest.TestCase):
     def test_a_hello_is_read_strictly(self):
@@ -229,7 +255,16 @@ class HelloWire(unittest.TestCase):
 class StableScope(unittest.TestCase):
     """With a persistent store the namespace survives a restart; without one it stays what it always was."""
 
-    def service(self, *, key: bytes | None = KEY, tok=None, template=None, model="m", tokenizer_dir=None):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.tokenizer_dir = Path(directory.name)
+        (self.tokenizer_dir / "vocab.json").write_text('{"a":0}')
+        (self.tokenizer_dir / "merges.txt").write_text("#version: 0.2\n")
+        (self.tokenizer_dir / "token_type.json").write_text("[1]")
+
+    def service(self, *, key: bytes | None = KEY, tok=None, template=None, model="m", tokenizer_dir=None,
+                model_id="ab" * 32):
         link = None
         if key is not None:
             link = conversation_offers.ConversationOfferLink()
@@ -238,8 +273,9 @@ class StableScope(unittest.TestCase):
             link.start()
             peer.start()
         engine = PlainEngine(tok or ByteTokenizer(), link=link)
+        engine.cache_model_id = model_id
         return Service(engine, engine.tok, template or ChatTemplate(TEMPLATE), model_name=model,
-                       tokenizer_dir=tokenizer_dir)
+                       tokenizer_dir=self.tokenizer_dir if tokenizer_dir is None else tokenizer_dir)
 
     def other_template(self):
         """The same template with different source (a re-exported template is a different namespace)."""
@@ -274,7 +310,8 @@ class StableScope(unittest.TestCase):
         self.assertNotEqual(baseline, self.service().cache_scope(request, "tenant-b"))       # another principal
         self.assertNotEqual(baseline, self.service().cache_scope(request, "tenant-a", credential="other-key"))
         self.assertNotEqual(baseline, self.service().cache_scope(request, "tenant-a", gateway=True))  # a tagged kind
-        self.assertNotEqual(baseline, self.service(model="other-model").cache_scope(request, "tenant-a"))
+        self.assertEqual(baseline, self.service(model="renamed-public-alias").cache_scope(request, "tenant-a"))
+        self.assertNotEqual(baseline, self.service(model_id="cd" * 32).cache_scope(request, "tenant-a"))
         self.assertNotEqual(baseline, self.service(template=self.other_template()).cache_scope(request, "tenant-a"))
         self.assertNotEqual(baseline, self.service(tok=OtherTokenizer()).cache_scope(request, "tenant-a"))
 
@@ -282,10 +319,36 @@ class StableScope(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "vocab.json").write_text('{"a": 0}', encoding="utf-8")
+            (root / "merges.txt").write_text("#version: 0.2\n")
+            (root / "token_type.json").write_text("[1]")
             first = self.service(tokenizer_dir=root).cache_scope({"messages": []}, "tenant-a")
             (root / "vocab.json").write_text('{"a": 0, "b": 1}', encoding="utf-8")
             second = self.service(tokenizer_dir=root).cache_scope({"messages": []}, "tenant-a")
         self.assertNotEqual(first, second)
+
+    def test_missing_identity_refuses_cross_restart_reuse(self):
+        request = {"messages": []}
+        first, second = self.service(model_id=""), self.service(model_id="")
+        self.assertNotEqual(first.cache_scope(request, "t"), second.cache_scope(request, "t"))
+        # ... while the process that has no verified identity keeps serving its own parked conversations
+        self.assertEqual(first.cache_scope(request, "t"), first.cache_scope(request, "t"))
+        (self.tokenizer_dir / "merges.txt").unlink()
+        first, second = self.service(), self.service()
+        self.assertIsNone(first.render_identity())
+        self.assertNotEqual(first.cache_scope(request, "t"), second.cache_scope(request, "t"))
+        self.assertEqual(first.cache_scope(request, "t"), first.cache_scope(request, "t"))
+
+    def test_a_partial_tokenizer_identity_is_never_invented(self):
+        """The artifacts' content names the namespace: what is missing must decline reuse, not be guessed at."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vocab.json").write_text('{"a": 0}', encoding="utf-8")
+            partial = self.service(tokenizer_dir=root)
+            self.assertIsNone(partial.render_identity(), "a partial tokenizer identity was invented from what was there")
+            self.assertEqual(partial.cache_scope({"messages": []}, "t"),
+                             partial.cache_scope({"messages": []}, "t"))     # the process-local namespace still works
+            self.assertNotEqual(partial.cache_scope({"messages": []}, "t"),
+                                self.service().cache_scope({"messages": []}, "t"))
 
     def test_a_client_cannot_name_its_own_scope(self):
         service = self.service()
@@ -327,7 +390,7 @@ class LinkTransport(unittest.TestCase):
         self.assertEqual(offer["scope"], bytes.fromhex("ab" * 32))
         self.assertTrue(offer["want_cvec"])
         self.assertFalse(offer["writable"])
-        for seal in (fcntl.F_SEAL_SHRINK, fcntl.F_SEAL_GROW, fcntl.F_SEAL_WRITE, fcntl.F_SEAL_SEAL):
+        for seal in (0x0001, 0x0002, 0x0004, 0x0008):
             self.assertTrue(offer["seals"] & seal, f"seal {seal} missing from {offer['seals']}")
         self.assertEqual(self.link.stats()["accepted"], 1)
         self.assertEqual(self.link.stats()["outstanding"], 1)
@@ -357,6 +420,7 @@ class LinkTransport(unittest.TestCase):
         self.assertIsNone(self.link.scope_key())
         self.assertFalse(self.link.offer(1, 1, 0, "ab" * 32, [1, 2, 3]))
         self.assertIsNone(peer.read_one(0.2), "nothing at all may be sent before the HELLO")
+        self.link.start()
         peer.start()
         self.assertTrue(self.link.store_enabled)
         self.assertIsNotNone(self.link.scope_key())
@@ -409,6 +473,20 @@ class LinkTransport(unittest.TestCase):
         self.assertFalse(self.link.offer(1, 0, 0, "ab" * 32, [1]))
         self.assertIsNone(peer.read_one(0.3))
 
+    def test_offer_ids_never_enter_the_native_demand_range(self):
+        """Native-only demand reads own the high half of the id space: an offer stays strictly below it."""
+        peer = NativePeer(self.link)
+        self.link.start()
+        peer.start()
+        with self.link._lock:
+            self.link._next_id = conversation_offers.OFFER_ID_MAX - 1
+        self.assertEqual(self.link.next_request_id(), conversation_offers.OFFER_ID_MAX)
+        self.assertEqual(self.link.next_request_id(), 0, "an exhausted incarnation kept handing out ids")
+        self.assertFalse(self.link.offer(conversation_offers.OFFER_ID_MAX + 1, self.link.epoch(), 0, "ab" * 32, [1]))
+        self.assertFalse(self.link.offer(1 << 63, self.link.epoch(), 0, "ab" * 32, [1]))
+        self.assertFalse(self.link.offer(conversation_offers.OFFER_ID_MAX, self.link.epoch() + 1, 0, "ab" * 32, [1]))
+        self.assertIsNone(peer.read_one(0.3))
+
 
 class QueuedFrontier(ChannelTestCase):
     """What the real production path does with queued, varied prompts."""
@@ -417,31 +495,65 @@ class QueuedFrontier(ChannelTestCase):
         rendered = mock.patch.object(self.svc, "encode_prompt", wraps=self.svc.encode_prompt)
         spy = rendered.start()
         self.addCleanup(rendered.stop)
+        resolved = mock.patch.object(self.svc, "resolve_openai", wraps=self.svc.resolve_openai)
+        resolutions = resolved.start()
+        self.addCleanup(resolved.stop)
         first = self.start_request("first")
         self.assertTrue(self.engine.entered.wait(5), "the first request never reached the engine")
         second = self.start_request("second")
         self.wait_queued(1)
         offered = self.peer.next_offer(5)
         self.assertIsNotNone(offered, "the queue head was never prepared and offered")
+        self.assertGreater(self.svc.offer_stats()["prepared_bytes"], 0,
+                           "the frontier's preparation was not reserved before it rendered")
         third = self.start_request("three")
         self.wait_queued(2)
         self.peer.drain(0.6)
         self.assertEqual(len(self.peer.offers), 1, "a request behind the frontier was prepared too")
+        # Only the frontier is touched while it waits: the admitted request resolved itself, the one behind the
+        # frontier was neither resolved nor rendered.
+        self.assertEqual(resolutions.call_count, 2, "a request behind the frontier was resolved ahead of its turn")
+        self.assertEqual(spy.call_count, 2, "a request behind the frontier was rendered ahead of its turn")
         self.assertEqual(self.peer.cancels, [])
         self.assertEqual(self.peer.other, [])
         self.engine.release.set()
         self.join(first, second, third)
+        self.peer.drain(0.2)
         self.assertEqual([outcome.get("status") for _t, outcome in (first, second, third)], [200, 200, 200])
-        self.assertEqual(len(self.engine.prompts), 3)
         self.assertEqual(self.engine.prompts[1], list(self.peer.offers[0]["tokens"]))   # consumed, not re-rendered
-        self.assertEqual(self.engine.prompts[2], list(self.peer.offers[1]["tokens"]))   # the next head, in turn
-        bound = StrataEngine.sampling_keys(self.engine.samplings[1])
-        self.assertIn(f"scope={self.engine.samplings[1]['_strata_cache_scope']}", bound)
-        self.assertIn(f"cache_offer={self.peer.offers[0]['request_id']}"
-                      f" cache_generation={self.peer.offers[0]['generation']}", bound)
-        self.assertNotIn("cache_offer", StrataEngine.sampling_keys({"temperature": 0.5}))
         self.assertEqual(spy.call_count, 3, "a prepared prompt was rendered again")
+        # five resolutions: each request's own demand, plus the two preparations - and never a second one for a
+        # result that was already prepared
+        self.assertEqual(resolutions.call_count, 5, "a prepared prompt was resolved again")
         self.assertEqual([c[0] for c in self.peer.cancels], [o["request_id"] for o in self.peer.offers])
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 0,
+                         "a finished request kept its preparation reserved")
+
+    def test_each_queued_request_keeps_its_own_prompt_and_settings(self):
+        """Varied queued requests: every offer is its own request's tokens, not a neighbour's or a re-render."""
+        bodies = [{"messages": [{"role": "user", "content": f"turn {i} " + "x" * (10 * i)}],
+                   "max_tokens": 3 + i, "temperature": 0.25 * i} for i in range(1, 4)]
+        first = self.start_request(body=bodies[0])
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body=bodies[1])
+        self.wait_queued(1)
+        third = self.start_request(body=bodies[2])
+        self.wait_queued(2)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered)
+        assert offered is not None
+        # the queue head is the second of the three (the first is already running): its own tokens, not the others'
+        self.assertIn(bodies[1]["messages"][0]["content"], prompt_text(offered["tokens"]))
+        self.assertNotIn(bodies[2]["messages"][0]["content"], prompt_text(offered["tokens"]))
+        self.engine.release.set()
+        self.join(first, second, third)
+        self.assertEqual([o.get("status") for _t, o in (first, second, third)], [200, 200, 200])
+        for i, sampling in enumerate(self.engine.samplings):
+            self.assertIn(bodies[i]["messages"][0]["content"], prompt_text(self.engine.prompts[i]))
+            self.assertEqual(sampling["max_tokens"], bodies[i]["max_tokens"])
+        consumed = [p for p in self.engine.prompts if any(p == list(o["tokens"]) for o in self.peer.offers)]
+        self.assertEqual(len(consumed), len(self.peer.offers),
+                         "a prepared prompt did not reach the engine exactly as it was offered")
 
     def test_only_text_requests_are_prepared_early(self):
         first = self.start_request("first")
@@ -466,28 +578,88 @@ class QueuedFrontier(ChannelTestCase):
         assert offered is not None
         queued = [r for r in self.svc.lifecycle_records() if r["state"] == "queued"]
         self.assertEqual(len(queued), 1)
+        record = next(r for r in self.svc.lifecycles if r["id"] == queued[0]["id"])
+        self.assertIsNotNone(record.get("_prepared"))
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 1)     # its bytes really were reserved
         self.assertTrue(self.svc.cancel_request(queued[0]["id"]))
         self.join(second)
         self.assertEqual(second[1].get("status"), 409)
         self.assertEqual(self.peer.next_cancel(5), (offered["request_id"], offered["generation"]))
         self.peer.drain(0.4)
         self.assertEqual(len(self.peer.cancels), 1, "a retired request left another offer outstanding")
+        # A cancelled request frees everything its preparation held: the reservation, the byte budget and its own
+        # references to the rendered prompt.
+        self.assertNotIn("_prepared", record)
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 0)
+        self.assertEqual(self.svc.offer_stats()["prepared_bytes"], 0)
+        self.assertEqual(self.svc.offer_stats()["outstanding"], 0)
+        self.assertEqual(self.svc.offer_stats()["outstanding_bytes"], 0)
         self.engine.release.set()
         self.join(first)
         self.assertEqual(first[1].get("status"), 200)
+
+    def test_a_queued_request_runs_the_pin_and_steering_the_store_was_offered(self):
+        self.engine.info = {"cvec": 1}        # a loaded control vector: this request's own cvec= is what runs
+        body = {"messages": [{"role": "user", "content": "a shared document " * 20},
+                             {"role": "user", "content": "the question"}],
+                "strata_prefix": {"messages": 1}, "max_tokens": 4,
+                "experimental_speed_projection": False}
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body=body)
+        self.wait_queued(1)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered, "the pinned request was not prepared")
+        assert offered is not None
+        self.assertFalse(offered["want_cvec"], "the offer did not declare the request's own steering")
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
+        keys = self.keys_of(self.engine.samplings[1])
+        self.assertIn("cvec=0", keys)                      # the steering the offer declared
+        self.assertRegex(keys, r" pin=\d+")                # the boundary the freeze resolved, not the client's spec
+        pinned = self.engine.samplings[1]["strata_prefix"]
+        self.assertIsInstance(pinned, dict)
+        self.assertIsInstance(pinned.get("tokens"), int)   # {"messages": 1} can never become this by itself
+        self.assertGreater(pinned["tokens"], 0)
+        self.assertEqual(self.engine.prompts[1], list(offered["tokens"]))
+
+    def test_a_request_with_no_control_vector_is_offered_as_unsteered(self):
+        """An engine without a loaded control vector prices nothing, so the offer must not ask for a vector."""
+        body = {"messages": [{"role": "user", "content": "a turn"}], "experimental_speed_projection": False}
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body=body)
+        self.wait_queued(1)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered)
+        assert offered is not None
+        self.assertTrue(offered["want_cvec"], "an unsteered engine's offer claimed steering the demand will not run")
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
 
     def test_a_prepared_result_is_consumed_once_and_only_for_its_own_prompt(self):
         generation = conversation_offers.generation_digest([], None, {}, 4, None)
         prepared = conversation_offers.PreparedGeneration(ids=(1, 2, 3), thinking=True, max_new=4, digest=generation,
                                                           ctx=4096, link=self.link, offer_id=9,
-                                                          generation=self.link.epoch())
+                                                          generation=self.link.epoch(),
+                                                          prefix={"tokens": 2})
         self.assertIsNone(self.svc.take_prepared(None, [], None, {}, 4, None))
-        record = {"_prepared": prepared}
+        record = {"id": "prepared-consumption", "_prepared": prepared}
         self.assertIs(self.svc.take_prepared(record, [], None, {}, 4, None), prepared)     # this exact prompt
         self.assertIsNone(self.svc.take_prepared(record, [{"role": "user"}], None, {}, 4, None))   # once only
         request: dict = {}
         self.svc.bind_offer(request, prepared)
+        prepared.apply_to(request)
         self.assertEqual(request.get("_strata_cache_offer"), 9)
+        self.assertEqual(request["strata_prefix"], {"tokens": 2})    # the frozen pin boundary, not the client's spec
+        request["strata_prefix"] = {"messages": 1}                   # a second resolution must not be able to win
+        prepared.apply_to(request)
+        self.assertEqual(request["strata_prefix"], {"tokens": 2})
+        prepared.release()
+        self.assertEqual(prepared.ids, (), "a consumed result kept the whole prompt")
+        self.assertIsNone(prepared.prefix)
         self.svc.bind_offer(request, prepared)
         self.assertEqual(request.get("_strata_cache_offer"), 9)
         stale = dict(request)
@@ -499,10 +671,24 @@ class QueuedFrontier(ChannelTestCase):
         self.assertNotIn("_strata_cache_offer", stale)      # another incarnation's offer is never bound
         self.svc.bind_offer(stale, prepared)
         self.assertEqual(stale.get("_strata_cache_offer"), 9)
-        self.svc.withdraw_offer({"_prepared": prepared})
+        self.svc.withdraw_offer({"id": record["id"], "_prepared": prepared})
         self.assertTrue(prepared.withdrawn)
-        self.assertIsNone(self.svc.withdraw_offer({"_prepared": prepared}))
+        self.assertIsNone(self.svc.withdraw_offer({"id": record["id"], "_prepared": prepared}))
         self.assertIsNone(self.svc.withdraw_offer(None))
+
+    def test_a_prepared_result_that_is_not_this_prompt_retires_its_offer(self):
+        """A generation that re-resolved to another prompt never consumes the offer: it is cancelled, not held."""
+        self.assertTrue(self.link.offer(4, self.link.epoch(), 0, "ab" * 32, [1, 2, 3]))
+        prepared = conversation_offers.PreparedGeneration(ids=(1, 2, 3), thinking=False, max_new=4, digest="other",
+                                                          ctx=self.svc.context_size(), link=self.link, offer_id=4,
+                                                          generation=self.link.epoch())
+        record = {"id": "prepared-mismatch", "_prepared": prepared}
+        self.assertIsNone(self.svc.take_prepared(record, [], None, {}, 4, None))
+        self.assertTrue(prepared.consumed)
+        self.assertTrue(prepared.withdrawn)
+        self.assertNotIn("_prepared", record)
+        self.assertEqual(self.peer.next_cancel(5), (4, self.link.epoch()))
+        self.assertEqual(self.link.stats()["outstanding"], 0)
 
     def test_a_shutdown_stops_admission_and_cancels_the_offer(self):
         first = self.start_request("first")
@@ -568,46 +754,281 @@ class NoStoreFrontier(ChannelTestCase):
         self.assertEqual(first[1].get("status"), 200)
 
 
-class EngineSpawn(unittest.TestCase):
-    """The engine really inherits this incarnation's descriptor, and really answers on it."""
+class FrontierOrder(unittest.TestCase):
+    """Preparation follows the admissions the selector would make, in its own order - not arrival order."""
 
-    ENGINE = r'''
-import json, os, socket, struct, sys
-from pathlib import Path
-fd = int(os.environ["STRATA_CONVERSATION_OFFER_FD"])
-out = Path(sys.argv[sys.argv.index("--report") + 1])
-with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET, fileno=fd) as s:
-    s.send(struct.pack("<4sHHQQQII32s", b"SCC1", 1, 1, 0, 77, 1 << 20, 2, 1, bytes(range(32))))
-    out.write_text(json.dumps({"fd": fd, "env": os.environ["STRATA_CONVERSATION_OFFER_FD"]}))
-print("READY 4096 stop", flush=True)
-for line in sys.stdin:
-    if line.startswith("QUIT"):
-        break
-'''
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.link = conversation_offers.ConversationOfferLink()
+        self.addCleanup(self.link.close)
+        self.peer = NativePeer(self.link)
+        self.link.start()
+        self.peer.start()
+        self.svc = Service(PlainEngine(self.tok, link=self.link), self.tok, ChatTemplate(TEMPLATE))
 
-    def test_the_engine_inherits_the_descriptor_and_its_number(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            script = root / "engine.py"
-            script.write_text("#!" + sys.executable + "\n" + self.ENGINE)
-            script.chmod(0o700)
-            report = root / "report.json"
-            engine = StrataEngine(str(script), ["--report", str(report)])
-            self.addCleanup(engine.close)
-            channel = engine.offers
-            assert channel is not None
-            self.assertTrue(channel.wait_hello(10), "the engine's HELLO never arrived")
-            self.assertTrue(channel.store_enabled)
-            self.assertEqual(channel.epoch(), 77)
-            self.assertEqual(channel.frontier(), 2)
-            self.assertEqual(channel.scope_key(), bytes(range(32)))
-            facts = json.loads(report.read_text())
-            self.assertEqual(facts["fd"], channel.child_fd)
-            self.assertEqual(facts["env"], str(channel.child_fd))
-            before = len(os.listdir("/proc/self/fd"))
-            engine.close()
-            self.assertIsNone(engine.offers)
-            self.assertLessEqual(len(os.listdir("/proc/self/fd")), before)
+    def queue(self, text, priority="foreground"):
+        """One request accepted and waiting exactly as the POST dispatch leaves it: registered and scoped, no work."""
+        req = {"messages": [{"role": "user", "content": text}], "strata_priority": priority}
+        req["_strata_cache_scope"] = self.svc.cache_scope(req, "tenant")
+        return self.svc.register_lifecycle(req, threading.Event()), req
+
+    def prepare(self, record, req) -> None:
+        self.svc.prefetch_offer(record, "/v1/chat/completions", req)
+
+    def test_only_the_selector_frontier_is_prepared_and_in_its_order(self):
+        for i in range(3):                      # three real foreground admissions: no background one yet
+            record, _req = self.queue(f"an earlier foreground turn {i}")
+            self.svc.acquire_request(record)    # admitted at once (the slot is free)
+            self.svc.finish_lifecycle(record)
+        self.assertEqual(self.svc.admission_foreground[False], 3)
+        head, head_req = self.queue("the foreground turn", priority="foreground")
+        behind, behind_req = self.queue("a later foreground turn", priority="foreground")
+        background, background_req = self.queue("the background turn", priority="background")
+        self.assertEqual([r["priority"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 3, 3)],
+                         ["background", "foreground", "foreground"])
+        self.prepare(head, head_req)            # the oldest waiter, and not the selector's next admission
+        self.prepare(behind, behind_req)        # a later one: behind the frontier either way
+        self.prepare(background, background_req)
+        self.peer.drain(0.4)
+        offered = self.peer.offers
+        self.assertEqual(len(offered), 1, "the selector's frontier was not the only request prepared")
+        self.assertIn("the background turn", prompt_text(offered[0]["tokens"]))
+        self.assertIsNone(head.get("_prepared"))
+        self.assertIsNone(behind.get("_prepared"))
+        self.assertIsNotNone(background.get("_prepared"))
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 1)
+        self.assertEqual([r["priority"] for r in self.svc.selector_order(True, self.svc.admission_waiters, 1, 1)], [])
+
+    def test_later_background_frontier_revokes_an_earlier_foreground_offer(self):
+        for i in range(3):
+            record, _req = self.queue(f"priming foreground {i}")
+            self.svc.acquire_request(record)
+            self.svc.finish_lifecycle(record)
+        foreground, foreground_req = self.queue("initial foreground")
+        self.prepare(foreground, foreground_req)
+        first = self.peer.next_offer(5)
+        self.assertIsNotNone(first)
+        background, background_req = self.queue("new background", priority="background")
+        self.prepare(foreground, foreground_req)
+        self.assertEqual(self.peer.next_cancel(5), (first["request_id"], first["generation"]))
+        self.assertNotIn("_prepared", foreground)
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 0)
+        self.prepare(background, background_req)
+        next_offer = self.peer.next_offer(5)
+        self.assertIsNotNone(next_offer)
+        self.assertIn("new background", prompt_text(next_offer["tokens"]))
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 1)
+
+
+class BoundedPreparation(ChannelTestCase):
+    """What the frontier will and will not prepare: a prompt it cannot build inside the allowance is declined (its
+    demand still renders, reports and runs it), the request it declined is not prepared again while it waits, a
+    changed steering withdraws what was prepared, and the preparation never rewrites the request's own pin."""
+
+    def test_an_over_context_prompt_is_never_prepared_or_offered(self):
+        self.engine.max_context = 512                   # fits the active request, but not the queued prompt
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        prepared_patch = mock.patch.object(self.svc, "freeze_generation", wraps=self.svc.freeze_generation)
+        frozen = prepared_patch.start()
+        self.addCleanup(prepared_patch.stop)
+        waited = mock.patch.object(self.svc, "prefetch_offer", wraps=self.svc.prefetch_offer)
+        attempts = waited.start()
+        self.addCleanup(waited.stop)
+        second = self.start_request(body={"messages": [{"role": "user", "content": "x" * 1024}], "max_tokens": 4})
+        self.wait_queued(1)
+        self.peer.drain(0.8)                            # several admission waits, each with its own preparation
+        self.assertEqual(self.peer.offers, [], "a prompt that cannot be prepared was offered anyway")
+        self.assertGreaterEqual(attempts.call_count, 2, "the queued request was never given another wait")
+        self.assertEqual(frozen.call_count, 1, "a refusal that cannot change was prepared again on every wait")
+        record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        self.assertTrue(record.get("_offer_declined"))
+        self.assertIsNone(record.get("_prepared"))
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 0, "a declined preparation kept its bytes")
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 400)   # the demand path still reports it in its own words
+        self.assertIn("exceeds the context window", json.loads(second[1]["body"])["error"]["message"])
+
+    def test_a_prompt_past_the_text_bound_is_declined_before_the_template_renders_it(self):
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        bound = mock.patch.object(self.svc, "preparation_text_bound", return_value=8)
+        bound.start()
+        self.addCleanup(bound.stop)
+        rendered = mock.patch.object(self.svc, "render_prompt", wraps=self.svc.render_prompt)
+        render = rendered.start()
+        self.addCleanup(rendered.stop)
+        second = self.start_request(body={"messages": [{"role": "user", "content": "y" * 400}], "max_tokens": 4})
+        self.wait_queued(1)
+        self.peer.drain(0.6)
+        self.assertEqual(render.call_count, 0, "the template rendered a request the preparation had not admitted")
+        self.assertEqual(self.peer.offers, [])
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)   # preparation is the only thing that was declined
+        self.assertEqual(render.call_count, 1, "the demand did not render the request it had to run")
+        self.assertIn("y" * 400, prompt_text(self.engine.prompts[1]))
+
+    def test_a_changed_steering_withdraws_what_was_prepared(self):
+        self.engine.info = {"cvec": 1}                   # a loaded control vector: its flag is what native prices
+        self.svc.set_shared({"experimental_speed_projection": False})
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body={"messages": [{"role": "user", "content": "a turn"}], "max_tokens": 4})
+        self.wait_queued(1)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered, "the queued request was not prepared")
+        assert offered is not None
+        self.assertFalse(offered["want_cvec"], "the offer did not declare the steering in force when it was made")
+        self.svc.set_shared({})                          # the settings change while the request waits
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
+        self.assertEqual(self.peer.next_cancel(5), (offered["request_id"], offered["generation"]),
+                         "the demand kept an offer validated under another steering")
+        keys = self.keys_of(self.engine.samplings[1])
+        self.assertNotIn("cache_offer", keys)            # the store's candidate was validated under the old flag
+        self.assertNotIn("cvec=", keys)                  # and the demand runs its own steering, not the frozen one
+
+    def test_the_preparation_never_rewrites_the_requests_own_pin_specification(self):
+        """The pin is resolved on a request-local copy: after the demand re-resolves to another prompt (the shared
+        settings changed), it resolves the client's own specification, not the boundary preparation computed."""
+        body = {"messages": [{"role": "user", "content": "a shared document " * 20},
+                             {"role": "user", "content": "the question"}],
+                "strata_prefix": {"messages": 1}}
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body=body)
+        self.wait_queued(1)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered, "the pinned request was not prepared")
+        queued = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        offered_pin = dict(queued["_prepared"].prefix)
+        self.svc.set_shared({"reasoning_effort": "low", "max_tokens": 6})
+        fresh = self.svc.resolve_openai(json.loads(json.dumps(body)), load=False)
+        self.svc.prepare(fresh.messages, fresh.tools, fresh.kw, fresh.max_new_requested,
+                         force=fresh.force, req=fresh.req)
+        expected_pin = fresh.req["strata_prefix"]
+        self.assertNotEqual(expected_pin, offered_pin, "the changed prompt must move the pin boundary")
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
+        pinned = self.engine.samplings[1].get("strata_prefix")
+        self.assertEqual(pinned, expected_pin, "demand reused the old prompt's pin after preparation was invalidated")
+
+
+class PreparedDialects(ChannelTestCase):
+    """Both other text endpoints prepare exactly as the chat route does: the queued request's own tokens are
+    offered, and its demand runs those tokens with the offer bound to the generation."""
+
+    def prepared(self, body, path):
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request(body=body, path=path)
+        self.wait_queued(1)
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered, f"a queued {path} request was never prepared")
+        assert offered is not None
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
+        self.assertEqual(self.engine.prompts[1], list(offered["tokens"]), "a prepared prompt was not the one run")
+        self.assertIn(f"cache_offer={offered['request_id']}", self.keys_of(self.engine.samplings[1]))
+        return offered
+
+    def test_a_queued_messages_request_is_prepared_and_its_demand_binds_the_offer(self):
+        offered = self.prepared({"model": "m", "messages": [{"role": "user", "content": "an anthropic turn"}],
+                                 "max_tokens": 4}, "/v1/messages")
+        self.assertIn("an anthropic turn", prompt_text(offered["tokens"]))
+
+    def test_a_queued_responses_request_is_prepared_and_its_demand_binds_the_offer(self):
+        offered = self.prepared({"input": "a responses turn", "max_output_tokens": 4}, "/v1/responses")
+        self.assertIn("a responses turn", prompt_text(offered["tokens"]))
+
+
+class UnofferedDeadline(ChannelTestCase):
+    """A request the store is never offered still carries its original lifecycle deadline to the engine."""
+    metadata_bytes = 4          # the store states a budget no token payload fits: nothing is prepared or offered
+
+    def test_an_unoffered_request_reaches_the_engine_with_its_original_deadline(self):
+        first = self.start_request("first")                 # admitted at once
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request("second")               # queued behind it: reserved, refused, unoffered
+        self.wait_queued(1)
+        self.peer.drain(0.5)
+        self.assertEqual(self.peer.offers, [])
+        self.assertGreaterEqual(self.svc.offer_stats()["preparation_refused"], 1,
+                                "the store's budget never refused the reservation")
+        record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        self.assertIsNone(record.get("_prepared"))
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual([o.get("status") for _t, o in (first, second)], [200, 200])
+        for i, sampling in enumerate(self.engine.samplings):
+            keys = self.keys_of(sampling)
+            found = re.search(r" cache_deadline_ns=(\d+)", keys)
+            self.assertIsNotNone(found, f"request {i} reached the engine without its deadline")
+            self.assertGreater(int(found.group(1)), 0)
+        queued = self.keys_of(self.engine.samplings[1])
+        original = int(record["_deadline"] * 1_000_000_000)
+        self.assertEqual(int(re.search(r" cache_deadline_ns=(\d+)", queued).group(1)), original,
+                         "the deadline the engine saw was not the one the request was accepted with")
+        self.assertNotIn("cache_offer", self.keys_of(self.engine.samplings[1]))
+
+
+class Ancillary(unittest.TestCase):
+    """What the channel accepts from the engine: no descriptor at all, a whole descriptor array, or nothing."""
+
+    def setUp(self):
+        self.link = conversation_offers.ConversationOfferLink()
+        self.addCleanup(self.link.close)
+        self.link.start()
+        sock = self.link.child_socket
+        assert sock is not None
+        self.sock = sock
+        sock.send(hello_payload(Hello(generation=5, frontier=1, metadata_bytes=1 << 20, enabled=True, issuer_key=KEY)))
+        self.assertTrue(self.link.wait_hello(5), "the engine's own HELLO was not read")
+
+    @staticmethod
+    def open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    def wait_for(self, key, count, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.link.stats()[key] >= count:
+                return
+            time.sleep(0.01)
+        self.fail(f"never saw {key} reach {count} (got {self.link.stats()[key]})")
+
+    def send_with(self, fds) -> None:
+        array_ = array.array("i", [fd for fd in fds])
+        self.sock.sendmsg([b"\0" * HEADER.size], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array_)])
+
+    def test_a_descriptor_from_the_engine_is_refused_closed_and_counted(self):
+        before = self.open_fds()
+        fd = os.open(__file__, os.O_RDONLY)
+        try:
+            self.send_with([fd])
+        finally:
+            os.close(fd)
+        self.wait_for("received_fds", 1)
+        self.wait_for("malformed", 1)
+        self.assertIsNone(self.link.stats()["reader_error"])
+        self.assertLessEqual(self.open_fds(), before, "a descriptor the channel refused was left open")
+
+    def test_a_truncated_descriptor_array_is_refused_without_leaking_any(self):
+        before = self.open_fds()
+        fds = [os.open(__file__, os.O_RDONLY) for _ in range(2 * conversation_offers.FD_SPACE)]
+        try:
+            self.send_with(fds)                              # more than a whole control buffer: the kernel cuts it
+        finally:
+            for fd in fds:
+                os.close(fd)
+        self.wait_for("malformed", 1)
+        self.assertIsNone(self.link.stats()["reader_error"])
+        self.assertLessEqual(self.open_fds(), before, "a truncated descriptor array leaked descriptors")
 
 
 if __name__ == "__main__":

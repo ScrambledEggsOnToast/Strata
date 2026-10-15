@@ -18,10 +18,12 @@
 // at.  Bytes are reused across turns only through explicit, caller-proven unchanged byte intervals, so an
 // immutable chunk that already exists is never re-read or re-hashed.
 //
-// Threading: one admitted writer thread and a bounded read pipeline (Options::max_reads materializations).  Nothing
-// in this module blocks under a caller's admission lock: a caller that wants a restore at its own safe seam calls
-// wait_ready(), and every other entry point returns immediately.  No storage wait ever runs while the module holds
-// its own catalog mutex.
+// Threading: one admitted writer thread and a bounded read pipeline (Options::max_reads incoming images).  Nothing in
+// this module blocks under a caller's admission lock: a caller that wants a restore at its own safe seam calls
+// wait_ready(), and every other entry point returns immediately - including confirmed_restore() and
+// invalidate_domain(), whose durable catalog commits are handed to the storage thread (invalidate_domain then waits
+// for that commit without holding the catalog mutex).  No storage wait ever runs while the module holds its own
+// catalog mutex, and no filesystem call is ever made on a path component the module has not opened itself.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -121,7 +123,13 @@ std::vector<ConversationStoreStreamInfo> conversation_store_streams(const SavedC
 // ---------------------------------------------------------------------------------------------------------------
 
 struct ConversationStoreOptions {
-    std::string root;                      // private directory on the cache device; empty disables persistence
+    // Private directory on the cache device; empty disables persistence.  It must be an absolute path owned by this
+    // account and not writable by group or others: a missing component is created 0700 with its parent flushed, an
+    // existing component or leaf that is a symlink, another account's or group/other-writable is refused, and every
+    // later access is descriptor-relative and never follows a symlink.  The issuer key is created only for a
+    // genuinely new, empty store: an existing store that has lost its key disables persistence instead of silently
+    // rotating the identity its old records were authorized under.
+    std::string root;
     // Verified identities.  `domain` is the strong execution-domain digest (state format, kernel contract, resolved
     // layout/arithmetic/draft).  `model` is the verified common model identity and `engine` the verified engine
     // identity; both must come from release data, never a sampled fingerprint, alias or profile name.  A zero value
@@ -129,19 +137,36 @@ struct ConversationStoreOptions {
     std::array<uint8_t, 32> domain{};
     std::array<uint8_t, 32> model{};
     std::array<uint8_t, 32> engine{};
+    // The quota covers *everything* this module owns on the device: objects, manifests, the catalog and its
+    // temporary, the issuer key, the run-intent marker and any file awaiting deletion.  Every byte is charged at the
+    // conservative allocated size (block-rounded, plus one block per file for its directory entry), and a charge is
+    // credited only once the file is confirmed gone.  Nothing is ever admitted against a promise to delete later.
     uint64_t quota_bytes = uint64_t(128) << 30;    // one shared physical quota for every layout
-    uint64_t min_free_bytes = uint64_t(128) << 30; // filesystem floor, resampled before new reservations
-    uint64_t metadata_bytes = uint64_t(64) << 20;  // ceiling on this module's in-RAM index
-    size_t head_limit = 128;                       // retained branch heads across the whole store
+    // Filesystem floor, resampled before every reservation.  A failed or zero sample refuses the reservation: an
+    // unreadable filesystem is never treated as an empty one.
+    uint64_t min_free_bytes = uint64_t(128) << 30;
+    // Hard ceiling on this module's in-RAM index *and* preparation: no job descriptor, token/image copy or index
+    // entry is allocated that would cross it.
+    uint64_t metadata_bytes = uint64_t(64) << 20;
+    // Hard retained-head ceiling: a publication that cannot obtain a slot (every head pinned or leased) is refused
+    // instead of overrunning it.  The protected segment is capped at three quarters of it.
+    size_t head_limit = 128;
     uint64_t chunk_bytes = uint64_t(1) << 20;      // immutable object size (the tail may be shorter)
-    // One materialized incoming restore at a time by default: read *descriptors* are bounded separately, and an
-    // in-flight prefetch's speculative resources are revoked when a demand request needs the slot.
+    // One materialized incoming image at a time by default.  The slot is held from the moment a read starts
+    // allocating *through the whole lease* of the image it produced, so `max_reads` bounds concurrent incoming
+    // images, not merely concurrently running workers.  Read *descriptors* are bounded separately by
+    // `max_read_requests`, and an in-flight prefetch's speculative resources are revoked when a demand needs them.
     uint32_t max_reads = 1;
-    uint32_t max_read_requests = 16;               // bounded queued read identifiers (demand and prefetch)
+    // Bounded read identifiers (demand and prefetch, including misses).  A request over this bound is refused
+    // *before* any descriptor is allocated.
+    uint32_t max_read_requests = 16;
     // Extra *same-lineage* publications that may replace the one in flight (see publish()).  Never a second
     // admitted image for a different branch.
     uint32_t max_pending_publishes = 1;
-    uint64_t read_budget_bytes = 0;                // 0: no read admission until publish_read_allowance()
+    // 0: no read allowance has been published yet.  No read materializes and a speculative read is refused, while a
+    // publication is admitted without a fit check (there is no envelope to fit into); publish_read_allowance() is
+    // what makes both absolute.
+    uint64_t read_budget_bytes = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -215,6 +240,8 @@ struct ConversationStoreMatch {
     bool pinned = false;
     uint32_t stages = 0;
     uint64_t payload_bytes = 0;
+    // The manifest's share of the shared physical charge: its encoded bytes rounded up to the filesystem's
+    // allocation granularity, plus one block for its directory entry - never a smaller figure than the file occupies.
     uint64_t manifest_bytes = 0;
     uint64_t published_order = 0;
 };
@@ -253,6 +280,8 @@ struct ConversationStoreRead {
     uint64_t request_id = 0;
     uint64_t generation = 0;
     uint64_t head_id = 0;
+    // The execution-domain epoch this read was admitted in.  Never relabelled: a completion of an older epoch is
+    // retired rather than delivered under the current one.
     uint64_t epoch = 0;
     int64_t tokens = 0;
     // True when the selected cut is the image's live record and false when it is a checkpoint: the caller needs this
@@ -277,6 +306,12 @@ struct ConversationStoreRead {
 // supply an interval the engine has actually proven unchanged (conversation_snapshot's retained/reused extents);
 // equal token ids alone do not qualify.  Reused intervals must end on a chunk boundary of both streams (or end both
 // streams), so no immutable chunk is ever partially rewritten.
+//
+// `head_id` is *the* donor of the interval and is resolved independently of Publish::supersedes: the store reads
+// that head's own manifest, requires it to be currently authorized, to be in this image's own compatibility bucket
+// and to have been captured in this epoch, and adopts whole aligned chunks only when its stream identity maps to the
+// same physical identity as the outgoing image's.  An unverified or differently mapped donor is ignored, never
+// guessed at, and every donor is protected from eviction while the publication is in flight.
 struct ConversationStoreReuse {
     uint64_t head_id = 0;
     ConversationStoreStreamId stream;
@@ -288,6 +323,11 @@ struct ConversationStoreReuse {
 struct ConversationStorePublish {
     uint64_t request_id = 0;
     uint64_t generation = 0;                 // capture ordering, not worker completion
+    // The execution-domain epoch (epoch()) sampled at the *actual capture seam*: the store refuses a publication
+    // whose capture predates an epoch advance, so an image captured before a safety invalidation can never be
+    // authorized afterwards.  A production caller MUST set this explicitly; 0 means "bind the epoch at publish()
+    // admission" and exists only for admission-only workflows and tests.
+    uint64_t epoch = 0;
     uint64_t supersedes = 0;                 // the head this image was captured from (0 = a new branch)
     bool cover = false;                      // the caller proved it covers `supersedes`' compatible prefix
     std::vector<ConversationStoreReuse> reuse;
@@ -297,10 +337,12 @@ enum class ConversationStorePublishStatus : uint8_t {
     stored = 0,             // a new branch head
     replaced,               // superseded its predecessor in the same branch and epoch
     retained_branch,        // the predecessor keeps a pinned/divergent cut, so both heads are retained
-    stale,                  // an older generation, a different epoch or a retired predecessor
+    stale,                  // an older generation, a different epoch, a retired predecessor or a cancelled ticket
     refused_quota,
     refused_floor,
-    refused_limits,         // the image exceeds ConversationStoreLimits, or the store's index ceiling is reached
+    // The image exceeds ConversationStoreLimits, the store's index or head ceiling is reached, or the publication
+    // image does not fit the published RAM allowance (see publish()).
+    refused_limits,
     refused_busy,           // the bounded writer and its pending slots are full
     coalesced,              // replaced by a newer covered publication of the same lineage (lease released)
     failed,
@@ -350,6 +392,7 @@ struct ConversationStoreManifestInfo {
     uint64_t generation = 0;
     uint64_t parent_head_id = 0;
     uint64_t payload_bytes = 0;
+    // The manifest's share of the shared charge (allocation-rounded), never a smaller figure than the file occupies.
     uint64_t manifest_bytes = 0;
     uint64_t published_order = 0;
     uint32_t stages = 0;
@@ -373,11 +416,16 @@ public:
     // lookup is a miss and every publication is refused.  `disabled_reason()` is empty when enabled.
     bool enabled() const;
     const char* disabled_reason() const;
-    bool healthy() const;                       // enabled and no fatal I/O or authority failure
+    // Enabled and not faulted.  A fault is *latched* for the life of this instance: a failure that must stop reuse (a
+    // safety fault, an authority write that cannot be trusted) is never cleared, and a faulted instance never clears
+    // its run-intent marker, never writes the catalog, and never looks like a clean close.
+    bool healthy() const;
     void set_unhealthy(const char* reason);      // the owner observed a failure that must stop reuse (e.g. a safety fault)
 
     // The execution domain's current epoch, the issuer key the frontend derives authorized scopes from, and the
-    // durable run-intent marker this owner holds.
+    // durable run-intent marker this owner holds.  The key is 32 bytes of cryptographic entropy and is immutable
+    // after a successful open: an existing store whose key cannot be read or is not exactly 32 bytes stays disabled
+    // rather than minting a new authorization identity.
     uint64_t epoch() const;
     const std::array<uint8_t, 32>& issuer_key() const;
     bool run_intent_active() const;
@@ -399,24 +447,33 @@ public:
                                                const std::vector<int32_t>& ids,
                                                const std::vector<ConversationImageKey>& images) const;
     bool manifest_info(uint64_t head_id, ConversationStoreManifestInfo& out) const;
-    // The stream table of a retained head, read from its manifest (bounded); for planning reuse intervals.
+    // The stream table of a retained head, read from its manifest (bounded, read-only, no catalog lock held): for
+    // planning reuse intervals.  It exposes no payload and authorizes nothing.
     bool manifest_streams(uint64_t head_id, std::vector<ConversationStoreStreamInfo>& out) const;
 
     // --- reads --------------------------------------------------------------------------------------------
-    // demand: required by a request that will consume a slot, admitted as soon as the read allowance admits it.
-    // prefetch: optional, only admitted while spare allowance exists, never overtaking a demand request.
-    // Both select the longest exact authorized prefix themselves, deduplicate by (request_id, generation) and return
-    // immediately; the caller consumes the result with take_ready()/wait_ready() at its own safe seam.
+    // demand: required by a request that will consume a slot; admit it when its whole peak fits the published
+    //   allowance (or when no allowance is published yet, in which case it waits).  When it can never fit it is
+    //   refused immediately as refused_budget, so the caller falls back to its ordinary prefill.
+    // prefetch: optional, only admitted while spare allowance exists, never overtaking a demand, and refused (never
+    //   left pending) when the allowance has no room for it.
+    // Both select the longest exact authorized prefix themselves, deduplicate by (request_id, generation), enforce
+    // the read-descriptor and preparation ceilings *before* allocating anything, bind the request to the epoch it was
+    // admitted in, and return immediately; the caller consumes the result with take_ready()/wait_ready() at its own
+    // safe seam.  A demand never revokes anything of its own; it does revoke outstanding speculation.
     bool demand(const ConversationStoreQuery& query, std::string& why);
     bool prefetch(const ConversationStoreQuery& query, std::string& why);
-    // Cancels a request or a prefetch for (request_id, generation): an issued filesystem operation may finish, but
-    // its completion is dropped and its bytes are refunded.  Safe with unknown or already-completed identifiers.
+    // Cancels a request, a prefetch or a not-yet-started publication ticket for (request_id, generation): an issued
+    // filesystem operation may finish, but its completion is dropped, its charge refunded and never delivered.  Safe
+    // with unknown or already-completed identifiers.
     void cancel(uint64_t request_id, uint64_t generation);
-    // Non-blocking: false when nothing is ready.  A returned image is complete and byte-verified.  The caller
-    // receives the only alias of an image whose RAM stays charged to this module (see ram_lease_bytes()) until it
-    // calls release_read(); nothing is refunded while the caller still holds bytes.  The store does not drop its
-    // accounting when the returned shared_ptr is destroyed, because an alias derived from it (a mounted copy that
-    // shares payloads) can outlive it: only the caller knows when it is truly done.
+    // Non-blocking: false when nothing is ready.  A returned image is complete and byte-verified, and it was
+    // materialized in the epoch this store still serves: a completion of an older epoch, or one produced after the
+    // store faulted or closed, is never delivered and never relabelled.  The caller receives the only alias of an
+    // image whose RAM stays charged to this module (see ram_lease_bytes()) until it calls release_read(); nothing is
+    // refunded while the caller still holds bytes.  The store does not drop its accounting when the returned
+    // shared_ptr is destroyed, because an alias derived from it (a mounted copy that shares payloads) can outlive it:
+    // only the caller knows when it is truly done.
     bool take_ready(ConversationStoreRead& out);
     // Bounded wait for the next ready result (own thread only: never call it while holding a caller lock that
     // cancel() or demand() needs).  timeout_ms 0 = non-blocking.  This and take_ready() above deliver the next
@@ -429,23 +486,28 @@ public:
     bool take_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out);
     bool wait_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out, uint64_t timeout_ms);
     // The single lease release: the caller reports that this read is finished AND that every alias of the returned
-    // image is gone.  The caller owns that lifetime centrally - one guard per read that fires on success, failure,
-    // cancellation and every fast or exception path - because the module cannot see inside a shared alias.  Until it
-    // fires, the image's RAM stays charged and no other read may use it.  Safe and counted for unknown or
-    // already-released identifiers; a release that never fires leaves the bytes charged, which is a caller bug the
-    // module cannot detect - and charging is the fail-safe direction, never a silent refund of live bytes.
+    // image is gone.  One unconditional, idempotent transition: a queued, active, ready or handed-out request is
+    // retired here, its charge is refunded once its buffers are actually dropped, and a released request can never be
+    // delivered or completed afterwards.  Safe and counted for unknown or already-released identifiers; a release
+    // that never fires leaves the bytes charged, which is a caller bug the module cannot detect - and charging is the
+    // fail-safe direction, never a silent refund of live bytes.
     void release_read(uint64_t request_id, uint64_t generation);
     ConversationStoreReadStatus request_status(uint64_t request_id, uint64_t generation) const;
-    // Recency promotion after a *confirmed* restore (never on prefetch or on a mere append): moves the head to the
-    // protected segment so eviction reclaims other histories first.
+    // Recency promotion after a *confirmed* restore (never on prefetch or on a mere append): moves the head into the
+    // protected segment so eviction reclaims other histories first, demoting the oldest protected head when the
+    // segment is at its three-quarter ceiling.  The durable catalog write is handed to this module's storage thread,
+    // so this call performs no storage wait; the promotion is a policy hint, and a failed commit leaves it pending for
+    // the next one rather than risking the authority.
     void confirmed_restore(uint64_t head_id);
 
     // --- publication --------------------------------------------------------------------------------------
     // The image is an owning frozen lease: the store keeps this alias until the publication finishes and the caller
-    // keeps its own.  One admitted writer image at a time.  While it is busy, a new publication is admitted only
-    // when it is proven to be the *same lineage* as the one in flight (identical `supersedes`, `cover` set and a
-    // newer generation): it then replaces it, and the replaced request's result is reported as `coalesced`.  A
-    // different branch is never coalesced - it is refused as `refused_busy`, the in-flight predecessor is left
+    // keeps its own.  One admitted writer image at a time, and it must fit the published RAM allowance exactly like a
+    // read: an image that cannot fit is refused (refused_limits) instead of overrunning the envelope.  While the
+    // writer is busy, a new publication is admitted only when it is proven to be the *same lineage* as the one in
+    // flight (both carry `cover` for the same nonzero `supersedes` and this one is the newer generation): it then
+    // replaces it, and the replaced request's result is reported as `coalesced`.  A different branch - including a
+    // second new branch - is never coalesced: it is refused as `refused_busy`, the in-flight predecessor is left
     // untouched and the newer, optional store is dropped as a safe miss.  The call returns immediately.
     bool publish(std::shared_ptr<const SavedConversation> image, const ConversationStorePublish& request,
                  std::string& why);
@@ -456,22 +518,26 @@ public:
     // --- host admission (RAM reserve handshake) -----------------------------------------------------------
     // Two authoritative numbers in two scopes that must never be mixed: a caller neither subtracts the shared disk
     // quota from a RAM envelope, nor treats a RAM lease as free disk.
-    //   ram_held_bytes()       every byte this module currently owns in host memory, including what it holds on a
-    //                          caller's behalf: index metadata, admitted reservations that have already allocated,
-    //                          materialized read images, the shared image of an in-flight publication, I/O scratch.
+    //   ram_held_bytes()       every byte this module currently owns in host memory *or has committed to
+    //                          allocating*: index metadata, bounded preparation/descriptors, the full peak of every
+    //                          read that has begun allocating, materialized read images, the shared image of an
+    //                          in-flight publication, and I/O scratch.  No allocation is ever made that this figure
+    //                          did not already include, and the figure never exceeds the published allowance (a read
+    //                          or publication that cannot fit is refused instead of overrunning it).
     //   ram_lease_bytes()      the handed-out share of it: a read image returned by take_ready()/wait_ready() and not
     //                          yet released, plus the publication image alias.  Charge this to your own envelope; the
     //                          module will not hand those bytes to another read, and never refunds them on its own.
     //   ram_read_budget()      the absolute admission bound in force.
     //   ram_available_bytes()  == max(0, ram_read_budget() - ram_held_bytes()).
-    //   disk_charged_bytes()   committed objects and manifests still authorized by the catalog, including bytes
-    //                          waiting to be reclaimed (orphans, pending deletions, retired objects - credited only
-    //                          after the authority record is durable and the file is gone).
+    //   disk_charged_bytes()   committed objects, manifests and control files (catalog, issuer key, run intent,
+    //                          temporaries) still present under the root, including bytes waiting to be reclaimed -
+    //                          credited only once the deletion has completed.
     //   disk_available_bytes() == max(0, disk_quota_bytes() - disk_charged_bytes()).
     //   disk_free_bytes()      last sampled filesystem space under the root, checked against min_free_bytes.
-    // suspend_read_admission() stops admitting *new* read work (queued demand stays queued); every byte the module
-    // can still allocate was already counted in ram_held_bytes() at admission time, so a caller may observe it while
-    // suspended and then publish_read_allowance() without racing an allocation.
+    // suspend_read_admission() stops admitting *new* read work and is serialized with the reader's start-of-
+    // allocation admission, so when it returns every byte this module can still allocate is already counted in
+    // ram_held_bytes(): queued work can allocate nothing while admission is suspended.  A caller may publish a new
+    // allowance afterwards without racing an allocation.
     uint64_t ram_held_bytes() const;
     uint64_t ram_lease_bytes() const;
     uint64_t ram_read_budget() const;
@@ -488,12 +554,17 @@ public:
 
     // --- lifecycle ----------------------------------------------------------------------------------------
     // Durably advances the execution-domain epoch, invalidating every stored record and outstanding completion of
-    // the previous epoch.  Called when the engine discards state for safety (a non-finite/poison detection).  A
-    // failed commit leaves the run intent armed: the next start must not reuse anything.
+    // the previous epoch.  Called when the engine discards state for safety (a non-finite/poison detection).  The
+    // durable commit runs on this module's storage thread and this call waits for it (bounded); it returns true only
+    // when that commit succeeded.  A failure - including one this call could not confirm in time - latches the store
+    // faulted and leaves the run intent armed: the next start must not reuse anything.
     bool invalidate_domain(const char* reason);
-    // Healthy drain: finishes/cancels storage work, then durably clears this domain's run intent.  Only a clean
-    // close promises that eligible completed publications survive a restart; the destructor deliberately abandons
-    // the intent instead (an unclean exit must not look healthy).
+    // Healthy drain: finishes or cancels storage work, durably commits a final catalog, and only then clears and
+    // flushes this domain's run-intent marker - in that order, so a close that cannot finish its commit never removes
+    // the marker that tells the next start to distrust this domain.  Only a healthy close promises that eligible
+    // completed publications survive a restart; a faulted close, and the destructor, deliberately abandon the intent
+    // (an unclean exit must not look healthy).  An instance that does not own the root lock performs no authority
+    // write and removes no marker at all.
     void close();
     ConversationStoreCounters counters() const;
     // Diagnostics for qualification evidence: one bounded line per stage of the open sequence.

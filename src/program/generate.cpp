@@ -31,6 +31,7 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/conversation_store.hpp"
+#include "strata/core/execution_identity.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -503,10 +504,40 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 // descriptor payload of the prepared frontier (a whole context of int32 tokens is under 1 MiB), never permission for
 // image-sized allocations: the store's own read budget governs those.
 constexpr size_t kConversationOfferBytes = 64u << 20;
-// How long a request waits for its required restore before treating the record as a miss and reading the prompt
-// itself.  It is bounded by the original request deadline when the frontend offered one and the deadline is still
-// ahead; STOP/cancellation always ends the wait immediately.
-constexpr uint64_t kConversationDemandWaitMs = 20000;
+
+uint64_t conversation_store_ram_limit(const strata::core::ConversationCache& cache, uint64_t envelope,
+                                      uint64_t local_bytes = 0) {
+    // The two processes each own bounded frontier metadata; neither may spend the snapshot envelope again.
+    const uint64_t preparation = 2 * kConversationOfferBytes;
+    uint64_t available = envelope > preparation ? envelope - preparation : 0;
+    const uint64_t cached = cache.envelope_bytes();
+    available = available > cached ? available - cached : 0;
+    return available > local_bytes ? available - local_bytes : 0;
+}
+
+class StoreRamAdmission {
+public:
+    StoreRamAdmission(strata::core::ConversationStore* store, strata::core::ConversationCache& cache,
+                      uint64_t envelope, uint64_t outside_bytes)
+        : store_(store), cache_(cache), envelope_(envelope), outside_bytes_(outside_bytes) {
+        if (store_) store_->suspend_read_admission();
+    }
+    StoreRamAdmission(const StoreRamAdmission&) = delete;
+    StoreRamAdmission& operator=(const StoreRamAdmission&) = delete;
+    ~StoreRamAdmission() { publish(); }
+    void publish(uint64_t local_bytes = 0) {
+        if (store_) {
+            const uint64_t available = conversation_store_ram_limit(cache_, envelope_, local_bytes);
+            store_->publish_read_allowance(available > outside_bytes_ ? available - outside_bytes_ : 0);
+        }
+    }
+    uint64_t held() const { return store_ ? store_->ram_held_bytes() + 2 * kConversationOfferBytes : 0; }
+private:
+    strata::core::ConversationStore* store_;
+    strata::core::ConversationCache& cache_;
+    uint64_t envelope_;
+    uint64_t outside_bytes_;
+};
 
 /// Canonical, typed, length-delimited byte sequence for the persistent store's execution-domain digest.  Every field
 /// is written as an explicit little-endian u64 tag/value pair, so two builds cannot disagree about the encoding, and
@@ -515,12 +546,25 @@ class ConversationDomainFields {
 public:
     void u64(uint64_t v) { for (int i = 0; i < 8; ++i) bytes_.push_back(uint8_t(v >> (8 * i))); }
     void i64(int64_t v) { u64((uint64_t) v); }
+    void f64(double value) {
+        uint64_t bits;
+        static_assert(sizeof bits == sizeof value);
+        std::memcpy(&bits, &value, sizeof bits);
+        u64(bits);
+    }
     void tag(std::string_view name) {
         u64(name.size());
         bytes_.insert(bytes_.end(), name.begin(), name.end());
     }
     void identity(const std::array<uint8_t, 32>& value) {
         tag("identity");
+        u64(value.size());
+        bytes_.insert(bytes_.end(), value.begin(), value.end());
+    }
+    /// A nested canonical sequence another module produced: its tag and its exact bytes, length-delimited, so the two
+    /// encoders can never disagree about where the nested sequence ends.
+    void blob(std::string_view name, const std::vector<uint8_t>& value) {
+        tag(name);
         u64(value.size());
         bytes_.insert(bytes_.end(), value.begin(), value.end());
     }
@@ -1935,8 +1979,12 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
+// `want_persistent_identity` gates the *persistent* store's SHA-256 form: it costs two digests over the uploaded
+// arrays, so a process that will not persist (no root, no verified identity, not serving) does no crypto at all -
+// the upload, the summary and the legacy 64-bit digest are identical either way.
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
-                          uint64_t& digest, std::string& err) {
+                          uint64_t& digest, std::array<uint8_t, 32>& persistent_digest, bool want_persistent_identity,
+                          std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
@@ -2009,6 +2057,24 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         b.bytes("scale", s.data(), s.size() * sizeof(float));
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"
+    }
+    if (want_persistent_identity) {
+        // The persistent store's form of the same identity: the two uploaded arrays are hashed where they already
+        // are (never concatenated into a third buffer), and the fields above are repeated so an image and a session
+        // file cannot disagree about which vector produced them.
+        ConversationDomainFields persistent;
+        persistent.tag("uploaded-control-vector");
+        persistent.i64(o.cvec_mode);
+        persistent.i64(first);
+        persistent.i64(last);
+        persistent.i64(single);
+        persistent.i64(L);
+        persistent.i64(N);
+        persistent.i64(g.hc);
+        persistent.identity(strata::core::conversation_store_domain_digest(dir.data(), dir.size() * sizeof(float)));
+        persistent.identity(strata::core::conversation_store_domain_digest(s.data(), s.size() * sizeof(float)));
+        persistent_digest = strata::core::conversation_store_domain_digest(persistent.bytes().data(),
+                                                                          persistent.bytes().size());
     }
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
@@ -2827,6 +2893,11 @@ int main(int argc, char** argv) {
         else if (!o.conversation_cache_engine_id_given)
             persistence_disabled_reason = "--conversation-cache-engine-id is missing";
         else if (!o.serve) persistence_disabled_reason = "not a serving process";
+        // A path-backed override whose *contents* change the arithmetic cannot be identified by its pathname: the
+        // engine reads the file, and hashing the name would authorize records computed under bytes this process never
+        // saw.  Declining is the rule the store's design states for an unavailable verified identity.
+        else if (const char* override_reason = strata::core::arithmetic_path_override_refusal())
+            persistence_disabled_reason = override_reason;
         else if (o.prompt_cache <= 0 || o.conversation_cache_mib <= 0 || o.conversation_cache_slots <= 0)
             persistence_disabled_reason =
                 "parking is off (--prompt-cache, --conversation-cache-mib or --conversation-cache-slots)";
@@ -5754,9 +5825,10 @@ int main(int argc, char** argv) {
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     uint64_t cvec_digest = 0;   // a session file is bound to the loaded vector (0: none)
+    std::array<uint8_t, 32> persistent_cvec_digest{};
     if (!o.cvec_files.empty()) {
         std::string ce;
-        if (!load_control_vectors(o, g, cvec_summary, cvec_digest, ce)) {
+        if (!load_control_vectors(o, g, cvec_summary, cvec_digest, persistent_cvec_digest, persistence_configured, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
             return 2;
         }
@@ -10837,10 +10909,16 @@ int main(int argc, char** argv) {
         uint64_t store_refused = 0, store_coalesced = 0, store_cancelled = 0;
         // Written by the offer channel's own thread, read by this one.
         std::atomic<uint64_t> store_prefetched{0};
-        // Every engine setting that changes what a saved state means, in one place: the session file's identity and
-        // the persistent store's execution-domain digest both read exactly this, so a file and a stored image can
-        // never disagree about which settings bind them.  Sampling, seeds, draft tuning, the expert tier and the
-        // prompt-reading chunk are deliberately absent (they change what is computed next, not what the cells hold).
+        // Every engine setting that changes what a saved state means, in one place: the *legacy* session file's
+        // identity is built from exactly this, and the persistent store's execution-domain digest carries the same
+        // fields plus the arithmetic selection the frozen session-file format has no room for (the environment
+        // controls and resolved policy bound below, the draft layer's own arithmetic, and the host dispatch the
+        // engine resolved an unset control through) - see core/execution_identity.hpp for that selection's rule.
+        // Sampling, seeds and draft proposals are deliberately absent from both: they choose what is computed next,
+        // not what the cells hold.  The prompt-reading chunk is absent from the file's identity for the same reason,
+        // and it *is* bound in the store's domain, where a different chunk's prompt-path rounding changes the bytes
+        // (docs/DETAILS.md, STRATA_EMB_REUSE_ACCOUNT: "a larger chunk or more borrowed slots ... with other rounding
+        // in the prompt path").
         auto session_config_now = [&]() -> strata::core::SessionConfig {
             strata::core::SessionConfig c;
             c.engine_version = STRATA_VERSION;
@@ -10922,8 +11000,129 @@ int main(int argc, char** argv) {
                 fields.i64(o.max_context);
                 fields.i64(o.kv_resident);
                 fields.i64(o.mtp_max_t);
-                fields.u64(1);   // the switch fingerprint that follows
-                fields.u64(strata::core::session_config_fingerprint(session_config_now()));
+                const auto config = session_config_now();
+                fields.tag(config.engine_version);
+                fields.tag(config.backend);
+                fields.tag(config.kv);
+                fields.i64(config.mtp_window);
+                fields.u64(config.kv_rot);
+                fields.i64(config.rope.type);
+                fields.f64(config.rope.freq_base);
+                fields.f64(config.rope.factor);
+                fields.f64(config.rope.freq_scale);
+                fields.f64(config.rope.orig_ctx);
+                fields.f64(config.rope.ext_factor);
+                fields.f64(config.rope.attn_factor);
+                fields.f64(config.rope.beta_fast);
+                fields.f64(config.rope.beta_slow);
+                fields.identity(persistent_cvec_digest);
+                fields.u64(config.switches.size());
+                for (const auto& [name, value] : config.switches) {
+                    fields.tag(name);
+                    fields.i64(value);
+                }
+                // ---- every remaining arithmetic selection ----------------------------------------------------
+                // The switches above are the CLI's declared set.  This is everything else that can change the bits
+                // this image holds: the environment controls the kernels read for themselves (bound by name and
+                // exact value bytes - core/execution_identity.hpp carries the membership rule and the cited
+                // exclusions: instrumentation, resource/lifetime, scheduling, placement, cache mechanics and
+                // sampling, none of which changes what the bytes mean) and the values the engine *resolved* before
+                // it got here, where an accessor reports the effective rule rather than the text that asked for it.
+                std::vector<strata::core::ArithmeticIdentityValue> arithmetic;
+                const auto bind_number = [&](std::string name, int64_t value) {
+                    arithmetic.push_back(strata::core::arithmetic_number(std::move(name), value));
+                };
+                // The route tail rank: the accessor returns the clamped rule the expert pool applies, not its text.
+                bind_number("route.tail_skip_rank", strata::core::tail_skip_rank());
+                // The prompt path's resolved width and small-chunk policy: the engine rewrites --prefill into the
+                // chunk it actually reads with (the auto scan, the Windows cap), and a layer split may read a
+                // request-specific shorter one, so the CLI spelling alone does not describe it.
+                bind_number("prompt.chunk", o.prefill_chunk);
+                bind_number("prompt.chunk_auto", o.prefill_auto ? 1 : 0);
+                bind_number("prompt.chunk_auto_max", o.prefill_auto_max);
+                bind_number("prompt.small_chunk", split_small);
+                bind_number("prompt.small_chunk_max", split_small_max);
+                // The host's own arithmetic dispatch: which kernel an unset control resolves to depends on the CPU's
+                // ISA and on each serving card (the BF16 tensor-core default, the QSA scorer's warp path, the shared
+                // memory STRATA_GR_V3 needs, the AVX-512/AVX-2 expert kernels and the per-type multi-token
+                // threshold), so an image is only interchangeable between hosts whose dispatch agrees.
+                bind_number("host.cpu_avx2", strata::kernels::cpu::cpu_avx2_ok() ? 1 : 0);
+                bind_number("host.cpu_avx512f", strata::kernels::cpu::cpu_avx512_ok() ? 1 : 0);
+                bind_number("host.cpu_avx512bw", strata::kernels::cpu::cpu_avx512bw_ok() ? 1 : 0);
+                {
+                    // native_gu_mt_min() is per gate/up type: bind the value for every type this pack's layers use,
+                    // so a rule that special-cases one type cannot hide behind the others.
+                    std::vector<int> gu_types;
+                    for (const strata::kernels::cpu::NativeFmt& f : strata::kernels::cpu::expert_layout().fmt)
+                        gu_types.push_back(f.gu_type);
+                    std::sort(gu_types.begin(), gu_types.end());
+                    gu_types.erase(std::unique(gu_types.begin(), gu_types.end()), gu_types.end());
+                    for (const int gu_type : gu_types)
+                        bind_number("host.cpu_gu_mt_min." + std::to_string(gu_type),
+                                    strata::kernels::cpu::native_gu_mt_min(gu_type));
+                }
+                // A build that is told to run another generation's code paths (tests) selects other kernels.
+                bind_number("host.emulated_cc", strata::emulated_cc());
+                {
+                    // Every card the runtime enumerates, not only the ones this session carved: a prompt helper or a
+                    // peer owner computes an expert's rows with the same kernels on a card of its own, so a host whose
+                    // visible cards differ is not the same execution domain.  A card the runtime cannot describe must
+                    // neither abort setup nor look like a known one: its failure is bound, and no identified card can
+                    // share that binding.
+                    const int cards = strata::core::device_count();
+                    for (int device = 0; device < cards; ++device) {
+                        strata::core::DeviceInfo info;
+                        try {
+                            info = strata::core::device_info(device);
+                        } catch (const std::exception&) {
+                            bind_number("host.gpu_query_failed." + std::to_string(device), 1);
+                            continue;
+                        }
+                        bind_number("host.gpu_cc." + std::to_string(device), info.cc_major * 10 + info.cc_minor);
+                        bind_number("host.gpu_driver." + std::to_string(device), info.driver_version);
+                        bind_number("host.gpu_runtime." + std::to_string(device), info.runtime_version);
+                        arithmetic.push_back(
+                            strata::core::arithmetic_text("host.gpu_arch." + std::to_string(device), info.arch));
+                    }
+                }
+                // The CPU prefill share computes expert rows on the CPU, whose activation format is *not* bit-identical
+                // to the GPU's (include/strata/prefill/prefill.hpp), so a run that arms it is a different arithmetic
+                // domain.  This binds the eligibility the process froze before any price or layout snapshot; the
+                // settings themselves are bound by name, and the prompt loop's later re-resolution of the *default*
+                // is a measured, occupancy-dependent choice no startup-time value can describe.
+                bind_number("prompt.cpu_share_armed", strata::prefill::Prefill::cpu_share_enabled() ? 1 : 0);
+                // Owner-side placement that changes which arithmetic computes an expert's rows: the resident CPU pool
+                // keeps some experts' rows on the CPU, and a remote or helper owner runs them on another card.
+                bind_number("experts.resident_cpu", o.resident_cpu_experts ? 1 : 0);
+                bind_number("experts.remote_opt", o.remote_expert_opt ? 1 : 0);
+                bind_number("experts.prefill_helpers", o.prefill_helpers ? 1 : 0);
+                if (use_mtp) {
+                    // The draft layer's own arithmetic: what its projections and head run from, how it normalizes,
+                    // whether its router is biased, how far its K/V catch-up reaches, and its vocabulary subset by
+                    // *content* - the ids are the artifact's own bytes, hashed where they already are (never the
+                    // file's path, and only while persistence is on).
+                    bind_number("draft.head_type", mtp.draft_head_type());
+                    bind_number("draft.q4_projections", mtp.draft_q4_projections() ? 1 : 0);
+                    bind_number("draft.hnorm_per_stream", mtp.hnorm_per_stream() ? 1 : 0);
+                    bind_number("draft.catchup_all", strata::core::MtpDrafter::catchup_all() ? 1 : 0);
+                    bind_number("draft.route_resident", mtp.route_resident() ? 1 : 0);
+                    if (mtp.route_resident()) {
+                        arithmetic.push_back(
+                            strata::core::arithmetic_double("draft.route_margin", mtp.route_resident_margin()));
+                        bind_number("draft.route_lo", mtp.route_resident_lo());
+                        bind_number("draft.route_hi", mtp.route_resident_hi());
+                    }
+                    const int64_t draft_vocab = mtp.draft_vocab_size();
+                    bind_number("draft.vocab_size", draft_vocab);
+                    if (draft_vocab > 0)
+                        arithmetic.push_back(strata::core::arithmetic_digest(
+                            "draft.vocab_bytes",
+                            strata::core::conversation_store_domain_digest(
+                                reinterpret_cast<const uint8_t*>(mtp.draft_vocab_ids()),
+                                (size_t) draft_vocab * sizeof(int32_t))));
+                }
+                fields.blob("arithmetic-identity",
+                            strata::core::arithmetic_execution_identity(std::move(arithmetic)));
                 // The store module owns the crypto; this file only builds the canonical field sequence.
                 options.domain = strata::core::conversation_store_domain_digest(fields.bytes().data(), fields.bytes().size());
             }
@@ -10935,7 +11134,17 @@ int main(int argc, char** argv) {
             options.quota_bytes = (uint64_t) o.conversation_cache_disk_mib << 20;
             options.min_free_bytes = (uint64_t) o.conversation_cache_disk_min_free_mib << 20;
             options.head_limit = (size_t) o.conversation_cache_disk_heads;
-            conversation_store = std::make_unique<strata::core::ConversationStore>(options);
+            options.read_budget_bytes = conversation_store_ram_limit(conversations,
+                (uint64_t) o.conversation_cache_mib << 20);
+            strata::core::ConversationStoreLimits limits;
+            limits.max_tokens = (uint64_t) o.max_context;
+            limits.max_image_bytes = options.read_budget_bytes;
+            limits.max_stream_bytes = options.read_budget_bytes;
+            limits.max_state_bytes = options.read_budget_bytes;
+            limits.max_stages = (uint32_t) stages.size() + 1;
+            limits.max_checkpoints = (uint32_t) std::max(o.prompt_cache, 1);
+            limits.max_kv_layers = (uint32_t) g.n_qsa_layers() + 1;
+            conversation_store = std::make_unique<strata::core::ConversationStore>(options, limits);
             if (!conversation_store->enabled()) {
                 std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
                              conversation_store->disabled_reason());
@@ -10948,17 +11157,20 @@ int main(int argc, char** argv) {
             }
         }
         const bool store_on = conversation_store && conversation_store->enabled();
+        bool store_faulted = false;
+        auto poison_store = [&] {
+            store_faulted = true;
+            if (conversation_store) conversation_store->set_unhealthy("non-finite logits");
+        };
         // The store's RAM - its metadata index, materialized read images and publication leases - lives inside the
         // same envelope as the parked conversations (--conversation-cache-mib).  The allowance is what the parked
         // payloads and the store's own held bytes leave over: a demand request is always admitted and charged, while
         // an optional prefetch only takes spare allowance, so a full envelope never delays a required restore.
         auto store_allowance = [&]() -> uint64_t {
             if (!store_on) return 0;
-            const uint64_t envelope = (uint64_t) o.conversation_cache_mib << 20;
-            const uint64_t mine = conversations.envelope_bytes();
-            const uint64_t held = conversation_store->ram_held_bytes();   // RAM family only: never the disk footprint
-            const uint64_t spare = envelope > mine + held ? envelope - mine - held : 0;
-            conversation_store->publish_read_allowance(spare);   // absolute: recomputed from live accounting
+            const uint64_t spare = conversation_store_ram_limit(conversations,
+                (uint64_t) o.conversation_cache_mib << 20);
+            conversation_store->publish_read_allowance(spare);
             return spare;
         };
         // A selector is the exactness bucket every lookup and publication shares: the authorized scope and steering
@@ -10993,8 +11205,6 @@ int main(int argc, char** argv) {
                 if (at == pending_publishes.size()) continue;   // already reaped (or a foreign result)
                 const PendingPublish pending = pending_publishes[at];
                 pending_publishes.erase(pending_publishes.begin() + (std::ptrdiff_t) at);
-                // The store dropped its alias (or never took it): the charge is ours again either way.
-                conversations.release_lease(pending.lease_bytes);
                 const bool created = result.status == strata::core::ConversationStorePublishStatus::stored ||
                     result.status == strata::core::ConversationStorePublishStatus::replaced ||
                     result.status == strata::core::ConversationStorePublishStatus::retained_branch;
@@ -11049,7 +11259,7 @@ int main(int argc, char** argv) {
                     if (entry.request_id == request_id && entry.generation == generation) return entry.deadline_ns;
                 return std::nullopt;
             }
-            static constexpr size_t kKeep = 8;   // the accepted frontier, oldest first
+            enum : size_t { kKeep = 8 };   // the accepted frontier, oldest first
             mutable std::mutex mu;
             std::deque<Entry> entries;
             uint64_t accepted = 0;
@@ -11189,7 +11399,7 @@ int main(int argc, char** argv) {
         auto store_demand_restore = [&](const std::vector<int32_t>& prompt,
                                         const std::vector<ImgKey>& imgs,
                                         const strata::core::ConversationScope& scope, bool want_cvec,
-                                        uint64_t offer_id, uint64_t offer_generation,
+                                        uint64_t offer_id, uint64_t offer_generation, uint64_t deadline_ns,
                                         const std::function<bool()>& cancelled,
                                         std::optional<strata::core::SavedConversation>& incoming) -> StoreDemandResult {
             StoreDemandResult out;
@@ -11201,20 +11411,22 @@ int main(int argc, char** argv) {
                 return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now().time_since_epoch()).count();
             };
-            uint64_t deadline_ns = 0;
-            if (offer_id != 0) {
+            if (deadline_ns == 0 && offer_id != 0) {
                 const auto remembered = offer_book->deadline(offer_id, offer_generation);
-                if (remembered && *remembered > now_ns()) deadline_ns = *remembered;
+                if (remembered) deadline_ns = *remembered;
             }
-            const uint64_t wait_until = std::min<uint64_t>(
-                deadline_ns ? deadline_ns : UINT64_MAX, now_ns() + kConversationDemandWaitMs * 1000000ull);
+            if (deadline_ns == 0 || deadline_ns <= now_ns()) {
+                out.status = strata::core::ConversationStoreReadStatus::cancelled;
+                return out;
+            }
+            const uint64_t wait_until = deadline_ns;
             strata::core::ConversationStoreQuery query;
             query.selector = store_selector_base;
             query.selector.scope = scope;
             query.selector.cvec = want_cvec;
             query.tokens = prompt;
             query.images = imgs;
-            query.request_id = offer_id != 0 ? offer_id : ++demand_serial;
+            query.request_id = offer_id != 0 ? offer_id : (uint64_t{1} << 63) | ++demand_serial;
             query.generation = offer_id != 0 ? offer_generation : conversation_store->epoch();
             query.deadline_ns = deadline_ns;
             store_allowance();
@@ -11239,7 +11451,7 @@ int main(int argc, char** argv) {
                 const uint64_t now = now_ns();
                 if (now >= wait_until) break;
                 const uint64_t slice_ms = std::min<uint64_t>(250, (wait_until - now) / 1000000ull + 1);
-                if (conversation_store->wait_ready(read, slice_ms)) break;
+                if (conversation_store->wait_ready(query.request_id, query.generation, read, slice_ms)) break;
             }
             if (read.status != strata::core::ConversationStoreReadStatus::ready || !read.image) {
                 // Abandon it: an issued filesystem operation may still finish, but its completion must not publish.
@@ -11251,6 +11463,32 @@ int main(int argc, char** argv) {
                              strata::core::conversation_store_read_status_name(out.status), read.detail.c_str());
                 return out;
             }
+            const auto& image = *read.image;
+            bool exact_cut = false;
+            if (read.live) {
+                exact_cut = strata::core::conversation_prefix(image.live, prompt, imgs) == read.tokens;
+            } else {
+                for (const auto& checkpoint : image.checkpoints)
+                    if (strata::core::conversation_prefix(checkpoint, prompt, imgs) == read.tokens) {
+                        exact_cut = true;
+                        break;
+                    }
+            }
+            if (cancelled() || now_ns() >= deadline_ns || read.request_id != query.request_id ||
+                read.generation != query.generation || read.epoch != conversation_store->epoch() ||
+                !image.scope.matches(scope) || image.cvec != want_cvec || read.tokens <= 0 || !exact_cut ||
+                read.stages != stages.size() + 1) {
+                read.image.reset();
+                conversation_store->release_read(read.request_id, read.generation);
+                out.status = strata::core::ConversationStoreReadStatus::stale;
+                return out;
+            }
+            struct UnmountedLease {
+                strata::core::ConversationStore& store;
+                uint64_t request, generation;
+                bool armed = true;
+                ~UnmountedLease() { if (armed) store.release_read(request, generation); }
+            } lease{*conversation_store, read.request_id, read.generation};
             out.status = read.status;
             out.head_id = read.head_id;
             out.tokens = read.tokens;
@@ -11268,8 +11506,7 @@ int main(int argc, char** argv) {
             // (ram_lease_bytes) until the engine's own alias dies: the caller records the transfer and releases it
             // through release_read() at its own end-of-request seam.  cancel() is refused for a transferred image.
             conversation_store->transfer_read_image(query.request_id, query.generation);
-            conversation_store->confirmed_restore(out.head_id);
-            ++store_restored;
+            lease.armed = false;
             return out;
         };
         using strata::program::PrefixTransfer;
@@ -11450,6 +11687,12 @@ int main(int argc, char** argv) {
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
+            StoreRamAdmission store_admission(store_on ? conversation_store.get() : nullptr, conversations,
+                                              (uint64_t) o.conversation_cache_mib << 20, held);
+            const uint64_t capture_epoch = store_on ? conversation_store->epoch() : 0;
+            const uint64_t external = store_admission.held();
+            if (external > SIZE_MAX - held) return true;
+            const size_t capture_held = held + (size_t) external;
             const auto park_t0 = Clock::now();
             PrefixWork park_work = source.resident ? PrefixWork{} : session_work((int64_t) live.size(), true);
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
@@ -11523,7 +11766,7 @@ int main(int argc, char** argv) {
             // the held incoming image. Entry replacement happens only after a
             // valid capture is ready to publish; resource-pressure eviction here
             // remains permitted and is not a transactional-capture guarantee.
-            if (!conversations.reserve_snapshot(estimate, held)) {
+            if (!conversations.reserve_snapshot(estimate, capture_held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -11665,39 +11908,49 @@ int main(int argc, char** argv) {
                         cover = true;
                     }
                     const size_t lease = image.bytes();
-                    if (conversations.try_reserve_lease(lease)) {
+                    // Reserve both references before freezing. Publication owns its charge in the store;
+                    // the RAM cache must not independently refund or double-spend that reservation.
+                    const size_t overhead = 1u << 20;
+                    const uint64_t external_now = store_admission.held();
+                    if (!conversation_store->writer_busy() && pending_publishes.size() < 8 &&
+                        lease <= (SIZE_MAX - overhead) / 2 && external_now <= SIZE_MAX - held &&
+                        conversations.reserve_snapshot(lease * 2 + overhead, held + (size_t) external_now)) {
                         auto alias = strata::core::conversation_image_freeze_share(image);
-                        // Freezing added one owner per segment; charge the alias's own accounting, not the estimate.
                         const size_t exact = alias->bytes();
-                        if (exact > lease) conversations.try_reserve_lease(exact - lease);
                         strata::core::ConversationStorePublish publish;
                         publish.request_id = ++publication_serial;
                         publish.generation = ++capture_generation;
+                        publish.epoch = capture_epoch;
                         publish.supersedes = supersedes;
                         publish.cover = cover;
+                        // Allocate bookkeeping before handing ownership to an asynchronous worker.
+                        pending_publishes.push_back(PendingPublish{publish.request_id, publish.generation,
+                                                                   publish.supersedes, exact});
+                        struct PendingRollback {
+                            std::deque<PendingPublish>& pending;
+                            bool accepted = false;
+                            ~PendingRollback() { if (!accepted) pending.pop_back(); }
+                        } rollback{pending_publishes};
+                        store_admission.publish(image.bytes());
                         std::string why;
                         if (conversation_store->publish(std::move(alias), publish, why)) {
-                            pending_publishes.push_back(PendingPublish{publish.request_id, publish.generation,
-                                                                       publish.supersedes, exact});
-                            // The store's own writer and pending slots bound how many can be outstanding; a very
-                            // slow writer must not let this list grow without bound.
-                            while (pending_publishes.size() > 8) {
-                                if (reap_publishes(1000) == 0) break;
-                            }
+                            rollback.accepted = true;
                         } else {
-                            conversations.release_lease(exact);
                             ++store_refused;
                             std::fprintf(stderr, "strata serve: conversation store: publication skipped (%s)\n",
                                          why.c_str());
                         }
                     } else {
                         ++store_refused;
-                        std::fprintf(stderr, "strata serve: conversation store: publication skipped (no RAM "
-                                             "envelope left for a %zu MiB lease)\n", lease >> 20);
+                        std::fprintf(stderr, "strata serve: conversation store: publication deferred "
+                                             "(writer or RAM admission)\n");
                     }
                 }
                 const size_t previous_superseded = conversations.superseded();
-                const bool stored = conversations.put(std::move(image), held, held_entries);
+                store_admission.publish(image.bytes());
+                const uint64_t final_external = store_admission.held();
+                const bool stored = final_external <= SIZE_MAX - held &&
+                    conversations.put(std::move(image), held + (size_t) final_external, held_entries);
                 if (const size_t dropped = conversations.superseded() - previous_superseded)
                     std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                                          "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
@@ -11791,6 +12044,7 @@ int main(int argc, char** argv) {
             std::fflush(stderr);
             nf_hit = true;
             nan_flush = true;
+            poison_store();
             return true;
         };
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
@@ -13380,6 +13634,7 @@ int main(int argc, char** argv) {
                         std::printf("ERR %s\n", err.c_str()); return false;
                     }
                     nan_flush = true;
+                    poison_store();
                     continue;
                 }
                 const float* last_residual = nullptr;
@@ -13580,6 +13835,7 @@ int main(int argc, char** argv) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
                         nan_flush = true;
+                        poison_store();
                         continue;
                     }
                     const int32_t y = outb[t];
@@ -13726,6 +13982,7 @@ int main(int argc, char** argv) {
                             std::printf("ERR %s\n", err.c_str()); return false;
                         }
                         nan_flush = true;
+                        poison_store();
                         continue;
                     }
                     const float* residual = nullptr;
@@ -14736,7 +14993,7 @@ int main(int argc, char** argv) {
             // consumes that exact prepared result instead of preparing it again.  Absent (or unknown here) means the
             // demand does its own lookup; the request itself is never refused, reordered or validated differently
             // because of them.
-            uint64_t req_cache_offer = 0, req_cache_generation = 0;
+            uint64_t req_cache_offer = 0, req_cache_generation = 0, req_cache_deadline_ns = 0;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -14771,6 +15028,7 @@ int main(int argc, char** argv) {
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "cache_offer") req_cache_offer = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "cache_generation") req_cache_generation = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "cache_deadline_ns") req_cache_deadline_ns = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -15188,7 +15446,7 @@ int main(int argc, char** argv) {
                 conversation_store->for_each_match(store_selector, store_prompt, req_imgs,
                     [&](const strata::core::ConversationStoreMatch& match) {
                         if (store_seen) return;                    // longest first: the first is the best cut
-                        if (match.stages != (uint32_t) stages.size()) return;   // another layout's image
+                        if (match.stages != (uint32_t) stages.size() + 1) return;   // another layout's image
                         if (match.tokens <= 0) return;
                         store_seen = true;
                         PrefixCandidate candidate;
@@ -15217,26 +15475,22 @@ int main(int argc, char** argv) {
             // the source this request would have used without the store.
             bool restored_from_store = false;
             StoreDemandResult store_demand;
-            // The mounted image's RAM charge while this request owns it, plus the store's handed-out read: an RAII
-            // guard, so a validation failure, a skipped request or a fatal restore failure cannot leave either the
-            // envelope or the store's own RAM accounting permanently charged.  The explicit release below is the
-            // ordinary path (the bytes then belong to the live session or to the retained reuse).
+            // The store owns the read charge through handoff. `incoming` is declared after this guard so every
+            // exceptional exit destroys the host image before returning its reservation.
             struct StoreLeaseGuard {
-                strata::core::ConversationCache* cache = nullptr;
                 strata::core::ConversationStore* store = nullptr;
                 uint64_t request_id = 0;
                 uint64_t generation = 0;
-                size_t bytes = 0;
                 ~StoreLeaseGuard() { release(); }
                 void release() {
                     if (store != nullptr && request_id != 0) store->release_read(request_id, generation);
-                    if (cache != nullptr && bytes != 0) cache->release_lease(bytes);
-                    store = nullptr; request_id = 0; generation = 0; bytes = 0;
+                    store = nullptr; request_id = 0; generation = 0;
                 }
-            } store_demand_lease{&conversations, nullptr, 0, 0, 0};
+            } store_demand_lease;
+            std::optional<strata::core::SavedConversation> incoming;
             if (selected.source == PrefixSource::disk) {
                 store_demand = store_demand_restore(store_prompt, req_imgs, req_scope, want_cvec,
-                                                    req_cache_offer, req_cache_generation,
+                                                    req_cache_offer, req_cache_generation, req_cache_deadline_ns,
                                                     [&] { return stop_req.load(); }, incoming);
                 if (store_demand.mounted) {   // arm the guard for every path, including a rejected mount
                     store_demand_lease.store = conversation_store.get();
@@ -15244,7 +15498,7 @@ int main(int argc, char** argv) {
                     store_demand_lease.generation = store_demand.generation;
                 }
                 if (store_demand.status == strata::core::ConversationStoreReadStatus::ready &&
-                    store_demand.stages == (uint32_t) stages.size() && store_demand.tokens > 0) {
+                    store_demand.stages == (uint32_t) stages.size() + 1 && store_demand.tokens > 0) {
                     restored_from_store = true;
                     selected.tokens = store_demand.tokens;
                     selected.parked = strata::core::ConversationCache::Match{0, store_demand.tokens, store_demand.live};
@@ -15255,11 +15509,6 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation store: demand mounted head %llu (planned "
                                              "%llu)\n", (unsigned long long) store_demand.head_id,
                                      (unsigned long long) selected.store_head);
-                    // The store has already dropped its reference, so this is the only charge for the mounted bytes
-                    // while the request owns them; it is given back once they belong to the live session or to the
-                    // retained reuse.  Best effort: a full envelope must not refuse a required restore.
-                    const size_t charge = incoming->bytes();
-                    if (conversations.try_reserve_lease(charge)) store_demand_lease.bytes = charge;
                 } else {
                     incoming.reset();
                     selected = choice.using_cost() ? store_candidate_backup.cheapest : store_candidate_backup.longest;
@@ -15352,7 +15601,8 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             if ((!from_live || incoming || slot_source >= 0 || !req_ckpt) && !pin_sibling &&
-                !park_current(incoming ? incoming->bytes() : 0, incoming ? &*incoming : nullptr, incoming && !req_ckpt ? 1 : 0)) {
+                !park_current(incoming && !restored_from_store ? incoming->bytes() : 0,
+                              incoming ? &*incoming : nullptr, incoming && !restored_from_store && !req_ckpt ? 1 : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -15514,12 +15764,6 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
-            // The mounted bytes now belong to the live session, to the retained reuse or to nothing: the request's own
-            // charge for them ends here (the guard would do it at the end of the iteration; the cache's accounting is
-            // fresher if the next seam in this request already sees it).
-            store_demand_lease.release();
-            // The take/restore above changed the parked set too: keep the offer filter honest.
-            if (store_on) publish_ram_view();
             if (!live_scope.matches(req_scope) || want_cvec != cvec_cached) {
                 conversations.limit_reuse(0);
                 live_ok = false;
@@ -15599,11 +15843,20 @@ int main(int argc, char** argv) {
             if (incoming) {
                 // Capture reserved both these bytes and this entry. Failure to
                 // return a validated donor is an ownership fault, not a cache miss.
-                if (!conversations.put(std::move(*incoming))) {
+                if (!restored_from_store && !conversations.put(std::move(*incoming))) {
                     std::printf("ERR returning a borrowed conversation snapshot failed\n");
                     return 1;
                 }
                 incoming.reset();
+            }
+            if (restored_from_store) {
+                conversation_store->confirmed_restore(store_demand.head_id);
+                ++store_restored;
+            }
+            store_demand_lease.release();
+            if (store_on) {
+                publish_ram_view();
+                store_allowance();
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
@@ -16126,12 +16379,7 @@ int main(int argc, char** argv) {
                         std::string ye;
                         const auto ty = Clock::now();
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                        const ConvCheckpoint* best = nullptr;
-                        for (const ConvCheckpoint& c : checks)
-                            if ((int64_t) c.ids.size() <= q && (!best || c.ids.size() > best->ids.size()) &&
-                                std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
-                                    [](int32_t x, int64_t y) { return (int64_t) x == y; })) best = &c;
-                        const strata::program::ResidentAdmission request{0, best};
+                        const strata::program::ResidentAdmission request{0, &checks, nullptr, q};
                         if (can && !park_replaced(ys)) { batch_fatal = true; e = err; return false; }
                         if (can && resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye)) {
                             yielded_at = q;
@@ -17545,21 +17793,14 @@ int main(int argc, char** argv) {
                     return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
                 }();
                 if (cont) {
-                    const ConvCheckpoint* best = nullptr;
-                    for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin())) best = &c;
-                    if (admission_timing)
-                        std::fprintf(stderr, "strata admission timing: slot=%d component=checkpoint_select device=-1 "
-                                             "items=%lld host_ms=%.3f\n", admit_slot, (long long) checks.size(),
-                                     std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                     const BSlot& old = bs[(size_t) admit_slot];
                     const bool retained_by_replacement = input.checkpoint && !input.images &&
                         old.reusable(req_scope, want_cvec) && starts_with(old.ids, {});
                     if (!retained_by_replacement && !park_replaced(admit_slot)) {
                         std::printf("ERR preserving completed resident: %s\n", err.c_str()); return 1;
                     }
-                    const strata::program::ResidentAdmission request{x, best, batch_mtp ? last_committed_residual : nullptr};
+                    const strata::program::ResidentAdmission request{
+                        x, &checks, batch_mtp ? last_committed_residual : nullptr, (int64_t) live.size() - 1};
                     if (!resident.admit(admit_slot, live, request, err)) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str()); return 1;
@@ -17807,7 +18048,7 @@ int main(int argc, char** argv) {
                              (unsigned long long) prefetch_suppressed.load(),
                              (unsigned long long) store_published, (unsigned long long) store_refused,
                              (unsigned long long) store_coalesced, (unsigned long long) store_cancelled);
-            conversation_store->close();
+            if (!store_faulted) conversation_store->close();
         }
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {
             std::fprintf(stderr, "strata cross-help capture REFUSED: the requested request/window was not "

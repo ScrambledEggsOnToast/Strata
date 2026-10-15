@@ -563,6 +563,10 @@ bool MtpDrafter::top2_env() {
     return on;
 }
 
+/// The identity accessor for the round's catch-up extent: mtp_catchup_all() above is the single place the
+/// environment is read, so a caller that binds this value binds exactly what draft_impl() applies.
+bool MtpDrafter::catchup_all() { return mtp_catchup_all(); }
+
 // STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
 // the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
 void MtpDrafter::record_top2(int j) {

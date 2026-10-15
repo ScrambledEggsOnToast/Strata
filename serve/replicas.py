@@ -33,6 +33,9 @@ BLOCK = 64                          # tokens per hashed block of a prompt
 LOAD_TOKENS = 3000                  # the cost of one request already running on a replica, in prompt tokens
 INDEX_MAX = 262144                  # block hashes kept (about 17M tokens of prompts)
 HEAL_COOLDOWN_S = 60.0              # a replica that died is started again at most this often
+# The internal keys serve/server.py puts on a generation whose prompt it prepared and offered (Service.bind_offer):
+# the recipient's store is decided here, at dispatch, so they are the replica layer's business as well.
+OFFER_KEYS = ("_strata_cache_offer", "_strata_cache_generation", "_strata_cache_offer_owner")
 
 
 class ReplicaConfigError(ValueError):
@@ -330,17 +333,47 @@ class ReplicaEngine:
         for k in range(len(self.engines)):
             self.router.forget(k)
 
-    def close(self):
+    def close(self, timeout_s: float | None = None):
+        """End every replica: one total budget, spent from the first one to the last.
+
+        `timeout_s` is the *whole* shutdown's budget, not each replica's: every engine the wrapper holds is asked to
+        end within what is left of it, so a bounded shutdown stays bounded however many replicas there are (each one
+        on its own would multiply the wait). The first failure is raised once every replica has been asked - a
+        replica that cannot be reached must not leave the others running.
+        """
+        deadline = None if timeout_s is None else time.monotonic() + max(0.5, float(timeout_s))
         err = None
         for e in self.engines:
+            left = None if deadline is None else max(0.1, deadline - time.monotonic())
             try:
-                e.close()
+                e.close(timeout_s=left)
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         if err:
             raise err
 
     # ---- routing
+    def recipient_sampling(self, sampling, engine):
+        """The sampling `engine`, this request's real recipient, may run: an offer belonging to another replica's
+        store is taken off it (and retired) rather than sent to a store that never validated those tokens.
+
+        Preparation happens before routing (the queue frontier knows nothing about which replica will run the
+        request), so the two keys a prepared generation carries can name a *different* replica than the one the
+        router picks.  Native would then look for a candidate that store never offered, while the offering store holds
+        one of its frontiers for a generation it will never get; the recipient instead decides the restore with its
+        own store - an ordinary, safe miss on both sides, exactly as an offer the store refused.
+        """
+        if not isinstance(sampling, dict):
+            return sampling
+        owner = sampling.get("_strata_cache_offer_owner")
+        if owner is None or owner is getattr(engine, "offers", None):
+            return sampling                       # nothing bound, or bound to this very recipient's store
+        offered, generation = sampling.get("_strata_cache_offer"), sampling.get("_strata_cache_generation")
+        cancel = getattr(owner, "cancel", None)
+        if callable(cancel) and isinstance(offered, int) and isinstance(generation, int):
+            cancel(offered, generation)           # the link that really offered it retires it (a closed one forgets)
+        return {key: value for key, value in sampling.items() if key not in OFFER_KEYS}
+
     def route(self, ids) -> int:
         """The replica for this prompt (and its running count raised): lowest cost among the living ones."""
         got = self.router.matched(ids)
@@ -388,6 +421,7 @@ class ReplicaEngine:
             raise EngineDied("no replica is running; this request was not sent")
         e = self.engines[k]
         self.tl.cur = e
+        sampling = self.recipient_sampling(sampling, e)
         produced: list[int] = []
         held = False
         nonfinite = False

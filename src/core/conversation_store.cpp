@@ -1,21 +1,37 @@
 // The durable NVMe conversation store: its disk authority (root, lock, issuer key, catalog, run intent), the shared
 // physical quota, the one admitted writer and the bounded read pipeline, and every byte it hands back.
 //
-// Ordering rule that the whole file follows: an object is durable before a manifest names it, a manifest is durable
-// before the catalog authorizes it, and the catalog is the only authority.  A file that the catalog does not
-// authorize is an accounted orphan, never a resurrected history; a catalog that cannot be trusted means cold caching.
+// Rules this file keeps, in the order they are enforced:
+//   * An object is durable before a manifest names it; a manifest is durable before the catalog authorizes it; the
+//     catalog is the only authority.  A file the catalog does not authorize is an accounted orphan, never a
+//     resurrected history; a catalog that cannot be trusted means cold caching.
+//   * Nothing is deleted until the authority that named it has been removed *durably*, and no byte is credited before
+//     the file is confirmed gone.  A failed deletion stays queued, stays charged, and is retried.
+//   * Every byte this module creates is charged first, at a conservative allocated size (block-rounded, plus one
+//     block for the file's directory entry): objects, manifests, the catalog and its temporary, the issuer key, the
+//     run-intent marker and orphans.  Nothing is ever admitted against a promise to delete something later.
+//   * The in-memory catalog is only ever replaced by a write that succeeded.  A failed commit leaves the durable
+//     authority intact and latches the store faulted instead of continuing from a divergent view.
+//   * Every entry point reports an ordinary failure as a *cache* failure; only genuine authority uncertainty or an
+//     observed safety fault latches the store.
 //
-// Threading rule: the catalog mutex guards state, never I/O.  Every storage wait happens on a worker thread with the
-// lock released, so no caller ever blocks under a lock it needs, and every entry point returns immediately.
+// Threading rules:
+//   * The catalog mutex guards state, never I/O.  Every storage wait happens with that mutex released.
+//   * One storage thread owns every durable catalog transaction, so a planned commit can never interleave with
+//     another.  Callers that need durability hand work to it and wait for it, bounded, without holding the mutex.
+//   * Descriptor-relative access only: the root and its three directories are opened once, validated (owner, type,
+//     mode) and never re-derived from a path, so no component can be swapped for a symlink underneath us.
 #include "strata/core/conversation_store.hpp"
 
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <dirent.h>
 #include <fcntl.h>
 #include <map>
@@ -37,22 +53,32 @@ namespace {
 using conversation_store_detail::Catalog;
 using conversation_store_detail::CatalogDomain;
 using conversation_store_detail::CatalogHead;
+using conversation_store_detail::ContainerMeta;
 using conversation_store_detail::Digest;
 using conversation_store_detail::digest_nonzero;
 using conversation_store_detail::digest_u64;
 using conversation_store_detail::ManifestMeta;
-using conversation_store_detail::RestoreTarget;
 using conversation_store_detail::sha256;
 using conversation_store_detail::sha256_hex;
-using conversation_store_detail::StreamRead;
 using conversation_store_detail::StreamRecord;
 using conversation_store_detail::StreamWrite;
 
 constexpr uint64_t kObjectBytesEstimate = 64;  // the RAM one object-table entry costs, at most
 constexpr size_t kMaxReaderThreads = 8;
+constexpr uint64_t kBlockBytes = 4096;         // conservative allocation granularity of the cache filesystem
+constexpr uint64_t kDirectoryCharge = 4096;    // one block per file for its directory entry and inode
+constexpr uint64_t kReadSlabBytes = uint64_t(1) << 20;
+constexpr uint64_t kReadFixedOverhead = uint64_t(64) << 10;
+constexpr uint64_t kJobFixedOverhead = 1024;
+constexpr uint64_t kMaxScanEntries = uint64_t(1) << 20;
+constexpr uint64_t kMaxReclaimPerPass = 65536;
+constexpr uint32_t kTempNameAttempts = 32;
+constexpr uint32_t kDurableWaitMs = 30000;
+constexpr uint64_t kIdlePollMs = 20;
 
 // ---------------------------------------------------------------------------------------------------------------
-// POSIX helpers.  Every one of them is either exact or fails with a reason; none of them throws.
+// POSIX helpers.  Each is exact or fails with a reason, none throws, and all are descriptor relative: no path is
+// ever re-walked, so no component can be replaced between two calls.
 // ---------------------------------------------------------------------------------------------------------------
 
 bool write_all(int fd, const void* data, size_t size, std::string& why) {
@@ -71,39 +97,143 @@ bool write_all(int fd, const void* data, size_t size, std::string& why) {
     return true;
 }
 
-bool write_file(const std::string& path, const void* data, size_t size, bool exclusive, std::string& why) {
-    const int flags = O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | (exclusive ? O_EXCL : O_TRUNC);
-    const int fd = ::open(path.c_str(), flags, 0600);
+// Where a file the store may have to delete lives.  `root` is the catalog, the issuer key, the run-intent marker or
+// the lock file; `object` names one content address inside a two-hex-digit shard.
+enum class Where : uint8_t { root = 0, objects = 1, manifests = 2, tmp = 3 };
+
+struct PendingFile {
+    Where where = Where::tmp;
+    Digest object{};        // object identity when `where` is objects: the refcount is rechecked before removal
+    std::string shard;      // two hex digits, when `where` is objects
+    std::string name;
+    uint64_t charge = 0;    // this file's share of the shared quota, credited only once it is confirmed gone
+    uint64_t head_id = 0;   // the retired head it belonged to; 0 never defers
+};
+
+// The shared charge of one file: its blocks plus one block for its directory entry (and inode).  Deliberately
+// conservative: the quota stops the store before the device does, so over-estimating is the safe direction.
+uint64_t allocated_charge(uint64_t size) {
+    return (size + kBlockBytes - 1) / kBlockBytes * kBlockBytes + kDirectoryCharge;
+}
+
+bool private_owner(const struct stat& info) { return info.st_uid == ::geteuid(); }
+bool private_directory(const struct stat& info) {
+    return S_ISDIR(info.st_mode) && private_owner(info) && (info.st_mode & 0077) == 0;
+}
+bool private_regular(const struct stat& info) {
+    return S_ISREG(info.st_mode) && private_owner(info) && (info.st_mode & 0077) == 0;
+}
+
+bool is_hex_name(const std::string& name) {
+    if (name.empty()) return false;
+    for (char c : name)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
+struct RootDirs {
+    int root = -1, objects = -1, manifests = -1, tmp = -1;
+
+    ~RootDirs() { close_all(); }
+    void close_all() {
+        for (int* fd : {&root, &objects, &manifests, &tmp}) {
+            if (*fd >= 0) ::close(*fd);
+            *fd = -1;
+        }
+    }
+    int of(Where where) const {
+        switch (where) {
+            case Where::root: return root;
+            case Where::objects: return objects;
+            case Where::manifests: return manifests;
+            case Where::tmp: return tmp;
+        }
+        return -1;
+    }
+};
+
+int open_child_dir(int parent, const char* name, std::string& why, bool private_leaf = true) {
+    const int fd = ::openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        why = std::string("cannot create ") + path + ": " + std::strerror(errno);
+        why = std::string("cannot open the directory ") + name + ": " + std::strerror(errno);
+        return -1;
+    }
+    struct stat info {};
+    const bool inspected = ::fstat(fd, &info) == 0;
+    const bool trusted_ancestor = inspected && S_ISDIR(info.st_mode) &&
+        (info.st_uid == 0 || private_owner(info)) &&
+        ((info.st_mode & 0022) == 0 || (info.st_uid == 0 && (info.st_mode & S_ISVTX)));
+    if (!inspected || (private_leaf ? !private_directory(info) : !trusted_ancestor)) {
+        why = std::string("the directory ") + name + " has unsafe ownership or permissions";
+        ::close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    return fd;
+}
+
+bool make_child_dir(int parent, const char* name, bool& created, std::string& why) {
+    created = false;
+    if (::mkdirat(parent, name, 0700) == 0) {
+        created = true;
+        return true;
+    }
+    if (errno != EEXIST) {
+        why = std::string("cannot create ") + name + ": " + std::strerror(errno);
+        return false;
+    }
+    struct stat info {};
+    if (::fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) != 0 || !private_directory(info)) {
+        why = std::string(name) + " exists and is not a private directory this account owns";
+        return false;
+    }
+    return true;
+}
+
+bool fsync_dir(int fd, const char* label, std::string& why) {
+    if (::fsync(fd) != 0) {
+        why = std::string("directory fsync failed for ") + label + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+// Creates a fresh file exclusively (O_EXCL), so a name collision can never truncate another file, and flushes its
+// data before it can be renamed into place.
+bool write_new_file(int dir, const std::string& name, const void* data, size_t size, std::string& why) {
+    const int fd = ::openat(dir, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        why = std::string("cannot create ") + name + ": " + std::strerror(errno);
         return false;
     }
     bool ok = write_all(fd, data, size, why);
     if (ok && ::fsync(fd) != 0) {
-        why = std::string("fsync failed for ") + path + ": " + std::strerror(errno);
+        why = std::string("fsync failed for ") + name + ": " + std::strerror(errno);
         ok = false;
     }
     if (::close(fd) != 0 && ok) {
-        why = std::string("close failed for ") + path + ": " + std::strerror(errno);
+        why = std::string("close failed for ") + name + ": " + std::strerror(errno);
         ok = false;
     }
     return ok;
 }
 
-bool read_file(const std::string& path, std::vector<uint8_t>& out, uint64_t limit, std::string& why) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+// Reads at most `limit` bytes of a regular file this account owns.  The size is checked from the open descriptor
+// before anything is allocated, so a declared length never becomes an allocation.
+bool read_file(int dir, const std::string& name, uint64_t limit, std::vector<uint8_t>& out, std::string& why) {
+    const int fd = ::openat(dir, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        why = std::string("cannot open ") + path + ": " + std::strerror(errno);
+        why = std::string("cannot open ") + name + ": " + std::strerror(errno);
         return false;
     }
     struct stat info {};
-    if (::fstat(fd, &info) != 0) {
-        why = std::string("cannot stat ") + path + ": " + std::strerror(errno);
+    if (::fstat(fd, &info) != 0 || !private_regular(info)) {
+        why = name + " is not a regular file this account owns";
         ::close(fd);
         return false;
     }
     if (info.st_size < 0 || uint64_t(info.st_size) > limit) {
-        why = path + " is larger than the limit this store admits";
+        why = name + " is larger than the limit this store admits";
         ::close(fd);
         return false;
     }
@@ -113,7 +243,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out, uint64_t limi
         const ssize_t n = ::read(fd, out.data() + at, out.size() - at);
         if (n < 0) {
             if (errno == EINTR) continue;
-            why = std::string("read failed for ") + path + ": " + std::strerror(errno);
+            why = std::string("read failed for ") + name + ": " + std::strerror(errno);
             ::close(fd);
             return false;
         }
@@ -122,67 +252,71 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out, uint64_t limi
     }
     ::close(fd);
     if (at != out.size()) {
-        why = path + " shrank while it was read";
+        why = name + " shrank while it was read";
         return false;
     }
     return true;
 }
 
-// The file existed and could not be made durable, or the directory could not be updated: both are fatal for the
-// caller's intent, never silently ignored.
-bool fsync_directory(const std::string& path, std::string& why) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) {
-        why = std::string("cannot open directory ") + path + ": " + std::strerror(errno);
+bool remove_file(int dir, const std::string& name, std::string& why) {
+    if (dir < 0) {
+        why = "the store does not own the directory this file lives in";
         return false;
     }
-    const bool ok = ::fsync(fd) == 0;
-    if (!ok) why = std::string("directory fsync failed for ") + path + ": " + std::strerror(errno);
-    ::close(fd);
-    return ok;
-}
-
-bool make_directory(const std::string& path, std::string& why) {
-    if (::mkdir(path.c_str(), 0700) == 0) return true;
-    if (errno == EEXIST) {
-        struct stat info {};
-        if (::stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) return true;
-        why = path + " exists and is not a directory";
-        return false;
-    }
-    why = std::string("cannot create ") + path + ": " + std::strerror(errno);
+    if (::unlinkat(dir, name.c_str(), 0) == 0) return true;
+    if (errno == ENOENT) return true;   // already gone: nothing to credit beyond what was charged
+    why = std::string("cannot remove ") + name + ": " + std::strerror(errno);
     return false;
 }
 
-bool path_exists(const std::string& path) {
-    struct stat info {};
-    return ::stat(path.c_str(), &info) == 0;
-}
+struct DirEntry {
+    std::string name;
+    bool directory = false;
+    bool regular = false;
+    bool ours = false;
+    uint64_t size = 0;
+};
 
-bool remove_file(const std::string& path, std::string& why) {
-    if (::unlink(path.c_str()) == 0) return true;
-    if (errno == ENOENT) return true;
-    why = std::string("cannot remove ") + path + ": " + std::strerror(errno);
-    return false;
-}
-
-bool list_directory(const std::string& path, std::vector<std::string>& out, std::string& why) {
-    DIR* dir = ::opendir(path.c_str());
-    if (!dir) {
-        why = std::string("cannot list ") + path + ": " + std::strerror(errno);
-        return false;
-    }
+// One bounded listing: the entry count is bounded *while* reading, so a directory full of junk cannot become an
+// unbounded allocation before a bound is checked.
+bool list_entries(int dir, std::vector<DirEntry>& out, uint64_t limit, std::string& why) {
     out.clear();
-    while (struct dirent* entry = ::readdir(dir)) {
+    // dup() shares the directory cursor and would make subsequent scans miss entries.
+    const int dup_fd = ::openat(dir, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dup_fd < 0) {
+        why = std::string("cannot reopen a directory for scanning: ") + std::strerror(errno);
+        return false;
+    }
+    DIR* stream = ::fdopendir(dup_fd);
+    if (!stream) {
+        why = std::string("cannot list a directory: ") + std::strerror(errno);
+        ::close(dup_fd);
+        return false;
+    }
+    while (struct dirent* entry = ::readdir(stream)) {
         const std::string name = entry->d_name;
         if (name == "." || name == "..") continue;
-        out.push_back(name);
+        if (out.size() >= limit) {
+            why = "a store directory holds more entries than this store accounts for";
+            ::closedir(stream);
+            return false;
+        }
+        DirEntry item;
+        item.name = name;
+        struct stat info {};
+        if (::fstatat(dir, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) {
+            item.directory = S_ISDIR(info.st_mode) != 0;
+            item.regular = S_ISREG(info.st_mode) != 0;
+            item.ours = private_owner(info) && !S_ISLNK(info.st_mode);
+            item.size = info.st_size > 0 ? uint64_t(info.st_size) : 0;
+        }
+        out.push_back(std::move(item));
     }
-    ::closedir(dir);
+    ::closedir(stream);
     return true;
 }
 
-void fill_random(uint8_t* out, size_t size) {
+bool fill_random(uint8_t* out, size_t size) {
     size_t at = 0;
     while (at < size) {
         const ssize_t n = ::getrandom(out + at, size - at, 0);
@@ -193,225 +327,76 @@ void fill_random(uint8_t* out, size_t size) {
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    if (at == size) return;
-    // The kernel has no entropy source available: fall back to the device node rather than persisting a weak key.
-    const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        while (at < size) {
-            const ssize_t n = ::read(fd, out + at, size - at);
-            if (n <= 0) {
+    if (at != size) {
+        const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            while (at < size) {
+                const ssize_t n = ::read(fd, out + at, size - at);
+                if (n > 0) {
+                    at += size_t(n);
+                    continue;
+                }
                 if (n < 0 && errno == EINTR) continue;
                 break;
             }
-            at += size_t(n);
-        }
-        ::close(fd);
-    }
-    if (at != size) {
-        // Still short: mix the clock and the address of this stack frame so the key is at least not constant.
-        uint64_t seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
-        for (size_t i = at; i < size; ++i) {
-            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-            out[i] = uint8_t(seed >> 33);
+            ::close(fd);
         }
     }
+    return at == size;
 }
 
-uint64_t filesystem_free_bytes(const std::string& path) {
+uint64_t filesystem_free_bytes(int root_fd) {
     struct statvfs info {};
-    if (::statvfs(path.c_str(), &info) != 0) return 0;
+    if (::fstatvfs(root_fd, &info) != 0) return 0;
     return uint64_t(info.f_bavail) * uint64_t(info.f_frsize);
 }
 
-// A stable, collision-free file name for one content address.
-std::string object_path(const std::string& root, const Digest& digest) {
-    const std::string hex = sha256_hex(digest);
-    return root + "/objects/" + hex.substr(0, 2) + "/" + hex;
+bool hex_to_digest(const std::string& text, Digest& out) {
+    return conversation_store_detail::sha256_hex_parse(text, out);
 }
 
-std::string manifest_path(const std::string& root, const Digest& digest) {
-    return root + "/manifests/" + sha256_hex(digest);
+// One object shard, opened under `objects/` without ever following a symlink at either step.
+int open_shard_fd(const RootDirs& dirs, const std::string& shard, std::string& why) {
+    return open_child_dir(dirs.objects, shard.c_str(), why);
 }
 
-bool hex_to_bytes(const std::string& text, Digest& out) { return conversation_store_detail::sha256_hex_parse(text, out); }
-
-} // namespace
-
-// ---------------------------------------------------------------------------------------------------------------
-// The implementation
-// ---------------------------------------------------------------------------------------------------------------
-
-struct ConversationStore::Impl {
-    // ---- configuration (immutable after construction) ----
-    ConversationStoreOptions options;
-    ConversationStoreLimits limits;
-    std::string root;
-    uint32_t reader_threads = 1;
-
-    // ---- authority ----
-    std::mutex mutex;
-    std::condition_variable cv_idsle;
-    std::condition_variable cv_ready;
-    std::condition_variable cv_publish;
-    std::condition_variable cv_work;
-    std::array<uint8_t, 32> issuer_key{};
-    Catalog catalog;
-    uint64_t epoch = 0;
-    uint32_t domain_index = 0;
-    bool intent_active = false;
-    bool on = false;
-    bool closing = false;
-    bool closed = false;
-    bool healthy = true;
-    std::string reason;
-    std::string unhealthy_reason;
-    int lock_fd = -1;
-
-    // ---- disk accounting (unique physical bytes) ----
-    struct ObjectState {
-        uint64_t bytes = 0;
-        uint32_t refs = 0;
-    };
-    std::map<Digest, ObjectState> objects;                  // every object the catalog authorizes
-    std::map<uint64_t, std::vector<Digest>> head_objects;   // head id -> the objects its manifest names
-    std::map<uint64_t, uint64_t> head_manifest_bytes;       // head id -> its manifest's file size
-    std::map<uint64_t, uint32_t> head_leases;               // head id -> materialized/ handed-out images using it
-    uint64_t charged = 0;         // live objects + manifests
-    uint64_t reserved = 0;        // about to be written
-    uint64_t reclaimable = 0;     // charged but no longer referenced
-    uint64_t free_sample = 0;     // last sampled filesystem space under the root
-    uint64_t metadata = 0;        // estimated RAM the index itself holds
-
-    // ---- RAM ledger ----
-    uint64_t ram_held = 0;        // everything we own in host memory
-    uint64_t ram_lease = 0;       // the handed-out share of it
-    uint64_t ram_reserved = 0;    // admitted, not yet allocated
-    uint64_t ram_budget = 0;
-    bool admission_suspended = false;
-
-    // ---- reads ----
-    struct ReadJob {
-        ConversationStoreQuery query;
-        ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
-        bool demand = false;
-        bool active = false;
-        std::atomic<bool> cancelled{false};
-        bool released = false;
-        bool handed = false;
-        uint64_t reserved_bytes = 0;
-        uint64_t lease_bytes = 0;
-        uint64_t epoch_at_admission = 0;
-        uint64_t head_id = 0;
-        uint64_t tokens = 0;
-        bool live = false;
-        uint32_t stages = 0;
-        uint64_t payload_bytes = 0;
-        std::shared_ptr<const SavedConversation> image;
-        std::string detail;
-    };
-    std::vector<std::shared_ptr<ReadJob>> jobs;      // queued, active and handed out
-    std::deque<std::shared_ptr<ReadJob>> queue;      // waiting for a slot (demand before prefetch)
-    std::deque<std::shared_ptr<ReadJob>> ready;      // materialized, waiting for take_ready()
-    size_t materializing = 0;
-
-    // ---- publication ----
-    struct PublishJob {
-        std::shared_ptr<const SavedConversation> image;
-        ConversationStorePublish request;
-        uint64_t ram_bytes = 0;
-        bool started = false;          // the writer has begun reading this image: it may never be replaced
-        bool coalesced = false;
-    };
-    // At most one publication identifier/image is admitted.  A ready-to-start (not yet begun) job may be replaced by
-    // a newer same-lineage generation - that is the only coalesce, and it happens before any capture image is read.
-    std::shared_ptr<PublishJob> publishing;
-    std::deque<ConversationStorePublishResult> publish_done;
-
-    // ---- workers ----
-    std::vector<std::thread> readers;
-    std::thread writer;
-    std::atomic<bool> stop{false};
-
-    // ---- counters and test seams ----
-    ConversationStoreCounters counters;
-    std::string fault_step;
-    std::atomic<uint64_t> source_bytes_read{0};
-    uint64_t name_counter = 0;
-
-    // ------------------------------ helpers ------------------------------
-    // Every one of these assumes the caller holds `mutex` unless its name says otherwise; none of them performs a
-    // storage wait while the lock is held.
-    uint64_t sample_free();
-    std::string temp_name();
-    std::string intent_path() const;
-    bool write_catalog(std::string& why);
-    bool arm_intent(std::string& why);
-    void clear_intent();
-    bool open_root(std::string& why);
-    bool load_catalog(std::string& why);
-    bool reconcile(std::string& why);
-    bool load_manifest(uint64_t head_id, ManifestMeta& out, std::string& why) const;
-    bool take_fault(const char* step);
-    void recount_metadata();
-    bool ensure_capacity(uint64_t incoming, std::vector<uint64_t>& victims, uint64_t& freeable, bool& floor_limited,
-                         std::string& why);
-
-    void writer_body();
-    void reader_body();
-    void publish_body(const std::shared_ptr<PublishJob>& job, ConversationStorePublishResult& out);
-    void read_body(const std::shared_ptr<ReadJob>& job);
-
-    // A head whose authority has been dropped but whose files are still on disk: the bytes stay charged (they exist!)
-    // until the catalog commit that removed the head is durable, and only then are they deleted and credited.
-    struct Retired {
-        Digest manifest_id{};
-        uint64_t manifest_bytes = 0;
-        std::vector<Digest> objects;
-    };
-    std::vector<Retired> pending_reclaim;
-    uint64_t retire_head(uint64_t head_id);
-    void reclaim_files();
-
-    void collect_matches(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
-                         const std::vector<ConversationImageKey>& images,
-                         std::vector<ConversationStoreMatch>& out) const;
-    bool admit_read(const ConversationStoreQuery& query, bool demand, std::string& why);
-    bool manifest_path_of(uint64_t head_id, std::string& path, uint64_t& bytes) const;
-    Digest head_manifest_id(uint64_t head_id) const;
-    void finish_job(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail);
-    bool deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation, bool specific);
-};
-
-// ---------------------------------------------------------------------------------------------------------------
-// Object files: the only place bytes are created, verified or copied
-// ---------------------------------------------------------------------------------------------------------------
-
-namespace {
-
-// An object is durable before any manifest names it: a scratch file, an fsync, a rename into its shard, then the
-// shard's own fsync.
-bool write_object_file(const std::string& root, const Digest& id, const uint8_t* data, size_t size, std::string& why) {
-    const std::string final_path = object_path(root, id);
-    const std::string shard = final_path.substr(0, final_path.rfind('/'));
-    std::string detail;
-    if (!make_directory(shard, detail) && !path_exists(shard)) {
-        why = detail;
+// An object is durable before any manifest names it: a scratch file, a flush, a rename into its shard, then the
+// shard's own flush - and the shard entry itself is flushed in `objects/` before anything can name it.
+bool write_object_file(RootDirs& dirs, const std::string& temp, const Digest& id, const uint8_t* data, size_t size,
+                       PendingFile& orphan, std::string& why) {
+    const std::string hex = sha256_hex(id);
+    const std::string shard = hex.substr(0, 2);
+    bool created = false;
+    if (!make_child_dir(dirs.objects, shard.c_str(), created, why)) return false;
+    if (created && !fsync_dir(dirs.objects, "objects", why)) return false;
+    const int shard_fd = open_shard_fd(dirs, shard, why);
+    if (shard_fd < 0) return false;
+    // The scratch name is reported to the caller before it is created, so a failure here can always account for the
+    // bytes of a file that may exist.
+    orphan.where = Where::tmp;
+    orphan.name = temp;
+    if (!write_new_file(dirs.tmp, temp, data, size, why)) {
+        ::close(shard_fd);
         return false;
     }
-    const std::string tmp = root + "/tmp/o" + sha256_hex(id).substr(0, 16);
-    if (!write_file(tmp, data, size, false, why)) return false;
-    if (::rename(tmp.c_str(), final_path.c_str()) != 0) {
+    if (::renameat(dirs.tmp, temp.c_str(), shard_fd, hex.c_str()) != 0) {
         why = std::string("cannot publish an object: ") + std::strerror(errno);
-        std::string ignored;
-        remove_file(tmp, ignored);
+        ::close(shard_fd);
         return false;
     }
-    return fsync_directory(shard, why);
+    orphan = PendingFile{};
+    const bool ok = fsync_dir(shard_fd, "an object shard", why);
+    ::close(shard_fd);
+    return ok;
 }
 
-// The mandatory verification: an object is trusted only after its bytes have reproduced its own content address.
-bool hash_object_file(const std::string& path, uint64_t size, Digest& out, std::string& why) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+// The mandatory verification: an object is trusted only after its bytes have reproduced its own content address.  The
+// bytes are hashed and written from the *same* descriptor in one pass, so verification and restore can never disagree
+// about which bytes were checked, and no buffer is trusted before every digest has matched.
+bool hash_and_copy_object(int shard, const std::string& name, uint64_t size, conversation_store_detail::Sha256& hash,
+                          StreamWrite& write, uint64_t offset, std::vector<uint8_t>& slab, Digest& out,
+                          std::string& why) {
+    const int fd = ::openat(shard, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         why = std::string("cannot open an object: ") + std::strerror(errno);
         return false;
@@ -422,8 +407,6 @@ bool hash_object_file(const std::string& path, uint64_t size, Digest& out, std::
         ::close(fd);
         return false;
     }
-    conversation_store_detail::Sha256 hash;
-    std::vector<uint8_t> slab(1u << 20);
     uint64_t left = size;
     while (left) {
         const ssize_t n = ::read(fd, slab.data(), size_t(std::min<uint64_t>(slab.size(), left)));
@@ -439,6 +422,10 @@ bool hash_object_file(const std::string& path, uint64_t size, Digest& out, std::
             return false;
         }
         hash.update(slab.data(), size_t(n));
+        if (!write(offset + size - left, slab.data(), size_t(n), why)) {
+            ::close(fd);
+            return false;
+        }
         left -= uint64_t(n);
     }
     ::close(fd);
@@ -446,572 +433,1218 @@ bool hash_object_file(const std::string& path, uint64_t size, Digest& out, std::
     return true;
 }
 
-// Copies one verified object into its final buffer in bounded slabs: no whole image is ever resident as scratch.
-bool copy_object_file(const std::string& path, uint64_t size, StreamWrite& write, uint64_t offset, std::string& why) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        why = std::string("cannot reopen an object: ") + std::strerror(errno);
+// ---------------------------------------------------------------------------------------------------------------
+// Exact prefix confirmation of a materialized image
+// ---------------------------------------------------------------------------------------------------------------
+
+// Does this record hold exactly the request's own token prefix, and does its own prefix chain reproduce the
+// advertised digest?  The chain is rebuilt from the *restored* bytes, so an advertisement can never be satisfied by
+// metadata alone.
+bool record_holds_cut(const ConversationCheckpoint& record, const ConversationStoreQuery& query, uint64_t tokens,
+                      const Digest& seed, Digest& digest) {
+    if (record.ids.size() != tokens || tokens > query.tokens.size()) return false;
+    if (tokens && std::memcmp(record.ids.data(), query.tokens.data(), size_t(tokens) * sizeof(int32_t)) != 0)
+        return false;
+    const conversation_store_detail::PrefixChain chain(seed, record.ids.data(), record.ids.size(), record.imgs);
+    return chain.digest(tokens, digest);
+}
+
+bool restored_cut_matches(const SavedConversation& image, const conversation_store_detail::ManifestMeta& meta,
+                          const ConversationStoreQuery& query, uint64_t tokens, bool live, const Digest& advertised,
+                          std::string& why) {
+    Digest digest{};
+    const ConversationCheckpoint* selected = nullptr;
+    if (live) {
+        if (record_holds_cut(image.live, query, tokens, meta.bucket, digest)) selected = &image.live;
+    } else {
+        for (const auto& checkpoint : image.checkpoints)
+            if (record_holds_cut(checkpoint, query, tokens, meta.bucket, digest)) {
+                selected = &checkpoint;
+                break;
+            }
+    }
+    if (!selected || !(digest == advertised)) {
+        why = "the materialized image does not reproduce the cut the manifest advertised";
         return false;
     }
-    std::vector<uint8_t> slab(1u << 20);
-    uint64_t at = 0;
-    bool ok = true;
-    while (at < size) {
-        const ssize_t n = ::read(fd, slab.data(), size_t(std::min<uint64_t>(slab.size(), size - at)));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            why = std::string("cannot read an object: ") + std::strerror(errno);
-            ok = false;
-            break;
-        }
-        if (n == 0) {
-            why = "an object shrank while it was being restored";
-            ok = false;
-            break;
-        }
-        if (!write(offset + at, slab.data(), size_t(n), why)) {
-            ok = false;
-            break;
-        }
-        at += uint64_t(n);
+    if (live ? !selected->stage_parts.empty() : selected->stage_parts.size() + 1 != meta.stages) {
+        why = "the selected cut has an inconsistent stage-part count";
+        return false;
     }
-    ::close(fd);
-    return ok && at == size;
+    for (const auto& part : selected->stage_parts) {
+        Digest part_digest{};
+        if (!record_holds_cut(part, query, tokens, meta.bucket, part_digest) || part_digest != advertised) {
+            why = "a selected checkpoint part does not hold the restored prefix";
+            return false;
+        }
+    }
+    // A cut is only ever advertised when every later stage can be placed at that same length; the restored stages
+    // must really carry that same prefix, byte for byte, or the image is not a coherent all-stage restore.
+    for (const auto& stage : image.stage_images) {
+        if (stage.scope != image.scope || stage.cvec != image.cvec) {
+            why = "a later stage belongs to a different scope or steering mode";
+            return false;
+        }
+        bool found = false;
+        Digest stage_digest{};
+        if (record_holds_cut(stage.live, query, tokens, meta.bucket, stage_digest) &&
+            stage_digest == advertised) found = true;
+        for (const auto& checkpoint : stage.checkpoints)
+            if (!found && record_holds_cut(checkpoint, query, tokens, meta.bucket, stage_digest) &&
+                stage_digest == advertised) found = true;
+        if (!found) {
+            why = "a later stage does not hold the restored prefix";
+            return false;
+        }
+    }
+    return true;
 }
 
-} // namespace
+}  // namespace
 
-// The engine's freeze()/frozen_alias() landed after this module's base commit, so it is called when it exists and is
-// a no-op otherwise: a caller that mounts the handed-out image pays no payload copy where the engine can freeze, and
-// this module still compiles against a base that has no freeze() at all.
-template<class T, class = void>
-struct has_freeze : std::false_type {};
-template<class T>
-struct has_freeze<T, std::void_t<decltype(std::declval<T&>().freeze())>> : std::true_type {};
+// ---------------------------------------------------------------------------------------------------------------
+// The implementation
+// ---------------------------------------------------------------------------------------------------------------
 
-template<class T>
-void freeze_if_available(T& image) {
-    if constexpr (has_freeze<T>::value) image.freeze();
+struct ConversationStore::Impl {
+    // ---- configuration (immutable after construction) ----
+    ConversationStoreOptions options;
+    ConversationStoreLimits limits;
+    std::string root;                 // diagnostics only: every access goes through `dirs`
+    RootDirs dirs;
+    uint32_t reader_threads = 1;
+
+    // ---- authority ----
+    std::mutex mutex;
+    std::condition_variable cv_ready;
+    std::condition_variable cv_publish;
+    std::condition_variable cv_work;
+    std::condition_variable cv_durable;
+    std::array<uint8_t, 32> issuer_key{};
+    Catalog catalog;
+    uint64_t catalog_charge = 0;
+    uint64_t epoch = 0;
+    uint64_t catalog_version = 0;      // bumped by every applied commit
+    uint32_t domain_index = 0;
+    bool intent_active = false;
+    bool on = false;
+    bool closing = false;
+    bool closed = false;
+    bool faulted = false;              // latched for the life of this instance
+    bool initialized = false;          // the open sequence completed and the authority is trustworthy
+    bool lock_owned = false;           // this instance holds the exclusive root lock
+    std::string reason;
+    std::string fault_reason;
+    int lock_fd = -1;
+
+    // ---- disk accounting (unique physical bytes) ----
+    struct ObjectState {
+        uint64_t bytes = 0;            // its conservative allocated charge
+        uint32_t refs = 0;
+    };
+    std::map<Digest, ObjectState> objects;                  // every object the catalog authorizes
+    std::map<uint64_t, std::vector<Digest>> head_objects;   // head id -> the objects its manifest names
+    std::map<uint64_t, uint64_t> head_manifest_bytes;       // head id -> its manifest's allocated charge
+    std::map<uint64_t, uint32_t> head_leases;               // head id -> images still using it
+    std::map<uint64_t, uint64_t> head_recency;              // RAM-only eviction recency (published order is fallback)
+    uint64_t recency_counter = 0;
+    std::set<uint64_t> eviction_excluded;                   // heads protected by the in-flight publication
+    std::vector<PendingFile> pending_files;                 // orphans and retired files awaiting confirmed deletion
+    uint64_t charged = 0;         // allocated bytes of every file this module owns that still exists
+    uint64_t reclaimable = 0;     // the part of `charged` no longer referenced but still on disk
+    uint64_t free_sample = 0;     // last sampled filesystem space under the root
+    uint64_t metadata = 0;        // estimated RAM of the in-RAM index
+    uint64_t prep = 0;            // the live read descriptors' own query copies
+
+    // ---- RAM ledger ----
+    uint64_t ram_held = 0;        // admitted read peaks, materialized images, the publication alias, scratch
+    uint64_t ram_lease = 0;       // the handed-out (or publication) share of it
+    uint64_t ram_budget = 0;      // the absolute published allowance; 0 = none published yet
+    bool admission_suspended = false;
+
+    // ---- reads ----
+    struct ReadJob {
+        ConversationStoreQuery query;
+        ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
+        bool demand = false;
+        bool active = false;              // a reader thread is materializing it right now
+        std::atomic<bool> cancelled{false};
+        bool released = false;
+        bool handed = false;
+        bool leased = false;              // this job holds a slot in head_leases
+        bool holds_slot = false;          // one of Options::max_reads incoming-image slots
+        uint64_t reserved_bytes = 0;      // the peak charged to ram_held while it is not yet a lease
+        uint64_t lease_bytes = 0;         // the finished image's charge, refunded by release_read()
+        uint64_t peak_bytes = 0;          // the peak its admission reserved
+        uint64_t prep_bytes = 0;          // its own query copy, charged to `prep`
+        uint64_t epoch_at_admission = 0;
+        uint64_t head_id = 0;
+        uint64_t tokens = 0;
+        bool live = false;
+        uint32_t stages = 0;
+        uint64_t payload_bytes = 0;
+        std::shared_ptr<const SavedConversation> image;
+        std::string detail;
+    };
+    std::vector<std::shared_ptr<ReadJob>> jobs;      // queued, active, ready or handed out (bounded)
+    std::deque<std::shared_ptr<ReadJob>> queue;      // waiting for the allowance and a slot (demand before prefetch)
+    std::deque<std::shared_ptr<ReadJob>> ready;      // settled, waiting for take_ready()
+    uint64_t incoming = 0;                           // jobs holding one of Options::max_reads slots
+
+    // ---- publication ----
+    struct PublishJob {
+        std::shared_ptr<const SavedConversation> image;
+        ConversationStorePublish request;
+        uint64_t epoch = 0;               // the capture epoch: bound at the seam, or at publish() admission
+        uint64_t ram_bytes = 0;
+        bool started = false;             // the writer has begun reading this image: it may never be replaced
+        bool cancelled = false;
+        bool coalesced = false;
+        std::vector<PendingFile> orphans; // files this attempt has created and not yet authorized
+    };
+    std::shared_ptr<PublishJob> publishing;
+    std::deque<ConversationStorePublishResult> publish_done;
+
+    struct CommitPlan {
+        enum class Kind : uint8_t { publish, eviction, invalidate, promote };
+        Kind kind = Kind::promote;
+        Catalog candidate;                        // exact for publish/eviction; re-derived at commit otherwise
+        uint64_t version = 0;                     // the catalog version an exact candidate was planned against
+        std::vector<uint64_t> retiring;           // heads the applied catalog drops
+        uint64_t new_head = 0;                    // publish only
+        std::vector<Digest> new_objects;          // publish only: everything the new manifest references
+        std::map<Digest, uint64_t> new_object_charges;   // the ones this publication created (already charged)
+        uint64_t new_manifest_bytes = 0;
+        uint64_t new_catalog_charge = 0;          // filled in by commit_plan
+        uint64_t epoch = 0;                       // invalidate: the advanced epoch
+        uint32_t domain_index = 0;                // invalidate
+    };
+
+    struct DurableWork {
+        CommitPlan plan;
+        bool done = false;
+        bool ok = false;
+        std::string detail;
+    };
+
+    // ---- workers ----
+    std::thread writer;
+    std::vector<std::thread> readers;
+    std::deque<std::shared_ptr<DurableWork>> durable;
+    std::atomic<bool> stop{false};
+
+    // ---- counters and test seams ----
+    ConversationStoreCounters counters;
+    std::string fault_step;
+    std::atomic<uint64_t> source_bytes_read{0};
+    std::atomic<uint64_t> name_counter{0};
+
+    // ------------------------------ helpers ------------------------------
+    // Every one of these assumes the caller holds `mutex` unless its name says otherwise; not one of them performs a
+    // storage wait while the lock is held.
+    uint64_t sample_free_locked();
+    uint64_t resident_locked() const { return ram_held + metadata + prep; }
+    std::string temp_name();
+    std::string intent_name() const;
+    bool store_is_empty(std::string& why);
+    void latch_fault_locked(const std::string& why);
+    void recount_metadata_locked();
+    bool revive_object_locked(const Digest& object);
+    uint64_t retire_head_locked(uint64_t head_id);
+    void touch_recency_locked(uint64_t head_id);
+    uint64_t recency_of_locked(const CatalogHead& head) const;
+    uint64_t choose_victim_locked(const Catalog& candidate, const std::set<uint64_t>& excluded, bool want_protected);
+    void cap_protected_locked(Catalog& candidate);
+    bool obtain_head_slot_locked(Catalog& candidate, uint64_t keep_head, std::vector<uint64_t>& retiring);
+    bool head_manifest_locked(uint64_t head_id, Digest& manifest_id, uint64_t& bytes) const;
+    bool load_manifest_of(uint64_t head_id, uint64_t epoch_now, ManifestMeta& out, std::string& why);
+    bool stream_identity_of(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
+                            Digest& scope, uint64_t& ordinal, std::string& why) const;
+
+    // These do I/O, so they are never called with `mutex` held.
+    bool remove_pending_file(const PendingFile& file, std::string& why);
+    void discard_files(std::vector<PendingFile>&& files);
+    void reclaim_pending();
+    void queue_orphans(std::vector<PendingFile>& files);
+    bool commit_plan(CommitPlan& plan, std::string& why);
+    bool evict_head_durably(uint64_t head_id, std::string& why);
+    bool make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why);
+    bool write_catalog_or_refuse(CommitPlan& plan, std::string& why);
+    bool take_fault(const char* step);
+
+    // Lookup: catalog metadata only, under the mutex, no payload read and no GPU pointer exposed.
+    void collect_matches(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
+                         const std::vector<ConversationImageKey>& images,
+                         std::vector<ConversationStoreMatch>& out) const;
+
+    // Read pipeline.  Settlement is idempotent and every path funnels through it.
+    bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why);
+    void settle_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail);
+    void retire_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status,
+                           const std::string& detail);
+    void retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail);
+    void revoke_speculation_locked(bool because_of_demand = true);
+    void release_reservation_locked(const std::shared_ptr<ReadJob>& job);
+    void release_lease_locked(const std::shared_ptr<ReadJob>& job);
+    void release_slot_locked(const std::shared_ptr<ReadJob>& job);
+    void release_head_lease_locked(const std::shared_ptr<ReadJob>& job);
+    void erase_job_locked(const std::shared_ptr<ReadJob>& job);
+    void free_job_prep_locked(const std::shared_ptr<ReadJob>& job);
+    bool deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation, bool specific);
+    void push_publish_result_locked(ConversationStorePublishResult&& result);
+
+    void writer_body();
+    void reader_body();
+    void publish_body(const std::shared_ptr<PublishJob>& job, ConversationStorePublishResult& out);
+    void read_body(const std::shared_ptr<ReadJob>& job);
+
+    bool open_root(std::string& why);
+    bool load_catalog(std::string& why);
+    bool reconcile(std::string& why);
+    bool write_intent(bool present, std::string& why);
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Authority: root, lock, issuer key, catalog, run intent, recovery
+// ---------------------------------------------------------------------------------------------------------------
+
+uint64_t ConversationStore::Impl::sample_free_locked() {
+    free_sample = filesystem_free_bytes(dirs.root);
+    return free_sample;
 }
 
-void ConversationStore::Impl::writer_body() {
-    std::unique_lock<std::mutex> lock(mutex);
-    while (!stop.load()) {
-        if (!publishing) {
-            cv_work.wait_for(lock, std::chrono::milliseconds(50));
+std::string ConversationStore::Impl::temp_name() {
+    const uint64_t n = ++name_counter;
+    return "tm-" + std::to_string(::getpid()) + "-" + std::to_string(n);
+}
+
+std::string ConversationStore::Impl::intent_name() const {
+    std::array<uint8_t, 96> material{};
+    std::memcpy(material.data(), options.domain.data(), 32);
+    std::memcpy(material.data() + 32, options.model.data(), 32);
+    std::memcpy(material.data() + 64, options.engine.data(), 32);
+    return "intent-" + sha256_hex(sha256(material.data(), material.size())).substr(0, 16);
+}
+
+// A genuinely new store: nothing but the directories and the lock file this module has just created.  Only such a
+// store may receive a fresh issuer key; an existing one whose key is missing stays disabled.
+bool ConversationStore::Impl::store_is_empty(std::string& why) {
+    std::vector<DirEntry> entries;
+    if (!list_entries(dirs.root, entries, 64, why)) return false;
+    for (const auto& entry : entries) {
+        if (entry.name == "objects" || entry.name == "manifests" || entry.name == "tmp" ||
+            entry.name == "owner.lock")
+            continue;
+        why.clear();
+        return false;
+    }
+    for (int fd : {dirs.objects, dirs.manifests, dirs.tmp}) {
+        std::vector<DirEntry> inner;
+        if (!list_entries(fd, inner, 1, why)) return false;
+        if (!inner.empty()) {
+            why.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+void ConversationStore::Impl::latch_fault_locked(const std::string& why) {
+    if (!faulted) {
+        faulted = true;
+        fault_reason = why;
+    }
+    cv_ready.notify_all();
+    cv_publish.notify_all();
+    cv_work.notify_all();
+}
+
+bool ConversationStore::Impl::take_fault(const char* step) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (fault_step != step) return false;
+    fault_step.clear();
+    return true;
+}
+
+bool ConversationStore::Impl::open_root(std::string& why) {
+    // Pin every component without following symlinks. Shared system ancestors may be root-owned; the cache
+    // root itself and every directory below it must be private to this account.
+    if (root.empty() || root[0] != '/') {
+        why = "the store root must be an absolute path";
+        return false;
+    }
+    std::vector<std::string> parts;
+    for (size_t at = 1; at <= root.size();) {
+        size_t slash = root.find('/', at);
+        if (slash == std::string::npos) slash = root.size();
+        if (slash > at) {
+            const auto part = root.substr(at, slash - at);
+            if (part == "." || part == "..") {
+                why = "the store root must not contain relative path components";
+                return false;
+            }
+            parts.push_back(part);
+        }
+        at = slash + 1;
+    }
+    if (parts.empty()) {
+        why = "the filesystem root is not a private cache directory";
+        return false;
+    }
+    int parent = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (parent < 0) {
+        why = std::string("cannot open the filesystem root: ") + std::strerror(errno);
+        return false;
+    }
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const std::string& part = parts[i];
+        std::string detail;
+        const int existing = open_child_dir(parent, part.c_str(), detail, i + 1 == parts.size());
+        if (existing >= 0) {
+            ::close(parent);
+            parent = existing;
             continue;
         }
-        const std::shared_ptr<PublishJob> job = publishing;
-        // Once the worker has begun reading the image it may never be replaced: publish() refuses instead.
-        job->started = true;
-        ConversationStorePublishResult result;
-        lock.unlock();
-        publish_body(job, result);
-        lock.lock();
-        if (job->ram_bytes) {
-            ram_held -= std::min(ram_held, job->ram_bytes);
-            job->ram_bytes = 0;
+        if (errno != ENOENT) {
+            why = detail;
+            ::close(parent);
+            return false;
         }
-        result.released = true;
-        if (job->coalesced && result.status == ConversationStorePublishStatus::stored) {
-            result.status = ConversationStorePublishStatus::coalesced;
-            result.detail = "replaced by a newer publication of the same lineage";
-            counters.coalesced_publishes++;
+        if (::mkdirat(parent, part.c_str(), 0700) != 0) {
+            why = std::string("cannot create ") + part + ": " + std::strerror(errno);
+            ::close(parent);
+            return false;
         }
-        result.request_id = job->request.request_id;
-        result.generation = job->request.generation;
-        if (result.epoch == 0) result.epoch = epoch;
-        publish_done.push_back(std::move(result));
-        const size_t keep = size_t(options.max_pending_publishes) * 4 + 4;
-        while (publish_done.size() > keep) publish_done.pop_front();
-        if (publishing == job) publishing.reset();
-        cv_publish.notify_all();
+        if (::fsync(parent) != 0) {
+            why = std::string("the parent of ") + part + " could not be flushed: " + std::strerror(errno);
+            ::close(parent);
+            return false;
+        }
+        const int made = open_child_dir(parent, part.c_str(), why);
+        if (made < 0) {
+            ::close(parent);
+            return false;
+        }
+        ::close(parent);
+        parent = made;
+    }
+    dirs.root = parent;
+
+    for (int* slot : {&dirs.objects, &dirs.manifests, &dirs.tmp}) {
+        const char* name = slot == &dirs.objects ? "objects" : (slot == &dirs.manifests ? "manifests" : "tmp");
+        bool created = false;
+        if (!make_child_dir(dirs.root, name, created, why)) return false;
+        *slot = open_child_dir(dirs.root, name, why);
+        if (*slot < 0) return false;
+    }
+    if (!fsync_dir(dirs.root, "the store root", why)) return false;
+
+    // The lock is taken before the key or the catalog is even looked at, so a rejected second owner can neither read
+    // nor write any authority state, and close() on it can do nothing at all.
+    lock_fd = ::openat(dirs.root, "owner.lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock_fd < 0) {
+        why = std::string("cannot open the store's lock file: ") + std::strerror(errno);
+        return false;
+    }
+    struct stat info {};
+    if (::fstat(lock_fd, &info) != 0 || !private_regular(info)) {
+        why = "the store's lock file is not a regular file this account owns";
+        return false;
+    }
+    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        counters.lock_conflicts++;
+        why = "another process owns this store's root";
+        return false;
+    }
+    lock_owned = true;
+
+    // The issuer key: read it if it exists, create it only for a new empty store, refuse anything else.
+    if (::fstatat(dirs.root, "issuer.key", &info, AT_SYMLINK_NOFOLLOW) == 0) {
+        std::vector<uint8_t> key;
+        if (!read_file(dirs.root, "issuer.key", 64, key, why)) return false;
+        if (key.size() != 32) {
+            why = "the issuer key file is not 32 bytes";
+            return false;
+        }
+        std::memcpy(issuer_key.data(), key.data(), key.size());
+        return true;
+    }
+    if (errno != ENOENT) {
+        why = std::string("cannot stat the issuer key: ") + std::strerror(errno);
+        return false;
+    }
+    std::string empty_why;
+    if (!store_is_empty(empty_why)) {
+        why = "the store holds records but has no issuer key: refusing to mint a new authorization identity";
+        return false;
+    }
+    uint8_t fresh[32] = {};
+    if (!fill_random(fresh, sizeof fresh)) {
+        why = "no cryptographic entropy is available for the store's issuer key";
+        return false;
+    }
+    if (!write_new_file(dirs.root, "issuer.key", fresh, sizeof fresh, why)) return false;
+    if (!fsync_dir(dirs.root, "the store root", why)) return false;
+    std::memcpy(issuer_key.data(), fresh, sizeof fresh);
+    return true;
+}
+
+bool ConversationStore::Impl::write_intent(bool present, std::string& why) {
+    const std::string name = intent_name();
+    const uint8_t marker[8] = {'S', 'T', 'C', 'S', 'I', 'N', 'T', '1'};
+    if (present) {
+        struct stat info {};
+        if (::fstatat(dirs.root, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) return true;
+        if (!write_new_file(dirs.root, name, marker, sizeof marker, why)) return false;
+        return fsync_dir(dirs.root, "the store root", why);
+    }
+    if (!remove_file(dirs.root, name, why)) return false;
+    if (!fsync_dir(dirs.root, "the store root", why)) {
+        // The marker is gone from this process's view but not durably: re-arm it so the next start still distrusts
+        // this domain, and report the failure rather than pretending the close was clean.
+        std::string ignored;
+        if (!write_new_file(dirs.root, name, marker, sizeof marker, ignored)) return false;
+        return false;
+    }
+    return true;
+}
+
+bool ConversationStore::Impl::load_catalog(std::string& why) {
+    Catalog loaded;
+    std::string detail;
+    struct stat catalog_info {};
+    if (::fstatat(dirs.root, "catalog", &catalog_info, AT_SYMLINK_NOFOLLOW) == 0) {
+        // Whatever the file turns out to be, its bytes exist and are charged before anything is trusted.
+        catalog_charge = allocated_charge(uint64_t(catalog_info.st_size > 0 ? catalog_info.st_size : 0));
+        charged += catalog_charge;
+        std::vector<uint8_t> bytes;
+        if (!read_file(dirs.root, "catalog", limits.max_manifest_bytes, bytes, detail) ||
+            !conversation_store_detail::catalog_decode(bytes.data(), bytes.size(), loaded, detail) ||
+            !(loaded.issuer_key_digest == sha256(issuer_key.data(), issuer_key.size()))) {
+            // A catalog that cannot be trusted is cold caching: never a directory-based resurrection.
+            counters.corrupt_records++;
+            loaded = Catalog{};
+        }
+    }
+    catalog = std::move(loaded);
+    catalog.issuer_key_digest = sha256(issuer_key.data(), issuer_key.size());
+
+    domain_index = uint32_t(catalog.domains.size());
+    for (uint32_t i = 0; i < catalog.domains.size(); ++i)
+        if (catalog.domains[i].digest == options.domain) {
+            domain_index = i;
+            break;
+        }
+    if (domain_index == catalog.domains.size()) {
+        CatalogDomain domain;
+        domain.digest = options.domain;
+        domain.epoch = 1;
+        catalog.domains.push_back(domain);
+        epoch = 1;
+    } else {
+        epoch = catalog.domains[domain_index].epoch;
+    }
+
+    // A run-intent marker for exactly this domain means its previous run did not close cleanly: its records and every
+    // outstanding completion of its epoch are invalid.  Otherwise records of a retired epoch are unreachable.
+    struct stat intent_info {};
+    const bool unclean =
+        ::fstatat(dirs.root, intent_name().c_str(), &intent_info, AT_SYMLINK_NOFOLLOW) == 0;
+    if (unclean) {
+        epoch += 1;
+        catalog.domains[domain_index].epoch = epoch;
+        counters.epoch_advances++;
+    }
+    std::vector<uint64_t> victims;
+    for (const auto& head : catalog.heads)
+        if (head.domain == domain_index && (unclean || head.epoch != epoch)) victims.push_back(head.head_id);
+    for (uint64_t head_id : victims) retire_head_locked(head_id);
+    for (const auto& head : catalog.heads) head_recency[head.head_id] = head.published_order;
+
+    // The marker is armed, and the retirements above are durable, before this store may reuse anything at all.
+    if (!write_intent(true, why)) return false;
+    intent_active = true;
+    CommitPlan plan;
+    plan.kind = CommitPlan::Kind::promote;
+    return commit_plan(plan, why);
+}
+
+bool ConversationStore::Impl::reconcile(std::string& why) {
+    // Every scratch file is garbage by construction: a durable write completes with a rename out of tmp/.  Anything
+    // that is not a regular file this account owns is left in place (and is still accounted for below).
+    std::vector<DirEntry> temporaries;
+    if (!list_entries(dirs.tmp, temporaries, kMaxScanEntries, why)) return false;
+    for (const auto& entry : temporaries) {
+        if (!entry.regular || !entry.ours) continue;
+        PendingFile file;
+        file.where = Where::tmp;
+        file.name = entry.name;
+        file.charge = allocated_charge(entry.size);
+        charged += file.charge;
+        reclaimable += file.charge;
+        counters.recovered_orphans++;
+        pending_files.push_back(std::move(file));
+    }
+    // The control files are real bytes on the device and belong to the shared charge as well.  The catalog is
+    // charged by load_catalog() from the file it read, so it is not counted twice here.
+    std::vector<DirEntry> root_entries;
+    if (!list_entries(dirs.root, root_entries, kMaxScanEntries, why)) return false;
+    for (const auto& entry : root_entries)
+        if (entry.regular && entry.ours && entry.name != "catalog") charged += allocated_charge(entry.size);
+
+    // Count what is physically present before the catalog is trusted: only the catalog authorizes a manifest, and
+    // only a manifest authorizes an object.
+    std::map<Digest, uint64_t> present_objects;
+    std::map<Digest, uint64_t> present_manifests;
+    uint64_t scanned = 0;
+    std::vector<DirEntry> shards;
+    if (!list_entries(dirs.objects, shards, kMaxScanEntries, why)) return false;
+    for (const auto& shard : shards) {
+        if (!shard.directory || !shard.ours || shard.name.size() != 2 || !is_hex_name(shard.name)) {
+            // Not a shard this store could have created: account nothing for it and delete nothing from it.
+            continue;
+        }
+        const int fd = open_child_dir(dirs.objects, shard.name.c_str(), why);
+        if (fd < 0) {
+            why.clear();
+            continue;
+        }
+        std::vector<DirEntry> files;
+        std::string nested;
+        if (!list_entries(fd, files, kMaxScanEntries, nested)) {
+            ::close(fd);
+            continue;
+        }
+        for (const auto& file : files) {
+            const uint64_t charge = allocated_charge(file.size);
+            charged += charge;
+            if (++scanned > kMaxScanEntries) {
+                why = "the store holds more objects than it can account at opening";
+                ::close(fd);
+                return false;
+            }
+            Digest digest{};
+            if (file.regular && file.ours && file.name.size() == 64 && is_hex_name(file.name) &&
+                hex_to_digest(file.name, digest) && sha256_hex(digest).compare(0, 2, shard.name) == 0) {
+                present_objects.emplace(digest, charge);
+                continue;
+            }
+            if (file.regular && file.ours) {
+                reclaimable += charge;
+                PendingFile unknown;
+                unknown.where = Where::objects;
+                unknown.shard = shard.name;
+                unknown.name = file.name;
+                unknown.charge = charge;
+                pending_files.push_back(std::move(unknown));
+            }
+        }
+        ::close(fd);
+    }
+    std::vector<DirEntry> manifests;
+    if (!list_entries(dirs.manifests, manifests, kMaxScanEntries, why)) return false;
+    for (const auto& file : manifests) {
+        const uint64_t charge = allocated_charge(file.size);
+        charged += charge;
+        if (++scanned > kMaxScanEntries) {
+            why = "the store holds more manifests than it can account at opening";
+            return false;
+        }
+        Digest digest{};
+        if (file.regular && file.ours && file.name.size() == 64 && is_hex_name(file.name) &&
+            hex_to_digest(file.name, digest)) {
+            present_manifests.emplace(digest, charge);
+            continue;
+        }
+        if (file.regular && file.ours) {
+            reclaimable += charge;
+            PendingFile unknown;
+            unknown.where = Where::manifests;
+            unknown.name = file.name;
+            unknown.charge = charge;
+            pending_files.push_back(std::move(unknown));
+        }
+    }
+
+    std::vector<uint64_t> dropped;
+    for (const auto& head : catalog.heads) {
+        const auto manifest = present_manifests.find(head.manifest_id);
+        ManifestMeta meta;
+        std::string detail;
+        if (manifest == present_manifests.end() || !load_manifest_of(head.head_id, head.epoch, meta, detail)) {
+            counters.corrupt_records++;
+            dropped.push_back(head.head_id);
+            continue;
+        }
+        bool complete = true;
+        for (const auto& object : meta.objects)
+            if (present_objects.find(object.first) == present_objects.end()) {
+                complete = false;
+                break;
+            }
+        if (!complete) {
+            counters.corrupt_records++;
+            dropped.push_back(head.head_id);
+            continue;
+        }
+        head_manifest_bytes[head.head_id] = manifest->second;
+        head_recency[head.head_id] = head.published_order;
+        recency_counter = std::max(recency_counter, head.published_order);
+        std::vector<Digest>& list = head_objects[head.head_id];
+        list.reserve(meta.objects.size());
+        for (const auto& object : meta.objects) {
+            ObjectState& state = objects[object.first];
+            const auto present = present_objects.find(object.first);
+            if (state.bytes == 0) state.bytes = present == present_objects.end() ? 0 : present->second;
+            state.refs += 1;
+            list.push_back(object.first);
+        }
+    }
+    for (uint64_t head_id : dropped) retire_head_locked(head_id);
+
+    // Present but referenced by nothing is an orphan: account it, then remove it (bounded per open).
+    uint64_t removed = 0;
+    for (const auto& manifest : present_manifests) {
+        bool referenced = false;
+        for (const auto& head : catalog.heads)
+            if (head.manifest_id == manifest.first) {
+                referenced = true;
+                break;
+            }
+        if (referenced) continue;
+        reclaimable += manifest.second;
+        const std::string name = sha256_hex(manifest.first);
+        std::string ignored;
+        if (removed < kMaxReclaimPerPass && remove_file(dirs.manifests, name, ignored)) {
+            charged -= std::min(charged, manifest.second);
+            reclaimable -= std::min(reclaimable, manifest.second);
+            counters.recovered_orphans++;
+            ++removed;
+            continue;
+        }
+        PendingFile file;
+        file.where = Where::manifests;
+        file.name = name;
+        file.charge = manifest.second;
+        pending_files.push_back(std::move(file));
+        counters.deferred_reclaims++;
+    }
+    for (const auto& object : present_objects) {
+        if (objects.count(object.first)) continue;
+        reclaimable += object.second;
+        PendingFile file;
+        file.where = Where::objects;
+        file.object = object.first;
+        file.shard = sha256_hex(object.first).substr(0, 2);
+        file.name = sha256_hex(object.first);
+        file.charge = object.second;
+        std::string ignored;
+        const int shard_fd = open_shard_fd(dirs, file.shard, ignored);
+        const bool gone = shard_fd >= 0 && removed < kMaxReclaimPerPass && remove_file(shard_fd, file.name, ignored);
+        if (shard_fd >= 0) ::close(shard_fd);
+        if (gone) {
+            charged -= std::min(charged, file.charge);
+            reclaimable -= std::min(reclaimable, file.charge);
+            counters.recovered_orphans++;
+            ++removed;
+            continue;
+        }
+        pending_files.push_back(std::move(file));
+        counters.deferred_reclaims++;
+    }
+
+    // Enforce the head and index ceilings before serving anything.
+    std::vector<uint64_t> retiring;
+    while (catalog.heads.size() > options.head_limit) {
+        const uint64_t victim = choose_victim_locked(catalog, {}, false);
+        if (victim == 0) break;
+        for (size_t i = 0; i < catalog.heads.size(); ++i)
+            if (catalog.heads[i].head_id == victim) {
+                retiring.push_back(victim);
+                catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        counters.evictions++;
+    }
+    recount_metadata_locked();
+    while (metadata > options.metadata_bytes && catalog.heads.size() > 1) {
+        const uint64_t victim = choose_victim_locked(catalog, {}, false);
+        if (victim == 0) break;
+        for (size_t i = 0; i < catalog.heads.size(); ++i)
+            if (catalog.heads[i].head_id == victim) {
+                retiring.push_back(victim);
+                catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        recount_metadata_locked();
+    }
+    if (metadata > options.metadata_bytes) {
+        why = "the store's index cannot be held under ConversationStoreOptions::metadata_bytes";
+        return false;
+    }
+    for (uint64_t head_id : retiring) retire_head_locked(head_id);
+    // The removals decided above must be durable before this store serves a lookup from them.
+    CommitPlan plan;
+    plan.kind = CommitPlan::Kind::promote;
+    if (!commit_plan(plan, why)) return false;
+    recount_metadata_locked();
+    return true;
+}
+
+bool ConversationStore::Impl::revive_object_locked(const Digest& object) {
+    for (auto it = pending_files.begin(); it != pending_files.end(); ++it) {
+        if (it->where != Where::objects || !(it->object == object)) continue;
+        reclaimable -= std::min(reclaimable, it->charge);
+        pending_files.erase(it);
+        return true;
+    }
+    return false;
+}
+
+uint64_t ConversationStore::Impl::retire_head_locked(uint64_t head_id) {
+    PendingFile manifest;
+    bool have_manifest = false;
+    for (size_t i = 0; i < catalog.heads.size(); ++i) {
+        if (catalog.heads[i].head_id != head_id) continue;
+        const Digest id = catalog.heads[i].manifest_id;
+        bool shared = false;   // defensive: never queue a manifest another retained head still names
+        for (size_t j = 0; j < catalog.heads.size(); ++j)
+            if (j != i && catalog.heads[j].manifest_id == id) shared = true;
+        if (digest_nonzero(id) && !shared) {
+            manifest.where = Where::manifests;
+            manifest.name = sha256_hex(id);
+            const auto bytes = head_manifest_bytes.find(head_id);
+            manifest.charge = bytes == head_manifest_bytes.end() ? 0 : bytes->second;
+            manifest.head_id = head_id;
+            have_manifest = true;
+        }
+        catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
+        break;
+    }
+    uint64_t freed = manifest.charge;
+    if (have_manifest) {
+        reclaimable += manifest.charge;
+        pending_files.push_back(std::move(manifest));
+    }
+    const auto list = head_objects.find(head_id);
+    if (list != head_objects.end()) {
+        for (const Digest& object : list->second) {
+            auto state = objects.find(object);
+            if (state == objects.end()) continue;
+            if (state->second.refs > 0) --state->second.refs;
+            if (state->second.refs != 0) continue;
+            PendingFile file;
+            file.where = Where::objects;
+            file.object = object;
+            file.shard = sha256_hex(object).substr(0, 2);
+            file.name = sha256_hex(object);
+            file.charge = state->second.bytes;
+            file.head_id = head_id;
+            reclaimable += file.charge;
+            freed += file.charge;
+            pending_files.push_back(std::move(file));
+        }
+        head_objects.erase(list);
+    }
+    head_manifest_bytes.erase(head_id);
+    // The lease count is NOT erased here: an open hold or a handed-out image keeps it until it finishes, and only
+    // then may the files it still reads be deleted and credited.
+    head_recency.erase(head_id);
+    eviction_excluded.erase(head_id);
+    return freed;
+}
+
+void ConversationStore::Impl::touch_recency_locked(uint64_t head_id) { head_recency[head_id] = ++recency_counter; }
+
+uint64_t ConversationStore::Impl::recency_of_locked(const CatalogHead& head) const {
+    const auto found = head_recency.find(head.head_id);
+    return found == head_recency.end() ? head.published_order : found->second;
+}
+
+uint64_t ConversationStore::Impl::choose_victim_locked(const Catalog& candidate, const std::set<uint64_t>& excluded,
+                                                       bool want_protected) {
+    uint64_t victim = 0;
+    uint64_t oldest = 0;
+    for (const auto& head : candidate.heads) {
+        if (head.pinned) continue;
+        if (excluded.count(head.head_id)) continue;
+        if (head_leases.count(head.head_id)) continue;
+        if (bool(head.protected_seg) != want_protected) continue;
+        const uint64_t recency = recency_of_locked(head);
+        if (victim == 0 || recency < oldest) {
+            victim = head.head_id;
+            oldest = recency;
+        }
+    }
+    return victim;
+}
+
+void ConversationStore::Impl::cap_protected_locked(Catalog& candidate) {
+    const uint64_t limit = uint64_t(options.head_limit) * 3 / 4;
+    for (;;) {
+        uint64_t count = 0;
+        uint64_t demote = 0;
+        uint64_t oldest = 0;
+        for (const auto& head : candidate.heads) {
+            if (!head.protected_seg) continue;
+            ++count;
+            const uint64_t recency = recency_of_locked(head);
+            if (demote == 0 || recency < oldest) {
+                demote = head.head_id;
+                oldest = recency;
+            }
+        }
+        if (count <= limit || demote == 0) return;
+        for (auto& head : candidate.heads)
+            if (head.head_id == demote) head.protected_seg = false;
     }
 }
 
-void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& job, ConversationStorePublishResult& out) {
-    const SavedConversation& image = *job->image;
-    const ConversationStorePublish& request = job->request;
-    out.status = ConversationStorePublishStatus::failed;
-    const auto fail = [&out](ConversationStorePublishStatus status, const std::string& detail) {
-        out.status = status;
-        out.detail = detail;
-    };
+bool ConversationStore::Impl::obtain_head_slot_locked(Catalog& candidate, uint64_t keep_head,
+                                                      std::vector<uint64_t>& retiring) {
+    while (candidate.heads.size() > options.head_limit) {
+        std::set<uint64_t> excluded = eviction_excluded;
+        if (keep_head) excluded.insert(keep_head);
+        uint64_t victim = choose_victim_locked(candidate, excluded, false);
+        if (victim == 0) victim = choose_victim_locked(candidate, excluded, true);
+        if (victim == 0) return false;   // every head is pinned or leased: refuse rather than overrun the ceiling
+        for (size_t i = 0; i < candidate.heads.size(); ++i)
+            if (candidate.heads[i].head_id == victim) {
+                retiring.push_back(victim);
+                candidate.heads.erase(candidate.heads.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        counters.evictions++;
+    }
+    return true;
+}
 
-    Digest bucket{};
-    uint64_t epoch_now = 0;
+bool ConversationStore::Impl::head_manifest_locked(uint64_t head_id, Digest& manifest_id, uint64_t& bytes) const {
+    for (const auto& head : catalog.heads) {
+        if (head.head_id != head_id) continue;
+        manifest_id = head.manifest_id;
+        bytes = head.manifest_bytes;
+        return true;
+    }
+    return false;
+}
+
+bool ConversationStore::Impl::load_manifest_of(uint64_t head_id, uint64_t epoch_now, ManifestMeta& out,
+                                               std::string& why) {
+    Digest manifest_id{};
+    uint64_t bytes = 0;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        if (!on || closing) {
-            fail(ConversationStorePublishStatus::disabled, reason.empty() ? "the store is not enabled" : reason);
-            return;
+        if (!head_manifest_locked(head_id, manifest_id, bytes)) {
+            why = "no retained head has that identity";
+            return false;
         }
-        if (!healthy) {
-            fail(ConversationStorePublishStatus::failed, unhealthy_reason);
-            return;
-        }
-        epoch_now = epoch;
-        ConversationStoreSelector selector;
-        selector.scope = image.scope;
-        selector.cvec = image.cvec;
-        selector.geometry = image.geometry;
-        selector.layer_lo = image.layer_lo;
-        selector.layer_hi = image.layer_hi;
-        bucket = conversation_store_detail::store_bucket_digest(options, selector);
     }
-    if (take_fault("layout")) {
-        fail(ConversationStorePublishStatus::failed, "injected fault: layout");
-        return;
+    std::vector<uint8_t> raw;
+    if (!read_file(dirs.manifests, sha256_hex(manifest_id), limits.max_manifest_bytes, raw, why)) return false;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        counters.bytes_read += raw.size();
     }
-    conversation_store_detail::ImageLayout layout;
-    std::string why;
-    if (!conversation_store_detail::image_layout(image, bucket, limits, layout, why)) {
-        counters.aborted_publications++;
-        fail(ConversationStorePublishStatus::refused_limits, why);
-        return;
+    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, out, why)) return false;
+    if (!(out.manifest_id == manifest_id) || out.epoch != epoch_now) {
+        why = "that manifest does not belong to this execution-domain epoch";
+        return false;
     }
-    // The caller's proven unchanged intervals and the predecessor's pinned cuts both need its manifest, so it is
-    // read whenever this publication names a predecessor; path resolution takes the state lock, the read does not.
-    conversation_store_detail::ManifestMeta source;
-    bool have_source = false;
-    if (request.supersedes != 0) {
-        std::string source_path;
-        uint64_t source_bytes = 0;
-        {
+    return true;
+}
+
+bool ConversationStore::Impl::stream_identity_of(const std::vector<ContainerMeta>& containers,
+                                                 const ConversationStoreStreamId& id, Digest& scope, uint64_t& ordinal,
+                                                 std::string& why) const {
+    return conversation_store_detail::stream_object_identity(containers, id, options.model, scope, ordinal, why);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Deleting files, and crediting only what is really gone
+// ---------------------------------------------------------------------------------------------------------------
+
+bool ConversationStore::Impl::remove_pending_file(const PendingFile& file, std::string& why) {
+    if (file.where != Where::objects) return remove_file(dirs.of(file.where), file.name, why);
+    const int shard = open_shard_fd(dirs, file.shard, why);
+    if (shard < 0) {
+        const bool missing = errno == ENOENT;
+        why.clear();
+        return missing;   // a missing shard means the whole subtree is already gone
+    }
+    const bool ok = remove_file(shard, file.name, why);
+    ::close(shard);
+    return ok;
+}
+
+void ConversationStore::Impl::discard_files(std::vector<PendingFile>&& files) {
+    std::vector<PendingFile> keep;
+    for (PendingFile& file : files) {
+        std::string why;
+        if (remove_pending_file(file, why)) {
             std::lock_guard<std::mutex> guard(mutex);
-            have_source = manifest_path_of(request.supersedes, source_path, source_bytes);
+            charged -= std::min(charged, file.charge);
+            reclaimable -= std::min(reclaimable, file.charge);
+            continue;
         }
-        if (have_source) {
-            std::vector<uint8_t> raw;
-            std::string detail;
-            have_source = read_file(source_path, raw, limits.max_manifest_bytes, detail) &&
-                          conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, source, detail) &&
-                          source.bucket == bucket && source.epoch == epoch_now;
-            if (have_source) {
+        std::lock_guard<std::mutex> guard(mutex);
+        counters.deferred_reclaims++;
+        keep.push_back(std::move(file));
+    }
+    if (!keep.empty()) {
+        std::lock_guard<std::mutex> guard(mutex);
+        for (auto& file : keep) pending_files.push_back(std::move(file));
+    }
+}
+
+void ConversationStore::Impl::queue_orphans(std::vector<PendingFile>& files) {
+    std::lock_guard<std::mutex> guard(mutex);
+    for (auto& file : files) {
+        reclaimable += file.charge;
+        pending_files.push_back(file);
+    }
+    files.clear();
+}
+
+void ConversationStore::Impl::reclaim_pending() {
+    std::vector<PendingFile> batch;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        std::vector<PendingFile> keep;
+        keep.reserve(pending_files.size());
+        for (auto& file : pending_files) {
+            // A file whose head still has an open hold or a handed-out image is not deleted yet: a reader's
+            // descriptors may still name it, and its bytes are still in use.
+            if (file.head_id != 0 && head_leases.count(file.head_id)) {
+                keep.push_back(std::move(file));
+                continue;
+            }
+            if (batch.size() >= kMaxReclaimPerPass) {
+                keep.push_back(std::move(file));
+                continue;
+            }
+            batch.push_back(std::move(file));
+        }
+        pending_files = std::move(keep);
+    }
+    std::vector<PendingFile> retry;
+    for (PendingFile& file : batch) {
+        if (file.where == Where::objects) {
+            bool referenced = false;
+            {
                 std::lock_guard<std::mutex> guard(mutex);
-                counters.bytes_read += raw.size();
+                const auto state = objects.find(file.object);
+                referenced = state != objects.end() && state->second.refs != 0;
+            }
+            if (referenced) {
+                // Referenced again: the file is needed, so the pending record goes away and its charge stays.
+                std::lock_guard<std::mutex> guard(mutex);
+                revive_object_locked(file.object);
+                continue;
             }
         }
-    }
-
-    // ---- payload: reuse proven intervals, chunk everything else, never write bytes that already exist ----
-    std::vector<conversation_store_detail::StreamRecord> streams;
-    streams.reserve(layout.streams.size());
-    std::map<Digest, uint64_t> referenced;
-    std::vector<std::pair<Digest, uint64_t>> written;
-    std::set<Digest> written_set;
-    std::vector<uint64_t> victims;
-    uint64_t freeable = 0;
-    uint64_t new_bytes = 0, reused_bytes = 0;
-    const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
-    auto kv_meta_for = [&layout](const ConversationStoreStreamId& id) -> const conversation_store_detail::KvMeta* {
-        if (!conversation_store_kv_kind(id.kind)) return nullptr;
-        for (const auto& container : layout.containers)
-            if (container.is_image && container.stage == id.stage && size_t(id.ordinal) < container.kv.size())
-                return &container.kv[size_t(id.ordinal)];
-        return nullptr;
-    };
-    bool aborted = false;
-    bool floor_limited = false;
-    ConversationStorePublishStatus abort_status = ConversationStorePublishStatus::failed;
-    auto rollback = [&]() {
-        std::string ignored;
-        for (const auto& object : written) remove_file(object_path(root, object.first), ignored);
-        std::lock_guard<std::mutex> guard(mutex);
-        for (const auto& object : written) charged -= std::min(charged, object.second);
-        counters.aborted_publications++;
-    };
-
-    for (const auto& stream : layout.streams) {
-        const ConversationStoreStreamId id = stream.info.id;
-        conversation_store_detail::StreamRecord record;
-        record.id = id;
-        record.bytes = stream.info.bytes;
-        const conversation_store_detail::KvMeta* kv = kv_meta_for(id);
-        const Digest scope = conversation_store_detail::object_scope_digest(id.kind, kv);
-        uint64_t at = 0;
-        auto emit = [&](uint64_t from, uint64_t to) {
-            while (from < to) {
-                const uint64_t element = std::max<uint32_t>(1, stream.element);
-                uint64_t size = chunk_limit;
-                if (element > 1) size -= size % element;
-                size = std::min(size, to - from);
-                std::vector<uint8_t> buffer(static_cast<size_t>(size));
-                if (!stream.read(from, buffer.data(), size_t(size), why)) return false;
-                source_bytes_read += size;
-                const Digest object =
-                    conversation_store_detail::object_digest(scope, id.kind, id.ordinal, size, buffer.data());
-                bool present = false;
-                {
-                    std::lock_guard<std::mutex> guard(mutex);
-                    if (job->coalesced) {
-                        why = "replaced by a newer publication of the same lineage";
-                        aborted = true;
-                        abort_status = ConversationStorePublishStatus::coalesced;
-                        return false;
-                    }
-                    present = objects.count(object) != 0 || written_set.count(object) != 0;
-                }
-                if (present) {
-                    counters.dedup_chunks++;
-                } else {
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        if (!ensure_capacity(size, victims, freeable, floor_limited, why)) {
-                            abort_status = floor_limited ? ConversationStorePublishStatus::refused_floor
-                                                        : ConversationStorePublishStatus::refused_quota;
-                            counters.aborted_publications++;
-                            return false;
-                        }
-                        charged += size;
-                    }
-                    if (take_fault("objects")) {
-                        why = "injected fault: objects";
-                        std::lock_guard<std::mutex> guard(mutex);
-                        charged -= std::min(charged, size);
-                        counters.aborted_publications++;
-                        return false;
-                    }
-                    if (!write_object_file(root, object, buffer.data(), size_t(size), why)) {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        charged -= std::min(charged, size);
-                        counters.aborted_publications++;
-                        return false;
-                    }
-                    written.emplace_back(object, size);
-                    written_set.insert(object);
-                    new_bytes += size;
-                    {
-                        std::lock_guard<std::mutex> guard(mutex);
-                        counters.bytes_written += size;
-                        counters.published_chunks++;
-                    }
-                }
-                conversation_store_detail::ChunkRecord chunk;
-                chunk.offset = from;
-                chunk.length = uint32_t(size);
-                chunk.object = object;
-                record.chunks.push_back(chunk);
-                referenced[object] = size;
-                from += size;
-            }
-            return true;
-        };
-
-        // Reuse intervals, longest first is irrelevant: they are placed by their own offset, and every byte they do
-        // not cover is a gap that gets chunked normally.
-        std::vector<const ConversationStoreReuse*> intervals;
-        for (const auto& entry : request.reuse)
-            if (entry.stream == id) intervals.push_back(&entry);
-        std::stable_sort(intervals.begin(), intervals.end(),
-                         [](const ConversationStoreReuse* a, const ConversationStoreReuse* b) {
-                             return a->offset < b->offset;
-                         });
-        const conversation_store_detail::StreamRecord* source_stream = nullptr;
-        if (have_source)
-            for (const auto& candidate : source.streams)
-                if (candidate.id == id) {
-                    source_stream = &candidate;
-                    break;
-                }
-        uint64_t covered_until = 0;
-        for (const ConversationStoreReuse* entry : intervals) {
-            if (aborted) break;
-            bool usable = entry->bytes > 0 && source_stream != nullptr &&
-                          entry->offset >= covered_until && entry->offset % chunk_limit == 0 &&
-                          entry->offset + entry->bytes <= stream.info.bytes &&
-                          entry->source_offset + entry->bytes <= source_stream->bytes;
-            if (usable) {
-                // The interval must start and end exactly on the source's own chunk boundaries, and end either on a
-                // chunk boundary of the outgoing stream or at its end: an immutable chunk is never rewritten.
-                const bool ends_clean = (entry->offset + entry->bytes) % chunk_limit == 0 ||
-                                        entry->offset + entry->bytes == stream.info.bytes;
-                size_t first = source_stream->chunks.size(), last = 0;
-                for (size_t i = 0; i < source_stream->chunks.size(); ++i) {
-                    const auto& chunk = source_stream->chunks[i];
-                    if (chunk.offset + chunk.length <= entry->source_offset ||
-                        chunk.offset >= entry->source_offset + entry->bytes)
-                        continue;
-                    first = std::min(first, i);
-                    last = std::max(last, i);
-                }
-                usable = ends_clean && first <= last && source_stream->chunks[first].offset == entry->source_offset &&
-                         source_stream->chunks[last].offset + source_stream->chunks[last].length ==
-                             entry->source_offset + entry->bytes;
-                if (usable) {
-                    // Every reused object must still be present and authorized, or the interval is not usable.
-                    std::lock_guard<std::mutex> guard(mutex);
-                    for (size_t i = first; i <= last; ++i)
-                        if (objects.count(source_stream->chunks[i].object) == 0) usable = false;
-                }
-                if (usable) {
-                    if (!emit(covered_until, entry->offset)) break;
-                    for (size_t i = first; i <= last; ++i) {
-                        const auto& chunk = source_stream->chunks[i];
-                        conversation_store_detail::ChunkRecord adopted = chunk;
-                        adopted.offset = entry->offset + (chunk.offset - entry->source_offset);
-                        record.chunks.push_back(adopted);
-                        referenced[chunk.object] = chunk.length;
-                        reused_bytes += chunk.length;
-                        counters.reused_chunks++;
-                        counters.reused_bytes += chunk.length;
-                    }
-                    covered_until = entry->offset + entry->bytes;
-                    at = covered_until;
-                    continue;
-                }
-            }
-        }
-        if (aborted) break;
-        if (!emit(covered_until, stream.info.bytes)) break;
-        (void)at;
-        streams.push_back(std::move(record));
-    }
-    if (aborted || streams.size() != layout.streams.size()) {
-        rollback();
-        fail(abort_status, why.empty() ? "the publication was abandoned" : why);
-        return;
-    }
-
-    // ---- the manifest, then the catalog commit that authorizes it ----
-    uint64_t published_order = 0;
-    {
-        std::lock_guard<std::mutex> guard(mutex);
-        published_order = ++catalog.published_order_counter;
-    }
-    conversation_store_detail::ManifestMeta meta;
-    meta.bucket = bucket;
-    meta.domain = options.domain;
-    meta.epoch = epoch_now;
-    meta.generation = request.generation;
-    meta.parent = request.supersedes;
-    meta.published_order = published_order;
-    meta.stages = layout.stages;
-    meta.containers = layout.containers;
-    meta.streams = std::move(streams);
-    meta.payload_bytes = layout.payload_bytes;
-    meta.objects.assign(referenced.begin(), referenced.end());
-    meta.cuts = layout.cuts;
-    const std::vector<uint8_t> encoded = conversation_store_detail::manifest_encode(meta);
-    meta.manifest_id = conversation_store_detail::manifest_id_of(encoded.data(), encoded.size());
-    const uint64_t head_id = std::max<uint64_t>(1, digest_u64(meta.manifest_id));
-    if (take_fault("manifest")) {
-        rollback();
-        fail(ConversationStorePublishStatus::failed, "injected fault: manifest");
-        return;
-    }
-    {
-        std::string detail;
-        std::lock_guard<std::mutex> guard(mutex);
-        if (!ensure_capacity(encoded.size(), victims, freeable, floor_limited, detail)) {
-            rollback();
-            fail(floor_limited ? ConversationStorePublishStatus::refused_floor
-                               : ConversationStorePublishStatus::refused_quota,
-                 detail);
-            return;
-        }
-        charged += encoded.size();
-    }
-    const std::string final_manifest = manifest_path(root, meta.manifest_id);
-    const std::string tmp = temp_name();
-    if (!write_file(tmp, encoded.data(), encoded.size(), false, why) ||
-        ::rename(tmp.c_str(), final_manifest.c_str()) != 0 ||
-        !fsync_directory(root + "/manifests", why)) {
-        std::string ignored;
-        remove_file(tmp, ignored);
-        {
+        std::string why;
+        if (remove_pending_file(file, why)) {
             std::lock_guard<std::mutex> guard(mutex);
-            charged -= std::min(charged, uint64_t(encoded.size()));
+            charged -= std::min(charged, file.charge);
+            reclaimable -= std::min(reclaimable, file.charge);
+            if (file.where == Where::objects) {
+                const auto state = objects.find(file.object);
+                if (state != objects.end() && state->second.refs == 0) objects.erase(state);
+                counters.reclaimed_objects++;
+            }
+            counters.reclaimed_bytes += file.charge;
+            continue;
         }
-        rollback();
-        fail(ConversationStorePublishStatus::failed, why.empty() ? "the manifest could not be written" : why);
-        return;
+        std::lock_guard<std::mutex> guard(mutex);
+        counters.deferred_reclaims++;
+        retry.push_back(std::move(file));
     }
     {
         std::lock_guard<std::mutex> guard(mutex);
-        counters.bytes_written += encoded.size();
+        for (auto& file : retry) pending_files.push_back(std::move(file));
+        recount_metadata_locked();
+    }
+}
+
+void ConversationStore::Impl::recount_metadata_locked() {
+    uint64_t bytes = uint64_t(conversation_store_detail::catalog_encode(catalog).size());
+    bytes += uint64_t(objects.size()) * kObjectBytesEstimate;
+    for (const auto& entry : head_objects) bytes += uint64_t(entry.second.size()) * sizeof(Digest);
+    metadata = bytes;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Durable catalog transactions
+// ---------------------------------------------------------------------------------------------------------------
+
+bool ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
+    std::vector<uint8_t> encoded;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!lock_owned) {
+            why = "this instance does not own the store's authority";
+            return false;
+        }
+        switch (plan.kind) {
+            case CommitPlan::Kind::invalidate: {
+                // Re-derived at commit time, so an intervening commit can never be overwritten by a stale snapshot.
+                plan.candidate = catalog;
+                if (plan.domain_index < plan.candidate.domains.size())
+                    plan.candidate.domains[plan.domain_index].epoch = plan.epoch;
+                std::vector<CatalogHead> keep;
+                keep.reserve(plan.candidate.heads.size());
+                for (const auto& head : plan.candidate.heads)
+                    if (head.domain == plan.domain_index)
+                        plan.retiring.push_back(head.head_id);
+                    else
+                        keep.push_back(head);
+                plan.candidate.heads = std::move(keep);
+                break;
+            }
+            case CommitPlan::Kind::promote:
+                // "Write the live catalog durably": a promotion is already reflected in its policy flags.
+                plan.candidate = catalog;
+                break;
+            default:
+                if (plan.version != catalog_version) {
+                    why = "the catalog changed while this plan was being built";
+                    return false;
+                }
+                break;
+        }
+        encoded = conversation_store_detail::catalog_encode(plan.candidate);
+        plan.new_catalog_charge = allocated_charge(encoded.size());
+        charged += plan.new_catalog_charge;
     }
 
-    ConversationStorePublishStatus status = ConversationStorePublishStatus::stored;
-    uint64_t superseded = 0;
+    std::string temp = temp_name();
+    bool written = false;
+    for (uint32_t attempt = 0; attempt < kTempNameAttempts && !written; ++attempt) {
+        if (write_new_file(dirs.tmp, temp, encoded.data(), encoded.size(), why)) {
+            written = true;
+            break;
+        }
+        if (errno != EEXIST) break;
+        temp = temp_name();
+        why.clear();
+    }
+    if (written && ::renameat(dirs.tmp, temp.c_str(), dirs.root, "catalog") != 0) {
+        why = std::string("cannot replace the catalog: ") + std::strerror(errno);
+        written = false;
+    }
+    if (written) written = fsync_dir(dirs.root, "the store root", why);
+    if (!written) {
+        // The catalog itself is untouched (a rename either happened or did not), so the authority is unchanged and
+        // only the temporary may remain.  Its charge stays until the file is confirmed gone.
+        std::vector<PendingFile> orphans;
+        PendingFile orphan;
+        orphan.where = Where::tmp;
+        orphan.name = temp;
+        orphan.charge = plan.new_catalog_charge;
+        orphans.push_back(std::move(orphan));
+        discard_files(std::move(orphans));
+        return false;
+    }
+
     {
         std::lock_guard<std::mutex> guard(mutex);
-        // A publication that cannot commit leaves its manifest and any object only it wrote as accounted orphans:
-        // the next reclaim deletes them and credits their bytes, and the catalog never authorizes them.
-        auto abandon = [&](ConversationStorePublishStatus code, const std::string& detail) {
-            Retired retired;
-            retired.manifest_id = meta.manifest_id;
-            retired.manifest_bytes = encoded.size();
-            for (const auto& object : written) retired.objects.push_back(object.first);
-            pending_reclaim.push_back(std::move(retired));
-            for (const auto& object : written) {
-                auto state = objects.find(object.first);
-                if (state != objects.end() && state->second.refs == 0) objects.erase(state);
-            }
-            counters.aborted_publications++;
-            fail(code, detail);
-        };
-        if (!on || closing || !healthy) {
-            abandon(ConversationStorePublishStatus::disabled,
-                    "the store stopped serving while the image was written");
-            return;
-        }
-        if (epoch != epoch_now) {
-            counters.refusals_stale++;
-            abandon(ConversationStorePublishStatus::stale,
-                    "the execution domain advanced while the image was written");
-            return;
-        }
-        if (fault_step == "catalog") {
-            fault_step.clear();
-            abandon(ConversationStorePublishStatus::failed, "injected fault: catalog");
-            return;
-        }
-        // Commit: the new head, its supersession, one durable catalog write, and only then any deletion eviction
-        // caused.  A head is only ever authorized by that write.
-        CatalogHead head;
-        head.head_id = head_id;
-        head.manifest_id = meta.manifest_id;
-        head.bucket = bucket;
-        head.domain = domain_index;
-        head.epoch = epoch_now;
-        head.generation = request.generation;
-        head.parent = request.supersedes;
-        head.payload_bytes = layout.payload_bytes;
-        head.manifest_bytes = encoded.size();
-        head.published_order = published_order;
-        head.stages = layout.stages;
-        head.pinned = image.pinned();
-        head.protected_seg = false;
-        head.cuts = layout.cuts;
-        const uint64_t predecessor = request.supersedes;
-        bool covered = request.cover;
-        if (covered && have_source) {
-            // Only a proven covered lineage may replace its predecessor, and only when every pinned cut of that
-            // predecessor is preserved: an independent branch always survives as its own head.
-            for (const auto& cut : source.cuts) {
-                if (!cut.pinned) continue;
-                bool kept = false;
-                for (const auto& ours : layout.cuts)
-                    if (ours.tokens == cut.tokens && ours.digest == cut.digest) kept = true;
-                if (!kept) covered = false;
-            }
-        }
-        catalog.heads.push_back(head);
-        head_manifest_bytes[head_id] = encoded.size();
-        head_objects[head_id];
-        while (catalog.heads.size() > options.head_limit) {
-            uint64_t victim = 0;
-            uint64_t oldest = 0;
-            for (const auto& candidate : catalog.heads) {
-                if (candidate.head_id == head_id || candidate.pinned || head_leases.count(candidate.head_id)) continue;
-                if (victim == 0 || candidate.published_order < oldest) {
-                    victim = candidate.head_id;
-                    oldest = candidate.published_order;
+        charged -= std::min(charged, catalog_charge);   // the previous catalog file is gone
+        catalog_charge = plan.new_catalog_charge;
+        if (plan.new_head) {
+            for (const Digest& object : plan.new_objects) {
+                ObjectState& state = objects[object];
+                if (state.bytes == 0) {
+                    const auto charge = plan.new_object_charges.find(object);
+                    state.bytes = charge == plan.new_object_charges.end() ? 0 : charge->second;
                 }
+                state.refs += 1;
+                revive_object_locked(object);
             }
-            if (victim == 0) break;
-            counters.evictions++;
-            retire_head(victim);
+            head_objects[plan.new_head] = plan.new_objects;
+            head_manifest_bytes[plan.new_head] = plan.new_manifest_bytes;
+            head_recency[plan.new_head] = ++recency_counter;
         }
-        recount_metadata();
-        if (metadata > options.metadata_bytes) {
-            catalog.heads.pop_back();
-            head_manifest_bytes.erase(head_id);
-            head_objects.erase(head_id);
-            abandon(ConversationStorePublishStatus::refused_limits,
-                    "the store's index ceiling cannot hold another head");
-            return;
-        }
-        if (predecessor != 0) {
-            bool exists = false;
-            for (const auto& candidate : catalog.heads)
-                if (candidate.head_id == predecessor) exists = true;
-            if (!exists)
-                status = ConversationStorePublishStatus::stored;
-            else if (covered) {
-                superseded = predecessor;
-                retire_head(predecessor);
-                status = ConversationStorePublishStatus::replaced;
-            } else {
-                status = ConversationStorePublishStatus::retained_branch;
-            }
-        }
-        std::string detail;
-        if (!write_catalog(detail)) {
-            // The durable catalog is unchanged, so nothing was authorized; the in-memory catalog no longer matches
-            // it, so the store stops serving rather than continuing from a divergent authority.
-            healthy = false;
-            unhealthy_reason = "the catalog commit failed: " + detail;
-            abandon(ConversationStorePublishStatus::failed, unhealthy_reason);
-            return;
-        }
-        reclaim_files();
-        freeable = 0;
-        for (const auto& object : referenced) {
-            ObjectState& state = objects[object.first];
-            state.bytes = object.second;
-            state.refs += 1;
-        }
-        counters.published++;
-        if (status == ConversationStorePublishStatus::replaced) counters.replaced++;
-        if (status == ConversationStorePublishStatus::retained_branch) counters.retained_branches++;
+        for (uint64_t victim : plan.retiring) retire_head_locked(victim);
+        catalog = plan.candidate;
+        catalog_version++;
+        recount_metadata_locked();
         counters.heads = uint64_t(catalog.heads.size());
         counters.objects = uint64_t(objects.size());
         counters.manifests = uint64_t(head_manifest_bytes.size());
     }
-    out.status = status;
-    out.head_id = head_id;
-    out.epoch = epoch_now;
-    out.superseded = superseded;
-    out.stages = layout.stages;
-    out.payload_bytes = layout.payload_bytes;
-    out.new_bytes = new_bytes;
-    out.reused_bytes = reused_bytes;
-    out.detail = status == ConversationStorePublishStatus::retained_branch
-                     ? "the predecessor keeps a divergent or pinned cut, so both branches are retained"
-                     : std::string();
+    // Deletions happen here: the authority that named these files is already durable, and the mutex is released.
+    reclaim_pending();
+    return true;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Quota and eviction: one shared physical quota for every layout, credited only after a removal is durable
-// ---------------------------------------------------------------------------------------------------------------
+bool ConversationStore::Impl::commit_plan(CommitPlan& plan, std::string& why) {
+    return write_catalog_or_refuse(plan, why);
+}
 
-bool ConversationStore::Impl::ensure_capacity(uint64_t incoming, std::vector<uint64_t>& victims, uint64_t& freeable,
-                                             bool& floor_limited, std::string& why) {
-    sample_free();
-    while (charged + incoming > options.quota_bytes + freeable ||
-           (free_sample != 0 && free_sample + freeable < options.min_free_bytes + incoming)) {
-        uint64_t victim = 0;
-        uint64_t oldest = 0;
-        // Two passes: the recent segment is evicted before the protected one, and neither ever takes a pinned or
-        // leased head.  The oldest publication in the segment goes first.
-        for (int pass = 0; pass < 2 && victim == 0; ++pass) {
-            for (const auto& head : catalog.heads) {
-                if (head.pinned || head_leases.count(head.head_id)) continue;
-                if (bool(head.protected_seg) != (pass == 1)) continue;
-                if (victim == 0 || head.published_order < oldest) {
-                    victim = head.head_id;
-                    oldest = head.published_order;
-                }
-            }
+bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& why) {
+    CommitPlan plan;
+    plan.kind = CommitPlan::Kind::eviction;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        plan.version = catalog_version;
+        plan.candidate = catalog;
+        bool found = false;
+        for (size_t i = 0; i < plan.candidate.heads.size(); ++i) {
+            if (plan.candidate.heads[i].head_id != head_id) continue;
+            plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));
+            found = true;
+            break;
         }
-        if (victim == 0) {
-            floor_limited = !(charged + incoming > options.quota_bytes + freeable);
-            why = floor_limited
-                      ? "the filesystem floor would be crossed and no unpinned, unleased head can be evicted"
-                      : "the shared quota is full and no unpinned, unleased head can be evicted";
-            if (floor_limited)
-                counters.refusals_floor++;
-            else
-                counters.refusals_quota++;
+        if (!found) {
+            why = "no retained head has that identity";
             return false;
         }
+        plan.retiring.push_back(head_id);
         counters.evictions++;
-        freeable += retire_head(victim);
-        victims.push_back(victim);
     }
-    return true;
+    return commit_plan(plan, why);
+}
+
+// Frees `incoming_bytes` before they are written.  Only physically present, unreferenced charge is counted, and an
+// eviction is *durable* (catalog committed, files deleted) before the new bytes are charged: no promise of a later
+// deletion ever authorizes a new file.
+bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why) {
+    floor_limited = false;
+    for (;;) {
+        uint64_t victim = 0;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            sample_free_locked();
+            if (free_sample == 0) {
+                // An unreadable filesystem is never treated as an empty one.
+                counters.refusals_floor++;
+                floor_limited = true;
+                why = "the filesystem could not be sampled, so no reservation can be admitted";
+                return false;
+            }
+            const bool over_quota = incoming_bytes > options.quota_bytes ||
+                charged > options.quota_bytes - incoming_bytes;
+            const bool over_floor = incoming_bytes > free_sample ||
+                free_sample - incoming_bytes < options.min_free_bytes;
+            floor_limited = over_floor;
+            if (!over_quota && !over_floor) return true;
+            std::set<uint64_t> blocked = eviction_excluded;
+            victim = choose_victim_locked(catalog, blocked, false);
+            if (victim == 0) victim = choose_victim_locked(catalog, blocked, true);
+            if (victim == 0) {
+                if (over_quota) counters.refusals_quota++;
+                if (over_floor) counters.refusals_floor++;
+                why = over_quota
+                          ? "the shared quota is full and no unpinned, unleased head can be evicted"
+                          : "the filesystem floor would be crossed and no unpinned, unleased head can be evicted";
+                why += " (charged " + std::to_string(charged) + ", incoming " +
+                    std::to_string(incoming_bytes) + ", quota " + std::to_string(options.quota_bytes) + ")";
+                return false;
+            }
+        }
+        if (!evict_head_durably(victim, why)) return false;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1022,7 +1655,7 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
                                              size_t count, const std::vector<ConversationImageKey>& images,
                                              std::vector<ConversationStoreMatch>& out) const {
     out.clear();
-    if (!on || !healthy) return;
+    if (!on || faulted) return;
     const Digest bucket = conversation_store_detail::store_bucket_digest(options, selector);
     conversation_store_detail::PrefixChain chain(bucket, ids, count, images);
     for (const auto& head : catalog.heads) {
@@ -1052,28 +1685,175 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
     });
 }
 
-bool ConversationStore::Impl::manifest_path_of(uint64_t head_id, std::string& path, uint64_t& bytes) const {
-    for (const auto& head : catalog.heads) {
-        if (head.head_id != head_id) continue;
-        path = manifest_path(root, head.manifest_id);
-        bytes = head.manifest_bytes;
-        return true;
+// ---------------------------------------------------------------------------------------------------------------
+// Reads: a bounded, cancellable pipeline.  A demand is admitted as soon as its whole peak fits the allowance and
+// never loses its slot to a prefetch; a prefetch is speculative and is refused or revoked instead.
+// ---------------------------------------------------------------------------------------------------------------
+
+void ConversationStore::Impl::release_reservation_locked(const std::shared_ptr<ReadJob>& job) {
+    if (!job->reserved_bytes) return;
+    ram_held -= std::min(ram_held, job->reserved_bytes);
+    job->reserved_bytes = 0;
+}
+
+void ConversationStore::Impl::release_lease_locked(const std::shared_ptr<ReadJob>& job) {
+    if (!job->lease_bytes) return;
+    ram_held -= std::min(ram_held, job->lease_bytes);
+    ram_lease -= std::min(ram_lease, job->lease_bytes);
+    job->lease_bytes = 0;
+}
+
+void ConversationStore::Impl::release_slot_locked(const std::shared_ptr<ReadJob>& job) {
+    if (!job->holds_slot) return;
+    job->holds_slot = false;
+    if (incoming) --incoming;
+}
+
+// The hold that keeps a retired head's files on disk while a reader still names them.  It ends exactly where the
+// job's ownership of the head ends - which is after the lease for a handed-out image.
+void ConversationStore::Impl::release_head_lease_locked(const std::shared_ptr<ReadJob>& job) {
+    if (!job->leased) return;
+    job->leased = false;
+    if (!job->head_id) return;
+    const auto lease = head_leases.find(job->head_id);
+    if (lease == head_leases.end()) return;
+    if (lease->second > 0) --lease->second;
+    if (lease->second == 0) head_leases.erase(lease);
+}
+
+void ConversationStore::Impl::free_job_prep_locked(const std::shared_ptr<ReadJob>& job) {
+    prep -= std::min(prep, job->prep_bytes);
+    job->prep_bytes = 0;
+    job->query.tokens.clear();
+    job->query.tokens.shrink_to_fit();
+    job->query.images.clear();
+    job->query.images.shrink_to_fit();
+}
+
+void ConversationStore::Impl::erase_job_locked(const std::shared_ptr<ReadJob>& job) {
+    free_job_prep_locked(job);
+    for (auto it = jobs.begin(); it != jobs.end(); ++it)
+        if (*it == job) {
+            jobs.erase(it);
+            break;
+        }
+}
+
+void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& job,
+                                                ConversationStoreReadStatus status, std::string detail) {
+    if (job->status != ConversationStoreReadStatus::none) return;   // exactly one settlement per job
+    job->active = false;
+    job->status = status;
+    job->detail = std::move(detail);
+    switch (status) {
+        case ConversationStoreReadStatus::ready: counters.reads_served++; break;
+        case ConversationStoreReadStatus::cancelled: counters.reads_cancelled++; break;
+        case ConversationStoreReadStatus::stale: counters.reads_stale++; break;
+        case ConversationStoreReadStatus::corrupt: counters.reads_corrupt++; break;
+        case ConversationStoreReadStatus::failed: counters.reads_failed++; break;
+        case ConversationStoreReadStatus::refused_budget: counters.refused_budget++; break;
+        case ConversationStoreReadStatus::refused_quota: counters.refused_quota++; break;
+        case ConversationStoreReadStatus::refused_limits: counters.refused_limits++; break;
+        default: break;
     }
-    return false;
+    if (status == ConversationStoreReadStatus::ready && job->image) {
+        release_reservation_locked(job);
+        const uint64_t bytes = job->image->bytes();
+        ram_held += bytes;
+        ram_lease += bytes;
+        job->lease_bytes = bytes;
+        counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+        if (job->released) {
+            // The caller already released this request: the image is dropped and its charge is not kept.
+            release_lease_locked(job);
+            release_slot_locked(job);
+            release_head_lease_locked(job);
+            job->image.reset();
+            erase_job_locked(job);
+            return;
+        }
+        ready.push_back(job);
+        cv_ready.notify_all();
+        return;
+    }
+    release_reservation_locked(job);
+    release_lease_locked(job);
+    release_slot_locked(job);
+    release_head_lease_locked(job);
+    job->image.reset();
+    if (job->released) {
+        erase_job_locked(job);
+        return;
+    }
+    if (!job->cancelled) {
+        ready.push_back(job);
+        cv_ready.notify_all();
+        return;
+    }
+    // A cancelled request reports its terminal status but is never delivered; its descriptor is spent.
+    free_job_prep_locked(job);
+    cv_ready.notify_all();
 }
 
-Digest ConversationStore::Impl::head_manifest_id(uint64_t head_id) const {
-    for (const auto& head : catalog.heads)
-        if (head.head_id == head_id) return head.manifest_id;
-    return Digest{};
+void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& job,
+                                                ConversationStoreReadStatus status, const std::string& detail) {
+    if (job->handed) return;                       // already the caller's image: release_read() is its way out
+    job->cancelled = true;
+    if (job->active) return;                       // the reader drops it at its next chunk boundary
+    for (auto q = queue.begin(); q != queue.end(); ++q)
+        if (*q == job) {
+            queue.erase(q);
+            break;
+        }
+    for (auto r = ready.begin(); r != ready.end(); ++r)
+        if (*r == job) {
+            ready.erase(r);
+            break;
+        }
+    release_reservation_locked(job);
+    release_lease_locked(job);
+    release_slot_locked(job);
+    release_head_lease_locked(job);
+    job->image.reset();
+    // A job that already holds a *refusal* keeps its own verdict; a queued or ready completion takes the authority's
+    // terminal status, because a completion that can no longer be handed out must never keep reporting `ready`.
+    if (job->status != ConversationStoreReadStatus::none &&
+        job->status != ConversationStoreReadStatus::ready) {
+        free_job_prep_locked(job);
+        return;
+    }
+    job->status = status;
+    job->detail = detail;
+    switch (status) {
+        case ConversationStoreReadStatus::stale: counters.reads_stale++; break;
+        case ConversationStoreReadStatus::cancelled: counters.reads_cancelled++; break;
+        default: break;
+    }
+    free_job_prep_locked(job);
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Reads: a bounded, cancellable pipeline.  A demand is admitted as soon as the allowance admits it and never loses
-// its slot to a prefetch; a prefetch is speculative and is refused or revoked instead.
-// ---------------------------------------------------------------------------------------------------------------
+void ConversationStore::Impl::retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail) {
+    for (const auto& job : jobs) retire_job_locked(job, status, detail);
+    cv_ready.notify_all();
+}
 
-bool ConversationStore::Impl::admit_read(const ConversationStoreQuery& query, bool demand, std::string& why) {
+void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) {
+    if (because_of_demand) {
+        bool waiting_demand = false;
+        for (const auto& job : jobs)
+            if (job->demand && !job->handed && !job->cancelled) waiting_demand = true;
+        if (!waiting_demand) return;
+    }
+    for (const auto& job : jobs) {
+        if (job->demand || job->handed || job->released) continue;
+        // Speculative work and speculation that is already materialized both give way to required work: a ready image
+        // is dropped here, so its RAM and its incoming-image slot are back before the demand or capture needs them.
+        retire_job_locked(job, ConversationStoreReadStatus::cancelled, "revoked in favour of a required operation");
+    }
+    cv_work.notify_all();
+}
+
+bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why) {
     // Dedupe by (request_id, generation): the demand for the same request upgrades the prefetch in place.
     for (const auto& job : jobs) {
         if (job->query.request_id != query.request_id || job->query.generation != query.generation) continue;
@@ -1090,9 +1870,23 @@ bool ConversationStore::Impl::admit_read(const ConversationStoreQuery& query, bo
                         queue.push_front(job);
                         break;
                     }
-            cv_work.notify_all();
+            revoke_speculation_locked();
         }
         return true;
+    }
+    // Everything is bounded *before* anything is allocated, including a miss and including the caller's own tokens.
+    const uint64_t own_prep = uint64_t(query.tokens.size()) * sizeof(int32_t) +
+                              uint64_t(query.images.size()) * sizeof(ConversationImageKey) + kJobFixedOverhead;
+    if (jobs.size() >= options.max_read_requests) {
+        counters.refused_budget++;
+        why = "the store is already holding the maximum number of read requests";
+        return false;
+    }
+    if (query.tokens.size() > size_t(limits.max_tokens) || query.images.size() > size_t(limits.max_images) ||
+        metadata + prep + own_prep > options.metadata_bytes) {
+        counters.refused_limits++;
+        why = "the store's preparation ceiling cannot hold another read descriptor";
+        return false;
     }
     std::vector<ConversationStoreMatch> found;
     collect_matches(query.selector, query.tokens.data(), query.tokens.size(), query.images, found);
@@ -1100,94 +1894,61 @@ bool ConversationStore::Impl::admit_read(const ConversationStoreQuery& query, bo
         auto job = std::make_shared<ReadJob>();
         job->query = query;
         job->demand = demand;
+        job->prep_bytes = own_prep;
+        job->epoch_at_admission = epoch;
+        prep += own_prep;
         job->status = ConversationStoreReadStatus::missing;
         job->detail = "no eligible stored prefix";
-        counters.misses++;
         jobs.push_back(job);
         ready.push_back(job);
+        counters.misses++;
         cv_ready.notify_all();
         return true;
     }
-    if (jobs.size() >= options.max_read_requests) {
+    const ConversationStoreMatch best = found.front();
+    // The whole peak this read will allocate, including its final image's scaffolding.  A demand that can never fit
+    // the published allowance is refused here rather than given a reservation it can never use.
+    const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 +
+                          2 * uint64_t(best.manifest_bytes) + own_prep + kReadSlabBytes + kReadFixedOverhead;
+    if (ram_budget != 0 && peak > ram_budget) {
         counters.refused_budget++;
-        why = "the store is already holding the maximum number of read requests";
+        why = "the read's peak does not fit the published RAM allowance";
         return false;
     }
-    const ConversationStoreMatch& best = found.front();
     auto job = std::make_shared<ReadJob>();
     job->query = query;
     job->demand = demand;
+    job->prep_bytes = own_prep;
+    job->epoch_at_admission = epoch;
+    prep += own_prep;
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
     job->live = best.live;
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
+    job->peak_bytes = peak;
     jobs.push_back(job);
     queue.push_back(job);
     counters.matches++;
+    if (demand) revoke_speculation_locked();
     cv_work.notify_all();
     return true;
-}
-
-void ConversationStore::Impl::finish_job(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status,
-                                         std::string detail) {
-    if (job->reserved_bytes) {
-        ram_held -= std::min(ram_held, job->reserved_bytes);
-        job->reserved_bytes = 0;
-    }
-    if (job->head_id) {
-        auto lease = head_leases.find(job->head_id);
-        if (lease != head_leases.end()) {
-            if (lease->second > 0) --lease->second;
-            if (lease->second == 0) head_leases.erase(lease);
-        }
-    }
-    job->active = false;
-    job->status = status;
-    job->detail = std::move(detail);
-    switch (status) {
-        case ConversationStoreReadStatus::ready: counters.reads_served++; break;
-        case ConversationStoreReadStatus::cancelled: counters.reads_cancelled++; break;
-        case ConversationStoreReadStatus::stale: counters.reads_stale++; break;
-        case ConversationStoreReadStatus::corrupt: counters.reads_corrupt++; break;
-        case ConversationStoreReadStatus::failed: counters.reads_failed++; break;
-        case ConversationStoreReadStatus::refused_budget: counters.refused_budget++; break;
-        default: break;
-    }
-    if (status == ConversationStoreReadStatus::ready && job->image) {
-        const uint64_t bytes = job->image->bytes();
-        ram_held += bytes;
-        ram_lease += bytes;
-        job->lease_bytes = bytes;
-        counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
-    }
-    if (job->released) {
-        // The caller already released this request: the result is dropped and its charge is not kept.
-        if (job->lease_bytes) {
-            ram_held -= std::min(ram_held, job->lease_bytes);
-            ram_lease -= std::min(ram_lease, job->lease_bytes);
-            job->lease_bytes = 0;
-        }
-        job->image.reset();
-        return;
-    }
-    ready.push_back(job);
-    cv_ready.notify_all();
 }
 
 bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation,
                                              bool specific) {
     for (auto it = ready.begin(); it != ready.end(); ++it) {
-        const std::shared_ptr<ReadJob>& job = *it;
+        const std::shared_ptr<ReadJob> job = *it;   // a copy: the ready entry is erased before the last uses
         if (job->cancelled || job->released) continue;
-        if (specific &&
-            (job->query.request_id != request_id || job->query.generation != generation))
-            continue;
+        if (specific && (job->query.request_id != request_id || job->query.generation != generation)) continue;
+        if (!on || faulted) continue;   // a stopped or faulted store hands nothing out
+        if (job->status == ConversationStoreReadStatus::ready && job->epoch_at_admission != epoch)
+            continue;                   // a completion of the previous epoch is never relabelled into this one
         out.status = job->status;
         out.request_id = job->query.request_id;
         out.generation = job->query.generation;
         out.head_id = job->head_id;
-        out.epoch = epoch;
+        out.epoch = job->epoch_at_admission;
         out.tokens = int64_t(job->tokens);
         out.live = job->live;
         out.stages = job->stages;
@@ -1195,45 +1956,55 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
         out.image = job->image;
         out.detail = job->detail;
         job->handed = true;
-        // The store drops its own alias: the caller holds the only remaining one, and the image's RAM stays charged
-        // until release_read(), because an alias the caller derived from it may outlive it.
-        job->image.reset();
         counters.reads_handed_out++;
         ready.erase(it);
+        if (job->lease_bytes) {
+            // The store drops its own alias: the caller holds the only remaining one, and the image's RAM stays
+            // charged until release_read(), because an alias derived from it may outlive it.
+            job->image.reset();
+            return true;
+        }
+        // Nothing is charged for a terminal result: its descriptor is spent.
+        erase_job_locked(job);
         return true;
     }
     return false;
 }
 
 void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
-    const ConversationStoreQuery query = job->query;
+    const ConversationStoreQuery& query = job->query;
     const uint64_t head_id = job->head_id;
     const uint64_t tokens = job->tokens;
+    const uint64_t epoch_at_admission = job->epoch_at_admission;
     const auto stop_with = [&](ConversationStoreReadStatus status, const std::string& detail) {
         std::lock_guard<std::mutex> guard(mutex);
-        finish_job(job, status, detail);
+        settle_job_locked(job, status, detail);
     };
-    std::string path;
+    Digest manifest_id{};
     uint64_t manifest_bytes = 0;
-    uint64_t epoch_now = 0;
-    bool allowed = true;
     {
         std::lock_guard<std::mutex> guard(mutex);
         if (!on || closing) {
-            allowed = false;
-        } else {
-            epoch_now = epoch;
-            allowed = manifest_path_of(head_id, path, manifest_bytes);
+            settle_job_locked(job, ConversationStoreReadStatus::disabled,
+                      reason.empty() ? std::string("the store stopped serving") : reason);
+            return;
         }
-    }
-    if (!allowed) {
-        stop_with(ConversationStoreReadStatus::disabled,
-                  reason.empty() ? "the store stopped serving" : reason);
-        return;
+        if (faulted) {
+            settle_job_locked(job, ConversationStoreReadStatus::disabled, fault_reason);
+            return;
+        }
+        if (epoch != epoch_at_admission) {
+            settle_job_locked(job, ConversationStoreReadStatus::stale, "the execution domain advanced before this read started");
+            return;
+        }
+        if (!head_manifest_locked(head_id, manifest_id, manifest_bytes)) {
+            settle_job_locked(job, ConversationStoreReadStatus::stale, "the head this read selected is no longer retained");
+            return;
+        }
     }
     std::vector<uint8_t> raw;
     std::string why;
-    if (!read_file(path, raw, limits.max_manifest_bytes, why)) {
+    if (!read_file(dirs.manifests, sha256_hex(manifest_id), limits.max_manifest_bytes, raw, why)) {
         stop_with(ConversationStoreReadStatus::failed, why);
         return;
     }
@@ -1242,17 +2013,22 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         counters.bytes_read += raw.size();
     }
     conversation_store_detail::ManifestMeta meta;
-    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, meta, why)) {
-        stop_with(ConversationStoreReadStatus::corrupt, why);
+    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), limits, meta, why) ||
+        !(meta.manifest_id == manifest_id)) {
+        stop_with(ConversationStoreReadStatus::corrupt, why.empty() ? "the manifest does not match its identity" : why);
         return;
     }
-    if (meta.epoch != epoch_now) {
-        stop_with(ConversationStoreReadStatus::stale, "the execution domain advanced before this read completed");
-        return;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (job->cancelled.load()) return;
+        if (epoch != epoch_at_admission) {
+            settle_job_locked(job, ConversationStoreReadStatus::stale,
+                              "the execution domain advanced before this read started");
+            return;
+        }
     }
     // The store - not the caller - is responsible for the compatibility namespace and the exact prefix: the manifest
-    // must belong to this request's own bucket, domain, scope, steering mode and layer carve, and this request's own
-    // tokens and images must reproduce the advertised cut bit for bit.
+    // must belong to this request's own bucket, domain, scope, steering mode and layer carve.
     if (!(meta.bucket == conversation_store_detail::store_bucket_digest(options, query.selector)) ||
         !(meta.domain == options.domain)) {
         stop_with(ConversationStoreReadStatus::missing,
@@ -1280,38 +2056,75 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         stop_with(ConversationStoreReadStatus::missing, "the stored image no longer holds that cut");
         return;
     }
+    // The exact figure the restore will hold, computed from the decoded metadata before any of it is allocated: a
+    // read whose restored image would not fit the published allowance fails here and is never charged past it.
+    const uint64_t scaffolding = uint64_t(meta.streams.size()) *
+                                     (sizeof(conversation_store_detail::RestoreTarget) + 64) +
+                                 uint64_t(meta.containers.size()) * sizeof(ContainerMeta) +
+                                 uint64_t(meta.objects.size()) * kObjectBytesEstimate;
+    const uint64_t needed = uint64_t(meta.payload_bytes) + uint64_t(meta.payload_bytes) / 4 + raw.size() +
+                            job->prep_bytes + kReadSlabBytes + kReadFixedOverhead + scaffolding;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (job->cancelled.load()) return;
+        if (needed > job->reserved_bytes) {
+            if (needed > ram_budget || resident_locked() - job->reserved_bytes > ram_budget - needed) {
+                settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
+                                  "the restored image does not fit the published RAM allowance");
+                return;
+            }
+            ram_held += needed - job->reserved_bytes;
+            job->reserved_bytes = needed;
+            counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+        }
+    }
     std::vector<conversation_store_detail::RestoreTarget> targets;
     SavedConversation image;
     if (!conversation_store_detail::restore_prepare(meta, limits, image, targets, why)) {
         stop_with(ConversationStoreReadStatus::corrupt, why);
         return;
     }
-    // Every object is verified against its own content address before any of its bytes are trusted, the transfer is
-    // bounded by the manifest's own chunk lengths, and the request is cancelled only at a chunk boundary.
+    // Every object is verified against its own content address - derived from the same stream identity the writer
+    // used - and copied into its final buffer in one pass over one descriptor: the bytes that are hashed are exactly
+    // the bytes that are restored, and no buffer is trusted before every digest has matched.
+    std::vector<uint8_t> slab(size_t(std::min<uint64_t>(kReadSlabBytes, std::max<uint64_t>(options.chunk_bytes, 4096))));
     for (size_t i = 0; i < meta.streams.size(); ++i) {
+        const auto& id = meta.streams[i].id;
+        Digest identity_scope{};
+        uint64_t identity_ordinal = 0;
+        if (!stream_identity_of(meta.containers, id, identity_scope, identity_ordinal, why)) {
+            stop_with(ConversationStoreReadStatus::corrupt, why);
+            return;
+        }
         for (const auto& chunk : meta.streams[i].chunks) {
             if (job->cancelled.load()) return;
             {
                 std::lock_guard<std::mutex> guard(mutex);
-                if (epoch != epoch_now) {
-                    finish_job(job, ConversationStoreReadStatus::stale,
-                               "the execution domain advanced before this read completed");
+                if (epoch != epoch_at_admission) {
+                    settle_job_locked(job, ConversationStoreReadStatus::stale,
+                                      "the execution domain advanced before this read completed");
                     return;
                 }
             }
-            const std::string object_file = object_path(root, chunk.object);
+            const std::string name = sha256_hex(chunk.object);
+            const int shard = open_shard_fd(dirs, name.substr(0, 2), why);
+            if (shard < 0) {
+                stop_with(ConversationStoreReadStatus::corrupt, why);
+                return;
+            }
             Digest actual{};
-            if (!hash_object_file(object_file, chunk.length, actual, why)) {
+            auto hash = conversation_store_detail::object_hasher(identity_scope, id.kind, identity_ordinal,
+                                                                chunk.length);
+            const bool ok = hash_and_copy_object(shard, name, chunk.length, hash, targets[i].write, chunk.offset,
+                                                 slab, actual, why);
+            ::close(shard);
+            if (!ok) {
                 stop_with(ConversationStoreReadStatus::corrupt, why);
                 return;
             }
             if (!(actual == chunk.object)) {
                 stop_with(ConversationStoreReadStatus::corrupt,
                           "an object's bytes do not reproduce its content address");
-                return;
-            }
-            if (!copy_object_file(object_file, chunk.length, targets[i].write, chunk.offset, why)) {
-                stop_with(ConversationStoreReadStatus::failed, why);
                 return;
             }
             {
@@ -1322,78 +2135,724 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         }
     }
     conversation_store_detail::restore_finish(image);
-    freeze_if_available(image);
+    if (!restored_cut_matches(image, meta, query, tokens, job->live, digest, why)) {
+        stop_with(ConversationStoreReadStatus::corrupt, why);
+        return;
+    }
+    image.freeze();
     auto shared = std::make_shared<SavedConversation>(std::move(image));
     std::lock_guard<std::mutex> guard(mutex);
     if (job->cancelled.load()) return;
+    if (shared->bytes() > job->reserved_bytes) {
+        settle_job_locked(job, ConversationStoreReadStatus::failed,
+                          "the restored image is larger than the peak it was admitted under");
+        return;
+    }
     job->image = shared;
     job->payload_bytes = meta.payload_bytes;
     job->stages = meta.stages;
-    finish_job(job, ConversationStoreReadStatus::ready, std::string());
+    settle_job_locked(job, ConversationStoreReadStatus::ready, std::string());
 }
 
 void ConversationStore::Impl::reader_body() {
     std::unique_lock<std::mutex> lock(mutex);
     while (!stop.load()) {
-        // A demand that is waiting revokes an in-flight prefetch: its speculative resources are released at the next
-        // chunk boundary, and no prefetch ever overtakes a demand.
-        bool waiting_demand = false;
-        for (const auto& job : queue)
-            if (job->demand && !job->cancelled) waiting_demand = true;
-        if (waiting_demand)
-            for (auto& job : jobs)
-                if (job->active && !job->demand && !job->cancelled) job->cancelled = true;
+        revoke_speculation_locked();
+        for (auto it = queue.begin(); it != queue.end();) {
+            const std::shared_ptr<ReadJob> job = *it;   // a copy: the entry itself is about to be erased
+            if (job->cancelled) {
+                it = queue.erase(it);
+                continue;
+            }
+            if (ram_budget != 0 && job->peak_bytes > ram_budget) {
+                // A read whose whole peak can never fit the allowance is refused instead of waiting forever.
+                it = queue.erase(it);
+                settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
+                                  "the read's peak does not fit the published allowance");
+                continue;
+            }
+            if (!job->demand && (ram_budget == 0 || admission_suspended || incoming >= options.max_reads)) {
+                // Speculative work never waits: it is refused when it cannot start now.
+                it = queue.erase(it);
+                settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
+                                  "the read allowance has no spare room for a prefetch");
+                continue;
+            }
+            ++it;
+        }
         std::shared_ptr<ReadJob> chosen;
-        if (materializing < reader_threads) {
-            for (auto it = queue.begin(); it != queue.end() && !chosen; ++it) {
-                const std::shared_ptr<ReadJob>& job = *it;
-                if (job->cancelled) continue;
-                if (waiting_demand && !job->demand) continue;
-                if (admission_suspended || ram_budget == 0 ||
-                    ram_held + job->payload_bytes > ram_budget) {
-                    if (job->demand) continue;  // a demand waits for the allowance instead of being refused
+        const bool can_start = !admission_suspended && ram_budget != 0 && incoming < options.max_reads;
+        if (can_start) {
+            for (int pass = 0; pass < 2 && !chosen; ++pass) {
+                for (auto it = queue.begin(); it != queue.end(); ++it) {
+                    const std::shared_ptr<ReadJob> job = *it;   // a copy: the entry may be erased below
+                    if (job->cancelled) continue;
+                    if (job->demand != (pass == 0)) continue;          // asks for a demand, then a prefetch
+                    if (ram_held + job->peak_bytes > ram_budget) {
+                        if (job->demand) continue;                     // a demand waits for room
+                        queue.erase(it);
+                        settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
+                                          "the read allowance has no spare room for a prefetch");
+                        break;
+                    }
+                    chosen = job;
                     queue.erase(it);
-                    finish_job(job, ConversationStoreReadStatus::refused_budget,
-                               "the read allowance has no spare room for a prefetch");
                     break;
                 }
-                chosen = job;
-                queue.erase(it);
             }
         }
         if (!chosen) {
-            cv_work.wait_for(lock, std::chrono::milliseconds(20));
+            cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs));
             continue;
         }
+        // The peak is charged here, under the same lock that guards `admission_suspended`, so a later suspension
+        // always sees every byte this read can still allocate.
         chosen->active = true;
-        chosen->reserved_bytes = chosen->payload_bytes;
-        ram_held += chosen->reserved_bytes;
-        head_leases[chosen->head_id] += 1;
-        ++materializing;
+        chosen->reserved_bytes = chosen->peak_bytes;
+        ram_held += chosen->peak_bytes;
+        counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+        chosen->holds_slot = true;
+        ++incoming;
+        if (chosen->head_id) {
+            head_leases[chosen->head_id] += 1;
+            chosen->leased = true;
+        }
         lock.unlock();
-        read_body(chosen);
-        lock.lock();
-        --materializing;
+        try {
+            read_body(chosen);
+            lock.lock();
+        } catch (const std::bad_alloc&) {
+            if (!lock.owns_lock()) lock.lock();
+            settle_job_locked(chosen, ConversationStoreReadStatus::failed,
+                              "the read could not allocate within its admitted peak");
+            cv_work.notify_all();
+            continue;
+        } catch (...) {
+            if (!lock.owns_lock()) lock.lock();
+            settle_job_locked(chosen, ConversationStoreReadStatus::failed, "the read aborted unexpectedly");
+            cv_work.notify_all();
+            continue;
+        }
         if (chosen->status == ConversationStoreReadStatus::none) {
-            // The body returned without a verdict because the request was cancelled or the store is closing: refund
-            // the reservation and forget the request, so nothing is delivered and nothing stays charged.
-            if (chosen->reserved_bytes) {
-                ram_held -= std::min(ram_held, chosen->reserved_bytes);
-                chosen->reserved_bytes = 0;
-            }
-            auto lease = head_leases.find(chosen->head_id);
-            if (lease != head_leases.end()) {
-                if (lease->second > 0) --lease->second;
-                if (lease->second == 0) head_leases.erase(lease);
-            }
-            for (auto it = jobs.begin(); it != jobs.end(); ++it)
-                if (*it == chosen) {
-                    jobs.erase(it);
-                    break;
-                }
+            // The body returned without a verdict because the request was cancelled or the store is closing.
+            settle_job_locked(chosen,
+                              chosen->cancelled.load() ? ConversationStoreReadStatus::cancelled
+                                                       : ConversationStoreReadStatus::failed,
+                              chosen->cancelled.load() ? "the request was cancelled"
+                                                       : "the read ended without a verdict");
         }
         cv_work.notify_all();
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Publication
+// ---------------------------------------------------------------------------------------------------------------
+
+void ConversationStore::Impl::push_publish_result_locked(ConversationStorePublishResult&& result) {
+    publish_done.push_back(std::move(result));
+    const size_t keep = size_t(options.max_pending_publishes) * 4 + 4;
+    while (publish_done.size() > keep) publish_done.pop_front();
+    cv_publish.notify_all();
+}
+
+void ConversationStore::Impl::writer_body() {
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+        if (!durable.empty()) {
+            // Safety work first: an invalidation or a promotion outranks starting another publication.
+            const std::shared_ptr<DurableWork> work = durable.front();
+            durable.pop_front();
+            lock.unlock();
+            std::string why;
+            const bool ok = commit_plan(work->plan, why);
+            lock.lock();
+            if (!ok) latch_fault_locked("a durable catalog commit failed: " + why);
+            work->ok = ok;
+            work->detail = ok ? std::string() : why;
+            work->done = true;
+            cv_durable.notify_all();
+            cv_work.notify_all();
+            continue;
+        }
+        if (publishing) {
+            const std::shared_ptr<PublishJob> job = publishing;
+            // Once the worker has begun reading the image it may never be replaced: publish() refuses instead.
+            job->started = true;
+            ConversationStorePublishResult result;
+            lock.unlock();
+            bool escaped = false;
+            std::string escape_detail;
+            try {
+                publish_body(job, result);
+            } catch (const std::bad_alloc&) {
+                result = ConversationStorePublishResult{};
+                result.status = ConversationStorePublishStatus::failed;
+                result.detail = "the publication could not allocate within the published allowance";
+                escaped = false;
+            } catch (...) {
+                escaped = true;
+                escape_detail = "the publication aborted unexpectedly; the authority is not trusted";
+            }
+            // This helper acquires the coordinator lock itself.
+            queue_orphans(job->orphans);
+            reclaim_pending();
+            lock.lock();
+            if (escaped) {
+                result = ConversationStorePublishResult{};
+                result.status = ConversationStorePublishStatus::failed;
+                result.detail = escape_detail;
+                // An escape could have interrupted the write path anywhere, so this store stops serving rather than
+                // guessing what reached the device.  The durable catalog is still consistent (every catalog write is
+                // one rename), and the run intent stays armed.
+                latch_fault_locked(escape_detail);
+            }
+            eviction_excluded.clear();
+            if (job->ram_bytes) {
+                ram_held -= std::min(ram_held, job->ram_bytes);
+                ram_lease -= std::min(ram_lease, job->ram_bytes);
+                job->ram_bytes = 0;
+            }
+            // One place counts what a publication attempt cost: anything that did not end in a committed head.
+            if (result.status != ConversationStorePublishStatus::stored &&
+                result.status != ConversationStorePublishStatus::replaced &&
+                result.status != ConversationStorePublishStatus::retained_branch &&
+                result.status != ConversationStorePublishStatus::coalesced)
+                counters.aborted_publications++;
+            result.released = true;
+            if (job->coalesced && result.status == ConversationStorePublishStatus::stored) {
+                result.status = ConversationStorePublishStatus::coalesced;
+                result.detail = "replaced by a newer publication of the same lineage";
+                counters.coalesced_publishes++;
+            } else if (job->cancelled && result.status == ConversationStorePublishStatus::stored) {
+                result.status = ConversationStorePublishStatus::stale;
+                result.detail = "the publication ticket was cancelled";
+                counters.refusals_stale++;
+            }
+            result.request_id = job->request.request_id;
+            result.generation = job->request.generation;
+            if (result.epoch == 0) result.epoch = job->epoch;
+            push_publish_result_locked(std::move(result));
+            if (publishing == job) publishing.reset();
+            cv_work.notify_all();
+            continue;
+        }
+        if (stop.load()) break;
+        cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs));
+    }
+}
+
+void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& job,
+                                           ConversationStorePublishResult& out) {
+    const SavedConversation& image = *job->image;
+    const ConversationStorePublish& request = job->request;
+    out.status = ConversationStorePublishStatus::failed;
+    const auto fail = [&out](ConversationStorePublishStatus status, const std::string& detail) {
+        out.status = status;
+        out.detail = detail;
+    };
+    // Every file this attempt creates is recorded here first, so an abandoned (or escaped) attempt can never lose
+    // track of a charged file.
+    const auto note_file = [&job](Where where, const std::string& name, uint64_t charge, const Digest& object,
+                                  const std::string& shard) {
+        PendingFile file;
+        file.where = where;
+        file.name = name;
+        file.charge = charge;
+        file.object = object;
+        file.shard = shard;
+        job->orphans.push_back(std::move(file));
+    };
+
+    Digest bucket{};
+    uint64_t epoch_now = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!on || closing || faulted) {
+            fail(ConversationStorePublishStatus::disabled,
+                 faulted ? fault_reason : (reason.empty() ? std::string("the store is not enabled") : reason));
+            return;
+        }
+        epoch_now = job->epoch;
+        if (epoch != epoch_now) {
+            counters.refusals_stale++;
+            fail(ConversationStorePublishStatus::stale,
+                 "the execution domain advanced after this image was captured");
+            return;
+        }
+        ConversationStoreSelector selector;
+        selector.scope = image.scope;
+        selector.cvec = image.cvec;
+        selector.geometry = image.geometry;
+        selector.layer_lo = image.layer_lo;
+        selector.layer_hi = image.layer_hi;
+        bucket = conversation_store_detail::store_bucket_digest(options, selector);
+        // Every head this publication reads from - its predecessor and every reuse donor - is protected from eviction
+        // (including this publication's own quota evictions) until it has committed.
+        if (request.supersedes) eviction_excluded.insert(request.supersedes);
+        for (const auto& entry : request.reuse)
+            if (entry.head_id) eviction_excluded.insert(entry.head_id);
+    }
+    if (take_fault("layout")) {
+        fail(ConversationStorePublishStatus::failed, "injected fault: layout");
+        return;
+    }
+    conversation_store_detail::ImageLayout layout;
+    std::string why;
+    if (!conversation_store_detail::image_layout(image, bucket, limits, layout, why)) {
+        fail(ConversationStorePublishStatus::refused_limits, why);
+        return;
+    }
+    // The predecessor (for the replacement predicate) and each reuse donor are read from their own manifests, and a
+    // donor is only ever the head the caller named: `supersedes` never stands in for it.
+    conversation_store_detail::ManifestMeta source;
+    bool have_source = false;
+    if (request.supersedes != 0) {
+        std::string detail;
+        have_source = load_manifest_of(request.supersedes, epoch_now, source, detail) && source.bucket == bucket;
+    }
+    std::map<uint64_t, conversation_store_detail::ManifestMeta> donors;
+    for (const auto& entry : request.reuse) {
+        if (!entry.head_id || donors.count(entry.head_id)) continue;
+        conversation_store_detail::ManifestMeta donor;
+        std::string detail;
+        if (load_manifest_of(entry.head_id, epoch_now, donor, detail) && donor.bucket == bucket)
+            donors.emplace(entry.head_id, std::move(donor));
+        else
+            donors.emplace(entry.head_id, conversation_store_detail::ManifestMeta{});   // recorded as unusable
+    }
+
+    // ---- payload: adopt proven intervals, chunk everything else, never write bytes that already exist ----
+    std::vector<StreamRecord> streams;
+    streams.reserve(layout.streams.size());
+    std::map<Digest, uint64_t> referenced;
+    std::map<Digest, uint64_t> charged_objects;      // objects this attempt created, and their charge
+    uint64_t new_bytes = 0, reused_bytes = 0;
+    size_t adopted_chunks = 0;
+    bool aborted = false;
+    bool floor_limited = false;
+    ConversationStorePublishStatus abort_status = ConversationStorePublishStatus::failed;
+    const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
+    const auto abandon = [&](ConversationStorePublishStatus status, const std::string& detail) {
+        aborted = true;
+        abort_status = status;
+        why = detail;
+    };
+
+    for (const auto& stream : layout.streams) {
+        const ConversationStoreStreamId id = stream.info.id;
+        StreamRecord record;
+        record.id = id;
+        record.bytes = stream.info.bytes;
+        // The canonical physical identity of this stream - authorized scope, interpretation and global layer ordinal
+        // - computed once and used for every object of the stream, in the writer and in the reader alike.
+        Digest identity_scope{};
+        uint64_t identity_ordinal = 0;
+        if (!stream_identity_of(layout.containers, id, identity_scope, identity_ordinal, why)) {
+            abandon(ConversationStorePublishStatus::refused_limits, why);
+            break;
+        }
+        auto emit = [&](uint64_t from, uint64_t to) {
+            while (from < to) {
+                const uint64_t element = std::max<uint32_t>(1, stream.element);
+                uint64_t size = chunk_limit;
+                if (element > 1) size -= size % element;
+                size = std::min(size, to - from);
+                std::vector<uint8_t> buffer(static_cast<size_t>(size));
+                if (!stream.read(from, buffer.data(), size_t(size), why)) return false;
+                source_bytes_read += size;
+                const Digest object = conversation_store_detail::object_digest(identity_scope, id.kind,
+                                                                              identity_ordinal, size, buffer.data());
+                bool known = false;
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    if (job->coalesced || job->cancelled) {
+                        abandon(ConversationStorePublishStatus::coalesced, "the publication ticket was cancelled");
+                        return false;
+                    }
+                    if (epoch != epoch_now) {
+                        counters.refusals_stale++;
+                        abandon(ConversationStorePublishStatus::stale,
+                                "the execution domain advanced while the image was written");
+                        return false;
+                    }
+                    known = charged_objects.count(object) != 0 || objects.count(object) != 0;
+                    if (known) counters.dedup_chunks++;
+                    if (!known) {
+                        // A complete file for this content address may exist as an accounted orphan: adopting it
+                        // rather than rewriting it keeps its charge honest and keeps it out of the reclaimer's way.
+                        known = revive_object_locked(object);
+                    }
+                }
+                if (!known) {
+                    const uint64_t charge = allocated_charge(size);
+                    if (!make_room(charge, floor_limited, why)) {
+                        abandon(floor_limited ? ConversationStorePublishStatus::refused_floor
+                                              : ConversationStorePublishStatus::refused_quota,
+                                why);
+                        return false;
+                    }
+                    if (take_fault("objects")) {
+                        abandon(ConversationStorePublishStatus::failed, "injected fault: objects");
+                        return false;
+                    }
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        charged += charge;
+                    }
+                    note_file(Where::objects, sha256_hex(object), charge, object, sha256_hex(object).substr(0, 2));
+                    const std::string scratch_name = "ob-" + temp_name();
+                    PendingFile scratch;
+                    if (!write_object_file(dirs, scratch_name, object, buffer.data(), size_t(size), scratch, why)) {
+                        if (!scratch.name.empty()) {
+                            scratch.charge = charge;
+                            job->orphans.push_back(std::move(scratch));
+                        }
+                        abandon(ConversationStorePublishStatus::failed, why);
+                        return false;
+                    }
+                    charged_objects[object] = charge;
+                    new_bytes += size;
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        counters.bytes_written += size;
+                        counters.published_chunks++;
+                    }
+                }
+                conversation_store_detail::ChunkRecord chunk;
+                chunk.offset = from;
+                chunk.length = uint32_t(size);
+                chunk.object = object;
+                record.chunks.push_back(chunk);
+                referenced[object] = size;
+                from += size;
+            }
+            return true;
+        };
+
+        // Reuse intervals, placed by their own offset; every byte they do not cover is a gap that is chunked.
+        std::vector<const ConversationStoreReuse*> intervals;
+        for (const auto& entry : request.reuse)
+            if (entry.stream == id) intervals.push_back(&entry);
+        std::stable_sort(intervals.begin(), intervals.end(),
+                         [](const ConversationStoreReuse* a, const ConversationStoreReuse* b) {
+                             return a->offset < b->offset;
+                         });
+        uint64_t covered_until = 0;
+        for (const ConversationStoreReuse* entry : intervals) {
+            if (aborted) break;
+            const auto donor = donors.find(entry->head_id);
+            if (donor == donors.end()) continue;   // only the head the caller named is ever a donor
+            const StreamRecord* source_stream = nullptr;
+            for (const auto& candidate : donor->second.streams)
+                if (candidate.id == id) {
+                    source_stream = &candidate;
+                    break;
+                }
+            bool usable = entry->bytes > 0 && source_stream != nullptr && entry->offset >= covered_until &&
+                          entry->offset % chunk_limit == 0 && entry->offset + entry->bytes <= stream.info.bytes &&
+                          entry->source_offset + entry->bytes <= source_stream->bytes;
+            if (usable) {
+                // The donor must map this stream to the same physical identity as the outgoing image, or an adopted
+                // object could not verify against the manifest it is written into.
+                Digest donor_scope{};
+                uint64_t donor_ordinal = 0;
+                std::string detail;
+                usable = stream_identity_of(donor->second.containers, id, donor_scope, donor_ordinal, detail) &&
+                         donor_scope == identity_scope && donor_ordinal == identity_ordinal;
+            }
+            if (usable) {
+                // The interval must start and end exactly on the donor's own chunk boundaries, and end either on a
+                // chunk boundary of the outgoing stream or at its end: an immutable chunk is never rewritten.
+                const bool ends_clean = (entry->offset + entry->bytes) % chunk_limit == 0 ||
+                                        entry->offset + entry->bytes == stream.info.bytes;
+                size_t first = source_stream->chunks.size(), last = 0;
+                for (size_t i = 0; i < source_stream->chunks.size(); ++i) {
+                    const auto& chunk = source_stream->chunks[i];
+                    if (chunk.offset + chunk.length <= entry->source_offset ||
+                        chunk.offset >= entry->source_offset + entry->bytes)
+                        continue;
+                    first = std::min(first, i);
+                    last = std::max(last, i);
+                }
+                usable = ends_clean && first <= last &&
+                         source_stream->chunks[first].offset == entry->source_offset &&
+                         source_stream->chunks[last].offset + source_stream->chunks[last].length ==
+                             entry->source_offset + entry->bytes;
+                if (usable) {
+                    // Every adopted object must still be present and authorized, or the interval is not usable.
+                    std::lock_guard<std::mutex> guard(mutex);
+                    for (size_t i = first; i <= last; ++i)
+                        if (objects.count(source_stream->chunks[i].object) == 0) usable = false;
+                }
+                if (usable) {
+                    if (!emit(covered_until, entry->offset)) break;
+                    for (size_t i = first; i <= last; ++i) {
+                        const auto& chunk = source_stream->chunks[i];
+                        conversation_store_detail::ChunkRecord adopted = chunk;
+                        adopted.offset = entry->offset + (chunk.offset - entry->source_offset);
+                        record.chunks.push_back(adopted);
+                        referenced[chunk.object] = chunk.length;
+                        reused_bytes += chunk.length;
+                        ++adopted_chunks;
+                    }
+                    covered_until = entry->offset + entry->bytes;
+                    continue;
+                }
+            }
+        }
+        if (aborted) break;
+        if (!emit(covered_until, stream.info.bytes)) break;
+        streams.push_back(std::move(record));
+    }
+    if (!aborted) {
+        std::lock_guard<std::mutex> guard(mutex);
+        counters.reused_chunks += adopted_chunks;
+        counters.reused_bytes += reused_bytes;
+    }
+    if (aborted || streams.size() != layout.streams.size()) {
+        fail(abort_status, why.empty() ? "the publication was abandoned" : why);
+        return;
+    }
+
+    conversation_store_detail::ManifestMeta meta;
+    uint64_t published_order = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!on || closing || faulted) {
+            fail(ConversationStorePublishStatus::disabled, "the store stopped serving while the image was written");
+            return;
+        }
+        if (epoch != epoch_now) {
+            counters.refusals_stale++;
+            fail(ConversationStorePublishStatus::stale,
+                 "the execution domain advanced while the image was written");
+            return;
+        }
+        if (job->cancelled || job->coalesced) {
+            fail(ConversationStorePublishStatus::stale, "the publication ticket was cancelled");
+            return;
+        }
+        published_order = ++catalog.published_order_counter;
+    }
+    meta.bucket = bucket;
+    meta.domain = options.domain;
+    meta.epoch = epoch_now;
+    meta.generation = request.generation;
+    meta.parent = request.supersedes;
+    meta.published_order = published_order;
+    meta.stages = layout.stages;
+    meta.containers = layout.containers;
+    meta.streams = std::move(streams);
+    meta.payload_bytes = layout.payload_bytes;
+    meta.objects.assign(referenced.begin(), referenced.end());
+    meta.cuts = layout.cuts;
+    const std::vector<uint8_t> encoded = conversation_store_detail::manifest_encode(meta);
+    if (encoded.size() > limits.max_manifest_bytes) {
+        fail(ConversationStorePublishStatus::refused_limits,
+             "the encoded manifest exceeds ConversationStoreLimits::max_manifest_bytes");
+        return;
+    }
+    meta.manifest_id = conversation_store_detail::manifest_id_of(encoded.data(), encoded.size());
+    const uint64_t head_id = std::max<uint64_t>(1, digest_u64(meta.manifest_id));
+    if (take_fault("manifest")) {
+        fail(ConversationStorePublishStatus::failed, "injected fault: manifest");
+        return;
+    }
+    // A durable published_order makes two manifests identical only when they describe the same publication, so an
+    // existing manifest file is reused rather than rewritten; anything else is written, flushed and renamed.
+    const std::string manifest_name = sha256_hex(meta.manifest_id);
+    struct stat info {};
+    const bool manifest_exists = ::fstatat(dirs.manifests, manifest_name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!manifest_exists) {
+        const uint64_t charge = allocated_charge(encoded.size());
+        if (!make_room(charge, floor_limited, why)) {
+            fail(floor_limited ? ConversationStorePublishStatus::refused_floor
+                               : ConversationStorePublishStatus::refused_quota,
+                 why);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            charged += charge;
+        }
+        note_file(Where::manifests, manifest_name, charge, Digest{}, std::string());
+        std::string temp = temp_name();
+        bool written = false;
+        for (uint32_t attempt = 0; attempt < kTempNameAttempts && !written; ++attempt) {
+            if (write_new_file(dirs.tmp, temp, encoded.data(), encoded.size(), why)) {
+                written = true;
+                break;
+            }
+            if (errno != EEXIST) break;
+            temp = temp_name();
+            why.clear();
+        }
+        if (written && ::renameat(dirs.tmp, temp.c_str(), dirs.manifests, manifest_name.c_str()) != 0) {
+            why = std::string("cannot publish the manifest: ") + std::strerror(errno);
+            written = false;
+        }
+        if (written) written = fsync_dir(dirs.manifests, "manifests", why);
+        if (!written) {
+            PendingFile scratch;
+            scratch.where = Where::tmp;
+            scratch.name = temp;
+            scratch.charge = charge;
+            job->orphans.push_back(std::move(scratch));
+            fail(ConversationStorePublishStatus::failed, why.empty() ? "the manifest could not be written" : why);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            counters.bytes_written += encoded.size();
+        }
+    }
+
+    // ---- the commit: plan under the lock, write the catalog without it, then apply ----
+    CommitPlan plan;
+    ConversationStorePublishStatus status = ConversationStorePublishStatus::stored;
+    uint64_t superseded = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        plan.kind = CommitPlan::Kind::publish;
+        plan.version = catalog_version;
+        plan.candidate = catalog;
+        CatalogHead head;
+        head.head_id = head_id;
+        head.manifest_id = meta.manifest_id;
+        head.bucket = bucket;
+        head.domain = domain_index;
+        head.epoch = epoch_now;
+        head.generation = request.generation;
+        head.parent = request.supersedes;
+        head.payload_bytes = layout.payload_bytes;
+        head.manifest_bytes = allocated_charge(encoded.size());   // the charged size, rounded like every other file
+        head.published_order = published_order;
+        head.stages = layout.stages;
+        head.pinned = image.pinned();
+        head.protected_seg = false;
+        head.cuts = layout.cuts;
+
+        // A covered replacement must be a proven cover of *this* predecessor, still authorized at commit time, in
+        // this branch and epoch, by a newer capture, with every pinned cut of the predecessor preserved as a pin.
+        const uint64_t predecessor = request.supersedes;
+        bool predecessor_present = false;
+        uint64_t predecessor_generation = 0;
+        if (predecessor != 0) {
+            for (const auto& candidate : plan.candidate.heads) {
+                if (candidate.head_id != predecessor) continue;
+                if (candidate.domain == domain_index && candidate.epoch == epoch_now &&
+                    candidate.manifest_id == source.manifest_id) {
+                    predecessor_present = true;
+                    predecessor_generation = candidate.generation;
+                    head.protected_seg = candidate.protected_seg;   // a covered replacement inherits its recency
+                }
+                break;
+            }
+        }
+        bool covered = request.cover && predecessor_present && have_source &&
+                       request.generation > predecessor_generation;
+        if (request.cover && predecessor != 0 && (!predecessor_present || !have_source ||
+                                                 request.generation <= predecessor_generation)) {
+            // A cover naming a predecessor that is not retained here, or one captured at an older or equal generation
+            // than the descendant already stored, is a stale completion: it must never overwrite or duplicate it.
+            counters.refusals_stale++;
+            fail(ConversationStorePublishStatus::stale,
+                 "that image is not a newer cover of the head it names");
+            return;
+        }
+        if (covered) {
+            for (const auto& cut : source.cuts) {
+                if (!cut.pinned) continue;
+                bool kept = false;
+                for (const auto& ours : layout.cuts)
+                    if (ours.tokens == cut.tokens && ours.digest == cut.digest && ours.pinned) kept = true;
+                if (!kept) covered = false;
+            }
+        }
+        plan.candidate.heads.push_back(head);
+        plan.new_head = head_id;
+        plan.new_objects.clear();
+        plan.new_objects.reserve(referenced.size());
+        for (const auto& entry : referenced) plan.new_objects.push_back(entry.first);
+        for (const auto& entry : charged_objects) plan.new_object_charges[entry.first] = entry.second;
+        plan.new_manifest_bytes = allocated_charge(encoded.size());
+        bool room = obtain_head_slot_locked(plan.candidate, head_id, plan.retiring);
+        if (room) {
+            cap_protected_locked(plan.candidate);
+            uint64_t estimate = uint64_t(conversation_store_detail::catalog_encode(plan.candidate).size());
+            estimate += uint64_t(objects.size() + plan.new_objects.size()) * kObjectBytesEstimate;
+            for (const auto& entry : head_objects) estimate += uint64_t(entry.second.size()) * sizeof(Digest);
+            estimate += uint64_t(plan.new_objects.size()) * sizeof(Digest);
+            if (estimate > options.metadata_bytes) {
+                plan.candidate.heads.pop_back();
+                plan.retiring.clear();
+                room = false;
+                counters.refused_limits++;
+                fail(ConversationStorePublishStatus::refused_limits,
+                     "the store's index ceiling cannot hold another head");
+            }
+        } else {
+            plan.candidate.heads.pop_back();
+            counters.refused_limits++;
+            fail(ConversationStorePublishStatus::refused_limits,
+                 "every retained head is pinned or leased, so no head slot can be obtained");
+        }
+        if (!room) return;
+        if (predecessor != 0 && covered) {
+            superseded = predecessor;
+            for (size_t i = 0; i < plan.candidate.heads.size(); ++i)
+                if (plan.candidate.heads[i].head_id == predecessor) {
+                    plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));
+                    break;
+                }
+            plan.retiring.push_back(predecessor);
+            status = ConversationStorePublishStatus::replaced;
+        } else if (predecessor != 0 && have_source) {
+            status = ConversationStorePublishStatus::retained_branch;
+        } else if (predecessor != 0) {
+            // A predecessor that is gone, retired or re-captured must never be silently turned into a new branch.
+            counters.refusals_stale++;
+            fail(ConversationStorePublishStatus::stale,
+                 "the head this image was captured from is no longer retained");
+            return;
+        }
+    }
+    if (take_fault("catalog")) {
+        fail(ConversationStorePublishStatus::failed, "injected fault: catalog");
+        return;
+    }
+    std::string commit_why;
+    if (!commit_plan(plan, commit_why)) {
+        // The durable catalog is unchanged, so nothing was authorized.  Files this attempt wrote stay accounted
+        // orphans whose bytes stay charged until they are confirmed gone, and the predecessor's authority is intact.
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            latch_fault_locked("the catalog commit failed: " + commit_why);
+        }
+        fail(ConversationStorePublishStatus::failed,
+             commit_why.empty() ? "the catalog commit failed" : commit_why);
+        return;
+    }
+    job->orphans.clear();   // every file this attempt created is now referenced by the committed manifest
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        counters.published++;
+        if (status == ConversationStorePublishStatus::replaced) counters.replaced++;
+        if (status == ConversationStorePublishStatus::retained_branch) counters.retained_branches++;
+        counters.heads = uint64_t(catalog.heads.size());
+    }
+    out.status = status;
+    out.head_id = head_id;
+    out.epoch = epoch_now;
+    out.superseded = superseded;
+    out.stages = layout.stages;
+    out.payload_bytes = layout.payload_bytes;
+    out.new_bytes = new_bytes;
+    out.reused_bytes = reused_bytes;
+    out.detail = status == ConversationStorePublishStatus::retained_branch
+                     ? "the predecessor keeps a divergent or pinned cut, so both branches are retained"
+                     : std::string();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1418,7 +2877,8 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
         self.reason = "the execution-domain, model or engine identity is missing";
         return;
     }
-    if (!self.limits.max_stages || !self.limits.max_images || !self.limits.max_streams) {
+    if (!self.limits.max_stages || !self.limits.max_images || !self.limits.max_streams ||
+        !self.limits.max_manifest_bytes) {
         self.reason = "a ConversationStoreLimits count is zero";
         return;
     }
@@ -1431,23 +2891,32 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
         return;
     }
     std::string why;
-    // Construction is single-threaded: no worker exists yet, so the authority steps do not take the state lock.
-    if (!self.open_root(why)) {
-        self.reason = why;
-        return;
+    // Construction is single-threaded: no worker exists yet, so the authority steps take no lock, and any failure
+    // here disables persistence without leaving the lock or a half-armed marker behind.
+    bool opened = false;
+    try {
+        opened = self.open_root(why) && self.load_catalog(why) && self.reconcile(why);
+    } catch (const std::exception& error) {
+        why = std::string("the store's open sequence failed: ") + error.what();
+        opened = false;
+    } catch (...) {
+        why = "the store's open sequence failed";
+        opened = false;
     }
-    if (!self.load_catalog(why) || !self.reconcile(why)) {
-        self.reason = why;
-        self.on = false;
+    if (!opened) {
+        self.reason = why.empty() ? "the store could not be opened" : why;
         if (self.lock_fd >= 0) {
             ::flock(self.lock_fd, LOCK_UN);
             ::close(self.lock_fd);
             self.lock_fd = -1;
         }
+        self.lock_owned = false;
+        self.dirs.close_all();
         return;
     }
-    self.sample_free();
+    self.sample_free_locked();
     self.on = true;
+    self.initialized = true;
     self.writer = std::thread([&self] { self.writer_body(); });
     self.readers.reserve(self.reader_threads);
     for (uint32_t i = 0; i < self.reader_threads; ++i)
@@ -1461,6 +2930,7 @@ ConversationStore::~ConversationStore() {
     self.cv_work.notify_all();
     self.cv_ready.notify_all();
     self.cv_publish.notify_all();
+    self.cv_durable.notify_all();
     if (self.writer.joinable()) self.writer.join();
     for (auto& thread : self.readers)
         if (thread.joinable()) thread.join();
@@ -1474,14 +2944,26 @@ ConversationStore::~ConversationStore() {
     self.on = false;
 }
 
-bool ConversationStore::enabled() const { return impl_->on; }
+bool ConversationStore::enabled() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->on;
+}
+
 const char* ConversationStore::disabled_reason() const { return impl_->reason.c_str(); }
-bool ConversationStore::healthy() const { return impl_->on && impl_->healthy; }
+
+bool ConversationStore::healthy() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->on && !impl_->faulted;
+}
 
 void ConversationStore::set_unhealthy(const char* reason) {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    impl_->healthy = false;
-    impl_->unhealthy_reason = reason ? reason : "the owner observed a failure";
+    // A latched fault is permanent: the engine observed something that must stop reuse, and only a restart (which
+    // re-reads the run-intent marker) may trust this domain again.
+    impl_->retire_reads_locked(ConversationStoreReadStatus::failed,
+                               "the store faulted before this read completed");
+    impl_->latch_fault_locked(reason ? reason : "the owner observed a failure");
+    impl_->cv_work.notify_all();
 }
 
 uint64_t ConversationStore::epoch() const {
@@ -1490,7 +2972,11 @@ uint64_t ConversationStore::epoch() const {
 }
 
 const std::array<uint8_t, 32>& ConversationStore::issuer_key() const { return impl_->issuer_key; }
-bool ConversationStore::run_intent_active() const { return impl_->intent_active; }
+
+bool ConversationStore::run_intent_active() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->intent_active;
+}
 
 uint64_t ConversationStore::domain_digest_truncated() const {
     std::array<uint8_t, 96> material{};
@@ -1516,11 +3002,9 @@ void ConversationStore::for_each_match(const ConversationStoreSelector& selector
 std::vector<ConversationStoreMatch> ConversationStore::matches(const ConversationStoreSelector& selector,
                                                               const std::vector<int32_t>& ids,
                                                               const std::vector<ConversationImageKey>& images) const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
     std::vector<ConversationStoreMatch> found;
-    {
-        std::lock_guard<std::mutex> guard(impl_->mutex);
-        impl_->collect_matches(selector, ids.data(), ids.size(), images, found);
-    }
+    impl_->collect_matches(selector, ids.data(), ids.size(), images, found);
     return found;
 }
 
@@ -1547,17 +3031,19 @@ bool ConversationStore::manifest_info(uint64_t head_id, ConversationStoreManifes
 }
 
 bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<ConversationStoreStreamInfo>& out) const {
-    std::string path;
+    Impl& self = *impl_;
+    Digest manifest_id{};
     uint64_t bytes = 0;
-    conversation_store_detail::ManifestMeta meta;
     {
-        std::lock_guard<std::mutex> guard(impl_->mutex);
-        if (!impl_->on || !impl_->manifest_path_of(head_id, path, bytes)) return false;
+        std::lock_guard<std::mutex> guard(self.mutex);
+        if (!self.on || !self.head_manifest_locked(head_id, manifest_id, bytes)) return false;
     }
     std::vector<uint8_t> raw;
     std::string why;
-    if (!read_file(path, raw, impl_->limits.max_manifest_bytes, why)) return false;
-    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), impl_->limits, meta, why)) return false;
+    if (!read_file(self.dirs.manifests, sha256_hex(manifest_id), self.limits.max_manifest_bytes, raw, why))
+        return false;
+    conversation_store_detail::ManifestMeta meta;
+    if (!conversation_store_detail::manifest_decode(raw.data(), raw.size(), self.limits, meta, why)) return false;
     out = conversation_store_detail::manifest_stream_infos(meta);
     return true;
 }
@@ -1568,11 +3054,11 @@ bool ConversationStore::demand(const ConversationStoreQuery& query, std::string&
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
         return false;
     }
-    if (!impl_->healthy) {
-        why = impl_->unhealthy_reason;
+    if (impl_->faulted) {
+        why = impl_->fault_reason;
         return false;
     }
-    return impl_->admit_read(query, true, why);
+    return impl_->admit_read_locked(query, true, why);
 }
 
 bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::string& why) {
@@ -1581,44 +3067,44 @@ bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::strin
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
         return false;
     }
-    if (!impl_->healthy) {
-        why = impl_->unhealthy_reason;
+    if (impl_->faulted) {
+        why = impl_->fault_reason;
         return false;
     }
-    return impl_->admit_read(query, false, why);
+    return impl_->admit_read_locked(query, false, why);
 }
 
 void ConversationStore::cancel(uint64_t request_id, uint64_t generation) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    for (auto it = impl_->jobs.begin(); it != impl_->jobs.end(); ++it) {
-        const std::shared_ptr<Impl::ReadJob>& job = *it;
-        if (job->query.request_id != request_id || job->query.generation != generation) continue;
-        if (job->handed) return;  // already the caller's image: release_read() is the way out
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
+    if (self.publishing && !self.publishing->started &&
+        self.publishing->request.request_id == request_id && self.publishing->request.generation == generation) {
+        // A ticket the writer has not begun reading is cancelled here, with its alias and charge released at once.
+        const std::shared_ptr<Impl::PublishJob>& job = self.publishing;
         job->cancelled = true;
-        if (job->active) return;  // the worker drops it at its next chunk boundary and refunds it
-        for (auto q = impl_->queue.begin(); q != impl_->queue.end(); ++q)
-            if (*q == job) {
-                impl_->queue.erase(q);
-                break;
-            }
-        for (auto r = impl_->ready.begin(); r != impl_->ready.end(); ++r)
-            if (*r == job) {
-                impl_->ready.erase(r);
-                break;
-            }
-        if (job->reserved_bytes) {
-            impl_->ram_held -= std::min(impl_->ram_held, job->reserved_bytes);
-            job->reserved_bytes = 0;
+        if (job->ram_bytes) {
+            self.ram_held -= std::min(self.ram_held, job->ram_bytes);
+            self.ram_lease -= std::min(self.ram_lease, job->ram_bytes);
+            job->ram_bytes = 0;
         }
-        if (job->lease_bytes) {
-            // The completion was already charged but never handed out: a cancellation drops it and its charge.
-            impl_->ram_held -= std::min(impl_->ram_held, job->lease_bytes);
-            impl_->ram_lease -= std::min(impl_->ram_lease, job->lease_bytes);
-            job->lease_bytes = 0;
-        }
-        impl_->jobs.erase(it);
-        impl_->counters.reads_cancelled++;
-        impl_->cv_work.notify_all();
+        job->image.reset();
+        ConversationStorePublishResult result;
+        result.status = ConversationStorePublishStatus::stale;
+        result.request_id = request_id;
+        result.generation = generation;
+        result.epoch = job->epoch;
+        result.released = true;
+        result.detail = "the publication ticket was cancelled before it began";
+        self.counters.refusals_stale++;
+        self.push_publish_result_locked(std::move(result));
+        self.publishing.reset();
+        self.cv_work.notify_all();
+        return;
+    }
+    for (const auto& job : self.jobs) {
+        if (job->query.request_id != request_id || job->query.generation != generation) continue;
+        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the caller cancelled this read");
+        self.cv_work.notify_all();
         return;
     }
 }
@@ -1644,33 +3130,53 @@ bool ConversationStore::wait_ready(ConversationStoreRead& out, uint64_t timeout_
 
 bool ConversationStore::wait_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out,
                                    uint64_t timeout_ms) {
-    std::unique_lock<std::mutex> lock(impl_->mutex);
-    auto settled = [&]() {
-        for (const auto& job : impl_->jobs)
+    Impl& self = *impl_;
+    std::unique_lock<std::mutex> lock(self.mutex);
+    const auto settled = [&]() {
+        for (const auto& job : self.jobs)
             if (job->query.request_id == request_id && job->query.generation == generation)
-                return job->handed || job->cancelled ||
+                return job->handed ||
                        (job->status != ConversationStoreReadStatus::none && !job->active);
-        return false;
+        return true;   // an unknown request has settled (as nothing)
     };
     if (!settled() && timeout_ms)
-        impl_->cv_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms), settled);
+        self.cv_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms), settled);
     if (!settled()) return false;
-    return impl_->deliver_locked(out, request_id, generation, true);
+    return self.deliver_locked(out, request_id, generation, true);
 }
 
 void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    for (auto it = impl_->jobs.begin(); it != impl_->jobs.end(); ++it) {
-        const std::shared_ptr<Impl::ReadJob>& job = *it;
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
+    for (const auto& job : self.jobs) {
         if (job->query.request_id != request_id || job->query.generation != generation) continue;
-        if (!job->released && job->lease_bytes) {
-            impl_->ram_held -= std::min(impl_->ram_held, job->lease_bytes);
-            impl_->ram_lease -= std::min(impl_->ram_lease, job->lease_bytes);
-            job->lease_bytes = 0;
+        if (!job->released) {
             job->released = true;
-            impl_->counters.reads_released++;
+            self.counters.reads_released++;
         }
-        if (!job->active) impl_->jobs.erase(it);
+        job->cancelled = true;                       // a released request is never delivered
+        for (auto q = self.queue.begin(); q != self.queue.end(); ++q)
+            if (*q == job) {
+                self.queue.erase(q);
+                break;
+            }
+        for (auto r = self.ready.begin(); r != self.ready.end(); ++r)
+            if (*r == job) {
+                self.ready.erase(r);
+                break;
+            }
+        if (!job->active) {
+            // The reader owns the charge until its body returns; a settled job gives everything back here.
+            self.release_reservation_locked(job);
+            self.release_lease_locked(job);
+            self.release_slot_locked(job);
+            self.release_head_lease_locked(job);
+            job->image.reset();
+            self.erase_job_locked(job);
+        } else {
+            self.free_job_prep_locked(job);
+        }
+        self.cv_work.notify_all();
         return;
     }
 }
@@ -1683,72 +3189,106 @@ ConversationStoreReadStatus ConversationStore::request_status(uint64_t request_i
 }
 
 void ConversationStore::confirmed_restore(uint64_t head_id) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    for (auto& head : impl_->catalog.heads) {
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
+    if (!self.on || self.faulted || !self.initialized) return;
+    bool found = false;
+    for (auto& head : self.catalog.heads) {
         if (head.head_id != head_id) continue;
-        if (head.protected_seg) return;
-        head.protected_seg = true;
-        std::string why;
-        if (!impl_->write_catalog(why)) {
-            // The promotion is a policy hint: a failed commit keeps it in RAM and leaves durability to the next one.
-            impl_->counters.corrupt_records++;
+        found = true;
+        self.touch_recency_locked(head_id);
+        if (!head.protected_seg) {
+            head.protected_seg = true;
+            self.cap_protected_locked(self.catalog);
         }
-        return;
+        break;
     }
+    if (!found) return;
+    // The durable write is the storage thread's job: this call performs no storage wait, and a failure is persisted
+    // by the next commit (a promotion is a policy hint, never authority).
+    auto work = std::make_shared<Impl::DurableWork>();
+    work->plan.kind = Impl::CommitPlan::Kind::promote;
+    self.durable.push_back(std::move(work));
+    self.cv_work.notify_all();
 }
 
 bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, const ConversationStorePublish& request,
                                 std::string& why) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    if (!impl_->on) {
-        why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
+    if (!self.on || self.closed) {
+        why = self.reason.empty() ? "the store is not enabled" : self.reason;
         return false;
     }
-    if (!impl_->healthy) {
-        why = impl_->unhealthy_reason;
+    if (self.faulted) {
+        why = self.fault_reason;
+        return false;
+    }
+    if (self.closing) {
+        why = "the store is closing";
         return false;
     }
     if (!image) {
         why = "no image was supplied";
         return false;
     }
-    if (impl_->publishing) {
-        const std::shared_ptr<Impl::PublishJob>& current = impl_->publishing;
-        const bool same_lineage = current->request.supersedes == request.supersedes &&
-                                  current->request.cover == request.cover;
+    if (request.epoch != 0 && request.epoch != self.epoch) {
+        self.counters.refusals_stale++;
+        why = "the image was captured in a previous execution-domain epoch";
+        return false;
+    }
+    const uint64_t image_bytes = image->bytes();
+    if (image_bytes > self.ram_budget || self.resident_locked() > self.ram_budget - image_bytes) {
+        // Speculative read resources are revocable, and an outgoing capture is required work: outstanding prefetch
+        // gives way to it before the store declines to persist the image at all.
+        self.revoke_speculation_locked(false);
+    }
+    if (image_bytes > self.ram_budget || self.resident_locked() > self.ram_budget - image_bytes) {
+        self.counters.refused_limits++;
+        why = "the publication image does not fit the published RAM allowance";
+        return false;
+    }
+    if (self.publishing) {
+        const std::shared_ptr<Impl::PublishJob>& current = self.publishing;
+        // Only a *proven cover of the same nonzero predecessor* by a newer generation may replace the job in flight:
+        // two unrelated new branches (supersedes == 0) are never coalesced.
+        const bool same_lineage = request.supersedes != 0 && request.supersedes == current->request.supersedes &&
+                                  request.cover && current->request.cover &&
+                                  current->epoch == (request.epoch != 0 ? request.epoch : self.epoch);
         if (current->started || !same_lineage || request.generation <= current->request.generation) {
-            // A job the writer is already reading may never be replaced, and a different branch is never coalesced:
-            // the in-flight predecessor is left untouched and this optional publication is refused as a safe miss.
-            impl_->counters.refusals_busy++;
+            self.counters.refusals_busy++;
             why = current->started ? "the writer is already serializing another image"
                                    : "another branch is already admitted";
             return false;
         }
-        // Coalesce before any capture image is read: the not-yet-started predecessor is cancelled and reported as
-        // coalesced, so the store never holds two images.
         ConversationStorePublishResult coalesced;
         coalesced.status = ConversationStorePublishStatus::coalesced;
         coalesced.request_id = current->request.request_id;
         coalesced.generation = current->request.generation;
+        coalesced.epoch = current->epoch;
         coalesced.detail = "replaced by a newer publication of the same lineage";
         coalesced.released = true;
         if (current->ram_bytes) {
-            impl_->ram_held -= std::min(impl_->ram_held, current->ram_bytes);
+            self.ram_held -= std::min(self.ram_held, current->ram_bytes);
+            self.ram_lease -= std::min(self.ram_lease, current->ram_bytes);
             current->ram_bytes = 0;
         }
-        impl_->counters.coalesced_publishes++;
-        impl_->publish_done.push_back(coalesced);
-        impl_->publishing.reset();
+        current->image.reset();
+        self.counters.coalesced_publishes++;
+        self.push_publish_result_locked(std::move(coalesced));
+        self.publishing.reset();
     }
     auto job = std::make_shared<Impl::PublishJob>();
     job->image = std::move(image);
     job->request = request;
+    job->epoch = request.epoch != 0 ? request.epoch : self.epoch;
     job->ram_bytes = job->image->bytes();
-    impl_->ram_held += job->ram_bytes;
-    impl_->publishing = job;
-    impl_->counters.peak_bytes = std::max(impl_->counters.peak_bytes, impl_->ram_held);
-    impl_->cv_work.notify_all();
-    impl_->cv_publish.notify_all();
+    self.ram_held += job->ram_bytes;
+    self.ram_lease += job->ram_bytes;
+    self.counters.peak_bytes = std::max(self.counters.peak_bytes, self.ram_held);
+    self.publishing = job;
+    self.cv_work.notify_all();
+    self.cv_publish.notify_all();
     return true;
 }
 
@@ -1778,7 +3318,7 @@ bool ConversationStore::writer_busy() const {
 
 uint64_t ConversationStore::ram_held_bytes() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->ram_held;
+    return impl_->ram_held + impl_->metadata + impl_->prep;
 }
 
 uint64_t ConversationStore::ram_lease_bytes() const {
@@ -1793,7 +3333,8 @@ uint64_t ConversationStore::ram_read_budget() const {
 
 uint64_t ConversationStore::ram_available_bytes() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->ram_budget > impl_->ram_held ? impl_->ram_budget - impl_->ram_held : 0;
+    const uint64_t held = impl_->ram_held + impl_->metadata + impl_->prep;
+    return impl_->ram_budget > held ? impl_->ram_budget - held : 0;
 }
 
 void ConversationStore::suspend_read_admission() {
@@ -1831,30 +3372,42 @@ uint64_t ConversationStore::disk_free_bytes() const {
 }
 
 bool ConversationStore::invalidate_domain(const char* reason) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    if (!impl_->on) return false;
-    impl_->epoch += 1;
-    impl_->catalog.domains[impl_->domain_index].epoch = impl_->epoch;
-    impl_->counters.epoch_advances++;
-    std::vector<uint64_t> victims;
-    for (const auto& head : impl_->catalog.heads)
-        if (head.domain == impl_->domain_index) victims.push_back(head.head_id);
-    for (uint64_t head_id : victims) impl_->retire_head(head_id);
-    // Outstanding reads of the previous epoch are dropped rather than delivered: their completions are stale.
-    for (auto& job : impl_->jobs)
-        if (!job->handed && job->status == ConversationStoreReadStatus::none) job->cancelled = true;
-    std::string why;
-    if (!impl_->write_catalog(why)) {
-        // The run intent stays armed, and the store stops serving: the next start must not reuse anything.
-        impl_->healthy = false;
-        impl_->unhealthy_reason = "the domain invalidation could not be made durable: " + why;
-        (void)reason;
+    Impl& self = *impl_;
+    std::shared_ptr<Impl::DurableWork> work;
+    {
+        std::lock_guard<std::mutex> guard(self.mutex);
+        if (!self.on || !self.initialized) return false;
+        if (self.faulted) return false;
+        self.epoch += 1;
+        if (self.domain_index < self.catalog.domains.size())
+            self.catalog.domains[self.domain_index].epoch = self.epoch;
+        self.counters.epoch_advances++;
+        // Every unhanded completion of the previous epoch is retired here, never relabelled, and nothing of the
+        // previous epoch is delivered again.
+        self.retire_reads_locked(ConversationStoreReadStatus::stale,
+                                 "the execution domain was invalidated before this read completed");
+        work = std::make_shared<Impl::DurableWork>();
+        work->plan.kind = Impl::CommitPlan::Kind::invalidate;
+        work->plan.epoch = self.epoch;
+        work->plan.domain_index = self.domain_index;
+        self.durable.push_back(work);
+        self.cv_work.notify_all();
+    }
+    (void)reason;
+    // The durable commit happens on the storage thread; this caller waits for it without ever performing or holding a
+    // storage wait itself, and reports a commit it could not confirm as a latched fault.  The run-intent marker is
+    // still armed in that case, so the next start distrusts this domain.
+    std::unique_lock<std::mutex> lock(self.mutex);
+    const bool done =
+        self.cv_durable.wait_for(lock, std::chrono::milliseconds(kDurableWaitMs), [&] { return work->done; });
+    if (!done) {
+        self.latch_fault_locked("the domain invalidation could not be confirmed in time");
         return false;
     }
-    impl_->reclaim_files();
-    impl_->recount_metadata();
-    impl_->counters.heads = uint64_t(impl_->catalog.heads.size());
-    impl_->cv_work.notify_all();
+    if (!work->ok) {
+        self.latch_fault_locked("the domain invalidation could not be committed: " + work->detail);
+        return false;
+    }
     return true;
 }
 
@@ -1863,42 +3416,107 @@ void ConversationStore::close() {
     {
         std::lock_guard<std::mutex> guard(self.mutex);
         if (self.closed) return;
+        self.closed = true;
+        if (!self.initialized || !self.lock_owned) {
+            // This instance never owned the store's authority (a rejected second owner, or a root that could not be
+            // opened): it must not write the catalog, retire anything, or touch the run-intent marker.
+            self.on = false;
+            if (self.lock_fd >= 0) {
+                ::flock(self.lock_fd, LOCK_UN);
+                ::close(self.lock_fd);
+                self.lock_fd = -1;
+            }
+            self.lock_owned = false;
+            return;
+        }
         self.closing = true;
         self.admission_suspended = true;
-        for (auto& job : self.jobs)
-            if (!job->handed && job->status == ConversationStoreReadStatus::none) job->cancelled = true;
+        self.retire_reads_locked(ConversationStoreReadStatus::disabled, "the store closed before this read completed");
         self.queue.clear();
+        if (self.publishing && !self.publishing->started) {
+            // A publication the writer never began is settled here, with its alias and its charge released.
+            const std::shared_ptr<Impl::PublishJob>& job = self.publishing;
+            job->cancelled = true;
+            if (job->ram_bytes) {
+                self.ram_held -= std::min(self.ram_held, job->ram_bytes);
+                self.ram_lease -= std::min(self.ram_lease, job->ram_bytes);
+                job->ram_bytes = 0;
+            }
+            job->image.reset();
+            ConversationStorePublishResult result;
+            result.status = ConversationStorePublishStatus::disabled;
+            result.request_id = job->request.request_id;
+            result.generation = job->request.generation;
+            result.epoch = job->epoch;
+            result.released = true;
+            result.detail = "the store closed before the publication began";
+            self.push_publish_result_locked(std::move(result));
+            self.publishing.reset();
+        }
     }
     self.stop.store(true);
     self.cv_work.notify_all();
     self.cv_ready.notify_all();
     self.cv_publish.notify_all();
+    self.cv_durable.notify_all();
     if (self.writer.joinable()) self.writer.join();
     for (auto& thread : self.readers)
         if (thread.joinable()) thread.join();
     self.readers.clear();
-    std::lock_guard<std::mutex> guard(self.mutex);
-    for (auto& job : self.jobs) {
-        if (job->status != ConversationStoreReadStatus::none) continue;
-        if (job->reserved_bytes) {
-            self.ram_held -= std::min(self.ram_held, job->reserved_bytes);
-            job->reserved_bytes = 0;
+
+    bool commit_final = false;
+    {
+        std::lock_guard<std::mutex> guard(self.mutex);
+        for (const auto& job : self.jobs) {
+            if (job->status != ConversationStoreReadStatus::none || job->active) continue;
+            job->status = ConversationStoreReadStatus::disabled;
+            job->detail = "the store closed before this read completed";
+            self.release_reservation_locked(job);
+            self.release_lease_locked(job);
+            self.release_slot_locked(job);
+            self.release_head_lease_locked(job);
+            job->image.reset();
+            self.free_job_prep_locked(job);
         }
-        job->status = ConversationStoreReadStatus::disabled;
-        job->detail = "the store closed before this read completed";
-        job->active = false;
+        self.queue.clear();
+        // A faulted store never presents itself as a clean close: the marker stays armed so the next start distrusts
+        // this domain, and no catalog write is attempted on authority already known to be untrustworthy.
+        commit_final = self.initialized && self.lock_owned && !self.faulted;
     }
-    self.queue.clear();
-    self.clear_intent();
-    std::string why;
-    self.write_catalog(why);
-    if (self.lock_fd >= 0) {
-        ::flock(self.lock_fd, LOCK_UN);
-        ::close(self.lock_fd);
-        self.lock_fd = -1;
+    if (commit_final) {
+        Impl::CommitPlan plan;
+        plan.kind = Impl::CommitPlan::Kind::promote;   // commit the live catalog durably, first
+        std::string why;
+        if (!self.commit_plan(plan, why)) {
+            std::lock_guard<std::mutex> guard(self.mutex);
+            self.latch_fault_locked("the final catalog commit failed: " + why);
+        } else {
+            // Only now may this run be called clean: the catalog is durable, so the marker can go.
+            std::string intent_why;
+            const bool cleared = self.write_intent(false, intent_why);
+            std::lock_guard<std::mutex> guard(self.mutex);
+            self.intent_active = !cleared;
+            if (!cleared) self.latch_fault_locked("the run-intent marker could not be cleared: " + intent_why);
+        }
     }
-    self.on = false;
-    self.closed = true;
+    {
+        std::lock_guard<std::mutex> guard(self.mutex);
+        if (!self.faulted) {
+            // No reader exists any more, so retired files can be removed and credited regardless of past leases.
+            for (auto& file : self.pending_files) file.head_id = 0;
+        }
+    }
+    if (!self.faulted) self.reclaim_pending();
+    {
+        std::lock_guard<std::mutex> guard(self.mutex);
+        if (self.lock_fd >= 0) {
+            ::flock(self.lock_fd, LOCK_UN);
+            ::close(self.lock_fd);
+            self.lock_fd = -1;
+        }
+        self.lock_owned = false;
+        self.on = false;
+    }
 }
 
 ConversationStoreCounters ConversationStore::counters() const {
@@ -1907,12 +3525,16 @@ ConversationStoreCounters ConversationStore::counters() const {
     out.heads = uint64_t(impl_->catalog.heads.size());
     out.objects = uint64_t(impl_->objects.size());
     out.manifests = uint64_t(impl_->head_manifest_bytes.size());
-    out.pending_delete_bytes = uint64_t(impl_->pending_reclaim.size());
     out.orphan_bytes = impl_->reclaimable;
+    uint64_t pending = 0;
+    for (const auto& file : impl_->pending_files) pending += file.charge;
+    out.pending_delete_bytes = pending;
     uint64_t pinned = 0;
     for (const auto& head : impl_->catalog.heads) pinned += head.pinned ? 1 : 0;
     out.pinned_heads = pinned;
-    out.shared_objects = uint64_t(impl_->objects.size());
+    uint64_t shared = 0;
+    for (const auto& object : impl_->objects) shared += object.second.refs > 1 ? 1 : 0;
+    out.shared_objects = shared;
     return out;
 }
 
@@ -1922,28 +3544,32 @@ std::string ConversationStore::describe() const {
     text += "root: " + (impl_->root.empty() ? std::string("(none)") : impl_->root) + "\n";
     text += std::string("enabled: ") + (impl_->on ? "yes" : "no") +
             (impl_->reason.empty() ? "" : " (" + impl_->reason + ")") + "\n";
-    text += std::string("healthy: ") + (impl_->healthy ? "yes" : "no") +
-            (impl_->unhealthy_reason.empty() ? "" : " (" + impl_->unhealthy_reason + ")") + "\n";
-    text += "owner lock: " + std::string(impl_->lock_fd >= 0 ? "held" : "not held") + "\n";
-    text += "issuer key digest: " + sha256_hex(sha256(impl_->issuer_key.data(), impl_->issuer_key.size())).substr(0, 16) +
-            "\n";
+    text += std::string("healthy: ") + ((impl_->on && !impl_->faulted) ? "yes" : "no") +
+            (impl_->fault_reason.empty() ? "" : " (" + impl_->fault_reason + ")") + "\n";
+    text += "owner lock: " + std::string(impl_->lock_owned ? "held" : "not held") + "\n";
+    text += "issuer key digest: " +
+            sha256_hex(sha256(impl_->issuer_key.data(), impl_->issuer_key.size())).substr(0, 16) + "\n";
     text += "run intent: " + std::string(impl_->intent_active ? "armed" : "clear") + "\n";
     text += "domain index: " + std::to_string(impl_->domain_index) + " of " +
-            std::to_string(impl_->catalog.domains.size()) + ", epoch " + std::to_string(impl_->epoch) + "\n";
+            std::to_string(impl_->catalog.domains.size()) + ", epoch " + std::to_string(impl_->epoch) +
+            ", catalog version " + std::to_string(impl_->catalog_version) + "\n";
     text += "heads: " + std::to_string(impl_->catalog.heads.size()) + " of " +
             std::to_string(impl_->options.head_limit) + ", objects " + std::to_string(impl_->objects.size()) +
             ", pub order " + std::to_string(impl_->catalog.published_order_counter) + "\n";
     text += "disk: charged " + std::to_string(impl_->charged) + " of quota " +
             std::to_string(impl_->options.quota_bytes) + ", reclaimable " + std::to_string(impl_->reclaimable) +
-            ", free sampled " + std::to_string(impl_->free_sample) + "\n";
+            ", pending files " + std::to_string(impl_->pending_files.size()) + ", free sampled " +
+            std::to_string(impl_->free_sample) + "\n";
     text += "index: " + std::to_string(impl_->metadata) + " of " + std::to_string(impl_->options.metadata_bytes) +
-            " bytes estimated\n";
-    text += "ram: held " + std::to_string(impl_->ram_held) + ", leased " + std::to_string(impl_->ram_lease) +
-            ", budget " + std::to_string(impl_->ram_budget) +
+            " bytes estimated, preparation " + std::to_string(impl_->prep) + " bytes\n";
+    text += "ram: held " + std::to_string(impl_->ram_held + impl_->metadata + impl_->prep) + ", leased " +
+            std::to_string(impl_->ram_lease) + ", budget " + std::to_string(impl_->ram_budget) +
             (impl_->admission_suspended ? " (admission suspended)" : "") + "\n";
-    text += "reads: queued " + std::to_string(impl_->queue.size()) + ", materializing " +
-            std::to_string(impl_->materializing) + ", ready " + std::to_string(impl_->ready.size()) + "\n";
-    text += std::string("writer: ") + (impl_->publishing ? "busy" : "idle") + "\n";
+    text += "reads: queued " + std::to_string(impl_->queue.size()) + ", incoming " +
+            std::to_string(impl_->incoming) + " of " + std::to_string(impl_->options.max_reads) + ", ready " +
+            std::to_string(impl_->ready.size()) + ", held descriptors " + std::to_string(impl_->jobs.size()) + "\n";
+    text += std::string("writer: ") + (impl_->publishing ? "busy" : "idle") + ", durable queue " +
+            std::to_string(impl_->durable.size()) + "\n";
     return text;
 }
 
@@ -1988,385 +3614,4 @@ const char* conversation_store_publish_status_name(ConversationStorePublishStatu
     return "unknown";
 }
 
-
-// ---------------------------------------------------------------------------------------------------------------
-// Authority: root, lock, issuer key, catalog, run intent, recovery
-// ---------------------------------------------------------------------------------------------------------------
-
-uint64_t ConversationStore::Impl::sample_free() {
-    free_sample = filesystem_free_bytes(root);
-    return free_sample;
-}
-
-std::string ConversationStore::Impl::temp_name() {
-    return root + "/tmp/w" + std::to_string(::getpid()) + "-" + std::to_string(++name_counter);
-}
-
-std::string ConversationStore::Impl::intent_path() const {
-    std::array<uint8_t, 96> material{};
-    std::memcpy(material.data(), options.domain.data(), 32);
-    std::memcpy(material.data() + 32, options.model.data(), 32);
-    std::memcpy(material.data() + 64, options.engine.data(), 32);
-    return root + "/intent-" + sha256_hex(sha256(material.data(), material.size())).substr(0, 16);
-}
-
-bool ConversationStore::Impl::write_catalog(std::string& why) {
-    const std::vector<uint8_t> bytes = conversation_store_detail::catalog_encode(catalog);
-    const std::string tmp = temp_name();
-    if (!write_file(tmp, bytes.data(), bytes.size(), false, why)) return false;
-    if (::rename(tmp.c_str(), (root + "/catalog").c_str()) != 0) {
-        why = std::string("cannot replace the catalog: ") + std::strerror(errno);
-        std::string ignored;
-        remove_file(tmp, ignored);
-        return false;
-    }
-    return fsync_directory(root, why);
-}
-
-bool ConversationStore::Impl::arm_intent(std::string& why) {
-    // The durable claim that this execution domain has unfinished business.  It is created before the first reuse and
-    // cleared only by a clean close, so an unclean exit invalidates this domain instead of trusting its records.
-    const uint8_t marker[8] = {'S', 'T', 'C', 'S', 'I', 'N', 'T', '1'};
-    if (!write_file(intent_path(), marker, sizeof marker, false, why)) return false;
-    if (!fsync_directory(root, why)) return false;
-    intent_active = true;
-    return true;
-}
-
-void ConversationStore::Impl::clear_intent() {
-    std::string ignored;
-    if (remove_file(intent_path(), ignored)) {
-        if (fsync_directory(root, ignored)) intent_active = false;
-    }
-}
-
-bool ConversationStore::Impl::open_root(std::string& why) {
-    if (!make_directory(root, why)) return false;
-    if (!make_directory(root + "/objects", why)) return false;
-    if (!make_directory(root + "/manifests", why)) return false;
-    if (!make_directory(root + "/tmp", why)) return false;
-    if (!fsync_directory(root, why)) return false;
-    lock_fd = ::open((root + "/owner.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (lock_fd < 0) {
-        why = std::string("cannot open the store's lock file: ") + std::strerror(errno);
-        return false;
-    }
-    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
-        counters.lock_conflicts++;
-        why = "another process owns this store's root";
-        return false;
-    }
-    const std::string key_path = root + "/issuer.key";
-    std::vector<uint8_t> key;
-    if (path_exists(key_path)) {
-        if (!read_file(key_path, key, 1024, why)) return false;
-        if (key.size() != 32) {
-            why = "the issuer key file is not 32 bytes";
-            return false;
-        }
-    } else {
-        key.assign(32, 0);
-        fill_random(key.data(), key.size());
-        if (!write_file(key_path, key.data(), key.size(), true, why)) return false;
-        if (!fsync_directory(root, why)) return false;
-    }
-    std::memcpy(issuer_key.data(), key.data(), key.size());
-    return true;
-}
-
-bool ConversationStore::Impl::load_catalog(std::string& why) {
-    const std::string path = root + "/catalog";
-    Catalog loaded;
-    std::string detail;
-    bool cold = !path_exists(path);
-    if (!cold) {
-        std::vector<uint8_t> bytes;
-        if (!read_file(path, bytes, uint64_t(256) << 20, detail) ||
-            !conversation_store_detail::catalog_decode(bytes.data(), bytes.size(), loaded, detail)) {
-            // A catalog that cannot be trusted is cold caching: never a directory-based resurrection.
-            counters.corrupt_records++;
-            loaded = Catalog{};
-            cold = true;
-        } else if (!(loaded.issuer_key_digest == sha256(issuer_key.data(), issuer_key.size()))) {
-            counters.corrupt_records++;
-            loaded = Catalog{};
-            cold = true;
-        }
-    }
-    (void)cold;
-    catalog = std::move(loaded);
-    catalog.issuer_key_digest = sha256(issuer_key.data(), issuer_key.size());
-
-    // Register (or find) this execution domain, and decide whether its previous run was clean.
-    domain_index = uint32_t(catalog.domains.size());
-    for (uint32_t i = 0; i < catalog.domains.size(); ++i)
-        if (catalog.domains[i].digest == options.domain) {
-            domain_index = i;
-            break;
-        }
-    if (domain_index == catalog.domains.size()) {
-        CatalogDomain domain;
-        domain.digest = options.domain;
-        domain.epoch = 1;
-        catalog.domains.push_back(domain);
-        epoch = 1;
-    } else {
-        epoch = catalog.domains[domain_index].epoch;
-    }
-    if (path_exists(intent_path())) {
-        // The previous run of exactly this domain did not close cleanly: its records and every outstanding
-        // completion of its epoch are invalid, and only this domain is invalidated.
-        epoch += 1;
-        catalog.domains[domain_index].epoch = epoch;
-        counters.epoch_advances++;
-        std::vector<uint64_t> victims;
-        for (const auto& head : catalog.heads)
-            if (head.domain == domain_index) victims.push_back(head.head_id);
-        for (uint64_t head_id : victims) retire_head(head_id);
-    } else if (!catalog.heads.empty()) {
-        // A clean restart: records of a retired epoch are unreachable, so they are dropped rather than trusted.
-        std::vector<uint64_t> victims;
-        for (const auto& head : catalog.heads)
-            if (head.domain == domain_index && head.epoch != epoch) victims.push_back(head.head_id);
-        for (uint64_t head_id : victims) retire_head(head_id);
-    }
-    if (!arm_intent(why)) return false;
-    if (!write_catalog(why)) return false;
-    reclaim_files();
-    return true;
-}
-
-bool ConversationStore::Impl::reconcile(std::string& why) {
-    constexpr uint64_t kMaxScanEntries = 1u << 20;
-    constexpr uint64_t kMaxReclaimPerOpen = 65536;
-    // Every scratch file is garbage by construction: a durable write completes with a rename out of tmp/.
-    std::vector<std::string> names;
-    if (list_directory(root + "/tmp", names, why)) {
-        for (const auto& name : names) {
-            std::string ignored;
-            if (remove_file(root + "/tmp/" + name, ignored)) counters.recovered_orphans++;
-        }
-    }
-    // Count what is physically present first, so the shared quota reflects the real footprint even before the
-    // catalog is trusted.
-    std::map<Digest, uint64_t> present_objects;
-    std::map<Digest, uint64_t> present_manifests;
-    uint64_t scanned = 0;
-    std::vector<std::string> shards;
-    if (!list_directory(root + "/objects", shards, why)) return false;
-    for (const auto& shard : shards) {
-        if (shard.size() != 2) {
-            std::string ignored;
-            remove_file(root + "/objects/" + shard, ignored);
-            continue;
-        }
-        std::vector<std::string> files;
-        std::string nested;
-        if (!list_directory(root + "/objects/" + shard, files, nested)) continue;
-        for (const auto& file : files) {
-            const std::string path = root + "/objects/" + shard + "/" + file;
-            struct stat info {};
-            if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
-            if (++scanned > kMaxScanEntries) {
-                why = "the store holds more objects than it can account at startup";
-                return false;
-            }
-            charged += uint64_t(info.st_size);
-            Digest digest{};
-            if (file.size() == 64 && hex_to_bytes(file, digest) &&
-                sha256_hex(digest).compare(0, 2, shard) == 0)
-                present_objects.emplace(digest, uint64_t(info.st_size));
-        }
-    }
-    std::vector<std::string> manifests;
-    if (!list_directory(root + "/manifests", manifests, why)) return false;
-    for (const auto& name : manifests) {
-        const std::string path = root + "/manifests/" + name;
-        struct stat info {};
-        if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
-        if (++scanned > kMaxScanEntries) {
-            why = "the store holds more manifests than it can account at startup";
-            return false;
-        }
-        charged += uint64_t(info.st_size);
-        Digest digest{};
-        if (name.size() == 64 && hex_to_bytes(name, digest))
-            present_manifests.emplace(digest, uint64_t(info.st_size));
-    }
-    // Only the catalog authorizes a manifest, and only a manifest authorizes an object.
-    std::vector<uint64_t> dropped;
-    for (const auto& head : catalog.heads) {
-        const auto manifest = present_manifests.find(head.manifest_id);
-        ManifestMeta meta;
-        std::string detail;
-        if (manifest == present_manifests.end()) {
-            counters.corrupt_records++;
-            dropped.push_back(head.head_id);
-            continue;
-        }
-        if (!load_manifest(head.head_id, meta, detail)) {
-            counters.corrupt_records++;
-            dropped.push_back(head.head_id);
-            continue;
-        }
-        bool complete = true;
-        for (const auto& object : meta.objects)
-            if (present_objects.find(object.first) == present_objects.end()) {
-                complete = false;
-                break;
-            }
-        if (!complete) {
-            counters.corrupt_records++;
-            dropped.push_back(head.head_id);
-            continue;
-        }
-        head_manifest_bytes[head.head_id] = manifest->second;
-        std::vector<Digest>& list = head_objects[head.head_id];
-        list.reserve(meta.objects.size());
-        for (const auto& object : meta.objects) {
-            ObjectState& state = objects[object.first];
-            state.bytes = object.second;
-            state.refs += 1;
-            list.push_back(object.first);
-        }
-    }
-    for (uint64_t head_id : dropped) retire_head(head_id);
-    // Present but referenced by nothing is an orphan: account it, then remove it (bounded per open).
-    uint64_t removed = 0;
-    for (const auto& manifest : present_manifests) {
-        bool referenced = false;
-        for (const auto& head : catalog.heads)
-            if (head.manifest_id == manifest.first) {
-                referenced = true;
-                break;
-            }
-        if (referenced) continue;
-        std::string ignored;
-        if (removed < kMaxReclaimPerOpen && remove_file(manifest_path(root, manifest.first), ignored)) {
-            charged -= manifest.second;
-            ++removed;
-            counters.recovered_orphans++;
-        } else {
-            reclaimable += manifest.second;
-            counters.deferred_reclaims++;
-        }
-    }
-    for (const auto& object : present_objects) {
-        if (objects.count(object.first)) continue;
-        std::string ignored;
-        if (removed < kMaxReclaimPerOpen && remove_file(object_path(root, object.first), ignored)) {
-            charged -= object.second;
-            ++removed;
-            counters.recovered_orphans++;
-        } else {
-            reclaimable += object.second;
-            counters.deferred_reclaims++;
-        }
-    }
-    // Enforce the head limit and the metadata ceiling before serving anything.
-    while (catalog.heads.size() > options.head_limit) {
-        uint64_t victim = 0;
-        uint64_t oldest = 0;
-        for (const auto& head : catalog.heads) {
-            if (head.pinned) continue;
-            if (victim == 0 || head.published_order < oldest) {
-                victim = head.head_id;
-                oldest = head.published_order;
-            }
-        }
-        if (victim == 0) break;
-        counters.evictions++;
-        retire_head(victim);
-    }
-    recount_metadata();
-    counters.heads = uint64_t(catalog.heads.size());
-    counters.objects = uint64_t(objects.size());
-    counters.manifests = uint64_t(head_manifest_bytes.size());
-    counters.pending_delete_bytes = uint64_t(pending_reclaim.size());
-    reclaim_files();
-    return true;
-}
-
-bool ConversationStore::Impl::load_manifest(uint64_t head_id, ManifestMeta& out, std::string& why) const {
-    for (const auto& head : catalog.heads) {
-        if (head.head_id != head_id) continue;
-        std::vector<uint8_t> bytes;
-        if (!read_file(manifest_path(root, head.manifest_id), bytes, limits.max_manifest_bytes, why)) return false;
-        return conversation_store_detail::manifest_decode(bytes.data(), bytes.size(), limits, out, why);
-    }
-    why = "no retained head has that identity";
-    return false;
-}
-
-uint64_t ConversationStore::Impl::retire_head(uint64_t head_id) {
-    Retired retired;
-    for (size_t i = 0; i < catalog.heads.size(); ++i) {
-        if (catalog.heads[i].head_id != head_id) continue;
-        retired.manifest_id = catalog.heads[i].manifest_id;
-        retired.manifest_bytes = head_manifest_bytes.count(head_id) ? head_manifest_bytes[head_id] : 0;
-        catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
-        break;
-    }
-    uint64_t freed = retired.manifest_bytes;
-    const auto list = head_objects.find(head_id);
-    if (list != head_objects.end()) {
-        retired.objects = list->second;
-        for (const Digest& object : retired.objects) {
-            auto state = objects.find(object);
-            if (state == objects.end()) continue;
-            if (state->second.refs > 0) --state->second.refs;
-            if (state->second.refs == 0) {
-                reclaimable += state->second.bytes;
-                freed += state->second.bytes;
-            }
-        }
-        head_objects.erase(list);
-    }
-    head_manifest_bytes.erase(head_id);
-    head_leases.erase(head_id);
-    pending_reclaim.push_back(std::move(retired));
-    return freed;
-}
-
-void ConversationStore::Impl::reclaim_files() {
-    if (pending_reclaim.empty()) return;
-    std::string ignored;
-    for (const Retired& retired : pending_reclaim) {
-        if (digest_nonzero(retired.manifest_id) &&
-            remove_file(manifest_path(root, retired.manifest_id), ignored)) {
-            charged -= std::min(charged, retired.manifest_bytes);
-            counters.reclaimed_bytes += retired.manifest_bytes;
-        }
-        for (const Digest& object : retired.objects) {
-            const auto state = objects.find(object);
-            if (state != objects.end() && state->second.refs != 0) continue;
-            if (remove_file(object_path(root, object), ignored)) {
-                const uint64_t bytes = state != objects.end() ? state->second.bytes : 0;
-                charged -= std::min(charged, bytes);
-                reclaimable -= std::min(reclaimable, bytes);
-                counters.reclaimed_objects++;
-                counters.reclaimed_bytes += bytes;
-                if (state != objects.end()) objects.erase(state);
-            }
-        }
-    }
-    pending_reclaim.clear();
-    recount_metadata();
-}
-
-bool ConversationStore::Impl::take_fault(const char* step) {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (fault_step != step) return false;
-    fault_step.clear();
-    return true;
-}
-
-void ConversationStore::Impl::recount_metadata() {
-    uint64_t bytes = uint64_t(conversation_store_detail::catalog_encode(catalog).size());
-    bytes += uint64_t(objects.size()) * kObjectBytesEstimate;
-    for (const auto& entry : head_objects) bytes += uint64_t(entry.second.size()) * sizeof(Digest);
-    metadata = bytes;
-}
-
-} // namespace strata::core
-
+}  // namespace strata::core

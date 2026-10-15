@@ -343,7 +343,8 @@ public:
     // restore, and release is idempotent per reservation. Refusal is a safe cache
     // miss: the caller skips publication, not the request.
     bool try_reserve_lease(size_t bytes) {
-        if (bytes > budget_ - std::min(budget_, held_bytes_)) return false;
+        const size_t occupied = envelope_bytes();
+        if (occupied > budget_ || bytes > budget_ - occupied) return false;
         held_bytes_ += bytes;
         return true;
     }
@@ -366,7 +367,9 @@ public:
         reuse_ = {};
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
+        const size_t available = room(0);
+        if (enabled() && bytes_ <= available && candidate.bytes() <= available - bytes_)
+            reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);

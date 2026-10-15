@@ -192,11 +192,14 @@ Digest store_bucket_digest(const ConversationStoreOptions& options, const Conver
 // one quota.  What must match exactly is the interpretation, so a K/V payload carries its whole layout (see
 // object_scope_digest); token ids, image keys and running-state arrays are canonical by construction.
 Digest object_digest(const Digest& scope, uint16_t kind, uint64_t ordinal, uint64_t length, const uint8_t* bytes);
+Sha256 object_hasher(const Digest& scope, uint16_t kind, uint64_t ordinal, uint64_t length);
 
-// The canonical interpretation of one payload kind's bytes: the whole K/V layout for a K/V stream (its bytes are not
-// self-describing), a constant for a canonical stream.  Two payloads with the same scope, kind, ordinal and bytes
-// are the same physical object.
-Digest object_scope_digest(uint16_t kind, const KvMeta* kv);
+// Stable row interpretation and authorized model/conversation identity. Extent counts belong only in the
+// manifest: appending cells must not rename an unchanged prefix chunk.
+Digest object_scope_digest(uint16_t kind, const KvMeta* kv, const ConversationScope& authorization,
+                           const Digest& model);
+bool stream_object_identity(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
+                            const Digest& model, Digest& scope, uint64_t& ordinal, std::string& why);
 
 // Exact authorized-prefix digests of one token/image prefix, at the cut lengths a lookup needs.  Built once per
 // record (publish) or per query (lookup), then asked for any prefix length: the chain states at the image positions

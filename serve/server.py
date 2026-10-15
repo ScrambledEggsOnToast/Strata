@@ -76,6 +76,26 @@ MAX_RETRY_AFTER_S = 30  # bounded advisory backoff, never a readiness/completion
 TOKENIZER_FILES = ("vocab.json", "merges.txt", "token_type.json")   # what a prompt's tokenizer content identity is
 
 
+def prompt_text_chars(messages, tools) -> int:
+    """A lower bound of the characters the rendered prompt's own text holds: every string the request carries.
+
+    The preparation path's probe (Service.freeze_generation).  It walks the request's message and tool structures -
+    the strings a template embeds, and nothing else - without rendering or copying anything, so it cannot itself be
+    the allocation it is there to prevent.  A rendered prompt is never *smaller* than the strings it was made of,
+    which is what makes declining over it a refusal the demand's own token count would make too.
+    """
+    total, stack = 0, [messages, tools]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            total += len(value)
+        elif isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    return total
+
+
 def credential_fingerprint(credential: str) -> str:
     """A short fingerprint of the credential a request was authenticated with - never the credential's bytes.
 
@@ -879,8 +899,9 @@ class StrataEngine:
         if spec_policy not in ("static", "adaptive"):
             raise ValueError("STRATA_SPEC_POLICY must be static or adaptive")
         self.speculation_policy = None
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--conversation-cache-model-id")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.cache_model_id = paths.get("--conversation-cache-model-id", "")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         # The private conversation-offer channel of this incarnation (None before it is spawned, on a system
@@ -1475,10 +1496,17 @@ class StrataEngine:
         offered = sampling.get("_strata_cache_offer")
         if offered is not None:
             generation = sampling.get("_strata_cache_generation")
+            owner = sampling.get("_strata_cache_offer_owner")
             if (isinstance(offered, bool) or not isinstance(offered, int) or offered <= 0
-                    or isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0):
+                    or isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0
+                    or not isinstance(owner, conversation_offers.ConversationOfferLink)):
                 raise ValueError("invalid internal prepared conversation offer")
             keys += f" cache_offer={offered} cache_generation={generation}"
+        deadline_ns = sampling.get("_strata_cache_deadline_ns")
+        if deadline_ns is not None:
+            if isinstance(deadline_ns, bool) or not isinstance(deadline_ns, int) or not 0 < deadline_ns < 1 << 64:
+                raise ValueError("invalid internal request deadline")
+            keys += f" cache_deadline_ns={deadline_ns}"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -3433,6 +3461,30 @@ class ByteTokenizer:
                 i += 1
         return out
 
+    def encode_within(self, text, limit, parse_special=False, plain=()):
+        """`encode(text)`'s ids when they fit within `limit`, else None (never a prefix of them).
+
+        The same contract the pack's tokenizer implements for preparation (tools/strata_tokenizer.py), so a service
+        runs the same bounded path with either.
+        """
+        out, i = [], 0
+        while i < len(text):
+            for k, s in enumerate(self.SPECIALS):
+                if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
+                        a <= i < b for a, b in plain):
+                    if len(out) + 1 > limit:
+                        return None
+                    out.append(256 + k)
+                    i += len(s)
+                    break
+            else:
+                piece = text[i].encode("utf-8")
+                if len(out) + len(piece) > limit:
+                    return None
+                out.extend(piece)
+                i += 1
+        return out
+
     def decode(self, ids, errors="replace"):
         raw = bytearray()
         for t in ids:
@@ -3605,6 +3657,7 @@ class Service:
         self.tokenizer_dir = tokenizer_dir    # the artifacts a prompt's tokenizer content identity is taken from
         self.scope_lock = threading.Lock()
         self._render_identity = None          # computed once, and only when a persistent store asks for a scope
+        self._render_identity_checked = False
         self.supervised = os.environ.get("STRATA_SUPERVISED") == "1"
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -3674,6 +3727,8 @@ class Service:
         self.lifecycle_api = False
         self.lifecycles = collections.deque(maxlen=500)
         self.lifecycle_local = threading.local()
+        self.preparation = conversation_offers.PreparationBudget()   # the queued frontier's own preparation bytes
+        self._max_token_bytes = 0            # the longest token the vocabulary can emit (see max_token_bytes)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -3909,11 +3964,8 @@ class Service:
                     record["_cancel"].set()
                     raise AdmissionError("request timed out while queued", 408)
                 score = bool(record.get("_score"))
-                foreground = next((r for r in self.admission_waiters
-                                   if bool(r.get("_score")) == score and r["priority"] == "foreground"), None)
-                background = next((r for r in self.admission_waiters
-                                   if bool(r.get("_score")) == score and r["priority"] == "background"), None)
-                chosen = background if background is not None and (foreground is None or self.admission_foreground[score] >= 3) else foreground
+                order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score], 1)
+                chosen = order[0] if order else None
                 capacity = 1 if score else max(1, int(getattr(self.engine, "batch", 0) or 0))
                 active = sum(bool(r.get("_score")) == score for r in self.admission_active.values())
                 if chosen is record and active < capacity:
@@ -4536,17 +4588,23 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, limit=None) -> list[int] | None:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
-        the control tokens the template writes are control tokens."""
+        the control tokens the template writes are control tokens.
+
+        `limit` is the preparation-only bound (`freeze_generation`): the tokenizer then returns None rather than a
+        prompt over it, and every other caller leaves it None and gets the ids it always got.
+        """
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
+            return self.tok.encode(prompt, parse_special=True) if limit is None else \
+                self.tok.encode_within(prompt, limit, parse_special=True)
         prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+        return self.tok.encode(prompt, parse_special=True, plain=plain) if limit is None else \
+            self.tok.encode_within(prompt, limit, parse_special=True, plain=plain)
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -4627,11 +4685,13 @@ class Service:
         # loaded engine. Replacement tokenizer/template objects or template source
         # invalidate this namespace before native token/image/steering validation.
         key = self.scope_key()
-        if key is None:
+        model_id = getattr(self.engine, "cache_model_id", "")
+        render_id = self.render_identity() if key is not None else None
+        if key is None or re.fullmatch(r"[0-9a-f]{64}", model_id) is None or render_id is None:
             identity = [tenant, group, self.model, id(self.tok), self.template.source]
             return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
         identity = ["scc1", ["gateway" if gateway else "principal", tenant, credential_fingerprint(credential)],
-                    group, self.model, self.render_identity()]
+                    group, model_id, render_id]
         return hmac.new(key, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
 
     def scope_key(self) -> bytes | None:
@@ -4646,46 +4706,43 @@ class Service:
             return link
         return None
 
-    def render_identity(self) -> str:
-        """The content identity of what a prompt is rendered and tokenized with (computed once per server).
-
-        The template's source, the tokenizer's own artifacts and the tokenizer's shape: a re-exported template or a
-        replaced/updated tokenizer directory is a different conversation namespace, so records tokenized another way
-        are never reused.  What the model artifact is, authoritatively, is the native store's own execution-domain
-        key; this only names the content the prompt was made of, and it is only ever computed when a persistent
-        store asks for a stable scope.
-        """
+    def render_identity(self) -> str | None:
+        """Hash the complete tokenizer artifacts and rendering contract once; missing identity refuses restart reuse."""
         with self.scope_lock:
-            if self._render_identity is None:
-                h = hashlib.sha256()
-                h.update(b"scc1")
-                h.update(self.template.source.encode("utf-8", "surrogatepass"))
-                h.update(type(self.tok).__name__.encode("utf-8", "surrogatepass"))
-                control = getattr(self.tok, "control_tokens", ()) or ()
-                h.update(repr(sorted(str(t) for t in control)).encode("utf-8", "surrogatepass"))
-                files = 0
-                for name in TOKENIZER_FILES:
-                    path = Path(self.tokenizer_dir) / name if self.tokenizer_dir else None
-                    try:
-                        if path is None or not path.is_file():
-                            continue
-                        with open(path, "rb") as f:
-                            h.update(name.encode() + b"\0")
-                            for block in iter(lambda: f.read(1 << 20), b""):
-                                h.update(block)
-                        files += 1
-                    except OSError:
-                        continue
-                if not files:                       # no artifacts to read (the tests' byte tokenizer, say): the
-                    tokens = getattr(self.tok, "tokens", None)   # tokenizer's own shape is what is left to name
-                    if isinstance(tokens, (list, tuple)):
-                        h.update(b"tokens=" + str(len(tokens)).encode())
-                self._render_identity = h.hexdigest()
+            if self._render_identity_checked:
+                return self._render_identity
+            self._render_identity_checked = True
+            if not self.tokenizer_dir:
+                return None
+            fields = ["scc2", self.template.source, type(self.tok).__name__,
+                      sorted(str(t) for t in (getattr(self.tok, "control_tokens", ()) or ()))]
+            for name in TOKENIZER_FILES:
+                try:
+                    digest = hashlib.sha256()
+                    with open(Path(self.tokenizer_dir) / name, "rb") as stream:
+                        for block in iter(lambda: stream.read(1 << 20), b""):
+                            digest.update(block)
+                    fields.append([name, digest.hexdigest()])
+                except OSError:
+                    return None
+            self._render_identity = hashlib.sha256(
+                json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
             return self._render_identity
 
     # -- the queued frontier: preparing and offering a request before it is admitted --------------------------------
 
     OFFER_PATHS = ("/v1/chat/completions", "/v1/messages", "/v1/responses")   # the text generation endpoints
+    PREPARATION_ALLOWANCE_BYTES = 64 << 20   # everything this process's preparation may hold, native's own figure for
+                                             # its frontend (generate.cpp: kConversationOfferBytes, reserved twice by
+                                             # conversation_store_ram_limit): the frontier's reservations and the
+                                             # tokenizer's retained piece cache together stay inside it
+    PREPARED_BYTES_PER_TOKEN = 48       # one prepared token's own cost: the frozen id, its box and the sealed payload
+    PREPARED_TRANSIENT_PER_TOKEN = 48   # ... and the transient id list the bounded encode builds it from, alive at
+                                        # the same time (the reservation covers one freeze's whole peak)
+    PREPARED_FLOOR_BYTES = 1 << 20      # one prepared request's own cost: its record, digest and descriptor
+    PREPARED_TEXT_BYTES = 2 << 20       # ... and one prepared prompt's own text: the rendered prompt and the digest
+                                        # taken of the request that produced it are both this size at worst, and a
+                                        # longer text is not prepared early (see preparation_text_bound)
 
     def offers_ready(self) -> bool:
         """True when this incarnation has a channel whose store persists histories: only then is there anything to
@@ -4700,26 +4757,137 @@ class Service:
     def offer_stats(self) -> dict:
         """This incarnation's offer counters (for tests and the operators' own monitoring, never a client API)."""
         link = getattr(self.engine, "offers", None)
+        prepared = self.preparation.stats()
         if isinstance(link, conversation_offers.ConversationOfferLink):
-            return link.stats()
+            return {**link.stats(), **prepared}
         return {"store": False, "frontier": 0, "accepted": 0, "cancelled": 0, "rejected": 0,
                 "accepted_token_bytes": 0, "outstanding": 0, "outstanding_bytes": 0, "malformed": 0,
-                "received_fds": 0, "closed": True, "reader_error": None}
+                "received_fds": 0, "closed": True, "reader_error": None, **prepared}
 
-    def offer_position(self, record) -> int:
-        """How many preparable requests wait ahead of `record` in queue order (-1: it is not waiting at all).
+    @staticmethod
+    def selector_order(score: bool, waiters, foreground_count: int, limit: int) -> list:
+        """The admissions the selector would make next, in its own order: the queue frontier is a prefix of this.
 
-        Queue order is the arrival order of the admitted-bound waiters - the order the admission selector scans - and
-        preparation follows it, so no later request is prepared (or can be run) ahead of the head of the queue.
+        The rule `acquire_request` decides by - this score class's own waiters, its longest-waiting foreground one
+        first, and its longest-waiting background one as soon as three foreground admissions have gone by since the
+        last background one - so preparation and admission can never disagree about who is next.
         """
+        pending = [r for r in waiters if bool(r.get("_score")) == score]
+        order, counter = [], foreground_count
+        while pending and len(order) < limit:
+            foreground = next((r for r in pending if r["priority"] == "foreground"), None)
+            background = next((r for r in pending if r["priority"] == "background"), None)
+            chosen = background if background is not None and (foreground is None or counter >= 3) else foreground
+            if chosen is None:
+                break
+            order.append(chosen)
+            pending = [r for r in pending if r is not chosen]
+            counter = counter + 1 if chosen["priority"] == "foreground" else 0
+        return order
+
+    def offer_turn(self, record, link) -> bool:
+        """True when `record` is one of the admissions the selector would make next - the queue frontier's own turn.
+
+        Only those requests are prepared, and each one's preparation happens on its own thread while it waits: a
+        later waiter is never prepared ahead of the head, a group of waiters is not prepared because it was resolved
+        first, and nothing here changes the order admission itself would use.
+        """
+        score = bool(record.get("_score"))
         with self.admission_cv:
-            ahead = 0
-            for waiter in self.admission_waiters:
-                if waiter is record:
-                    return ahead
-                if waiter.get("_resolved") is not None:
-                    ahead += 1
-            return -1
+            if not any(w is record for w in self.admission_waiters):
+                return False
+            order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score],
+                                        self.offer_frontier(link))
+        return any(w is record for w in order)
+
+    def preparation_token_limit(self) -> int:
+        """The most tokens a prepared prompt may have: exactly the room the demand itself requires.
+
+        `prepare` refuses a prompt that leaves no room to answer in (`ctx - CTX_SLACK - len(ids) < 1`), and a
+        consumed prepared result is not checked again, so preparing a prompt past this would hand the engine one the
+        demand would have refused.  It is also why a bounded encode that reaches it is a *decline*: the demand path
+        renders and reports that same prompt in its own words.
+        """
+        context = self.context_size()
+        if self.request_context_tokens is not None:
+            context = min(context, self.request_context_tokens)
+        return context - CTX_SLACK - 1
+
+    def max_token_bytes(self) -> int:
+        """The longest token this vocabulary can emit, in byte-alphabet symbols: what one token may hide.
+
+        A byte-level BPE token is a run of mapped bytes, one symbol each, so its symbol length is the token's own
+        length.  A prompt's text can hide at most this many symbols in one token, which is what makes the text bound
+        below a refusal the demand would make too rather than a policy of its own.
+        """
+        if self._max_token_bytes:
+            return self._max_token_bytes
+        tokens = getattr(self.tok, "tokens", None)
+        longest = max((len(t) for t in tokens), default=1) if tokens else 1
+        for name in ("SPECIALS", "ALWAYS", "control_tokens"):
+            longest = max(longest, max((len(s) for s in getattr(self.tok, name, ()) or ()), default=1))
+        self._max_token_bytes = max(1, longest)
+        return self._max_token_bytes
+
+    def preparation_text_bound(self) -> int:
+        """The most text one prepared prompt may be rendered from (and digested), in characters.
+
+        The smaller of what `preparation_token_limit` tokens can possibly hide - a text past that cannot tokenize
+        within the limit, so the demand refuses that request anyway - and what one reservation's own text term pays
+        for.  `freeze_generation` checks it before the template renders a copy of the request, which is the first
+        allocation preparation would otherwise make of the whole prompt.
+        """
+        return max(1, min(self.preparation_token_limit() * self.max_token_bytes(), self.PREPARED_TEXT_BYTES))
+
+    def preparation_peak_bytes(self) -> int:
+        """What one freeze holds besides the tokens: the bounded encode's own single-piece peak (see the tokenizer).
+
+        Read from the tokenizer that enforces that bound, so the reservation cannot drift away from it.
+        """
+        peak = getattr(self.tok, "preparation_peak_bytes", None)
+        return int(peak()) if callable(peak) else 0
+
+    def preparation_cache_bytes(self) -> int:
+        """The share of the allowance the tokenizer's own piece cache is entitled to (never the reservations').
+
+        A fixed figure, not what the cache happens to hold: taking the cache's *bound* off the allowance is what
+        makes reservations and a cache that grows under them stay inside one allowance together.
+        """
+        share = getattr(self.tok, "cache_share_bytes", None)
+        return max(0, int(share())) if callable(share) else 0
+
+    def preparation_allowance(self) -> int:
+        """The bytes the frontier's own reservations may hold: the allowance less the tokenizer's cache share."""
+        return max(0, self.PREPARATION_ALLOWANCE_BYTES - self.preparation_cache_bytes())
+
+    def preparation_slot(self) -> tuple[int, int]:
+        """One frontier slot's worst case: the prepared bytes it may hold, and the payload descriptor's own bytes.
+
+        What preparing one whole-context prompt costs at its peak, not just what it keeps: the frozen ids and their
+        boxes, the transient list a bounded encode builds them from, the payload's descriptor, the rendered prompt,
+        its digest and the tokenizer's own piece structures.  The descriptor half is a separate budget - the sealed
+        payload's bytes, which native charges against the byte budget its HELLO states (see `reserve_preparation`).
+        """
+        context = max(1, self.context_size())
+        tokens = (self.PREPARED_BYTES_PER_TOKEN + self.PREPARED_TRANSIENT_PER_TOKEN) * context
+        return self.PREPARED_FLOOR_BYTES + tokens + 2 * self.preparation_text_bound() + self.preparation_peak_bytes(), \
+            4 * context
+
+    def reserve_preparation(self, record, link) -> bool:
+        """Take this request's preparation bytes (and its payload's descriptor bytes) before anything is rendered.
+
+        The frontier admits one such peak per request it prepares, and the whole frontier may not hold more than the
+        allowance native reserves for this process (whatever context the profile runs): beyond either, the
+        reservation is refused and the request simply renders at demand.
+        """
+        prepared, descriptor = self.preparation_slot()
+        limit = min(self.offer_frontier(link) * prepared, self.preparation_allowance())
+        return self.preparation.reserve(record["id"], prepared, descriptor, limit, link.metadata_bytes())
+
+    def release_preparation(self, record) -> None:
+        """Free what this request reserved (idempotent: the demand, a cancel and a timeout may all get here)."""
+        if record is not None:
+            self.preparation.release(record["id"])
 
     def resolve_for_offer(self, path: str, req: dict, images_gate=None) -> ResolvedGeneration | None:
         """The endpoint resolution of a request that is only queued, or None when it may not be prepared early.
@@ -4749,85 +4917,164 @@ class Service:
             return None
         return resolved
 
-    def prefetch_offer(self, record) -> None:
-        """Prepare and offer `record`'s queued request when it is on the frontier and the engine can serve it.
+    def prefetch_offer(self, record, path: str, req: dict, images_gate=None) -> None:
+        """Prepare and offer `record`'s queued request when it is the frontier's own turn and the engine can serve it.
 
         Runs on the queued request's own thread, outside every admission lock and without touching the engine's own
-        stdin: it may hold up nothing but itself.  Any failure leaves the request exactly as it was - the demand path
-        resolves, prepares and runs it as it always has, which is also what a missing preparation resource means.
+        stdin: it may hold up nothing but itself.  Nothing is resolved or rendered before this: only the requests the
+        selector would admit next are resolved, rendered and offered, in that order, and each one's preparation bytes
+        are reserved first.  Every failure - a request that may never be prepared early, a spent preparation budget, a
+        refusal - leaves the demand path exactly as it was: it resolves, prepares and runs the request as always.
         """
-        resolved = record.get("_resolved")
-        if resolved is None or record.get("_prepared") is not None:
+        if path not in self.OFFER_PATHS or record.get("_offer_declined"):
             return
         link = self.offer_link()
         if link is None or not link.store_enabled or record["_cancel"].is_set():
             return
-        if self.offer_position(record) >= self.offer_frontier(link):
-            return                                           # behind the frontier: nothing is prepared for it yet
-        ctx = int(getattr(self.engine, "max_context", 0) or 0)
-        if not self.loaded() or ctx <= 0:
+        if not self.offer_turn(record, link):
+            self.withdraw_offer(record)
+            return
+        if record.get("_prepared") is not None:
+            return
+        if not self.loaded() or int(getattr(self.engine, "max_context", 0) or 0) <= 0:
             return                                           # a queued request never starts or restarts the engine
+        if not self.reserve_preparation(record, link):
+            return                                           # the preparation budget is spent: render at demand
         try:
-            prepared = self.freeze_generation(resolved, ctx)
+            resolved = self.resolve_for_offer(path, req, images_gate=images_gate)
+            if resolved is None:
+                record["_offer_declined"] = True             # this request may never be prepared early at all
+                return
+            prepared = self.freeze_generation(resolved)
+            if prepared is None:
+                record["_offer_declined"] = True             # its own prompt cannot be prepared (never truncated)
+                return
+            if not self.offer_turn(record, link) or record["_cancel"].is_set():
+                prepared.release()
+                return
+            self.offer_prepared(record, link, prepared, resolved.req)
         except Exception:            # noqa: BLE001 - the demand path reports every refusal, in its own words
             return
-        self.offer_prepared(record, link, prepared)
+        finally:
+            if record.get("_prepared") is None:
+                self.release_preparation(record)             # nothing was frozen: the reservation goes with it
 
-    def freeze_generation(self, resolved: ResolvedGeneration, ctx: int) -> "conversation_offers.PreparedGeneration":
+    def freeze_generation(self, resolved: ResolvedGeneration) -> "conversation_offers.PreparedGeneration | None":
         """Render and tokenize `resolved`'s prompt now, for the generation that will consume it.
 
         This is the whole CPU text preparation of a queued request: no image, no temporary file, no vision worker, no
-        engine turn and no client I/O - everything that needs the request's own turn stays in the demand path.
-        """
-        digest = conversation_offers.generation_digest(resolved.messages, resolved.tools, resolved.kw,
-                                                       resolved.max_new_requested, resolved.force)
-        ids, thinking, max_new = self.prepare(resolved.messages, resolved.tools, resolved.kw,
-                                              resolved.max_new_requested, force=resolved.force, req=resolved.req)
-        return conversation_offers.PreparedGeneration(ids=tuple(ids), thinking=thinking, max_new=max_new,
-                                                      digest=digest, ctx=ctx)
+        engine turn and no client I/O - everything that needs the request's own turn stays in the demand path.  What it
+        resolves besides the ids is frozen with them: the pin boundary the engine's `pin=` will get and the steering
+        its `cvec=` will get, so the demand that consumes this result runs exactly what the store was offered.
 
-    def offer_prepared(self, record, link, prepared) -> None:
+        None when this request's own prompt cannot be prepared inside the allowance: its text is checked against
+        `preparation_text_bound` *before* the template renders a copy of it, everything it builds is tokenized by the
+        bounded `encode_within` (no list of every pre-tokenizer piece, no oversized piece merged, never a truncated
+        prompt), and the digest is taken only of a prompt that passed both - a refusal that cannot change while the
+        request waits, so `prefetch_offer` marks it and does not retry it.  The prompt is the demand's own: the
+        resolution above is what the demand resolves again, and a pin resolved here must not rewrite it (the
+        preparation runs on a request-local copy, which is also where its frozen boundary is read from).
+        """
+        tools = resolved.shown if resolved.api == "/v1/responses" else resolved.tools
+        limit = self.preparation_token_limit()
+        if limit < 1 or prompt_text_chars(resolved.messages, tools) + len(resolved.force or "") > self.preparation_text_bound():
+            return None
+        # Request-local: resolving the pin below writes this copy, never the request the demand owns (and this is
+        # also where the pin boundary the store was offered is read from).
+        request = dict(resolved.req)
+        result = self.prepare(resolved.messages, tools, resolved.kw, resolved.max_new_requested,
+                              force=resolved.force, req=request, limit=limit)
+        if result is None:
+            return None
+        ids, thinking, max_new = result
+        prefix = request.get("strata_prefix")
+        digest = conversation_offers.generation_digest(resolved.messages, tools, resolved.kw,
+                                                       resolved.max_new_requested, resolved.force)
+        return conversation_offers.PreparedGeneration(
+            ids=tuple(ids), thinking=thinking, max_new=max_new, digest=digest, ctx=self.context_size(),
+            prefix=dict(prefix) if isinstance(prefix, dict) else None,
+            want_cvec=self.request_want_cvec(resolved.req))
+
+    def context_size(self) -> int:
+        """The loaded engine's context: what a prepared result is validated against, and what bounds its reservation."""
+        return int(getattr(self.engine, "max_context", 0) or 0)
+
+    def cvec_loaded(self) -> bool:
+        """True when this engine has a control vector loaded (an engine without one prices nothing, whatever the
+        request's own `cvec=` says)."""
+        cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
+        return str(cvec) not in ("0", "", "None")
+
+    def request_want_cvec(self, req: dict) -> bool:
+        """The steering this request's native demand will run with, which its offer must declare.
+
+        Native keeps `cvec=1` when the key is absent and drops it (`cvec=0`) only when the request says
+        `experimental_speed_projection: false` - and an engine without a loaded control vector runs unsteered whatever
+        the key says.  The offer's flag has to be exactly this: the store keys its own candidate lookup by it.
+        """
+        on = req.get("experimental_speed_projection")
+        if on is None:
+            on = {**self.sampling_defaults, **self.shared}.get("experimental_speed_projection")
+        return on is not False or not self.cvec_loaded()
+
+    def offer_prepared(self, record, link, prepared, req: dict) -> None:
         """Tell the store about a prepared queued request and keep its answer on the request.
 
         The offer is advisory: when the store cannot take it (no scope, too long, its byte budget is spent, or the
         write fails) the prepared tokens are kept for the request itself and no generation key is bound later.
         """
-        scope = (record.get("_resolved").req or {}).get("_strata_cache_scope")
-        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        scope = (req or {}).get("_strata_cache_scope")
+        ctx = self.context_size()
         request_id = 0
         if scope and 0 < len(prepared.ids) <= ctx:
             request_id = link.next_request_id()
-            if not link.offer(request_id=request_id, generation=link.epoch(),
-                              deadline_ns=int(record["_deadline"] * 1_000_000_000), scope=scope,
-                              tokens=prepared.ids, token_limit=ctx):
+            if request_id and not link.offer(request_id=request_id, generation=link.epoch(),
+                                             deadline_ns=int(record["_deadline"] * 1_000_000_000), scope=scope,
+                                             tokens=prepared.ids, token_limit=ctx, want_cvec=prepared.want_cvec):
                 request_id = 0
         prepared.link = link
         prepared.generation = link.epoch()
         prepared.offer_id = request_id
         record["_prepared"] = prepared
 
-    def take_prepared(self, record, messages, tools, kwargs, max_new, force):
+    def take_prepared(self, record, messages, tools, kwargs, max_new, force, req=None):
         """The prepared result `record` may consume once, or None (nothing prepared, or it is not this prompt).
 
         A match means the generation asks for exactly what was prepared, in the same engine incarnation (the store
-        binds the scope's candidate to that offer, so the tokens must be the ones it already read).
+        binds the scope's candidate to that offer, so the tokens must be the ones it already read) *and* with the
+        same steering: the effective control vector can change while a request waits (the shared Chat settings), and
+        native selects and validates the candidate plan under the flag the offer declared.  Either way the
+        preparation is over here: its reservation is freed at once, and a result that is *not* this prompt's retires
+        its offer instead of holding one of the store's frontiers for a store never to use.
+
+        `req` is the demand's own resolved request, the one its `cvec=` will be taken from; without it (an internal
+        continuation that carries no request) the steering cannot be rechecked and the digest decides alone.
         """
         prepared = record.get("_prepared") if record else None
-        if prepared is None:
+        if prepared is None or prepared.consumed:
             return None
-        ctx = int(getattr(self.engine, "max_context", 0) or 0)
         digest = conversation_offers.generation_digest(messages, tools, kwargs, max_new, force)
+        reusable = prepared.reusable(digest, self.context_size())
+        if reusable and req is not None and prepared.want_cvec != self.request_want_cvec(req):
+            reusable = False               # the steering changed while it waited: the demand renders and prices its own
         prepared.consumed = True            # a prepared result is consumed once, whether or not it matches
-        return prepared if prepared.reusable(digest, ctx) else None
+        self.release_preparation(record)
+        if not reusable:
+            self.withdraw_offer(record)
+            return None
+        return prepared
 
     def bind_offer(self, req: dict, prepared) -> None:
         """Bind this generation to the offer the store already validated (or clear any client's fields of that name).
 
-        These two keys are internal: they are put here from the request's own prepared result, in the incarnation that
-        really offered it, and never from a client - exactly like the conversation scope.
+        These keys are internal: they are put here from the request's own prepared result, in the incarnation that
+        really offered it, and never from a client - exactly like the conversation scope.  The owner is the link
+        whose store validated the tokens: a replica layer dispatches the demand after this point and needs it to
+        keep an offer from reaching a replica that never offered it (see serve/replicas.py).
         """
         req.pop("_strata_cache_offer", None)
         req.pop("_strata_cache_generation", None)
+        req.pop("_strata_cache_offer_owner", None)
         if prepared is None or not prepared.offered or prepared.withdrawn:
             return
         link = self.offer_link()
@@ -4835,12 +5082,17 @@ class Service:
             return                                           # another incarnation: its own demand restore decides
         req["_strata_cache_offer"] = int(prepared.offer_id)
         req["_strata_cache_generation"] = int(prepared.generation)
+        req["_strata_cache_offer_owner"] = link
 
     def withdraw_offer(self, record) -> None:
         """Retire a prepared offer this request will not (or no longer does) need: its deadline, its client or its
-        cancellation ends the offer with it, so the store's two frontiers are never held by a finished request."""
-        prepared = record.get("_prepared") if record else None
-        if prepared is None or not prepared.offered or prepared.withdrawn:
+        cancellation ends the offer with it, so the store's two frontiers are never held by a finished request.  The
+        preparation's own reservation is freed here too, whether or not the demand ever consumed what it held."""
+        prepared = record.pop("_prepared", None) if record else None
+        if prepared is None:
+            return
+        self.release_preparation(record)
+        if not prepared.offered or prepared.withdrawn:
             return
         prepared.withdrawn = True
         link = prepared.link
@@ -4945,7 +5197,7 @@ class Service:
                                   max_new_requested=req.get("max_output_tokens") or 0, validator=validator,
                                   names=names, skipped=skipped, shown=shown)
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None, limit=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over.
@@ -4953,22 +5205,37 @@ class Service:
         A queued request this server already prepared (prefetch_offer, on the queue frontier) is consumed here: the
         demand path gets exactly the tokens the store was offered, and the prompt is not resolved or rendered a second
         time.  The two internal keys that bind the generation to that offer are put on `req` here, never taken from a
-        client, and only for the incarnation that really offered them."""
+        client, and only for the incarnation that really offered them.
+
+        `limit` is that same preparation's own bound (freeze_generation): the prompt is then built by the bounded
+        tokenizer and this returns None rather than an over-long prompt - the demand path leaves it None and gets its
+        ids and its own refusal, in its own words.  Everything else here (the room the answer needs, the forced
+        opening, the pin) is the demand's own arithmetic, on the same inputs the digest checked.
+        """
         record = getattr(self.lifecycle_local, "record", None)
-        prepared = self.take_prepared(record, messages, tools, kwargs, max_new, force)
+        prepared = self.take_prepared(record, messages, tools, kwargs, max_new, force, req=req)
         if prepared is not None:
             self.embeddings.path = None       # a prepared request is text-only (see resolve_for_offer)
+            ids, thinking, wanted = list(prepared.ids), prepared.thinking, prepared.max_new
             if req is not None:
                 self.bind_offer(req, prepared)
-            return list(prepared.ids), prepared.thinking, prepared.max_new
+                prepared.apply_to(req)        # the pin boundary the store was offered, not a second resolution
+            prepared.release()                # the demand owns the tokens now: the request keeps only the offer
+            return ids, thinking, wanted
         if req is not None:
             self.bind_offer(req, None)        # a re-rendered prompt never carries a stale offer's keys
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = self.encode_prompt(messages, tools, kwargs)
+        ids = self.encode_prompt(messages, tools, kwargs, limit)
+        if ids is None:
+            return None                       # preparation only: the prompt does not fit inside its allowance
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+            opening = (self.tok.encode(force, parse_special=True) if limit is None
+                       else self.tok.encode_within(force, limit - len(ids), parse_special=True))
+            if opening is None:
+                return None
+            ids.extend(opening)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -5047,12 +5314,15 @@ class Service:
             self.embeddings.path = combined             # first, so a half-written one is found as well
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
-            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+            prefix = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images), limit)
+            if prefix is None:              # preparation only: the pin's own head is over the allowance too
+                return None
+            req["strata_prefix"] = prefix
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
-    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
+    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False, limit=None) -> dict | None:
         """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
         short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
         I, "chars": N}` (the first N characters of message I's text: a document and its question in one message) or
@@ -5060,7 +5330,11 @@ class Service:
         (never evicted) and does not park the branch it leaves, so N questions cost one prefix.  Returns
         {"tokens": N} (what the engine's `pin=N` takes: always a prefix of the prompt's ids, the tokenizer's merge across
         the boundary included), or {} when the prefix cannot be marked (said in the log: the request is never refused for
-        it).  A malformed field is a 400."""
+        it).  A malformed field is a 400.
+
+        `limit` is the preparation's own token bound: the head this resolves against is tokenized under it as well,
+        and None then (rather than a partial answer) means "not prepared inside the allowance" - the demand resolves
+        this same spec without a bound and gets its pin as always."""
         keys = ("messages", "message", "chars", "tokens")
         if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
                 set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
@@ -5096,8 +5370,10 @@ class Service:
                 text = text[:cut]
             if changed:
                 text, plain = unmark_think_literals(text, self.literals)
-                return self.tok.encode(text, parse_special=True, plain=plain)
-            return self.tok.encode(text, parse_special=True)
+                return (self.tok.encode(text, parse_special=True, plain=plain) if limit is None else
+                        self.tok.encode_within(text, limit, parse_special=True, plain=plain))
+            return (self.tok.encode(text, parse_special=True) if limit is None else
+                    self.tok.encode_within(text, limit, parse_special=True))
 
         if "tokens" in spec:
             n = spec["tokens"]
@@ -5108,6 +5384,8 @@ class Service:
                       "prefix must leave at least the last one", flush=True)
                 return {}
             head = head_ids(messages[:k])
+            if head is None:
+                return None
             n = lcp(head, ids)
         else:
             i, chars = spec["message"], spec["chars"]
@@ -5117,6 +5395,8 @@ class Service:
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
             head = head_ids(cut)
+            if head is None:
+                return None
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
             print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
@@ -5581,8 +5861,7 @@ class Service:
                             if lifecycle is not None:
                                 lifecycle.setdefault("_response_work", []).append({**last, "output_tokens": n})
                             started = st.get("started", time.time())
-                            cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
-                            loaded = str(cvec) not in ("0", "", "None")
+                            loaded = self.cvec_loaded()
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
                             # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
@@ -5857,7 +6136,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         try:
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
+            # `req`: the same request this continuation belongs to, so a queued request's frozen steering is
+            # rechecked here too (and any prepared result this round cannot reuse is retired, not held).
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, req=req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
@@ -6735,6 +7016,7 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
+                    req["_strata_cache_deadline_ns"] = int(self.lifecycle["_deadline"] * 1_000_000_000)
                     # A client that stops consuming must not hold a resident slot forever in a socket write.
                     self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
                     self._watch_client(self.request_cancel)
@@ -6743,11 +7025,11 @@ def make_handler(svc: Service):
                     # names are dropped here, exactly like a client-supplied scope.
                     req.pop("_strata_cache_offer", None)
                     req.pop("_strata_cache_generation", None)
-                    resolved = svc.resolve_for_offer(path, req, self._no_local_images) if path in svc.OFFER_PATHS \
-                        else None
-                    if resolved is not None:
-                        self.lifecycle["_resolved"] = resolved
-                    svc.acquire_request(self.lifecycle, on_wait=self._prefetch_offer)
+                    req.pop("_strata_cache_offer_owner", None)
+                    # Nothing of the request is resolved, rendered or offered here: while it waits, each frontier
+                    # request prepares itself on its own thread, in the selector's own order.
+                    svc.acquire_request(self.lifecycle,
+                                        on_wait=lambda: self._prefetch_offer(path, req))
                     if self.record is not None:
                         with svc.status_lock:
                             self.record["queue_s"] += self.lifecycle["queue_s"]
@@ -7049,10 +7331,14 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
-        def _prefetch_offer(self):
-            """This queued request's one chance to prepare and offer itself while it waits (see prefetch_offer)."""
+        def _prefetch_offer(self, path, req):
+            """This queued request's chance to prepare and offer itself while it waits (see prefetch_offer).
+
+            Only the requests the admission selector would take next get here with work to do: the frontier's own
+            turn decides that, not this callback, and it never runs past it.
+            """
             if self.lifecycle is not None:
-                svc.prefetch_offer(self.lifecycle)
+                svc.prefetch_offer(self.lifecycle, path, req, images_gate=self._no_local_images)
 
         def _openai_mcp(self, req, tools, force):
             """The chat route's opt-in MCP block: the app's own page gate, the wait for servers still starting and the

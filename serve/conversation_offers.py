@@ -34,8 +34,9 @@ have been.  Nothing in this module may block a request: the send is bounded and 
 from __future__ import annotations
 
 import array
+import ctypes
+import errno
 import dataclasses
-import fcntl
 import hashlib
 import os
 import socket
@@ -43,6 +44,11 @@ import struct
 import sys
 import threading
 from typing import Sequence
+
+try:
+    import fcntl
+except ImportError:                       # the ordinary Windows frontend has no private Linux channel
+    fcntl = None
 
 MAGIC = b"SCC1"
 VERSION = 1
@@ -60,11 +66,12 @@ FLAG_WANT_CVEC = 1 << 0                 # OFFER: this request wants its control 
 OFFER_FD_ENV = "STRATA_CONVERSATION_OFFER_FD"
 SEND_TIMEOUT_S = 0.5                    # an advisory send is bounded: it may never hold a queued request for long
 CLOSE_TIMEOUT_S = 2.0                   # how long close() waits for the reader thread
+OFFER_ID_MAX = (1 << 63) - 1            # the private id space: native-only demand reads use the high bit, so an
+                                        # offer is never at or above it (the two must not collide on any one key)
+RECV_FLAGS = getattr(socket, "MSG_CMSG_CLOEXEC", 0)   # a descriptor this process receives is never inherited by an exec
+FD_SPACE = 4 * 8                        # descriptors a received message may carry (this channel expects none at all:
+                                        # anything more is refused as truncated rather than half-delivered)
 
-# The channel needs a Linux socketpair of SEQPACKET sockets and memfd payloads.  Anywhere else the frontend keeps
-# its ordinary demand path: no offers, no persistent scope, no fd inherited by the engine.
-SUPPORTED = (os.name == "posix" and sys.platform.startswith("linux") and hasattr(os, "memfd_create")
-             and hasattr(socket, "SOCK_SEQPACKET"))
 
 
 class OfferProtocolError(ValueError):
@@ -117,46 +124,83 @@ def hello_payload(hello: Hello) -> bytes:
                        hello.issuer_key)
 
 
+# Linux UAPI values are stable even when Python was built against older headers.
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+PAYLOAD_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
+_libc_memfd = None
+if sys.platform == "linux" and not hasattr(os, "memfd_create"):
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _libc_memfd = getattr(_libc, "memfd_create", None)
+    if _libc_memfd is not None:
+        _libc_memfd.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        _libc_memfd.restype = ctypes.c_int
+
+SUPPORTED = (sys.platform == "linux" and hasattr(socket, "SOCK_SEQPACKET") and fcntl is not None
+             and (hasattr(os, "memfd_create") or _libc_memfd is not None))
+
+
+def _token_memfd() -> int:
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create("strata-conversation-offer", 0x0001 | 0x0002)
+    if _libc_memfd is None:
+        raise OSError(errno.ENOSYS, "Linux memfd_create is unavailable")
+    fd = _libc_memfd(b"strata-conversation-offer", 0x0001 | 0x0002)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 def sealed_token_payload(tokens: Sequence[int]) -> int:
     """A sealed, read-only memfd holding exactly `tokens` as little-endian int32: the caller closes the descriptor.
 
     Sealing (SHRINK/GROW/WRITE/SEAL) fixes the length and the bytes: the store may map it and read it, and no one -
     the frontend included - can change it afterwards.  The descriptor handed over is a read-only duplicate, so the
-    receiver cannot be given a writable payload by accident (`/proc` is not always mounted: then the file's own
-    write seal is the guarantee, and the original descriptor is returned).
+    receiver cannot be given a writable payload by accident. Reopening through /proc is required;
+    if unavailable, the optional offer is refused instead of sending a writable descriptor.
     """
-    data = array.array("i", [int(t) for t in tokens])
+    data = array.array("i", tokens)
     if data.itemsize != 4:
         raise OfferProtocolError("this interpreter's C int is not 32 bits")
     if sys.byteorder != "little":
         data.byteswap()
-    fd = os.memfd_create("strata-conversation-offer", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    fd = _token_memfd()
     try:
-        view = memoryview(data.tobytes())
+        view = memoryview(data).cast("B")
         while view:
             written = os.write(fd, view)
             if written <= 0:
                 raise OSError("the token payload could not be written")
             view = view[written:]
         os.lseek(fd, 0, os.SEEK_SET)
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
-        read_only = _read_only_dup(fd)
+        fcntl.fcntl(fd, F_ADD_SEALS, PAYLOAD_SEALS)
+        read_only = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_CLOEXEC)
+        # The descriptor that leaves this process is validated, not assumed: a writable one would let the receiver
+        # change a prompt the store already validated, and a short one would be mapped past its own bytes.
+        if fcntl.fcntl(read_only, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+            raise OfferProtocolError("the sealed payload's descriptor is not read-only")
+        if os.fstat(read_only).st_size != 4 * len(tokens):
+            raise OfferProtocolError("the sealed payload is not the size of its tokens")
     except BaseException:
         os.close(fd)
         raise
-    if read_only is None:
-        return fd
     os.close(fd)
     return read_only
 
 
-def _read_only_dup(fd: int) -> int | None:
-    """A read-only descriptor for the same sealed payload, or None when this system cannot reopen it."""
+def _cloexec(fd: int) -> None:
+    """A received descriptor is marked close-on-exec before it is closed: ownership is explicit, never inherited."""
+    if fcntl is None:
+        return
     try:
-        return os.open(f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_CLOEXEC)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        if not flags & fcntl.FD_CLOEXEC:
+            fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
     except OSError:
-        return None
+        pass
+
+
 
 
 def generation_digest(messages, tools, kwargs, max_new, force) -> str:
@@ -178,7 +222,9 @@ class PreparedGeneration:
 
     `offer_id` is nonzero only when the payload also reached the native store; `withdrawn` and `consumed` keep the
     offer's lifetime tied to this request (its deadline, its client and its cancellation) instead of the request
-    object's.
+    object's.  `prefix` and `want_cvec` are the *resolved* parts of the endpoint that the offer was made with - the
+    pin boundary the engine's `pin=` gets and the steering its `cvec=` gets - so the demand that consumes this result
+    runs exactly what the store already validated instead of resolving a second request and changing either.
     """
 
     ids: tuple[int, ...]
@@ -191,6 +237,9 @@ class PreparedGeneration:
     generation: int = 0
     consumed: bool = False
     withdrawn: bool = False
+    prefix: dict | None = None                 # the resolved `strata_prefix` ({"tokens": N}, or {} when it cannot
+                                               # be marked); None when this request declared no pin at all
+    want_cvec: bool = True                     # the steering the offer declared: native's own cvec= for this request
 
     @property
     def offered(self) -> bool:
@@ -199,6 +248,68 @@ class PreparedGeneration:
     def reusable(self, digest: str, ctx: int) -> bool:
         """True when the generation asking for this result asks for exactly it, in the same engine incarnation."""
         return not self.consumed and self.digest == digest and self.ctx == ctx
+
+    def apply_to(self, req: dict) -> None:
+        """Put the frozen resolution onto the demand's own request: the pin boundary the offer was made with.
+
+        The demand path runs this request's resolution again (it owns every refusal's own words), so the pin it
+        resolved on the frontier's thread would otherwise be replaced - or never reach the wire - and the engine's
+        `pin=` could name a different boundary than the tokens the store read.  The steering needs no key here: the
+        offer already declared it and the request's own `cvec=` is what the offer's flag was derived from.
+        """
+        if self.prefix is not None:
+            req["strata_prefix"] = dict(self.prefix)
+
+    def release(self) -> None:
+        """Drop what only *preparation* held once the demand owns the tokens: the ids, their digest and the pin."""
+        self.ids = ()
+        self.digest = ""
+        self.prefix = None
+
+
+class PreparationBudget:
+    """The bytes one incarnation may hold in prepared-but-unconsumed queued requests, reserved before rendering.
+
+    A queued request reserves its own worst case - the frozen ids, their boxes and the sealed payload's descriptor -
+    *before* anything is resolved or rendered, and the reservation is freed when the demand takes the tokens over
+    (or when the request is cancelled, times out or finishes without them).  So preparation can never allocate past
+    the frontier's own bound, a refused reservation means "render at demand", and the count is what `stats()` tells
+    an operator.  The store's own metadata budget is reserved in the same step: a payload it would refuse must not be
+    sealed and mapped first.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._held: dict[object, tuple[int, int]] = {}    # request key -> (prepared bytes, payload descriptor bytes)
+        self.bytes = 0
+        self.descriptor_bytes = 0
+        self.refused = 0
+
+    def reserve(self, key, nbytes: int, descriptor_bytes: int, limit: int, descriptor_limit: int) -> bool:
+        """Hold this request's bytes, or refuse (counted) when either budget cannot take them."""
+        with self._lock:
+            held, held_descriptor = self._held.get(key, (0, 0))
+            if (self.bytes - held + nbytes > limit
+                    or (descriptor_limit and self.descriptor_bytes - held_descriptor + descriptor_bytes
+                        > descriptor_limit)):
+                self.refused += 1
+                return False
+            self._held[key] = (nbytes, descriptor_bytes)
+            self.bytes += nbytes - held
+            self.descriptor_bytes += descriptor_bytes - held_descriptor
+            return True
+
+    def release(self, key) -> None:
+        """Free a reservation (idempotent: a key that holds nothing is already released)."""
+        with self._lock:
+            held, held_descriptor = self._held.pop(key, (0, 0))
+            self.bytes -= held
+            self.descriptor_bytes -= held_descriptor
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"prepared_bytes": self.bytes, "prepared_descriptor_bytes": self.descriptor_bytes,
+                    "prepared_requests": len(self._held), "preparation_refused": self.refused}
 
 
 class ConversationOfferLink:
@@ -307,8 +418,15 @@ class ConversationOfferLink:
     # -- what the frontend sends ------------------------------------------------------------------------------------
 
     def next_request_id(self) -> int:
-        """A nonzero id no offer of this incarnation has used (the native side refuses a duplicate)."""
+        """A nonzero id no offer of this incarnation has used, or 0 once every id it may use is spent.
+
+        Native demand reads of the same store own the high half of the id space (bit 63 set), so an offer id is
+        kept strictly below `OFFER_ID_MAX`: the two allocators can then never name the same request, whatever order
+        the store sees their work in.  An exhausted incarnation prepares nothing more (0: no offer).
+        """
         with self._lock:
+            if self._next_id >= OFFER_ID_MAX:
+                return 0
             self._next_id += 1
             return self._next_id
 
@@ -326,7 +444,8 @@ class ConversationOfferLink:
             with self._lock:
                 self.rejected += 1
             return False
-        if request_id <= 0 or generation <= 0 or generation != self.epoch() or not self.store_enabled:
+        if (not 0 < request_id <= OFFER_ID_MAX or generation <= 0 or generation != self.epoch()
+                or not self.store_enabled):
             with self._lock:
                 self.rejected += 1
             return False
@@ -394,6 +513,9 @@ class ConversationOfferLink:
             self._outstanding_bytes = max(0, self._outstanding_bytes - entry[1])
         payload = HEADER.pack(MAGIC, VERSION, TYPE_CANCEL, request_id, generation, 0, 0, 0, b"\0" * SCOPE_BYTES)
         if not self._send(payload, None):
+            # Disconnect releases the native frontier even when this CANCEL could
+            # not be delivered; silently forgetting it would strand that slot.
+            self.close()
             return False
         with self._lock:
             self.cancelled += 1
@@ -464,7 +586,7 @@ class ConversationOfferLink:
                 if self._closed:
                     return
             try:
-                payload, fds = self._recv()
+                payload, fds, truncated = self._recv()
             except OSError as e:
                 with self._lock:
                     if not self._closed:                     # a close is not an error worth remembering
@@ -472,16 +594,26 @@ class ConversationOfferLink:
                 return
             if payload is None:
                 return                                   # the engine closed its end (or this link was closed)
-            for fd in fds:                               # the store never sends descriptors to us: close them at once
+            # A descriptor is never expected on this channel, and a message whose descriptors the kernel had to cut
+            # is not a message at all: every descriptor delivered is closed here, exactly once, and the message is
+            # refused - never half-used, and never leaked into an engine this process later spawns.
+            for fd in fds:
+                _cloexec(fd)
                 try:
                     os.close(fd)
                 except OSError:
                     pass
                 with self._lock:
                     self.received_fds += 1
-            if fds or not payload:                       # only a read timeout and an unexpected descriptor land here
+            if fds or truncated:
                 with self._lock:
-                    self.malformed += 1 if fds else 0
+                    self.malformed += 1
+                    first = self.malformed == 1
+                if first:                                    # one line per failure kind, not one per message
+                    self._note(("an unexpected descriptor was refused and closed" if fds else
+                                "a message whose descriptors were truncated was refused"))
+                continue
+            if not payload:                              # only a read timeout lands here
                 continue
             if self._hello is not None:
                 with self._lock:
@@ -501,21 +633,30 @@ class ConversationOfferLink:
                         % (hello.frontier, hello.metadata_bytes, hello.generation)) if hello.store_enabled else
                        "the engine has no persistent conversation store: prompts stay in this process")
 
-    def _recv(self) -> tuple[bytes | None, list[int]]:
-        """One datagram and any descriptors it carried (None when the peer closed its end)."""
+    def _recv(self) -> tuple[bytes | None, list[int], bool]:
+        """One datagram, the descriptors it carried (none are expected) and whether the control data was cut.
+
+        A descriptor array the kernel could not deliver whole is reported as truncated: its partial tail is not a
+        descriptor at all, and the descriptors that did arrive are the caller's to close.
+        """
         try:
-            payload, ancillary, _flags, _address = self._parent.recvmsg(HEADER_BYTES, socket.CMSG_SPACE(4 * 8))
+            payload, ancillary, flags, _address = self._parent.recvmsg(
+                HEADER_BYTES, socket.CMSG_SPACE(FD_SPACE), RECV_FLAGS)
         except socket.timeout:
-            return b"", []
+            return b"", [], False
         except OSError:
             raise
         if not payload:
-            return None, []
+            return None, [], False
         fds: list[int] = []
+        truncated = bool(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
         for level, kind, data in ancillary:
             if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                fds.extend(array.array("i", data[:len(data) - (len(data) % 4)]).tolist())
-        return payload, fds
+                whole, remainder = divmod(len(data), 4)
+                if remainder:
+                    truncated = True
+                fds.extend(array.array("i", data[:whole * 4]).tolist())
+        return payload, fds, truncated
 
 
 def _scope_bytes(scope: str) -> bytes:

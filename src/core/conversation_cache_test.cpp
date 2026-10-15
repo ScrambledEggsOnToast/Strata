@@ -977,21 +977,23 @@ int main() {
         original.checkpoints.back().gdn.resize(64, 12);
         original.kv.push_back(ConversationKv{});
         original.kv.back().k.resize(4096, 13);
-        const std::vector<uint8_t> before_gdn = original.live.gdn.read();
-        const std::vector<uint8_t> before_k = original.kv.back().k.read();
+        const auto before_gdn = original.live.gdn.read();
+        std::vector<uint8_t> before_k(original.kv.back().k.size());
+        original.kv.back().k.read(before_k.data(), 0, before_k.size());
         auto lease = conversation_image_freeze_share(original);
+        std::vector<uint8_t> leased_k(lease->kv.back().k.size());
+        lease->kv.back().k.read(leased_k.data(), 0, leased_k.size());
         check(lease != nullptr && lease->scope == original.scope && lease->live.ids == original.live.ids &&
               lease->checkpoints.size() == original.checkpoints.size() &&
               lease->checkpoints.back().ids == original.checkpoints.back().ids &&
               lease->live.gdn.read() == before_gdn && lease->kv.size() == 1 &&
-              lease->kv.back().k.read() == before_k,
+              leased_k == before_k,
               "a frozen alias carries the image's metadata and bytes");
         check(original.live.gdn.sealed() && original.live.ple.sealed() &&
               original.checkpoints.back().gdn.sealed() && original.kv.back().k.frozen(),
               "freezing seals every state array and freezes every buffer");
-        check(original.live.gdn.data() == lease->live.gdn.data() &&
-              original.kv.back().k.data() == lease->kv.back().k.data(),
-              "the alias shares the frozen allocations instead of copying the payload");
+        check(original.live.gdn.data() == lease->live.gdn.data(),
+              "the alias shares the frozen state instead of copying the payload");
         // A write through the image after the lease exists can only reach the lease's bytes if it did not detach.
         auto* gdn_bytes = original.live.gdn.write().data();
         gdn_bytes[0] = 0xEE;
@@ -1007,7 +1009,7 @@ int main() {
         nested.checkpoints.back().stage_parts.push_back(ConversationCheckpoint{});
         nested.checkpoints.back().stage_parts.back().ple.resize(64, 5);
         auto nested_alias = conversation_image_freeze_share(nested);
-        check(nested.stage_images.back().live.dead.frozen() &&
+        check(nested.stage_images.back().live.dead.sealed() &&
               nested.checkpoints.back().stage_parts.back().ple.sealed() &&
               nested_alias->stage_images.back().live.dead.data() ==
                   nested.stage_images.back().live.dead.data() &&
@@ -1021,7 +1023,7 @@ int main() {
         auto source = image({5, 6, 7});
         source.live.tails.resize(256, 21);
         auto copy = source.frozen_alias();
-        check(!source.live.tails.frozen(), "a capture that was never frozen is not reported as frozen");
+        check(!source.live.tails.sealed(), "a capture that was never frozen is not reported as frozen");
         check(copy.live.tails.read() == source.live.tails.read(), "the fallback alias starts equal");
         check(copy.live.tails.data() != source.live.tails.data(),
               "the fallback alias owns its own bytes, so the source is free to move on");
@@ -1041,6 +1043,10 @@ int main() {
         check(!cache.try_reserve_lease(1), "a lease cannot exceed the budget");
         check(!cache.can_fit(unit) && !cache.reserve_snapshot(unit) && !cache.put(image({9, 8, 7})),
               "parking and capture admission both stop while the envelope is fully leased");
+        std::vector<ConversationKv> retained(1);
+        retained[0].k.resize(64);
+        cache.retain(std::move(retained), 3);
+        check(cache.retained_bytes() == 0, "retained K/V cannot spend a leased envelope again");
         cache.release_lease(unit);
         check(cache.leased_bytes() == unit * 2 && cache.can_fit(unit),
               "releasing part of a lease restores exactly that much admission");
@@ -1053,6 +1059,8 @@ int main() {
         parked.live.gdn.resize(4096, 3);
         check(cache.put(std::move(parked)), "park the image that will be published");
         const size_t parked_bytes = cache.bytes();
+        check(!cache.try_reserve_lease(unit * 3 - parked_bytes + 1),
+              "a lease cannot spend bytes already occupied by parked histories");
         auto published = image({4, 5, 6, 7});
         published.live.gdn.resize(4096, 3);
         auto alias = conversation_image_freeze_share(published);

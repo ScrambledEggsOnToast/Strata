@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import threading
 
 import regex
 
@@ -114,6 +115,8 @@ class Tokenizer:
         # Initialize once, rather than allocating a default dict and looking it up
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}
+        self._cached_bytes = 0
+        self._piece_lock = threading.Lock()
         self._bytes_cache: dict[int, bytes] = {}
 
     @staticmethod
@@ -212,26 +215,79 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s in parts if s is not None]
 
+    # ---- the preparation bound ----------------------------------------------------------------------------------
+    # A *bounded* encode (`encode_within`) is the preparation-only one: the frontend prepares a queued request and
+    # offers its tokens to the native store before the request is admitted, under a fixed allowance for everything
+    # that preparation holds (serve/server.py: PREPARATION_ALLOWANCE_BYTES - native's own 64 MiB, generate.cpp's
+    # kConversationOfferBytes).  Two numbers make an encode fit inside it: the token count the caller states, and
+    # this cap on one pre-tokenizer piece - a single piece's own merge structures cost many times its length, so a
+    # piece bigger than the cap is declined before it is mapped or merged, not after.
+    PREPARATION_PIECE_MAX_BYTES = 16 << 10   # mapped symbols (one byte each) one piece of a bounded encode may have
+    PIECE_PEAK_PER_BYTE = 160                # what one piece's own structures cost at worst, per mapped symbol:
+                                             # `parts`, `nxt`, `prv` (24 B a symbol) plus one heap entry a symbol
+                                             # (~100 B, each holding its two symbols) plus the mapped string itself
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
+    # The cache is the other half of that allowance: what this tokenizer retains for itself across requests.  It is a
+    # fixed share (never the reservation side), with its own bound in bytes - a cache that grows under a live
+    # reservation must not be able to take the two past the one allowance.
+    CACHE_SHARE_BYTES = 16 << 20             # the most the piece cache may retain (see cache_share_bytes)
+    CACHED_TOKEN_BYTES = 40                  # one cached id's own cost: the reference, the box and the list's share
+    CACHED_PIECE_BYTES = 128                 # ... plus one remembered piece's: its key string, dict entry and list
+
+    def preparation_peak_bytes(self) -> int:
+        """What one bounded encode holds besides the ids it returns: the one piece it is merging at the time.
+
+        The frontend's preparation reservation pays for this (serve/server.py: Service.preparation_slot), so it is
+        read from here rather than repeated there.
+        """
+        return self.PREPARATION_PIECE_MAX_BYTES * self.PIECE_PEAK_PER_BYTE
+
+    def cache_share_bytes(self) -> int:
+        """The share of the preparation allowance this tokenizer's own piece cache may use (0: it keeps nothing).
+
+        Fixed, not what the cache happens to hold: the frontend takes it off the allowance it admits reservations
+        against (Service.preparation_allowance), which is what makes the two together stay inside one allowance
+        whatever the cache did before.
+        """
+        return self.CACHE_SHARE_BYTES
+
+    def retained_bytes(self) -> int:
+        """What the piece cache holds right now (never more than `cache_share_bytes`; for diagnostics and tests)."""
+        with self._piece_lock:
+            return self._cached_bytes
+
+    def _piece_token_ids(self, piece: str, raw: bytes | None = None) -> list[int]:
+        """The ids one pre-tokenizer piece maps to, merged once and then looked up.
+
+        A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are not merged
+        again: `raw` is the piece's UTF-8 bytes, which a caller that already has them passes (the mapping is theirs).
+        """
+        cache = self._piece_ids
+        got = cache.get(piece)
+        if got is None:
+            mapped = "".join(BYTE_TO_UNICODE[b] for b in (raw if raw is not None else piece.encode("utf-8")))
+            got = []
+            for tok in self._bpe(mapped):
+                i = self.ids.get(tok)
+                if i is None:
+                    raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                got.append(i)
+            cost = (sys.getsizeof(piece) + sys.getsizeof(got) +
+                    len(got) * self.CACHED_TOKEN_BYTES + self.CACHED_PIECE_BYTES)
+            with self._piece_lock:
+                existing = cache.get(piece)
+                if existing is not None:
+                    return existing
+                if len(cache) < self.PIECE_CACHE_MAX and self._cached_bytes + cost <= self.cache_share_bytes():
+                    cache[piece] = got
+                    self._cached_bytes += cost
+        return got
 
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
-        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
-        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
-        cache = self._piece_ids
+        ids_of = self._piece_token_ids
         for piece in self._re.findall(text):
-            got = cache.get(piece)
-            if got is None:
-                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-                got = []
-                for tok in self._bpe(mapped):
-                    i = self.ids.get(tok)
-                    if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                    got.append(i)
-                if len(cache) < self.PIECE_CACHE_MAX:
-                    cache[piece] = got
-            out.extend(got)
+            out.extend(ids_of(piece))
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
@@ -272,6 +328,76 @@ class Tokenizer:
         if pos < len(text):
             out.extend(self._encode_plain(text[pos:]))
         return out
+
+    def _encode_plain_within(self, text: str, limit: int) -> list[int] | None:
+        """`_encode_plain`'s ids when the whole `text` fits within `limit` tokens, else None - never a prefix.
+
+        Iterating the matches (`finditer`) instead of listing them (`findall`) is what makes the bound real:
+        nothing but the piece being merged is ever materialised, and a piece longer than
+        `PREPARATION_PIECE_MAX_BYTES` is declined before it is mapped or merged at all.
+        """
+        cap = self.PREPARATION_PIECE_MAX_BYTES
+        out: list[int] = []
+        for m in self._re.finditer(text):
+            if m.end() - m.start() > cap:
+                return None
+            piece = m.group(0)
+            raw = piece.encode("utf-8")
+            if len(raw) > cap:
+                return None
+            got = self._piece_token_ids(piece, raw)
+            if len(out) + len(got) > limit:
+                return None                 # the whole text's ids would pass the limit: none of them are offered
+            out.extend(got)
+        return out
+
+    def _encode_matching_within(self, text: str, pat, plain, limit: int) -> list[int] | None:
+        """`_encode_matching`'s ids within `limit`, else None: the same split of literals and plain spans, bounded."""
+        if pat is None:
+            return self._encode_plain_within(text, limit)
+        out: list[int] = []
+        pos = 0
+        span_sequence = isinstance(plain, (list, tuple)) and bool(plain)
+        if span_sequence:
+            spans = iter(sorted(plain))
+            upcoming = next(spans, None)
+            plain_end = 0
+        for m in pat.finditer(text):
+            start = m.start()
+            if span_sequence:
+                while upcoming is not None and upcoming[0] <= start:
+                    plain_end = max(plain_end, upcoming[1])
+                    upcoming = next(spans, None)
+                if start < plain_end:
+                    continue
+            elif plain and any(a <= start < b for a, b in plain):
+                continue
+            if start > pos:
+                run = self._encode_plain_within(text[pos:start], limit - len(out))
+                if run is None:
+                    return None
+                out.extend(run)
+            if len(out) + 1 > limit:
+                return None
+            out.append(self.special_tokens[m.group(0)])
+            pos = m.end()
+        if pos < len(text):
+            run = self._encode_plain_within(text[pos:], limit - len(out))
+            if run is None:
+                return None
+            out.extend(run)
+        return out
+
+    def encode_within(self, text: str, limit: int, parse_special: bool = False, plain=()) -> list[int] | None:
+        """`encode(text)`'s ids when the whole prompt fits within `limit` tokens, else None - never a truncated one.
+
+        The preparation-only entry point (serve/server.py's `Service.freeze_generation`): a prepared prompt is
+        offered to the native store before its request is admitted, so neither a prompt the demand would refuse for
+        being over the context nor a shortened one may be produced here.  The ids it returns are exactly `encode`'s,
+        the cache is the same one, and everything that owns its whole request keeps calling `encode`.
+        """
+        return self._encode_matching_within(text, self._special_re if parse_special else self._always_re, plain,
+                                            limit)
 
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
         """Tokenize `text`.

@@ -8,6 +8,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -93,6 +94,59 @@ class ByteCache(unittest.TestCase):
             return text
         with ThreadPoolExecutor(len(texts)) as pool:
             self.assertEqual(list(pool.map(decode, texts)), texts)
+
+
+class BoundedEncode(unittest.TestCase):
+    """`encode_within`: the preparation-only encode.  It returns `encode`'s ids or nothing - never a prefix - and it
+    declines a single pre-tokenizer piece too big to merge inside the preparation allowance before merging it."""
+
+    TEXT = "the cat sat on the mat, and 日本語 the cat sat again\r\n\r\n<think>quoted</think>"
+
+    def test_the_ids_are_the_ones_encode_gives(self):
+        for parse_special in (False, True):
+            for plain in ((), [(0, 4)]):
+                with self.subTest(parse_special=parse_special, plain=plain):
+                    t = toy()
+                    want = t.encode(self.TEXT, parse_special=parse_special, plain=plain)
+                    self.assertEqual(t.encode_within(self.TEXT, len(want), parse_special=parse_special, plain=plain),
+                                     want)
+
+    def test_a_bound_that_does_not_fit_produces_nothing_at_all(self):
+        t = toy()
+        want = t.encode(self.TEXT, parse_special=True)
+        self.assertGreater(len(want), 8)
+        for limit in range(0, len(want)):
+            with self.subTest(limit=limit):
+                got = t.encode_within(self.TEXT, limit, parse_special=True)
+                self.assertIsNone(got, "a bounded encode returned the first tokens of a prompt it could not fit")
+        self.assertEqual(t.encode_within(self.TEXT, len(want) - 1, parse_special=True), None)
+        self.assertEqual(t.encode_within(self.TEXT, len(want) + 100, parse_special=True), want)
+
+    def test_a_piece_over_the_cap_is_never_merged(self):
+        t = toy()
+        t.PREPARATION_PIECE_MAX_BYTES = 4
+        self.assertEqual(t.encode_within("the cat sat", 100), t.encode("the cat sat"))   # pieces of four or less
+        long_word = "wonderful"                                                          # nine characters: over the cap
+        with mock.patch.object(t, "_bpe", wraps=t._bpe) as bpe:
+            self.assertIsNone(t.encode_within(f"{long_word} the cat", 100))
+        self.assertEqual(bpe.call_args_list, [], "a bounded encode merged a piece it had already refused")
+        self.assertIsNotNone(t.encode(f"the {long_word} cat"))        # the unbounded path is untouched
+
+    def test_the_cache_never_holds_more_than_its_share(self):
+        t = toy()
+        t.CACHE_SHARE_BYTES = 3 * (t.CACHED_TOKEN_BYTES + t.CACHED_PIECE_BYTES)
+        for i in range(50):
+            t.encode(" ".join("w%d" % (i * 10 + k) for k in range(10)))
+        self.assertLessEqual(t.retained_bytes(), t.CACHE_SHARE_BYTES,
+                             "the piece cache kept more than the allowance pays it")
+        self.assertGreater(len(t._piece_ids), 0)
+        payload = sum(sys.getsizeof(key) + sys.getsizeof(value) for key, value in t._piece_ids.items())
+        self.assertGreaterEqual(t.retained_bytes(), payload, "cache accounting omits retained string or list storage")
+        off = toy()
+        off.CACHE_SHARE_BYTES = 0
+        off.encode("the cat sat on the mat")
+        self.assertEqual(off.retained_bytes(), 0)
+
 
 
 if __name__ == "__main__":

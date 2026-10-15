@@ -323,11 +323,28 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
          prefix.size() >= working_prompt_->size() || !std::equal(prefix.begin(), prefix.end(), working_prompt_->begin())))) {
         error = "resident admission: invalid or unavailable slot/request"; return false;
     }
-    if (request.checkpoint && (request.checkpoint->stage_parts.size() + 1 != stages_.size() ||
-        request.checkpoint->ids.size() > prefix.size() ||
-        !std::equal(request.checkpoint->ids.begin(), request.checkpoint->ids.end(), prefix.begin()))) {
-        error = "resident admission: checkpoint is not a prefix of the admitted context"; return false;
-    }
+    const size_t checkpoint_limit = request.checkpoint_limit < 0 ? prefix.size() :
+        std::min(prefix.size(), size_t(request.checkpoint_limit));
+    const auto eligible = [&](const core::ConversationCheckpoint& checkpoint) {
+        return !checkpoint.ids.empty() && checkpoint.ids.size() <= checkpoint_limit &&
+            checkpoint.imgs.empty() &&
+            std::equal(checkpoint.ids.begin(), checkpoint.ids.end(), prefix.begin());
+    };
+    core::ConversationCheckpoint* root = nullptr;
+    core::ConversationCheckpoint* latest = nullptr;
+    if (request.checkpoints && !input_.images)
+        for (auto& checkpoint : *request.checkpoints) {
+            if (!eligible(checkpoint)) continue;
+            if (checkpoint.stage_parts.size() + 1 != stages_.size() ||
+                std::any_of(checkpoint.stage_parts.begin(), checkpoint.stage_parts.end(), [&](const auto& part) {
+                    return part.ids != checkpoint.ids || !part.imgs.empty() || !part.stage_parts.empty();
+                })) {
+                error = "resident admission: checkpoint parts do not describe the same prefix";
+                return false;
+            }
+            if (!root || checkpoint.ids.size() < root->ids.size()) root = &checkpoint;
+            if (!latest || checkpoint.ids.size() > latest->ids.size()) latest = &checkpoint;
+        }
     for (size_t b = 0; b < slots_.size(); ++b)
         if ((int) b != slot && slots_[b].request == working_.request) {
             error = "resident admission: request already owns another slot"; return false;
@@ -340,7 +357,12 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     // Capture possibly aliased checkpoint metadata before clearing the target.
     std::vector<core::ConversationCheckpoint> selected;
     try {
-        if (request.checkpoint && !input_.images) selected.push_back(*request.checkpoint);
+        if (request.checkpoints && !input_.images)
+            for (auto& checkpoint : *request.checkpoints)
+                if (eligible(checkpoint) && (checkpoint.pinned || &checkpoint == root || &checkpoint == latest)) {
+                    checkpoint.freeze();
+                    selected.push_back(checkpoint.frozen_alias());
+                }
     } catch (const std::bad_alloc&) {
         error = "resident admission: checkpoint allocation failed"; return false;
     }

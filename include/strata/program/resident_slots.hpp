@@ -104,8 +104,9 @@ private:
 
 struct ResidentAdmission {
     int32_t next_token = 0;
-    const core::ConversationCheckpoint* checkpoint = nullptr;
+    std::vector<core::ConversationCheckpoint>* checkpoints = nullptr;
     const float* residual = nullptr;
+    int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
 };
 
 // One host submitter, the same as Verifier. Scheduling and protocol emission

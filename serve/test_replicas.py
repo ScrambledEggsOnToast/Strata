@@ -4,11 +4,14 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
 from unittest import mock
 
+from serve import conversation_offers
+from serve.conversation_offers import Hello
 from serve.frontend import ChatTemplate
 from serve.replicas import BLOCK, ReplicaConfigError, ReplicaEngine, Router, cpu_sets, gpu_groups, replica_cfg
 from serve.server import ByteTokenizer, Service, StrataEngine, serve
@@ -144,6 +147,75 @@ class RouteChoice(unittest.TestCase):
         self.assertEqual(ReplicaEngine([FakeEngine(0), FakeEngine(0)]).batch, 2)
 
 
+class OfferOwnership(unittest.TestCase):
+    """A prepared offer belongs to the replica whose store validated it.  Preparation happens before routing, so the
+    keys a prepared generation carries can name another replica than the one the router picks: the *recipient* must
+    not be handed an offer it never made, and the offering store must not keep a frontier slot for that demand."""
+
+    class Engine:
+        """A replica that records what it was asked to run, with its own offer channel."""
+
+        def __init__(self, link=None):
+            self.offers, self.batch, self.max_context, self.info = link, 0, 4096, {}
+            self.samplings = []
+
+        def alive(self):
+            return True
+
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.samplings.append(dict(sampling))
+            yield 1
+
+    def link(self):
+        """A link whose store is enabled, as the engine's own HELLO says at startup."""
+        link = conversation_offers.ConversationOfferLink()
+        self.addCleanup(link.close)
+        link.start()
+        sock = link.child_socket
+        assert sock is not None
+        sock.send(conversation_offers.hello_payload(Hello(generation=7, frontier=1, metadata_bytes=1 << 20,
+                                                          enabled=True, issuer_key=bytes(range(32)))))
+        self.assertTrue(link.wait_hello(5), "the store's own HELLO was not read")
+        return link
+
+    def prepared_sampling(self, owner):
+        """What Service.bind_offer leaves on a generation after this replica's store took its offer."""
+        return {"_strata_cache_scope": "cd" * 32, "_strata_cache_offer": 3, "_strata_cache_generation": owner.epoch(),
+                "_strata_cache_offer_owner": owner}
+
+    def test_another_recipient_never_runs_an_offer_it_did_not_make(self):
+        owner, other = self.link(), self.link()
+        first, second = self.Engine(owner), self.Engine(other)
+        engine = ReplicaEngine([first, second])
+        self.assertTrue(owner.offer(3, owner.epoch(), 0, "ab" * 32, [1, 2, 3]))
+        sampling = self.prepared_sampling(owner)
+        engine.inflight[1] += 1                                         # as route() counts it (route is patched)
+        with mock.patch.object(engine, "route", return_value=1):        # the demand lands on the other replica
+            list(engine.generate([1, 2, 3], 4, sampling, threading.Event()))
+        self.assertEqual(second.samplings, [{"_strata_cache_scope": "cd" * 32}],
+                         "a replica was handed an offer another replica's store validated")
+        self.assertEqual(first.samplings, [])
+        self.assertEqual(owner.stats()["cancelled"], 1, "the offering store still holds the offer")
+        self.assertEqual(owner.stats()["outstanding"], 0)
+        self.assertEqual(other.stats()["cancelled"], 0)
+        self.assertEqual(sampling["_strata_cache_offer"], 3, "the caller's own request was rewritten")
+
+    def test_the_offering_replica_keeps_its_own_offer(self):
+        owner, other = self.link(), self.link()
+        first, second = self.Engine(owner), self.Engine(other)
+        engine = ReplicaEngine([first, second])
+        self.assertTrue(owner.offer(3, owner.epoch(), 0, "ab" * 32, [1, 2, 3]))
+        sampling = self.prepared_sampling(owner)
+        engine.inflight[0] += 1                                         # as route() counts it (route is patched)
+        with mock.patch.object(engine, "route", return_value=0):        # the demand lands on the offering replica
+            list(engine.generate([1, 2, 3], 4, sampling, threading.Event()))
+        self.assertEqual(first.samplings[0]["_strata_cache_offer"], 3)
+        self.assertIs(first.samplings[0]["_strata_cache_offer_owner"], owner)
+        self.assertEqual(owner.stats()["cancelled"], 0)
+        self.assertEqual(owner.stats()["outstanding"], 1)
+        self.assertEqual(second.samplings, [])
+
+
 class ReplicaService(unittest.TestCase):
     def start(self, slots=4, n=2):
         import serve.server as server
@@ -239,6 +311,50 @@ class ReplicaService(unittest.TestCase):
         for i in range(3):
             self.assertIn("ok, done.", self.chat(f"after the loss {i}"))
         self.assertEqual(self.served()[1], 3)
+
+
+class ReplicaClose(unittest.TestCase):
+    """One shutdown budget covers every replica: the wrapper hands each engine what is *left* of it."""
+
+    class Engine:
+        def __init__(self, delay=0.0):
+            self.delay = delay
+            self.budgets: list[float | None] = []
+
+        def alive(self):
+            return False
+
+        def close(self, timeout_s=None):
+            self.budgets.append(timeout_s)
+            if self.delay:
+                time.sleep(self.delay)
+
+    def test_every_replica_is_closed_within_one_total_budget(self):
+        engines = [self.Engine(), self.Engine(delay=0.4), self.Engine()]
+        engine = ReplicaEngine(engines, load_tokens=3000)
+        start = time.monotonic()
+        engine.close(timeout_s=5.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual([len(e.budgets) for e in engines], [1, 1, 1], "a replica was not asked to end")
+        for e in engines:
+            self.assertIsNotNone(e.budgets[0], "a replica was closed without the shutdown's own budget")
+            self.assertLessEqual(e.budgets[0], 5.0)
+        self.assertLess(engines[-1].budgets[0], engines[0].budgets[0], "each replica got the whole budget again")
+        self.assertLess(elapsed, 1.0, "the shutdown waited for more than the replicas' own work")
+
+    def test_a_replica_that_fails_does_not_leave_the_others_running(self):
+        class Broken(self.Engine):
+            def close(self, timeout_s=None):
+                super().close(timeout_s)
+                raise RuntimeError("this replica cannot be reached")
+
+        engines = [Broken(), self.Engine(), self.Engine()]
+        engine = ReplicaEngine(engines, load_tokens=3000)
+        with self.assertRaises(RuntimeError):
+            engine.close(timeout_s=2.0)
+        self.assertEqual([len(e.budgets) for e in engines], [1, 1, 1])
+        for e in engines[1:]:
+            self.assertIsNotNone(e.budgets[0])
 
 
 if __name__ == "__main__":

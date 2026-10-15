@@ -396,9 +396,11 @@ bool build_tree(const SavedConversation& image, const ConversationStoreLimits& l
                     why = "the image has more containers than ConversationStoreLimits::max_images";
                     return false;
                 }
+                TreeContainer part;
                 if (!part_container(record.stage_parts[p], owners.meta, owner_key, p, carve, owners.meta.scope,
-                                    limits, out.emplace_back(), why))
+                                    limits, part, why))
                     return false;
+                out.push_back(std::move(part));
             }
         }
     }
@@ -537,13 +539,13 @@ bool check_containers(const ManifestMeta& meta, const ConversationStoreLimits& l
             why = "a stage part container must not carry checkpoints or K/V layers";
             return false;
         }
-        const ContainerMeta& declared = meta.containers[c.stage];
         const bool carve_known = c.stage < meta.stages;
         if (carve_known != c.carve_known) {
             why = "a stage part's carve flag disagrees with the stages the image declares";
             return false;
         }
         if (carve_known) {
+            const ContainerMeta& declared = meta.containers[c.stage];
             if (declared.layer_lo != c.layer_lo || declared.layer_hi != c.layer_hi ||
                 declared.geometry != c.geometry || declared.cvec != c.cvec) {
                 why = "a stage part's carve disagrees with the stage image that declares it";
@@ -562,25 +564,27 @@ bool check_containers(const ManifestMeta& meta, const ConversationStoreLimits& l
     }
     // Every record's declared part count must be exactly the parts the manifest carries for it, in part order and
     // grouped by owner: a restore attaches them by position, so a gap or a reordering would misplace state.
-    std::vector<std::tuple<uint32_t, uint64_t, uint32_t>> expected;
+    size_t next_part = meta.stages;
     for (uint32_t s = 0; s < meta.stages; ++s) {
         const ContainerMeta& c = meta.containers[s];
-        for (uint32_t r = 0; r <= c.checkpoints.size(); ++r) {
+        for (size_t r = 0; r <= c.checkpoints.size(); ++r) {
             const uint32_t parts = r == 0 ? c.record.parts : c.checkpoints[r - 1].parts;
-            for (uint32_t p = 0; p < parts; ++p) expected.emplace_back(s, uint64_t(r), p);
+            if (parts > limits.max_stages || parts > meta.containers.size() - next_part) {
+                why = "a record declares more stage parts than the manifest contains";
+                return false;
+            }
+            for (uint32_t p = 0; p < parts; ++p) {
+                const ContainerMeta& part = meta.containers[next_part++];
+                if (part.parent_stage != s || part.parent_owner != r || part.part_index != p) {
+                    why = "the manifest's stage parts are not grouped by owner in part order";
+                    return false;
+                }
+            }
         }
     }
-    if (expected.size() != meta.containers.size() - meta.stages) {
+    if (next_part != meta.containers.size()) {
         why = "the manifest's stage part count disagrees with the records that own them";
         return false;
-    }
-    for (size_t k = 0; k < expected.size(); ++k) {
-        const ContainerMeta& c = meta.containers[meta.stages + k];
-        const auto& [s, owner, p] = expected[k];
-        if (c.parent_stage != s || c.parent_owner != owner || c.part_index != p) {
-            why = "the manifest's stage parts are not grouped by owner in part order";
-            return false;
-        }
     }
     return true;
 }
@@ -913,6 +917,8 @@ bool bind_streams(const ManifestMeta& meta, const ConversationStoreLimits& limit
                 return false;
             }
             record = &parts[c.part_index];
+            record->used = c.record.used;
+            record->pinned = c.record.pinned;
             declared_tokens = c.record.tokens;
         }
         switch (slot.buffer) {
@@ -1705,31 +1711,70 @@ Digest store_bucket_digest(const ConversationStoreOptions& options, const Conver
     return sha256(w.data().data(), w.size());
 }
 
-Digest object_scope_digest(uint16_t kind, const KvMeta* kv) {
-    Writer w;
-    w.raw(kObjectScopeTag, sizeof kObjectScopeTag);
-    w.u16(kind);
+Digest object_scope_digest(uint16_t kind, const KvMeta* kv, const ConversationScope& authorization,
+                           const Digest& model) {
+    Sha256 hash;
+    hash.update(kObjectScopeTag, sizeof kObjectScopeTag);
+    hash.update(authorization.value.data(), authorization.value.size());
+    hash.update(model.data(), model.size());
+    hash.update(&kind, sizeof kind);
     if (kv) {
-        w.i64(kv->format);
-        w.i64(kv->cells);
-        w.i64(kv->heads);
-        w.i64(kv->head_dim);
-        w.i64(kv->page_size);
-        w.i64(kv->pooled_rows);
-        w.i64(kv->idx_dim);
+        const int64_t interpretation[] = {kv->format, kv->heads, kv->head_dim, kv->page_size, kv->idx_dim};
+        hash.update(interpretation, sizeof interpretation);
     }
-    return sha256(w.data().data(), w.size());
+    return hash.digest();
+}
+
+bool stream_object_identity(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
+                            const Digest& model, Digest& scope, uint64_t& ordinal, std::string& why) {
+    if (containers.empty() || !containers.front().scope.valid()) {
+        why = "a physical object has no authorized conversation";
+        return false;
+    }
+    const KvMeta* kv = nullptr;
+    ordinal = id.ordinal;
+    if (conversation_store_kv_kind(id.kind)) {
+        const ContainerMeta* stage = nullptr;
+        for (const auto& container : containers)
+            if (container.is_image && container.stage == id.stage) {
+                stage = &container;
+                break;
+            }
+        if (!stage || id.ordinal >= stage->kv.size() || stage->geometry[1] <= 0 ||
+            stage->geometry[2] <= 0 || stage->layer_lo < 0 || stage->layer_hi < stage->layer_lo ||
+            stage->layer_hi > stage->geometry[1]) {
+            why = "a K/V object has no valid model-layer interpretation";
+            return false;
+        }
+        const int64_t interval = stage->geometry[2];
+        const int64_t count = stage->geometry[1] / interval;
+        const int64_t first = count ? std::min(stage->layer_lo / interval, count - 1) : 0;
+        const uint64_t allocated = uint64_t(std::max<int64_t>(
+            stage->layer_hi / interval - stage->layer_lo / interval, count ? 1 : 0));
+        if (stage->kv.size() < allocated || stage->kv.size() - allocated > 1) {
+            why = "a K/V object count disagrees with the captured attention layers";
+            return false;
+        }
+        // The extra pool is the drafter, not the next main-model attention layer.
+        ordinal = id.ordinal == allocated ? uint64_t{1} << 63 : uint64_t(first) + id.ordinal;
+        kv = &stage->kv[size_t(id.ordinal)];
+    }
+    scope = object_scope_digest(id.kind, kv, containers.front().scope, model);
+    return true;
+}
+
+Sha256 object_hasher(const Digest& scope, uint16_t kind, uint64_t ordinal, uint64_t length) {
+    Sha256 hash;
+    hash.update(kObjectTag, sizeof kObjectTag);
+    hash.update(scope.data(), scope.size());
+    hash.update(&kind, sizeof kind);
+    hash.update(&ordinal, sizeof ordinal);
+    hash.update(&length, sizeof length);
+    return hash;
 }
 
 Digest object_digest(const Digest& scope, uint16_t kind, uint64_t ordinal, uint64_t length, const uint8_t* bytes) {
-    Writer w;
-    w.raw(kObjectTag, sizeof kObjectTag);
-    w.digest(scope);
-    w.u16(kind);
-    w.u64(ordinal);
-    w.u64(length);
-    Sha256 hash;
-    hash.update(w.data().data(), w.size());
+    Sha256 hash = object_hasher(scope, kind, ordinal, length);
     if (bytes && length) hash.update(bytes, length);
     return hash.digest();
 }

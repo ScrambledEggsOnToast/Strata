@@ -70,6 +70,29 @@ public:
     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
     /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
     void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
+    // ---- the draft layer's identity, for the persistent store's execution-domain digest ----------------------
+    // These are not tuning knobs: each one changes the draft layer's own projections, its normalization or the K/V
+    // cells it writes, so two runs that differ in any of them must not share a stored draft state.  The caller reads
+    // the *effective* value: --mtp-q4 proj only installs Q4_0 copies where the native expert path can make them, and
+    // the head's type is whatever make_q4_head() left behind.
+    /// The Q4_0 projection copies actually in use (--mtp-q4 proj); false means the pack's Q8_0 originals.
+    bool draft_q4_projections() const { return dense4_ != nullptr; }
+    /// The draft head's effective ggml type (Q4_0 under --mtp-q4 head, else the main head's); -1 when no subset is
+    /// bound (bind() has not run, or the full-head diagnostic selected the main head itself).
+    int draft_head_type() const { return dhead_type_; }
+    /// The vocabulary subset's ids as loaded - exactly the artifact's own bytes (little-endian int32 on every
+    /// deployment), so a content digest over them identifies the artifact and never its path.  Empty (null/0) in the
+    /// full-head case.
+    const int32_t* draft_vocab_ids() const { return dvocab_host_.data(); }
+    int64_t draft_vocab_size() const { return n_dvocab_; }
+    /// STRATA_ROUTE_RESIDENT_MTP (experimental, "changes the output"): the draft router's residency bias.
+    bool route_resident() const { return rr_res_ != nullptr; }
+    float route_resident_margin() const { return rr_margin_; }
+    int route_resident_lo() const { return rr_lo_; }
+    int route_resident_hi() const { return rr_hi_; }
+    /// STRATA_MTP_CATCHUP_ALL: whether a round catches the drafter's K/V up for the whole verified window (rejected
+    /// rows included) instead of the accepted prefix alone, which decides which draft-K/V cells exist afterwards.
+    static bool catchup_all();
     /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
     /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
