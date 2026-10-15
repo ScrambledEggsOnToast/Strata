@@ -18279,7 +18279,7 @@ int main(int argc, char** argv) {
         // publications survive a restart.  A GPU fault, the poison path or a killed process deliberately leaves the
         // intent armed (the destructor does exactly that), so a run that stopped short never looks healthy.
         if (offer_channel) offer_channel->stop();
-        if (store_on) {
+        if (store_on && !store_faulted) {
             const auto now_ms = [] {
                 return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now().time_since_epoch()).count();
@@ -18290,7 +18290,7 @@ int main(int argc, char** argv) {
             const uint64_t deadline = shutdown_started + 8000;
             store_allowance();
             flush_publishes(0);
-            size_t drained_owners = 0, skipped_owners = 0;
+            size_t skipped_owners = 0;
             auto drain_owner = [&](uint64_t owner) {
                 // The capture just taken is handed over and waited for here, before the next owner is captured: the
                 // writer's queue is a handover, never an accumulation, and a busy writer delays the next capture
@@ -18304,11 +18304,7 @@ int main(int argc, char** argv) {
                     flush_publishes(250);
                     stalled = store_queue.size() + pending_publishes.size() < before ? 0 : stalled + 1;
                 }
-                if (store_queue.empty() && pending_publishes.empty()) {
-                    ++drained_owners;
-                    return;
-                }
-                ++skipped_owners;
+                if (store_queue.empty() && pending_publishes.empty()) return;
                 std::fprintf(stderr, "strata serve: conversation store: owner %llu still holds %zu queued and %zu "
                                      "outstanding publication%s after this owner's bounded drain\n",
                              (unsigned long long) owner, store_queue.size(), pending_publishes.size(),
@@ -18317,13 +18313,16 @@ int main(int argc, char** argv) {
             bool any = false;
             if (exit_park_allowed && live_ok && live_scope.valid() && !live.empty()) {
                 any = true;
-                if (!park_current(0, nullptr))
+                if (!park_current(0, nullptr)) {
                     std::fprintf(stderr, "strata serve: conversation store: the last serial conversation could not be "
                                          "parked at shutdown (%s)\n", err.c_str());
+                    store_faulted = true;
+                    conversation_store->set_unhealthy("shutdown snapshot capture failed");
+                }
                 err.clear();
-                drain_owner(kSessionOwner);
+                if (!store_faulted) drain_owner(kSessionOwner);
             }
-            for (int b = 0; b < (int) bs.size(); ++b) {
+            for (int b = 0; !store_faulted && b < (int) bs.size(); ++b) {
                 // An owner that finished a turn: the same source the serving path would park when the next request
                 // replaced it.  A slot with nothing completed reports no source and is skipped.
                 std::string probe;
@@ -18335,20 +18334,31 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 any = true;
-                if (!park_completed(b, 0, nullptr))
+                if (!park_completed(b, 0, nullptr)) {
                     std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d could not be "
                                          "parked at shutdown (%s)\n", b, err.c_str());
+                    store_faulted = true;
+                    conversation_store->set_unhealthy("shutdown snapshot capture failed");
+                }
                 err.clear();
-                drain_owner(kResidentOwnerFirst + (uint64_t) b);
+                if (!store_faulted) drain_owner(kResidentOwnerFirst + (uint64_t) b);
+            }
+            // The short per-owner waits above let subsequent owners capture while the writer
+            // works. They are not the shutdown deadline: finish outstanding publications with
+            // the remaining allowance, including the last owner when no next request arrives.
+            while (!store_faulted && (!store_queue.empty() || !pending_publishes.empty()) && now_ms() < deadline) {
+                store_allowance();
+                const uint64_t remaining = deadline - std::min(deadline, now_ms());
+                if (!remaining) break;
+                flush_publishes(std::min<uint64_t>(250, remaining));
             }
             if (!any)
                 std::fprintf(stderr, "strata serve: conversation store: nothing to park at shutdown (a one-shot, a "
                                      "pinned sibling or an incomplete session)\n");
-            std::fprintf(stderr, "strata serve: conversation store: shutdown drained %zu owner%s in %llu ms; %zu "
-                                 "owner%s abandoned, %zu queued publication%s left\n", drained_owners,
-                         drained_owners == 1 ? "" : "s", (unsigned long long) (now_ms() - shutdown_started),
-                         skipped_owners, skipped_owners == 1 ? "" : "s", store_queue.size(),
-                         store_queue.size() == 1 ? "" : "s");
+            std::fprintf(stderr, "strata serve: conversation store: shutdown completed in %llu ms; %zu owner "
+                                 "captures skipped, %zu queued and %zu outstanding publications left\n",
+                         (unsigned long long) (now_ms() - shutdown_started), skipped_owners,
+                         store_queue.size(), pending_publishes.size());
             for (const QueuedPublish& entry : store_queue)
                 std::fprintf(stderr, "strata serve: conversation store: queued publication for owner %llu was not "
                                      "published (%zu MiB, capture epoch %llu)\n", (unsigned long long) entry.owner,
