@@ -1235,8 +1235,8 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
     }
     for (uint64_t head_id : dropped) retire_head_locked(head_id);
 
-    // Present but referenced by nothing is an orphan: account it, then remove it (bounded per open).
-    uint64_t removed = 0;
+    // Queue unreferenced files, but retain them until the startup catalog is durable.
+    // A refused transaction must not delete bytes still named by the old catalog.
     for (const auto& manifest : present_manifests) {
         bool referenced = false;
         for (const auto& head : catalog.heads)
@@ -1247,14 +1247,6 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         if (referenced) continue;
         reclaimable += manifest.second;
         const std::string name = sha256_hex(manifest.first);
-        std::string ignored;
-        if (removed < kMaxReclaimPerPass && remove_file(dirs.manifests, name, ignored)) {
-            charged -= std::min(charged, manifest.second);
-            reclaimable -= std::min(reclaimable, manifest.second);
-            counters.recovered_orphans++;
-            ++removed;
-            continue;
-        }
         PendingFile file;
         file.where = Where::manifests;
         file.name = name;
@@ -1271,17 +1263,6 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         file.shard = sha256_hex(object.first).substr(0, 2);
         file.name = sha256_hex(object.first);
         file.charge = object.second;
-        std::string ignored;
-        const int shard_fd = open_shard_fd(dirs, file.shard, ignored);
-        const bool gone = shard_fd >= 0 && removed < kMaxReclaimPerPass && remove_file(shard_fd, file.name, ignored);
-        if (shard_fd >= 0) ::close(shard_fd);
-        if (gone) {
-            charged -= std::min(charged, file.charge);
-            reclaimable -= std::min(reclaimable, file.charge);
-            counters.recovered_orphans++;
-            ++removed;
-            continue;
-        }
         pending_files.push_back(std::move(file));
         counters.deferred_reclaims++;
     }
@@ -1599,14 +1580,14 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
         return true;
     }
     const uint64_t delta = workspace - job->workspace_bytes;
-    const uint64_t image = job->ram_bytes;
     if (workspace > options.metadata_bytes || metadata + prep > options.metadata_bytes - workspace) {
         why = "the writer's workspace does not fit the store's preparation ceiling";
         return false;
     }
-    // This publication's own transferred lease still widens its own fit check; it never widens anything else.
+    // A later absolute allowance already accounts for the caller's released image lease.
+    // resident_locked() includes this job's image and existing workspace; charge only growth.
     const uint64_t envelope = sat_add(ram_budget, job->external_credit_bytes);
-    if (image > envelope || resident_locked() > envelope - image - delta) {
+    if (delta > envelope || resident_locked() > envelope - delta) {
         why = "the writer's workspace does not fit the published RAM allowance";
         return false;
     }
@@ -3923,6 +3904,9 @@ uint64_t ConversationStore::publish_read_allowance(uint64_t bytes) {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     // Absolute, and never retroactive: a lower bound admits no new work but revokes nothing already admitted.
     impl_->ram_budget = bytes;
+    // The caller has now published a complete absolute envelope, including any
+    // lease it released after publish(). Do not add that transfer a second time.
+    if (impl_->publishing) impl_->publishing->external_credit_bytes = 0;
     impl_->admission_suspended = false;
     impl_->cv_work.notify_all();
     return impl_->ram_budget;

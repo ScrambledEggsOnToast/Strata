@@ -505,6 +505,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 // descriptor payload of the prepared frontier (a whole context of int32 tokens is under 1 MiB), never permission for
 // image-sized allocations: the store's own read budget governs those.
 constexpr size_t kConversationOfferBytes = 64u << 20;
+constexpr size_t kConversationPreparationBytes = 400u << 20;
 
 // The store's immutable object size.  This file names it because the native side also aligns the reuse intervals it
 // offers to it: a K/V part is a byte stream (element 1), so every interval the store can adopt is a whole number of
@@ -513,14 +514,10 @@ constexpr uint64_t kConversationStoreChunkBytes = 1u << 20;
 
 uint64_t conversation_store_ram_limit(const strata::core::ConversationCache& cache, uint64_t envelope,
                                       uint64_t local_bytes = 0) {
-    // The two processes each own bounded frontier metadata; neither may spend the snapshot envelope again.
-    const uint64_t preparation = 2 * kConversationOfferBytes;
+    // Python preparation and native offers share this envelope with all parked and queued images.
+    const uint64_t preparation = kConversationPreparationBytes + kConversationOfferBytes;
     uint64_t available = envelope > preparation ? envelope - preparation : 0;
-    // What the parked cache holds: its parked payloads and the K/V it retained for the next capture.  A publication
-    // this process has queued but the store has *not* admitted yet is deliberately not subtracted here - the store's
-    // allowance is what admits that very publication, and the queue's own lease is charged to the cache's budget
-    // instead (ConversationCache::envelope_bytes), where it can only ever cause an eviction, never an overrun.
-    const uint64_t cached = cache.bytes();
+    const uint64_t cached = cache.envelope_bytes();
     available = available > cached ? available - cached : 0;
     return available > local_bytes ? available - local_bytes : 0;
 }
@@ -541,7 +538,9 @@ public:
             store_->publish_read_allowance(available > outside_bytes_ ? available - outside_bytes_ : 0);
         }
     }
-    uint64_t held() const { return store_ ? store_->ram_held_bytes() + 2 * kConversationOfferBytes : 0; }
+    uint64_t held() const {
+        return store_ ? store_->ram_held_bytes() + kConversationPreparationBytes + kConversationOfferBytes : 0;
+    }
 private:
     strata::core::ConversationStore* store_;
     strata::core::ConversationCache& cache_;
@@ -10925,8 +10924,8 @@ int main(int argc, char** argv) {
         // A capture the engine already paid for (GPU copies included) waits here instead of being dropped when the
         // store's single writer is busy.  The image is frozen in place and its RAM is charged through the cache while
         // it waits, so evicting the parked copy can never silently drop the only snapshot that is still to be written.
-        // Bounded: one entry per owner, a newer capture of the same owner replaces the older one (only one owner's
-        // generations coalesce, never two branches), and a fixed small ceiling overall.
+        // Owner slots can be reused by unrelated conversations. Keep their publications distinct;
+        // the image leases and fixed entry ceiling bound the queue independently of slot identity.
         struct QueuedPublish {
             uint64_t owner = 0;
             uint64_t owner_generation = 0;
@@ -10943,7 +10942,7 @@ int main(int argc, char** argv) {
             uint32_t attempts = 0;             // bounded retries; a permanently refused entry is dropped and counted
         };
         std::deque<QueuedPublish> store_queue;
-        constexpr size_t kQueuedPublishes = 16;   // the ceiling: one writer, its pending slot and one per owner
+        constexpr size_t kQueuedPublishes = 16;
         constexpr uint32_t kPublishAttempts = 8;  // bounded retries of an entry the store refuses to admit yet
         // One record per publication the store has admitted and not yet reported, so its result can move the exact
         // owner generation it belongs to and its lease can be reported when the store releases it.
@@ -11375,6 +11374,7 @@ int main(int argc, char** argv) {
                 publish.request_id = publication_id;
                 publish.generation = publication_id;
                 publish.epoch = entry.capture_epoch;
+                publish.external_lease_bytes = entry.lease_bytes;
                 publish.reuse = entry.reuse;
                 StoreOwner& owner = store_owner(entry.owner);
                 const StoreLineage& lineage = owner.lineage;
@@ -11414,6 +11414,7 @@ int main(int argc, char** argv) {
                     // The store charges the alias itself from here on; the cache's lease on it ends.
                     conversations.release_lease(entry.lease_bytes);
                     store_queue.pop_front();
+                    store_allowance();
                     continue;
                 }
                 entry.image = std::move(image);
@@ -11431,19 +11432,9 @@ int main(int argc, char** argv) {
                 break;
             }
         };
-        // Queue a capture for the store's writer without spending any further GPU work on it.  Bounded: a newer capture
-        // of the same owner replaces that owner's older entry (only one owner's own generations coalesce - two branches
-        // are never merged), and the cache charges the frozen alias in full while it waits, so the envelope bounds how
-        // many snapshots may wait at once.  A full queue refuses the new entry explicitly; it never grows.
+        // Slot ownership does not establish conversation ancestry. Do not replace an unwritten
+        // conversation merely because a later request reused its slot.
         auto queue_publish = [&](QueuedPublish&& entry) -> bool {
-            for (size_t i = 0; i < store_queue.size(); ++i) {
-                if (store_queue[i].owner != entry.owner) continue;
-                conversations.release_lease(store_queue[i].lease_bytes);
-                std::fprintf(stderr, "strata serve: conversation store: a newer capture of owner %llu replaced an "
-                                     "unwritten publication of the same owner\n", (unsigned long long) entry.owner);
-                store_queue.erase(store_queue.begin() + (std::ptrdiff_t) i);
-                break;
-            }
             if (store_queue.size() >= kQueuedPublishes) {
                 std::fprintf(stderr, "strata serve: conversation store: %zu publications are already waiting; this "
                                      "capture is not queued for persistence\n", store_queue.size());
@@ -18318,7 +18309,7 @@ int main(int argc, char** argv) {
                 }
                 ++skipped_owners;
                 std::fprintf(stderr, "strata serve: conversation store: owner %llu still holds %zu queued and %zu "
-                                     "outstanding publication%s at the shutdown deadline\n",
+                                     "outstanding publication%s after this owner's bounded drain\n",
                              (unsigned long long) owner, store_queue.size(), pending_publishes.size(),
                              store_queue.size() + pending_publishes.size() == 1 ? "" : "s");
             };
@@ -18331,11 +18322,17 @@ int main(int argc, char** argv) {
                 err.clear();
                 drain_owner(kSessionOwner);
             }
-            for (int b = 0; b < (int) bs.size() && now_ms() < deadline; ++b) {
+            for (int b = 0; b < (int) bs.size(); ++b) {
                 // An owner that finished a turn: the same source the serving path would park when the next request
                 // replaced it.  A slot with nothing completed reports no source and is skipped.
                 std::string probe;
                 if (!resident.completed_snapshot_source(b, probe)) continue;
+                if (now_ms() >= deadline) {
+                    ++skipped_owners;
+                    std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d was not "
+                                         "captured before the shutdown deadline\n", b);
+                    continue;
+                }
                 any = true;
                 if (!park_completed(b, 0, nullptr))
                     std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d could not be "
@@ -18393,11 +18390,9 @@ int main(int argc, char** argv) {
                              (unsigned long long) store_published, (unsigned long long) store_refused,
                              (unsigned long long) store_coalesced, (unsigned long long) store_cancelled,
                              (unsigned long long) store_dropped);
-            // The store's own close is a bounded healthy drain: it finishes or cancels the storage work it has admitted,
-            // commits a final catalog and only then clears the run intent, so the publications that *did* complete
-            // survive a restart and the ones this run abandoned simply never existed.  Anything else - a GPU fault, the
-            // poison path, a capture or publication abandoned at the deadline - leaves the run intent armed by not
-            // closing cleanly at all (the destructor does exactly that).
+            // A healthy close preserves only completed durable publications; the explicit
+            // abandoned-work reports above are not a promise that every conversation was saved.
+            // GPU faults and poison leave the run intent armed instead.
             if (!store_faulted) conversation_store->close();
         }
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {
