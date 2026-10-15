@@ -527,7 +527,12 @@ bool restored_cut_matches(const SavedConversation& image, const conversation_sto
         why = "the materialized image does not reproduce the cut the manifest advertised";
         return false;
     }
-    if (live ? !selected->stage_parts.empty() : selected->stage_parts.size() + 1 != meta.stages) {
+    // A split image carries the later stages in one of two encodings, and a cut is only coherent when the encoding it
+    // uses names exactly one part per later stage.  A record-container image keeps the parts on the record itself
+    // (`stage_parts`); the native parked split leaves a primary record's `stage_parts` empty and carries each part as
+    // that stage's own image record, which the stage loop below confirms holds this exact prefix.  A running
+    // checkpoint never owns parts: whole-session parking is single-GPU.
+    if (!selected->stage_parts.empty() && (live || selected->stage_parts.size() + 1 != meta.stages)) {
         why = "the selected cut has an inconsistent stage-part count";
         return false;
     }
@@ -4113,9 +4118,16 @@ ConversationStoreCounters ConversationStore::counters() const {
     uint64_t pinned = 0;
     for (const auto& head : impl_->catalog.heads) pinned += head.pinned ? 1 : 0;
     out.pinned_heads = pinned;
-    uint64_t shared = 0;
-    for (const auto& object : impl_->objects) shared += object.second.refs > 1 ? 1 : 0;
+    uint64_t shared = 0, object_bytes = 0;
+    for (const auto& object : impl_->objects) {
+        shared += object.second.refs > 1 ? 1 : 0;
+        object_bytes += object.second.bytes;   // the ledger's own allocated charge, never a second accounting
+    }
     out.shared_objects = shared;
+    out.object_bytes = object_bytes;
+    uint64_t manifest_bytes = 0;
+    for (const auto& manifest : impl_->head_manifest_bytes) manifest_bytes += manifest.second;
+    out.manifest_bytes = manifest_bytes;
     return out;
 }
 

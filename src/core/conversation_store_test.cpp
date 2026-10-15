@@ -275,6 +275,74 @@ SavedConversation hollow_fixture(uint64_t seed, int checkpoints, int kv_layers) 
     return image;
 }
 
+// A record carrying `whole`'s own ids and image keys and one stage tag's state bytes: what a split moves into a
+// later stage's record, so the same cut can be told apart byte for byte across stages.
+ConversationCheckpoint split_record(const ConversationCheckpoint& whole, uint8_t tag) {
+    ConversationCheckpoint out;
+    out.ids = whole.ids;
+    out.imgs = whole.imgs;
+    out.used = whole.used;
+    out.pinned = whole.pinned;
+    out.gdn.assign(whole.ids.size(), tag);
+    out.ple.assign(whole.ids.size() / 2, uint8_t(tag + 1));
+    out.tails.assign(2, uint8_t(tag + 2));
+    out.dead.assign(3, uint8_t(tag + 3));
+    out.block_pos.assign(whole.ids.size(), uint8_t(tag + 4));
+    return out;
+}
+
+// One later stage of a native parked split: its own carve and K/V layers, its own running record and, as its own
+// checkpoints, one part per primary checkpoint.  `stage_parts` is deliberately never set anywhere here: this is the
+// shape `strata serve` captures (SavedConversation::stage_images), where a primary record stays part-free.
+SavedConversation split_stage(const SavedConversation& primary, uint8_t tag, int64_t layer_lo, int64_t layer_hi) {
+    SavedConversation stage;
+    stage.scope = primary.scope;
+    stage.geometry = primary.geometry;
+    stage.cvec = primary.cvec;
+    stage.layer_lo = layer_lo;
+    stage.layer_hi = layer_hi;
+    stage.live = split_record(primary.live, tag);
+    stage.checkpoints.reserve(primary.checkpoints.size());
+    for (const auto& checkpoint : primary.checkpoints) stage.checkpoints.push_back(split_record(checkpoint, tag));
+    stage.kv.reserve(primary.kv.size());
+    for (const auto& layer : primary.kv) {
+        ConversationKv copy = layer;
+        const uint8_t fill_k = uint8_t(tag + 8), fill_v = uint8_t(tag + 9);
+        copy.k.visit(0, copy.k.size(), [&](uint8_t* bytes, size_t count, size_t) {
+            std::memset(bytes, fill_k, count);
+            return true;
+        });
+        copy.v.visit(0, copy.v.size(), [&](uint8_t* bytes, size_t count, size_t) {
+            std::memset(bytes, fill_v, count);
+            return true;
+        });
+        stage.kv.push_back(std::move(copy));
+    }
+    return stage;
+}
+
+// A native parked split image of `stages` stages with two cuts - a root at a quarter of the prompt and the newest at
+// half - and one saved image per later stage holding both, as that stage's own records.
+SavedConversation split_fixture(uint64_t seed, int64_t tokens, size_t stages) {
+    SavedConversation image = fixture(seed, tokens);
+    image.layer_hi = 4;
+    image.checkpoints.clear();
+    for (int64_t at : {tokens / 4, tokens / 2}) {
+        ConversationCheckpoint cut;
+        cut.ids.assign(image.live.ids.begin(), image.live.ids.begin() + long(at));
+        cut.used = seed + uint64_t(at);
+        cut.gdn.assign(size_t(at), uint8_t(seed + 5));
+        cut.tails.assign(2, uint8_t(seed + 6));
+        cut.block_pos.assign(size_t(at), uint8_t(seed + 7));
+        image.checkpoints.push_back(std::move(cut));
+    }
+    for (size_t k = 1; k < stages; ++k) {
+        const uint8_t tag = uint8_t(0x20 * k);
+        image.stage_images.push_back(split_stage(image, tag, int64_t(4 * k), int64_t(4 * k + 4)));
+    }
+    return image;
+}
+
 // Every regular file under `root`, by relative path: what a transaction may not delete, and what it must not lose.
 std::vector<std::string> file_inventory(const std::string& root) {
     std::vector<std::string> out;
@@ -368,6 +436,7 @@ void check_identity();
 void check_manifest();
 void check_round_trip();
 void check_multi_stage_restore();
+void check_native_split_restore();
 void check_request_specific();
 void check_incoming_lifetime();
 void check_publication_rules();
@@ -403,6 +472,7 @@ int main() {
     check_manifest();
     check_round_trip();
     check_multi_stage_restore();
+    check_native_split_restore();
     check_request_specific();
     check_incoming_lifetime();
     check_publication_rules();
@@ -778,6 +848,100 @@ void check_multi_stage_restore() {
     }
 }
 
+// The native parked split - the shape `strata serve` writes - restores an earlier checkpoint cut: that cut's part
+// lives in each later stage's own image, never in the primary record's `stage_parts`.  A later stage that cannot
+// hold the cut is either never advertised or refused before handoff, and the live cut stays independent of it.
+void check_native_split_restore() {
+    for (size_t stages : {size_t(2), size_t(3)}) {
+        const SavedConversation image = split_fixture(151, 128, stages);
+        check(image.checkpoints[0].stage_parts.empty() && image.stage_images.size() + 1 == stages,
+              "the fixture is the native split: no primary record owns a stage part");
+
+        // A coherent native split: every stage's own image holds both cuts.
+        {
+            TempRoot root;
+            ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, image, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "a native split image is stored");
+            check_eq(result.stages, stages, "the stored image keeps every stage");
+            check_eq(result.payload_bytes, image_payload_bytes(image), "the stored payload is every stage's own bytes");
+            uint64_t request = 10;
+            for (const auto& cut : image.checkpoints) {
+                ConversationStoreQuery query = query_of(image, request, 1);
+                query.tokens = cut.ids;
+                query.tokens.push_back(12345);
+                std::string why;
+                check(store.demand(query, why), "the earlier-cut demand is admitted");
+                ConversationStoreRead read;
+                check(store.wait_ready(request, 1, read, 5000), "the earlier-cut demand settles");
+                check(read.status == ConversationStoreReadStatus::ready,
+                      "a checkpoint cut of a native split restores");
+                check(!read.live, "the restore reports the selected checkpoint cut, not the live cut");
+                check_eq(read.stages, stages, "the restore reports every stage");
+                check(read.image && images_equal(*read.image, image, why),
+                      "every stage's own image survives the round trip byte for byte");
+                store.release_read(request, 1);
+                ++request;
+            }
+            store.close();
+        }
+
+        // A torn native split: the last stage has lost the earlier cut and holds another prefix at the newest one.
+        {
+            TempRoot root;
+            ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+            SavedConversation torn = split_fixture(151, 128, stages);
+            torn.stage_images.back().checkpoints.erase(torn.stage_images.back().checkpoints.begin());
+            torn.stage_images.back().checkpoints.back().ids[0] += 1;
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, torn, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "a torn native split image is storable");
+            std::string why;
+            uint64_t request = 20;
+            // The earlier cut: the last stage holds no record of that length at all, so no lookup may offer it.
+            ConversationStoreQuery absent = query_of(torn, request, 1);
+            absent.tokens = torn.checkpoints[0].ids;
+            absent.tokens.push_back(12345);
+            check(store.matches(absent.selector, absent.tokens, absent.images).empty(),
+                  "a cut a later stage no longer holds is not advertised");
+            check(store.demand(absent, why), "the request no advertisement covers is still admitted");
+            ConversationStoreRead absent_read;
+            check(store.wait_ready(request, 1, absent_read, 5000), "the unadvertised request settles");
+            check(absent_read.status == ConversationStoreReadStatus::missing && !absent_read.image,
+                  "a cut a later stage no longer holds is a miss, never a wrong restore");
+            store.release_read(request, 1);
+            ++request;
+            // The newest cut: the last stage holds that length as another prefix, so it is advertised, then refused.
+            ConversationStoreQuery other = query_of(torn, request, 1);
+            other.tokens = torn.checkpoints.back().ids;
+            other.tokens.push_back(12345);
+            check(!store.matches(other.selector, other.tokens, other.images).empty(),
+                  "a same-length part still advertises the cut it is not part of");
+            check(store.demand(other, why), "the mismatched demand is admitted");
+            ConversationStoreRead other_read;
+            check(store.wait_ready(request, 1, other_read, 5000), "the mismatched demand settles");
+            check(other_read.status == ConversationStoreReadStatus::corrupt && !other_read.image,
+                  "a later stage holding another prefix is refused before handoff");
+            store.release_read(request, 1);
+            ++request;
+            // The live cut does not depend on any checkpoint part.
+            ConversationStoreQuery live = query_of(torn, request, 1);
+            check(store.demand(live, why), "the live demand is admitted");
+            ConversationStoreRead live_read;
+            check(store.wait_ready(request, 1, live_read, 5000), "the live demand settles");
+            check(live_read.status == ConversationStoreReadStatus::ready && live_read.live && live_read.image,
+                  "the live cut of a torn split still restores");
+            check(live_read.image && images_equal(*live_read.image, torn, why),
+                  "the live restore is byte-identical to the torn image it was stored from");
+            store.release_read(request, 1);
+            store.close();
+        }
+    }
+}
+
 void check_round_trip() {
     TempRoot root;
     const SavedConversation image = fixture(41, 256);
@@ -799,6 +963,15 @@ void check_round_trip() {
         check(result.status == ConversationStorePublishStatus::stored, "a new branch is stored");
         check(result.released, "the store released its publication alias");
         check(result.new_bytes > 0, "the publication wrote object bytes");
+        const ConversationStoreCounters counted = store.counters();
+        check(counted.objects > 0 && counted.object_bytes > 0,
+              "the counters report the bytes of the objects the store holds");
+        check(counted.object_bytes >= result.new_bytes,
+              "the counted object bytes cover the objects this publication wrote");
+        check(counted.object_bytes <= store.disk_charged_bytes(),
+              "the counted object bytes stay inside every physical byte the store owns");
+        check(counted.manifests > 0 && counted.manifest_bytes > 0,
+              "the counters report the bytes of the manifests the store holds");
         head_id = result.head_id;
         check(head_id != 0, "the publication has a head identity");
         check_eq(store.ram_lease_bytes(), 0, "no read is leased yet");
@@ -855,6 +1028,9 @@ void check_round_trip() {
         ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
         check(store.enabled(), "the root reopens after a clean close");
         check(store.run_intent_active(), "a reopened store arms its own intent");
+        const ConversationStoreCounters reopened = store.counters();
+        check(reopened.objects > 0 && reopened.object_bytes > 0 && reopened.manifest_bytes > 0,
+              "a reopened store counts the bytes it inherited from disk");
         const ConversationStoreQuery query = query_of(image, 9, 1);
         const std::vector<ConversationStoreMatch> found = store.matches(query.selector, query.tokens, query.images);
         check(!found.empty(), "the retained head answers a lookup after a clean restart");
