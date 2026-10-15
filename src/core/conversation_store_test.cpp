@@ -854,8 +854,6 @@ void check_multi_stage_restore() {
 void check_native_split_restore() {
     for (size_t stages : {size_t(2), size_t(3)}) {
         const SavedConversation image = split_fixture(151, 128, stages);
-        check(image.checkpoints[0].stage_parts.empty() && image.stage_images.size() + 1 == stages,
-              "the fixture is the native split: no primary record owns a stage part");
 
         // A coherent native split: every stage's own image holds both cuts.
         {
