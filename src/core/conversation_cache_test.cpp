@@ -1,4 +1,5 @@
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_reuse.hpp"
 #include "strata/core/prefix_extent_probe.hpp"
 #include "strata/program/prefix_selection.hpp"
 
@@ -1093,6 +1094,82 @@ int main() {
         priced.consider(1, 2000, 9.0);
         check(priced.using_cost() && priced.selected() == 0,
               "a priced stored candidate competes in the existing cost policy like any other source");
+    }
+    {
+        // The reuse intervals a capture may offer: each one names the donor head the retained bytes came from, ends on
+        // that donor's own object grid, and claims nothing the capture did not keep.  The store re-validates all of it;
+        // this is the caller-side half of the proof.
+        const uint64_t chunk = 1u << 20;
+        std::vector<ConversationStoreStreamInfo> streams;
+        auto add_stream = [&](uint32_t stage, ConversationStoreStreamKind kind, uint64_t ordinal, uint64_t bytes) {
+            ConversationStoreStreamInfo info;
+            info.id = ConversationStoreStreamId{stage, uint16_t(kind), 0, ordinal};
+            info.index = uint32_t(streams.size());
+            info.bytes = bytes;
+            streams.push_back(info);
+        };
+        add_stream(0, ConversationStoreStreamKind::kv_k, 0, 4 * chunk);
+        add_stream(0, ConversationStoreStreamKind::kv_v, 0, 4 * chunk);
+        add_stream(0, ConversationStoreStreamKind::kv_pooled, 0, chunk / 2);
+        add_stream(1, ConversationStoreStreamKind::kv_k, 0, 2 * chunk);
+        auto kept = [](uint32_t stage, uint32_t layer, uint32_t part, uint64_t bytes, uint64_t donor_bytes) {
+            ConversationRetainedPrefix prefix;
+            prefix.stage = stage;
+            prefix.layer = layer;
+            prefix.part = part;
+            prefix.bytes = bytes;
+            prefix.donor_bytes = donor_bytes;
+            return prefix;
+        };
+        const std::vector<ConversationRetainedPrefix> reported = {
+            kept(0, 0, 0, 3 * chunk + 4096, 4 * chunk),   // an unaligned prefix of this part's objects
+            kept(0, 0, 4, chunk / 2, chunk / 2),          // the whole (short) pooled page: it ends both streams
+            kept(1, 0, 0, 2 * chunk, 2 * chunk),          // a stage image's own stream, not the top image's
+        };
+        const auto reuse = conversation_store_reuse_intervals(streams, reported, 7, 5, 5, chunk);
+        check(reuse.size() == 3, "every retained part may offer exactly one interval");
+        check(reuse[0].head_id == 7 && reuse[0].offset == 0 && reuse[0].source_offset == 0 &&
+              reuse[0].stream.stage == 0 && reuse[0].stream.ordinal == 0 &&
+              reuse[0].stream.kind == uint16_t(ConversationStoreStreamKind::kv_k) &&
+              reuse[0].bytes == 3 * chunk,
+              "an unaligned retained prefix is offered down to the donor's own object grid");
+        check(reuse[1].bytes == chunk / 2 && reuse[1].stream.kind == uint16_t(ConversationStoreStreamKind::kv_pooled),
+              "a retained part that ends both streams needs no object grid");
+        check(reuse[2].stream.stage == 1 && reuse[2].bytes == 2 * chunk,
+              "a stage image's interval names the stage's own stream identity");
+        check(conversation_store_reuse_intervals(streams, reported, 7, 4, 5, chunk).empty(),
+              "a donor captured in another execution-domain epoch authorizes nothing");
+        check(conversation_store_reuse_intervals(streams, reported, 0, 5, 5, chunk).empty(),
+              "a capture with no named donor authorizes nothing");
+        check(conversation_store_reuse_intervals(streams, reported, 7, 5, 0, chunk).empty(),
+              "a capture outside any execution epoch authorizes nothing");
+        const auto clamped = conversation_store_reuse_intervals(streams,
+            {kept(0, 0, 0, 5 * chunk, 3 * chunk)}, 7, 5, 5, chunk);
+        check(clamped.size() == 1 && clamped[0].bytes == 3 * chunk,
+              "an interval is bounded by what the donor actually holds");
+        const auto unknown = conversation_store_reuse_intervals(streams, {kept(0, 0, 1, chunk, chunk),
+                                                                         kept(0, 3, 0, chunk, chunk)}, 7, 5, 5, chunk);
+        check(unknown.size() == 1 && unknown[0].bytes == chunk,
+              "a part whose stream identity is absent is skipped, never guessed at");
+        check(conversation_store_reuse_intervals(streams, {kept(0, 0, 1, 4096, 4 * chunk)}, 7, 5, 5, chunk).empty(),
+              "a retained prefix shorter than one object offers nothing");
+        check(conversation_store_reuse_intervals(streams, {kept(0, 0, 1, 9 * chunk, 9 * chunk)}, 7, 5, 5, chunk).empty(),
+              "a retained length longer than the outgoing stream offers nothing");
+    }
+    {
+        // The retained K/V carries the store head it was restored from, so a later capture can name the donor; a
+        // RAM-only restore carries none, and a capture then offers nothing.
+        ConversationCache cache(1u << 20, 2);
+        std::vector<ConversationKv> layers(1);
+        layers[0].k.resize(512);
+        cache.retain(std::move(layers), 8, {}, 91, 4);
+        const ConversationKvReuse named = cache.take_reuse();
+        check(named.donor_head == 91 && named.donor_epoch == 4 && named.captured_tokens == 8,
+              "retained K/V keeps the head and epoch it was restored from");
+        std::vector<ConversationKv> anonymous(1);
+        anonymous[0].k.resize(512);
+        cache.retain(std::move(anonymous), 8);
+        check(cache.take_reuse().donor_head == 0, "a RAM-only restore retains its bytes without naming a donor");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

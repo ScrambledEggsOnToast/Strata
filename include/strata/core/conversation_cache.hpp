@@ -129,6 +129,11 @@ struct ConversationKvReuse {
     int64_t captured_tokens = 0, unchanged_tokens = 0;
     // With a layer split: the later stages' own retained K/V, one per stage, same extents (empty: none)
     std::vector<ConversationKvReuse> stages;
+    // Provenance of these bytes: the persistent-store head this K/V was retained from and the execution-domain epoch
+    // it was captured in. 0 (a RAM-only restore) authorizes no reuse interval: nothing else can name the image these
+    // buffers came from, and a donor that cannot be named is never guessed at.
+    uint64_t donor_head = 0;
+    uint64_t donor_epoch = 0;
     size_t bytes() const {
         size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse);
         for (const auto& layer : kv) n += layer.bytes();
@@ -362,11 +367,22 @@ public:
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
+    // `donor_head`/`donor_epoch` name the persistent-store image these bytes were restored from (0: a RAM-only
+    // restore), so a later capture can offer exactly the bytes it kept from it as reuse intervals. The bytes here are
+    // charged in full by envelope_bytes(): they are still live host memory even though no parked entry owns them.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {},
+                uint64_t donor_head = 0, uint64_t donor_epoch = 0) {
         reuse_ = {};
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
-        for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
+        candidate.donor_head = donor_head;
+        candidate.donor_epoch = donor_epoch;
+        for (auto& k : stage_kv) {
+            ConversationKvReuse part{std::move(k), tokens, tokens, {}};
+            part.donor_head = donor_head;
+            part.donor_epoch = donor_epoch;
+            candidate.stages.push_back(std::move(part));
+        }
         const size_t available = room(0);
         if (enabled() && bytes_ <= available && candidate.bytes() <= available - bytes_)
             reuse_ = std::move(candidate);

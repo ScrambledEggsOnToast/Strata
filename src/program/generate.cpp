@@ -30,6 +30,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_reuse.hpp"
 #include "strata/core/conversation_store.hpp"
 #include "strata/core/execution_identity.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -505,12 +506,21 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 // image-sized allocations: the store's own read budget governs those.
 constexpr size_t kConversationOfferBytes = 64u << 20;
 
+// The store's immutable object size.  This file names it because the native side also aligns the reuse intervals it
+// offers to it: a K/V part is a byte stream (element 1), so every interval the store can adopt is a whole number of
+// these objects, and the caller has to know the grid to name the bytes it actually kept.
+constexpr uint64_t kConversationStoreChunkBytes = 1u << 20;
+
 uint64_t conversation_store_ram_limit(const strata::core::ConversationCache& cache, uint64_t envelope,
                                       uint64_t local_bytes = 0) {
     // The two processes each own bounded frontier metadata; neither may spend the snapshot envelope again.
     const uint64_t preparation = 2 * kConversationOfferBytes;
     uint64_t available = envelope > preparation ? envelope - preparation : 0;
-    const uint64_t cached = cache.envelope_bytes();
+    // What the parked cache holds: its parked payloads and the K/V it retained for the next capture.  A publication
+    // this process has queued but the store has *not* admitted yet is deliberately not subtracted here - the store's
+    // allowance is what admits that very publication, and the queue's own lease is charged to the cache's budget
+    // instead (ConversationCache::envelope_bytes), where it can only ever cause an eviction, never an overrun.
+    const uint64_t cached = cache.bytes();
     available = available > cached ? available - cached : 0;
     return available > local_bytes ? available - local_bytes : 0;
 }
@@ -10882,31 +10892,89 @@ int main(int argc, char** argv) {
         // persistence does not change today's choice.  A store that cannot open (no root, a missing identity, another
         // owner's lock, an unusable catalog) is an ordinary miss - never a serving failure - and says why.
         std::unique_ptr<strata::core::ConversationStore> conversation_store;
-        // The store head this session's live state continues from.  A publication supersedes it only when the
-        // outgoing image provably still covers the restored cut (same authorized scope, and the same prefix hash),
-        // which is the same predicate the RAM cache uses before it retires a predecessor.
+        // ---- publication lineage, per state owner ---------------------------------
+        // The head an owner's state continues from, and the owner's own record at that head.  A publication of that
+        // owner may retire it only when the outgoing capture still contains *that whole record* as its prefix (the
+        // store then re-validates the predecessor, every pin of it and its epoch itself, and keeps the predecessor as
+        // a retained branch whenever the proof does not hold).  One lineage per owner - this engine's session and
+        // each resident owner - because a resident owner's conversation has nothing to do with the session's, and a
+        // head one of them holds may never license retiring the other's.
         struct StoreLineage {
             uint64_t head = 0;
-            int64_t cut = 0;
-            uint64_t prefix_hash = 0;
+            uint64_t epoch = 0;
+            std::vector<int32_t> live;   // the record this head holds, as this engine continues it
             strata::core::ConversationScope scope;
+            bool cvec = true;
             bool valid = false;
         };
-        StoreLineage store_lineage;
-        // One entry per published lease not yet released by the store, so its RAM charge is given back and the
-        // lineage can move to the head the store actually created.
+        // `generation` is the owner's current capture generation: a publication completion moves the lineage only when
+        // it belongs to exactly that generation, so a completion that arrives after its owner was retargeted, remounted
+        // or recaptured is dropped instead of attaching itself to a state it does not describe.
+        struct StoreOwner {
+            uint64_t generation = 0;
+            StoreLineage lineage;
+        };
+        std::deque<StoreOwner> store_owners;   // stable references: entries are only appended
+        constexpr uint64_t kSessionOwner = 0;  // the session this engine runs requests in
+        constexpr uint64_t kResidentOwnerFirst = 1;   // 1 + slot: one owner per resident slot's own conversation
+        auto store_owner = [&](uint64_t owner) -> StoreOwner& {
+            while (store_owners.size() <= owner) store_owners.emplace_back();
+            return store_owners[size_t(owner)];
+        };
+        // ---- queued publications (bounded, before any extra GPU capture) ----------
+        // A capture the engine already paid for (GPU copies included) waits here instead of being dropped when the
+        // store's single writer is busy.  The image is frozen in place and its RAM is charged through the cache while
+        // it waits, so evicting the parked copy can never silently drop the only snapshot that is still to be written.
+        // Bounded: one entry per owner, a newer capture of the same owner replaces the older one (only one owner's
+        // generations coalesce, never two branches), and a fixed small ceiling overall.
+        struct QueuedPublish {
+            uint64_t owner = 0;
+            uint64_t owner_generation = 0;
+            uint64_t capture_epoch = 0;
+            uint64_t publication_id = 0;       // assigned when it is handed to the store, so results can be matched
+            uint64_t supersedes_hint = 0;      // the owner's lineage head at capture (0: this capture starts a branch)
+            bool continues = true;             // false: a one-shot borrow; never supersedes and never sets a lineage
+            strata::core::ConversationScope scope;
+            bool cvec = true;
+            std::vector<int32_t> live;         // the captured record, for the coverage proof and the lineage
+            std::vector<strata::core::ConversationStoreReuse> reuse;   // the proven intervals, donor already resolved
+            std::shared_ptr<const strata::core::SavedConversation> image;   // frozen alias: payloads are shared
+            size_t lease_bytes = 0;            // its charge in the cache envelope while it waits
+            uint32_t attempts = 0;             // bounded retries; a permanently refused entry is dropped and counted
+        };
+        std::deque<QueuedPublish> store_queue;
+        constexpr size_t kQueuedPublishes = 16;   // the ceiling: one writer, its pending slot and one per owner
+        constexpr uint32_t kPublishAttempts = 8;  // bounded retries of an entry the store refuses to admit yet
+        // One record per publication the store has admitted and not yet reported, so its result can move the exact
+        // owner generation it belongs to and its lease can be reported when the store releases it.
         struct PendingPublish {
             uint64_t request_id = 0;
             uint64_t generation = 0;
             uint64_t supersedes = 0;
+            uint64_t owner = 0;
+            uint64_t owner_generation = 0;
+            uint64_t capture_epoch = 0;
+            bool continues = true;
+            strata::core::ConversationScope scope;
+            bool cvec = true;
+            std::vector<int32_t> live;
             size_t lease_bytes = 0;
         };
         std::deque<PendingPublish> pending_publishes;
+        constexpr size_t kPendingPublishes = 8;   // the store's own writer plus its pending slots, plus slack
         uint64_t capture_generation = 0;   // publication ordering at capture, never worker completion
         uint64_t demand_serial = 0;        // demand identifiers for requests that arrived without an offer
         uint64_t publication_serial = 0;   // publication identifiers, to match asynchronous results
         uint64_t store_published = 0, store_restored = 0;
-        uint64_t store_refused = 0, store_coalesced = 0, store_cancelled = 0;
+        uint64_t store_refused = 0, store_coalesced = 0, store_cancelled = 0, store_dropped = 0;
+        // Internal identifiers must stay unique for as long as a completion can still arrive: a wrapped demand id
+        // would alias an offer's, and a wrapped publication id would match another publication's result.  Exhaustion
+        // refuses that one piece of work - it never reuses a number.
+        auto next_scheduled_serial = [&](uint64_t& serial, uint64_t& out) {
+            if (serial == UINT64_MAX) return false;
+            out = ++serial;
+            return true;
+        };
         // Written by the offer channel's own thread, read by this one.
         std::atomic<uint64_t> store_prefetched{0};
         // Every engine setting that changes what a saved state means, in one place: the *legacy* session file's
@@ -10954,6 +11022,9 @@ int main(int argc, char** argv) {
         if (persistence_configured) {
             strata::core::ConversationStoreOptions options;
             options.root = o.conversation_cache_dir;
+            // A required hardware identity this process cannot obtain declines persistence - never serving, and never
+            // by binding a stand-in: see the per-card query below.
+            std::string store_declined_reason;
             // The execution domain is a canonical digest of the fields that decide how a stored image must be
             // interpreted: the verified engine identity, the resolved runtime geometry, the main session's and every
             // stage's layer carve, device and authoritative K/V form, the draft's own form and presence, the resolved
@@ -11066,16 +11137,19 @@ int main(int argc, char** argv) {
                 {
                     // Every card the runtime enumerates, not only the ones this session carved: a prompt helper or a
                     // peer owner computes an expert's rows with the same kernels on a card of its own, so a host whose
-                    // visible cards differ is not the same execution domain.  A card the runtime cannot describe must
-                    // neither abort setup nor look like a known one: its failure is bound, and no identified card can
-                    // share that binding.
+                    // visible cards differ is not the same execution domain.  A card the runtime cannot describe is a
+                    // required identity this process does not have: binding a generic "unavailable" marker would let
+                    // two unidentified cards share one execution domain and restore each other's records, so the run
+                    // declines *persistence* instead.  Serving is unaffected: it continues without a conversation
+                    // store, exactly like a missing identity or an unusable root.
                     const int cards = strata::core::device_count();
-                    for (int device = 0; device < cards; ++device) {
+                    for (int device = 0; device < cards && store_declined_reason.empty(); ++device) {
                         strata::core::DeviceInfo info;
                         try {
                             info = strata::core::device_info(device);
-                        } catch (const std::exception&) {
-                            bind_number("host.gpu_query_failed." + std::to_string(device), 1);
+                        } catch (const std::exception& failure) {
+                            store_declined_reason = "the identity of CUDA device " + std::to_string(device) +
+                                                    " is unavailable (" + failure.what() + ")";
                             continue;
                         }
                         bind_number("host.gpu_cc." + std::to_string(device), info.cc_major * 10 + info.cc_minor);
@@ -11134,6 +11208,8 @@ int main(int argc, char** argv) {
             options.quota_bytes = (uint64_t) o.conversation_cache_disk_mib << 20;
             options.min_free_bytes = (uint64_t) o.conversation_cache_disk_min_free_mib << 20;
             options.head_limit = (size_t) o.conversation_cache_disk_heads;
+            // Named here because the reuse intervals this file offers are aligned to exactly this grid.
+            options.chunk_bytes = kConversationStoreChunkBytes;
             options.read_budget_bytes = conversation_store_ram_limit(conversations,
                 (uint64_t) o.conversation_cache_mib << 20);
             strata::core::ConversationStoreLimits limits;
@@ -11144,16 +11220,24 @@ int main(int argc, char** argv) {
             limits.max_stages = (uint32_t) stages.size() + 1;
             limits.max_checkpoints = (uint32_t) std::max(o.prompt_cache, 1);
             limits.max_kv_layers = (uint32_t) g.n_qsa_layers() + 1;
-            conversation_store = std::make_unique<strata::core::ConversationStore>(options, limits);
-            if (!conversation_store->enabled()) {
+            if (!store_declined_reason.empty()) {
+                // The binding above is deliberately incomplete without a card identity, so nothing is opened and no
+                // record is ever authorized under it.
                 std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
-                             conversation_store->disabled_reason());
+                             store_declined_reason.c_str());
             } else {
-                std::fprintf(stderr, "strata serve: conversation store: root=%s quota=%lld MiB floor=%lld MiB "
-                                     "heads=%zu epoch=%llu enabled=1\n",
-                             o.conversation_cache_dir.c_str(), (long long) o.conversation_cache_disk_mib,
-                             (long long) o.conversation_cache_disk_min_free_mib,
-                             (size_t) o.conversation_cache_disk_heads, (unsigned long long) conversation_store->epoch());
+                conversation_store = std::make_unique<strata::core::ConversationStore>(options, limits);
+                if (!conversation_store->enabled()) {
+                    std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
+                                 conversation_store->disabled_reason());
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation store: root=%s quota=%lld MiB floor=%lld MiB "
+                                         "heads=%zu epoch=%llu enabled=1\n",
+                                 o.conversation_cache_dir.c_str(), (long long) o.conversation_cache_disk_mib,
+                                 (long long) o.conversation_cache_disk_min_free_mib,
+                                 (size_t) o.conversation_cache_disk_heads,
+                                 (unsigned long long) conversation_store->epoch());
+                }
             }
         }
         const bool store_on = conversation_store && conversation_store->enabled();
@@ -11188,8 +11272,11 @@ int main(int argc, char** argv) {
             }
             return h;
         };
-        // Harvest finished publications: their lease leaves the RAM envelope, and the lineage moves to the head the
-        // store created (so the next turn's publication supersedes that one, not the head it replaced).
+        // Harvest finished publications: their lease leaves the RAM envelope, and the lineage of the *exact owner
+        // generation* that produced the image moves to the head the store created.  A result whose owner was captured
+        // again (or remounted, or taken over by another conversation) since it was queued is reported and dropped: it
+        // must never attach itself to a state it does not describe, and a cancelled or refused publication never
+        // establishes a lineage at all.
         auto reap_publishes = [&](uint64_t wait_ms) -> size_t {
             if (!store_on) return 0;
             size_t reaped = 0;
@@ -11208,29 +11295,175 @@ int main(int argc, char** argv) {
                 const bool created = result.status == strata::core::ConversationStorePublishStatus::stored ||
                     result.status == strata::core::ConversationStorePublishStatus::replaced ||
                     result.status == strata::core::ConversationStorePublishStatus::retained_branch;
-                if (created && store_lineage.valid && pending.supersedes != 0 &&
-                    pending.supersedes == store_lineage.head)
-                    store_lineage.head = result.head_id;
-                if (result.status != strata::core::ConversationStorePublishStatus::stored &&
-                    result.status != strata::core::ConversationStorePublishStatus::replaced &&
-                    result.status != strata::core::ConversationStorePublishStatus::retained_branch) {
+                if (created) {
+                    StoreOwner& owner = store_owner(pending.owner);
+                    // Exactly this capture generation, and only a capture that continues the owner's own branch: a
+                    // one-shot borrow published as a fresh branch never becomes the owner's lineage.
+                    if (pending.continues && owner.generation == pending.owner_generation) {
+                        owner.lineage.head = result.head_id;
+                        owner.lineage.epoch = result.epoch;
+                        owner.lineage.live = pending.live;
+                        owner.lineage.scope = pending.scope;
+                        owner.lineage.cvec = pending.cvec;
+                        owner.lineage.valid = !pending.live.empty() && pending.scope.valid();
+                    }
+                }
+                if (result.status == strata::core::ConversationStorePublishStatus::coalesced) {
+                    // A newer capture of the same owner and lineage replaced this one before the writer started it.
+                    // The retired lease is the store's own accounting; no lineage moves here.
+                    ++store_coalesced;
+                    std::fprintf(stderr, "strata serve: conversation store: publication of owner %llu was coalesced "
+                                         "by a newer capture of the same lineage\n", (unsigned long long) pending.owner);
+                } else if (!created) {
                     ++store_refused;
-                    std::fprintf(stderr, "strata serve: conversation store: publication %s (%s, %llu new bytes)\n",
+                    std::fprintf(stderr, "strata serve: conversation store: publication %s for owner %llu "
+                                         "generation %llu (%s, %llu new bytes)\n",
                                  strata::core::conversation_store_publish_status_name(result.status),
-                                 result.detail.c_str(), (unsigned long long) result.new_bytes);
+                                 (unsigned long long) pending.owner,
+                                 (unsigned long long) pending.generation, result.detail.c_str(),
+                                 (unsigned long long) result.new_bytes);
                 } else {
                     ++store_published;
-                    if (result.status == strata::core::ConversationStorePublishStatus::coalesced) ++store_coalesced;
-                    std::fprintf(stderr, "strata serve: conversation store: %s head=%llu tokens_published=%llu "
-                                         "new=%llu reused=%llu released=%d\n",
+                    std::fprintf(stderr, "strata serve: conversation store: %s head=%llu owner=%llu supersedes=%llu "
+                                         "tokens_published=%llu new=%llu reused=%llu released=%d\n",
                                  strata::core::conversation_store_publish_status_name(result.status),
-                                 (unsigned long long) result.head_id, (unsigned long long) result.payload_bytes,
+                                 (unsigned long long) result.head_id, (unsigned long long) pending.owner,
+                                 (unsigned long long) pending.supersedes,
+                                 (unsigned long long) result.payload_bytes,
                                  (unsigned long long) result.new_bytes, (unsigned long long) result.reused_bytes,
                                  int(result.released));
                 }
                 if (reaped >= pending_publishes.size() + 4) break;
             }
             return reaped;
+        };
+        // Hand the queued captures to the store's one bounded writer, oldest first.  A busy or momentarily-full writer
+        // leaves an entry queued and the next safe seam retries it - never a misleading "deferred" line over work the
+        // engine has already paid for.  The coverage proof is re-derived here from the *entry's own* captured record
+        // and its owner's current lineage, so a capture queued before an earlier publication reported its head is
+        // still able to supersede the head that publication created.
+        auto drop_queued_publish = [&](size_t index, const char* why) {
+            QueuedPublish& entry = store_queue[index];
+            conversations.release_lease(entry.lease_bytes);
+            ++store_dropped;
+            std::fprintf(stderr, "strata serve: conversation store: queued publication of owner %llu (capture epoch "
+                                 "%llu) dropped (%s, %zu MiB)\n", (unsigned long long) entry.owner,
+                         (unsigned long long) entry.capture_epoch, why, entry.lease_bytes >> 20);
+            store_queue.erase(store_queue.begin() + (std::ptrdiff_t) index);
+        };
+        auto flush_publishes = [&](uint64_t wait_ms) {
+            if (!store_on) return;
+            reap_publishes(wait_ms);
+            while (!store_queue.empty()) {
+                const uint64_t epoch_now = conversation_store->epoch();
+                if (store_queue.front().capture_epoch != epoch_now) {
+                    // The execution domain advanced after this capture: the store would refuse it, and no head of the
+                    // retired epoch may be superseded.
+                    drop_queued_publish(0, "captured in a retired execution-domain epoch");
+                    continue;
+                }
+                if (pending_publishes.size() >= kPendingPublishes) break;   // the writer's own queue is full: retry
+                if (conversation_store->writer_busy()) break;               // retry at the next safe seam
+                QueuedPublish& entry = store_queue.front();
+                uint64_t publication_id = 0;
+                if (!next_scheduled_serial(publication_serial, publication_id)) {
+                    drop_queued_publish(0, "the publication identifier namespace is exhausted");
+                    continue;
+                }
+                entry.publication_id = publication_id;
+                strata::core::ConversationStorePublish publish;
+                publish.request_id = publication_id;
+                publish.generation = publication_id;
+                publish.epoch = entry.capture_epoch;
+                publish.reuse = entry.reuse;
+                StoreOwner& owner = store_owner(entry.owner);
+                const StoreLineage& lineage = owner.lineage;
+                const bool same_generation = owner.generation == entry.owner_generation;
+                if (entry.continues && same_generation && lineage.valid && entry.supersedes_hint != 0 &&
+                    lineage.head == entry.supersedes_hint && lineage.epoch == entry.capture_epoch &&
+                    lineage.scope.matches(entry.scope) && lineage.cvec == entry.cvec &&
+                    lineage.live.size() <= entry.live.size() &&
+                    std::equal(lineage.live.begin(), lineage.live.end(), entry.live.begin())) {
+                    // The whole record the predecessor head holds is still this capture's prefix (equal or longer), so
+                    // the store may retire it; the store re-validates the predecessor, every pin it carries and its
+                    // epoch itself, and keeps the predecessor as a retained branch whenever that proof does not hold.
+                    publish.supersedes = lineage.head;
+                    publish.cover = true;
+                }
+                // The store admits the image against the read allowance in force, which every flush site publishes
+                // from live accounting right before calling this (and which a suspended capture keeps from racing an
+                // allocation): this function deliberately never republishes it.
+                PendingPublish pending;
+                pending.request_id = publish.request_id;
+                pending.generation = publish.generation;
+                pending.supersedes = publish.supersedes;
+                pending.owner = entry.owner;
+                pending.owner_generation = entry.owner_generation;
+                pending.capture_epoch = entry.capture_epoch;
+                pending.continues = entry.continues;
+                pending.scope = entry.scope;
+                pending.cvec = entry.cvec;
+                pending.live = entry.live;
+                pending.lease_bytes = entry.lease_bytes;
+                pending_publishes.push_back(std::move(pending));
+                std::string why;
+                // The entry keeps its own reference across the call: a refused publication leaves the image exactly
+                // where it was, so the retry at the next seam hands over the same immutable bytes.
+                std::shared_ptr<const strata::core::SavedConversation> image = std::move(entry.image);
+                if (conversation_store->publish(image, publish, why)) {
+                    // The store charges the alias itself from here on; the cache's lease on it ends.
+                    conversations.release_lease(entry.lease_bytes);
+                    store_queue.pop_front();
+                    continue;
+                }
+                entry.image = std::move(image);
+                pending_publishes.pop_back();
+                ++store_refused;
+                if (++entry.attempts >= kPublishAttempts) {
+                    std::string detail = why.empty() ? "the store refused the publication" : why;
+                    drop_queued_publish(0, detail.c_str());
+                    continue;
+                }
+                std::fprintf(stderr, "strata serve: conversation store: publication of owner %llu held back (%s); "
+                                     "it stays queued for the next safe seam (attempt %u/%u, id %llu)\n",
+                             (unsigned long long) entry.owner, why.c_str(), entry.attempts + 1, kPublishAttempts,
+                             (unsigned long long) entry.publication_id);
+                break;
+            }
+        };
+        // Queue a capture for the store's writer without spending any further GPU work on it.  Bounded: a newer capture
+        // of the same owner replaces that owner's older entry (only one owner's own generations coalesce - two branches
+        // are never merged), and the cache charges the frozen alias in full while it waits, so the envelope bounds how
+        // many snapshots may wait at once.  A full queue refuses the new entry explicitly; it never grows.
+        auto queue_publish = [&](QueuedPublish&& entry) -> bool {
+            for (size_t i = 0; i < store_queue.size(); ++i) {
+                if (store_queue[i].owner != entry.owner) continue;
+                conversations.release_lease(store_queue[i].lease_bytes);
+                std::fprintf(stderr, "strata serve: conversation store: a newer capture of owner %llu replaced an "
+                                     "unwritten publication of the same owner\n", (unsigned long long) entry.owner);
+                store_queue.erase(store_queue.begin() + (std::ptrdiff_t) i);
+                break;
+            }
+            if (store_queue.size() >= kQueuedPublishes) {
+                std::fprintf(stderr, "strata serve: conversation store: %zu publications are already waiting; this "
+                                     "capture is not queued for persistence\n", store_queue.size());
+                return false;
+            }
+            store_queue.push_back(std::move(entry));
+            return true;
+        };
+        // Every head an owner holds is dropped when the execution domain is invalidated: no head of a retired epoch may
+        // ever be superseded, and a capture queued for it must not be published.  Storage work the store has already
+        // admitted is the store's own to retire when the epoch advances.
+        auto drop_store_publications = [&](const char* why) {
+            for (QueuedPublish& entry : store_queue) {
+                conversations.release_lease(entry.lease_bytes);
+                ++store_dropped;
+                std::fprintf(stderr, "strata serve: conversation store: queued publication of owner %llu dropped (%s)\n",
+                             (unsigned long long) entry.owner, why);
+            }
+            store_queue.clear();
+            for (StoreOwner& owner : store_owners) owner.lineage = {};
         };
         // The prepared offers the channel accepted.  Its own thread inserts them; the request path only looks up the
         // deadline of the offer a request binds to (the internal stdin key carries the identifiers, not the tokens,
@@ -11389,6 +11622,7 @@ int main(int argc, char** argv) {
         struct StoreDemandResult {
             strata::core::ConversationStoreReadStatus status = strata::core::ConversationStoreReadStatus::none;
             uint64_t head_id = 0;
+            uint64_t epoch = 0;        // the execution-domain epoch the mounted image was captured in
             int64_t tokens = 0;
             bool live = false;
             uint32_t stages = 0;
@@ -11426,7 +11660,19 @@ int main(int argc, char** argv) {
             query.selector.cvec = want_cvec;
             query.tokens = prompt;
             query.images = imgs;
-            query.request_id = offer_id != 0 ? offer_id : (uint64_t{1} << 63) | ++demand_serial;
+            if (offer_id != 0) {
+                query.request_id = offer_id;
+            } else {
+                // This process's own identifiers live in the high half of the same 64-bit space the frontend's offers
+                // use, so a wrapped one would alias an accepted offer's completion.  Exhaustion refuses the read.
+                if (demand_serial == ((uint64_t{1} << 63) - 1)) {
+                    out.status = strata::core::ConversationStoreReadStatus::failed;
+                    std::fprintf(stderr, "strata serve: conversation store: the demand identifier namespace is "
+                                         "exhausted; the prompt is read instead\n");
+                    return out;
+                }
+                query.request_id = (uint64_t{1} << 63) | ++demand_serial;
+            }
             query.generation = offer_id != 0 ? offer_generation : conversation_store->epoch();
             query.deadline_ns = deadline_ns;
             store_allowance();
@@ -11491,6 +11737,7 @@ int main(int argc, char** argv) {
             } lease{*conversation_store, read.request_id, read.generation};
             out.status = read.status;
             out.head_id = read.head_id;
+            out.epoch = read.epoch;
             out.tokens = read.tokens;
             out.live = read.live;
             out.stages = read.stages;
@@ -11503,9 +11750,10 @@ int main(int argc, char** argv) {
             out.request_id = query.request_id;
             out.generation = query.generation;
             // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
-            // (ram_lease_bytes) until the engine's own alias dies: the caller records the transfer and releases it
-            // through release_read() at its own end-of-request seam.  cancel() is refused for a transferred image.
-            conversation_store->transfer_read_image(query.request_id, query.generation);
+            // (ram_lease_bytes) until this process reports the read finished.  That report is release_read(), and the
+            // caller makes it at its own end-of-request seam - after the engine's alias of the image is gone, which
+            // the guard above already orders.  A handed-out read is never cancelled: cancel() names a request that has
+            // not been delivered.
             lease.armed = false;
             return out;
         };
@@ -11654,6 +11902,11 @@ int main(int argc, char** argv) {
             const strata::core::ConversationScope& scope;
             bool steering, valid;
             const strata::program::ResidentSnapshotSource* resident = nullptr;
+            // The state owner this capture belongs to (its lineage is the only one this capture may supersede), and
+            // whether this capture continues that owner's own stored branch: a one-shot borrow (ckpt=0) does not, so
+            // it is published as a branch of its own and never becomes the owner's lineage.
+            uint64_t owner = kSessionOwner;
+            bool continues = true;
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
@@ -11686,6 +11939,13 @@ int main(int argc, char** argv) {
                                      "minimum; parked=%zu)\n",
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
+            }
+            // A capture is about to spend GPU time on copies; hand the store's writer whatever is already queued
+            // first.  This is a real retry seam (the entry stays queued if the writer is busy), and it is also what
+            // lets this capture's own publication find the writer free.
+            if (store_on) {
+                store_allowance();
+                flush_publishes(0);
             }
             StoreRamAdmission store_admission(store_on ? conversation_store.get() : nullptr, conversations,
                                               (uint64_t) o.conversation_cache_mib << 20, held);
@@ -11810,17 +12070,28 @@ int main(int argc, char** argv) {
                 auto backing_ledger = backing_probe_on ? std::make_unique<strata::core::PrefixBackingLedger>() : nullptr;
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
+                // The bytes each stage's capture kept from the image it retained, named by the donor head that image
+                // came from.  Reported by the capture itself (the same keeps it did not copy); nothing here reads,
+                // hashes or compares an old payload to establish them.
+                const uint64_t reuse_donor_head = store_on ? reuse.donor_head : 0;
+                const uint64_t reuse_donor_epoch = reuse.donor_epoch;
+                std::vector<strata::core::ConversationRetainedPrefix> retained_prefixes;
                 if (!strata::core::conversation_snapshot_save(image, view, session_at(0), g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
+                        std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
+                    std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
+                            std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr))
                         return false;
+                    for (strata::core::ConversationRetainedPrefix& prefix : stage_prefixes) {
+                        prefix.stage = (uint32_t) (k + 1);   // this capture's own stage tag: the store's stream stage
+                        retained_prefixes.push_back(prefix);
+                    }
                     image.stage_images.push_back(std::move(part));
                 }
                 image.scope = live_scope;
@@ -11896,54 +12167,63 @@ int main(int argc, char** argv) {
                 // back when the store releases the alias.  A busy, full or unhealthy store only skips the write: the
                 // request keeps its result either way.
                 if (store_on && valid_image(image)) {
-                    reap_publishes(0);
-                    // A publication may retire its predecessor head only when this image provably still covers the
-                    // restored cut it continues from: same authorized scope and the same token prefix.
-                    uint64_t supersedes = 0;
-                    bool cover = false;
-                    if (store_lineage.valid && store_lineage.scope.matches(live_scope) &&
-                        (int64_t) live.size() >= store_lineage.cut && store_lineage.cut > 0 &&
-                        token_prefix_hash(live.data(), (size_t) store_lineage.cut) == store_lineage.prefix_hash) {
-                        supersedes = store_lineage.head;
-                        cover = true;
+                    // A busy writer first: drain what is already queued before this capture adds to it, so the queue
+                    // is a handover, not an accumulation, and no seam spends GPU work on a write that cannot start.
+                    // The allowance this handover is admitted against subtracts the held incoming image.
+                    store_admission.publish(image.bytes());
+                    flush_publishes(0);
+                    StoreOwner& owner = store_owner(source.owner);
+                    QueuedPublish queued;
+                    queued.owner = source.owner;
+                    queued.capture_epoch = capture_epoch;
+                    queued.continues = source.continues;
+                    queued.supersedes_hint = owner.lineage.valid ? owner.lineage.head : 0;
+                    queued.scope = live_scope;
+                    queued.cvec = cvec_cached;
+                    queued.live.assign(live.begin(), live.end());
+                    // Only bytes the capture itself kept from the image it retained may be offered, and only against
+                    // the head that image came from - never against a global "current" head.
+                    if (!retained_prefixes.empty() && reuse_donor_head != 0) {
+                        const std::vector<strata::core::ConversationStoreStreamInfo> streams =
+                            strata::core::conversation_store_streams(image);
+                        queued.reuse = strata::core::conversation_store_reuse_intervals(
+                            streams, retained_prefixes, reuse_donor_head, reuse_donor_epoch, capture_epoch,
+                            kConversationStoreChunkBytes);
                     }
                     const size_t lease = image.bytes();
-                    // Reserve both references before freezing. Publication owns its charge in the store;
-                    // the RAM cache must not independently refund or double-spend that reservation.
+                    // Reserve both references before freezing: the store owns the publication's own charge, and the
+                    // cache's lease covers exactly the window in which the entry is queued and the store does not yet
+                    // hold it, so neither side can hand those bytes to another image while it waits.
                     const size_t overhead = 1u << 20;
                     const uint64_t external_now = store_admission.held();
-                    if (!conversation_store->writer_busy() && pending_publishes.size() < 8 &&
-                        lease <= (SIZE_MAX - overhead) / 2 && external_now <= SIZE_MAX - held &&
-                        conversations.reserve_snapshot(lease * 2 + overhead, held + (size_t) external_now)) {
-                        auto alias = strata::core::conversation_image_freeze_share(image);
-                        const size_t exact = alias->bytes();
-                        strata::core::ConversationStorePublish publish;
-                        publish.request_id = ++publication_serial;
-                        publish.generation = ++capture_generation;
-                        publish.epoch = capture_epoch;
-                        publish.supersedes = supersedes;
-                        publish.cover = cover;
-                        // Allocate bookkeeping before handing ownership to an asynchronous worker.
-                        pending_publishes.push_back(PendingPublish{publish.request_id, publish.generation,
-                                                                   publish.supersedes, exact});
-                        struct PendingRollback {
-                            std::deque<PendingPublish>& pending;
-                            bool accepted = false;
-                            ~PendingRollback() { if (!accepted) pending.pop_back(); }
-                        } rollback{pending_publishes};
-                        store_admission.publish(image.bytes());
-                        std::string why;
-                        if (conversation_store->publish(std::move(alias), publish, why)) {
-                            rollback.accepted = true;
+                    const bool admitted = lease <= (SIZE_MAX - overhead) / 2 && external_now <= SIZE_MAX - held &&
+                        conversations.reserve_snapshot(lease * 2 + overhead, held + (size_t) external_now) &&
+                        conversations.try_reserve_lease(lease);
+                    if (admitted) {
+                        queued.image = strata::core::conversation_image_freeze_share(image);
+                        queued.lease_bytes = lease;
+                        if (!next_scheduled_serial(capture_generation, queued.publication_id)) {
+                            conversations.release_lease(lease);
+                            ++store_dropped;
+                            std::fprintf(stderr, "strata serve: conversation store: the capture identifier namespace "
+                                                 "is exhausted; this capture is not published\n");
                         } else {
-                            ++store_refused;
-                            std::fprintf(stderr, "strata serve: conversation store: publication skipped (%s)\n",
-                                         why.c_str());
+                            // This capture becomes the owner's current generation: an older completion of the same
+                            // owner is now dropped rather than attached to a state it no longer describes.
+                            const uint64_t previous_generation = owner.generation;
+                            owner.generation = queued.publication_id;
+                            queued.owner_generation = queued.publication_id;
+                            if (queue_publish(std::move(queued))) {
+                                flush_publishes(0);
+                            } else {
+                                owner.generation = previous_generation;
+                                conversations.release_lease(lease);
+                            }
                         }
                     } else {
                         ++store_refused;
-                        std::fprintf(stderr, "strata serve: conversation store: publication deferred "
-                                             "(writer or RAM admission)\n");
+                        std::fprintf(stderr, "strata serve: conversation store: publication not queued (writer or "
+                                             "RAM admission; %zu MiB)\n", lease >> 20);
                     }
                 }
                 const size_t previous_superseded = conversations.superseded();
@@ -12012,16 +12292,23 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
-        auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image, size_t held_entries = 0) -> bool {
-            return park_source({live, live_imgs, checks, live_scope, cvec_cached, live_ok}, held, held_image, held_entries);
+        auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image, size_t held_entries = 0,
+                                bool continues = true) -> bool {
+            // The session this engine runs requests in is its own owner, and only the request's own keys decide
+            // whether this capture continues the branch a publication of it established (a one-shot borrow does not).
+            return park_source({live, live_imgs, checks, live_scope, cvec_cached, live_ok, nullptr, kSessionOwner,
+                                continues}, held, held_image, held_entries);
         };
         auto park_completed = [&](int slot, size_t held, const strata::core::SavedConversation* held_image) -> bool {
             if (!conversations.enabled()) return true;
             auto source = resident.completed_snapshot_source(slot, err);
             if (!source) return err.empty();
             const auto& owner = source->owner;
+            // A resident owner's own conversation is the owner of this capture: its lineage is the only one a
+            // publication of it may supersede or update, never the session's and never another slot's.
             return park_source({owner.ids, no_park_images, source->checkpoints, owner.input.scope,
-                                owner.cvec, true, &*source}, held, held_image);
+                                owner.cvec, true, &*source, kResidentOwnerFirst + (uint64_t) slot, true},
+                               held, held_image);
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
@@ -14722,12 +15009,13 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
-            // Between requests: harvest finished store publications (their RAM leases go back to the envelope) and
-            // republish the store's read allowance from live accounting.  Both are non-blocking and CPU-only; the
+            // Between requests: hand over anything still queued (this is the seam where a busy writer is retried,
+            // never dropped) and harvest finished publications (their RAM leases go back to the envelope), then
+            // republish the store's read allowance from live accounting.  All of it is non-blocking and CPU-only; the
             // serving path never waits for storage here.
             if (store_on) {
-                reap_publishes(0);
                 store_allowance();
+                flush_publishes(0);
                 // The RAM the next request's offers must be filtered against changed at the end of the last request.
                 publish_ram_view();
             }
@@ -14956,7 +15244,9 @@ int main(int argc, char** argv) {
                         // The poison may sit in any stored image of this execution domain, so the domain's epoch
                         // advances durably here as well: a restart must not resurrect what RAM deliberately dropped.
                         if (store_on) conversation_store->invalidate_domain("non-finite logits");
-                        store_lineage.valid = false;   // the epoch advanced: no head of it may be superseded
+                        // The epoch advanced: no head of the retired epoch may be superseded, and a capture queued
+                        // for it must not be published.
+                        drop_store_publications("the execution domain advanced after the capture");
                         if (store_on) publish_ram_view();   // the parked set just went away
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
@@ -15274,7 +15564,7 @@ int main(int argc, char** argv) {
                 // suspect once the poison is in the K/V, and the durable epoch advance is what makes a later restart
                 // refuse it.  A failed commit leaves the run intent armed, so the next start is conservative too.
                 if (store_on) conversation_store->invalidate_domain("non-finite logits");
-                store_lineage.valid = false;   // the epoch advanced: no head of it may be superseded
+                drop_store_publications("the execution domain advanced after the capture");
                 if (store_on) publish_ram_view();   // the parked set just went away
                 const auto slots_dropped = resident.invalidate_after_nonfinite();   // running tainted, idle caches dropped
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
@@ -15602,7 +15892,10 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             if ((!from_live || incoming || slot_source >= 0 || !req_ckpt) && !pin_sibling &&
                 !park_current(incoming && !restored_from_store ? incoming->bytes() : 0,
-                              incoming ? &*incoming : nullptr, incoming && !restored_from_store && !req_ckpt ? 1 : 0)) {
+                              incoming ? &*incoming : nullptr, incoming && !restored_from_store && !req_ckpt ? 1 : 0,
+                              // A one-shot borrow (ckpt=0) leaves its donor alone: its capture is a branch of its
+                              // own, and it never supersedes the head that donor came from.
+                              req_ckpt != 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -15728,24 +16021,32 @@ int main(int argc, char** argv) {
                 live_scope = incoming->scope;
                 resume = parked.tokens;
                 from_live = parked.live || direct_cut;
-                // A store-mounted image sets the lineage a later publication may supersede: the head the live state
-                // now continues from, the cut it was mounted at, and the prefix hash that proves coverage when the
-                // conversation is parked again (the same predicate the RAM cache applies before retiring a
-                // predecessor, plus the authorized scope).
+                // A store-mounted image sets the lineage of the owner whose state it becomes: the head this state now
+                // continues from and the *whole record that head holds* (the mounted cut is that head's own prefix),
+                // which is what a later capture has to contain before the store may retire it.  Mounting replaces the
+                // state this session runs requests in, so it also moves the owner's generation: a completion of the
+                // state that was just replaced must never attach itself to the state that replaced it.
                 if (restored_from_store) {
-                    store_lineage.valid = false;
+                    StoreOwner& owner = store_owner(kSessionOwner);
+                    ++owner.generation;
+                    owner.lineage = {};
                     if (resume > 0 && (int64_t) live.size() >= resume) {
-                        store_lineage.head = store_demand.head_id;
-                        store_lineage.cut = resume;
-                        store_lineage.prefix_hash = token_prefix_hash(live.data(), (size_t) resume);
-                        store_lineage.scope = req_scope;
-                        store_lineage.valid = true;
+                        owner.lineage.head = store_demand.head_id;
+                        owner.lineage.epoch = store_demand.epoch;
+                        owner.lineage.live.assign(live.begin(), live.begin() + (size_t) resume);
+                        owner.lineage.scope = req_scope;
+                        owner.lineage.cvec = want_cvec;
+                        owner.lineage.valid = true;
                     }
                 }
                 if (req_ckpt && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    // The retained K/V names the head it came from, so a later capture can offer the exact bytes it
+                    // keeps from it; a RAM-only restore names no donor and can authorize no interval.
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv),
+                                         restored_from_store ? store_demand.head_id : 0,
+                                         restored_from_store ? store_demand.epoch : 0);
                 }
                 if (direct_cut) {
                     // Retained K/V still describes the full captured allocation; only this prefix is unchanged.
@@ -15853,6 +16154,11 @@ int main(int argc, char** argv) {
                 conversation_store->confirmed_restore(store_demand.head_id);
                 ++store_restored;
             }
+            // Every alias of the mounted image is gone by now - the engine's own image was reset above, and the K/V the
+            // cache retained for its next capture is charged in full by the cache's own envelope
+            // (ConversationCache::bytes, which the read allowance is computed against) - so the store may refund its
+            // lease here.  The guard's destructor releases it on every other path, and it is declared before the image
+            // so that teardown always happens first, a rejected or failed mount included.
             store_demand_lease.release();
             if (store_on) {
                 publish_ram_view();
@@ -17972,12 +18278,50 @@ int main(int argc, char** argv) {
         // ---- clean shutdown ---------------------------------------------------
         // QUIT (or the server closing stdin) has no later request to park the last completed conversation, so the
         // final owners are captured here: the serial session this engine is holding, and every resident owner a batch
-        // slot completed.  Their capture is what publishes them.  Then the offer channel is stopped BEFORE the store
-        // is drained and destroyed - a callback must never reach a retired store - outstanding publications are
-        // drained with a bounded wait, and the store is closed: only a clean close durably clears this domain's run
-        // intent, which is what lets eligible completed publications survive a restart.  A GPU fault, the poison path
-        // or a killed process deliberately leaves the intent armed (the destructor does exactly that).
+        // slot completed.  Two things are ordered deliberately.  The offer channel is stopped FIRST: its callback must
+        // never reach a store that is being drained or destroyed, and no offer may add work while the drain runs.  The
+        // deadline starts BEFORE the captures, so capturing every final owner cannot extend the shutdown past it.
+        // Then each owner is captured and drained one at a time: a busy writer delays the next owner rather than making
+        // it skip its own publication, and only the remaining deadline can end the drain.  Finally the store is closed:
+        // only a clean close durably clears this domain's run intent, which is what lets eligible completed
+        // publications survive a restart.  A GPU fault, the poison path or a killed process deliberately leaves the
+        // intent armed (the destructor does exactly that), so a run that stopped short never looks healthy.
+        if (offer_channel) offer_channel->stop();
         if (store_on) {
+            const auto now_ms = [] {
+                return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count();
+            };
+            // Bounded: the frontend's QUIT grace is 15 s inside the host's 20 s, and the lifetime already reserves
+            // its own window, so storage work that has not finished by then is abandoned rather than waited out.
+            const uint64_t shutdown_started = now_ms();
+            const uint64_t deadline = shutdown_started + 8000;
+            store_allowance();
+            flush_publishes(0);
+            size_t drained_owners = 0, skipped_owners = 0;
+            auto drain_owner = [&](uint64_t owner) {
+                // The capture just taken is handed over and waited for here, before the next owner is captured: the
+                // writer's queue is a handover, never an accumulation, and a busy writer delays the next capture
+                // instead of making it skip its own publication.  The wait is bounded twice - by the deadline, and by
+                // progress: after three iterations that neither hand over nor report anything, the next owner is
+                // captured anyway and this entry keeps its remaining attempts.
+                int stalled = 0;
+                while ((!store_queue.empty() || !pending_publishes.empty()) && now_ms() < deadline && stalled < 3) {
+                    const size_t before = store_queue.size() + pending_publishes.size();
+                    store_allowance();
+                    flush_publishes(250);
+                    stalled = store_queue.size() + pending_publishes.size() < before ? 0 : stalled + 1;
+                }
+                if (store_queue.empty() && pending_publishes.empty()) {
+                    ++drained_owners;
+                    return;
+                }
+                ++skipped_owners;
+                std::fprintf(stderr, "strata serve: conversation store: owner %llu still holds %zu queued and %zu "
+                                     "outstanding publication%s at the shutdown deadline\n",
+                             (unsigned long long) owner, store_queue.size(), pending_publishes.size(),
+                             store_queue.size() + pending_publishes.size() == 1 ? "" : "s");
+            };
             bool any = false;
             if (exit_park_allowed && live_ok && live_scope.valid() && !live.empty()) {
                 any = true;
@@ -17985,8 +18329,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation store: the last serial conversation could not be "
                                          "parked at shutdown (%s)\n", err.c_str());
                 err.clear();
+                drain_owner(kSessionOwner);
             }
-            for (int b = 0; b < (int) bs.size(); ++b) {
+            for (int b = 0; b < (int) bs.size() && now_ms() < deadline; ++b) {
                 // An owner that finished a turn: the same source the serving path would park when the next request
                 // replaced it.  A slot with nothing completed reports no source and is skipped.
                 std::string probe;
@@ -17996,21 +18341,20 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d could not be "
                                          "parked at shutdown (%s)\n", b, err.c_str());
                 err.clear();
+                drain_owner(kResidentOwnerFirst + (uint64_t) b);
             }
             if (!any)
                 std::fprintf(stderr, "strata serve: conversation store: nothing to park at shutdown (a one-shot, a "
                                      "pinned sibling or an incomplete session)\n");
-        }
-        if (offer_channel) offer_channel->stop();
-        if (store_on) {
-            // Bounded: the frontend's QUIT grace is 15 s inside the host's 20 s, and the lifetime already reserves
-            // its own window, so storage work that has not finished by then is abandoned rather than waited out.
-            const auto now_ms = [] {
-                return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now().time_since_epoch()).count();
-            };
-            const uint64_t deadline = now_ms() + 8000;
-            while (!pending_publishes.empty() && now_ms() < deadline) reap_publishes(250);
+            std::fprintf(stderr, "strata serve: conversation store: shutdown drained %zu owner%s in %llu ms; %zu "
+                                 "owner%s abandoned, %zu queued publication%s left\n", drained_owners,
+                         drained_owners == 1 ? "" : "s", (unsigned long long) (now_ms() - shutdown_started),
+                         skipped_owners, skipped_owners == 1 ? "" : "s", store_queue.size(),
+                         store_queue.size() == 1 ? "" : "s");
+            for (const QueuedPublish& entry : store_queue)
+                std::fprintf(stderr, "strata serve: conversation store: queued publication for owner %llu was not "
+                                     "published (%zu MiB, capture epoch %llu)\n", (unsigned long long) entry.owner,
+                             entry.lease_bytes >> 20, (unsigned long long) entry.capture_epoch);
             for (const PendingPublish& pending : pending_publishes)
                 std::fprintf(stderr, "strata serve: conversation store: publication %llu still outstanding at shutdown "
                                      "(%zu MiB lease)\n", (unsigned long long) pending.request_id,
@@ -18030,7 +18374,7 @@ int main(int argc, char** argv) {
                                  "misses=%llu evictions=%llu bytes_written=%llu bytes_read=%llu orphan_bytes=%llu "
                                  "pending_delete_bytes=%llu corrupt_records=%llu epoch_advances=%llu; engine: restored=%llu "
                                  "prefetched=%llu suppressed_prefetches=%llu published_results=%llu skipped=%llu "
-                                 "coalesced_results=%llu cancelled=%llu\n",
+                                 "coalesced_results=%llu cancelled=%llu abandoned=%llu\n",
                              int(conversation_store->enabled()), int(conversation_store->healthy()),
                              int(conversation_store->run_intent_active()),
                              (unsigned long long) c.heads, (unsigned long long) c.pinned_heads,
@@ -18047,7 +18391,13 @@ int main(int argc, char** argv) {
                              (unsigned long long) store_restored, (unsigned long long) store_prefetched.load(),
                              (unsigned long long) prefetch_suppressed.load(),
                              (unsigned long long) store_published, (unsigned long long) store_refused,
-                             (unsigned long long) store_coalesced, (unsigned long long) store_cancelled);
+                             (unsigned long long) store_coalesced, (unsigned long long) store_cancelled,
+                             (unsigned long long) store_dropped);
+            // The store's own close is a bounded healthy drain: it finishes or cancels the storage work it has admitted,
+            // commits a final catalog and only then clears the run intent, so the publications that *did* complete
+            // survive a restart and the ones this run abandoned simply never existed.  Anything else - a GPU fault, the
+            // poison path, a capture or publication abandoned at the deadline - leaves the run intent armed by not
+            // closing cleanly at all (the destructor does exactly that).
             if (!store_faulted) conversation_store->close();
         }
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {

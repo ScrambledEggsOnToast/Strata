@@ -2,9 +2,11 @@
 
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_reuse.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <array>
 #include <string>
 
 namespace strata::core {
@@ -36,9 +38,14 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // A nonzero unchanged_tokens is valid only for storage retained from an image
 // actually restored into this session, bounded by every subsequent rewrite.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
+// `reused_bytes` sums the bytes this capture kept instead of copying; `retained`, when given, reports them per part
+// (k, v, k_scale, v_scale, pooled) so a caller can name the exact intervals an already-stored image may donate. Both
+// describe the same bytes: the leading bytes of the part that came from the retained image, never a byte the capture
+// wrote, and never anything established by comparing or hashing an old payload.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
+                          std::array<uint64_t, 5>* retained = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -100,10 +107,14 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 // the uniquely owned reusable buffers, including on failure.
 // Caller admits the estimate before invoking capture. Allocation failures propagate
 // to the RAM policy; the active session is never modified by capture.
+// `retained`, when given, receives the K/V prefix each layer and every stage part kept from `reuse` instead of
+// copying: the exact bytes an already-stored image (the one this reuse was retained from) can donate, with the
+// caller's own stage tag left at 0. Nothing here reads, hashes or compares the donor's payload.
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                std::vector<ConversationRetainedPrefix>* retained = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
@@ -130,7 +141,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          size_t& bytes, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                std::vector<ConversationRetainedPrefix>* retained = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

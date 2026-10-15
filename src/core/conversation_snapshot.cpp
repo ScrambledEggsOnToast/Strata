@@ -228,7 +228,7 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes, std::array<uint64_t, 5>* retained) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -236,6 +236,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
     }
+    if (retained) *retained = {};
     const int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;
     image.format = l.format;
     image.cells = l.cells;
@@ -258,6 +259,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::capture);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
+        // Exactly the bytes this capture did not write: at this point they are still the retained image's own bytes
+        // (the same allocation, or its detach-free copy), so a caller may offer them as immutable reuse intervals.
+        if (retained) (*retained)[i] = uint64_t(keep);
     }
     return true;
 }

@@ -318,9 +318,11 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationRetainedPrefix>* retained) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    if (retained) retained->clear();
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -328,18 +330,50 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
-    captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
+    // The donor's own part lengths, read before the capture resizes those buffers in place: an offered reuse interval
+    // is bounded by what the donor actually holds, never by what this image happens to need.
+    std::vector<std::array<uint64_t, 5>> donor_bytes;
+    if (retained) {
+        donor_bytes.resize(layers + (draft ? 1 : 0));
+        for (size_t j = 0; j < donor_bytes.size() && j < reuse.kv.size(); ++j) {
+            const ConversationKv& source = reuse.kv[j];
+            const std::array<const ConversationBuffer*, 5> parts = {&source.k, &source.v, &source.k_scale,
+                                                                    &source.v_scale, &source.pooled};
+            for (size_t part = 0; part < parts.size(); ++part) donor_bytes[j][part] = uint64_t(parts[part]->size());
+        }
+    }
+    auto report = [retained, &donor_bytes](uint32_t layer, const std::array<uint64_t, 5>& kept) {
+        if (!retained) return;
+        for (uint32_t part = 0; part < kept.size(); ++part) {
+            if (kept[part] == 0) continue;
+            ConversationRetainedPrefix entry;
+            entry.layer = layer;
+            entry.part = part;
+            entry.bytes = kept[part];
+            entry.donor_bytes = layer < donor_bytes.size() ? donor_bytes[layer][part] : 0;
+            retained->push_back(entry);
+        }
+    };
+    captured.kv = std::move(reuse.kv);
     captured.kv.resize(layers + (draft ? 1 : 0));
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
-    for (size_t j = 0; j < layers; ++j)
+    for (size_t j = 0; j < layers; ++j) {
+        std::array<uint64_t, 5> kept{};
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, retained ? &kept : nullptr)) return false;
+        report((uint32_t) j, kept);
+    }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
-    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    if (draft) {
+        std::array<uint64_t, 5> kept{};
+        if (!conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
+                                  std::max<int64_t>(0, unchanged - 1), reused_bytes,
+                                  retained ? &kept : nullptr)) return false;
+        report((uint32_t) layers, kept);
+    }
     image = std::move(captured);
     return true;
 }
@@ -448,8 +482,9 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
-    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes);
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationRetainedPrefix>* retained) {
+    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, retained);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {
