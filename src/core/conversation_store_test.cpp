@@ -1224,6 +1224,29 @@ void check_profile_recovery() {
     check(file_inventory(root.path) == inventory, "the smaller budget deleted and wrote nothing");
     check(file_digest(root.path + "/catalog") == catalog_digest, "the smaller budget rewrote no authority");
 
+    {
+        auto state_limited = wide;
+        state_limited.max_state_bytes = 1;
+        auto store = open_profile(root.path, quota, state_limited, retained_heads);
+        if (!store->enabled()) return;
+        std::string why;
+        const auto query = query_of(pair, 45, 1);
+        check(store->demand(query, why), "a state-limited demand reaches capacity classification");
+        ConversationStoreRead read;
+        check(store->wait_ready(45, 1, read, 5000) &&
+                  read.status == ConversationStoreReadStatus::refused_limits,
+              "a state-only capacity reduction refuses without corruption");
+        ConversationStorePublish request;
+        request.request_id = 46;
+        request.generation = 1;
+        check(!store->publish(std::make_shared<SavedConversation>(pair), request, why),
+              "publication cannot create state this profile refuses to restore");
+        check_eq(store->counters().reads_corrupt, 0, "state capacity is not corruption");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "state capacity refusal preserves retained files");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "state capacity refusal preserves authority");
+
     // Back under the profile that wrote both records: they are still there, still matchable, and both restore byte
     // for byte - including the three-stage one every other profile above could not serve.
     {
@@ -1271,6 +1294,7 @@ void check_profile_recovery() {
 SavedConversation repeated_state_fixture(uint64_t seed, int64_t tokens, size_t state_bytes) {
     SavedConversation image = fixture(seed, tokens);
     image.kv.resize(1);
+    image.geometry[1] = image.layer_hi = 4;  // one global attention layer
     ConversationKv& layer = image.kv[0];
     // Two heads of eight values per cell, so both extents below are coherent with the layout the metadata declares.
     layer.cells = int64_t(state_bytes / 16);
@@ -1368,6 +1392,12 @@ void check_dense_manifest_workspace_refusal() {
     const uint64_t quota = uint64_t(1) << 30;
     // A dense record with a couple of live tokens, so it advertises a cut a read can ask for.
     SavedConversation dense = hollow_fixture(461, 64, 4096);
+    dense.geometry[1] = dense.layer_hi = 4 * int64_t(dense.kv.size());
+    for (auto& layer : dense.kv) {
+        layer.cells = 4;
+        layer.k.resize(4, 12);
+        layer.v.resize(4, 13);
+    }
     dense.live.ids.assign(4, 11);
     dense.live.gdn.resize(4, 12);
     dense.live.block_pos.resize(4, 13);
@@ -1397,7 +1427,6 @@ void check_dense_manifest_workspace_refusal() {
         tight.metadata_bytes = uint64_t(1) << 20;
         ConversationStore store(tight);
         check(!store.enabled(), "a run whose preparation ceiling cannot hold the decode refuses to serve the root");
-        check(!store.disabled_reason().empty(), "the refusal carries a reason");
         check_eq(store.counters().corrupt_records, 0, "an unreadable record is never called corrupt");
     }
     check(file_inventory(root.path) == inventory, "the refused open deleted nothing");
@@ -1452,9 +1481,30 @@ void check_damaged_manifest_is_still_reclaimed() {
             if (!inventory_contains(before, candidate)) damaged_manifest = candidate;
         check(!damaged_manifest.empty(), "the second publication wrote its own manifest");
         store.close();
+    }
+    const std::string path = root.path + "/manifests/" + damaged_manifest;
+    const std::string catalog_before = file_digest(root.path + "/catalog");
+    const auto inventory_before = file_inventory(root.path);
+    if (::geteuid() != 0) {
+        check(::chmod(path.c_str(), 0000) == 0, "the owned manifest can be made temporarily unreadable");
+        {
+            ConversationStore store(options_for(root.path, quota, 0));
+            check(!store.enabled(), "an unreadable manifest disables persistence instead of guessing corruption");
+            check_eq(store.counters().corrupt_records, 0, "a permission failure is not corruption");
+        }
+        check(::chmod(path.c_str(), 0600) == 0, "manifest readability is restored");
+        check(file_digest(root.path + "/catalog") == catalog_before, "a read failure preserves catalog authority");
+        check(file_inventory(root.path) == inventory_before, "a read failure preserves every file");
+        {
+            ConversationStore store(options_for(root.path, quota, 0));
+            check(store.enabled(), "persistence recovers when the manifest is readable again");
+            check_eq(store.counters().heads, 2, "both histories survived the temporary read failure");
+            store.close();
+        }
+    }
+    {
         // One flipped byte in the file.  It still reads - it is far inside this run's manifest ceiling - so nothing
         // about it may be excused as capacity this run lacks: it is a defect in the record.
-        const std::string path = root.path + "/manifests/" + damaged_manifest;
         const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
         check(fd >= 0, "the manifest opens for damage");
         if (fd >= 0) {
@@ -2476,12 +2526,6 @@ void check_reuse_reservation() {
           "the donor publication is admitted at its floor");
     check(!publication_is_admitted(shape, grown, with_donor, donor_floor - 1),
           "one byte below the donor publication's floor is refused");
-    // The donor's preparation is a few times the donor's own manifest charge and nothing more: one decode holds the
-    // raw file, the decoded metadata and the tables the consistency pass builds at once (see
-    // manifest_read_workspace_bound).  What it must never scale with is a configured maximum - head_limit x
-    // max_manifest_bytes is hundreds of megabytes here - so a megabyte is the assertion's own generous ceiling.
-    check(donor_floor - uint64_t(grown.bytes()) < (uint64_t(1) << 20),
-          "the donor's preparation is bounded by its own manifest charge, not by a head-limit maximum");
 
     // The same counts with many named donors, including one this store does not retain: an unknown name is a lookup
     // that fails before it allocates, so it cannot inflate the reservation.

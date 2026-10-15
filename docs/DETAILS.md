@@ -1530,31 +1530,21 @@ an image's identity, so both layouts borrow the same capacity. Refusals are ordi
 floor that cannot be met, a busy writer or an unhealthy root skips the write or the read and the request completes as
 it would without persistence.
 
-**One root, several profiles: kept is not the same as servable.** The quota and the head ceiling are shared, but the
-figures that describe a single run's admitted capacity - the stage count of its split, its checkpoint policy
-(`--prompt-cache`), its image budget and its maximum context - are not, and two serving profiles that point at the same
-root differ in exactly those. They decide what a run may **create or serve**, never whether an existing record is kept.
-A record another profile captured is retained, indexed and charged to the shared quota as long as it is *structurally*
-sound - its checksum, lengths, canonical stream order and cut order, and every one of its objects present - and a run
-that cannot serve one refuses the read or the publication (`refused_limits`) while leaving every byte where it is.
-`refused_limits` is an ordinary miss, not corruption. Shared-quota eviction, valid replacement and
-epoch retirement still apply; a change of serving profile alone must not discard valid records.
+**One root, several profiles.** A run's stage count, checkpoint policy (`--prompt-cache`),
+context and image/state budgets decide what it may create or restore—not whether another
+profile's valid record is corrupt. Capacity refusals return `refused_limits` and preserve the
+record. Shared-quota eviction, valid replacement and epoch retirement still apply.
 
-Which records are *kept* is decided by the format, never by this run's capacity and never by the physical quota. Bytes
-deduplicate by payload digest with the chunk's offset excluded from the digest, so a sound record's logical bytes can
-far exceed the bytes on disk - a running-state stream of repeated identical 1 MiB chunks is charged one object - and
-deriving a retention ceiling from the quota would delete such a record the moment a run opened the root with a smaller
-admitted budget. The retained byte and token figures therefore come from the widest record a manifest within
-`ConversationStoreLimits::max_manifest_bytes` could declare at all - its encoded chunks times the widest chunk its own
-length field can carry - the stage depth from the format's structural ceiling, and every per-element count from what
-such a manifest could encode. The physical quota stays where it belongs, against the unique files the ledger charges.
-A record this run cannot even *read* - larger than its configured manifest ceiling, or one whose decode and its
-consistency tables do not fit the preparation budget - is likewise never deleted: recovery declines to index the root
-and persistence stays disabled for that run (the caller's cold path), with the catalog, every manifest, every object
-and every charge untouched. Truly invalid records - a checksum, a length, a canonical order or a missing object - are
-still corrupt and still reclaimed. The widened decode a foreign record needs is preflighted and charged before it
-allocates anything (raw bytes, decoded metadata and the consistency tables) against the preparation ceiling and, where
-a run has published one, the shared RAM allowance.
+Retention validation uses format bounds derived from the manifest's encoding. Its logical
+payload can exceed the physical quota because repeated chunks share one on-disk object;
+the quota therefore applies to the unique-file ledger, not logical snapshot sizes.
+
+If a catalog-authorized manifest exceeds the current parsing or preparation budget, or a
+permission/I/O failure prevents reading it, recovery disables persistence for that run
+without rewriting the catalog or deleting its files. Normal cold serving remains available.
+Checksummed structural contradictions and missing objects still count as corruption.
+Raw bytes, decoded metadata and validation workspace are admitted before allocation, and
+the reservation remains held until those buffers are destroyed.
 
 *What is stored.* One **immutable manifest per complete image** and immutable 1 MiB payload objects, with a small
 checksummed binary **root catalog** as the only authority (atomically replaced; flush file data, then the immutable

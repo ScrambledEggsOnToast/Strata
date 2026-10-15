@@ -1295,6 +1295,10 @@ bool count_record(const ConversationCheckpoint& record, const ConversationStoreL
             why = "a stream is longer than ConversationStoreLimits::max_stream_bytes";
             return false;
         }
+        if (state > limits.max_state_bytes) {
+            why = "a state stream is longer than ConversationStoreLimits::max_state_bytes";
+            return false;
+        }
         bytes = sat_add(bytes, state);
     }
     if (sat_mul(uint64_t(record.ids.size()), sizeof(int32_t)) > limits.max_stream_bytes ||
@@ -1321,6 +1325,10 @@ bool count_kv_layer(const ConversationKv& layer, const ConversationStoreLimits& 
     for (uint64_t part : parts) {
         if (part > limits.max_stream_bytes) {
             why = "a stream is longer than ConversationStoreLimits::max_stream_bytes";
+            return false;
+        }
+        if (part > limits.max_state_bytes) {
+            why = "a K/V part is longer than ConversationStoreLimits::max_state_bytes";
             return false;
         }
         bytes = sat_add(bytes, part);
@@ -1855,7 +1863,7 @@ bool manifest_within_limits(const ManifestMeta& meta, const ConversationStoreLim
 //     object (object_hasher() excludes the chunk's offset and the unchanging-prefix rule charges an object once), so
 //     a perfectly sound record's logical bytes may exceed the whole quota, and a quota reduction alone could then
 //     turn a retained history into corruption;
-//   * the stage depth by the format's own structural ceiling;
+//   * the stage count by the number of containers the manifest can encode;
 //   * every per-element count (containers, checkpoints, K/V layers and streams) by what a manifest within the
 //     configured manifest ceiling could encode at all - the manifest is read under that ceiling, so nothing wider
 //     can be observed, and a reduction of any of these is a smaller parsing ceiling for *this* run, never a reason to
@@ -1871,14 +1879,14 @@ ConversationStoreLimits retention_limits(const ConversationStoreLimits& configur
     // long.  Their product bounds one stream's bytes, an image's whole payload and a record's token-id stream (an
     // int32 per token), independently of every physical figure.  Saturating multiplication: a ceiling wide enough to
     // overflow the product saturates to "no representable limit" rather than wrapping to a small one.
-    const uint64_t chunks = std::min<uint64_t>(kCatalogCeiling, configured.max_manifest_bytes / kChunkEncodedMin);
+    const uint64_t chunks = configured.max_manifest_bytes / kChunkEncodedMin;
     const uint64_t widest = sat_mul(chunks, kMaxChunkBytes);
     kept.max_stream_bytes = std::max(configured.max_stream_bytes, widest);
     kept.max_state_bytes = std::max(configured.max_state_bytes, widest);
     kept.max_image_bytes = std::max(configured.max_image_bytes, widest);
     kept.max_tokens = std::max(configured.max_tokens, widest / uint64_t(sizeof(int32_t)));
-    kept.max_stages = std::max(configured.max_stages, uint32_t(kFormatMaxStages));
     kept.max_images = std::max(configured.max_images, encoded_ceiling(configured.max_manifest_bytes, kContainerEncodedMin));
+    kept.max_stages = std::max(configured.max_stages, kept.max_images);
     kept.max_checkpoints =
         std::max(configured.max_checkpoints, encoded_ceiling(configured.max_manifest_bytes, kCheckpointEncodedMin));
     kept.max_kv_layers =

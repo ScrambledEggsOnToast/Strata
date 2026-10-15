@@ -769,11 +769,23 @@ struct ConversationStore::Impl {
     // charges its whole peak, a publication charges its donors, and recovery and the stream-table diagnostic charge it
     // with reserve_decode_locked() around this call.
     ManifestRead load_manifest_of(uint64_t head_id, uint64_t epoch_now, ManifestMeta& out, std::string& why);
-    // The transient workspace of one manifest read and decode, charged before the read allocates and released after
-    // the decode: against the store's preparation ceiling always, and against the published RAM allowance when this
-    // instance has one.  Refuses (false, with a reason) instead of overrunning either.
+    // These helpers lock internally. The lease must outlive the raw and decoded buffers,
+    // including early returns and exceptions.
     bool reserve_decode_locked(uint64_t workspace, std::string& why);
     void release_decode_locked(uint64_t workspace);
+    struct DecodeLease {
+        Impl& store;
+        uint64_t bytes = 0;
+        explicit DecodeLease(Impl& store) : store(store) {}
+        DecodeLease(const DecodeLease&) = delete;
+        DecodeLease& operator=(const DecodeLease&) = delete;
+        ~DecodeLease() { if (bytes) store.release_decode_locked(bytes); }
+        bool acquire(uint64_t requested, std::string& why) {
+            if (!store.reserve_decode_locked(requested, why)) return false;
+            bytes = requested;
+            return true;
+        }
+    };
     bool stream_identity_of(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
                             Digest& scope, uint64_t& ordinal, std::string& why) const;
 
@@ -1233,6 +1245,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
 
     std::vector<uint64_t> dropped;
     for (const auto& head : catalog.heads) {
+        recount_metadata_locked();
         // A record of this domain that this run must not reuse - an unclean start or a retired epoch - is dropped
         // here, after its manifest and its objects have been accounted above, so its bytes are charged into the
         // ledger before the first catalog transaction forgets it.
@@ -1241,6 +1254,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
             continue;
         }
         const auto manifest = present_manifests.find(head.manifest_id);
+        DecodeLease lease(*this);
         ManifestMeta meta;
         std::string detail;
         ManifestRead read = ManifestRead::invalid;
@@ -1251,11 +1265,10 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
             // ceiling (see manifest_read_workspace_bound).
             const uint64_t workspace = conversation_store_detail::manifest_read_workspace_bound(
                 manifest_read_cap(head.manifest_bytes, limits));
-            if (!reserve_decode_locked(workspace, detail)) {
+            if (!lease.acquire(workspace, detail)) {
                 read = ManifestRead::unreadable;
             } else {
                 read = load_manifest_of(head.head_id, head.epoch, meta, detail);
-                release_decode_locked(workspace);
             }
         }
         if (read == ManifestRead::unreadable) {
@@ -1534,15 +1547,15 @@ ConversationStore::Impl::ManifestRead ConversationStore::Impl::load_manifest_of(
     // built from those same recorded charges - a read's peak, a publication's donors - can never be smaller than it.
     const uint64_t capped = manifest_read_cap(bytes, limits);
     if (!read_file(dirs.manifests, name, capped, raw, why)) {
-        // A manifest this run's own parsing ceiling is too small for is not a defect in the record: nothing may be
-        // deleted because this run cannot read it (see reconcile()).  Everything else read_file() refuses - a missing
-        // file, a symlink, a file another account owns, or one larger than the charge its catalog entry recorded - is
-        // a record this store can no longer believe, and existing policy reclaims it.
+        // Missing or contradictory files are invalid. A resource, permission or I/O
+        // failure does not establish corruption and must preserve catalog authority.
         struct stat info {};
-        if (::fstatat(dirs.manifests, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(info.st_mode) &&
-            info.st_size >= 0 && uint64_t(info.st_size) > limits.max_manifest_bytes)
-            return ManifestRead::unreadable;
-        return ManifestRead::invalid;
+        if (::fstatat(dirs.manifests, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0)
+            return errno == ENOENT || errno == ENOTDIR ? ManifestRead::invalid : ManifestRead::unreadable;
+        if (!S_ISREG(info.st_mode) || info.st_uid != ::geteuid() || info.st_size < 0 ||
+            (bytes != 0 && uint64_t(info.st_size) > bytes))
+            return ManifestRead::invalid;
+        return ManifestRead::unreadable;
     }
     {
         std::lock_guard<std::mutex> guard(mutex);
@@ -1578,27 +1591,23 @@ bool ConversationStore::Impl::stream_identity_of(const std::vector<ContainerMeta
 // because the writer's own lookup of it fails before it allocates anything.
 DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePublish& request) const {
     DonorPrep prep;
-    const auto charge_of = [&](uint64_t head_id, uint64_t& bytes) {
-        for (const auto& head : catalog.heads)
-            if (head.head_id == head_id) {
-                bytes = head.manifest_bytes;
-                return true;
+    // The writer retains one decoded copy per distinct donor, even when many
+    // streams name it. Its predecessor is a separate retained copy.
+    for (const auto& head : catalog.heads) {
+        const uint64_t raw = manifest_read_cap(head.manifest_bytes, limits);
+        if (head.head_id == request.supersedes)
+            prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
+        bool donor_counted = false;
+        for (const auto& entry : request.reuse) {
+            if (entry.head_id != head.head_id) continue;
+            if (!donor_counted) {
+                prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
+                donor_counted = true;
             }
-        return false;
-    };
-    uint64_t bytes = 0;
-    if (request.supersedes != 0 && charge_of(request.supersedes, bytes)) {
-        const uint64_t raw = manifest_read_cap(bytes, limits);
-        prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
-    }
-    for (const auto& entry : request.reuse) {
-        if (!entry.head_id || !charge_of(entry.head_id, bytes)) continue;
-        const uint64_t raw = manifest_read_cap(bytes, limits);
-        prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
-        // Every donor chunk costs kChunkEncodedMin encoded bytes, so the donor's own encoding bounds how many chunks
-        // one interval can adopt.  This is deliberately generous: the writer counts the interval's real donor chunks
-        // once the manifest is decoded, and only ever lowers what was reserved.
-        prep.chunks = sat_add(prep.chunks, sat_add(raw / 44, 2));
+            // Repeated intervals can contribute repeated chunk references, but
+            // do not cause another manifest decode.
+            prep.chunks = sat_add(prep.chunks, sat_add(raw / 44, 2));
+        }
     }
     return prep;
 }
@@ -1677,10 +1686,10 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
     return true;
 }
 
-// The transient workspace of one manifest read and decode, charged before the read allocates and released once the
-// metadata exists.  ConversationStoreOptions::metadata_bytes bounds every structure the store holds that is not a
-// payload lease, and the published allowance bounds everything this run holds at once, so a decode - which allocates
-// its decoded metadata and its validation tables before any consistency check can refuse the record - is charged
+// Keep transient metadata charged until its buffers are destroyed. The preparation ceiling
+// bounds an operation's workspace alongside the resident index; the shared RAM allowance
+// bounds concurrent reads, publication and diagnostic work together. A decode allocates
+// metadata and validation tables before checking consistency, so its workspace is charged
 // against both before it starts.  A read's and a writer's own decodes are charged to their reservations instead (a
 // read's whole peak, a writer's donor figures), so this is only ever a path that holds no reservation of its own.
 bool ConversationStore::Impl::reserve_decode_locked(uint64_t workspace, std::string& why) {
@@ -3702,14 +3711,14 @@ bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<Conversat
     const uint64_t capped = manifest_read_cap(bytes, self.limits);
     const uint64_t workspace = conversation_store_detail::manifest_read_workspace_bound(capped);
     std::string why;
-    if (!self.reserve_decode_locked(workspace, why)) return false;
+    Impl::DecodeLease lease(self);
+    if (!lease.acquire(workspace, why)) return false;
     std::vector<uint8_t> raw;
     const bool read = read_file(self.dirs.manifests, sha256_hex(manifest_id), capped, raw, why);
     conversation_store_detail::ManifestMeta meta;
     const bool decoded = read &&
                          conversation_store_detail::manifest_decode(raw.data(), raw.size(), self.retained_limits, meta,
                                                                    why);
-    self.release_decode_locked(workspace);
     if (!decoded) return false;
     out = conversation_store_detail::manifest_stream_infos(meta);
     return true;
