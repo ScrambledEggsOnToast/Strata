@@ -3952,7 +3952,8 @@ class Service:
                     self.admission_active[record["id"]] = record
                     self.admission_foreground[score] = self.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
                     self.status["queued"] -= 1
-                    record["queue_s"] = round(time.perf_counter() - record["_clock"], 6)
+                    record["_admitted_clock"] = time.perf_counter()
+                    record["queue_s"] = round(record["_admitted_clock"] - record["_clock"], 6)
                     self.admission_cv.notify_all()
                     admitted = True
                 else:
@@ -6176,6 +6177,8 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
             "interval": {"started_at": lifecycle["started_at"], "finished_at": time.time(),
                          "duration_s": lifecycle["completion_s"]},
             "queue_s": lifecycle.get("queue_s"),
+            "registered_monotonic_s": lifecycle.get("_clock"),
+            "admitted_monotonic_s": lifecycle.get("_admitted_clock"),
             "first_token_s": lifecycle.get("first_token_s"),
             "drafts_accepted": figures.get("drafts_accepted"), "drafts_offered": figures.get("drafts_offered"),
             "legs": figures.get("legs", [])}
