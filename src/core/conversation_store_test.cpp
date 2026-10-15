@@ -2069,7 +2069,9 @@ void check_incoming_lifetime() {
 
 void check_pinned_branch() {
     TempRoot root;
-    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 2;
+    ConversationStore store(options);
     const SavedConversation pinned = fixture(141, 128);
     check(pinned.pinned(), "the fixture carries a pinned cut");
     ConversationStorePublishResult first;
@@ -2110,6 +2112,8 @@ void check_pinned_branch() {
           "a cover that preserves every pinned cut replaces its predecessor");
     check_eq(replaced.superseded, first.head_id, "the replaced predecessor is reported");
     check_eq(store.counters().heads, 2, "the retained divergent branch survives the replacement");
+    check(store.manifest_info(retained.head_id, info),
+          "replacement at the head ceiling does not evict the independent branch");
 
     // An older capture that claims to cover a newer descendant is a stale completion, never an overwrite.
     auto older = std::make_shared<SavedConversation>(pinned);

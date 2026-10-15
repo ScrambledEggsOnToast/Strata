@@ -1532,6 +1532,9 @@ admission limits from resources temporarily occupied by other work. Temporary pr
 transferring its image or lease or spending a retry. It stays queued for a later safe seam, subject to the existing
 queue and shutdown bounds; this is not a guarantee that every capture will persist. Only unhanded, undemanded
 speculation may be revoked to make room, and an active worker retains its reservation until it settles.
+At the head ceiling, a proven replacement reuses its predecessor's catalog slot rather than evicting an unrelated
+history. The predecessor remains durable until the replacement commits; its files still count toward the
+physical-byte and free-space admission peak.
 
 **One root, several profiles.** A run's stage count, checkpoint policy (`--prompt-cache`),
 context and image/state budgets decide what it may create or restore—not whether another

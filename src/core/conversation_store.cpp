@@ -3553,6 +3553,26 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                 if (!kept) covered = false;
             }
         }
+        if (predecessor != 0 && covered) {
+            superseded = predecessor;
+            for (size_t i = 0; i < plan.candidate.heads.size(); ++i)
+                if (plan.candidate.heads[i].head_id == predecessor) {
+                    plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));
+                    break;
+                }
+            plan.retiring.push_back(predecessor);
+            status = ConversationStorePublishStatus::replaced;
+        } else if (predecessor != 0 && have_source) {
+            status = ConversationStorePublishStatus::retained_branch;
+        } else if (predecessor != 0) {
+            // A predecessor that is gone, retired or re-captured must never be silently turned into a new branch.
+            counters.refusals_stale++;
+            fail(ConversationStorePublishStatus::stale,
+                 "the head this image was captured from is no longer retained");
+            return;
+        }
+        // Count a proven replacement in the candidate catalog before enforcing its head ceiling.
+        // The predecessor stays durable until commit; byte/floor admission still includes its files.
         plan.candidate.heads.push_back(head);
         plan.new_head = head_id;
         plan.new_objects.clear();
@@ -3584,24 +3604,6 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                  "every retained head is pinned or leased, so no head slot can be obtained");
         }
         if (!room) return;
-        if (predecessor != 0 && covered) {
-            superseded = predecessor;
-            for (size_t i = 0; i < plan.candidate.heads.size(); ++i)
-                if (plan.candidate.heads[i].head_id == predecessor) {
-                    plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));
-                    break;
-                }
-            plan.retiring.push_back(predecessor);
-            status = ConversationStorePublishStatus::replaced;
-        } else if (predecessor != 0 && have_source) {
-            status = ConversationStorePublishStatus::retained_branch;
-        } else if (predecessor != 0) {
-            // A predecessor that is gone, retired or re-captured must never be silently turned into a new branch.
-            counters.refusals_stale++;
-            fail(ConversationStorePublishStatus::stale,
-                 "the head this image was captured from is no longer retained");
-            return;
-        }
     }
     if (take_fault("catalog")) {
         fail(ConversationStorePublishStatus::failed, "injected fault: catalog");
