@@ -1825,6 +1825,7 @@ ConversationStoreLimits retention_limits(const ConversationStoreOptions& options
 
 std::vector<ConversationStoreStreamInfo> manifest_stream_infos(const ManifestMeta& meta) {
     std::vector<ConversationStoreStreamInfo> out;
+    out.reserve(meta.streams.size());
     for (size_t i = 0; i < meta.streams.size(); ++i) {
         ConversationStoreStreamInfo info;
         info.id = meta.streams[i].id;

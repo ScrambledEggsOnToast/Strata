@@ -1537,8 +1537,8 @@ root differ in exactly those. They decide what a run may **create or serve**, ne
 A record another profile captured is retained, indexed and charged to the shared quota as long as it is *structurally*
 sound - its checksum, lengths, canonical stream order and cut order, and every one of its objects present - and a run
 that cannot serve one refuses the read or the publication (`refused_limits`) while leaving every byte where it is.
-`refused` is an ordinary miss, `corrupt` is a defect, and only a record that fails its own structural validation, has
-lost a file, or belongs to a retired epoch or an unclean run is ever reclaimed.
+`refused_limits` is an ordinary miss, not corruption. Shared-quota eviction, valid replacement and
+epoch retirement still apply; a change of serving profile alone must not discard valid records.
 
 *What is stored.* One **immutable manifest per complete image** and immutable 1 MiB payload objects, with a small
 checksummed binary **root catalog** as the only authority (atomically replaced; flush file data, then the immutable
