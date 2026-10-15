@@ -12452,6 +12452,7 @@ int main(int argc, char** argv) {
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        uint64_t batch_commit_epoch = 0; // monotonic across the resettable batch timing windows
         const char* judge_timing_env = std::getenv("STRATA_JUDGE_TIMING");
         const bool judge_timing = judge_timing_env && std::strcmp(judge_timing_env, "1") == 0;
         const auto judge_commits = judge_timing && o.batch > 0 ? std::make_unique<JudgeCommitTrace>() : nullptr;
@@ -12461,6 +12462,7 @@ int main(int argc, char** argv) {
                 judge_commits->add(slot, state.request, state.p, state.produced);
             }
             std::printf("BT %d %d\n", slot, (int)token);
+            if (o.foreground_budget_ms > 0) ++batch_commit_epoch;
         };
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
@@ -13211,7 +13213,7 @@ int main(int argc, char** argv) {
             const auto begin = Clock::now();
             if (piped) {
                 bounded_round = true;
-                for (auto& group : pg) group.round_started = false;
+                for (auto& group : pg) group.round_started = group.inflight;
                 for (;;) {
                     bool pending = pipe_inflight();
                     for (size_t group = 0; group < pg.size(); ++group)
@@ -13409,12 +13411,12 @@ int main(int argc, char** argv) {
                                              next.rfind("BGEN ", 0) == 0 || next.rfind("BGENI ", 0) == 0;
                     }
                 }
-                const double age = std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
                 // One charged opportunity, then admit the queued request. The
                 // prior admission has published and no final_R borrow survives.
-                if (generation_waiting && batch_on() &&
-                    time_budget.decode_due(age, std::max<int64_t>(sp.chunk(), 1)) &&
-                    time_budget.decode_allowed(0) && !decode_round(true)) return 1;
+                if (generation_waiting && batch_on() && time_budget.decode_allowed(0)) {
+                    const double age = std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                    if (time_budget.decode_due(age, std::max<int64_t>(sp.chunk(), 1)) && !decode_round(true)) return 1;
+                }
             }
             if (reference_pending) {
                 line = "GEN 1 ckpt=0 ";
@@ -13424,9 +13426,14 @@ int main(int argc, char** argv) {
             } else
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    // No admission is waiting: keep the native pipeline filled,
-                    // rather than imposing a drained boundary on decode-only work.
-                    if (!(piped ? pipeline_step(true) : time_budget.enabled() ? decode_round(false) : batch_step())) return 1;
+                    // No admission is waiting: keep the native pipeline filled.
+                    // Train no chunk/round cost from a polling tick; refresh age
+                    // only when a committed token actually advances the stream.
+                    if (piped) {
+                        const uint64_t before = time_budget.enabled() ? batch_commit_epoch : 0;
+                        if (!pipeline_step(true)) return 1;
+                        if (time_budget.enabled() && batch_commit_epoch != before) last_decode = Clock::now();
+                    } else if (!(time_budget.enabled() ? decode_round(false) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
