@@ -233,6 +233,23 @@ def _order_tool_results(messages):
             c.pop("_call_id", None)
 
 
+def _additional_tools(req: dict) -> list[list]:
+    """The `tools` arrays of the request's own `additional_tools` input items (#782, Codex v0.160)."""
+    return [item["tools"] for item in (req.get("input") if isinstance(req.get("input"), list) else [])
+            if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list)]
+
+
+def tool_groups(req: dict) -> list[list]:
+    """Every tool list this request's resolution reads: its own `tools` and its `additional_tools` items' lists.
+
+    `request_tools` expands them into the tools the prompt is rendered with; the admission of a queued request
+    (serve/server.py's `charge_resolution_expansions`) walks them to charge a namespace's expansion before it is
+    built, and both read the same two places through here.
+    """
+    own = req.get("tools")
+    return ([own] if isinstance(own, list) else []) + _additional_tools(req)
+
+
 def request_tools(req: dict):
     """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
     tools, names, skipped = [], {}, []
@@ -241,10 +258,7 @@ def request_tools(req: dict):
         raise ResponsesError("tools must be an array", "tools")
     # #782 (Codex v0.160): `additional_tools` input items carry more tool definitions (a `tools` array, as the request
     # has); they join the request's own, and an item without a usable array adds nothing
-    extra = [t for item in (req.get("input") if isinstance(req.get("input"), list) else [])
-             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list)
-             for t in item["tools"]]
-    given = list(given) + extra
+    given = list(given) + [t for group in _additional_tools(req) for t in group]
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
@@ -395,6 +409,17 @@ def prompt_tools(req: dict, tools):
     if kind != "compaction" or conversation is None or owner != conversation or kept is None or req.get("tools"):
         return tools
     return json.loads(kept)                          # a fresh copy: the kept one is nobody's to change
+
+
+def kept_prompt_tools_chars() -> int:
+    """How many characters the kept prompt tools hold (0: none), without decoding them.
+
+    The admission of a queued request charges a Codex compaction request for the `json.loads(kept)` its resolution
+    will do (serve/server.py's `charge_resolution_expansions`), before that decode runs: the kept text is a whole
+    tools array, so its own length bounds both what it decodes to and the nodes it can hold.
+    """
+    kept = _kept_prompt_tools[1]
+    return len(kept) if isinstance(kept, str) else 0
 
 
 def prompt_made(req: dict, tools):

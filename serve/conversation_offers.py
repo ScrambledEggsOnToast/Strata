@@ -38,6 +38,7 @@ import ctypes
 import errno
 import dataclasses
 import hashlib
+import json
 import os
 import socket
 import struct
@@ -203,17 +204,178 @@ def _cloexec(fd: int) -> None:
 
 
 
-def generation_digest(messages, tools, kwargs, max_new, force) -> str:
-    """A digest of everything that decides a request's prepared ids and tokens.
+# -- the preparation-only input admission --------------------------------------------------------------------------
+# What one prepared request's own JSON-shaped inputs may cost, and what its rendering may produce: the figures
+# serve/server.py's per-slot reservation is built from, stated here because the probe that refuses a request and the
+# bytes it would have held must not drift apart.  They bound *preparation* only: a request past them is rendered,
+# reported and run by its own demand exactly as it always was (see PreparationWalk).
+PREPARATION_INPUT_CHARS = 2 << 20        # J: the serialized input one prepared request may hide - its JSON syntax and
+                                         # both its keys and its values, every escape at its worst
+PREPARATION_INPUT_NODES = 131072         # N: ... and its input and work nodes, which the character limits do not pay
+                                         # for: a compact string can hide a very large collection of small values
+PREPARATION_INPUT_DEPTH = 64             # ... to this depth of nesting, so the probe itself is depth-bounded
+DIGEST_CHARS = 4096                      # characters of encoded output hashed at a time (see generation_digest)
+_QUOTE, _BACKSLASH = '"', "\\"
+_CONTROLS = tuple(chr(code) for code in range(0x20))     # what a JSON encoder escapes as \u00XX
+_MISSING = object()
+
+
+def json_string_charge(text: str) -> int:
+    """The most characters `text` can cost as a JSON string: its two quotes and the widest escape of each character.
+
+    Conservative: a C0 control is `\\u00XX` (six characters), a quote or a backslash is escaped (two), and every
+    character the digest's encoder writes as it stands (`ensure_ascii=False`) is itself.  A surrogate or a non-ASCII
+    character is one character here and up to four bytes in the four-byte-wide text buffers the reservation pays for
+    per character (see server.py's per-slot formula), so nothing is charged twice.
+
+    Written as counted runs rather than a loop over the characters (`len` plus one extra for each escape plus five
+    more for each control) so a whole-context prompt is charged at C speed, without materializing anything: the value
+    is exactly the one the loop would give, and `str.count` never allocates.
+    """
+    return (2 + len(text) + text.count(_QUOTE) + text.count(_BACKSLASH)
+            + 5 * sum(text.count(control) for control in _CONTROLS))
+
+
+class PreparationWalk:
+    """A conservative, allocation-free walk of one prepared request's JSON-shaped inputs.
+
+    Preparation happens on a queued request's own thread, before anything of the request is rendered, so the probe
+    that decides whether it may be prepared at all must not itself be the allocation it is there to prevent: this
+    walk copies nothing, materializes no string and keeps one frame per level of nesting (never one per value).
+
+    It charges three things, because no one of them bounds the others: every string at its widest encoded length,
+    every collection node (a character limit does not pay for a hundred thousand one-character values), and the
+    nesting depth.  A string a known `embedded_keys` decode will be parsed again also pays for the node structure it
+    can hide - an encoded form is never shorter than what it decodes to, but a compact one can be all structure.
+
+    `add` is the whole admission; `charge` pays for an expansion of the resolution that is known before it runs.
+    `refused` says in words which limit a False came from (it is a preparation refusal, never a client's error).
+    """
+
+    __slots__ = ("char_limit", "node_limit", "depth_limit", "embedded_keys", "chars", "nodes", "depth", "refused")
+
+    def __init__(self, char_limit: int, node_limit: int, depth_limit: int, embedded_keys=()):
+        self.char_limit = int(char_limit)
+        self.node_limit = int(node_limit)
+        self.depth_limit = max(1, int(depth_limit))
+        self.embedded_keys = frozenset(embedded_keys)
+        self.chars = 0
+        self.nodes = 0
+        self.depth = 0
+        self.refused: str | None = None
+
+    def add(self, root) -> bool:
+        """Charge every key, every value and every collection node of `root`'s JSON shape.  True when it fits."""
+        frames: list = []
+        if not self._descend((None, root), frames):
+            return False
+        while frames:
+            step = next(frames[-1], _MISSING)
+            if step is _MISSING:
+                frames.pop()
+            elif not self._descend(step, frames):
+                return False
+        return True
+
+    def charge(self, chars: int = 0, nodes: int = 0) -> bool:
+        """Pay for a known expansion of the resolution, before it runs: a namespace's description written again in
+        front of each of its members, the tools its conversation kept decoded back, ... True when it still fits."""
+        self.chars += chars
+        self.nodes += nodes
+        return self._within()
+
+    def _descend(self, step, frames) -> bool:
+        """Charge one (key, value) pair and push a frame for its children, or None when a limit was passed."""
+        key, value = step
+        self.nodes += 1
+        if isinstance(value, str) and key in self.embedded_keys:
+            # a string the resolution decodes as JSON: its own characters already pay for the content it holds, but
+            # not for the node structure a compact one can carry
+            self.nodes += len(value) + 1
+        children = self._shape(value)
+        if children is not None:
+            depth = len(frames) + 1
+            if depth >= self.depth_limit:
+                return self._over("nesting")
+            self.depth = max(self.depth, depth)
+            frames.append(children)
+        return self._within()
+
+    def _shape(self, value):
+        """Charge one value's own JSON syntax and return an iterator of its children, or None for a scalar."""
+        if isinstance(value, str):
+            self.chars += json_string_charge(value)
+            return None
+        if value is None or isinstance(value, bool):
+            self.chars += 5                                    # null / false / true
+            return None
+        if isinstance(value, int):
+            self.chars += 3 + value.bit_length() // 3           # its digits, without materializing them
+            return None
+        if isinstance(value, float):
+            self.chars += 32                                    # a double's longest repr, sign and exponent included
+            return None
+        if isinstance(value, dict):
+            self.chars += 2 * len(value)                        # the members' own separators
+            for key in value:
+                if not isinstance(key, str):
+                    self.refused = self.refused or "a mapping key that is not a string"
+                    return None
+                self.chars += json_string_charge(key)
+            return iter(value.items())
+        if isinstance(value, (list, tuple)):
+            self.chars += 2 * len(value)
+            return ((None, item) for item in value)              # one frame for the list, not one per item
+        self.refused = self.refused or f"a {type(value).__name__} cannot be priced or hashed"
+        return None
+
+    def _within(self) -> bool:
+        if self.refused is not None:
+            return False
+        if self.chars > self.char_limit:
+            return self._over("characters")
+        if self.nodes > self.node_limit:
+            return self._over("nodes")
+        return True
+
+    def _over(self, what: str) -> bool:
+        self.refused = self.refused or f"over the preparation allowance: {what}"
+        return False
+
+
+def generation_digest(messages, tools, kwargs, max_new, force, walk: PreparationWalk | None = None) -> str | None:
+    """A digest of everything that decides a request's prepared ids and tokens, or None when one cannot be taken.
 
     A prepared result is reused only when the generation asks with exactly these inputs, so a re-resolved request
-    (a later turn, a second tool round of the same request) always renders its own prompt.
+    (a later turn, a second tool round of the same request) always renders its own prompt.  The five inputs are
+    exactly the endpoint resolution's own semantics - the messages, the tools the prompt is rendered with, the
+    template kwargs, the requested length and a forced call's opening - and nothing else.
+
+    Hashing is incremental and *typed*: the JSON encoder's own `iterencode` walks the inputs, one piece of its
+    output (at most `DIGEST_CHARS` characters) is encoded and hashed at a time, and a value the encoder cannot write
+    - or one this module cannot price or hash, see `PreparationWalk` - makes the whole digest None instead of a
+    second, general serializer.  A caller that has already admitted these exact values (serve/server.py's
+    `admit_inputs`) passes its walk, so the admission is not walked twice; without one this function admits them
+    itself, because the installed encoder yields a whole escaped string at once and would otherwise build the
+    unbounded digest this refusal exists to avoid.  None is never reusable: see PreparedGeneration.reusable.
     """
+    values = (messages, tools, kwargs, max_new, force)
+    if walk is None:
+        walk = PreparationWalk(PREPARATION_INPUT_CHARS, PREPARATION_INPUT_NODES, PREPARATION_INPUT_DEPTH)
+        for value in values:
+            if not walk.add(value):
+                return None
+    elif walk.refused is not None:
+        return None                    # the admission this caller ran already refused: never reuse what it held
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+    digest = hashlib.sha256()
     try:
-        blob = repr((messages, tools, kwargs, max_new, force))
-    except Exception:                    # noqa: BLE001 - a value that cannot be printed is never reused
-        return ""
-    return hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
+        for chunk in encoder.iterencode(values):
+            for start in range(0, len(chunk), DIGEST_CHARS):
+                digest.update(chunk[start:start + DIGEST_CHARS].encode("utf-8", "surrogatepass"))
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return None
+    return digest.hexdigest()
 
 
 @dataclasses.dataclass
@@ -245,9 +407,13 @@ class PreparedGeneration:
     def offered(self) -> bool:
         return self.offer_id > 0
 
-    def reusable(self, digest: str, ctx: int) -> bool:
-        """True when the generation asking for this result asks for exactly it, in the same engine incarnation."""
-        return not self.consumed and self.digest == digest and self.ctx == ctx
+    def reusable(self, digest: str | None, ctx: int) -> bool:
+        """True when the generation asking for this result asks for exactly it, in the same engine incarnation.
+
+        A digest that could not be taken (None, or this result's own empty sentinel) is never a match: two inputs
+        whose digest failed must not satisfy each other's equality, and the demand renders and prices its own prompt.
+        """
+        return bool(digest) and not self.consumed and self.digest == digest and self.ctx == ctx
 
     def apply_to(self, req: dict) -> None:
         """Put the frozen resolution onto the demand's own request: the pin boundary the offer was made with.

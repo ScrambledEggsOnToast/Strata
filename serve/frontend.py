@@ -56,14 +56,45 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
-        # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
-        # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
-        messages = [m for i, m in enumerate(messages)
-                    if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
-                                                      and not _text_of(m.get("content")).strip()
-                                                      and not _has_image(m.get("content")) and not m.get("tool_calls"))]
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+        return self.template.render(messages=self._examples(messages), tools=tools,
+                                    add_generation_prompt=add_generation_prompt, **kwargs)
+
+    @staticmethod
+    def _examples(messages: list[dict]) -> list[dict]:
+        """The messages a prompt is rendered from: completed empty assistant turns are left out (they are not
+        examples for the next reply), and the final message is always kept.  (#843.
+        STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)"""
+        return [m for i, m in enumerate(messages)
+                if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
+                                                  and not _text_of(m.get("content")).strip()
+                                                  and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+
+    def render_within(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
+                      limit: int | None = None, **kwargs) -> str | None:
+        """`render`'s own text when it fits within `limit` characters, else None - never a shortened prompt.
+
+        The preparation-only entry point: a queued request's prompt is rendered before the request is admitted, so
+        the template's output is collected under a bound instead of being built whole and measured afterwards.  The
+        installed Jinja renders through `Template.generate`, which yields the output as the template writes it; each
+        yielded piece is paid for *before* it is retained, and the generator is closed at once when one does not fit
+        (its own macro buffers are bounded by the admission of the request's inputs, which happens first - see
+        serve/server.py's admit_inputs).  `limit` None renders exactly as `render` does, in one piece.
+        """
+        if limit is None:
+            return self.render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
+        stream = self.template.generate(messages=self._examples(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
+        out: list[str] = []
+        total = 0
+        try:
+            for chunk in stream:
+                if total + len(chunk) > limit:
+                    return None
+                out.append(chunk)
+                total += len(chunk)
+        finally:
+            stream.close()
+        return "".join(out)
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
@@ -316,9 +347,16 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
 _THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
 
 
-def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
+def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS, restore_limit: int | None = None,
+                          span_limit: int | None = None) -> tuple[str, list[tuple[int, int]]] | None:
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
-    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans).
+
+    `restore_limit` and `span_limit` are the preparation-only bounds (None: neither, as every caller but the queued
+    frontier leaves them): restoring a mark writes the tag it stands for, which is longer, so a prompt bounded when
+    it was rendered can still grow here - the restored length and the number of spans are checked *before* each tag
+    is appended, and None means the prompt is over the allowance rather than a shortened one.
+    """
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
     mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
@@ -326,10 +364,15 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
         out.append(prompt[pos:m.start()])
         n += m.start() - pos
         tag = marks[m.group(0)]
+        if (restore_limit is not None and n + len(tag) > restore_limit) or \
+                (span_limit is not None and len(spans) >= span_limit):
+            return None
         out.append(tag)
         spans.append((n, n + len(tag)))
         n += len(tag)
         pos = m.end()
+    if restore_limit is not None and n + len(prompt) - pos > restore_limit:
+        return None                                # the tags fit; the text they restore into does not
     out.append(prompt[pos:])
     return "".join(out), spans
 

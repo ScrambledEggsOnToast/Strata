@@ -26,6 +26,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import conversation_offers                                              # noqa: E402
+from serve import server                                                           # noqa: E402
 from serve.conversation_offers import HEADER, Hello, OfferProtocolError, hello_payload  # noqa: E402
 from serve.frontend import ChatTemplate                                            # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, serve   # noqa: E402
@@ -732,6 +733,201 @@ class WiderFrontier(ChannelTestCase):
                          [200, 200, 200, 200])
 
 
+class FrontierArithmetic(ChannelTestCase):
+    """The allowance admits what the frontier actually settles: two whole-context reservations fit inside it beside
+    the tokenizer's own cache share, so a frontier of two prepares both of its candidates at 262144 tokens instead of
+    silently falling back to one.  The arithmetic decides that, not whether one prompt happens to tokenize."""
+
+    frontier = 2
+    batch = 2
+    hold = 2
+    context = 262144
+    metadata_bytes = 64 << 20        # the HELLO's descriptor share (one whole payload per slot fits inside it)
+
+    def engine_for(self):
+        return QueuedEngine(self.tok, link=self.link, batch=self.batch, hold=self.hold, max_context=self.context)
+
+    def test_two_full_context_slots_fit_the_allowance_and_both_are_prepared(self):
+        slot, descriptor = self.svc.preparation_slot()
+        self.assertEqual(descriptor, 4 * self.context)
+        self.assertLessEqual(self.svc.preparation_cache_bytes() + self.frontier * slot,
+                             self.svc.PREPARATION_ALLOWANCE_BYTES,
+                             "the allowance cannot hold the frontier's own reservations and the cache share")
+        first = self.start_request("first")
+        second = self.start_request("second")
+        self.assertTrue(self.engine.entered.wait(5), "the two engine slots were never both busy")
+        third = self.start_request("third")
+        fourth = self.start_request("fourth")
+        self.wait_queued(2)
+        self.assertIsNotNone(self.peer.next_offer(5), "the frontier's own two candidates were not both prepared")
+        self.assertIsNotNone(self.peer.next_offer(5))
+        self.assertEqual(len(self.peer.offers), 2, "the second full-context reservation was refused")
+        stats = self.svc.offer_stats()
+        self.assertEqual(stats["preparation_refused"], 0)
+        self.assertEqual(stats["prepared_requests"], 2)
+        self.assertEqual(stats["prepared_bytes"], 2 * slot)
+        self.engine.release.set()
+        self.join(first, second, third, fourth)
+        self.assertEqual([outcome.get("status") for _t, outcome in (first, second, third, fourth)],
+                         [200, 200, 200, 200])
+
+
+class SpeculativeValidation(ChannelTestCase):
+    """A `json_schema` request is prepared at demand only: its validation is the installed jsonschema's own walk of a
+    structure this thread has not admitted, so preparation never runs it - while the demand validates and answers it
+    exactly as it always did."""
+
+    SCHEMA = {"type": "json_schema", "json_schema": {
+        "name": "answer", "strict": True,
+        "schema": {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"],
+                   "additionalProperties": False}}}
+
+    def engine_for(self):
+        """The demand's answer is the object its schema asks for, so the whole path can be observed end to end."""
+        return QueuedEngine(self.tok, link=self.link, script='{"answer": 4}', batch=self.batch, hold=self.hold)
+
+    def test_the_demand_validates_its_own_schema_and_preparation_never_does(self):
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        validating = mock.patch.object(server, "prepare_format", wraps=server.prepare_format)
+        validate = validating.start()
+        self.addCleanup(validating.stop)
+        second = self.start_request(body={"messages": [{"role": "user", "content": "a turn"}],
+                                          "response_format": self.SCHEMA, "reasoning_effort": "none",
+                                          "max_tokens": 32})
+        self.wait_queued(1)
+        self.peer.drain(0.6)
+        self.assertEqual(validate.call_count, 0, "preparation validated a schema speculatively")
+        self.assertEqual(self.peer.offers, [], "a json_schema request was prepared early")
+        record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        self.assertTrue(record.get("_offer_declined"))
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(validate.call_count, 1, "the demand did not validate the schema it answers under")
+        self.assertEqual(second[1].get("status"), 200, second[1].get("body"))
+        reply = json.loads(second[1]["body"])
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), {"answer": 4})
+
+
+class DigestBounds(unittest.TestCase):
+    """The generation digest is taken incrementally, over inputs the same admission admitted, and a digest that
+    cannot be taken is never reusable (two failures must not match each other)."""
+
+    VALUES = ([{"role": "user", "content": "hi"}], [{"name": "t"}], {"reasoning_effort": "low"}, 4, None)
+
+    def test_a_digest_is_stable_for_its_own_inputs_and_changes_with_them(self):
+        first = conversation_offers.generation_digest(*self.VALUES)
+        self.assertIsInstance(first, str)
+        self.assertTrue(first)
+        self.assertEqual(first, conversation_offers.generation_digest(*self.VALUES))
+        self.assertNotEqual(first, conversation_offers.generation_digest(*([{"role": "user", "content": "ho"}],)
+                                                                        + self.VALUES[1:]))
+        self.assertNotEqual(first, conversation_offers.generation_digest(*self.VALUES[:2] + ({"reasoning_effort": "xhigh"},)
+                                                                        + self.VALUES[3:]))
+
+    def test_inputs_that_cannot_be_hashed_are_refused_rather_than_serialized(self):
+        self.assertIsNone(conversation_offers.generation_digest([{1: "a"}], None, {}, 4, None))
+        self.assertIsNone(conversation_offers.generation_digest([{"content": {1, 2}}], None, {}, 4, None))
+        self.assertIsNone(conversation_offers.generation_digest(
+            ["x" * (conversation_offers.PREPARATION_INPUT_CHARS + 1)], None, {}, 4, None))
+        refused = conversation_offers.PreparationWalk(1 << 20, 1 << 20, 2)
+        self.assertFalse(refused.add([[[[[[1]]]]]]))
+        self.assertIsNone(conversation_offers.generation_digest([[[[[[1]]]]]], None, {}, 4, None, walk=refused))
+
+    def test_a_digest_that_cannot_be_taken_is_never_reusable(self):
+        prepared = conversation_offers.PreparedGeneration(ids=(1,), thinking=False, max_new=1, digest="", ctx=16)
+        self.assertFalse(prepared.reusable(None, 16))
+        self.assertFalse(prepared.reusable("", 16))
+        prepared.digest = "abc"
+        self.assertTrue(prepared.reusable("abc", 16))
+        self.assertFalse(prepared.reusable("abc", 17))
+        self.assertFalse(prepared.reusable(None, 16))
+
+    def test_the_walk_counts_nodes_depth_and_what_a_decoded_string_hides(self):
+        walk = conversation_offers.PreparationWalk(1 << 20, 1 << 20, 64)
+        self.assertTrue(walk.add({"a": [1, 2, 3]}))
+        self.assertEqual((walk.nodes, walk.depth), (5, 2))          # the root, the list, three numbers
+        self.assertGreater(walk.chars, 0)
+        self.assertIsNone(walk.refused)
+        decoded = conversation_offers.PreparationWalk(1 << 20, 1 << 20, 64, ("messages",))
+        self.assertTrue(decoded.add({"messages": "x" * 100}))
+        self.assertEqual(decoded.nodes, 3 + 100)                    # ... and the nodes that string can decode to
+        deep = conversation_offers.PreparationWalk(1 << 20, 1 << 20, 2)
+        self.assertFalse(deep.add({"a": {"b": {"c": 1}}}))
+        self.assertIn("nesting", deep.refused)
+        wide = conversation_offers.PreparationWalk(1 << 20, 10, 64)
+        self.assertFalse(wide.add(list(range(20))))
+        self.assertIn("nodes", wide.refused)
+        expensive = conversation_offers.PreparationWalk(16, 1 << 20, 64)
+        self.assertFalse(expensive.add({"a": "b" * 100}))
+        self.assertIn("characters", expensive.refused)
+
+
+class ChangedDemandInput(ChannelTestCase):
+    """A demand whose own inputs changed (or are past the allowance) never consumes the prepared result: the offer is
+    retired first, without building the digest of a replacement nothing has admitted."""
+
+    def test_a_demand_past_the_allowance_withdraws_the_offer_before_digesting_it(self):
+        generation = conversation_offers.generation_digest([], None, {}, 4, None)
+        self.assertTrue(self.link.offer(7, self.link.epoch(), 0, "ab" * 32, [1, 2, 3]))
+        prepared = conversation_offers.PreparedGeneration(ids=(1, 2, 3), thinking=False, max_new=4, digest=generation,
+                                                          ctx=self.svc.context_size(), link=self.link, offer_id=7,
+                                                          generation=self.link.epoch())
+        record = {"id": "changed-demand", "_prepared": prepared}
+        huge = [{"role": "user", "content": "x" * (conversation_offers.PREPARATION_INPUT_CHARS + 1)}]
+        hashing = mock.patch.object(conversation_offers.json.JSONEncoder, "iterencode",
+                                    side_effect=AssertionError("an unadmitted input was digested"))
+        hashing.start()
+        self.addCleanup(hashing.stop)
+        self.assertIsNone(self.svc.take_prepared(record, huge, None, {}, 4, None))
+        self.assertTrue(prepared.consumed)
+        self.assertTrue(prepared.withdrawn)
+        self.assertNotIn("_prepared", record)
+        self.assertEqual(self.peer.next_cancel(5), (7, self.link.epoch()))
+        self.assertEqual(self.link.stats()["outstanding"], 0)
+
+
+class ResolutionExpansion(ChannelTestCase):
+    """A namespace tool's own description is written again in front of each of its members, so the admission charges
+    that expansion *before* the resolution builds it: a request whose expansion is past the allowance is prepared at
+    demand only, and the demand still expands it and runs it."""
+
+    def engine_for(self):
+        """The expanded prompt is many times the request's own text: the engine's context must hold what it makes."""
+        return QueuedEngine(self.tok, link=self.link, batch=self.batch, hold=self.hold, max_context=131072)
+
+    def test_a_namespace_expansion_past_the_allowance_is_declined_before_it_is_built(self):
+        namespace = "namespace instructions for every member tool " * 10
+        body = {"input": "a turn", "max_output_tokens": 4, "tools": [
+            {"type": "namespace", "name": "mcp_fs", "description": namespace,
+             "tools": [{"type": "function", "name": f"read{i}", "parameters": {"type": "object"}} for i in range(40)]}]}
+        walk = self.svc.preparation_walk()
+        self.assertTrue(walk.add(body))
+        expansion = 40 * (conversation_offers.json_string_charge(namespace) + 2)
+        self.assertGreater(expansion, 0)
+        bound = walk.chars + expansion // 2          # between the request's own JSON and its expansion
+        self.assertGreater(walk.chars, 0)
+        with mock.patch.object(self.svc, "preparation_input_chars", return_value=bound):
+            resolving = mock.patch.object(self.svc, "resolve_for_offer", wraps=self.svc.resolve_for_offer)
+            resolve = resolving.start()
+            self.addCleanup(resolving.stop)
+            first = self.start_request("first")
+            self.assertTrue(self.engine.entered.wait(5))
+            second = self.start_request(body=body, path="/v1/responses")
+            self.wait_queued(1)
+            self.peer.drain(0.6)
+            self.assertEqual(resolve.call_count, 0, "the expansion was built before it was paid for")
+            self.assertEqual(self.peer.offers, [])
+            record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+            self.assertTrue(record.get("_offer_declined"))
+            self.engine.release.set()
+            self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200, second[1].get("body"))
+        prompt = prompt_text(self.engine.prompts[1])
+        self.assertIn(namespace, prompt, "the demand did not expand the namespace it had to render")
+        self.assertIn("mcp_fs.read0", prompt)
+
+
 class NoStoreFrontier(ChannelTestCase):
     """A store that keeps nothing (a disabled HELLO) offers nothing: the demand path stays exactly as it was."""
 
@@ -850,25 +1046,60 @@ class BoundedPreparation(ChannelTestCase):
         self.assertEqual(second[1].get("status"), 400)   # the demand path still reports it in its own words
         self.assertIn("exceeds the context window", json.loads(second[1]["body"])["error"]["message"])
 
-    def test_a_prompt_past_the_text_bound_is_declined_before_the_template_renders_it(self):
+    def test_a_request_past_the_input_bound_is_declined_before_it_is_even_resolved(self):
+        """The raw request's own JSON is admitted first: over the allowance nothing resolves, renders or is offered
+        for it, and its demand still resolves, renders, runs and answers it (a preparation refusal only)."""
         first = self.start_request("first")
         self.assertTrue(self.engine.entered.wait(5))
-        bound = mock.patch.object(self.svc, "preparation_text_bound", return_value=8)
+        bound = mock.patch.object(self.svc, "preparation_input_chars", return_value=8)
         bound.start()
         self.addCleanup(bound.stop)
+        resolving = mock.patch.object(self.svc, "resolve_for_offer", wraps=self.svc.resolve_for_offer)
+        resolve = resolving.start()
+        self.addCleanup(resolving.stop)
         rendered = mock.patch.object(self.svc, "render_prompt", wraps=self.svc.render_prompt)
         render = rendered.start()
         self.addCleanup(rendered.stop)
         second = self.start_request(body={"messages": [{"role": "user", "content": "y" * 400}], "max_tokens": 4})
         self.wait_queued(1)
         self.peer.drain(0.6)
+        self.assertEqual(resolve.call_count, 0, "a request over the input bound was resolved for preparation")
         self.assertEqual(render.call_count, 0, "the template rendered a request the preparation had not admitted")
         self.assertEqual(self.peer.offers, [])
+        record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        self.assertTrue(record.get("_offer_declined"))
         self.engine.release.set()
         self.join(first, second)
         self.assertEqual(second[1].get("status"), 200)   # preparation is the only thing that was declined
         self.assertEqual(render.call_count, 1, "the demand did not render the request it had to run")
         self.assertIn("y" * 400, prompt_text(self.engine.prompts[1]))
+        self.assertNotIn("cache_offer", self.keys_of(self.engine.samplings[1]))
+
+    def test_a_prompt_the_bounded_render_cannot_produce_is_declined_and_its_demand_still_runs_it(self):
+        """The render itself is bounded: a prompt the collector cannot hold is declined as preparation (never
+        truncated), and the demand renders it whole and runs it."""
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        bound = mock.patch.object(self.svc, "preparation_render_chars", return_value=64)
+        bound.start()
+        self.addCleanup(bound.stop)
+        collecting = mock.patch.object(self.svc.template, "render_within",
+                                       wraps=self.svc.template.render_within)
+        collector = collecting.start()
+        self.addCleanup(collecting.stop)
+        second = self.start_request(body={"messages": [{"role": "user", "content": "z" * 400}], "max_tokens": 4})
+        self.wait_queued(1)
+        self.peer.drain(0.6)
+        self.assertEqual(collector.call_count, 1, "the preparation did not render through the bounded collector")
+        self.assertEqual(self.peer.offers, [], "a prompt the bound could not hold was offered anyway")
+        record = next(r for r in self.svc.lifecycles if r["state"] == "queued")
+        self.assertTrue(record.get("_offer_declined"))
+        self.assertEqual(self.svc.offer_stats()["prepared_requests"], 0)
+        self.engine.release.set()
+        self.join(first, second)
+        self.assertEqual(second[1].get("status"), 200)
+        self.assertEqual(collector.call_count, 1, "the demand rendered through the preparation's own bound")
+        self.assertIn("z" * 400, prompt_text(self.engine.prompts[1]), "the demand ran a shortened prompt")
 
     def test_a_changed_steering_withdraws_what_was_prepared(self):
         self.engine.info = {"cvec": 1}                   # a loaded control vector: its flag is what native prices

@@ -20,6 +20,7 @@ from serve.server import Detokenizer  # noqa: E402
 def find_tokenizer():
     cands = [os.environ.get("STRATA_TOKENIZER", "")]
     cands += [str(p) for p in ROOT.glob("packs/*/tokenizer")] + [str(p) for p in ROOT.glob("pack/*/tokenizer")]
+    cands += [str(p) for p in Path("/srv/development/models").glob("*/pack/tokenizer")]   # a deployed pack (Linux)
     cands += [r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\pack\full\tokenizer"]
     for c in cands:
         if c and (Path(c) / "vocab.json").exists():
@@ -189,6 +190,31 @@ def synthetic_tokenizer(seed=268, n_merges=1500):
         tokens.append(lit)
         types.append(ty)
     return ST.Tokenizer(tokens, merges, types)
+
+
+class BpeWorkspaceCharge(unittest.TestCase):
+    """What one bounded encode's own merge workspace is charged for: `(1024 + 8A) * P`, with A the vocabulary's
+    longest token and P the piece cap - the frontend's per-slot reservation pays this, so it must be the tokenizer's
+    own figure (an unsupported coefficient would let a 16 KiB piece hide tens of MiB)."""
+
+    def check(self, tok, expect_a=None):
+        longest = max(len(t) for t in tok.tokens)
+        self.assertEqual(tok.max_token_symbols, longest)
+        if expect_a is not None:
+            self.assertEqual(longest, expect_a)
+        self.assertEqual(tok.preparation_peak_bytes(),
+                         (tok.PIECE_FIXED_BYTES + tok.PIECE_SYMBOL_BYTES * longest) * tok.PREPARATION_PIECE_MAX_BYTES)
+        self.assertEqual(tok.preparation_peak_bytes(), (1024 + 8 * longest) * (16 << 10))
+
+    def test_synthetic_vocab(self):
+        self.check(synthetic_tokenizer())
+
+    @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
+    def test_pack_vocab(self):
+        """The deployed pack's own figure: A=128, so a 16 KiB piece is charged 32 MiB, not the 2.5 MiB the old
+        per-symbol coefficient gave it."""
+        self.check(real_tokenizer(), expect_a=128)
+        self.assertEqual(real_tokenizer().preparation_peak_bytes(), 32 << 20)
 
 
 class ThreadedEncode(unittest.TestCase):

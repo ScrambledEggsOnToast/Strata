@@ -1,7 +1,9 @@
 """Chat history normalization before rendering the model's prompt."""
 import copy
+import os
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
 from serve.server import ByteTokenizer, MockEngine, Service
@@ -192,6 +194,126 @@ class EmptyTurnsSwitch(unittest.TestCase):
         self.assertEqual(template.render(msgs), clean)
         with mock.patch.dict(os.environ, {"STRATA_KEEP_EMPTY_TURNS": "1"}):
             self.assertNotEqual(template.render(msgs), clean)
+
+
+class BoundedRendering(unittest.TestCase):
+    """The preparation-only bounds of the template and of its literal restoration: a prompt is rendered and restored
+    under a stated character bound, and over it the result is None - never a shortened prompt."""
+
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        self.messages = [{"role": "user", "content": "a long enough turn to render " * 40}]
+
+    def test_the_bounded_render_is_the_unbounded_one_until_the_bound_is_passed(self):
+        whole = self.template.render(self.messages)
+        self.assertEqual(self.template.render_within(self.messages, limit=len(whole)), whole)
+        self.assertEqual(self.template.render_within(self.messages, limit=len(whole) + 1), whole)
+        self.assertIsNone(self.template.render_within(self.messages, limit=len(whole) - 1))
+        self.assertIsNone(self.template.render_within(self.messages, limit=16))
+        # None renders exactly as render does, for every caller that is not the queued frontier
+        self.assertEqual(self.template.render_within(self.messages, limit=None), whole)
+        # the empty-turn filtering is the same on both paths (#843)
+        history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": ""},
+                   {"role": "user", "content": "q2"}]
+        self.assertEqual(self.template.render_within(history, limit=None), self.template.render(history))
+        self.assertEqual(self.template.render_within(history, limit=len(self.template.render(history))),
+                         self.template.render(history))
+
+    def test_a_restoration_over_its_bounds_is_refused_rather_than_shortened(self):
+        from serve.frontend import mark_think_literals, unmark_think_literals
+        marked, _tools, changed = mark_think_literals([{"role": "user", "content": "<think>a</think>" * 40}], None)
+        self.assertTrue(changed)
+        prompt = marked[0]["content"]
+        restored, spans = unmark_think_literals(prompt)
+        self.assertEqual(spans, unmark_think_literals(prompt, restore_limit=len(restored),
+                                                      span_limit=len(spans))[1])
+        self.assertEqual(unmark_think_literals(prompt, restore_limit=len(restored), span_limit=len(spans))[0],
+                         restored)
+        self.assertIsNone(unmark_think_literals(prompt, restore_limit=len(restored) - 1))
+        self.assertIsNone(unmark_think_literals(prompt, span_limit=len(spans) - 1))
+        self.assertIsNone(unmark_think_literals(prompt, restore_limit=len(restored), span_limit=0))
+        self.assertEqual(len(spans), 80)                                   # forty <think> and forty </think>
+
+
+def pack_template():
+    """The deployed pack's own chat template - the one production renders with - or None when there is no pack here.
+
+    serve/server.py constructs `ChatTemplate(pack/.../chat_template.jinja)` whenever the pack ships one, and that
+    template (with its `render_content` macro and `tojson` filter) is what the preparation bounds must hold for, not
+    only this repository's fixture.
+    """
+    dirs = [os.environ.get("STRATA_TOKENIZER", "")]
+    dirs += [str(p) for p in Path("/srv/development/models").glob("*/pack/tokenizer")]
+    for directory in dirs:
+        if directory and (Path(directory) / "chat_template.jinja").exists():
+            return Path(directory) / "chat_template.jinja"
+    return None
+
+
+@unittest.skipIf(pack_template() is None, "no deployed pack template here")
+class PackTemplateRendering(unittest.TestCase):
+    """The preparation path with the template production really uses: the bounded render and its literal restoration
+    produce exactly the demand's own ids (the effort split, a literal <think>, and a prefix head included), and a
+    bound below what the prompt needs refuses instead of shortening it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+        cls.template = ChatTemplate(pack_template())
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=32768), cls.tok, cls.template)
+
+    def setUp(self):
+        self.svc.effort_end = True
+        self.messages = [{"role": "system", "content": "You are a careful assistant. " * 20},
+                         {"role": "user", "content": "Read this: " + ("the document text " * 300)},
+                         {"role": "assistant", "content": "Done."},
+                         {"role": "user", "content": "Now: <think>a quoted marker</think> and a question."}]
+        self.tools = [{"name": "read", "description": "read a file " * 10,
+                       "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+
+    def test_the_bounded_path_produces_the_demands_own_ids(self):
+        for kwargs in ({}, {"reasoning_effort": "low"}, {"enable_thinking": False}):
+            with self.subTest(kwargs=kwargs):
+                bound = self.svc.preparation_token_limit()
+                self.assertEqual(self.svc.encode_prompt(self.messages, self.tools, dict(kwargs), limit=bound),
+                                 self.svc.encode_prompt(self.messages, self.tools, kwargs))
+
+    def test_the_prefix_head_is_bounded_the_same_way(self):
+        req = {"strata_prefix": {"messages": 3}}
+        prepared = self.svc.prepare(self.messages, self.tools, {}, 16, req=req)
+        self.assertIsNotNone(prepared)
+        pinned = dict(req["strata_prefix"])
+        self.assertGreater(pinned.get("tokens", 0), 0)
+        bounded_req = {"strata_prefix": {"messages": 3}}
+        self.assertEqual(self.svc.prepare(self.messages, self.tools, {}, 16, req=bounded_req,
+                                          limit=self.svc.preparation_token_limit()), prepared)
+        self.assertEqual(bounded_req["strata_prefix"], pinned)
+
+    def test_a_long_context_prompt_is_bounded_and_still_the_demands_own(self):
+        """A prompt of the length the frontier really prepares (a long turn, the tools included) on the template
+        production renders with: the bounded path produces the demand's own ids, and both figure are inside the
+        frontend's own bounds."""
+        svc = Service(MockEngine(self.tok, "ok", max_context=262144), self.tok, self.template)
+        messages = [{"role": "user", "content": "a document line that is long enough to matter\n" * 4000},
+                    {"role": "user", "content": "and the question"}]
+        ids = svc.encode_prompt(messages, self.tools, {}, limit=svc.preparation_token_limit())
+        self.assertIsNotNone(ids)
+        self.assertEqual(ids, svc.encode_prompt(messages, self.tools, {}))
+        rendered = svc.render_prompt(messages, self.tools, {})
+        self.assertGreater(len(rendered), 1 << 17)
+        self.assertLessEqual(len(rendered), svc.preparation_render_chars())
+        self.assertLessEqual(len(ids), svc.preparation_token_limit())
+        self.assertEqual(svc.render_prompt(messages, self.tools, {}, limit=svc.preparation_render_chars()), rendered)
+
+    def test_a_render_bound_below_the_prompt_refuses_it(self):
+        rendered = self.svc.render_prompt(self.messages, self.tools, {})
+        self.assertIsNone(self.svc.render_prompt(self.messages, self.tools, {}, limit=len(rendered) - 1))
+        self.assertEqual(self.svc.render_prompt(self.messages, self.tools, {}, limit=len(rendered)), rendered)
+        bounded = self.svc.encode_prompt(self.messages, self.tools, {}, limit=self.svc.preparation_token_limit())
+        self.assertIsNotNone(bounded)
+        with mock.patch.object(self.svc, "preparation_render_chars", return_value=64):
+            self.assertIsNone(self.svc.encode_prompt(self.messages, self.tools, {},
+                                                     limit=self.svc.preparation_token_limit()))
 
 
 class ForcedCallOpening(unittest.TestCase):

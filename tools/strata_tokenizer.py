@@ -72,6 +72,9 @@ class Tokenizer:
         self.pre = pre
         self.token_types = token_types
         self.special_ids = special_ids or {}
+        # A: the longest token in this vocabulary, in byte-alphabet symbols (one character each).  One pass at
+        # construction: it is what the bounded encode's own workspace is charged against (preparation_peak_bytes).
+        self.max_token_symbols = max((len(t) for t in tokens), default=1)
         self.ids = {t: i for i, t in enumerate(tokens)}
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
@@ -218,14 +221,18 @@ class Tokenizer:
     # ---- the preparation bound ----------------------------------------------------------------------------------
     # A *bounded* encode (`encode_within`) is the preparation-only one: the frontend prepares a queued request and
     # offers its tokens to the native store before the request is admitted, under a fixed allowance for everything
-    # that preparation holds (serve/server.py: PREPARATION_ALLOWANCE_BYTES - native's own 64 MiB, generate.cpp's
-    # kConversationOfferBytes).  Two numbers make an encode fit inside it: the token count the caller states, and
-    # this cap on one pre-tokenizer piece - a single piece's own merge structures cost many times its length, so a
-    # piece bigger than the cap is declined before it is mapped or merged, not after.
+    # that preparation holds (serve/server.py: PREPARATION_ALLOWANCE_BYTES - the byte share native reserves for this
+    # frontend, an explicit term of generate.cpp's conversation-cache reservation).  Two numbers make an encode fit
+    # inside it: the token count the caller states, and this cap on one pre-tokenizer piece - a single piece's own
+    # merge structures cost many times its length, so a piece bigger than the cap is declined before it is mapped or
+    # merged, not after.
     PREPARATION_PIECE_MAX_BYTES = 16 << 10   # mapped symbols (one byte each) one piece of a bounded encode may have
-    PIECE_PEAK_PER_BYTE = 160                # what one piece's own structures cost at worst, per mapped symbol:
-                                             # `parts`, `nxt`, `prv` (24 B a symbol) plus one heap entry a symbol
-                                             # (~100 B, each holding its two symbols) plus the mapped string itself
+    PIECE_FIXED_BYTES = 1024                 # what one piece's own merge workspace costs before its symbols do:
+                                             # `parts`, `nxt`, `prv`, the boxed list positions, the heap's own list
+                                             # and its four-field tuples (each holding its two operand strings)
+    PIECE_SYMBOL_BYTES = 8                   # ... plus this much per symbol, for the operands the heap tuples hold:
+                                             # fewer than 2P entries each name two vocabulary tokens of at most A
+                                             # two-byte-wide characters (see preparation_peak_bytes)
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
     # The cache is the other half of that allowance: what this tokenizer retains for itself across requests.  It is a
     # fixed share (never the reservation side), with its own bound in bytes - a cache that grows under a live
@@ -237,10 +244,18 @@ class Tokenizer:
     def preparation_peak_bytes(self) -> int:
         """What one bounded encode holds besides the ids it returns: the one piece it is merging at the time.
 
+        `(1024 + 8A) * P`, where P is the most symbols one piece may have (PREPARATION_PIECE_MAX_BYTES) and A the
+        longest token in this vocabulary (max_token_symbols).  Derived from `_bpe_heap`, not measured: the heap
+        starts with at most P-1 entries, each merge pops one and pushes at most two, and every successful merge
+        removes a part, so there are fewer than 2P entries and fewer than 2P created symbol strings; every created
+        string is a concatenation of two vocabulary tokens, so at most 2A two-byte-wide symbols.  8AP pays those
+        operands, 1024P the linked-list arrays, the boxed positions, the four-field heap tuples and the slack.
+
         The frontend's preparation reservation pays for this (serve/server.py: Service.preparation_slot), so it is
-        read from here rather than repeated there.
+        read from here rather than repeated there: at the deployed pack's A=128 and P=16 KiB it is 32 MiB.
         """
-        return self.PREPARATION_PIECE_MAX_BYTES * self.PIECE_PEAK_PER_BYTE
+        return ((self.PIECE_FIXED_BYTES + self.PIECE_SYMBOL_BYTES * self.max_token_symbols)
+                * self.PREPARATION_PIECE_MAX_BYTES)
 
     def cache_share_bytes(self) -> int:
         """The share of the preparation allowance this tokenizer's own piece cache may use (0: it keeps nothing).
