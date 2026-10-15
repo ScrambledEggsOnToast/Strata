@@ -381,12 +381,15 @@ public:
     // Divergent branches and every explicitly pinned cut remain protected.
     size_t superseded() const { return superseded_; }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    // A non-consuming restore also reserves its eventual publication entry.
+    bool put(SavedConversation&& image, size_t held = 0, size_t held_entries = 0) {
         static_assert(std::is_nothrow_move_constructible_v<SavedConversation>);
         static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
         static_assert(std::is_nothrow_destructible_v<SavedConversation>);
         const size_t n = image.bytes();
-        if (!enabled() || !image.scope.valid() || held > budget_ || n > budget_ - held) return false;
+        if (!enabled() || !image.scope.valid() || held_entries >= slots_ ||
+            held > budget_ || n > budget_ - held) return false;
+        const size_t available_entries = slots_ - held_entries;
         const size_t limit = budget_ - held - n;
         size_t count = entries_.size(), remaining = bytes_, replaced = 0, victims = 0;
         for (const auto& old : entries_) if (replaces(old, image)) {
@@ -398,14 +401,14 @@ public:
         const bool discard_reuse = remaining > limit || reuse_bytes > limit - remaining;
         const size_t payload_limit = discard_reuse ? limit : limit - reuse_bytes;
         for (const auto& old : entries_) {
-            if (count < slots_ && remaining <= payload_limit) break;
+            if (count < available_entries && remaining <= payload_limit) break;
             if (!old.pinned() && !replaces(old, image)) {
                 --count;
                 remaining -= old.bytes();
                 ++victims;
             }
         }
-        if (count >= slots_ || remaining > payload_limit) return false;
+        if (count >= available_entries || remaining > payload_limit) return false;
 
         // Allocate/construct publication storage before destroying any old image.
         // noexcept movement keeps the candidate unchanged if deque growth fails.

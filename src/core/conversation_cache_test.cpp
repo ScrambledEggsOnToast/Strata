@@ -476,6 +476,36 @@ int main() {
         check(cache.size() == 1, "oversized put leaves cache unchanged");
         check(!cache.reserve_snapshot(0, one*2+1), "held larger than budget cannot underflow");
     }
+    for (bool pinned : {false, true}) {
+        ConversationCache cache(1 << 20, 2);
+        auto donor = image({1, 2, 3, 4}), other = image({9, 8, 7});
+        if (pinned) {
+            donor.checkpoints = {donor.live}; donor.checkpoints.back().pinned = true;
+        }
+        other.checkpoints = {other.live}; other.checkpoints.back().pinned = true;
+        check(cache.put(std::move(donor)) && cache.put(std::move(other)), "park a donor beside a pinned history");
+        auto held = cache.take(cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true, test_scope).index);
+        check(!cache.put(image({6, 5, 4}), held.bytes(), 1),
+              "outgoing capture cannot spend a non-consuming donor's reserved entry");
+        check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3,
+              "refused outgoing capture preserves the existing pinned history");
+        check(cache.put(std::move(held)) &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true, test_scope).tokens == 4,
+              "one-shot donor returns with its complete original prefix");
+        check(cache.evictions() == 0 && cache.size() == 2, "borrow and return do not evict either history");
+    }
+    {
+        ConversationCache cache(1 << 20, 2);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "fill ordinary donor table");
+        auto held = cache.take(0);
+        check(cache.put(image({6, 5, 4}), held.bytes(), 1), "reserved-entry capture may evict an unrelated unpinned history");
+        check(cache.put(std::move(held)) && cache.size() == 2 && cache.evictions() == 1 &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true, test_scope).tokens == 3 &&
+              cache.best(std::vector<int32_t>{6, 5, 4, 3}, {}, true, test_scope).tokens == 3,
+              "capture plus donor return obey the entry limit without consuming the donor");
+        check(!cache.put(image({7, 6, 5}), 0, std::numeric_limits<size_t>::max()),
+              "invalid held-entry reservations cannot underflow the publication limit");
+    }
     {
         ConversationCache cache(1 << 20, 4);
         auto first = image({1, 2, 3, 8});

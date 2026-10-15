@@ -10717,7 +10717,8 @@ int main(int argc, char** argv) {
             }
             return work;
         };
-        auto checkpoint_work = [&](const ConvCheckpoint& checkpoint) {
+        auto checkpoint_work = [&](const ConvCheckpoint& checkpoint,
+                                   const std::vector<const ConvCheckpoint*>* separated = nullptr) {
             PrefixWork work;
             if (!o.prefix_cost_selection) return work;
             auto part = [&](const ConvCheckpoint& c, const strata::core::SessionState& state) {
@@ -10726,8 +10727,11 @@ int main(int argc, char** argv) {
                                  c.block_pos.size(), c.dead.size()}) work.add(n);
             };
             part(checkpoint, ss);
-            if (checkpoint.stage_parts.size() != stages.size()) { work.bytes = UINT64_MAX; return work; }
-            for (size_t i = 0; i < stages.size(); ++i) part(checkpoint.stage_parts[i], stages[i]->ss);
+            if (separated ? separated->size() != stages.size() + 1 : checkpoint.stage_parts.size() != stages.size()) {
+                work.bytes = UINT64_MAX; return work;
+            }
+            for (size_t i = 0; i < stages.size(); ++i)
+                part(separated ? *(*separated)[i + 1] : checkpoint.stage_parts[i], stages[i]->ss);
             return work;
         };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
@@ -10826,7 +10830,7 @@ int main(int argc, char** argv) {
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
-                                    const strata::core::SavedConversation* held_image) -> bool {
+                                    const strata::core::SavedConversation* held_image, size_t held_entries) -> bool {
             const auto& live = source.tokens;
             const auto& live_imgs = source.images;
             auto& checks = source.checkpoints;
@@ -10836,7 +10840,8 @@ int main(int argc, char** argv) {
                 if (source.resident) return source.resident->session(k);
                 return k == 0 ? ss : stages[k - 1]->ss;
             };
-            if (!conversations.enabled() || !live_ok || !live_scope.valid() || live.empty()) return true;
+            if (!conversations.enabled() || held_entries >= conversations.slots() ||
+                !live_ok || !live_scope.valid() || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -11051,7 +11056,7 @@ int main(int argc, char** argv) {
                 };
                 if (extent_probe_on && held_image) observe("held-incoming", 0, image, *held_image);
                 const size_t previous_superseded = conversations.superseded();
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.put(std::move(image), held, held_entries);
                 if (const size_t dropped = conversations.superseded() - previous_superseded)
                     std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                                          "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
@@ -11106,15 +11111,15 @@ int main(int argc, char** argv) {
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
         auto park_source = [&](const ParkSource& source, size_t held,
-                               const strata::core::SavedConversation* held_image) -> bool {
-            try { return park_source_body(source, held, held_image); }
+                               const strata::core::SavedConversation* held_image, size_t held_entries = 0) -> bool {
+            try { return park_source_body(source, held, held_image, held_entries); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
             }
         };
-        auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image) -> bool {
-            return park_source({live, live_imgs, checks, live_scope, cvec_cached, live_ok}, held, held_image);
+        auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image, size_t held_entries = 0) -> bool {
+            return park_source({live, live_imgs, checks, live_scope, cvec_cached, live_ok}, held, held_image, held_entries);
         };
         auto park_completed = [&](int slot, size_t held, const strata::core::SavedConversation* held_image) -> bool {
             if (!conversations.enabled()) return true;
@@ -14507,7 +14512,7 @@ int main(int argc, char** argv) {
             bool direct_cut = incoming && !parked.live && direct_cut_on &&
                 std::getenv("STRATA_CKPT_REREAD") == nullptr;
             std::vector<const ConvCheckpoint*> incoming_cuts;
-            if (direct_cut) {
+            if (incoming && !parked.live && (direct_cut || !req_ckpt)) {
                 auto find_cut = [&](const strata::core::SavedConversation& image) -> const ConvCheckpoint* {
                     for (const auto& c : image.checkpoints)
                         if ((int64_t) c.ids.size() == parked.tokens && starts_with(c.ids, c.imgs)) return &c;
@@ -14533,7 +14538,8 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0, incoming ? &*incoming : nullptr)) {
+            if ((!from_live || incoming || slot_source >= 0 || !req_ckpt) && !pin_sibling &&
+                !park_current(incoming ? incoming->bytes() : 0, incoming ? &*incoming : nullptr, incoming && !req_ckpt ? 1 : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -14628,21 +14634,30 @@ int main(int argc, char** argv) {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
-                live = std::move(incoming->live.ids);
-                live_imgs = std::move(incoming->live.imgs);
-                if (stages.empty()) {
-                    checks = std::move(incoming->checkpoints);
-                } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
-                    strata::core::ConversationCheckpointSplit cs;
-                    cs.stage0 = std::move(incoming->checkpoints);
-                    for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
-                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                if (!req_ckpt) {
+                    // Borrow an existing history, but do not consume it for a
+                    // one-shot extension that cannot replace it when finished.
+                    live = incoming->live.ids;
+                    live_imgs = incoming->live.imgs;
+                    checks.clear();
+                    conversations.limit_reuse(0);
+                } else {
+                    live = std::move(incoming->live.ids);
+                    live_imgs = std::move(incoming->live.imgs);
+                    if (stages.empty()) {
+                        checks = std::move(incoming->checkpoints);
+                    } else {
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(incoming->checkpoints);
+                        for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                    }
                 }
                 cvec_cached = incoming->cvec;
                 live_scope = incoming->scope;
                 resume = parked.tokens;
                 from_live = parked.live || direct_cut;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                if (req_ckpt && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
@@ -14655,7 +14670,7 @@ int main(int argc, char** argv) {
                         [&](const auto& key) { return key.start >= resume; }), live_imgs.end());
                     for (auto& c : checks) if ((int64_t) c.ids.size() == resume) c.used = ++check_clock;
                 }
-                incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                if (req_ckpt) incoming.reset(); // One-shot donors remain intact through checkpoint rewind.
                 if (o.prefix_cost_selection)
                     prefix_costs.transfer(PrefixTransfer::parked, restore_work,
                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -14702,9 +14717,10 @@ int main(int argc, char** argv) {
                 checks.clear();
             } else if (!from_live) {
                 const auto checkpoint_t0 = Clock::now();
-                ConvCheckpoint* c = nullptr;
-                for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
-                if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
+                ConvCheckpoint* working_cut = nullptr;
+                for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) working_cut = &k;
+                if (working_cut != nullptr) working_cut->used = ++check_clock;
+                const ConvCheckpoint* c = incoming ? incoming_cuts[0] : working_cut;
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
@@ -14722,11 +14738,13 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) ||
+                           (!incoming && c->stage_parts.size() != stages.size()) ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
-                                   if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+                                   if (!checkpoint_restore(incoming ? *incoming_cuts[i + 1] : c->stage_parts[i],
+                                                           stages[i]->ss, g)) return true;
                                }
                                return false;
                            }()) {
@@ -14734,8 +14752,17 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (o.prefix_cost_selection && reread_to < 0 && c)
-                    prefix_costs.transfer(PrefixTransfer::checkpoint, checkpoint_work(*c),
+                    prefix_costs.transfer(PrefixTransfer::checkpoint, checkpoint_work(*c, incoming ? &incoming_cuts : nullptr),
                         std::chrono::duration<double, std::milli>(Clock::now() - checkpoint_t0).count());
+            }
+            if (incoming) {
+                // Capture reserved both these bytes and this entry. Failure to
+                // return a validated donor is an ownership fault, not a cache miss.
+                if (!conversations.put(std::move(*incoming))) {
+                    std::printf("ERR returning a borrowed conversation snapshot failed\n");
+                    return 1;
+                }
+                incoming.reset();
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
