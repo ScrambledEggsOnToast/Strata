@@ -6175,6 +6175,8 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
             "output_tokens": sum(part["output_tokens"] for part in work),
             "interval": {"started_at": lifecycle["started_at"], "finished_at": time.time(),
                          "duration_s": lifecycle["completion_s"]},
+            "queue_s": lifecycle.get("queue_s"),
+            "first_token_s": lifecycle.get("first_token_s"),
             "drafts_accepted": figures.get("drafts_accepted"), "drafts_offered": figures.get("drafts_offered"),
             "legs": figures.get("legs", [])}
 
