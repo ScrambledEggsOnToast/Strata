@@ -90,9 +90,10 @@ inline void progress_at(const char*) {}
 
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
                           const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
-                          double prior_chunk_ms = 0, bool inject_yield = false) {
+                          double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1) {
     Clock::ms = 0;
     Result result;
+    const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
     struct Options { int batch; int prompt_cache = 6; int64_t short_read = 32; double foreground_budget_ms; };
     const Options o{batch, 6, 32, budget_ms};
     std::vector<int64_t> ids((size_t) n);
@@ -101,7 +102,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     strata::program::TimeBudget time_budget(budget_ms, 0.25);
     if (prior_chunk_ms > 0) time_budget.prefilled(prior_chunk_ms, 1, 2048);
     auto last_decode = Clock::now();
-    double credited_prefill_ms = 0;
+    double credited_prefill_ms = 0, resident_round_ms = 0;
     std::atomic<bool> stop_req{false};
     const auto credit_service = [] {};
     const auto retire_stopped = [] { return true; };
@@ -125,11 +126,18 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         if (!drain_ok) err = "descendant drain failed";
         return drain_ok;
     };
+    std::mutex in_mu;
+    std::deque<std::string> in_lines;
     auto decode_round = [&]() -> bool {
         result.decode_positions.push_back(sp.position);
         Clock::ms += 5;
         last_decode = Clock::now();
         time_budget.decoded(5);
+        if (time_budget.enabled()) resident_round_ms += 5;
+        if (yield_on_decode_at >= 0 && sp.position >= yield_on_decode_at) {
+            in_lines.push_back("BYIELD 0");
+            yield_on_decode_at = -1;
+        }
         return true;
     };
     const double decode_share = 0.5;
@@ -137,10 +145,8 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     int64_t il_parts = 0, yielded_at = -1;
     double il_ms = 0;
     int yielded_slot = -1;
-    std::mutex in_mu;
-    std::deque<std::string> in_lines;
     NoControlRequests resident;
-    resident.allow_park = inject_yield;
+    resident.allow_park = expects_yield;
     if (inject_yield) sp.incoming = &in_lines;
     const auto resident_control = [&](const std::string& command) {
         if (command.rfind("BSTOP ", 0) == 0) resident.cancel(std::atoi(command.c_str() + 6));
@@ -161,7 +167,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.okay = read_part(0, n, e);
     result.fatal = batch_fatal;
     result.error = e;
-    if (!retained_prefill && !inject_yield &&
+    if (!retained_prefill && !expects_yield &&
         (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
         throw std::runtime_error("read_part did not finish: " + e);
     result.interleave_boundaries = il_parts;
@@ -189,8 +195,8 @@ int main() {
         CHECK(frontier == 10000 && !positive.decode_positions.empty());
         CHECK(positive.decode_positions.front() > 0 && positive.decode_positions.back() < frontier);
     }
-    // Idle pipeline filling preserves complete arithmetic chunks and a separate
-    // tail, never invents a decoder, and cannot cheapen a known isolated-C cost.
+    // Idle pipeline filling preserves arithmetic chunks and the unchanged tail,
+    // never invents a decoder, and cannot cheapen a known isolated-C cost.
     for (int64_t n : {2047, 2048, 2049, 4095, 4096, 4097, 8193}) {
         const auto solo = read_prompt(1000, true, true, false, 4, nullptr, true, n, 1200);
         int64_t frontier = 0;
@@ -210,6 +216,14 @@ int main() {
         const auto yielded = read_prompt(1000, true, true, false, 4, nullptr, true, n, 1200, true);
         CHECK(!yielded.okay && !yielded.fatal && yielded.error == "yield");
         CHECK(yielded.parked_at == 2048 && yielded.decode_positions.empty());
+    }
+    // A control arriving during either boundary decode or a credited burst
+    // parks at the first advanced frontier, before another prefill launch.
+    for (int64_t trigger : {0, 1}) {
+        const auto yielded = read_prompt(1000, true, true, true, 4, nullptr, true, 10000, 1200, false, trigger);
+        CHECK(!yielded.okay && !yielded.fatal && yielded.error == "yield" && yielded.parked_at == 2048);
+        CHECK(yielded.reads.size() == 1 && yielded.reads.front().second == 2048);
+        CHECK(std::count(yielded.decode_positions.begin(), yielded.decode_positions.end(), 2048) == (trigger == 1 ? 1 : 0));
     }
     // Budget 0 retains both legacy whole-run bypasses, with no learned timing or decode callback.
     const auto legacy_piped = read_prompt(0, true, true, true);

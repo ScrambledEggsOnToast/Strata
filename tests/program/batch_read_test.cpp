@@ -36,6 +36,8 @@ int main() {
             CHECK(span > 0 && span <= n && span <= 4096);
             if (span > 2048) CHECK(n == span || n - span > 2048);
         }
+        CHECK(batch_read_quantum(2049, 2048, true, 2048) == 2049);
+        CHECK(batch_read_quantum(4095, 2048, true, 2048) == 4095);
         CHECK(batch_read_quantum(4096, 2048, true, 2048) == 4096);
         CHECK(batch_read_quantum(4097, 2048, true, 2048) == 2048);
         CHECK(batch_read_quantum(6144, 2048, true, 2048) == 2048);

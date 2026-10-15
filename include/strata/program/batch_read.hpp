@@ -32,7 +32,10 @@ inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool b
 inline int64_t batch_read_quantum(int64_t remaining, int64_t chunk, bool fill, int64_t yield_tail) {
     if (remaining <= 0 || chunk <= 0) return 0;
     const int64_t single = std::min(remaining, chunk);
-    if (!fill || remaining / chunk < 2) return single;
+    if (!fill) return single;
+    // C + tail has no eligible interior yield frontier; overlap its two
+    // unchanged arithmetic pieces instead of paying another pipeline fill.
+    if (remaining / chunk < 2) return remaining;
     const int64_t pair = 2 * chunk; // division above proves representability
     const int64_t left = remaining - pair;
     return left == 0 || left > yield_tail ? pair : single;

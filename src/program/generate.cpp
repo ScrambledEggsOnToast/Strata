@@ -15230,40 +15230,12 @@ int main(int argc, char** argv) {
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 // A zero legacy piece must not bypass time-budget quanta (notably piped groups).
                 if (!time_budget.enabled() && piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
-                for (int64_t q = a0; q < b0;) {
-                    const auto age = [&] {
-                        return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
-                    };
-                    if (!prompt_boundary(e)) return false;
+                bool yield_requested = false;
+                auto prompt_controls = [&](int64_t q) -> bool {
                     if (stop_req.load()) { e = "cancelled"; return false; }
-                    const bool grouped_budget = time_budget.enabled() && piped && !stages.empty();
-                    bool fill = false;
-                    if (grouped_budget && !batch_on() && !pipe_inflight()) {
-                        std::lock_guard<std::mutex> lk(in_mu);
-                        fill = in_lines.empty();
-                    }
-                    const int64_t quantum = grouped_budget
-                        ? strata::program::batch_read_quantum(b0 - q, C, fill, std::max<int64_t>(C, o.short_read))
-                        : time_budget.enabled() ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
-                        : std::min(C, b0 - q);
-                    const bool pipeline_fill = grouped_budget && quantum > C;
-                    const int64_t r = time_budget.enabled() ? q + quantum : std::min(b0, q + piece);
-                    const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
-                    const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
-                    if (time_budget.enabled()) {
-                        if (!pipeline_fill && quantum % C == 0) time_budget.prefilled(chunk_wall_ms, quantum / C, C);
-                        else time_budget.background_work(chunk_wall_ms); // overlapped spans and tails cannot price isolated C
-                        credited_prefill_ms += chunk_wall_ms;
-                        std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
-                                             "estimate_ms=%.3f budget_ms=%.3f%s\n",
-                                     (long long) q, (long long) r, (long long) C, chunk_wall_ms,
-                                     time_budget.chunk_ms(), o.foreground_budget_ms,
-                                     quantum <= C && chunk_wall_ms > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
-                    }
-                    q = r;
-                    if (q >= b0) continue;
-                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (q <= read_from) return true; // no zero-progress re-yield of a restored native leg
+                    score_controls(false);
+                    if (!retire_stopped()) { batch_fatal = true; e = "resident cancellation failed"; return false; }
                     for (;;) {
                         std::string control;
                         {
@@ -15272,10 +15244,12 @@ int main(int argc, char** argv) {
                         }
                         if (control.rfind("BYIELD ", 0) != 0) {
                             resident_control(control);
+                            if (!retire_stopped()) { batch_fatal = true; e = "resident cancellation failed"; return false; }
                             continue;
                         }
                         const int ys = std::atoi(control.c_str() + 7);
                         if (ys < 0) continue;
+                        yield_requested = true;
                         // only where the rest is read the same way after it (more than a chunk and more than a short
                         // read left), text only, and into a slot that is not decoding
                         const bool can = resident.available(ys) &&
@@ -15308,25 +15282,77 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
+                    return true;
+                };
+                for (int64_t q = a0; q < b0;) {
+                    const auto age = [&] {
+                        return std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
+                    };
+                    if (time_budget.enabled() && !prompt_controls(q)) return false;
+                    if (!prompt_boundary(e)) return false;
+                    if (time_budget.enabled() && !prompt_controls(q)) return false;
+                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    const bool grouped_budget = time_budget.enabled() && piped && !stages.empty();
+                    bool fill = false;
+                    if (grouped_budget && !batch_on() && !pipe_inflight()) {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        fill = in_lines.empty();
+                    }
+                    const int64_t quantum = grouped_budget
+                        ? strata::program::batch_read_quantum(b0 - q, C, fill, std::max<int64_t>(C, o.short_read))
+                        : time_budget.enabled() ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
+                        : std::min(C, b0 - q);
+                    const bool pipeline_fill = grouped_budget && quantum > C;
+                    const int64_t r = time_budget.enabled() ? q + quantum : std::min(b0, q + piece);
+                    const auto tq = Clock::now();
+                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (time_budget.enabled()) {
+                        if (!pipeline_fill && quantum % C == 0) time_budget.prefilled(chunk_wall_ms, quantum / C, C);
+                        else time_budget.background_work(chunk_wall_ms); // overlapped spans and tails cannot price isolated C
+                        credited_prefill_ms += chunk_wall_ms;
+                        std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
+                                             "estimate_ms=%.3f budget_ms=%.3f%s\n",
+                                     (long long) q, (long long) r, (long long) C, chunk_wall_ms,
+                                     time_budget.chunk_ms(), o.foreground_budget_ms,
+                                     quantum <= C && chunk_wall_ms > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
+                    }
+                    q = r;
+                    if (q >= b0) continue;
+                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (!prompt_controls(q)) return false;
                     if (!retire_stopped()) { batch_fatal = true; e = "resident cancellation failed"; return false; }
                     strata::core::progress().busy.store(true);
                     if (!batch_on() || (!time_budget.enabled() && decode_share <= 0.0)) continue;
                     const double budget = decode_share * chunk_wall_ms;
                     const auto td = Clock::now();
+                    const double round_mark = resident_round_ms;
+                    auto finish_interleave = [&] {
+                        in_prompt_read = false;
+                        ++il_parts;
+                        il_ms += time_budget.enabled() ? resident_round_ms - round_mark :
+                            std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                    };
                     in_prompt_read = true;
                     double decoded_ms = 0;
                     while (batch_on() && !stop_req.load() && (time_budget.enabled()
                         ? time_budget.decode_due(age(), C) && time_budget.decode_allowed(0)
                         : decoded_ms == 0 || decoded_ms < budget)) {
-                        if (!decode_round()) { in_prompt_read = false; batch_fatal = true; e = "a decode round failed"; return false; }
+                        if (time_budget.enabled()) {
+                            if (!prompt_controls(q)) { finish_interleave(); return false; }
+                            if (!retire_stopped()) {
+                                finish_interleave(); batch_fatal = true; e = "resident cancellation failed"; return false;
+                            }
+                            if (yield_requested || stop_req.load() || !batch_on()) break;
+                        }
+                        if (!decode_round()) { finish_interleave(); batch_fatal = true; e = "a decode round failed"; return false; }
                         decoded_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     }
-                    in_prompt_read = false;
-                    ++il_parts;
-                    il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                    finish_interleave();
                     if (trace) {
                         std::fprintf(stderr, "strata trace: prompt chunk to %lld, then the slots decoded %.0f ms\n",
-                                     (long long) q, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
+                                     (long long) q, time_budget.enabled() ? resident_round_ms - round_mark :
+                                         std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         std::fflush(stderr);
                     }
                 }
