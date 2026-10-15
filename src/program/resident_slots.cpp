@@ -455,6 +455,20 @@ bool ResidentSlots::copy_to(int slot, const std::vector<int32_t>& prefix, std::s
     return true;
 }
 
+std::optional<ResidentSnapshotSource> ResidentSlots::completed_snapshot_source(int slot, std::string& error) {
+    error.clear();
+    if (!retained(slot)) return std::nullopt;
+    auto& source = slots_[(size_t) slot];
+    if (source.partial || source.img || source.tainted || !source.input.scope.valid() || source.ids.empty())
+        return std::nullopt;
+    if (!idle(error)) return std::nullopt;
+    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : nullptr;
+    if (draft_.kv_state().max_cells > 0 && !draft) {
+        error = "resident snapshot: missing draft state"; return std::nullopt;
+    }
+    return ResidentSnapshotSource{source, stages_, draft, slot};
+}
+
 bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
                                 PrefixWork& work, std::string& error) const {
     work = {};

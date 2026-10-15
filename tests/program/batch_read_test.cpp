@@ -29,6 +29,24 @@ int main() {
     for (int64_t c : {256, 1000, 2048, 4096})
         for (int64_t k : {1, 3, 8, 16}) CHECK(batch_read_piece(true, false, true, false, c, k) % c == 0);
     {
+        using strata::program::batch_read_quantum;
+        for (int64_t n : {2047, 2048, 2049, 4095, 4096, 4097, 6144, 6145}) {
+            CHECK(batch_read_quantum(n, 2048, false, 2048) == std::min<int64_t>(n, 2048));
+            const auto span = batch_read_quantum(n, 2048, true, 2048);
+            CHECK(span > 0 && span <= n && span <= 4096);
+            if (span > 2048) CHECK(n == span || n - span > 2048);
+        }
+        CHECK(batch_read_quantum(4096, 2048, true, 2048) == 4096);
+        CHECK(batch_read_quantum(4097, 2048, true, 2048) == 2048);
+        CHECK(batch_read_quantum(6144, 2048, true, 2048) == 2048);
+        CHECK(batch_read_quantum(6145, 2048, true, 2048) == 4096);
+        CHECK(batch_read_quantum(INT64_MAX, INT64_MAX, true, INT64_MAX) == INT64_MAX);
+        CHECK(batch_read_quantum(INT64_MAX, INT64_MAX / 2, true, INT64_MAX / 2) == INT64_MAX / 2);
+        CHECK(batch_read_quantum(INT64_MAX, INT64_MAX / 4, true, INT64_MAX / 4) == 2 * (INT64_MAX / 4));
+        CHECK(batch_read_quantum(4096, 0, true, 2048) == 0);
+        CHECK(batch_read_quantum(0, 2048, true, 2048) == 0);
+    }
+    {
         using strata::program::pop_control_prefix;
         std::deque<std::string> pending{"BGEN 0 next-owner", "BSTOP 0"};
         std::string control = "unchanged";

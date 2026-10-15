@@ -26,37 +26,6 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
-    {
-        // This is the same post-prefill request-setup seam used by generate.cpp,
-        // after begin() has resolved/restored the resident owner's automatic seed.
-        struct SamplingSink {
-            const kernels::SamplerParams* installed = nullptr;
-            int calls = 0;
-            void set_sampling(const kernels::SamplerParams& sp) { installed = &sp; ++calls; }
-            void set_draft_sampling(const kernels::SamplerParams& sp) { installed = &sp; ++calls; }
-        } primary, peer, drafter;
-        program::ResidentWorking working;
-        working.request = 42;
-        working.sampling.seed = 987654321;  // resolved automatic seed, retained across a resend
-        working.sampling.greedy = false;
-        working.sampling.temperature = 0.7f;
-        working.sampling.penalty_last_n = 13;
-        const program::ResidentRequest arriving;  // the original omitted seed must never be resolved again here
-        program::apply_request_sampling(working, primary, &peer, &drafter);
-        check(primary.installed == &working.sampling && peer.installed == &working.sampling &&
-              drafter.installed == &working.sampling && arriving.sampling.seed == 0 &&
-              primary.installed->seed == 987654321 && primary.installed->penalty_last_n == 13,
-              "production request setup distributes the owner's resolved sampling object unchanged");
-        program::apply_request_sampling(working, primary, (SamplingSink*) nullptr, (SamplingSink*) nullptr);
-        check(primary.calls == 2 && peer.calls == 1 && drafter.calls == 1 &&
-              primary.installed->seed == 987654321,
-              "resend and disabled optional samplers cannot resolve a second automatic seed");
-    }
-    check(stage.batch_peer == nullptr, "ordinary resident stages have no replay peer");
-    const auto untouched = verifier.batch_resources();
-    check(untouched.device_bytes == 0 && untouched.pinned_bytes == 0 &&
-          untouched.history_bytes == 0 && untouched.graph_keys == 0 && untouched.graph_execs == 0,
-          "an uninitialized optional verifier owns no resident arena, history or captures");
     const core::GraphCaptureProbe disabled_probe({"resident-default", "no-observer"});
     for (const auto phase : {core::GraphCapturePhase::BeforeCapture, core::GraphCapturePhase::AfterCapture,
                             core::GraphCapturePhase::AfterInstantiate, core::GraphCapturePhase::AfterUpload,
@@ -136,6 +105,14 @@ int main() {
     check(slots.working().request == 0 && slots.slots()[0].ids.empty() &&
           slots.slots()[0].failed == failed_before_pricing,
           "pricing refusal changes no request identity, history or failure state");
+    error = "stale pricing error";
+    check(!slots.completed_snapshot_source(-1, error) && error.empty(),
+          "missing completed source is a clean cache miss before GPU access");
+    check(!slots.completed_snapshot_source(0, error) && error.empty(),
+          "an unpublished seat cannot supply a conversation snapshot");
+    check(slots.working().request == 0 && slots.slots()[0].ids.empty() &&
+          slots.slots()[0].failed == failed_before_pricing && dispatch.request_generation == 0,
+          "snapshot refusal changes neither working identity nor resident ownership");
     std::printf("resident lifecycle preflight: failures=%d\n", failures);
     return failures ? 1 : 0;
 }

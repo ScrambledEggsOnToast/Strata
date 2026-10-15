@@ -27,4 +27,15 @@ inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool b
     return chunks_per_piece > 0 ? chunk * chunks_per_piece : 0;
 }
 
+// Two idle arithmetic chunks may overlap, but must not skip the last
+// eligible BYIELD frontier. Contended reads stop after at most one chunk.
+inline int64_t batch_read_quantum(int64_t remaining, int64_t chunk, bool fill, int64_t yield_tail) {
+    if (remaining <= 0 || chunk <= 0) return 0;
+    const int64_t single = std::min(remaining, chunk);
+    if (!fill || remaining / chunk < 2) return single;
+    const int64_t pair = 2 * chunk; // division above proves representability
+    const int64_t left = remaining - pair;
+    return left == 0 || left > yield_tail ? pair : single;
+}
+
 }  // namespace strata::program

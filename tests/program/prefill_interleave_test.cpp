@@ -28,18 +28,27 @@ struct ConvCheckpoint { std::vector<int32_t> ids; };
 namespace strata::program {
 struct ResidentAdmission { int unused; const ConvCheckpoint* checkpoint; };
 }
-// Resident parking/BSTOP are not this test's seam. Fail if a fixture reaches them.
+// The narrow parking sink records the production lambda's chosen frontier;
+// device transfers and slot ownership are exercised by the real-model probe.
 struct NoControlRequests {
+    bool allow_park = false;
+    int64_t parked_at = -1;
     void cancel(int) { throw std::logic_error("unexpected BSTOP"); }
-    bool available(int) { throw std::logic_error("unexpected BYIELD"); }
-    bool park(int, const std::vector<int32_t>&, const strata::program::ResidentAdmission&, bool, std::string&) {
-        throw std::logic_error("unexpected park");
+    bool available(int slot) {
+        if (!allow_park) throw std::logic_error("unexpected BYIELD");
+        return slot == 0;
+    }
+    bool park(int, const std::vector<int32_t>& prefix, const strata::program::ResidentAdmission&, bool, std::string&) {
+        if (!allow_park || parked_at >= 0) throw std::logic_error("unexpected park");
+        parked_at = (int64_t) prefix.size();
+        return true;
     }
 };
 struct Result {
     std::vector<std::pair<int64_t, int64_t>> reads;
     std::vector<int64_t> decode_positions;
     int64_t interleave_boundaries = 0;
+    int64_t parked_at = -1;
     double estimate_ms = 0;
     bool okay = false, fatal = false;
     int drains = 0;
@@ -54,12 +63,16 @@ struct Prefill {
     Result& result;
     const char* retained_error = nullptr;
     int64_t position = 0;
+    bool pipelined = false;
+    std::deque<std::string>* incoming = nullptr;
     int64_t chunk() const { return 2048; }
     bool run(const int64_t* data, int64_t count, int64_t pos, std::string& e) {
         if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
         result.reads.emplace_back(pos, count);
         position += count;
-        Clock::ms += 250 * (count / chunk() + (count % chunk() != 0));
+        const int64_t chunks = count / chunk() + (count % chunk() != 0);
+        Clock::ms += 250 * chunks - (pipelined ? 150 * (chunks - 1) : 0);
+        if (incoming) { incoming->push_back("BYIELD 0"); incoming = nullptr; }
         return true;
     }
     bool run_retained(const int64_t* data, int64_t count, int64_t pos, std::string& e,
@@ -76,16 +89,17 @@ inline void progress_at(const char*) {}
 }
 
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
-                          const char* retained_error = nullptr, bool drain_ok = true) {
+                          const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
+                          double prior_chunk_ms = 0, bool inject_yield = false) {
     Clock::ms = 0;
     Result result;
     struct Options { int batch; int prompt_cache = 6; int64_t short_read = 32; double foreground_budget_ms; };
     const Options o{batch, 6, 32, budget_ms};
-    const int64_t n = 10000;
     std::vector<int64_t> ids((size_t) n);
     struct Stage { strata::prefill::Prefill sp; };
     std::vector<std::unique_ptr<Stage>> stages(split ? 2 : 0);
     strata::program::TimeBudget time_budget(budget_ms, 0.25);
+    if (prior_chunk_ms > 0) time_budget.prefilled(prior_chunk_ms, 1, 2048);
     auto last_decode = Clock::now();
     double credited_prefill_ms = 0;
     std::atomic<bool> stop_req{false};
@@ -93,11 +107,15 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const auto retire_stopped = [] { return true; };
     const auto batch_on = [&] { return active; };
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
+    sp.pipelined = piped;
     const bool retained_prefill = retained_error != nullptr, retained_layer_yields = true;
     int retained_blocked_stage = -1;
     std::vector<int> stage_group(3, -1);
     struct Group { bool inflight = false; };
     std::vector<Group> pg(2);
+    const auto pipe_inflight = [&] {
+        return std::any_of(pg.begin(), pg.end(), [](const Group& group) { return group.inflight; });
+    };
     std::string err;
     const auto score_controls = [](bool) {};
     const auto pump_mtp = [](bool) -> bool { throw std::logic_error("unexpected retained callback"); };
@@ -122,9 +140,12 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     std::mutex in_mu;
     std::deque<std::string> in_lines;
     NoControlRequests resident;
+    resident.allow_park = inject_yield;
+    if (inject_yield) sp.incoming = &in_lines;
     const auto resident_control = [&](const std::string& command) {
         if (command.rfind("BSTOP ", 0) == 0) resident.cancel(std::atoi(command.c_str() + 6));
     };
+    const auto park_replaced = [](int) { return true; }; // GPU snapshotting is outside this CPU control-flow seam.
     const int admit_slot = -1;
     const std::vector<int> req_imgs;
     const std::vector<ConvCheckpoint> checks;
@@ -140,10 +161,12 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.okay = read_part(0, n, e);
     result.fatal = batch_fatal;
     result.error = e;
-    if (!retained_prefill && (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
+    if (!retained_prefill && !inject_yield &&
+        (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
         throw std::runtime_error("read_part did not finish: " + e);
     result.interleave_boundaries = il_parts;
     result.estimate_ms = time_budget.chunk_ms();
+    result.parked_at = resident.parked_at;
     return result;
 }
 
@@ -153,21 +176,40 @@ static int fails = 0;
 int main() {
     // Piped groups return piece=0 in the unchanged upstream helper, even beside decoding slots.
     CHECK(strata::program::batch_read_piece(true, true, true, true, 2048, 8) == 0);
-    const std::vector<std::pair<int64_t, int64_t>> quanta{{0, 2048}, {2048, 6144}, {8192, 1808}};
     const std::vector<std::pair<int64_t, int64_t>> whole{{0, 10000}};
     for (bool piped : {false, true}) {
         const auto positive = read_prompt(1000, piped, true, true);
-        CHECK(positive.reads == quanta);                    // cold chunk, whole-chunk quantum, original tail
-        CHECK(positive.decode_positions == std::vector<int64_t>{8192}); // decode between prompt boundaries
-        CHECK(positive.interleave_boundaries == 2);
-        CHECK(positive.estimate_ms == 250);                 // actually reached time_budget.prefilled
+        int64_t frontier = 0;
+        for (const auto& read : positive.reads) {
+            CHECK(read.first == frontier && read.second > 0);
+            if (piped) CHECK(read.second <= 2048);
+            frontier += read.second;
+            CHECK(read.second % 2048 == 0 || frontier == 10000);
+        }
+        CHECK(frontier == 10000 && !positive.decode_positions.empty());
+        CHECK(positive.decode_positions.front() > 0 && positive.decode_positions.back() < frontier);
     }
-    // The initial solo split also reaches the quantum loop, but must not invent a decoder.
-    for (bool piped : {false, true}) {
-        const auto solo = read_prompt(1000, piped, true, false);
-        CHECK(solo.reads == quanta);
-        CHECK(solo.decode_positions.empty() && solo.interleave_boundaries == 0);
-        CHECK(solo.estimate_ms == 250);
+    // Idle pipeline filling preserves complete arithmetic chunks and a separate
+    // tail, never invents a decoder, and cannot cheapen a known isolated-C cost.
+    for (int64_t n : {2047, 2048, 2049, 4095, 4096, 4097, 8193}) {
+        const auto solo = read_prompt(1000, true, true, false, 4, nullptr, true, n, 1200);
+        int64_t frontier = 0;
+        for (const auto& read : solo.reads) {
+            CHECK(read.first == frontier && read.second > 0 && read.second <= 4096);
+            frontier += read.second;
+            CHECK(read.second % 2048 == 0 || frontier == n);
+        }
+        CHECK(frontier == n && solo.decode_positions.empty() && solo.interleave_boundaries == 0);
+        if (n == 4096) CHECK(solo.reads.front().second == 4096 && solo.estimate_ms == 1200);
+        if (n == 4097) CHECK(solo.reads.front().second == 2048);
+        if (n < 2048) CHECK(solo.estimate_ms == 1200);
+    }
+    // An arrival during 2C+tail or 3C must still reach the eligible C frontier,
+    // not skip over it and make the waiter sit through the unparkable tail.
+    for (int64_t n : {4097, 6144}) {
+        const auto yielded = read_prompt(1000, true, true, false, 4, nullptr, true, n, 1200, true);
+        CHECK(!yielded.okay && !yielded.fatal && yielded.error == "yield");
+        CHECK(yielded.parked_at == 2048 && yielded.decode_positions.empty());
     }
     // Budget 0 retains both legacy whole-run bypasses, with no learned timing or decode callback.
     const auto legacy_piped = read_prompt(0, true, true, true);

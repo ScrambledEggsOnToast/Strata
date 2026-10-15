@@ -5,6 +5,7 @@
 #include "strata/program/prefix_selection.hpp"
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,6 +82,26 @@ struct ResidentSlot {
     }
 };
 
+// Borrowed until the next resident mutation. Capture must return the checkpoint
+// chain after split/merge; private GPU state and owner identity stay read-only.
+class ResidentSnapshotSource {
+public:
+    const ResidentSlot& owner;
+    std::vector<core::ConversationCheckpoint>& checkpoints;
+    const core::QsaState* draft;
+
+    const core::SessionState& session(size_t stage) const {
+        return *stages_[stage].slots[(size_t) slot_];
+    }
+private:
+    friend class ResidentSlots;
+    ResidentSnapshotSource(ResidentSlot& owner, const std::vector<ResidentStage>& stages,
+                           const core::QsaState* draft, int slot)
+        : owner(owner), checkpoints(owner.checks), draft(draft), stages_(stages), slot_(slot) {}
+    const std::vector<ResidentStage>& stages_;
+    int slot_;
+};
+
 struct ResidentAdmission {
     int32_t next_token = 0;
     const core::ConversationCheckpoint* checkpoint = nullptr;
@@ -130,6 +151,10 @@ public:
     // Restores private model state into the working session. A partial restore
     // returns false; it is never advertised as a usable prefix by this interface.
     bool resume(int slot, const core::ConversationCheckpoint* checkpoint, std::string& error);
+    // Requires drained consumers; never mounts foreign state into the working request.
+    // Ineligible sources return nullopt with no error; capture uses the source's
+    // own scope and must restore its borrowed checkpoint chain before replacement.
+    std::optional<ResidentSnapshotSource> completed_snapshot_source(int slot, std::string& error);
     // Called only for a GPU-committed row. No state migration or allocation.
     bool committed(int slot, int32_t next, const float* residual, std::string& error, bool observe = true);
     bool propose(int slot, const float* residual, std::string& error);
