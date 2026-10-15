@@ -136,6 +136,16 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_link_libraries(conversation_offers_test PRIVATE Threads::Threads)
   add_test(NAME conversation_offers_test COMMAND conversation_offers_test)
   set_tests_properties(conversation_offers_test PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77)
+  # The native publication handover, against the real store on a temporary root: it links the store's own translation
+  # units (and its private format header) so the handover's verdicts are checked against actual admissions and durable
+  # commits, not a stand-in.  CPU only; it returns 77 where the store is not implemented.
+  add_executable(conversation_publication_test src/program/conversation_publication_test.cpp
+    src/program/conversation_publication.cpp src/core/conversation_store.cpp src/core/conversation_store_format.cpp
+    src/core/conversation_store_sha256.cpp)
+  target_include_directories(conversation_publication_test PRIVATE include src/core)
+  target_link_libraries(conversation_publication_test PRIVATE OpenSSL::Crypto Threads::Threads)
+  add_test(NAME conversation_publication_test COMMAND conversation_publication_test)
+  set_tests_properties(conversation_publication_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   # The arithmetic execution identity: the header is the whole module (a pure function of the environment and the
   # caller's resolved values), so this target has no library of its own to link.
   add_executable(execution_identity_test src/core/execution_identity_test.cpp)
@@ -532,7 +542,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
     src/core/conversation_store.cpp src/core/conversation_store_format.cpp src/core/conversation_store_sha256.cpp
-    src/program/conversation_offers.cpp)
+    src/program/conversation_offers.cpp src/program/conversation_publication.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   # OpenSSL stays private to the store's translation units: no other CUDA TU gains an include root, and the crypto
