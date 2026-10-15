@@ -5414,14 +5414,10 @@ int main(int argc, char** argv) {
                 "FileExpertSource::reserve_exchanges: swaps * max_blob");
         if (o.conversation_cache_mib > 0) {
             const uint64_t conv = byte_mul((uint64_t) o.conversation_cache_mib, 1ull << 20);
-            guest.add("conversation_parked", conv, "--conversation-cache-mib");
+            // Runtime leases partition this total between parked images, store metadata/I/O
+            // and queued preparation. Those sub-budgets must not be charged again here.
+            guest.add("conversation_parked", conv, "--conversation-cache-mib total cache-owned envelope");
         }
-        // The persistent store's own RAM (its metadata index, preparation descriptors and the two bounded I/O slabs)
-        // lives inside the same conversation envelope, so it is priced here as the store's 64 MiB metadata cap plus
-        // one 1 MiB reader and one 1 MiB writer slab rather than as new memory.
-        if (persistence_configured)
-            guest.add("conversation_store_metadata", byte_add(byte_mul(64, 1ull << 20), byte_mul(2, 1ull << 20)),
-                      "conversation cache store: metadata/preparation sub-cap and one reader and writer slab");
         if (o.vision) {
             const uint64_t rows = byte_mul(byte_add((uint64_t) o.max_context, 64), byte_mul((uint64_t) g.n_embd, 4));
             guest.add("vision_embeddings", rows, "--vision image rows, upper bound at the context");
