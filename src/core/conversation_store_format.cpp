@@ -63,6 +63,10 @@ public:
     void digest(const Digest& d) { raw(d.data(), d.size()); }
     const std::vector<uint8_t>& data() const { return bytes_; }
     size_t size() const { return bytes_.size(); }
+    // Reserves the exact size the caller already counted, so an encode never reallocates as it grows, and hands the
+    // finished bytes out by move: `data()` would copy the whole encoding into the return value.
+    void reserve(size_t capacity) { bytes_.reserve(capacity); }
+    std::vector<uint8_t> take() { return std::move(bytes_); }
 
 private:
     void put(uint64_t v, int n) {
@@ -1218,6 +1222,214 @@ uint64_t image_payload_bytes(const SavedConversation& image) {
     return layout.payload_bytes;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Allocation-free counting (see the header).  Nothing below allocates, reads a payload or depends on a configured
+// maximum: every figure is the actual object's own element count plus a documented per-allocation allowance.
+// ---------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+uint64_t sat_mul(uint64_t a, uint64_t b) {
+    return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
+
+// One record's streams: its token ids, its image keys and its five running-state arrays.  `parts` are counted by the
+// caller, which turns each into a container of its own.
+bool count_record(const ConversationCheckpoint& record, const ConversationStoreLimits& limits, ImageShape& out,
+                  std::string& why) {
+    if (record.ids.size() > size_t(limits.max_tokens)) {
+        why = "an image record holds more tokens than ConversationStoreLimits::max_tokens";
+        return false;
+    }
+    const uint64_t states[5] = {uint64_t(record.gdn.size()), uint64_t(record.ple.size()),
+                                uint64_t(record.tails.size()), uint64_t(record.dead.size()),
+                                uint64_t(record.block_pos.size())};
+    uint64_t bytes = sat_mul(uint64_t(record.ids.size()), sizeof(int32_t));
+    bytes = sat_add(bytes, sat_mul(uint64_t(record.imgs.size()), sizeof(ConversationImageKey)));
+    for (uint64_t state : states) {
+        if (state > limits.max_stream_bytes) {
+            why = "a stream is longer than ConversationStoreLimits::max_stream_bytes";
+            return false;
+        }
+        bytes = sat_add(bytes, state);
+    }
+    if (sat_mul(uint64_t(record.ids.size()), sizeof(int32_t)) > limits.max_stream_bytes ||
+        sat_mul(uint64_t(record.imgs.size()), sizeof(ConversationImageKey)) > limits.max_stream_bytes) {
+        why = "a stream is longer than ConversationStoreLimits::max_stream_bytes";
+        return false;
+    }
+    out.records = sat_add(out.records, 1);
+    out.streams = sat_add(out.streams, 7);
+    out.payload_bytes = sat_add(out.payload_bytes, bytes);
+    out.max_record_images = std::max(out.max_record_images, uint64_t(record.imgs.size()));
+    out.max_stream_bytes = std::max(out.max_stream_bytes, sat_mul(uint64_t(record.ids.size()), sizeof(int32_t)));
+    out.max_stream_bytes = std::max(out.max_stream_bytes,
+                                    sat_mul(uint64_t(record.imgs.size()), sizeof(ConversationImageKey)));
+    for (uint64_t state : states) out.max_stream_bytes = std::max(out.max_stream_bytes, state);
+    return true;
+}
+
+bool count_kv_layer(const ConversationKv& layer, const ConversationStoreLimits& limits, ImageShape& out,
+                    std::string& why) {
+    const uint64_t parts[5] = {uint64_t(layer.k.size()), uint64_t(layer.v.size()), uint64_t(layer.k_scale.size()),
+                               uint64_t(layer.v_scale.size()), uint64_t(layer.pooled.size())};
+    uint64_t bytes = 0;
+    for (uint64_t part : parts) {
+        if (part > limits.max_stream_bytes) {
+            why = "a stream is longer than ConversationStoreLimits::max_stream_bytes";
+            return false;
+        }
+        bytes = sat_add(bytes, part);
+    }
+    out.kv_layers = sat_add(out.kv_layers, 1);
+    out.streams = sat_add(out.streams, 5);
+    out.payload_bytes = sat_add(out.payload_bytes, bytes);
+    for (uint64_t part : parts) out.max_stream_bytes = std::max(out.max_stream_bytes, part);
+    return true;
+}
+
+// One container's own records: the live record when `live` is the top record of a whole image, or the single record
+// of a stage part.
+bool count_container(const ConversationCheckpoint& record, const ConversationCheckpoint* checkpoints,
+                     size_t checkpoint_count, const ConversationKv* kv, size_t kv_count,
+                     const ConversationStoreLimits& limits, ImageShape& out, std::string& why) {
+    out.containers = sat_add(out.containers, 1);
+    if (!count_record(record, limits, out, why)) return false;
+    for (size_t i = 0; i < checkpoint_count; ++i)
+        if (!count_record(checkpoints[i], limits, out, why)) return false;
+    for (size_t i = 0; i < kv_count; ++i)
+        if (!count_kv_layer(kv[i], limits, out, why)) return false;
+    return true;
+}
+
+// The containers one whole image's records contribute: one per retained stage part, refused exactly as build_tree()
+// refuses them (a part that owns further parts, the container ceiling).
+bool count_parts(const ConversationCheckpoint& record, const ConversationStoreLimits& limits, ImageShape& out,
+                 std::string& why) {
+    for (const auto& part : record.stage_parts) {
+        if (!part.stage_parts.empty()) {
+            why = "a stage part that owns further stage parts is not representable";
+            return false;
+        }
+        if (out.containers >= limits.max_images) {
+            why = "the image has more containers than ConversationStoreLimits::max_images";
+            return false;
+        }
+        if (!count_container(part, nullptr, 0, nullptr, 0, limits, out, why)) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+uint64_t stream_chunk_count(uint64_t bytes, uint32_t element, uint64_t chunk_limit) {
+    if (bytes == 0) return 0;
+    uint64_t size = chunk_limit;
+    if (element > 1) size -= size % element;
+    if (size == 0) return bytes;   // a degenerate chunk size can never merge two bytes into one object
+    return bytes <= size ? 1 : (bytes + size - 1) / size;
+}
+
+uint64_t donor_chunks_in_interval(const StreamRecord& donor, uint64_t offset, uint64_t bytes) {
+    const uint64_t end = sat_add(offset, bytes);
+    uint64_t count = 0;
+    for (const auto& chunk : donor.chunks) {
+        if (sat_add(chunk.offset, chunk.length) <= offset) continue;
+        if (chunk.offset >= end) continue;
+        count = sat_add(count, 1);
+    }
+    return count;
+}
+
+uint64_t prefix_chain_workspace(uint64_t image_keys) {
+    // The chain's own sorted index (one pair per image key), one state per group and the allocator's header for each.
+    // A state is a Sha256 plus the EVP context a copy of it allocates, which this tree cannot size: see
+    // kChainBytesPerImageKey.
+    return sat_add(sat_mul(image_keys, sizeof(std::pair<uint64_t, size_t>) + kChainBytesPerImageKey),
+                   sat_add(sat_mul(image_keys, 8), 2 * kAllocSlackBytes));
+}
+
+uint64_t image_layout_workspace(const ImageShape& shape) {
+    uint64_t bytes = 0;
+    // build_tree() holds its own roster (a ContainerMeta and two pointer vectors per container) while the layout
+    // copies those metadata out, so both exist at once.
+    bytes = sat_add(bytes, sat_mul(shape.containers, 2 * sizeof(ContainerMeta) + 3 * kAllocSlackBytes));
+    bytes = sat_add(bytes, sat_mul(shape.records, sizeof(RecordMeta) + kAllocSlackBytes));
+    bytes = sat_add(bytes, sat_mul(shape.kv_layers, sizeof(KvMeta) + kAllocSlackBytes));
+    // One StreamSource per stream, and one heap block for the closure each source's StreamRead holds.
+    bytes = sat_add(bytes, sat_mul(shape.streams, sizeof(StreamSource) + 2 * kAllocSlackBytes));
+    // The duplicate-identity set image_layout() keeps while it builds, one node per stream.
+    bytes = sat_add(bytes, sat_mul(shape.streams, kAllocSlackBytes));
+    bytes = sat_add(bytes, sat_mul(shape.cuts, sizeof(CutRecord) + kAllocSlackBytes));
+    bytes = sat_add(bytes, prefix_chain_workspace(shape.max_record_images));
+    return sat_add(bytes, 8 * kAllocSlackBytes);
+}
+
+bool image_shape(const SavedConversation& image, const ConversationStoreLimits& limits, ImageShape& out,
+                 std::string& why) {
+    out = ImageShape{};
+    for (const auto& stage : image.stage_images) {
+        if (!stage.stage_images.empty()) {
+            why = "a stage image that owns its own stage images is not representable";
+            return false;
+        }
+    }
+    if (image.stage_images.size() + 1 > limits.max_stages) {
+        why = "the image declares more stages than ConversationStoreLimits::max_stages";
+        return false;
+    }
+    // The whole images, in build_tree()'s order: the top image, then every later stage's own image.
+    const auto count_image = [&](const SavedConversation& container) -> bool {
+        if (!container.scope.valid()) {
+            why = "an image has no valid authorized scope";
+            return false;
+        }
+        if (container.checkpoints.size() > size_t(limits.max_checkpoints)) {
+            why = "an image holds more checkpoints than ConversationStoreLimits::max_checkpoints";
+            return false;
+        }
+        if (container.kv.size() > size_t(limits.max_kv_layers)) {
+            why = "an image holds more K/V layers than ConversationStoreLimits::max_kv_layers";
+            return false;
+        }
+        if (!count_container(container.live, container.checkpoints.data(), container.checkpoints.size(),
+                             container.kv.data(), container.kv.size(), limits, out, why))
+            return false;
+        if (out.containers >= limits.max_images) {
+            why = "the image has more containers than ConversationStoreLimits::max_images";
+            return false;
+        }
+        return true;
+    };
+    if (!count_image(image)) return false;
+    for (const auto& stage : image.stage_images)
+        if (!count_image(stage)) return false;
+    // Every record's stage parts become containers of their own, taking their carve from the stage image that
+    // declares their stage.
+    const auto count_record_parts = [&](const SavedConversation& container) -> bool {
+        if (!count_parts(container.live, limits, out, why)) return false;
+        for (const auto& checkpoint : container.checkpoints)
+            if (!count_parts(checkpoint, limits, out, why)) return false;
+        return true;
+    };
+    if (!count_record_parts(image)) return false;
+    for (const auto& stage : image.stage_images)
+        if (!count_record_parts(stage)) return false;
+    // Only the top image advertises cuts, and only for records that every later stage can also be placed at.
+    out.cuts = sat_add(1, uint64_t(image.checkpoints.size()));
+    if (out.streams > limits.max_streams) {
+        why = "the image has more streams than ConversationStoreLimits::max_streams";
+        return false;
+    }
+    if (out.payload_bytes > limits.max_image_bytes) {
+        why = "the image is larger than ConversationStoreLimits::max_image_bytes";
+        return false;
+    }
+    return true;
+}
+
+
 bool images_equal(const SavedConversation& a, const SavedConversation& b, std::string& why) {
     const ConversationStoreLimits limits = unconstrained_limits();
     ImageLayout left, right;
@@ -1262,8 +1474,51 @@ bool images_equal(const SavedConversation& a, const SavedConversation& b, std::s
 // Manifest
 // ---------------------------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------------------------
+// Encoded sizes, counted rather than encoded
+// ---------------------------------------------------------------------------------------------------------------
+
+uint64_t manifest_encoded_size_of(const ManifestShape& shape) {
+    // tag, payload, epoch, generation, parent, published_order, stages, bucket, domain
+    uint64_t bytes = 116;
+    bytes = sat_add(bytes, 4);                                        // the container count
+    bytes = sat_add(bytes, sat_mul(shape.containers, 244));           // 236 fixed + the checkpoint and K/V counts
+    bytes = sat_add(bytes, sat_mul(shape.container_records, 21));
+    bytes = sat_add(bytes, sat_mul(shape.kv_layers, 96));
+    bytes = sat_add(bytes, 4);                                        // the stream count
+    bytes = sat_add(bytes, sat_mul(shape.streams, 34));               // identity, length and the chunk count
+    bytes = sat_add(bytes, sat_mul(shape.chunks, 44));                // offset, length, content address
+    bytes = sat_add(bytes, 4);                                        // the object count
+    bytes = sat_add(bytes, sat_mul(shape.objects, 40));
+    bytes = sat_add(bytes, 4);                                        // the cut count
+    bytes = sat_add(bytes, sat_mul(shape.cuts, 42));
+    return sat_add(bytes, 32);                                        // the trailing digest
+}
+
+ManifestShape manifest_shape(const ManifestMeta& meta) {
+    ManifestShape shape;
+    shape.containers = uint64_t(meta.containers.size());
+    for (const auto& container : meta.containers) shape.container_records = sat_add(shape.container_records, uint64_t(container.checkpoints.size()));
+    for (const auto& container : meta.containers) shape.kv_layers = sat_add(shape.kv_layers, uint64_t(container.kv.size()));
+    shape.streams = uint64_t(meta.streams.size());
+    for (const auto& stream : meta.streams) shape.chunks = sat_add(shape.chunks, uint64_t(stream.chunks.size()));
+    shape.objects = uint64_t(meta.objects.size());
+    shape.cuts = uint64_t(meta.cuts.size());
+    return shape;
+}
+
+uint64_t manifest_encoded_size(const ManifestMeta& meta) { return manifest_encoded_size_of(manifest_shape(meta)); }
+
+uint64_t manifest_workspace_bound(uint64_t encoded_bytes) {
+    // Every decoded element is at most about 1.5x the bytes that encode it (ContainerMeta 300/244, StreamRecord
+    // 48/34, ChunkRecord 48/44, CutRecord 48/42) and each of its vectors carries one allocator header, at most one
+    // per 21 decoded bytes in the manifest's densest section.  Twice the encoding plus a quarter covers both.
+    return sat_add(sat_mul(encoded_bytes, 2), sat_add(encoded_bytes / 4, 2 * kAllocSlackBytes));
+}
+
 std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
     Writer w;
+    w.reserve(size_t(manifest_encoded_size(meta)));
     w.raw(kManifestTag, sizeof kManifestTag);
     w.u64(meta.payload_bytes);
     w.u64(meta.epoch);
@@ -1337,7 +1592,7 @@ std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
     }
     const Digest trailer = sha256(w.data().data(), w.size());
     w.digest(trailer);
-    return w.data();
+    return w.take();
 }
 
 Digest manifest_id_of(const uint8_t* bytes, size_t size) { return sha256(bytes, size); }
@@ -1528,8 +1783,27 @@ std::vector<ConversationStoreStreamInfo> manifest_stream_infos(const ManifestMet
 // Root catalog: the only authority.  A corrupt catalog means cold caching; a directory never resurrects a history.
 // ---------------------------------------------------------------------------------------------------------------
 
+uint64_t catalog_encoded_size(const Catalog& catalog) {
+    // tag, issuer digest, publication counter, the domain count and section, then the head count and section.
+    uint64_t bytes = 8 + 32 + 8 + 4;
+    bytes = sat_add(bytes, sat_mul(uint64_t(catalog.domains.size()), 40));
+    bytes = sat_add(bytes, 4);
+    // Per head: head id, manifest, bucket, domain index, epoch, generation, parent, payload, manifest and publication
+    // sizes, stages, pin and protected flags, then the cut count and section.
+    bytes = sat_add(bytes, sat_mul(uint64_t(catalog.heads.size()), 130 + 4));
+    for (const auto& head : catalog.heads) bytes = sat_add(bytes, sat_mul(uint64_t(head.cuts.size()), 42));
+    return sat_add(bytes, 32);
+}
+
+uint64_t catalog_workspace_bound(uint64_t encoded_bytes) {
+    // The same derivation as a manifest's: one decoded head costs about 1.2x its encoded bytes plus one vector
+    // header each.
+    return sat_add(sat_mul(encoded_bytes, 2), sat_add(encoded_bytes / 4, 2 * kAllocSlackBytes));
+}
+
 std::vector<uint8_t> catalog_encode(const Catalog& catalog) {
     Writer w;
+    w.reserve(size_t(catalog_encoded_size(catalog)));
     w.raw(kCatalogTag, sizeof kCatalogTag);
     w.digest(catalog.issuer_key_digest);
     w.u64(catalog.published_order_counter);
@@ -1563,7 +1837,7 @@ std::vector<uint8_t> catalog_encode(const Catalog& catalog) {
     }
     const Digest trailer = sha256(w.data().data(), w.size());
     w.digest(trailer);
-    return w.data();
+    return w.take();
 }
 
 bool catalog_decode(const uint8_t* bytes, size_t size, Catalog& out, std::string& why) {
@@ -1698,6 +1972,7 @@ void restore_finish(SavedConversation& out) { seal_tree(out); }
 
 Digest store_bucket_digest(const ConversationStoreOptions& options, const ConversationStoreSelector& selector) {
     Writer w;
+    w.reserve(sizeof kBucketTag + 96 + 32 + 1 + 18 * 8 + 16);
     w.raw(kBucketTag, sizeof kBucketTag);
     w.digest(options.domain);
     w.digest(options.model);

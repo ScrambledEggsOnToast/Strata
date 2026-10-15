@@ -111,6 +111,58 @@ ConversationStoreLimits unconstrained_limits();
 bool image_layout(const SavedConversation& image, const Digest& seed, const ConversationStoreLimits& limits,
                   ImageLayout& out, std::string& why);
 
+// ---------------------------------------------------------------------------------------------------------------
+// Allocation-free counting: what an image will cost, and how big its encodings will be
+//
+// The writer charges its whole workspace before it allocates any of it, so the counts below are computed from the
+// image tree/encoded sizes alone: no layout is built, no manifest is decoded and no vector is reserved to find out
+// how much something would take.  Every figure is an over-estimate by construction (a container's own element plus
+// the allocator's header and rounding); over-estimating is the safe direction, and no figure is ever derived from a
+// configured maximum instead of the actual object.
+// ---------------------------------------------------------------------------------------------------------------
+
+// One small allocation's header and granularity.  A per-allocation figure, never a per-element one.
+inline constexpr uint64_t kAllocSlackBytes = 64;
+// One node of a std::map keyed by a 32-byte digest, including its bucket and the allocator's header.
+inline constexpr uint64_t kMapNodeBytes = 128;
+// One PrefixChain state: sizeof(Sha256) plus the EVP_MD_CTX and provider-side context a copy of it allocates
+// (conversation_store_sha256.cpp: EVP_MD_CTX_new()/EVP_DigestInit_ex()).  A hard numerical bound for the provider's
+// internals cannot be derived from this tree, so this is a fixed, deliberately generous allowance per image-key
+// group rather than a silent omission.
+inline constexpr uint64_t kChainBytesPerImageKey = 1024;
+
+// Counts of the structures one image materializes.  No allocation, no I/O, no payload read.
+struct ImageShape {
+    uint64_t containers = 0;
+    uint64_t records = 0;              // live records and checkpoints, across every container
+    uint64_t kv_layers = 0;
+    uint64_t streams = 0;
+    uint64_t cuts = 0;                 // cut records the top image can advertise (duplicates merged later)
+    uint64_t payload_bytes = 0;
+    uint64_t max_stream_bytes = 0;     // the longest single stream: the largest chunk one read can produce
+    uint64_t max_record_images = 0;    // the largest image-key list in one record: the PrefixChain's own scratch
+};
+
+// Counts what image_layout() would build, and refuses exactly what it would refuse (an unrepresentable stage depth,
+// a scope-less image, an exceeded limit, an overflowing count).  Never allocates.
+bool image_shape(const SavedConversation& image, const ConversationStoreLimits& limits, ImageShape& out,
+                 std::string& why);
+
+// The workspace (host bytes) the layout skeleton, the per-record prefix chains and the cut list need for `shape`.
+uint64_t image_layout_workspace(const ImageShape& shape);
+
+// The workspace of one source read of `bytes`: the chain over its own image keys.  Used by the read pipeline's own
+// preparation charge as well as by the writer.
+uint64_t prefix_chain_workspace(uint64_t image_keys);
+
+// Immutable chunks one stream of `bytes` splits into at `chunk_limit`, element aligned: the count only, never the
+// payload.  `element` is the stream's own alignment (4 for tokens, 16 for image keys, 1 for opaque bytes).
+uint64_t stream_chunk_count(uint64_t bytes, uint32_t element, uint64_t chunk_limit);
+
+// How many of a decoded donor stream's own chunks fall inside [offset, offset + bytes) of the same stream identity:
+// the most chunks one adopted reuse interval can contribute to the destination stream.  Allocation-free.
+uint64_t donor_chunks_in_interval(const StreamRecord& donor, uint64_t offset, uint64_t bytes);
+
 struct ManifestMeta {
     Digest bucket{};                // the exactness namespace: domain, scope, cvec, geometry, layer carve
     Digest domain{};                // the execution-domain digest, copied from the options
@@ -134,6 +186,27 @@ Digest manifest_id_of(const uint8_t* bytes, size_t size);
 bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreLimits& limits, ManifestMeta& out,
                      std::string& why);
 std::vector<ConversationStoreStreamInfo> manifest_stream_infos(const ManifestMeta& meta);
+
+// The exact encoded size of a manifest with these counts, and of a manifest that already exists.  Exact, so the
+// writer can charge the catalog/floor for a file before it encodes one byte, and reserve the encoder's own buffer
+// once instead of reallocating it as it grows.
+struct ManifestShape {
+    uint64_t containers = 0;
+    uint64_t container_records = 0;    // checkpoints, summed over the containers
+    uint64_t kv_layers = 0;
+    uint64_t streams = 0;
+    uint64_t chunks = 0;
+    uint64_t objects = 0;
+    uint64_t cuts = 0;
+};
+uint64_t manifest_encoded_size_of(const ManifestShape& shape);
+ManifestShape manifest_shape(const ManifestMeta& meta);
+uint64_t manifest_encoded_size(const ManifestMeta& meta);
+
+// The workspace one manifest decode needs beyond its own encoded bytes: the decoded metadata, its per-element
+// vectors and the allocator's overhead.  Derived from the encoded size (whose every element is backed by at least
+// one encoded byte), so it needs no decode to compute.
+uint64_t manifest_workspace_bound(uint64_t encoded_bytes);
 
 struct CatalogHead {
     uint64_t head_id = 0;
@@ -166,6 +239,13 @@ struct Catalog {
 
 std::vector<uint8_t> catalog_encode(const Catalog& catalog);
 bool catalog_decode(const uint8_t* bytes, size_t size, Catalog& out, std::string& why);
+
+// The exact encoded size of the given catalog: the same figure catalog_encode().size() returns, computed without
+// allocating the encoding.  The store charges and reserves the catalog's next copy from this, so a measurement must
+// never be the reason something is allocated.
+uint64_t catalog_encoded_size(const Catalog& catalog);
+// The workspace one catalog decode needs beyond the bytes it read, derived from the encoded size like a manifest's.
+uint64_t catalog_workspace_bound(uint64_t encoded_bytes);
 
 // Where one stream's payload bytes go.  Built by restore_prepare() for every stream, in the manifest's order.
 struct RestoreTarget {

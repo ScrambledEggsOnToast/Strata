@@ -54,9 +54,12 @@ using conversation_store_detail::Catalog;
 using conversation_store_detail::CatalogDomain;
 using conversation_store_detail::CatalogHead;
 using conversation_store_detail::ContainerMeta;
+using conversation_store_detail::CutRecord;
 using conversation_store_detail::Digest;
 using conversation_store_detail::digest_nonzero;
 using conversation_store_detail::digest_u64;
+using conversation_store_detail::kAllocSlackBytes;
+using conversation_store_detail::kMapNodeBytes;
 using conversation_store_detail::ManifestMeta;
 using conversation_store_detail::sha256;
 using conversation_store_detail::sha256_hex;
@@ -72,9 +75,27 @@ constexpr uint64_t kReadFixedOverhead = uint64_t(64) << 10;
 constexpr uint64_t kJobFixedOverhead = 1024;
 constexpr uint64_t kMaxScanEntries = uint64_t(1) << 20;
 constexpr uint64_t kMaxReclaimPerPass = 65536;
-constexpr uint32_t kTempNameAttempts = 32;
+constexpr uint64_t kTempNameAttempts = 32;
 constexpr uint32_t kDurableWaitMs = 30000;
 constexpr uint64_t kIdlePollMs = 20;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+uint64_t sat_mul(uint64_t a, uint64_t b) { return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
+uint64_t sat_max3(uint64_t a, uint64_t b, uint64_t c) { return std::max(a, std::max(b, c)); }
+
+// The most one committed change can add to the catalog: a single head's own encoding (its fixed fields plus every cut
+// one image can advertise), the publication counter and one allocation's rounding.  A commit adds at most one head,
+// and an eviction, promotion or invalidation only shrinks or repeats one, so this is what makes the next catalog
+// copy's cost predictable before it is written.
+uint64_t catalog_growth_bytes(const ConversationStoreLimits& limits) {
+    return 512 + 130 + 4 + (uint64_t(limits.max_checkpoints) + 1) * 42;
+}
+
+// The outcome of one catalog transaction.  `unchanged` means not one durable byte changed and the previously
+// committed authority is still the authority; `durable_applied` means the new catalog was renamed into place and
+// every directory that changed was flushed; `uncertain` means the rename happened but its durability could not be
+// confirmed, so nothing may be deleted, credited or reused until a restart re-reads the authority.
+enum class CommitOutcome : uint8_t { unchanged = 0, durable_applied = 1, uncertain = 2 };
 
 // ---------------------------------------------------------------------------------------------------------------
 // POSIX helpers.  Each is exact or fails with a reason, none throws, and all are descriptor relative: no path is
@@ -108,6 +129,45 @@ struct PendingFile {
     std::string name;
     uint64_t charge = 0;    // this file's share of the shared quota, credited only once it is confirmed gone
     uint64_t head_id = 0;   // the retired head it belonged to; 0 never defers
+};
+
+// Every host byte one admitted publication can hold at once, counted before any of it is allocated.  Each field is an
+// upper bound on one phase's structures; `peak` is the largest sum of them that can be live together, so the writer
+// never allocates beyond what it reserved (see publish() and publish_body()).
+struct WriterWorkspace {
+    uint64_t request_copy = 0;    // the copied ConversationStorePublish and its reuse intervals
+    uint64_t layout = 0;          // the layout skeleton, its per-record prefix chains and the identity set
+    uint64_t donor_decoded = 0;   // every decoded manifest this attempt retains (its parent and its donors)
+    uint64_t donor_raw_peak = 0;  // the largest single manifest file it reads at once
+    uint64_t chunks = 0;          // the most immutable chunks it can emit; every one is assumed unique
+    uint64_t buffer = 0;          // the largest single chunk it reads into one buffer
+    uint64_t manifest = 0;        // its own encoded manifest
+    uint64_t catalog_apply = 0;   // the candidate catalog copy, the apply staging and the retire queue's room
+
+    // I + J + max(W_layout/decode, W_chunks/maps/orphans + B, W_manifest/catalog/apply)
+    uint64_t peak() const {
+        uint64_t chunk_phase = sat_mul(chunks, sizeof(conversation_store_detail::ChunkRecord) + kAllocSlackBytes);
+        // Every prospective chunk may be a distinct object: its node in the referenced/charged object maps, its node
+        // in the new-object map, its entry in the persistent index and its slot in the head's own object list.
+        chunk_phase = sat_add(chunk_phase,
+                              sat_mul(chunks, 4 * conversation_store_detail::kMapNodeBytes + 2 * sizeof(Digest) + 40 +
+                                                 2 * kAllocSlackBytes));
+        // Every object this attempt writes is accounted before it is written, by name and by shard.
+        chunk_phase = sat_add(chunk_phase, sat_mul(chunks, sizeof(PendingFile) + 2 * kAllocSlackBytes));
+        chunk_phase = sat_add(chunk_phase, 2 * kAllocSlackBytes);   // the per-stream chunk reservations
+        chunk_phase = sat_add(chunk_phase, buffer);
+        const uint64_t base = sat_add(sat_add(request_copy, layout), donor_decoded);
+        return sat_add(base, sat_max3(donor_raw_peak, chunk_phase, sat_add(manifest, catalog_apply)));
+    }
+};
+
+// The bounded preparation one publication's parent and reuse donors need.  Built from the named heads' own recorded
+// charges - never from head_limit x max_manifest_bytes and never from a default maximum - and computed from catalog
+// metadata alone, with no I/O and no allocation.
+struct DonorPrep {
+    uint64_t decoded = 0;     // every decoded manifest this attempt retains
+    uint64_t raw_peak = 0;    // the largest single raw manifest it reads at once
+    uint64_t chunks = 0;      // the most chunks those donors can contribute through reuse intervals
 };
 
 // The shared charge of one file: its blocks plus one block for its directory entry (and inode).  Deliberately
@@ -533,6 +593,7 @@ struct ConversationStore::Impl {
     bool faulted = false;              // latched for the life of this instance
     bool initialized = false;          // the open sequence completed and the authority is trustworthy
     bool lock_owned = false;           // this instance holds the exclusive root lock
+    bool unclean_start = false;        // this domain's previous run did not close cleanly: retire its records
     std::string reason;
     std::string fault_reason;
     int lock_fd = -1;
@@ -596,10 +657,20 @@ struct ConversationStore::Impl {
         std::shared_ptr<const SavedConversation> image;
         ConversationStorePublish request;
         uint64_t epoch = 0;               // the capture epoch: bound at the seam, or at publish() admission
-        uint64_t ram_bytes = 0;
+        uint64_t ram_bytes = 0;           // the image alias: charged to ram_held *and* ram_lease
+        uint64_t workspace_bytes = 0;     // the writer's own counted workspace: charged to ram_held only
+        uint64_t catalog_apply_bytes = 0; // the apply structures this attempt may copy (counted at admission)
+        // The part of this image's lease the caller had already accounted for outside this store's allowance.  It
+        // widens *this* publication's own fit check and nothing else: reads are never admitted against it, and the
+        // ledger still charges the full image and the whole counted workspace.
+        uint64_t external_credit_bytes = 0;
+        conversation_store_detail::ImageShape shape;   // the allocation-free count this admission was charged for
         bool started = false;             // the writer has begun reading this image: it may never be replaced
         bool cancelled = false;
         bool coalesced = false;
+        // The catalog transaction renamed a new catalog into place but could not confirm its durability.  Every file
+        // this attempt created may be referenced by either catalog, so none of them may be deleted.
+        bool retain_files = false;
         std::vector<PendingFile> orphans; // files this attempt has created and not yet authorized
     };
     std::shared_ptr<PublishJob> publishing;
@@ -618,6 +689,12 @@ struct ConversationStore::Impl {
         uint64_t new_catalog_charge = 0;          // filled in by commit_plan
         uint64_t epoch = 0;                       // invalidate: the advanced epoch
         uint32_t domain_index = 0;                // invalidate
+        // Everything the apply after the rename needs, built *before* it: fresh object-index nodes (merged without
+        // allocating) and the head's own index entries.  A commit that cannot allocate these changes nothing.
+        std::map<Digest, ObjectState> staged_objects;
+        bool staged_head_objects = false;
+        bool staged_head_manifest = false;
+        bool staged_head_recency = false;
     };
 
     struct DurableWork {
@@ -635,7 +712,7 @@ struct ConversationStore::Impl {
 
     // ---- counters and test seams ----
     ConversationStoreCounters counters;
-    std::string fault_step;
+    std::set<std::string> fault_steps;   // armed failure steps; each one fires once and is then disarmed
     std::atomic<uint64_t> source_bytes_read{0};
     std::atomic<uint64_t> name_counter{0};
 
@@ -666,11 +743,33 @@ struct ConversationStore::Impl {
     void discard_files(std::vector<PendingFile>&& files);
     void reclaim_pending();
     void queue_orphans(std::vector<PendingFile>& files);
-    bool commit_plan(CommitPlan& plan, std::string& why);
+    CommitOutcome commit_plan(CommitPlan& plan, std::string& why);
     bool evict_head_durably(uint64_t head_id, std::string& why);
     bool make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why);
-    bool write_catalog_or_refuse(CommitPlan& plan, std::string& why);
+    CommitOutcome write_catalog_or_refuse(CommitPlan& plan, std::string& why);
     bool take_fault(const char* step);
+
+    // ---- catalog copy headroom, writer workspace and the post-rename apply ----
+    // The physical charge of the catalog's *next* copy: the current catalog plus the most one commit can add to it.
+    uint64_t catalog_next_bound_locked(const Catalog& candidate) const;
+    // The quota headroom ordinary admissions never spend: two catalog copies plus the growth of the one after them.
+    uint64_t catalog_reserve_locked() const;
+    // The commit's own copy, admitted against the quota and the floor exactly like every other physical byte.
+    bool admit_catalog_copy_locked(uint64_t copy_charge, const Catalog& candidate, std::string& why);
+    // The counted preparation of the named parent/donor heads: catalog metadata only, no I/O, no allocation.
+    DonorPrep donor_prep_locked(const ConversationStorePublish& request) const;
+    // The workspace of one admitted publication, counted before it allocates any of it.
+    WriterWorkspace writer_workspace_locked(const ConversationStorePublish& request,
+                                            const conversation_store_detail::ImageShape& shape) const;
+    // The apply structures one commit may copy: the candidate catalog, the index nodes and the queues' room.
+    uint64_t catalog_apply_bytes_locked(uint64_t chunks) const;
+    // Reserves the *actual* prospective chunk peak once the layout and the donors are decoded: never more than the
+    // publication was admitted with, and only upwards if that counted figure grew.
+    bool reserve_writer_workspace(const std::shared_ptr<PublishJob>& job, uint64_t workspace, std::string& why);
+    // Everything the post-rename apply needs, allocated while the old authority is still the durable one.
+    bool stage_apply_locked(CommitPlan& plan, std::string& why);
+    void unstage_apply_locked(CommitPlan& plan);
+    void apply_staged_locked(CommitPlan& plan);   // allocation-free: the staged nodes are moved, never built
 
     // Lookup: catalog metadata only, under the mutex, no payload read and no GPU pointer exposed.
     void collect_matches(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
@@ -699,7 +798,9 @@ struct ConversationStore::Impl {
     void read_body(const std::shared_ptr<ReadJob>& job);
 
     bool open_root(std::string& why);
-    bool load_catalog(std::string& why);
+    // Reads and decodes the durable catalog and decides this domain's epoch.  It may not write anything: the first
+    // catalog transaction happens only once the whole physical ledger has been accounted (see reconcile()).
+    bool read_catalog(std::string& why);
     bool reconcile(std::string& why);
     bool write_intent(bool present, std::string& why);
 };
@@ -761,8 +862,10 @@ void ConversationStore::Impl::latch_fault_locked(const std::string& why) {
 
 bool ConversationStore::Impl::take_fault(const char* step) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (fault_step != step) return false;
-    fault_step.clear();
+    if (!step) return false;
+    const auto found = fault_steps.find(step);
+    if (found == fault_steps.end()) return false;
+    fault_steps.erase(found);
     return true;
 }
 
@@ -895,21 +998,51 @@ bool ConversationStore::Impl::write_intent(bool present, std::string& why) {
     if (present) {
         struct stat info {};
         if (::fstatat(dirs.root, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) return true;
+        // This marker is safety critical: it is created even when the quota or the floor has no room for it, and its
+        // bytes are charged before it is written so the ledger never pretends the store owns less than it does.
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            charged = sat_add(charged, allocated_charge(sizeof marker));
+        }
         if (!write_new_file(dirs.root, name, marker, sizeof marker, why)) return false;
         return fsync_dir(dirs.root, "the store root", why);
     }
     if (!remove_file(dirs.root, name, why)) return false;
-    if (!fsync_dir(dirs.root, "the store root", why)) {
-        // The marker is gone from this process's view but not durably: re-arm it so the next start still distrusts
-        // this domain, and report the failure rather than pretending the close was clean.
-        std::string ignored;
-        if (!write_new_file(dirs.root, name, marker, sizeof marker, ignored)) return false;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        charged -= std::min(charged, allocated_charge(sizeof marker));
+    }
+    std::string flush;
+    const bool gone_durable = fsync_dir(dirs.root, "the store root", flush) && !take_fault("intent-unlink-sync");
+    if (!gone_durable) {
+        // The marker is gone from this process's view but not durably, so it is re-armed here and its own flush is
+        // attempted again.  The close is still reported as failed either way: a re-arm this call could not prove is
+        // not a durable one, and the next start must distrust this domain.
+        why = flush.empty() ? std::string("the store root could not be flushed after removing the run-intent marker")
+                            : flush;
+        std::string rearm;
+        if (!write_new_file(dirs.root, name, marker, sizeof marker, rearm)) {
+            why += "; the run-intent marker could not be re-armed: " + rearm;
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            charged = sat_add(charged, allocated_charge(sizeof marker));
+        }
+        std::string refush;
+        const bool rearmed_durable =
+            fsync_dir(dirs.root, "the store root", refush) && !take_fault("intent-rearm-sync");
+        if (rearmed_durable)
+            why += "; the run-intent marker was re-armed and flushed, so this domain stays distrusted";
+        else
+            why += "; the re-armed run-intent marker is not durably flushed: " +
+                   (refush.empty() ? std::string("the store root could not be flushed") : refush);
         return false;
     }
     return true;
 }
 
-bool ConversationStore::Impl::load_catalog(std::string& why) {
+bool ConversationStore::Impl::read_catalog(std::string& why) {
     Catalog loaded;
     std::string detail;
     struct stat catalog_info {};
@@ -921,9 +1054,11 @@ bool ConversationStore::Impl::load_catalog(std::string& why) {
         if (!read_file(dirs.root, "catalog", limits.max_manifest_bytes, bytes, detail) ||
             !conversation_store_detail::catalog_decode(bytes.data(), bytes.size(), loaded, detail) ||
             !(loaded.issuer_key_digest == sha256(issuer_key.data(), issuer_key.size()))) {
-            // A catalog that cannot be trusted is cold caching: never a directory-based resurrection.
+            // A catalog that cannot be trusted is cold caching: never a directory-based resurrection.  The reason is
+            // recorded for the open sequence's diagnostics; serving from an empty catalog is still a success.
             counters.corrupt_records++;
             loaded = Catalog{};
+            if (!detail.empty()) why = "the stored catalog was not trusted: " + detail;
         }
     }
     catalog = std::move(loaded);
@@ -948,25 +1083,16 @@ bool ConversationStore::Impl::load_catalog(std::string& why) {
     // A run-intent marker for exactly this domain means its previous run did not close cleanly: its records and every
     // outstanding completion of its epoch are invalid.  Otherwise records of a retired epoch are unreachable.
     struct stat intent_info {};
-    const bool unclean =
-        ::fstatat(dirs.root, intent_name().c_str(), &intent_info, AT_SYMLINK_NOFOLLOW) == 0;
-    if (unclean) {
+    unclean_start = ::fstatat(dirs.root, intent_name().c_str(), &intent_info, AT_SYMLINK_NOFOLLOW) == 0;
+    if (unclean_start) {
+        // The epoch is advanced in memory here; retire_head_locked() for this domain's records waits for
+        // reconcile(), which retires them once every one of their bytes is in the physical ledger.
         epoch += 1;
         catalog.domains[domain_index].epoch = epoch;
         counters.epoch_advances++;
     }
-    std::vector<uint64_t> victims;
-    for (const auto& head : catalog.heads)
-        if (head.domain == domain_index && (unclean || head.epoch != epoch)) victims.push_back(head.head_id);
-    for (uint64_t head_id : victims) retire_head_locked(head_id);
     for (const auto& head : catalog.heads) head_recency[head.head_id] = head.published_order;
-
-    // The marker is armed, and the retirements above are durable, before this store may reuse anything at all.
-    if (!write_intent(true, why)) return false;
-    intent_active = true;
-    CommitPlan plan;
-    plan.kind = CommitPlan::Kind::promote;
-    return commit_plan(plan, why);
+    return true;
 }
 
 bool ConversationStore::Impl::reconcile(std::string& why) {
@@ -1068,6 +1194,13 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
 
     std::vector<uint64_t> dropped;
     for (const auto& head : catalog.heads) {
+        // A record of this domain that this run must not reuse - an unclean start or a retired epoch - is dropped
+        // here, after its manifest and its objects have been accounted above, so its bytes are charged into the
+        // ledger before the first catalog transaction forgets it.
+        if (head.domain == domain_index && (unclean_start || head.epoch != epoch)) {
+            dropped.push_back(head.head_id);
+            continue;
+        }
         const auto manifest = present_manifests.find(head.manifest_id);
         ManifestMeta meta;
         std::string detail;
@@ -1183,10 +1316,22 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         return false;
     }
     for (uint64_t head_id : retiring) retire_head_locked(head_id);
-    // The removals decided above must be durable before this store serves a lookup from them.
+    // The marker is armed before anything is served, and it is armed whether or not a catalog transaction follows.
+    if (!write_intent(true, why)) return false;
+    intent_active = true;
+    // The first catalog transaction happens only when this run's view of the authority really differs from the
+    // durable one.  An unchanged catalog *is* the durable authority (the decoded file, re-derived deterministically
+    // where a domain was added), so rewriting it would be a durable write nothing needs - and, on a filesystem or a
+    // quota that cannot pay for it, the difference between a store that serves reads and one that cannot open.  A
+    // retired epoch, a dropped record or a queued retirement all change the authority, and those are committed here
+    // now that the whole physical ledger above has been accounted.
+    if (!unclean_start && dropped.empty() && retiring.empty()) {
+        recount_metadata_locked();
+        return true;
+    }
     CommitPlan plan;
     plan.kind = CommitPlan::Kind::promote;
-    if (!commit_plan(plan, why)) return false;
+    if (commit_plan(plan, why) != CommitOutcome::durable_applied) return false;
     recount_metadata_locked();
     return true;
 }
@@ -1341,7 +1486,10 @@ bool ConversationStore::Impl::load_manifest_of(uint64_t head_id, uint64_t epoch_
         }
     }
     std::vector<uint8_t> raw;
-    if (!read_file(dirs.manifests, sha256_hex(manifest_id), limits.max_manifest_bytes, raw, why)) return false;
+    // The read is capped by the head's own recorded charge as well as the configured ceiling, so the writer's
+    // reservation - which is built from those same recorded charges - can never be smaller than this read.
+    const uint64_t capped = bytes != 0 && bytes < limits.max_manifest_bytes ? bytes : limits.max_manifest_bytes;
+    if (!read_file(dirs.manifests, sha256_hex(manifest_id), capped, raw, why)) return false;
     {
         std::lock_guard<std::mutex> guard(mutex);
         counters.bytes_read += raw.size();
@@ -1358,6 +1506,114 @@ bool ConversationStore::Impl::stream_identity_of(const std::vector<ContainerMeta
                                                  const ConversationStoreStreamId& id, Digest& scope, uint64_t& ordinal,
                                                  std::string& why) const {
     return conversation_store_detail::stream_object_identity(containers, id, options.model, scope, ordinal, why);
+}
+
+// The bounded preparation the named parent and reuse donors need: the raw manifest bytes this attempt will read and
+// the decoded metadata it will retain, from the heads' own recorded charges.  Catalog metadata only: no I/O, no
+// allocation, and no figure taken from a configured maximum.  A head this store does not retain contributes nothing,
+// because the writer's own lookup of it fails before it allocates anything.
+DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePublish& request) const {
+    DonorPrep prep;
+    const auto charge_of = [&](uint64_t head_id, uint64_t& bytes) {
+        for (const auto& head : catalog.heads)
+            if (head.head_id == head_id) {
+                bytes = head.manifest_bytes;
+                return true;
+            }
+        return false;
+    };
+    uint64_t bytes = 0;
+    if (request.supersedes != 0 && charge_of(request.supersedes, bytes)) {
+        const uint64_t raw = bytes != 0 && bytes < limits.max_manifest_bytes ? bytes : limits.max_manifest_bytes;
+        prep.raw_peak = std::max(prep.raw_peak, raw);
+        prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_workspace_bound(raw));
+    }
+    for (const auto& entry : request.reuse) {
+        if (!entry.head_id || !charge_of(entry.head_id, bytes)) continue;
+        const uint64_t raw = bytes != 0 && bytes < limits.max_manifest_bytes ? bytes : limits.max_manifest_bytes;
+        prep.raw_peak = std::max(prep.raw_peak, raw);
+        prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_workspace_bound(raw));
+        // Every donor chunk costs 44 encoded bytes, so the donor's own encoding bounds how many chunks one interval
+        // can adopt.  This is deliberately generous: the writer counts the interval's real donor chunks once the
+        // manifest is decoded, and only ever lowers what was reserved.
+        prep.chunks = sat_add(prep.chunks, sat_add(raw / 44, 2));
+    }
+    return prep;
+}
+
+// The workspace of one admission, counted before the job that would need it exists.  `shape` is the allocation-free
+// count of the image's own structures; the donor figure is the bounded one above, so the first stage never depends on
+// a decoded manifest to know what the decode will cost.
+WriterWorkspace ConversationStore::Impl::writer_workspace_locked(const ConversationStorePublish& request,
+                                                                 const conversation_store_detail::ImageShape& shape)
+    const {
+    WriterWorkspace work;
+    work.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
+                                kJobFixedOverhead);
+    work.layout = conversation_store_detail::image_layout_workspace(shape);
+    const DonorPrep prep = donor_prep_locked(request);
+    work.donor_decoded = prep.decoded;
+    work.donor_raw_peak = prep.raw_peak;
+    const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
+    // The image's own chunk grid: every stream contributes at most one partial chunk beside its full ones, and the
+    // smallest chunk an element-aligned stream uses is the chunk size minus its 16-byte alignment.  Then the most
+    // chunks the named donors could contribute through their intervals.
+    const uint64_t aligned = std::max<uint64_t>(1, chunk_limit - 16);
+    const uint64_t grid = sat_add(sat_add(sat_mul(shape.payload_bytes / aligned, 1), shape.streams), 1);
+    const uint64_t chunks = sat_add(grid, prep.chunks);
+    work.chunks = chunks;
+    work.buffer = std::min(chunk_limit, shape.max_stream_bytes);
+    const auto manifest_shape = conversation_store_detail::ManifestShape{
+        shape.containers, shape.records - shape.containers, shape.kv_layers, shape.streams,
+        chunks, chunks, shape.cuts};
+    work.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_shape);
+    work.catalog_apply = catalog_apply_bytes_locked(chunks);
+    return work;
+}
+
+// The apply structures one commit of this publication may copy: the candidate catalog (every head and every cut),
+// the object-index nodes, the head's own list and the room the retire and orphan queues need.  Catalog metadata and
+// counts only.
+uint64_t ConversationStore::Impl::catalog_apply_bytes_locked(uint64_t chunks) const {
+    uint64_t bytes = sat_mul(uint64_t(catalog.heads.size()) + 1,
+                             sizeof(CatalogHead) + 3 * kAllocSlackBytes);
+    for (const auto& head : catalog.heads)
+        bytes = sat_add(bytes, sat_mul(uint64_t(head.cuts.size()) + 1, sizeof(CutRecord) + kAllocSlackBytes));
+    // The retire queue (one manifest entry per retired head plus every object that head alone named) and the orphan
+    // queue this attempt fills before its commit.
+    bytes = sat_add(bytes, sat_mul(sat_add(sat_add(uint64_t(catalog.heads.size()), uint64_t(objects.size())), chunks),
+                                   sizeof(PendingFile) + 2 * kAllocSlackBytes));
+    return bytes;
+}
+
+// Reserves the *actual* prospective peak once the layout and the donors are decoded: never below what is already
+// live, never above what the publication was admitted with unless the counted figure really grew (which is then
+// admitted or refused here, before one chunk is read or written).
+bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<PublishJob>& job, uint64_t workspace,
+                                                       std::string& why) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (workspace <= job->workspace_bytes) {
+        const uint64_t drop = job->workspace_bytes - workspace;
+        ram_held -= std::min(ram_held, drop);
+        job->workspace_bytes = workspace;
+        return true;
+    }
+    const uint64_t delta = workspace - job->workspace_bytes;
+    const uint64_t image = job->ram_bytes;
+    if (workspace > options.metadata_bytes || metadata + prep > options.metadata_bytes - workspace) {
+        why = "the writer's workspace does not fit the store's preparation ceiling";
+        return false;
+    }
+    // This publication's own transferred lease still widens its own fit check; it never widens anything else.
+    const uint64_t envelope = sat_add(ram_budget, job->external_credit_bytes);
+    if (image > envelope || resident_locked() > envelope - image - delta) {
+        why = "the writer's workspace does not fit the published RAM allowance";
+        return false;
+    }
+    ram_held += delta;
+    job->workspace_bytes = workspace;
+    counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1410,6 +1666,10 @@ void ConversationStore::Impl::reclaim_pending() {
     std::vector<PendingFile> batch;
     {
         std::lock_guard<std::mutex> guard(mutex);
+        // After an uncertain catalog transaction this process cannot know which catalog is durable, so neither
+        // catalog's files may be deleted: every pending file is retained, stays charged, and awaits a restart that
+        // re-reads the authority.
+        if (faulted) return;
         std::vector<PendingFile> keep;
         keep.reserve(pending_files.size());
         for (auto& file : pending_files) {
@@ -1468,7 +1728,9 @@ void ConversationStore::Impl::reclaim_pending() {
 }
 
 void ConversationStore::Impl::recount_metadata_locked() {
-    uint64_t bytes = uint64_t(conversation_store_detail::catalog_encode(catalog).size());
+    // Counted, never encoded: this runs after a rename, where an allocation for the sake of measuring one would be
+    // exactly the escape the transaction must not have.
+    uint64_t bytes = conversation_store_detail::catalog_encoded_size(catalog);
     bytes += uint64_t(objects.size()) * kObjectBytesEstimate;
     for (const auto& entry : head_objects) bytes += uint64_t(entry.second.size()) * sizeof(Digest);
     metadata = bytes;
@@ -1478,13 +1740,148 @@ void ConversationStore::Impl::recount_metadata_locked() {
 // Durable catalog transactions
 // ---------------------------------------------------------------------------------------------------------------
 
-bool ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
+// The physical charge of the catalog's *next* copy: the current catalog's encoding plus the most one commit can add
+// to it, charged at the conservative allocated size the quota is kept in.
+uint64_t ConversationStore::Impl::catalog_next_bound_locked(const Catalog& candidate) const {
+    return allocated_charge(sat_add(conversation_store_detail::catalog_encoded_size(candidate),
+                                    catalog_growth_bytes(limits)));
+}
+
+// The headroom ordinary admissions never spend.  Every commit needs its own copy to coexist with the live catalog
+// (which `charged` already includes) and the copy after that to remain possible, so the reserve is
+// max(live, next) + next.  Payloads, manifests and objects are admitted only while this much of the quota is still
+// free, which is what makes an eviction - whose whole purpose is to make room - always writable.
+uint64_t ConversationStore::Impl::catalog_reserve_locked() const {
+    const uint64_t next = catalog_next_bound_locked(catalog);
+    return sat_add(std::max(catalog_charge, next), next);
+}
+
+// The commit's own copy, admitted against the quota and the floor exactly like every other physical byte.  It is
+// deliberately NOT routed through make_room(): a catalog commit never evicts recursively, and an admission that
+// cannot be paid for is refused without deleting a single victim.
+bool ConversationStore::Impl::admit_catalog_copy_locked(uint64_t copy_charge, const Catalog& candidate,
+                                                        std::string& why) {
+    sample_free_locked();
+    if (free_sample == 0) {
+        counters.refusals_floor++;
+        why = "the filesystem could not be sampled, so the catalog's own copy cannot be admitted";
+        return false;
+    }
+    const uint64_t next = catalog_next_bound_locked(candidate);
+    // After this transaction the live catalog *is* this copy, so the committed figure is what is left of the quota
+    // once the old copy is released, plus the headroom the transaction after this one needs.
+    const uint64_t after = sat_add(charged - std::min(charged, catalog_charge), copy_charge);
+    const uint64_t committed = sat_add(after, sat_add(std::max(copy_charge, next), next));
+    if (committed > options.quota_bytes) {
+        counters.refusals_quota++;
+        why = "the catalog's own copy does not fit the shared quota (committed " + std::to_string(committed) +
+              ", quota " + std::to_string(options.quota_bytes) + ")";
+        return false;
+    }
+    if (copy_charge > free_sample || free_sample - copy_charge < options.min_free_bytes) {
+        counters.refusals_floor++;
+        why = "the catalog's own copy would cross the filesystem floor";
+        return false;
+    }
+    return true;
+}
+
+// Everything the apply after the rename needs, allocated while the old authority is still the durable one.  The
+// object-index nodes, the head's own index entries and the room the retire queue needs are built here; a commit that
+// cannot build them changes nothing at all (its caller treats a false return as `unchanged`).
+bool ConversationStore::Impl::stage_apply_locked(CommitPlan& plan, std::string& why) {
+    if (!plan.new_head) return true;
+    plan.staged_objects.clear();
+    for (const Digest& object : plan.new_objects) {
+        ObjectState state;
+        const auto charge = plan.new_object_charges.find(object);
+        state.bytes = charge == plan.new_object_charges.end() ? 0 : charge->second;
+        state.refs = 1;
+        plan.staged_objects.emplace(object, state);
+    }
+    if (head_objects.find(plan.new_head) == head_objects.end()) {
+        head_objects.emplace(plan.new_head, std::vector<Digest>{});
+        plan.staged_head_objects = true;
+    }
+    if (head_manifest_bytes.find(plan.new_head) == head_manifest_bytes.end()) {
+        head_manifest_bytes.emplace(plan.new_head, 0);
+        plan.staged_head_manifest = true;
+    }
+    if (head_recency.find(plan.new_head) == head_recency.end()) {
+        head_recency.emplace(plan.new_head, 0);
+        plan.staged_head_recency = true;
+    }
+    // The retire path queues one manifest and every object it alone named, then hands the new head its own list: all
+    // of it must fit without reallocating after the rename.
+    uint64_t retiring_entries = 1;
+    for (uint64_t victim : plan.retiring) {
+        const auto list = head_objects.find(victim);
+        retiring_entries = sat_add(retiring_entries, sat_add(1, list == head_objects.end() ? 0 : list->second.size()));
+    }
+    pending_files.reserve(size_t(sat_add(uint64_t(pending_files.size()), sat_add(retiring_entries, plan.new_objects.size()))));
+    if (plan.staged_objects.size() != plan.new_objects.size()) {
+        why = "the object index cannot hold this publication";
+        unstage_apply_locked(plan);
+        return false;
+    }
+    return true;
+}
+
+void ConversationStore::Impl::unstage_apply_locked(CommitPlan& plan) {
+    if (plan.staged_head_objects) head_objects.erase(plan.new_head);
+    if (plan.staged_head_manifest) head_manifest_bytes.erase(plan.new_head);
+    if (plan.staged_head_recency) head_recency.erase(plan.new_head);
+    plan.staged_head_objects = plan.staged_head_manifest = plan.staged_head_recency = false;
+    plan.staged_objects.clear();
+}
+
+// The apply after the rename: node merges, moves and erases only.  Nothing here allocates, so nothing here can fail
+// after the point of no return; the exception guard around it exists to keep even a bug from deleting files.
+void ConversationStore::Impl::apply_staged_locked(CommitPlan& plan) {
+    charged -= std::min(charged, catalog_charge);   // the previous catalog file is gone
+    catalog_charge = plan.new_catalog_charge;
+    if (plan.new_head) {
+        for (const Digest& object : plan.new_objects) revive_object_locked(object);
+        // The fresh nodes were built before the rename; merging them cannot allocate.  A key that already existed
+        // keeps its own node (and its charge) and only its reference count changes.
+        objects.merge(plan.staged_objects);
+        for (const auto& entry : plan.staged_objects) {
+            const auto state = objects.find(entry.first);
+            if (state == objects.end()) continue;
+            if (state->second.bytes == 0) state->second.bytes = entry.second.bytes;
+            state->second.refs += 1;
+        }
+        plan.staged_objects.clear();
+        // The list and the two per-head figures belong to nodes this transaction created before the rename.
+        head_objects[plan.new_head] = std::move(plan.new_objects);
+        head_manifest_bytes[plan.new_head] = plan.new_manifest_bytes;
+        head_recency[plan.new_head] = ++recency_counter;
+        plan.staged_head_objects = plan.staged_head_manifest = plan.staged_head_recency = false;
+    }
+    for (uint64_t victim : plan.retiring) retire_head_locked(victim);
+    catalog = std::move(plan.candidate);
+    catalog_version++;
+    recount_metadata_locked();
+    counters.heads = uint64_t(catalog.heads.size());
+    counters.objects = uint64_t(objects.size());
+    counters.manifests = uint64_t(head_manifest_bytes.size());
+}
+
+CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
     std::vector<uint8_t> encoded;
-    {
+    // ---- plan, count, admit and stage, under the lock, before any durable byte changes.  Every failure below
+    // leaves the previously committed catalog as the authority ----
+    try {
         std::lock_guard<std::mutex> guard(mutex);
+        // The guard lives here rather than only at the public entry points: a fault that must stop reuse stops
+        // queued durable work too, and a queued transaction must never be the first thing to notice it.
+        if (faulted) {
+            why = fault_reason.empty() ? "the store has faulted" : fault_reason;
+            return CommitOutcome::unchanged;
+        }
         if (!lock_owned) {
             why = "this instance does not own the store's authority";
-            return false;
+            return CommitOutcome::unchanged;
         }
         switch (plan.kind) {
             case CommitPlan::Kind::invalidate: {
@@ -1509,13 +1906,22 @@ bool ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::str
             default:
                 if (plan.version != catalog_version) {
                     why = "the catalog changed while this plan was being built";
-                    return false;
+                    return CommitOutcome::unchanged;
                 }
                 break;
         }
         encoded = conversation_store_detail::catalog_encode(plan.candidate);
         plan.new_catalog_charge = allocated_charge(encoded.size());
+        if (!admit_catalog_copy_locked(plan.new_catalog_charge, plan.candidate, why))
+            return CommitOutcome::unchanged;
+        if (!stage_apply_locked(plan, why)) return CommitOutcome::unchanged;
         charged += plan.new_catalog_charge;
+    } catch (const std::exception& error) {
+        why = std::string("the catalog transaction could not be prepared: ") + error.what();
+        return CommitOutcome::unchanged;
+    } catch (...) {
+        why = "the catalog transaction could not be prepared";
+        return CommitOutcome::unchanged;
     }
 
     std::string temp = temp_name();
@@ -1529,14 +1935,24 @@ bool ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::str
         temp = temp_name();
         why.clear();
     }
-    if (written && ::renameat(dirs.tmp, temp.c_str(), dirs.root, "catalog") != 0) {
-        why = std::string("cannot replace the catalog: ") + std::strerror(errno);
-        written = false;
+    bool renamed = false;
+    if (written) {
+        if (take_fault("catalog-rename")) {
+            why = "injected fault: the catalog rename";
+        } else if (::renameat(dirs.tmp, temp.c_str(), dirs.root, "catalog") != 0) {
+            why = std::string("cannot replace the catalog: ") + std::strerror(errno);
+        } else {
+            renamed = true;
+        }
     }
-    if (written) written = fsync_dir(dirs.root, "the store root", why);
-    if (!written) {
+    if (!renamed) {
         // The catalog itself is untouched (a rename either happened or did not), so the authority is unchanged and
-        // only the temporary may remain.  Its charge stays until the file is confirmed gone.
+        // only the temporary this attempt created may remain.  It is cleaned here and its charge is credited only
+        // once the file is confirmed gone; a cleanup that cannot confirm that leaves the bytes charged.
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            unstage_apply_locked(plan);
+        }
         std::vector<PendingFile> orphans;
         PendingFile orphan;
         orphan.where = Where::tmp;
@@ -1544,41 +1960,58 @@ bool ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::str
         orphan.charge = plan.new_catalog_charge;
         orphans.push_back(std::move(orphan));
         discard_files(std::move(orphans));
-        return false;
+        return CommitOutcome::unchanged;
     }
-
-    {
-        std::lock_guard<std::mutex> guard(mutex);
-        charged -= std::min(charged, catalog_charge);   // the previous catalog file is gone
-        catalog_charge = plan.new_catalog_charge;
-        if (plan.new_head) {
-            for (const Digest& object : plan.new_objects) {
-                ObjectState& state = objects[object];
-                if (state.bytes == 0) {
-                    const auto charge = plan.new_object_charges.find(object);
-                    state.bytes = charge == plan.new_object_charges.end() ? 0 : charge->second;
-                }
-                state.refs += 1;
-                revive_object_locked(object);
-            }
-            head_objects[plan.new_head] = plan.new_objects;
-            head_manifest_bytes[plan.new_head] = plan.new_manifest_bytes;
-            head_recency[plan.new_head] = ++recency_counter;
+    // From here the new catalog exists under the live name.  Recording that immediately - before the first fallible
+    // step after it - is what separates "nothing happened" from "something happened and durability is unknown".
+    bool durable = true;
+    if (take_fault("catalog-sync")) {
+        why = "injected fault: the store root could not be flushed";
+        durable = false;
+    } else if (!fsync_dir(dirs.root, "the store root", why)) {
+        durable = false;
+    }
+    if (!durable) {
+        // Uncertainty, not failure: the durable catalog is the new one *or* the old one, and this process cannot
+        // tell which.  No file may be deleted or credited, reuse stops, further transactions stop, and the run
+        // intent stays armed so the next start re-reads the authority instead of trusting this view.
+        const std::string detail =
+            "the new catalog was renamed into place but its durability is not confirmed (" + why +
+            "); every file either catalog may name is retained and this store stops serving";
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            unstage_apply_locked(plan);
+            latch_fault_locked(detail);
         }
-        for (uint64_t victim : plan.retiring) retire_head_locked(victim);
-        catalog = plan.candidate;
-        catalog_version++;
-        recount_metadata_locked();
-        counters.heads = uint64_t(catalog.heads.size());
-        counters.objects = uint64_t(objects.size());
-        counters.manifests = uint64_t(head_manifest_bytes.size());
+        why = detail;
+        return CommitOutcome::uncertain;
+    }
+    try {
+        // A failure that only appears while the apply is allocating is the same class of uncertainty as a failed
+        // flush: the renamed file is in place and only a restart can say which catalog is durable.  The injected
+        // fault exists so that path is exercised rather than merely reachable.
+        if (take_fault("catalog-apply")) throw std::bad_alloc();
+        std::lock_guard<std::mutex> guard(mutex);
+        apply_staged_locked(plan);
+    } catch (const std::exception& error) {
+        const std::string detail = std::string("the catalog apply failed after the rename: ") + error.what();
+        std::lock_guard<std::mutex> guard(mutex);
+        latch_fault_locked(detail);
+        why = detail;
+        return CommitOutcome::uncertain;
+    } catch (...) {
+        const std::string detail = "the catalog apply failed after the rename";
+        std::lock_guard<std::mutex> guard(mutex);
+        latch_fault_locked(detail);
+        why = detail;
+        return CommitOutcome::uncertain;
     }
     // Deletions happen here: the authority that named these files is already durable, and the mutex is released.
     reclaim_pending();
-    return true;
+    return CommitOutcome::durable_applied;
 }
 
-bool ConversationStore::Impl::commit_plan(CommitPlan& plan, std::string& why) {
+CommitOutcome ConversationStore::Impl::commit_plan(CommitPlan& plan, std::string& why) {
     return write_catalog_or_refuse(plan, why);
 }
 
@@ -1603,7 +2036,7 @@ bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& 
         plan.retiring.push_back(head_id);
         counters.evictions++;
     }
-    return commit_plan(plan, why);
+    return commit_plan(plan, why) == CommitOutcome::durable_applied;
 }
 
 // Frees `incoming_bytes` before they are written.  Only physically present, unreferenced charge is counted, and an
@@ -1623,8 +2056,12 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
                 why = "the filesystem could not be sampled, so no reservation can be admitted";
                 return false;
             }
-            const bool over_quota = incoming_bytes > options.quota_bytes ||
-                charged > options.quota_bytes - incoming_bytes;
+            // The catalog's own next copy is never spent by a payload, a manifest or an object: ordinary admissions
+            // keep that headroom free, so the commit that follows them - and the eviction commit that makes room for
+            // them - can always be written, and no deletion is ever credited before it happens.
+            const uint64_t reserve = catalog_reserve_locked();
+            const uint64_t committed = sat_add(charged, sat_add(incoming_bytes, reserve));
+            const bool over_quota = committed > options.quota_bytes;
             const bool over_floor = incoming_bytes > free_sample ||
                 free_sample - incoming_bytes < options.min_free_bytes;
             floor_limited = over_floor;
@@ -1638,11 +2075,14 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
                 why = over_quota
                           ? "the shared quota is full and no unpinned, unleased head can be evicted"
                           : "the filesystem floor would be crossed and no unpinned, unleased head can be evicted";
-                why += " (charged " + std::to_string(charged) + ", incoming " +
-                    std::to_string(incoming_bytes) + ", quota " + std::to_string(options.quota_bytes) + ")";
+                why += " (charged " + std::to_string(charged) + ", reserved for the catalog " +
+                    std::to_string(reserve) + ", incoming " + std::to_string(incoming_bytes) + ", quota " +
+                    std::to_string(options.quota_bytes) + ")";
                 return false;
             }
         }
+        // An eviction that itself cannot be committed - a quota or a floor that even a catalog copy cannot be paid
+        // from - is a refusal: it deletes nothing, so it never turns a promise of space into an admitted byte.
         if (!evict_head_durably(victim, why)) return false;
     }
 }
@@ -1875,8 +2315,12 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         return true;
     }
     // Everything is bounded *before* anything is allocated, including a miss and including the caller's own tokens.
-    const uint64_t own_prep = uint64_t(query.tokens.size()) * sizeof(int32_t) +
-                              uint64_t(query.images.size()) * sizeof(ConversationImageKey) + kJobFixedOverhead;
+    // The request's own prefix chain is charged here too: every image key it carries can become one chain state, and
+    // a state is its EVP context as well as its bytes (see kChainBytesPerImageKey).
+    const uint64_t own_prep =
+        uint64_t(query.tokens.size()) * sizeof(int32_t) +
+        uint64_t(query.images.size()) * sizeof(ConversationImageKey) +
+        conversation_store_detail::prefix_chain_workspace(uint64_t(query.images.size())) + kJobFixedOverhead;
     if (jobs.size() >= options.max_read_requests) {
         counters.refused_budget++;
         why = "the store is already holding the maximum number of read requests";
@@ -2265,11 +2709,13 @@ void ConversationStore::Impl::writer_body() {
             durable.pop_front();
             lock.unlock();
             std::string why;
-            const bool ok = commit_plan(work->plan, why);
+            const CommitOutcome outcome = commit_plan(work->plan, why);
             lock.lock();
-            if (!ok) latch_fault_locked("a durable catalog commit failed: " + why);
-            work->ok = ok;
-            work->detail = ok ? std::string() : why;
+            // A refusal that changed nothing durable is an ordinary failure and does not fault the store: the
+            // previously committed authority is still the authority.  Uncertainty is latched by the transaction
+            // itself, and an invalidation that could not be committed faults through its caller either way.
+            if (outcome != CommitOutcome::durable_applied && !why.empty()) work->detail = why;
+            work->ok = outcome == CommitOutcome::durable_applied;
             work->done = true;
             cv_durable.notify_all();
             cv_work.notify_all();
@@ -2294,9 +2740,13 @@ void ConversationStore::Impl::writer_body() {
                 escaped = true;
                 escape_detail = "the publication aborted unexpectedly; the authority is not trusted";
             }
-            // This helper acquires the coordinator lock itself.
-            queue_orphans(job->orphans);
-            reclaim_pending();
+            // This helper acquires the coordinator lock itself.  When the catalog transaction could not confirm its
+            // own durability, every file this attempt created may be named by either catalog and must be retained:
+            // nothing is queued, nothing is deleted, nothing is credited, and the charge stays where it is.
+            if (!job->retain_files) {
+                queue_orphans(job->orphans);
+                reclaim_pending();
+            }
             lock.lock();
             if (escaped) {
                 result = ConversationStorePublishResult{};
@@ -2312,6 +2762,13 @@ void ConversationStore::Impl::writer_body() {
                 ram_held -= std::min(ram_held, job->ram_bytes);
                 ram_lease -= std::min(ram_lease, job->ram_bytes);
                 job->ram_bytes = 0;
+            }
+            // The workspace charge is released here, after the writer's own frame - and with it every chunk, chunk
+            // buffer, map and orphan record it counted for - is really gone.  What the commit retained into the
+            // index has already been counted as metadata by the apply itself.
+            if (job->workspace_bytes) {
+                ram_held -= std::min(ram_held, job->workspace_bytes);
+                job->workspace_bytes = 0;
             }
             // One place counts what a publication attempt cost: anything that did not end in a committed head.
             if (result.status != ConversationStorePublishStatus::stored &&
@@ -2422,6 +2879,67 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             donors.emplace(entry.head_id, conversation_store_detail::ManifestMeta{});   // recorded as unusable
     }
 
+    // ---- the actual prospective peak, counted once the layout and the donors are decoded ----
+    //
+    // This is the second half of the two-stage reservation: the admission counted what the layout and the decode
+    // would need, and now that both exist the chunk, map, orphan, manifest, catalog and apply peak is counted from
+    // the real objects - the actual layout, the adopted counts of the decoded donors and the uncovered gaps - before
+    // one payload byte is read or written.  A publication whose counted peak cannot fit settles as refused_limits;
+    // the reservation is never raised above what it was admitted with unless the counted figure really grew.
+    const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
+    std::vector<uint64_t> stream_chunks(layout.streams.size(), 0);
+    uint64_t peak_chunks = 0;
+    uint64_t chunk_buffer = 0;
+    for (size_t index = 0; index < layout.streams.size(); ++index) {
+        const uint64_t bytes = layout.streams[index].info.bytes;
+        const uint32_t element = layout.streams[index].element;
+        const ConversationStoreStreamId id = layout.streams[index].info.id;
+        // The grid this stream chunks into, plus every chunk a decoded donor's own interval could contribute.
+        uint64_t count = conversation_store_detail::stream_chunk_count(bytes, element, chunk_limit);
+        for (const auto& entry : request.reuse) {
+            if (!(entry.stream == id)) continue;
+            const auto donor = donors.find(entry.head_id);
+            if (donor == donors.end()) continue;
+            for (const auto& candidate : donor->second.streams)
+                if (candidate.id == id) {
+                    count = sat_add(count, conversation_store_detail::donor_chunks_in_interval(
+                                               candidate, entry.source_offset, entry.bytes));
+                    break;
+                }
+        }
+        stream_chunks[index] = count;
+        peak_chunks = sat_add(peak_chunks, count);
+        uint64_t size = chunk_limit;
+        if (element > 1) size -= size % element;
+        if (bytes) chunk_buffer = std::max(chunk_buffer, std::min(size, bytes));
+    }
+    uint64_t retained_donors = 0;
+    if (have_source)
+        retained_donors = sat_add(retained_donors,
+                                  conversation_store_detail::manifest_workspace_bound(
+                                      conversation_store_detail::manifest_encoded_size(source)));
+    for (const auto& donor : donors)
+        retained_donors = sat_add(retained_donors,
+                                  conversation_store_detail::manifest_workspace_bound(
+                                      conversation_store_detail::manifest_encoded_size(donor.second)));
+    WriterWorkspace actual;
+    actual.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
+                                  kJobFixedOverhead);
+    actual.layout = conversation_store_detail::image_layout_workspace(job->shape);
+    actual.donor_decoded = retained_donors;
+    actual.donor_raw_peak = 0;   // every manifest file this attempt read is already released
+    actual.chunks = peak_chunks;
+    actual.buffer = chunk_buffer;
+    const auto manifest_counts = conversation_store_detail::ManifestShape{
+        job->shape.containers, job->shape.records - job->shape.containers, job->shape.kv_layers,
+        job->shape.streams, peak_chunks, peak_chunks, job->shape.cuts};
+    actual.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_counts);
+    actual.catalog_apply = job->catalog_apply_bytes;
+    if (!reserve_writer_workspace(job, actual.peak(), why)) {
+        fail(ConversationStorePublishStatus::refused_limits, why);
+        return;
+    }
+
     // ---- payload: adopt proven intervals, chunk everything else, never write bytes that already exist ----
     std::vector<StreamRecord> streams;
     streams.reserve(layout.streams.size());
@@ -2432,18 +2950,22 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     bool aborted = false;
     bool floor_limited = false;
     ConversationStorePublishStatus abort_status = ConversationStorePublishStatus::failed;
-    const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
     const auto abandon = [&](ConversationStorePublishStatus status, const std::string& detail) {
         aborted = true;
         abort_status = status;
         why = detail;
     };
+    // Every structure that grows once per chunk is reserved to the count this attempt was charged for: nothing below
+    // may reallocate past the reserved workspace, and a chunk vector that grew geometrically would do exactly that.
+    // (The two per-chunk maps have no reserve: their node growth is what the reservation counted.)
+    job->orphans.reserve(size_t(peak_chunks));
 
     for (const auto& stream : layout.streams) {
         const ConversationStoreStreamId id = stream.info.id;
         StreamRecord record;
         record.id = id;
         record.bytes = stream.info.bytes;
+        record.chunks.reserve(size_t(stream_chunks[stream.info.index]));
         // The canonical physical identity of this stream - authorized scope, interpretation and global layer ordinal
         // - computed once and used for every object of the stream, in the writer and in the reader alike.
         Digest identity_scope{};
@@ -2642,11 +3164,13 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     meta.parent = request.supersedes;
     meta.published_order = published_order;
     meta.stages = layout.stages;
-    meta.containers = layout.containers;
+    // Moved, not copied: the layout is finished with (every stream has been emitted) and a second copy of the
+    // container metadata and the cut list would be an allocation the reservation did not need to make.
+    meta.containers = std::move(layout.containers);
     meta.streams = std::move(streams);
     meta.payload_bytes = layout.payload_bytes;
+    meta.cuts = std::move(layout.cuts);
     meta.objects.assign(referenced.begin(), referenced.end());
-    meta.cuts = layout.cuts;
     const std::vector<uint8_t> encoded = conversation_store_detail::manifest_encode(meta);
     if (encoded.size() > limits.max_manifest_bytes) {
         fail(ConversationStorePublishStatus::refused_limits,
@@ -2731,7 +3255,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         head.stages = layout.stages;
         head.pinned = image.pinned();
         head.protected_seg = false;
-        head.cuts = layout.cuts;
+        head.cuts = meta.cuts;   // the moved list: the layout no longer owns one
 
         // A covered replacement must be a proven cover of *this* predecessor, still authorized at commit time, in
         // this branch and epoch, by a newer capture, with every pinned cut of the predecessor preserved as a pin.
@@ -2765,7 +3289,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             for (const auto& cut : source.cuts) {
                 if (!cut.pinned) continue;
                 bool kept = false;
-                for (const auto& ours : layout.cuts)
+                for (const auto& ours : meta.cuts)
                     if (ours.tokens == cut.tokens && ours.digest == cut.digest && ours.pinned) kept = true;
                 if (!kept) covered = false;
             }
@@ -2780,7 +3304,9 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         bool room = obtain_head_slot_locked(plan.candidate, head_id, plan.retiring);
         if (room) {
             cap_protected_locked(plan.candidate);
-            uint64_t estimate = uint64_t(conversation_store_detail::catalog_encode(plan.candidate).size());
+            // Counted, not encoded: this is a measurement, and a measurement must never be the reason bytes are
+            // allocated inside an admission that has already decided what it can afford.
+            uint64_t estimate = conversation_store_detail::catalog_encoded_size(plan.candidate);
             estimate += uint64_t(objects.size() + plan.new_objects.size()) * kObjectBytesEstimate;
             for (const auto& entry : head_objects) estimate += uint64_t(entry.second.size()) * sizeof(Digest);
             estimate += uint64_t(plan.new_objects.size()) * sizeof(Digest);
@@ -2823,15 +3349,22 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         return;
     }
     std::string commit_why;
-    if (!commit_plan(plan, commit_why)) {
+    const CommitOutcome outcome = commit_plan(plan, commit_why);
+    if (outcome == CommitOutcome::unchanged) {
         // The durable catalog is unchanged, so nothing was authorized.  Files this attempt wrote stay accounted
         // orphans whose bytes stay charged until they are confirmed gone, and the predecessor's authority is intact.
-        {
-            std::lock_guard<std::mutex> guard(mutex);
-            latch_fault_locked("the catalog commit failed: " + commit_why);
-        }
+        // This is an ordinary failure of an optional write: it does not fault the store.
         fail(ConversationStorePublishStatus::failed,
-             commit_why.empty() ? "the catalog commit failed" : commit_why);
+             commit_why.empty() ? "the catalog commit was refused" : commit_why);
+        return;
+    }
+    if (outcome == CommitOutcome::uncertain) {
+        // The new catalog may be the durable one, so every file this attempt created may be named by it.  Nothing is
+        // handed to the reclaimer, nothing is credited, and the store has already latched its fault: the next start
+        // re-reads the authority instead of trusting this view.
+        job->retain_files = true;
+        fail(ConversationStorePublishStatus::failed,
+             commit_why.empty() ? "the catalog commit is not confirmed" : commit_why);
         return;
     }
     job->orphans.clear();   // every file this attempt created is now referenced by the committed manifest
@@ -2895,7 +3428,7 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
     // here disables persistence without leaving the lock or a half-armed marker behind.
     bool opened = false;
     try {
-        opened = self.open_root(why) && self.load_catalog(why) && self.reconcile(why);
+        opened = self.open_root(why) && self.read_catalog(why) && self.reconcile(why);
     } catch (const std::exception& error) {
         why = std::string("the store's open sequence failed: ") + error.what();
         opened = false;
@@ -3087,6 +3620,10 @@ void ConversationStore::cancel(uint64_t request_id, uint64_t generation) {
             self.ram_lease -= std::min(self.ram_lease, job->ram_bytes);
             job->ram_bytes = 0;
         }
+        if (job->workspace_bytes) {
+            self.ram_held -= std::min(self.ram_held, job->workspace_bytes);
+            job->workspace_bytes = 0;
+        }
         job->image.reset();
         ConversationStorePublishResult result;
         result.status = ConversationStorePublishStatus::stale;
@@ -3238,14 +3775,44 @@ bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, 
         return false;
     }
     const uint64_t image_bytes = image->bytes();
-    if (image_bytes > self.ram_budget || self.resident_locked() > self.ram_budget - image_bytes) {
+    // The image is not the workspace.  Count what this publication will really allocate - the copied request, the
+    // layout skeleton, its per-record prefix chains and the parent/donor manifest decode - before one byte of it is
+    // allocated, and count the image itself separately: a ticket whose workspace cannot fit settles as refused_limits
+    // instead of overrunning either the allowance or the preparation ceiling.
+    conversation_store_detail::ImageShape shape;
+    if (!conversation_store_detail::image_shape(*image, self.limits, shape, why)) {
+        self.counters.refused_limits++;
+        why = "the publication image is not representable: " + why;
+        return false;
+    }
+    const WriterWorkspace workspace = self.writer_workspace_locked(request, shape);
+    const uint64_t needed = workspace.peak();
+    const uint64_t required = sat_add(image_bytes, needed);
+    // The preparation sub-cap covers the index and the writer alike, so the whole counted peak is checked against
+    // it: the writer's workspace is preparing an index entry, not a payload.
+    if (needed > self.options.metadata_bytes ||
+        self.metadata + self.prep > self.options.metadata_bytes - needed) {
+        self.counters.refused_limits++;
+        why = "the publication's writer workspace does not fit the store's preparation ceiling";
+        return false;
+    }
+    // A transferred lease: the caller's own cache still holds exactly this entry's bytes outside the store's
+    // allowance, so this one publication is fitted against the allowance *plus* that credit.  The credit is clamped
+    // to the image's own size, is granted to no read, and widens nothing else: the store still charges the full
+    // image and the whole counted workspace into ram_held_bytes().
+    const uint64_t credit = std::min(request.external_lease_bytes, image_bytes);
+    const uint64_t envelope = sat_add(self.ram_budget, credit);
+    if (self.ram_budget == 0 || required > envelope) {
         // Speculative read resources are revocable, and an outgoing capture is required work: outstanding prefetch
         // gives way to it before the store declines to persist the image at all.
         self.revoke_speculation_locked(false);
     }
-    if (image_bytes > self.ram_budget || self.resident_locked() > self.ram_budget - image_bytes) {
+    if (self.ram_budget == 0 || required > envelope || self.resident_locked() > envelope - required) {
         self.counters.refused_limits++;
-        why = "the publication image does not fit the published RAM allowance";
+        why = credit
+                  ? "the publication image and its writer workspace do not fit the published RAM allowance plus the "
+                    "lease the caller transferred"
+                  : "the publication image and its writer workspace do not fit the published RAM allowance";
         return false;
     }
     if (self.publishing) {
@@ -3273,6 +3840,10 @@ bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, 
             self.ram_lease -= std::min(self.ram_lease, current->ram_bytes);
             current->ram_bytes = 0;
         }
+        if (current->workspace_bytes) {
+            self.ram_held -= std::min(self.ram_held, current->workspace_bytes);
+            current->workspace_bytes = 0;
+        }
         current->image.reset();
         self.counters.coalesced_publishes++;
         self.push_publish_result_locked(std::move(coalesced));
@@ -3280,10 +3851,16 @@ bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, 
     }
     auto job = std::make_shared<Impl::PublishJob>();
     job->image = std::move(image);
+    // The request copy is allocated here, after its own bytes were counted and admitted above.
     job->request = request;
     job->epoch = request.epoch != 0 ? request.epoch : self.epoch;
     job->ram_bytes = job->image->bytes();
-    self.ram_held += job->ram_bytes;
+    job->workspace_bytes = needed;
+    job->catalog_apply_bytes = workspace.catalog_apply;
+    job->shape = shape;
+    job->external_credit_bytes = credit;
+    // The image alias is the only part of this that is also a lease: the workspace belongs to the writer alone.
+    self.ram_held += job->ram_bytes + needed;
     self.ram_lease += job->ram_bytes;
     self.counters.peak_bytes = std::max(self.counters.peak_bytes, self.ram_held);
     self.publishing = job;
@@ -3363,7 +3940,10 @@ uint64_t ConversationStore::disk_quota_bytes() const {
 
 uint64_t ConversationStore::disk_available_bytes() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->options.quota_bytes > impl_->charged ? impl_->options.quota_bytes - impl_->charged : 0;
+    // The outstanding catalog-copy reservation is part of what is committed: bytes this store may still have to
+    // write for its own authority are never reported as available for payload.
+    const uint64_t committed = sat_add(impl_->charged, impl_->catalog_reserve_locked());
+    return impl_->options.quota_bytes > committed ? impl_->options.quota_bytes - committed : 0;
 }
 
 uint64_t ConversationStore::disk_free_bytes() const {
@@ -3405,7 +3985,11 @@ bool ConversationStore::invalidate_domain(const char* reason) {
         return false;
     }
     if (!work->ok) {
-        self.latch_fault_locked("the domain invalidation could not be committed: " + work->detail);
+        // A safety invalidation that did not commit durably must fault: the marker stays armed either way, so the
+        // next start distrusts this domain rather than trusting an epoch advance this run could not record.
+        self.latch_fault_locked(work->detail.empty()
+                                    ? "the domain invalidation could not be committed"
+                                    : "the domain invalidation could not be committed: " + work->detail);
         return false;
     }
     return true;
@@ -3441,6 +4025,10 @@ void ConversationStore::close() {
                 self.ram_held -= std::min(self.ram_held, job->ram_bytes);
                 self.ram_lease -= std::min(self.ram_lease, job->ram_bytes);
                 job->ram_bytes = 0;
+            }
+            if (job->workspace_bytes) {
+                self.ram_held -= std::min(self.ram_held, job->workspace_bytes);
+                job->workspace_bytes = 0;
             }
             job->image.reset();
             ConversationStorePublishResult result;
@@ -3487,16 +4075,25 @@ void ConversationStore::close() {
         Impl::CommitPlan plan;
         plan.kind = Impl::CommitPlan::Kind::promote;   // commit the live catalog durably, first
         std::string why;
-        if (!self.commit_plan(plan, why)) {
-            std::lock_guard<std::mutex> guard(self.mutex);
-            self.latch_fault_locked("the final catalog commit failed: " + why);
-        } else {
+        const CommitOutcome outcome = self.commit_plan(plan, why);
+        if (outcome == CommitOutcome::durable_applied) {
             // Only now may this run be called clean: the catalog is durable, so the marker can go.
             std::string intent_why;
             const bool cleared = self.write_intent(false, intent_why);
             std::lock_guard<std::mutex> guard(self.mutex);
             self.intent_active = !cleared;
+            // A close that could not prove the marker gone is not a clean close, and the reason is reported as the
+            // fault it is rather than as a successful drain.
             if (!cleared) self.latch_fault_locked("the run-intent marker could not be cleared: " + intent_why);
+        } else {
+            // The final commit either changed nothing durable (its own copy could not be admitted, so the previously
+            // committed catalog is still the authority) or its durability is uncertain.  Neither is a clean close:
+            // the marker stays armed so the next start distrusts this domain.  Uncertainty already latched a fault;
+            // an ordinary refusal is not a fault, it just is not a promise.
+            std::lock_guard<std::mutex> guard(self.mutex);
+            self.intent_active = true;
+            if (outcome == CommitOutcome::uncertain)
+                self.latch_fault_locked(why.empty() ? "the final catalog commit is not confirmed" : why);
         }
     }
     {
@@ -3557,7 +4154,8 @@ std::string ConversationStore::describe() const {
             std::to_string(impl_->options.head_limit) + ", objects " + std::to_string(impl_->objects.size()) +
             ", pub order " + std::to_string(impl_->catalog.published_order_counter) + "\n";
     text += "disk: charged " + std::to_string(impl_->charged) + " of quota " +
-            std::to_string(impl_->options.quota_bytes) + ", reclaimable " + std::to_string(impl_->reclaimable) +
+            std::to_string(impl_->options.quota_bytes) + ", reserved for the catalog's own copy " +
+            std::to_string(impl_->catalog_reserve_locked()) + ", reclaimable " + std::to_string(impl_->reclaimable) +
             ", pending files " + std::to_string(impl_->pending_files.size()) + ", free sampled " +
             std::to_string(impl_->free_sample) + "\n";
     text += "index: " + std::to_string(impl_->metadata) + " of " + std::to_string(impl_->options.metadata_bytes) +
@@ -3575,7 +4173,13 @@ std::string ConversationStore::describe() const {
 
 void ConversationStore::set_publish_fault_for_test(const char* step) {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    impl_->fault_step = step ? step : "";
+    if (!step || !*step) {
+        impl_->fault_steps.clear();
+        return;
+    }
+    // Named steps accumulate and each one fires once, so a test can arm the whole sequence of a transaction (for
+    // example a failed rename flush followed by a failed re-arm flush) before it starts.
+    impl_->fault_steps.insert(step);
 }
 
 uint64_t ConversationStore::source_bytes_read_for_test() const { return impl_->source_bytes_read.load(); }

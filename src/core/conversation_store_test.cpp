@@ -7,12 +7,14 @@
 #include "conversation_store_sha256.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <functional>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -64,6 +66,20 @@ std::string file_digest(const std::string& path) {
     }
     ::close(fd);
     return sha256_hex(sha256(bytes.data(), bytes.size()));
+}
+
+// The physical headroom one catalog copy needs, at the store's own conservative allocated size (block rounded plus
+// one block for the directory entry).  A store must be able to write the copy a commit creates *and* the copy after
+// that, so a quota is only "tight" - not impossible - when it leaves these few copies free: anything less and the
+// store has to refuse rather than spend a promise, and the eviction that would make room could not be written either.
+uint64_t catalog_copy_headroom(const std::string& root) {
+    struct stat info {};
+    if (::stat((root + "/catalog").c_str(), &info) != 0) return uint64_t(1) << 20;
+    const uint64_t charge = (uint64_t(info.st_size) + 4095) / 4096 * 4096 + 4096;
+    // Six copies: the live catalog, the copy a transaction creates, their next-copy room and margin for the growth a
+    // single commit adds (one head and its cuts).  Deliberately generous: the fixture must not drift with the exact
+    // encoding size, and it stays far below the payload a publication needs, so the eviction path is still exercised.
+    return charge * 6;
 }
 
 // A bounded poll for a status the storage threads have to reach.  Deterministic: it only waits for the store's own
@@ -209,6 +225,139 @@ ConversationStoreQuery query_of(const SavedConversation& image, uint64_t request
     return query;
 }
 
+// An appended turn: the live record grows and the K/V extents with it, so every unchanged completed prefix byte keeps
+// its physical identity (see check_reuse).  `seed` is the base fixture's own seed, so the grown turns continue exactly
+// the pattern the fixture wrote.
+SavedConversation appended_turn(const SavedConversation& base, int64_t tokens, int seed) {
+    SavedConversation grown = base;
+    for (int64_t t = int64_t(base.live.ids.size()); t < tokens; ++t)
+        grown.live.ids.push_back(int32_t(uint64_t(seed) * 7 + uint64_t(t)));
+    grown.live.gdn.resize(grown.live.ids.size(), uint8_t(seed));
+    grown.live.ple.resize(grown.live.ids.size() / 2, uint8_t(seed + 1));
+    grown.live.tails.resize(grown.live.ids.size() / 4, uint8_t(seed + 2));
+    grown.live.block_pos.resize(grown.live.ids.size(), uint8_t(seed + 4));
+    for (size_t layer = 0; layer < grown.kv.size(); ++layer) {
+        grown.kv[layer].cells = grown.live.ids.size();
+        grown.kv[layer].k.resize(size_t(grown.live.ids.size()) * 16, uint8_t(seed + int(layer)));
+        grown.kv[layer].v.resize(size_t(grown.live.ids.size()) * 16, uint8_t(seed + 10 + int(layer)));
+    }
+    return grown;
+}
+
+// An image with hundreds of streams and almost no payload: every record is empty and every K/V part is empty, so a
+// reservation that scaled with a configured maximum instead of with the actual object would show up immediately.
+SavedConversation hollow_fixture(uint64_t seed, int checkpoints, int kv_layers) {
+    SavedConversation image;
+    std::memset(image.scope.value.data(), uint8_t((seed | 1) & 0xff), image.scope.value.size());
+    for (int i = 0; i < 18; ++i) image.geometry[size_t(i)] = int64_t(seed) * 1000 + i;
+    image.geometry[1] = 8;   // two global attention layers at a QSA interval of four
+    image.geometry[2] = 4;
+    image.layer_lo = 0;
+    image.layer_hi = 8;
+    image.cvec = true;
+    image.live.used = seed;
+    for (int c = 0; c < checkpoints; ++c) {
+        ConversationCheckpoint checkpoint;
+        checkpoint.used = seed + uint64_t(c);
+        image.checkpoints.push_back(std::move(checkpoint));
+    }
+    for (int layer = 0; layer < kv_layers; ++layer) {
+        ConversationKv kv;
+        kv.format = 0;
+        kv.cells = 1;
+        kv.heads = 1;
+        kv.head_dim = 1;
+        kv.page_size = 1;
+        kv.pooled_rows = 0;
+        kv.idx_dim = 1;
+        image.kv.push_back(std::move(kv));
+    }
+    return image;
+}
+
+// Every regular file under `root`, by relative path: what a transaction may not delete, and what it must not lose.
+std::vector<std::string> file_inventory(const std::string& root) {
+    std::vector<std::string> out;
+    const std::function<void(const std::string&)> walk = [&](const std::string& path) {
+        DIR* dir = ::opendir(path.c_str());
+        if (!dir) return;
+        while (struct dirent* entry = ::readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") continue;
+            const std::string child = path + "/" + name;
+            struct stat info {};
+            if (::stat(child.c_str(), &info) != 0) continue;
+            if (S_ISDIR(info.st_mode))
+                walk(child);
+            else if (S_ISREG(info.st_mode))
+                out.push_back(child.substr(root.size()));
+        }
+        ::closedir(dir);
+    };
+    walk(root);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool inventory_contains(const std::vector<std::string>& inventory, const std::string& entry) {
+    return std::binary_search(inventory.begin(), inventory.end(), entry);
+}
+
+// The entry names of one directory, sorted: used to identify the file a publication just wrote.
+std::vector<std::string> directory_names(const std::string& path) {
+    std::vector<std::string> out;
+    DIR* dir = ::opendir(path.c_str());
+    if (!dir) return out;
+    while (struct dirent* entry = ::readdir(dir)) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        out.push_back(name);
+    }
+    ::closedir(dir);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// One probe of a publication admission against one published allowance.  Every probe uses its own root and its own
+// store: `attempt` seeds whatever state the publication needs (a donor, a predecessor) and returns the request, so no
+// probe can drift with another one's commits.
+bool publication_is_admitted(const ConversationStoreOptions& shape, const SavedConversation& image,
+                             const std::function<ConversationStorePublish(ConversationStore&)>& attempt,
+                             uint64_t allowance) {
+    TempRoot root;
+    ConversationStoreOptions options = shape;
+    options.root = root.path;
+    ConversationStore store(options);
+    if (!store.enabled()) return false;
+    store.publish_read_allowance(allowance);
+    const ConversationStorePublish request = attempt(store);
+    auto shared = std::make_shared<SavedConversation>(image);
+    std::string why;
+    const bool admitted = store.publish(shared, request, why);
+    if (admitted) {
+        ConversationStorePublishResult result;
+        store.wait_publish(result, 5000);
+    }
+    store.close();
+    return admitted;
+}
+
+// The smallest published allowance that admits one publication: the admission figure is counted and deterministic, so
+// its exact boundary is observable by bisection.
+uint64_t publication_admission_floor(const ConversationStoreOptions& shape, const SavedConversation& image,
+                                     const std::function<ConversationStorePublish(ConversationStore&)>& attempt,
+                                     uint64_t high) {
+    uint64_t low = 0;
+    while (low + 1 < high) {
+        const uint64_t mid = low + (high - low) / 2;
+        if (publication_is_admitted(shape, image, attempt, mid))
+            high = mid;
+        else
+            low = mid;
+    }
+    return high;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------------------------------------------
@@ -235,6 +384,11 @@ void check_capacity_floor();
 void check_quota_credit();
 void check_stream_identity();
 void check_corruption();
+void check_writer_workspace();
+void check_reuse_reservation();
+void check_catalog_headroom();
+void check_commit_outcomes();
+void check_bootstrap_and_intent();
 
 } // namespace
 
@@ -265,6 +419,11 @@ int main() {
     check_quota_credit();
     check_stream_identity();
     check_corruption();
+    check_writer_workspace();
+    check_reuse_reservation();
+    check_catalog_headroom();
+    check_commit_outcomes();
+    check_bootstrap_and_intent();
     std::printf("conversation_store_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 #endif
@@ -427,6 +586,37 @@ void check_manifest() {
     meta.objects.emplace_back(chunk.object, 32);
     meta.payload_bytes = 32;
     const std::vector<uint8_t> encoded = conversation_store_detail::manifest_encode(meta);
+    // The writer reserves a container's capacity from the counted size without encoding it, and the store's whole
+    // catalog-copy headroom is derived from the same kind of figure: a counted size must equal the encoded one, or a
+    // reservation would be built on a lie.
+    check_eq(uint64_t(conversation_store_detail::manifest_encoded_size(meta)), uint64_t(encoded.size()),
+             "the counted manifest size is exactly the encoded size");
+    for (int variant = 0; variant < 3; ++variant) {
+        conversation_store_detail::ManifestMeta other = meta;
+        if (variant == 1) {
+            other.containers.clear();
+            other.streams.clear();
+            other.objects.clear();
+            other.cuts.clear();
+        }
+        if (variant == 2) {
+            for (int i = 0; i < 3; ++i) {
+                conversation_store_detail::CutRecord cut;
+                cut.tokens = uint64_t(i + 1);
+                cut.digest = bytes_from("cut");
+                other.cuts.push_back(cut);
+            }
+            for (int i = 0; i < 4; ++i) {
+                conversation_store_detail::StreamRecord copy = stream;
+                copy.chunks.push_back(chunk);
+                other.streams.push_back(std::move(copy));
+            }
+            for (int i = 0; i < 5; ++i) other.objects.emplace_back(bytes_from("object" + std::to_string(i)), 32);
+        }
+        const std::vector<uint8_t> variant_bytes = conversation_store_detail::manifest_encode(other);
+        check_eq(uint64_t(conversation_store_detail::manifest_encoded_size(other)), uint64_t(variant_bytes.size()),
+                 "the counted manifest size is exact for every layout");
+    }
     conversation_store_detail::ManifestMeta decoded;
     std::string why;
     check(conversation_store_detail::manifest_decode(encoded.data(), encoded.size(),
@@ -478,6 +668,32 @@ void check_manifest() {
     head.cuts.push_back(cut);
     catalog.heads.push_back(head);
     const std::vector<uint8_t> catalog_bytes = conversation_store_detail::catalog_encode(catalog);
+    check_eq(uint64_t(conversation_store_detail::catalog_encoded_size(catalog)), uint64_t(catalog_bytes.size()),
+             "the counted catalog size is exactly the encoded size");
+    {
+        conversation_store_detail::Catalog other = catalog;
+        other.domains.push_back(conversation_store_detail::CatalogDomain{bytes_from("other"), 7});
+        for (int i = 0; i < 4; ++i) {
+            conversation_store_detail::CatalogHead extra = head;
+            extra.head_id = 100 + uint64_t(i);
+            extra.cuts.clear();
+            for (int c = 0; c < 3; ++c) {
+                conversation_store_detail::CutRecord extra_cut;
+                extra_cut.tokens = uint64_t(c + 1);
+                extra_cut.digest = bytes_from("cut");
+                extra.cuts.push_back(extra_cut);
+            }
+            other.heads.push_back(std::move(extra));
+        }
+        const std::vector<uint8_t> other_bytes = conversation_store_detail::catalog_encode(other);
+        check_eq(uint64_t(conversation_store_detail::catalog_encoded_size(other)), uint64_t(other_bytes.size()),
+                 "the counted catalog size is exact as the catalog grows");
+        conversation_store_detail::Catalog empty;
+        empty.issuer_key_digest = bytes_from("key");
+        const std::vector<uint8_t> empty_bytes = conversation_store_detail::catalog_encode(empty);
+        check_eq(uint64_t(conversation_store_detail::catalog_encoded_size(empty)), uint64_t(empty_bytes.size()),
+                 "the counted catalog size is exact for an empty catalog");
+    }
     conversation_store_detail::Catalog restored;
     check(conversation_store_detail::catalog_decode(catalog_bytes.data(), catalog_bytes.size(), restored, why),
           "a catalog round-trips");
@@ -1356,7 +1572,9 @@ void check_quota_credit() {
             check(charged > 0, "the pinned branch is charged");
             store.close();
         }
-        ConversationStore store(options_for(path, charged + (uint64_t(4) << 10), 0));
+        // A quota that leaves exactly the physical headroom the store's own catalog copies need - not an exempt
+        // write, and not a promise of a later deletion: every payload admission still has to pay from what is left.
+        ConversationStore store(options_for(path, charged + catalog_copy_headroom(path), 0));
         check(store.enabled(), "the pinned store opens inside its quota");
         const uint64_t before = store.disk_charged_bytes();
         const SavedConversation other_pinned = fixture(203, 4096);
@@ -1401,7 +1619,9 @@ void check_quota_credit() {
             charged = store.disk_charged_bytes();
             store.close();
         }
-        ConversationStore store(options_for(path, charged + (uint64_t(4) << 10), 0));
+        // A quota that leaves exactly the physical headroom the store's own catalog copies need - not an exempt
+        // write, and not a promise of a later deletion: every payload admission still has to pay from what is left.
+        ConversationStore store(options_for(path, charged + catalog_copy_headroom(path), 0));
         check(store.enabled(), "the eviction store opens inside its quota");
         SavedConversation replacement_image = fixture(213, 4096);
         auto replacement = std::make_shared<SavedConversation>(replacement_image);
@@ -1423,6 +1643,307 @@ void check_quota_credit() {
         const ConversationStoreQuery kept = query_of(small_pinned, 5, 5);
         check(!store.matches(kept.selector, kept.tokens, kept.images).empty(),
               "the pinned branch survived the eviction");
+        store.close();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The writer's own workspace: counted before it is allocated, exact at its own boundary, and always given back
+// ---------------------------------------------------------------------------------------------------------------
+
+void check_writer_workspace() {
+    const ConversationStoreOptions shape = options_for("/unused", uint64_t(1) << 30, 0);
+    const auto fresh_branch = [](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = 1;
+        request.generation = 1;
+        return request;
+    };
+
+    // Hundreds of empty streams and a nearly empty payload: a reservation that scaled with a configured maximum rather
+    // than with the actual object would be visible immediately, and the counted peak is exact at its own boundary.
+    const SavedConversation hollow = hollow_fixture(301, 64, 2);
+    const uint64_t hollow_bytes = uint64_t(hollow.bytes());
+    const uint64_t hollow_floor = publication_admission_floor(shape, hollow, fresh_branch, uint64_t(16) << 20);
+    check(hollow_floor > hollow_bytes, "the writer's workspace is charged on top of the image itself");
+    check(hollow_floor - hollow_bytes < (uint64_t(2) << 20),
+          "a hollow image's workspace is counted from its own structures, not a per-stream or per-head maximum");
+    check(publication_is_admitted(shape, hollow, fresh_branch, hollow_floor),
+          "a publication is admitted at exactly its counted peak");
+    check(!publication_is_admitted(shape, hollow, fresh_branch, hollow_floor - 1),
+          "one byte below the counted peak is refused");
+
+    // The preparation ceiling covers the writer as well as the index, and a refusal allocates nothing at all.
+    {
+        TempRoot root;
+        ConversationStoreOptions options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.metadata_bytes = uint64_t(4) << 10;
+        ConversationStore store(options);
+        check(store.enabled(), "a store opens with a four-kilobyte preparation ceiling");
+        const uint64_t held = store.ram_held_bytes();
+        auto image = std::make_shared<SavedConversation>(hollow);
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 1;
+        std::string why;
+        check(!store.publish(image, request, why),
+              "a workspace larger than the store's preparation ceiling is refused");
+        check(!why.empty(), "the refusal carries a reason");
+        check_eq(store.ram_held_bytes(), held, "a refused workspace allocates nothing");
+        check(store.counters().refused_limits > 0, "the refusal is counted as a limit refusal");
+        store.close();
+    }
+
+    // A failed attempt gives the image and the whole counted workspace back, exactly.
+    {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        store.publish_read_allowance(uint64_t(64) << 20);
+        const uint64_t before = store.ram_held_bytes();
+        store.set_publish_fault_for_test("layout");
+        auto image = std::make_shared<SavedConversation>(fixture(302, 4096));
+        ConversationStorePublish request;
+        request.request_id = 3;
+        request.generation = 1;
+        std::string why;
+        check(store.publish(image, request, why), "a publication with a fault ahead of it is admitted");
+        ConversationStorePublishResult result;
+        check(store.wait_publish(result, 5000), "the failed publication settles");
+        check(result.status == ConversationStorePublishStatus::failed,
+              "the injected layout fault fails the publication");
+        check_eq(store.ram_held_bytes(), before, "a failed publication releases its image and its counted workspace");
+        check_eq(store.ram_lease_bytes(), 0, "a failed publication releases its lease");
+        check(store.healthy(), "an ordinary publication failure does not fault the store");
+        store.close();
+    }
+
+    // A stored publication keeps only its retained index entry: what is left charged must be far smaller than the
+    // workspace that was released, or the counted peak would still be held alive.
+    {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        store.publish_read_allowance(uint64_t(64) << 20);
+        const SavedConversation tiny = fixture(303, 256);
+        const uint64_t workspace =
+            publication_admission_floor(shape, tiny, fresh_branch, uint64_t(4) << 20) - uint64_t(tiny.bytes());
+        check(workspace > 0, "the tiny fixture's workspace is a real charge");
+        const uint64_t before = store.ram_held_bytes();
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, tiny, 4, 4, result) &&
+                  result.status == ConversationStorePublishStatus::stored,
+              "the tiny publication is stored");
+        check_eq(store.ram_lease_bytes(), 0, "a stored publication releases its alias");
+        check(store.ram_held_bytes() - before < workspace,
+              "a stored publication retains its index entry and releases its counted workspace");
+        store.close();
+    }
+
+    // A ticket the writer has not begun is refunded at once when it is cancelled.  If the writer won the race the
+    // publication settles normally instead and its charge is released at its end, so the ledger is conserved either
+    // way and only the cancellation branch asserts the stronger, immediate refund.
+    {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        store.publish_read_allowance(uint64_t(1) << 30);
+        const uint64_t before = store.ram_held_bytes();
+        auto image = std::make_shared<SavedConversation>(fixture(304, 65536));
+        ConversationStorePublish request;
+        request.request_id = 5;
+        request.generation = 1;
+        std::string why;
+        check(store.publish(image, request, why), "a large publication is admitted for cancellation");
+        store.cancel(5, 1);
+        ConversationStorePublishResult settled;
+        bool got = false;
+        for (int waited = 0; waited < 5000 && !got; waited += 10) got = store.wait_publish(settled, 10);
+        check(got, "the cancelled ticket settles");
+        check(settled.status == ConversationStorePublishStatus::stale ||
+                  settled.status == ConversationStorePublishStatus::stored,
+              "a cancelled ticket either never started or settled normally");
+        check_eq(store.ram_lease_bytes(), 0, "no publication alias survives its attempt");
+        check(store.ram_held_bytes() >= before, "the ledger never drops below what the store still owns");
+        if (settled.status == ConversationStorePublishStatus::stale)
+            check_eq(store.ram_held_bytes(), before,
+                     "a ticket cancelled before it starts gives its workspace back at once");
+        store.close();
+    }
+
+    // A transferred lease: a shared cache hands the entry over while still holding a lease for exactly its bytes, so
+    // this one publication is fitted against the published allowance *plus* that credit.  The credit is never added
+    // to the allowance itself, is never granted to a read, and cannot claim more than the image being handed over.
+    {
+        const ConversationStoreOptions shape = options_for("/unused", uint64_t(1) << 30, 0);
+        const SavedConversation leased = fixture(305, 4096);
+        const uint64_t floor = publication_admission_floor(shape, leased, fresh_branch, uint64_t(16) << 20);
+        const auto without_credit = [](ConversationStore&) {
+            ConversationStorePublish request;
+            request.request_id = 1;
+            request.generation = 1;
+            return request;
+        };
+        const auto with_credit = [&](ConversationStore&) {
+            ConversationStorePublish request;
+            request.request_id = 1;
+            request.generation = 1;
+            request.external_lease_bytes = uint64_t(leased.bytes());
+            return request;
+        };
+        check(!publication_is_admitted(shape, leased, without_credit, floor - 1),
+              "one byte below the floor is refused without a transferred lease");
+        check(publication_is_admitted(shape, leased, with_credit, floor - 1),
+              "the entry's own lease credit admits the same publication at that allowance");
+        check(!publication_is_admitted(shape, leased, with_credit, 1),
+              "a credit larger than the image is clamped to the image it hands over");
+
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        store.publish_read_allowance(floor - 1);
+        auto image = std::make_shared<SavedConversation>(leased);
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 1;
+        request.external_lease_bytes = uint64_t(leased.bytes()) * 4;   // a claim far beyond the entry itself
+        std::string why;
+        check(store.publish(image, request, why), "the publication is admitted on its own lease's credit");
+        check_eq(store.ram_read_budget(), floor - 1,
+                 "a transferred lease is never added to the published allowance");
+        check_eq(store.ram_available_bytes(), 0,
+                 "the credit leaves no room for a read: the full image and workspace are still charged");
+        ConversationStorePublishResult result;
+        check(store.wait_publish(result, 5000), "the credited publication settles");
+        check_eq(store.ram_lease_bytes(), 0, "the credited publication releases its alias");
+        check(store.ram_held_bytes() >= store.ram_lease_bytes(), "the ledger is conserved after the credit");
+        store.close();
+    }
+}
+
+// The reused bytes are counted before they are adopted: a donor's own finer chunks, a repeated interval and a
+// predecessor that doubles as a donor are all charged from the donor's actual manifest, never from a head-limit maximum.
+void check_reuse_reservation() {
+    const SavedConversation base = fixture(311, 2048);
+    const SavedConversation grown = appended_turn(base, 3072, 311);
+    ConversationStoreOptions shape = options_for("/unused", uint64_t(1) << 30, 0);
+    shape.chunk_bytes = uint64_t(1) << 20;   // 256x coarser than the donor's own grid
+    const uint64_t donor_stream_bytes = uint64_t(base.live.ids.size()) * sizeof(int32_t);
+    const auto idle = [](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = 1;
+        request.generation = 1;
+        return request;
+    };
+    const uint64_t plain_floor = publication_admission_floor(shape, grown, idle, uint64_t(8) << 20);
+    check(publication_is_admitted(shape, grown, idle, plain_floor), "the plain publication is admitted at its floor");
+    check(!publication_is_admitted(shape, grown, idle, plain_floor - 1),
+          "one byte below the plain publication's floor is refused");
+
+    // A donor written with 4 KiB chunks, adopted by a writer whose own grid is 1 MiB: the whole-stream interval ends
+    // where both streams end, so the donor's own chunk boundaries are what the destination adopts.
+    const auto with_donor = [&](ConversationStore& store) {
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, base, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the finer-chunk donor is stored");
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        ConversationStoreReuse interval;
+        interval.head_id = stored.head_id;
+        interval.stream = ConversationStoreStreamId{0, uint16_t(ConversationStoreStreamKind::ids), 0, 0};
+        interval.bytes = donor_stream_bytes;
+        request.reuse.push_back(interval);
+        return request;
+    };
+    const uint64_t donor_floor = publication_admission_floor(shape, grown, with_donor, uint64_t(8) << 20);
+    check(donor_floor > plain_floor, "a named donor's preparation is counted on top of the plain publication");
+    check(publication_is_admitted(shape, grown, with_donor, donor_floor),
+          "the donor publication is admitted at its floor");
+    check(!publication_is_admitted(shape, grown, with_donor, donor_floor - 1),
+          "one byte below the donor publication's floor is refused");
+    check(donor_floor - uint64_t(grown.bytes()) < (uint64_t(256) << 10),
+          "the donor's preparation is bounded by its own manifest charge, not by a head-limit maximum");
+
+    // The same counts with many named donors, including one this store does not retain: an unknown name is a lookup
+    // that fails before it allocates, so it cannot inflate the reservation.
+    const auto with_many_donors = [&](ConversationStore& store) {
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, base, 1, 1, stored), "the many-donor publication's donor is stored");
+        ConversationStorePublish request;
+        request.request_id = 3;
+        request.generation = 2;
+        for (int i = 0; i < 8; ++i) {
+            ConversationStoreReuse interval;
+            interval.head_id = i < 4 ? stored.head_id : uint64_t(0xdead0000 + i);
+            interval.stream = ConversationStoreStreamId{0, uint16_t(ConversationStoreStreamKind::ids), 0, 0};
+            interval.bytes = donor_stream_bytes;
+            request.reuse.push_back(interval);
+        }
+        return request;
+    };
+    const uint64_t many_floor = publication_admission_floor(shape, grown, with_many_donors, uint64_t(8) << 20);
+    check(many_floor < uint64_t(grown.bytes()) + (uint64_t(4) << 20),
+          "many named donors cost their own manifests, never a configured maximum each");
+    check(publication_is_admitted(shape, grown, with_many_donors, many_floor),
+          "the many-donor publication is admitted at its floor");
+
+    // Behaviour through a real store: the finer donor's chunks are really adopted, once per interval even when the
+    // caller repeats one, and a predecessor that is also a donor is decoded (and charged) twice.
+    {
+        TempRoot root;
+        const std::string path = root.path + "/reuse";
+        uint64_t donor_head = 0;
+        {
+            ConversationStoreOptions donor_options = options_for(path, uint64_t(1) << 30, 0);
+            donor_options.chunk_bytes = 4096;
+            ConversationStore donor_store(donor_options);
+            ConversationStorePublishResult stored;
+            check(publish_and_wait(donor_store, base, 1, 1, stored) &&
+                      stored.status == ConversationStorePublishStatus::stored,
+                  "the finer-chunk donor is stored under its own grid");
+            donor_head = stored.head_id;
+            donor_store.close();
+        }
+        ConversationStoreOptions options = options_for(path, uint64_t(1) << 30, 0);
+        options.chunk_bytes = uint64_t(1) << 20;
+        ConversationStore store(options);
+        const auto interval_for = [&](uint64_t head) {
+            ConversationStoreReuse interval;
+            interval.head_id = head;
+            interval.stream = ConversationStoreStreamId{0, uint16_t(ConversationStoreStreamKind::ids), 0, 0};
+            interval.bytes = donor_stream_bytes;
+            return interval;
+        };
+        auto image = std::make_shared<SavedConversation>(base);
+        ConversationStorePublish request;
+        request.request_id = 4;
+        request.generation = 2;
+        request.reuse.push_back(interval_for(donor_head));
+        request.reuse.push_back(interval_for(donor_head));   // repeated: it must not be adopted twice
+        std::string why;
+        check(store.publish(image, request, why), "the repeated-donor publication is admitted");
+        ConversationStorePublishResult result;
+        check(store.wait_publish(result, 5000), "the repeated-donor publication settles");
+        check(result.status == ConversationStorePublishStatus::stored, "the repeated-donor publication is stored");
+        check_eq(result.reused_bytes, donor_stream_bytes, "a repeated donor interval is adopted exactly once");
+        // Every payload byte is adopted, written, or already present as an identical object (the donor's finer grid
+        // shares the short streams with this one, byte for byte), and never covered twice.
+        check(result.new_bytes + result.reused_bytes <= result.payload_bytes,
+              "adopted and newly written chunks cover the payload at most once");
+        check(store.counters().dedup_chunks > 0, "the already present chunks are counted as deduplicated");
+        check(store.counters().reused_chunks >= 2, "the adopted chunks are counted");
+
+        auto cover_image = std::make_shared<SavedConversation>(base);
+        ConversationStorePublish cover;
+        cover.request_id = 5;
+        cover.generation = 3;
+        cover.supersedes = donor_head;
+        cover.cover = true;
+        cover.reuse.push_back(interval_for(donor_head));
+        check(store.publish(cover_image, cover, why),
+              "a cover that also names its own predecessor as a donor is admitted");
+        ConversationStorePublishResult covered;
+        check(store.wait_publish(covered, 5000), "the cover settles");
+        check(covered.status == ConversationStorePublishStatus::replaced,
+              "the cover replaces the predecessor it also read as a donor");
         store.close();
     }
 }
@@ -1489,5 +2010,373 @@ void check_stream_identity() {
     check(!(scoped == wide_first), "another authorized conversation cannot share physical objects");
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The catalog's own copy: headroom reserved, headroom never spent by payload, and credit only after removal
+// ---------------------------------------------------------------------------------------------------------------
+
+void check_catalog_headroom() {
+    TempRoot root;
+    const std::string path = root.path + "/tight";
+    const SavedConversation pinned = fixture(321, 4096);
+    uint64_t charged = 0;
+    {
+        ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, pinned, 1, 1, result) &&
+                  result.status == ConversationStorePublishStatus::stored,
+              "the tight store publishes its pinned branch");
+        charged = store.disk_charged_bytes();
+        check(charged > 0, "the pinned branch is charged");
+        store.close();
+    }
+    // The headroom the store keeps for its own catalog copy is observable as quota - charged - available.
+    uint64_t reserve = 0;
+    {
+        ConversationStore probe(options_for(path, charged + (uint64_t(1) << 20), 0));
+        check(probe.enabled(), "the probe store opens inside a permissive quota");
+        check_eq(probe.disk_charged_bytes(), charged, "reopening the root charges the same physical bytes");
+        reserve = probe.disk_quota_bytes() - probe.disk_charged_bytes() - probe.disk_available_bytes();
+        check(reserve >= (uint64_t(2) << 13), "at least two catalog copies are held back");
+        check(reserve <= (uint64_t(1) << 20), "the held-back headroom is proportional to the catalog, not a default");
+        probe.close();
+    }
+    // A quota that leaves exactly that headroom and nothing else: no payload may be admitted, the durable catalog is
+    // untouched, and the store can still write the catalog its own close needs.
+    {
+        ConversationStoreOptions options = options_for(path, 0, 0);
+        options.quota_bytes = charged + reserve;
+        ConversationStore store(options);
+        check(store.enabled(), "the store opens on a quota that is exactly its own catalog headroom");
+        check_eq(store.disk_available_bytes(), 0, "exactly the catalog's headroom is held back, and nothing is spare");
+        const std::string catalog_before = file_digest(path + "/catalog");
+        auto image = std::make_shared<SavedConversation>(fixture(322, 4096));
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why), "the publication is admitted as a ticket");
+        ConversationStorePublishResult refused;
+        check(store.wait_publish(refused, 5000), "the publication settles");
+        check(refused.status == ConversationStorePublishStatus::refused_quota,
+              "a payload cannot spend the headroom held back for the catalog");
+        check(store.healthy(), "an ordinary quota refusal does not fault the store");
+        check(store.counters().refusals_quota > 0, "the refusal is counted");
+        check_eq(store.disk_charged_bytes(), charged, "a refused publication leaves nothing charged");
+        check(file_digest(path + "/catalog") == catalog_before, "a refused publication wrote no catalog");
+        store.close();
+        check(!store.run_intent_active(), "the close committed its catalog inside the headroom it held back");
+    }
+
+    // The headroom tracks the catalog's growth, block by block, and a store that just crossed an allocation block
+    // still commits and closes cleanly.
+    {
+        const std::string growth_path = root.path + "/growth";
+        ConversationStoreOptions options = options_for(growth_path, uint64_t(1) << 30, 0);
+        options.head_limit = 64;
+        ConversationStore store(options);
+        check(store.enabled(), "the growth store opens");
+        const uint64_t reserve_before =
+            store.disk_quota_bytes() - store.disk_charged_bytes() - store.disk_available_bytes();
+        bool all_stored = true;
+        bool crossed = false;
+        for (int i = 0; i < 24 && !crossed; ++i) {
+            const SavedConversation image = fixture(330 + uint64_t(i), 256);
+            ConversationStorePublishResult result;
+            if (!publish_and_wait(store, image, uint64_t(100 + i), 1, result) ||
+                result.status != ConversationStorePublishStatus::stored)
+                all_stored = false;
+            struct stat info {};
+            if (::stat((growth_path + "/catalog").c_str(), &info) == 0 && uint64_t(info.st_size) > 4096) crossed = true;
+        }
+        check(all_stored, "every head of the growth store is stored");
+        check(crossed, "the catalog grows past one allocation block");
+        const uint64_t reserve_after =
+            store.disk_quota_bytes() - store.disk_charged_bytes() - store.disk_available_bytes();
+        check(reserve_after >= reserve_before, "the held-back headroom grows with the catalog");
+        check(store.healthy(), "the growth store is healthy after crossing the block boundary");
+        store.close();
+        check(!store.run_intent_active(), "the growth store closes cleanly after crossing the block boundary");
+    }
+
+    // A deletion that cannot be confirmed stays charged and stays queued: the credit happens only once the file is
+    // really gone, and it is never spent as room for the bytes that displaced it.
+    {
+        const std::string credit_path = root.path + "/credit";
+        SavedConversation victim = fixture(340, 2048);
+        for (auto& checkpoint : victim.checkpoints) checkpoint.pinned = false;
+        check(!victim.pinned(), "the credit fixture carries no pin, so it can be evicted");
+        std::vector<std::string> before_manifests = directory_names(credit_path + "/manifests");
+        uint64_t charged_now = 0;
+        {
+            ConversationStore store(options_for(credit_path, uint64_t(1) << 30, 0));
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, victim, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "the evictable victim is stored");
+            charged_now = store.disk_charged_bytes();
+            store.close();
+        }
+        std::string victim_manifest;
+        for (const auto& name : directory_names(credit_path + "/manifests"))
+            if (!inventory_contains(before_manifests, name)) victim_manifest = name;
+        check(!victim_manifest.empty(), "the victim's manifest file is identified");
+        const std::string manifest_path = credit_path + "/manifests/" + victim_manifest;
+        ConversationStoreOptions tight = options_for(credit_path, 0, 0);
+        tight.quota_bytes = charged_now + catalog_copy_headroom(credit_path) + 8192;
+        ConversationStore store(tight);
+        check(store.enabled(), "the credit store opens on a tight quota");
+        // A directory where a file used to be cannot be unlinked, so an eviction's removal of that manifest cannot be
+        // confirmed.  The sabotage lands only now, with the victim already authorized: the store has to evict it for
+        // room, and the removal it cannot confirm must stay charged rather than be credited as if it were gone.
+        check(::unlink(manifest_path.c_str()) == 0, "the victim's manifest is replaced by a directory");
+        check(::mkdir(manifest_path.c_str(), 0700) == 0, "the directory takes the manifest's place");
+        const int keep = ::open((manifest_path + "/keep").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (keep >= 0) ::close(keep);
+        auto image = std::make_shared<SavedConversation>(fixture(341, 2048));
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why), "the displacing publication is admitted");
+        ConversationStorePublishResult stored;
+        check(store.wait_publish(stored, 5000), "the displacing publication settles");
+        check(stored.status == ConversationStorePublishStatus::stored,
+              "the displacing publication is stored after evicting the victim");
+        check(store.counters().pending_delete_bytes > 0,
+              "a deletion that could not be confirmed stays charged");
+        check(store.counters().deferred_reclaims > 0, "the failed deletion is counted as deferred");
+        check(store.counters().reclaimed_objects > 0, "the victim's objects were reclaimed and credited");
+        // Repair the sabotage: the next commit's retry finds the file gone and credits it.
+        ::unlink((manifest_path + "/keep").c_str());
+        ::rmdir(manifest_path.c_str());
+        store.close();
+        check_eq(store.counters().pending_delete_bytes, 0,
+                 "the retried deletion is credited once the file is confirmed gone");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Catalog transaction outcomes: an ordinary refusal changes nothing, an unconfirmed rename changes everything
+// ---------------------------------------------------------------------------------------------------------------
+
+void check_commit_outcomes() {
+    // (1) A rename that never happened is an ordinary refusal: the previous authority is intact, the store keeps
+    // serving, and the bytes this attempt wrote come back out of the ledger once they are confirmed gone.
+    {
+        TempRoot root;
+        const std::string path = root.path + "/unchanged";
+        ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+        const SavedConversation head_image = fixture(361, 2048);
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, head_image, 1, 1, head) &&
+                  head.status == ConversationStorePublishStatus::stored,
+              "the predecessor of the refused commit is stored");
+        const uint64_t charged_before = store.disk_charged_bytes();
+        const std::string catalog_before = file_digest(path + "/catalog");
+        store.set_publish_fault_for_test("catalog-rename");
+        auto image = std::make_shared<SavedConversation>(head_image);
+        ConversationStorePublish cover;
+        cover.request_id = 2;
+        cover.generation = 2;
+        cover.supersedes = head.head_id;
+        cover.cover = true;
+        std::string why;
+        check(store.publish(image, cover, why), "the covering publication is admitted");
+        ConversationStorePublishResult refused;
+        check(store.wait_publish(refused, 5000), "the refused commit settles");
+        check(refused.status == ConversationStorePublishStatus::failed, "a refused catalog commit fails the publication");
+        check(!refused.detail.empty(), "the failure carries a reason");
+        check(store.healthy(), "a catalog commit that changed nothing does not fault the store");
+        check_eq(store.counters().heads, 1, "a refused commit authorizes no head and retires none");
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(head.head_id, info), "the predecessor keeps its authority");
+        const ConversationStoreQuery query = query_of(head_image, 3, 3);
+        check(!store.matches(query.selector, query.tokens, query.images).empty(),
+              "the predecessor still answers a lookup");
+        check(file_digest(path + "/catalog") == catalog_before, "a refused commit left the durable catalog alone");
+        check_eq(store.disk_charged_bytes(), charged_before,
+                 "a refused commit credits back everything its attempt wrote");
+        // The store is still a working store: the same publication succeeds once the fault is gone.
+        ConversationStorePublishResult retry;
+        auto retry_image = std::make_shared<SavedConversation>(head_image);
+        check(store.publish(retry_image, cover, why), "the retry is admitted");
+        check(store.wait_publish(retry, 5000), "the retry settles");
+        check(retry.status == ConversationStorePublishStatus::replaced, "the retry replaces the predecessor");
+        store.close();
+    }
+
+    // (2) A rename whose durability cannot be confirmed is uncertainty: every file this attempt wrote is retained,
+    // nothing is deleted or credited, no further transaction or reuse happens, and the close is not a clean one.
+    for (const char* injected : {"catalog-sync", "catalog-apply"}) {
+        TempRoot root;
+        const std::string path = std::string(root.path) + "/uncertain";
+        uint64_t first_epoch = 0;
+        uint64_t head_id = 0;
+        {
+            ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+            const SavedConversation image = fixture(362, 2048);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, image, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "the uncertain-commit store stores its branch");
+            first_epoch = store.epoch();
+            head_id = result.head_id;
+            const std::vector<std::string> before = file_inventory(path);
+            const std::string catalog_before = file_digest(path + "/catalog");
+            const uint64_t charged_before_attempt = store.disk_charged_bytes();
+            store.set_publish_fault_for_test(injected);
+            auto image2 = std::make_shared<SavedConversation>(fixture(363, 2048));
+            ConversationStorePublish request;
+            request.request_id = 2;
+            request.generation = 2;
+            std::string why;
+            check(store.publish(image2, request, why), "the publication that will be uncertain is admitted");
+            ConversationStorePublishResult uncertain;
+            check(store.wait_publish(uncertain, 5000), "the uncertain publication settles");
+            check(uncertain.status == ConversationStorePublishStatus::failed,
+                  "an unconfirmed catalog rename fails the publication");
+            check(!store.healthy(), "an unconfirmed catalog rename latches a fault");
+            // Every file this attempt created - and every file that existed before it - is still there.
+            const std::vector<std::string> after = file_inventory(path);
+            bool retained = true;
+            for (const auto& entry : before)
+                if (!inventory_contains(after, entry)) retained = false;
+            check(retained, "an uncertain commit retains every file that existed before it");
+            check(after.size() > before.size(), "the files this attempt wrote are retained, not cleaned up");
+            // The rename really happened, so the live catalog file *is* the new one - and because that cannot be
+            // confirmed, its bytes and every file it may name stay charged: nothing is credited, and no further
+            // transaction may be written over it.
+            const std::string catalog_after_attempt = file_digest(path + "/catalog");
+            check(catalog_after_attempt != catalog_before,
+                  "an uncertain commit does not pretend the temporary's absence means nothing happened");
+            check(store.disk_charged_bytes() >= charged_before_attempt,
+                  "an uncertain commit credits nothing and keeps every byte it wrote charged");
+            // No further transaction, no reclamation and no reuse: the authority cannot be trusted.
+            check(!store.invalidate_domain("non-finite logits"),
+                  "a safety invalidation cannot commit after an uncertain transaction");
+            store.confirmed_restore(head_id);   // a queued promotion must not be written either
+            ::usleep(50000);
+            check(file_digest(path + "/catalog") == catalog_after_attempt,
+                  "no queued commit is written after an uncertain transaction");
+            check_eq(file_inventory(path).size(), after.size(),
+                     "no queued commit collects garbage after an uncertain transaction");
+            auto third = std::make_shared<SavedConversation>(fixture(364, 2048));
+            ConversationStorePublish blocked;
+            blocked.request_id = 3;
+            blocked.generation = 3;
+            check(!store.publish(third, blocked, why), "a faulted store admits no further publication");
+            const ConversationStoreQuery query = query_of(fixture(362, 2048), 4, 4);
+            check(store.matches(query.selector, query.tokens, query.images).empty(),
+                  "a faulted store answers no lookup");
+            store.close();
+            check(store.run_intent_active(), "an uncertain transaction keeps the run intent armed");
+            check(file_inventory(path) == after, "closing an uncertain store deletes nothing");
+        }
+        {
+            // The next start re-reads the authority instead of trusting the uncertain view.
+            ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+            check(store.enabled(), "the root reopens after an uncertain transaction");
+            check_eq(store.epoch(), first_epoch + 1, "the armed intent makes the next start distrust this domain");
+            const ConversationStoreQuery query = query_of(fixture(362, 2048), 5, 5);
+            check(store.matches(query.selector, query.tokens, query.images).empty(),
+                  "an uncertain run's records are never reused");
+            store.close();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The bootstrap ledger and the run-intent marker: nothing is admitted against a partial ledger, and a re-arm is
+// reported for what it is
+// ---------------------------------------------------------------------------------------------------------------
+
+void check_bootstrap_and_intent() {
+    // (1) A dirty start whose first transaction cannot be paid for does not open at all: the epoch advance it needs
+    // is not recorded, so serving from its own view of the authority would be serving an uncommitted one.
+    {
+        TempRoot root;
+        const std::string path = root.path + "/unclean";
+        uint64_t charged = 0;
+        {
+            // A run that arms its intent and never closes it: the next start must distrust this domain.  Nothing is
+            // published, so there is no record whose removal could free the room the boot transaction needs, and a
+            // brand-new store writes no catalog at all (its domain is re-derived identically on the next start).
+            ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+            check(store.enabled() && store.run_intent_active(), "the first run arms its run intent");
+            charged = store.disk_charged_bytes();
+            check(charged > 0, "the first run charges the control files it created");
+            // No close(): the destructor abandons the run intent.
+        }
+        check(file_digest(path + "/catalog") == "(missing)", "a new store's first open writes no catalog");
+        {
+            ConversationStoreOptions options = options_for(path, 0, 0);
+            options.quota_bytes = charged + (uint64_t(4) << 10);
+            ConversationStore store(options);
+            check(!store.enabled(), "a dirty start without catalog headroom does not open");
+            check(!store.healthy(), "a store that could not record its epoch is not healthy");
+            check(store.run_intent_active(), "the run intent stays armed when the boot transaction is refused");
+            check(store.counters().refusals_quota > 0, "the refused boot transaction is counted");
+            check(store.disk_charged_bytes() < store.disk_quota_bytes(),
+                  "the refused boot transaction admitted nothing");
+            const ConversationStoreQuery query = query_of(fixture(351, 2048), 2, 1);
+            check(store.matches(query.selector, query.tokens, query.images).empty(),
+                  "a store that never opened serves nothing");
+            store.close();
+            check(file_digest(path + "/catalog") == "(missing)",
+                  "closing a store that never opened writes no catalog");
+        }
+        {
+            // With the headroom the store holds back for its own copy, the same dirty start opens, records the epoch
+            // advance and distrusts the previous run's records.
+            ConversationStoreOptions options = options_for(path, 0, 0);
+            options.quota_bytes = charged + catalog_copy_headroom(path);
+            ConversationStore store(options);
+            check(store.enabled(), "the dirty start opens once its own headroom exists");
+            check(store.counters().epoch_advances > 0, "the unclean start advanced the epoch");
+            const ConversationStoreQuery query = query_of(fixture(351, 2048), 3, 1);
+            check(store.matches(query.selector, query.tokens, query.images).empty(), "an unclean start reuses nothing");
+            store.close();
+            check(!store.run_intent_active(), "the repaired run closes cleanly");
+        }
+    }
+
+    // (2) A close that cannot prove its marker removal durably re-arms it and says so; the next start then distrusts
+    // this domain, which is exactly what the re-arm was for.
+    for (const char* extra : {"", "intent-rearm-sync"}) {
+        TempRoot root;
+        const std::string path = std::string(root.path) + "/intent";
+        uint64_t epoch = 0;
+        {
+            ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+            const SavedConversation image = fixture(352, 2048);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, image, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "the intent store stores its branch");
+            epoch = store.epoch();
+            store.set_publish_fault_for_test("intent-unlink-sync");
+            if (*extra) store.set_publish_fault_for_test(extra);
+            store.close();
+            check(!store.healthy(), "a close that cannot prove its marker gone is not a healthy close");
+            check(store.run_intent_active(), "a failed marker removal leaves the run intent armed");
+            const std::string described = store.describe();
+            check(described.find("re-armed") != std::string::npos,
+                  "the re-armed marker is reported rather than hidden");
+            if (*extra)
+                check(described.find("not durably flushed") != std::string::npos,
+                      "a re-arm that could not be flushed is reported as such");
+            else
+                check(described.find("flushed") != std::string::npos,
+                      "a re-arm that was flushed is reported honestly");
+        }
+        {
+            ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+            check(store.enabled(), "the root reopens after a failed marker removal");
+            check_eq(store.epoch(), epoch + 1, "the re-armed marker makes the next start distrust this domain");
+            check(store.run_intent_active(), "the reopened store arms its own intent");
+            store.close();
+        }
+    }
+}
 
 } // namespace

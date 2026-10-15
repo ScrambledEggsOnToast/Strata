@@ -163,9 +163,10 @@ struct ConversationStoreOptions {
     // Extra *same-lineage* publications that may replace the one in flight (see publish()).  Never a second
     // admitted image for a different branch.
     uint32_t max_pending_publishes = 1;
-    // 0: no read allowance has been published yet.  No read materializes and a speculative read is refused, while a
-    // publication is admitted without a fit check (there is no envelope to fit into); publish_read_allowance() is
-    // what makes both absolute.
+    // 0: no read allowance has been published yet.  No read materializes and a speculative read is refused, and no
+    // publication is admitted either: reads and publications are both admitted against this one envelope, and a
+    // publication must fit it as its image *plus* the writer workspace it needs (see publish()).  There is no
+    // admission path that skips the check, and publish_read_allowance() is what makes both absolute.
     uint64_t read_budget_bytes = 0;
 };
 
@@ -330,6 +331,17 @@ struct ConversationStorePublish {
     uint64_t epoch = 0;
     uint64_t supersedes = 0;                 // the head this image was captured from (0 = a new branch)
     bool cover = false;                      // the caller proved it covers `supersedes`' compatible prefix
+    // The bytes of *this image's* lease that the caller has already accounted for outside this store's published
+    // allowance, because a shared cache handed the entry over while still holding a lease for exactly those bytes.
+    // The store fits this one publication against `ram_read_budget() + external_lease_bytes - what it already holds`;
+    // it never grants the credit to read admission, and it still charges the full image *and* its whole counted
+    // writer workspace, so a transferred lease can never become a second shared allowance.
+    // Caller contract: on a successful admission the caller MUST release its matching lease and republish the
+    // allowance (the store now owns the bytes); when the publication is refused or a ticket settles as anything but
+    // stored/replaced/retained_branch, the caller MUST keep its lease.  The store clamps the figure to the image's
+    // own size, so a caller can never claim more credit than the bytes it is handing over, and a publication whose
+    // actual counted peak does not fit is refused before any payload is allocated.
+    uint64_t external_lease_bytes = 0;
     std::vector<ConversationStoreReuse> reuse;
 };
 
@@ -502,10 +514,13 @@ public:
 
     // --- publication --------------------------------------------------------------------------------------
     // The image is an owning frozen lease: the store keeps this alias until the publication finishes and the caller
-    // keeps its own.  One admitted writer image at a time, and it must fit the published RAM allowance exactly like a
-    // read: an image that cannot fit is refused (refused_limits) instead of overrunning the envelope.  While the
-    // writer is busy, a new publication is admitted only when it is proven to be the *same lineage* as the one in
-    // flight (both carry `cover` for the same nonzero `supersedes` and this one is the newer generation): it then
+    // keeps its own.  One admitted writer image at a time, and it is admitted against the published RAM allowance
+    // exactly like a read: the image *and* the bounded writer workspace this attempt will allocate (its copied
+    // request, layout, prefix chains, parent/donor decode, chunk vectors and scratch, object/orphan records, encoded
+    // manifest and catalog copy) must both fit, and a ticket that cannot fit is refused (refused_limits) instead of
+    // overrunning the envelope or the metadata sub-cap.  While the writer is busy, a new publication is admitted only
+    // when it is proven to be the *same lineage* as the one in flight (both carry `cover` for the same nonzero
+    // `supersedes` and this one is the newer generation): it then
     // replaces it, and the replaced request's result is reported as `coalesced`.  A different branch - including a
     // second new branch - is never coalesced: it is refused as `refused_busy`, the in-flight predecessor is left
     // untouched and the newer, optional store is dropped as a safe miss.  The call returns immediately.
@@ -570,8 +585,19 @@ public:
     // Diagnostics for qualification evidence: one bounded line per stage of the open sequence.
     std::string describe() const;
 
-    // Test-only seams (documented, deterministic): force the next publication to fail at a named step, and count the
-    // bytes this module actually read from a payload source.  Empty by default.
+    // Test-only seams (documented, deterministic): arm a named publication/transaction step to fail, and count the
+    // bytes this module actually read from a payload source.  Steps accumulate, and each one fires exactly once;
+    // an empty name disarms every armed step.  Recognised steps:
+    //   "layout"          the image's layout is refused before any payload is read
+    //   "objects"         the next immutable object write fails
+    //   "manifest"        the manifest write fails
+    //   "catalog"         the catalog commit is refused before it plans anything
+    //   "catalog-rename"  the catalog rename fails: nothing durable changed
+    //   "catalog-sync"    the rename succeeded and the root directory flush failed: durability is uncertain
+    //   "catalog-apply"   the rename succeeded and the apply could not allocate: durability is uncertain
+    //   "intent-unlink-sync"  the flush after removing the run-intent marker failed (it is then re-armed)
+    //   "intent-rearm-sync"   the flush of the re-armed run-intent marker failed
+    // An unrecognised step is never taken, so arming one costs nothing.
     void set_publish_fault_for_test(const char* step);
     uint64_t source_bytes_read_for_test() const;
 
