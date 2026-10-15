@@ -11598,7 +11598,7 @@ int main(int argc, char** argv) {
                     },
                     [offer_store, offer_book](uint64_t request_id, uint64_t generation) {
                         if (offer_store == nullptr) return;
-                        offer_store->cancel(request_id, generation);
+                        offer_store->withdraw_prefetch(request_id, generation);
                         offer_book->forget(request_id, generation);
                     });
                 std::string why;
@@ -11673,6 +11673,8 @@ int main(int argc, char** argv) {
             }
             query.generation = offer_id != 0 ? offer_generation : conversation_store->epoch();
             query.deadline_ns = deadline_ns;
+            std::fprintf(stderr, "strata serve: conversation store: demand begin request=%llu generation=%llu tokens=%zu\n",
+                         (unsigned long long) query.request_id, (unsigned long long) query.generation, prompt.size());
             store_allowance();
             std::string why;
             if (!conversation_store->demand(query, why)) {
@@ -11681,11 +11683,21 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation store: demand refused (%s)\n", why.c_str());
                 return out;
             }
+            // Admission owns the descriptor even when no image is delivered. Destroy read aliases first,
+            // then acknowledge every non-mounted exit; a successful mount transfers the lease to the caller.
+            struct UnmountedLease {
+                strata::core::ConversationStore& store;
+                uint64_t request, generation;
+                bool armed = true;
+                ~UnmountedLease() { if (armed) store.release_read(request, generation); }
+            } lease{*conversation_store, query.request_id, query.generation};
+            std::fprintf(stderr, "strata serve: conversation store: demand admitted request=%llu\n",
+                         (unsigned long long) query.request_id);
             strata::core::ConversationStoreRead read;
             const uint64_t wait_started = now_ns();
             for (;;) {
                 if (cancelled()) {
-                    conversation_store->cancel(query.request_id, query.generation);
+                    conversation_store->cancel_read(query.request_id, query.generation);
                     ++store_cancelled;
                     out.status = strata::core::ConversationStoreReadStatus::cancelled;
                     std::fprintf(stderr, "strata serve: conversation store: demand cancelled after %.1f ms\n",
@@ -11696,10 +11708,16 @@ int main(int argc, char** argv) {
                 if (now >= wait_until) break;
                 const uint64_t slice_ms = std::min<uint64_t>(250, (wait_until - now) / 1000000ull + 1);
                 if (conversation_store->wait_ready(query.request_id, query.generation, read, slice_ms)) break;
+                const auto status = conversation_store->request_status(query.request_id, query.generation);
+                if (status != strata::core::ConversationStoreReadStatus::none &&
+                    status != strata::core::ConversationStoreReadStatus::ready) {
+                    read.status = status;
+                    break; // A terminal refusal/cancellation cannot become a deliverable image.
+                }
             }
             if (read.status != strata::core::ConversationStoreReadStatus::ready || !read.image) {
                 // Abandon it: an issued filesystem operation may still finish, but its completion must not publish.
-                conversation_store->cancel(query.request_id, query.generation);
+                conversation_store->cancel_read(query.request_id, query.generation);
                 out.status = read.status == strata::core::ConversationStoreReadStatus::none
                     ? conversation_store->request_status(query.request_id, query.generation) : read.status;
                 std::fprintf(stderr, "strata serve: conversation store: demand for %lld tokens did not produce a "
@@ -11723,16 +11741,9 @@ int main(int argc, char** argv) {
                 !image.scope.matches(scope) || image.cvec != want_cvec || read.tokens <= 0 || !exact_cut ||
                 read.stages != stages.size() + 1) {
                 read.image.reset();
-                conversation_store->release_read(read.request_id, read.generation);
                 out.status = strata::core::ConversationStoreReadStatus::stale;
                 return out;
             }
-            struct UnmountedLease {
-                strata::core::ConversationStore& store;
-                uint64_t request, generation;
-                bool armed = true;
-                ~UnmountedLease() { if (armed) store.release_read(request, generation); }
-            } lease{*conversation_store, read.request_id, read.generation};
             out.status = read.status;
             out.head_id = read.head_id;
             out.epoch = read.epoch;
@@ -11747,11 +11758,14 @@ int main(int argc, char** argv) {
             out.mounted = true;
             out.request_id = query.request_id;
             out.generation = query.generation;
+            std::fprintf(stderr, "strata serve: conversation store: demand ready request=%llu head=%llu tokens=%lld "
+                                 "wait_ms=%.1f\n", (unsigned long long) query.request_id,
+                         (unsigned long long) read.head_id, (long long) read.tokens,
+                         (double) (now_ns() - wait_started) / 1e6);
             // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
             // (ram_lease_bytes) until this process reports the read finished.  That report is release_read(), and the
             // caller makes it at its own end-of-request seam - after the engine's alias of the image is gone, which
-            // the guard above already orders.  A handed-out read is never cancelled: cancel() names a request that has
-            // not been delivered.
+            // the guard above already orders. A handed-out read is never cancelled by cancel_read().
             lease.armed = false;
             return out;
         };

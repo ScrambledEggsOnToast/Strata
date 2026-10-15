@@ -7,6 +7,9 @@
 #include "conversation_store_sha256.hpp"
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -481,6 +484,8 @@ void check_reuse();
 void check_leases_and_budget();
 void check_tight_ram();
 void check_cancel_and_release();
+void check_revoked_prefetch_demand();
+void check_active_prefetch_replacement();
 void check_epoch_and_intent();
 void check_dirty_close();
 void check_ownership_and_close();
@@ -521,6 +526,8 @@ int main() {
     check_leases_and_budget();
     check_tight_ram();
     check_cancel_and_release();
+    check_revoked_prefetch_demand();
+    check_active_prefetch_replacement();
     check_epoch_and_intent();
     check_dirty_close();
     check_ownership_and_close();
@@ -1764,11 +1771,11 @@ void check_leases_and_budget() {
     // A cancelled request is refunded and never delivered.
     const uint64_t before = store.ram_held_bytes();
     check(store.demand(query_of(image, 400, 1), why), "a demand is admitted for cancellation");
-    store.cancel(400, 1);
+    store.cancel_read(400, 1);
     ConversationStoreRead cancelled;
     check(!store.wait_ready(400, 1, cancelled, 200), "a cancelled request is not delivered");
     check(store.ram_held_bytes() <= before, "a cancelled request does not leave a charge behind");
-    store.cancel(4242, 99);  // unknown identifiers are safe
+    store.cancel_read(4242, 99);  // unknown identifiers are safe
     store.close();
 }
 
@@ -2066,6 +2073,116 @@ void check_tight_ram() {
     store.close();
 }
 
+void check_revoked_prefetch_demand() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation image = fixture(162, 256);
+    ConversationStorePublishResult published;
+    check(publish_and_wait(store, image, 1, 1, published) &&
+              published.status == ConversationStorePublishStatus::stored, "the prefetch branch is stored");
+    std::string why;
+    check(store.prefetch(query_of(image, 101, 1), why), "a future request is prefetched");
+    check(await_status(store, 101, 1, ConversationStoreReadStatus::ready), "the future image is materialized");
+    check(store.demand(query_of(image, 102, 1), why), "an earlier demand displaces speculative work");
+    ConversationStoreRead earlier;
+    check(store.wait_ready(102, 1, earlier, 5000) &&
+              earlier.status == ConversationStoreReadStatus::ready, "the earlier demand receives its image");
+    check(store.request_status(101, 1) == ConversationStoreReadStatus::cancelled,
+          "the unused prefetch was revoked");
+    earlier.image.reset();
+    store.release_read(102, 1);
+    check(store.demand(query_of(image, 101, 1), why), "the future request later becomes demand");
+    ConversationStoreRead later;
+    check(store.wait_ready(101, 1, later, 5000) &&
+              later.status == ConversationStoreReadStatus::ready, "a revoked prefetch becomes a deliverable demand");
+    check(later.image && images_equal(*later.image, image, why),
+          "the reissued demand restores the original complete image");
+    later.image.reset();
+    store.release_read(101, 1);
+    check_eq(store.ram_lease_bytes(), 0, "both demand images release their leases");
+
+    store.publish_read_allowance(0);
+    check(store.prefetch(query_of(image, 104, 1), why), "a budget-limited prefetch is registered");
+    check(await_status(store, 104, 1, ConversationStoreReadStatus::refused_budget), "the speculative read is refused");
+    store.publish_read_allowance(uint64_t(64) << 20);
+    check(store.demand(query_of(image, 104, 1), why), "demand retries after its allowance becomes available");
+    ConversationStoreRead budget_retry;
+    check(store.wait_ready(104, 1, budget_retry, 5000) && budget_retry.image &&
+              images_equal(*budget_retry.image, image, why), "a prior speculative budget refusal does not force cold prefill");
+    budget_retry.image.reset();
+    store.release_read(104, 1);
+
+    check(store.prefetch(query_of(image, 103, 1), why), "another request is prefetched");
+    check(await_status(store, 103, 1, ConversationStoreReadStatus::ready), "its image is materialized");
+    store.cancel_read(103, 1);
+    check(!store.demand(query_of(image, 103, 1), why), "explicit caller cancellation cannot be revived as demand");
+    store.release_read(103, 1);
+    store.close();
+}
+
+void check_active_prefetch_replacement() {
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false, open = false, timed_out = false;
+    } gate;
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.max_read_requests = 3;
+    ConversationStore store(options);
+    const SavedConversation image = fixture(163, 256);
+    ConversationStorePublishResult published;
+    check(publish_and_wait(store, image, 1, 1, published) &&
+              published.status == ConversationStorePublishStatus::stored, "the active-reader branch is stored");
+    store.set_read_gate_for_test([](void* context) {
+        auto& state = *static_cast<Gate*>(context);
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.entered = true;
+        state.cv.notify_all();
+        if (!state.cv.wait_for(lock, std::chrono::seconds(5), [&] { return state.open; })) state.timed_out = true;
+    }, &gate);
+    std::string why;
+    check(store.prefetch(query_of(image, 201, 1), why), "the old speculative worker starts");
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        check(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.entered; }),
+              "the real reader holds its reservation before revocation");
+    }
+    check(store.demand(query_of(image, 202, 1), why), "an earlier demand revokes the active prefetch");
+    check(store.demand(query_of(image, 201, 1), why), "a replacement owns the revoked request identity");
+    check(!store.demand(query_of(image, 203, 1), why), "the retiring worker still counts against the descriptor bound");
+    store.withdraw_prefetch(201, 1);
+    store.cancel_publication(201, 1);
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        gate.open = true;
+    }
+    gate.cv.notify_all();
+    ConversationStoreRead earlier;
+    check(store.wait_ready(202, 1, earlier, 5000) && earlier.image &&
+              images_equal(*earlier.image, image, why), "the earlier demand survives active-worker retirement");
+    earlier.image.reset();
+    store.release_read(202, 1);
+    ConversationStoreRead replacement;
+    check(store.wait_ready(201, 1, replacement, 5000) && replacement.image &&
+              images_equal(*replacement.image, image, why),
+          "the replacement survives old-worker cleanup, advisory withdrawal and publication cancellation");
+    replacement.image.reset();
+    store.release_read(201, 1);
+    check_eq(store.ram_lease_bytes(), 0, "active-worker replacement releases every image lease");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    // Cross the descriptor ceiling with withdrawn offers: none may consume a later request's slot.
+    for (uint64_t request = 210; request < 214; ++request) {
+        check(store.prefetch(query_of(image, request, 1), why), "a withdrawn offer leaves room for the next one");
+        check(await_status(store, request, 1, ConversationStoreReadStatus::ready), "the next offered image materializes");
+        store.withdraw_prefetch(request, 1);
+        check(store.request_status(request, 1) == ConversationStoreReadStatus::none,
+              "withdrawal retires an unadopted descriptor");
+    }
+    store.close();
+    check(!gate.timed_out, "the worker gate was released explicitly, not by timeout");
+}
+
 void check_cancel_and_release() {
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
@@ -2079,7 +2196,7 @@ void check_cancel_and_release() {
     // A queued demand that is cancelled is refunded and never delivered.
     const uint64_t before = store.ram_held_bytes();
     check(store.demand(query_of(image, 21, 1), why), "a demand is admitted for cancellation");
-    store.cancel(21, 1);
+    store.cancel_read(21, 1);
     ConversationStoreRead cancelled;
     check(!store.wait_ready(21, 1, cancelled, 300), "a cancelled request is never delivered");
     check(store.request_status(21, 1) == ConversationStoreReadStatus::cancelled,
@@ -2112,8 +2229,8 @@ void check_cancel_and_release() {
     store.release_read(24, 1);
     store.release_read(24, 1);
     check_eq(store.ram_lease_bytes(), 0, "a repeated release is safe and idempotent");
-    store.cancel(4242, 99);   // unknown identifiers are safe
-    store.cancel(0, 0);
+    store.cancel_read(4242, 99);   // unknown identifiers are safe
+    store.cancel_read(0, 0);
     store.close();
 }
 
@@ -2419,7 +2536,7 @@ void check_writer_workspace() {
         request.generation = 1;
         std::string why;
         check(store.publish(image, request, why), "a large publication is admitted for cancellation");
-        store.cancel(5, 1);
+        store.cancel_publication(5, 1);
         ConversationStorePublishResult settled;
         bool got = false;
         for (int waited = 0; waited < 5000 && !got; waited += 10) got = store.wait_publish(settled, 10);

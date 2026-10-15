@@ -127,6 +127,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_store_test src/core/conversation_store_test.cpp src/core/conversation_store.cpp
     src/core/conversation_store_format.cpp src/core/conversation_store_sha256.cpp)
   target_include_directories(conversation_store_test PRIVATE include)
+  target_compile_definitions(conversation_store_test PRIVATE STRATA_STORE_TEST_HOOKS)
   target_link_libraries(conversation_store_test PRIVATE OpenSSL::Crypto Threads::Threads)
   add_test(NAME conversation_store_test COMMAND conversation_store_test)
   set_tests_properties(conversation_store_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)

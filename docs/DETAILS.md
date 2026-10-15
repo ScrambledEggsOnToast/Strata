@@ -1595,6 +1595,10 @@ read, verified and validated first) and then restored exactly like a parked one;
 cancelled or outlasted read is an ordinary miss that falls back to the source the request would have used, so the
 engine still reads the prompt itself. The wait is bounded, honours `STOP`/cancellation, and never runs under the
 request admission or generation-pipe lock.
+Revoked or budget-refused speculation is re-admitted from the complete query when it becomes demand, rather than
+waiting on a retired prefetch. Advisory withdrawal cannot cancel an adopted demand or release its image lease.
+Explicit read cancellation remains terminal until the demand owner acknowledges it; publication cancellation is a
+separate operation. An active retired reader keeps its descriptor, query and allocation charges until it settles.
 
 The frontend may prepare the queued frontier early over a **private inherited control socket** (one
 `SOCK_SEQPACKET` endpoint passed as `STRATA_CONVERSATION_OFFER_FD` - never a listening service, never a public

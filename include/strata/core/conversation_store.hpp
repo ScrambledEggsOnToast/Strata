@@ -489,10 +489,12 @@ public:
     // safe seam.  A demand never revokes anything of its own; it does revoke outstanding speculation.
     bool demand(const ConversationStoreQuery& query, std::string& why);
     bool prefetch(const ConversationStoreQuery& query, std::string& why);
-    // Cancels a request, a prefetch or a not-yet-started publication ticket for (request_id, generation): an issued
-    // filesystem operation may finish, but its completion is dropped, its charge refunded and never delivered.  Safe
-    // with unknown or already-completed identifiers.
-    void cancel(uint64_t request_id, uint64_t generation);
+    // Explicit read cancellation leaves a terminal verdict until its owner calls release_read().
+    // Issued filesystem work may finish, but no cancelled image is delivered.
+    void cancel_read(uint64_t request_id, uint64_t generation);
+    // Withdraw optional work only. Once demand adopts a read, the advisory channel cannot cancel
+    // or release it. Unadopted descriptors are retired; a later demand may submit a fresh query.
+    void withdraw_prefetch(uint64_t request_id, uint64_t generation);
     // Non-blocking: false when nothing is ready.  A returned image is complete and byte-verified, and it was
     // materialized in the epoch this store still serves: a completion of an older epoch, or one produced after the
     // store faulted or closed, is never delivered and never relabelled.  The caller receives the only alias of an
@@ -502,7 +504,7 @@ public:
     // only the caller knows when it is truly done.
     bool take_ready(ConversationStoreRead& out);
     // Bounded wait for the next ready result (own thread only: never call it while holding a caller lock that
-    // cancel() or demand() needs).  timeout_ms 0 = non-blocking.  This and take_ready() above deliver the next
+    // cancel_read() or demand() needs). timeout_ms 0 = non-blocking. This and take_ready() above deliver the next
     // completion of *any* request, so a caller that mounts the image must check request_id/generation or, better, use
     // the request-specific overloads below.
     bool wait_ready(ConversationStoreRead& out, uint64_t timeout_ms);
@@ -540,6 +542,8 @@ public:
     // untouched and the newer, optional store is dropped as a safe miss.  The call returns immediately.
     bool publish(std::shared_ptr<const SavedConversation> image, const ConversationStorePublish& request,
                  std::string& why);
+    // Cancel only a not-yet-started publication, never a read with coincident identifiers.
+    void cancel_publication(uint64_t request_id, uint64_t generation);
     bool take_publish(ConversationStorePublishResult& out);
     bool wait_publish(ConversationStorePublishResult& out, uint64_t timeout_ms);
     bool writer_busy() const;
@@ -614,6 +618,10 @@ public:
     // An unrecognised step is never taken, so arming one costs nothing.
     void set_publish_fault_for_test(const char* step);
     uint64_t source_bytes_read_for_test() const;
+#ifdef STRATA_STORE_TEST_HOOKS
+    // Pause the real worker after reservation, outside the store mutex. Absent from production builds.
+    void set_read_gate_for_test(void (*gate)(void*), void* context);
+#endif
 
 private:
     struct Impl;

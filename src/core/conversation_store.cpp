@@ -656,6 +656,7 @@ struct ConversationStore::Impl {
         bool demand = false;
         bool active = false;              // a reader thread is materializing it right now
         std::atomic<bool> cancelled{false};
+        bool speculation_revoked = false; // internal eviction is retryable demand, unlike caller cancellation
         bool released = false;
         bool handed = false;
         bool leased = false;              // this job holds a slot in head_leases
@@ -677,6 +678,10 @@ struct ConversationStore::Impl {
     std::deque<std::shared_ptr<ReadJob>> queue;      // waiting for the allowance and a slot (demand before prefetch)
     std::deque<std::shared_ptr<ReadJob>> ready;      // settled, waiting for take_ready()
     uint64_t incoming = 0;                           // jobs holding one of Options::max_reads slots
+#ifdef STRATA_STORE_TEST_HOOKS
+    void (*read_gate)(void*) = nullptr;
+    void* read_gate_context = nullptr;
+#endif
 
     // ---- publication ----
     struct PublishJob {
@@ -2382,9 +2387,9 @@ void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) 
         if (!waiting_demand) return;
     }
     for (const auto& job : jobs) {
-        if (job->demand || job->handed || job->released) continue;
-        // Speculative work and speculation that is already materialized both give way to required work: a ready image
-        // is dropped here, so its RAM and its incoming-image slot are back before the demand or capture needs them.
+        if (job->demand || job->handed || job->released || job->cancelled) continue;
+        // Revoking speculative I/O does not cancel the request that may later need this prefix.
+        job->speculation_revoked = true;
         retire_job_locked(job, ConversationStoreReadStatus::cancelled, "revoked in favour of a required operation");
     }
     cv_work.notify_all();
@@ -2392,8 +2397,24 @@ void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) 
 
 bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why) {
     // Dedupe by (request_id, generation): the demand for the same request upgrades the prefetch in place.
-    for (const auto& job : jobs) {
+    for (auto it = jobs.begin(); it != jobs.end(); ++it) {
+        const std::shared_ptr<ReadJob> job = *it;
+        if (job->released) continue; // an old worker may still own a retired descriptor with this identity
         if (job->query.request_id != query.request_id || job->query.generation != query.generation) continue;
+        const bool retryable = job->speculation_revoked ||
+            (!job->cancelled && !job->demand && job->status == ConversationStoreReadStatus::refused_budget);
+        if (demand && retryable && !job->handed && !job->released) {
+            // Keep active retired workers inside the descriptor/byte/slot bounds until they settle.
+            // Retirement removes any queued result before the fresh query can reuse this identity.
+            retire_job_locked(job, ConversationStoreReadStatus::cancelled, "reissued as demand");
+            job->released = true;
+            if (!job->active) erase_job_locked(job);
+            break; // Rebuild the descriptor and revalidate the catalog under the current allowance.
+        }
+        if (job->cancelled) {
+            why = "that request was cancelled";
+            return false;
+        }
         if (job->handed || job->released) {
             why = "that request has already been handed out";
             return false;
@@ -2787,8 +2808,15 @@ void ConversationStore::Impl::reader_body() {
             head_leases[chosen->head_id] += 1;
             chosen->leased = true;
         }
+#ifdef STRATA_STORE_TEST_HOOKS
+        const auto gate = read_gate;
+        void* const gate_context = read_gate_context;
+#endif
         lock.unlock();
         try {
+#ifdef STRATA_STORE_TEST_HOOKS
+            if (gate) gate(gate_context);
+#endif
             read_body(chosen);
             lock.lock();
         } catch (const std::bad_alloc&) {
@@ -3750,7 +3778,7 @@ bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::strin
     return impl_->admit_read_locked(query, false, why);
 }
 
-void ConversationStore::cancel(uint64_t request_id, uint64_t generation) {
+void ConversationStore::cancel_publication(uint64_t request_id, uint64_t generation) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
     if (self.publishing && !self.publishing->started &&
@@ -3781,9 +3809,31 @@ void ConversationStore::cancel(uint64_t request_id, uint64_t generation) {
         self.cv_work.notify_all();
         return;
     }
+}
+
+void ConversationStore::cancel_read(uint64_t request_id, uint64_t generation) {
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
     for (const auto& job : self.jobs) {
+        if (job->released) continue;
         if (job->query.request_id != request_id || job->query.generation != generation) continue;
+        job->speculation_revoked = false; // explicit cancellation wins over a previous internal revocation
         self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the caller cancelled this read");
+        self.cv_work.notify_all();
+        return;
+    }
+}
+
+void ConversationStore::withdraw_prefetch(uint64_t request_id, uint64_t generation) {
+    Impl& self = *impl_;
+    std::lock_guard<std::mutex> guard(self.mutex);
+    for (const auto& entry : self.jobs) {
+        const std::shared_ptr<Impl::ReadJob> job = entry;
+        if (job->released || job->query.request_id != request_id || job->query.generation != generation) continue;
+        if (job->demand || job->handed) return; // the demand owner, not the advisory channel, now owns it
+        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the advisory prefetch was withdrawn");
+        job->released = true;
+        if (!job->active) self.erase_job_locked(job);
         self.cv_work.notify_all();
         return;
     }
@@ -3814,7 +3864,7 @@ bool ConversationStore::wait_ready(uint64_t request_id, uint64_t generation, Con
     std::unique_lock<std::mutex> lock(self.mutex);
     const auto settled = [&]() {
         for (const auto& job : self.jobs)
-            if (job->query.request_id == request_id && job->query.generation == generation)
+            if (!job->released && job->query.request_id == request_id && job->query.generation == generation)
                 return job->handed ||
                        (job->status != ConversationStoreReadStatus::none && !job->active);
         return true;   // an unknown request has settled (as nothing)
@@ -3829,6 +3879,7 @@ void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
     for (const auto& job : self.jobs) {
+        if (job->released) continue;
         if (job->query.request_id != request_id || job->query.generation != generation) continue;
         if (!job->released) {
             job->released = true;
@@ -3853,8 +3904,6 @@ void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
             self.release_head_lease_locked(job);
             job->image.reset();
             self.erase_job_locked(job);
-        } else {
-            self.free_job_prep_locked(job);
         }
         self.cv_work.notify_all();
         return;
@@ -3864,7 +3913,8 @@ void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
 ConversationStoreReadStatus ConversationStore::request_status(uint64_t request_id, uint64_t generation) const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     for (const auto& job : impl_->jobs)
-        if (job->query.request_id == request_id && job->query.generation == generation) return job->status;
+        if (!job->released && job->query.request_id == request_id && job->query.generation == generation)
+            return job->status;
     return ConversationStoreReadStatus::none;
 }
 
@@ -4336,6 +4386,14 @@ void ConversationStore::set_publish_fault_for_test(const char* step) {
 }
 
 uint64_t ConversationStore::source_bytes_read_for_test() const { return impl_->source_bytes_read.load(); }
+
+#ifdef STRATA_STORE_TEST_HOOKS
+void ConversationStore::set_read_gate_for_test(void (*gate)(void*), void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->read_gate = gate;
+    impl_->read_gate_context = context;
+}
+#endif
 
 const char* conversation_store_read_status_name(ConversationStoreReadStatus status) {
     switch (status) {
