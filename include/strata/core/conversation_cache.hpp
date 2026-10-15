@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 #include <string_view>
 #include <type_traits>
@@ -72,6 +73,24 @@ struct ConversationCheckpoint {
         gdn.seal(); ple.seal(); tails.seal(); dead.seal(); block_pos.seal();
         for (auto& part : stage_parts) part.seal();
     }
+    // Freeze every payload for immutable sharing (ConversationBuffer::freeze):
+    // the state arrays seal into shared allocations, this checkpoint's and every
+    // stage part's. No byte is copied; a later write detaches first, so an alias
+    // taken afterwards never observes a byte written through this checkpoint.
+    void freeze() {
+        gdn.seal(); ple.seal(); tails.seal(); dead.seal(); block_pos.seal();
+        for (auto& part : stage_parts) part.freeze();
+    }
+    /// Cheap alias: the token/image/LRU metadata is copied, every payload is
+    /// shared with this (frozen) checkpoint.
+    ConversationCheckpoint frozen_alias() const {
+        ConversationCheckpoint out;
+        out.ids = ids; out.imgs = imgs; out.used = used; out.pinned = pinned;
+        out.gdn = gdn; out.ple = ple; out.tails = tails; out.dead = dead; out.block_pos = block_pos;
+        out.stage_parts.reserve(stage_parts.size());
+        for (const auto& part : stage_parts) out.stage_parts.push_back(part.frozen_alias());
+        return out;
+    }
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
@@ -88,6 +107,17 @@ struct ConversationKv {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
+    void freeze() { k.freeze(); v.freeze(); k_scale.freeze(); v_scale.freeze(); pooled.freeze(); }
+    /// Cheap alias: the layer's identity fields are copied, its payloads shared.
+    ConversationKv frozen_alias() const {
+        ConversationKv out;
+        out.format = format; out.cells = cells; out.heads = heads; out.head_dim = head_dim;
+        out.page_size = page_size; out.pooled_rows = pooled_rows; out.idx_dim = idx_dim;
+        out.k = k.frozen_alias(); out.v = v.frozen_alias();
+        out.k_scale = k_scale.frozen_alias(); out.v_scale = v_scale.frozen_alias();
+        out.pooled = pooled.frozen_alias();
+        return out;
+    }
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
     }
@@ -215,6 +245,32 @@ struct SavedConversation {
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
+    /// Freeze every payload this image owns for immutable sharing: the running
+    /// checkpoint, every parked cut, every K/V layer and every stage image. No
+    /// byte is copied.
+    void freeze() {
+        live.freeze();
+        for (auto& c : checkpoints) c.freeze();
+        for (auto& layer : kv) layer.freeze();
+        for (auto& stage : stage_images) stage.freeze();
+    }
+    /// Cheap alias: metadata is copied, every payload is shared with this image
+    /// (which must be frozen for the alias to be free).
+    SavedConversation frozen_alias() const {
+        SavedConversation out;
+        out.scope = scope; out.geometry = geometry;
+        out.layer_lo = layer_lo; out.layer_hi = layer_hi;
+        out.live = live.frozen_alias();
+        out.checkpoints.reserve(checkpoints.size());
+        for (const auto& c : checkpoints) out.checkpoints.push_back(c.frozen_alias());
+        out.kv.reserve(kv.size());
+        for (const auto& layer : kv) out.kv.push_back(layer.frozen_alias());
+        out.cvec = cvec;
+        out.stage_images.reserve(stage_images.size());
+        for (const auto& stage : stage_images) out.stage_images.push_back(stage.frozen_alias());
+        return out;
+    }
+
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
         for (const auto& c : checkpoints) if (c.pinned) return true;
@@ -230,6 +286,18 @@ struct SavedConversation {
         return n;
     }
 };
+
+/// Freeze a captured image in place and return an immutable alias that shares its
+/// payloads: the NVMe store's publication lease. No payload byte is copied (only
+/// token/image metadata and the frozen segment directories). The returned image
+/// keeps observing exactly the bytes frozen here even if `image` is later mutated
+/// (that mutation detaches its own allocation first) or moved from (the shared
+/// allocations outlive the move through this handle). The store treats the image
+/// as const and must drop the handle when its publication ends.
+inline std::shared_ptr<const SavedConversation> conversation_image_freeze_share(SavedConversation& image) {
+    image.freeze();
+    return std::make_shared<const SavedConversation>(image.frozen_alias());
+}
 
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
@@ -265,6 +333,24 @@ public:
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+
+    // ---- Immutable publication leases -------------------------------------
+    // The store holds an immutable alias of a parked image's payloads while it
+    // writes them (conversation_image_freeze_share). The lease is charged in full
+    // even though its payload is physically shared with the parked entry - the
+    // same "every reference in full" convention the buffers use - so the envelope
+    // never over-commits; the peak is one admitted writer plus one incoming
+    // restore, and release is idempotent per reservation. Refusal is a safe cache
+    // miss: the caller skips publication, not the request.
+    bool try_reserve_lease(size_t bytes) {
+        if (bytes > budget_ - std::min(budget_, held_bytes_)) return false;
+        held_bytes_ += bytes;
+        return true;
+    }
+    void release_lease(size_t bytes) { held_bytes_ -= std::min(held_bytes_, bytes); }
+    size_t leased_bytes() const { return held_bytes_; }
+    /// What the configured budget has to cover: payload + retained reuse + leases.
+    size_t envelope_bytes() const { return bytes() + held_bytes_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
@@ -291,8 +377,8 @@ public:
     size_t retained_bytes() const { return reuse_.bytes(); }
     int64_t unchanged_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
     bool can_fit(size_t incoming, size_t held = 0) const {
-        return enabled() && held <= budget_ && incoming <= budget_ - held &&
-               entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
+        return enabled() && held <= budget_ && incoming <= room(held) &&
+               entries_.size() < slots_ && bytes() <= room(held) - incoming;
     }
 
     // Read-only enumeration: a caller can validate and price every authorized source
@@ -341,9 +427,9 @@ public:
     // evict a queued history before capture can fail or replace its older image.
     // held is a taken incoming image, still alive and fully charged during capture.
     bool reserve_snapshot(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && bytes_ > budget_ - held - incoming) {
+        if (!enabled() || held > budget_ || incoming > room(held)) return false;
+        if (bytes() > room(held) - incoming) reuse_ = {};
+        while (!entries_.empty() && bytes_ > room(held) - incoming) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             if (!evict_oldest()) return false;
@@ -388,9 +474,9 @@ public:
         static_assert(std::is_nothrow_destructible_v<SavedConversation>);
         const size_t n = image.bytes();
         if (!enabled() || !image.scope.valid() || held_entries >= slots_ ||
-            held > budget_ || n > budget_ - held) return false;
+            held > budget_ || n > room(held)) return false;
         const size_t available_entries = slots_ - held_entries;
-        const size_t limit = budget_ - held - n;
+        const size_t limit = room(held) - n;
         size_t count = entries_.size(), remaining = bytes_, replaced = 0, victims = 0;
         for (const auto& old : entries_) if (replaces(old, image)) {
             --count;
@@ -471,7 +557,16 @@ private:
         return old.scope.matches(next.scope) && compatible_pins(old, next);
     }
 
+    // Bytes the envelope can still admit for a new image: budget minus this
+    // image's own held charge, the outstanding publication leases and nothing
+    // else (0 when the charges alone already exceed the budget).
+    size_t room(size_t held) const {
+        if (held_bytes_ > budget_ || held > budget_ - held_bytes_) return 0;
+        return budget_ - held_bytes_ - held;
+    }
+
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+    size_t held_bytes_ = 0;    // outstanding immutable publication leases (see try_reserve_lease)
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;

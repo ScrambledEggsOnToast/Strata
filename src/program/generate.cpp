@@ -30,6 +30,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_store.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -77,6 +78,7 @@
 #include "strata/program/readout_reference.hpp"
 #include "logits_dump.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/conversation_offers.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/serial_judge.hpp"
@@ -497,6 +499,36 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     return true;
 }
 
+// Bounded outstanding token descriptors for the private frontend/native offer channel.  The limit covers the
+// descriptor payload of the prepared frontier (a whole context of int32 tokens is under 1 MiB), never permission for
+// image-sized allocations: the store's own read budget governs those.
+constexpr size_t kConversationOfferBytes = 64u << 20;
+// How long a request waits for its required restore before treating the record as a miss and reading the prompt
+// itself.  It is bounded by the original request deadline when the frontend offered one and the deadline is still
+// ahead; STOP/cancellation always ends the wait immediately.
+constexpr uint64_t kConversationDemandWaitMs = 20000;
+
+/// Canonical, typed, length-delimited byte sequence for the persistent store's execution-domain digest.  Every field
+/// is written as an explicit little-endian u64 tag/value pair, so two builds cannot disagree about the encoding, and
+/// the digest itself is taken with the store module's vetted SHA-256 (this file never implements crypto).
+class ConversationDomainFields {
+public:
+    void u64(uint64_t v) { for (int i = 0; i < 8; ++i) bytes_.push_back(uint8_t(v >> (8 * i))); }
+    void i64(int64_t v) { u64((uint64_t) v); }
+    void tag(std::string_view name) {
+        u64(name.size());
+        bytes_.insert(bytes_.end(), name.begin(), name.end());
+    }
+    void identity(const std::array<uint8_t, 32>& value) {
+        tag("identity");
+        u64(value.size());
+        bytes_.insert(bytes_.end(), value.begin(), value.end());
+    }
+    const std::vector<uint8_t>& bytes() const { return bytes_; }
+private:
+    std::vector<uint8_t> bytes_;
+};
+
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -844,6 +876,25 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    /// --conversation-cache-dir PATH: a private directory on the cache device. Non-empty turns on the persistent
+    /// NVMe store, which also needs --conversation-cache-model-id and --conversation-cache-engine-id (verified
+    /// release identities); without them persistence stays off and parking stays RAM-only.
+    std::string conversation_cache_dir;
+    /// --conversation-cache-disk-mib N: one shared physical quota for the whole store (default 131072 = 128 GiB).
+    int64_t conversation_cache_disk_mib = 131072;
+    /// --conversation-cache-disk-min-free-mib N: filesystem space a new reservation must leave free (default 131072).
+    int64_t conversation_cache_disk_min_free_mib = 131072;
+    /// --conversation-cache-disk-heads N: retained branch heads across the whole store, independent of the RAM slots
+    /// (default 128).
+    int64_t conversation_cache_disk_heads = 128;
+    /// Verified identities (64 hex digits each) from the release artifacts, never a profile name, an alias or a
+    /// sampled fingerprint: --conversation-cache-model-id is the common model/pack identity (draft and layout
+    /// excluded) and --conversation-cache-engine-id the resolved execution domain (layout, arithmetic, draft, kernel
+    /// identity). Either one missing disables persistence rather than authorizing the wrong records.
+    std::array<uint8_t, 32> conversation_cache_model_id{};
+    std::array<uint8_t, 32> conversation_cache_engine_id{};
+    bool conversation_cache_model_id_given = false;
+    bool conversation_cache_engine_id_given = false;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1012,6 +1063,20 @@ void usage() {
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                 "  --conversation-cache-dir PATH  --serve: a private directory on the cache device.  With the two\n"
+                 "                       verified identities below, completed histories persist there and are looked up\n"
+                 "                       by authorized scope + execution domain + exact token/image prefix\n"
+                 "  --conversation-cache-disk-mib N  --serve persistence: one shared physical quota for the store\n"
+                 "                       (default 131072 = 128 GiB), lazily allocated and never split per profile\n"
+                 "  --conversation-cache-disk-min-free-mib N  --serve persistence: filesystem space a new reservation\n"
+                 "                       must leave free (default 131072); a refusal is an ordinary cache miss\n"
+                 "  --conversation-cache-disk-heads N  --serve persistence: retained branch heads across the whole\n"
+                 "                       store (default 128), independent of --conversation-cache-slots\n"
+                 "  --conversation-cache-model-id HEX64  --serve persistence: the verified common model/pack identity\n"
+                 "                       (64 hex digits) from the release artifacts, never a profile name or alias\n"
+                 "  --conversation-cache-engine-id HEX64  --serve persistence: the verified execution domain (state\n"
+                 "                       format, layout, arithmetic, draft and kernel identity).  A missing identity\n"
+                 "                       disables persistence safely instead of authorizing the wrong records\n"
                  "  --prefix-selection longest|cost  --serve: longest valid prefix (default), or measured park +\n"
                  "                       restore + remaining-prefill cost; missing observations keep longest\n"
                  "  --prefix-min-savings-ms N  --serve cost selection: minimum gain over longest (default 0)\n"
@@ -1248,6 +1313,27 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
         out.push_back(id);
     }
     if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
+/// Verified 32-byte release identity from its HEX64 spelling (the conversation cache's persistent store keys its
+/// records on these, so a typo must not silently select a different domain). Not `conversation_scope_parse`: an
+/// identity is not required to be nonzero here - a zero identity is refused later, by name, as missing release data.
+bool parse_identity64(const std::string& text, std::array<uint8_t, 32>& out) {
+    if (text.size() != 64) return false;
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::array<uint8_t, 32> candidate{};
+    for (size_t i = 0; i < candidate.size(); ++i) {
+        const int hi = hex(text[2 * i]), lo = hex(text[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        candidate[i] = uint8_t(16 * hi + lo);
+    }
+    out = candidate;
     return true;
 }
 
@@ -2553,6 +2639,40 @@ int main(int argc, char** argv) {
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-model-id" || a == "--conversation-cache-engine-id") {
+            const std::string value = next(a.c_str());
+            std::array<uint8_t, 32> identity{};
+            if (!parse_identity64(value, identity)) {
+                std::fprintf(stderr, "%s needs 64 hex digits (the verified identity from the release artifacts)\n",
+                             a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-cache-model-id") {
+                o.conversation_cache_model_id = identity;
+                o.conversation_cache_model_id_given = true;
+            } else {
+                o.conversation_cache_engine_id = identity;
+                o.conversation_cache_engine_id_given = true;
+            }
+        }
+        // Longs for the persistent store's quota/floor/head limit: the same range
+        // check the RAM-cache numbers take, in MiB.
+        else if (a == "--conversation-cache-disk-mib" || a == "--conversation-cache-disk-min-free-mib" ||
+                 a == "--conversation-cache-disk-heads") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            const int64_t limit = a == "--conversation-cache-disk-heads"
+                                      ? INT32_MAX : INT64_MAX / (1024 * 1024);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
+            else if (a == "--conversation-cache-disk-min-free-mib") o.conversation_cache_disk_min_free_mib = number;
+            else o.conversation_cache_disk_heads = number;
+        }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -2683,7 +2803,7 @@ int main(int argc, char** argv) {
             o.batch > 0 || o.batch_mtp || o.batch_mtp_pipeline || o.pipeline_windows != 0 ||
             o.spec_split || o.no_pool || o.no_capture || !o.mtp.empty() || o.suffix_draft != 0 ||
             o.lookup_chain != 0 || o.adapt_async || o.adapt_swaps != 0 ||
-            o.prompt_cache != 0 || o.conversation_cache_mib != 0 || !o.greedy ||
+            o.prompt_cache != 0 || o.conversation_cache_mib != 0 || !o.conversation_cache_dir.empty() || !o.greedy ||
             !o.dump_logits.empty() || !o.dump_layers.empty() ||
             std::getenv("STRATA_DUMP_TEACHER_LOGITS") || std::getenv("STRATA_DUMP_COMMITTED_LOGITS") ||
             std::getenv("STRATA_DUMP_FIRST_LOGITS") || std::getenv("STRATA_LOGPOS")) {
@@ -2694,6 +2814,29 @@ int main(int argc, char** argv) {
         }
         o.max_new = 1; // serve's internal admission placeholder; the readout never enters decode
     }
+    // ---- the persistent conversation store's eligibility -------------------
+    // Persistence extends the RAM parking envelope, so it needs parking to be on, a private root directory and both
+    // verified release identities. Anything missing keeps parking RAM-only and says why: a missing identity must
+    // never authorize a different domain's records, and an unusable root is a cache miss rather than a serving
+    // failure (the store itself refuses the root and reports the reason).
+    std::string persistence_disabled_reason;
+    auto persistence_reason = [&]() -> const std::string& {
+        if (o.conversation_cache_dir.empty()) persistence_disabled_reason = "--conversation-cache-dir is unset";
+        else if (!o.conversation_cache_model_id_given)
+            persistence_disabled_reason = "--conversation-cache-model-id is missing";
+        else if (!o.conversation_cache_engine_id_given)
+            persistence_disabled_reason = "--conversation-cache-engine-id is missing";
+        else if (!o.serve) persistence_disabled_reason = "not a serving process";
+        else if (o.prompt_cache <= 0 || o.conversation_cache_mib <= 0 || o.conversation_cache_slots <= 0)
+            persistence_disabled_reason =
+                "parking is off (--prompt-cache, --conversation-cache-mib or --conversation-cache-slots)";
+        else persistence_disabled_reason.clear();
+        return persistence_disabled_reason;
+    };
+    const bool persistence_configured = persistence_reason().empty();
+    if (!o.conversation_cache_dir.empty() && !persistence_configured)
+        std::fprintf(stderr, "strata serve: persistent conversation caching stays off: %s\n",
+                     persistence_disabled_reason.c_str());
     if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
         (o.foreground_budget_ms > 0 && (!o.serve || o.batch < 2 || o.prompt_cache <= 0))) {
         std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
@@ -5193,6 +5336,12 @@ int main(int argc, char** argv) {
             const uint64_t conv = byte_mul((uint64_t) o.conversation_cache_mib, 1ull << 20);
             guest.add("conversation_parked", conv, "--conversation-cache-mib");
         }
+        // The persistent store's own RAM (its metadata index, preparation descriptors and the two bounded I/O slabs)
+        // lives inside the same conversation envelope, so it is priced here as the store's 64 MiB metadata cap plus
+        // one 1 MiB reader and one 1 MiB writer slab rather than as new memory.
+        if (persistence_configured)
+            guest.add("conversation_store_metadata", byte_add(byte_mul(64, 1ull << 20), byte_mul(2, 1ull << 20)),
+                      "conversation cache store: metadata/preparation sub-cap and one reader and writer slab");
         if (o.vision) {
             const uint64_t rows = byte_mul(byte_add((uint64_t) o.max_context, 64), byte_mul((uint64_t) g.n_embd, 4));
             guest.add("vision_embeddings", rows, "--vision image rows, upper bound at the context");
@@ -10641,6 +10790,9 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
+        // Whether the clean-shutdown seam parks the conversation the last request left: a one-shot (ckpt=0) or a
+        // pinned-sibling suffix is deliberately not parked, and QUIT must not override that decision.
+        bool exit_park_allowed = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
@@ -10651,6 +10803,475 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // ---- the persistent conversation store (private, CPU-only) -------------
+        // One coordinator owns the cache root, its catalog, its quota and its storage threads; it is the sole disk
+        // authority and never touches GPU state.  It extends the sources above instead of competing with them: the
+        // RAM/live/resident candidates are enumerated first and an equally long one always wins, so enabling
+        // persistence does not change today's choice.  A store that cannot open (no root, a missing identity, another
+        // owner's lock, an unusable catalog) is an ordinary miss - never a serving failure - and says why.
+        std::unique_ptr<strata::core::ConversationStore> conversation_store;
+        // The store head this session's live state continues from.  A publication supersedes it only when the
+        // outgoing image provably still covers the restored cut (same authorized scope, and the same prefix hash),
+        // which is the same predicate the RAM cache uses before it retires a predecessor.
+        struct StoreLineage {
+            uint64_t head = 0;
+            int64_t cut = 0;
+            uint64_t prefix_hash = 0;
+            strata::core::ConversationScope scope;
+            bool valid = false;
+        };
+        StoreLineage store_lineage;
+        // One entry per published lease not yet released by the store, so its RAM charge is given back and the
+        // lineage can move to the head the store actually created.
+        struct PendingPublish {
+            uint64_t request_id = 0;
+            uint64_t generation = 0;
+            uint64_t supersedes = 0;
+            size_t lease_bytes = 0;
+        };
+        std::deque<PendingPublish> pending_publishes;
+        uint64_t capture_generation = 0;   // publication ordering at capture, never worker completion
+        uint64_t demand_serial = 0;        // demand identifiers for requests that arrived without an offer
+        uint64_t publication_serial = 0;   // publication identifiers, to match asynchronous results
+        uint64_t store_published = 0, store_restored = 0;
+        uint64_t store_refused = 0, store_coalesced = 0, store_cancelled = 0;
+        // Written by the offer channel's own thread, read by this one.
+        std::atomic<uint64_t> store_prefetched{0};
+        // Every engine setting that changes what a saved state means, in one place: the session file's identity and
+        // the persistent store's execution-domain digest both read exactly this, so a file and a stored image can
+        // never disagree about which settings bind them.  Sampling, seeds, draft tuning, the expert tier and the
+        // prompt-reading chunk are deliberately absent (they change what is computed next, not what the cells hold).
+        auto session_config_now = [&]() -> strata::core::SessionConfig {
+            strata::core::SessionConfig c;
+            c.engine_version = STRATA_VERSION;
+#if defined(STRATA_USE_HIP)
+            c.backend = "hip";
+#else
+            c.backend = "cuda";
+#endif
+            c.kv = o.kv;
+            c.max_context = o.max_context;
+            c.kv_resident = o.kv_resident;
+            c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+            const char* rot = std::getenv("STRATA_KV_ROT");
+            c.kv_rot = rot != nullptr && rot[0] == '1';
+            c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
+                      rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
+                      rope_cfg.beta_slow};
+            c.cvec = cvec_digest;
+            c.switches = {
+                {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
+                {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
+                {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
+                {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
+                {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
+                {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
+                {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
+                {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
+                {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
+                {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
+                {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+            return c;
+        };
+        if (persistence_configured) {
+            strata::core::ConversationStoreOptions options;
+            options.root = o.conversation_cache_dir;
+            // The execution domain is a canonical digest of the fields that decide how a stored image must be
+            // interpreted: the verified engine identity, the resolved runtime geometry, the main session's and every
+            // stage's layer carve, device and authoritative K/V form, the draft's own form and presence, the resolved
+            // context/ draft geometry, and the engine's declared setting fingerprint.  Profile names, paths, quotas,
+            // queue limits, sampling and seeds are absent by construction: they do not change what the bytes mean.
+            {
+                ConversationDomainFields fields;
+                fields.tag("strata-conversation-domain");
+                fields.u64(1);                                      // encoding version
+                fields.identity(o.conversation_cache_engine_id);     // verified deployment identity
+                fields.i64((int64_t) stages.size());
+                fields.u64(18);
+                for (const int64_t field : strata::core::conversation_geometry_key(g)) fields.i64(field);
+                fields.i64(ss.layer_lo);
+                fields.i64(ss.layer_hi);
+                const auto add_qsa = [&](const strata::core::QsaState& qsa, bool index) {
+                    fields.i64(qsa.kv_mode);
+                    fields.i64(qsa.kv_int8 ? 1 : 0);
+                    fields.i64(qsa.kv_q4 ? 1 : 0);
+                    fields.i64(qsa.kv_hybrid ? 1 : 0);
+                    fields.i64(qsa.kv_rot ? 1 : 0);
+                    fields.i64(qsa.n_slots);
+                    fields.i64(qsa.max_cells);
+                    fields.i64(index ? 1 : 0);
+                };
+                const auto add_state = [&](const strata::core::SessionState& state, uint64_t ordinal) {
+                    fields.u64(ordinal);
+                    fields.i64(state.layer_lo);
+                    fields.i64(state.layer_hi);
+                    fields.i64(state.allocation_device);
+                    fields.i64(state.qsa_ord0);
+                    fields.i64(state.qsa_alloc);
+                    for (int64_t j = 0; j < state.qsa_alloc; ++j)
+                        add_qsa(state.qsa_states[state.qsa_ord0 + j], true);
+                };
+                add_state(ss, 0);
+                for (size_t k = 0; k < stages.size(); ++k) add_state(stages[k]->ss, (uint64_t) k + 1);
+                fields.u64(use_mtp ? 1 : 0);
+                if (use_mtp) {
+                    fields.i64(mtp.device());
+                    add_qsa(mtp.kv_state(), false);
+                    fields.i64(mtp.max_t());
+                }
+                fields.i64(o.max_context);
+                fields.i64(o.kv_resident);
+                fields.i64(o.mtp_max_t);
+                fields.u64(1);   // the switch fingerprint that follows
+                fields.u64(strata::core::session_config_fingerprint(session_config_now()));
+                // The store module owns the crypto; this file only builds the canonical field sequence.
+                options.domain = strata::core::conversation_store_domain_digest(fields.bytes().data(), fields.bytes().size());
+            }
+            // The verified engine identity is the resolved execution domain's *artifact* binding, so the store's
+            // engine field carries it; the model identity is the release's common model/pack identity, with draft and
+            // layout deliberately excluded (they are part of the resolved domain above).
+            options.engine = o.conversation_cache_engine_id;
+            options.model = o.conversation_cache_model_id;
+            options.quota_bytes = (uint64_t) o.conversation_cache_disk_mib << 20;
+            options.min_free_bytes = (uint64_t) o.conversation_cache_disk_min_free_mib << 20;
+            options.head_limit = (size_t) o.conversation_cache_disk_heads;
+            conversation_store = std::make_unique<strata::core::ConversationStore>(options);
+            if (!conversation_store->enabled()) {
+                std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
+                             conversation_store->disabled_reason());
+            } else {
+                std::fprintf(stderr, "strata serve: conversation store: root=%s quota=%lld MiB floor=%lld MiB "
+                                     "heads=%zu epoch=%llu enabled=1\n",
+                             o.conversation_cache_dir.c_str(), (long long) o.conversation_cache_disk_mib,
+                             (long long) o.conversation_cache_disk_min_free_mib,
+                             (size_t) o.conversation_cache_disk_heads, (unsigned long long) conversation_store->epoch());
+            }
+        }
+        const bool store_on = conversation_store && conversation_store->enabled();
+        // The store's RAM - its metadata index, materialized read images and publication leases - lives inside the
+        // same envelope as the parked conversations (--conversation-cache-mib).  The allowance is what the parked
+        // payloads and the store's own held bytes leave over: a demand request is always admitted and charged, while
+        // an optional prefetch only takes spare allowance, so a full envelope never delays a required restore.
+        auto store_allowance = [&]() -> uint64_t {
+            if (!store_on) return 0;
+            const uint64_t envelope = (uint64_t) o.conversation_cache_mib << 20;
+            const uint64_t mine = conversations.envelope_bytes();
+            const uint64_t held = conversation_store->ram_held_bytes();   // RAM family only: never the disk footprint
+            const uint64_t spare = envelope > mine + held ? envelope - mine - held : 0;
+            conversation_store->publish_read_allowance(spare);   // absolute: recomputed from live accounting
+            return spare;
+        };
+        // A selector is the exactness bucket every lookup and publication shares: the authorized scope and steering
+        // mode per request, and this engine's resolved geometry and layer carve, which are immutable for the cache's
+        // lifetime.  It is built once here and never derived from a profile name or a quota.
+        strata::core::ConversationStoreSelector store_selector_base;
+        store_selector_base.geometry = strata::core::conversation_geometry_key(g);
+        store_selector_base.layer_lo = ss.layer_lo;
+        store_selector_base.layer_hi = ss.layer_hi;
+        // FNV-1a over a token prefix: the coverage proof a publication needs before it may retire a predecessor head.
+        auto token_prefix_hash = [](const int32_t* tokens, size_t count) {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < count; ++i) {
+                h = (h ^ uint64_t(uint32_t(tokens[i]))) * 1099511628211ull;
+            }
+            return h;
+        };
+        // Harvest finished publications: their lease leaves the RAM envelope, and the lineage moves to the head the
+        // store created (so the next turn's publication supersedes that one, not the head it replaced).
+        auto reap_publishes = [&](uint64_t wait_ms) -> size_t {
+            if (!store_on) return 0;
+            size_t reaped = 0;
+            for (;;) {
+                strata::core::ConversationStorePublishResult result;
+                const bool got = reaped == 0 && wait_ms > 0 ? conversation_store->wait_publish(result, wait_ms)
+                                                            : conversation_store->take_publish(result);
+                if (!got) break;
+                ++reaped;
+                size_t at = pending_publishes.size();
+                for (size_t i = 0; i < pending_publishes.size(); ++i)
+                    if (pending_publishes[i].request_id == result.request_id) { at = i; break; }
+                if (at == pending_publishes.size()) continue;   // already reaped (or a foreign result)
+                const PendingPublish pending = pending_publishes[at];
+                pending_publishes.erase(pending_publishes.begin() + (std::ptrdiff_t) at);
+                // The store dropped its alias (or never took it): the charge is ours again either way.
+                conversations.release_lease(pending.lease_bytes);
+                const bool created = result.status == strata::core::ConversationStorePublishStatus::stored ||
+                    result.status == strata::core::ConversationStorePublishStatus::replaced ||
+                    result.status == strata::core::ConversationStorePublishStatus::retained_branch;
+                if (created && store_lineage.valid && pending.supersedes != 0 &&
+                    pending.supersedes == store_lineage.head)
+                    store_lineage.head = result.head_id;
+                if (result.status != strata::core::ConversationStorePublishStatus::stored &&
+                    result.status != strata::core::ConversationStorePublishStatus::replaced &&
+                    result.status != strata::core::ConversationStorePublishStatus::retained_branch) {
+                    ++store_refused;
+                    std::fprintf(stderr, "strata serve: conversation store: publication %s (%s, %llu new bytes)\n",
+                                 strata::core::conversation_store_publish_status_name(result.status),
+                                 result.detail.c_str(), (unsigned long long) result.new_bytes);
+                } else {
+                    ++store_published;
+                    if (result.status == strata::core::ConversationStorePublishStatus::coalesced) ++store_coalesced;
+                    std::fprintf(stderr, "strata serve: conversation store: %s head=%llu tokens_published=%llu "
+                                         "new=%llu reused=%llu released=%d\n",
+                                 strata::core::conversation_store_publish_status_name(result.status),
+                                 (unsigned long long) result.head_id, (unsigned long long) result.payload_bytes,
+                                 (unsigned long long) result.new_bytes, (unsigned long long) result.reused_bytes,
+                                 int(result.released));
+                }
+                if (reaped >= pending_publishes.size() + 4) break;
+            }
+            return reaped;
+        };
+        // The prepared offers the channel accepted.  Its own thread inserts them; the request path only looks up the
+        // deadline of the offer a request binds to (the internal stdin key carries the identifiers, not the tokens,
+        // which the store already holds).  Bounded identifiers and deadlines, never a payload.
+        struct OfferBook {
+            struct Entry { uint64_t request_id = 0, generation = 0, deadline_ns = 0; size_t tokens = 0; };
+            void remember(uint64_t request_id, uint64_t generation, uint64_t deadline_ns, size_t tokens) {
+                std::lock_guard<std::mutex> lock(mu);
+                for (const auto& entry : entries)
+                    if (entry.request_id == request_id && entry.generation == generation) return;
+                entries.push_back(Entry{request_id, generation, deadline_ns, tokens});
+                while (entries.size() > kKeep) entries.pop_front();
+                ++accepted;
+            }
+            void forget(uint64_t request_id, uint64_t generation) {
+                std::lock_guard<std::mutex> lock(mu);
+                for (auto it = entries.begin(); it != entries.end(); ++it)
+                    if (it->request_id == request_id && it->generation == generation) {
+                        entries.erase(it);
+                        return;
+                    }
+            }
+            std::optional<uint64_t> deadline(uint64_t request_id, uint64_t generation) const {
+                std::lock_guard<std::mutex> lock(mu);
+                for (const auto& entry : entries)
+                    if (entry.request_id == request_id && entry.generation == generation) return entry.deadline_ns;
+                return std::nullopt;
+            }
+            static constexpr size_t kKeep = 8;   // the accepted frontier, oldest first
+            mutable std::mutex mu;
+            std::deque<Entry> entries;
+            uint64_t accepted = 0;
+        };
+        std::shared_ptr<OfferBook> offer_book = std::make_shared<OfferBook>();
+        // ---- published RAM availability (offer filter only) --------------------
+        // The offer callback runs on the channel's thread and must not inspect the mutable RAM cache or GPU state.  It
+        // consults this small published view instead: per (authorized scope, steering) the longest cut the engine
+        // already holds in RAM (live session, checkpoints, parked histories, resident owners) with the exact prefix
+        // hash of that cut's own tokens.  It only suppresses a speculative read when the offered prompt provably starts
+        // with an equal or longer RAM cut - otherwise generation would select RAM while the store reads the same
+        // prefix from disk.  It is a filter, never a selector: the demand path re-enumerates every source and
+        // revalidates the record at its own safe seam.  Owners update it at their own mutation points (main thread).
+        struct RamCut {
+            strata::core::ConversationScope scope;
+            bool cvec = true;
+            int64_t tokens = 0;
+            uint64_t hash = 0;   // FNV-1a over the cut's own token ids
+        };
+        struct RamView {
+            std::vector<RamCut> cuts;   // at most one (the longest) per scope and steering mode
+        };
+        std::mutex ram_view_mu;
+        std::shared_ptr<const RamView> ram_view = std::make_shared<const RamView>();
+        // Assigned once the resident slots exist (the definition below captures them); empty until then, and the
+        // offers that could consult it cannot arrive before the channel is started.
+        std::function<void()> publish_ram_view = [] {};
+        std::atomic<uint64_t> prefetch_suppressed{0};
+        // The private inherited channel (one SOCK_SEQPACKET endpoint, no listening socket).  It is CPU-only: the
+        // callback below validates nothing about GPU state and only hands a prepared request to the store, which does
+        // its own bounded lookup and bounded read.  Constructed whenever the frontend passed the endpoint, so a
+        // disabled store still drains it instead of letting the frontend block on a full socket buffer.
+        std::unique_ptr<strata::program::ConversationOfferChannel> offer_channel;
+        {
+            const int offer_fd = strata::program::inherited_conversation_offer_fd();
+            if (offer_fd >= 0) {
+                // The pair prepares one queued candidate, the batched three-GPU profile two.
+                const size_t frontier = o.batch >= 2 ? 2 : 1;
+                strata::core::ConversationStore* const offer_store = store_on ? conversation_store.get() : nullptr;
+                offer_channel = std::make_unique<strata::program::ConversationOfferChannel>(
+                    offer_fd, (size_t) std::max<int64_t>(o.max_context, 1), frontier, kConversationOfferBytes,
+                    [offer_store, offer_book, &store_prefetched, &prefetch_suppressed, &ram_view, &ram_view_mu,
+                     base = store_selector_base](strata::program::ConversationOffer&& offer) -> bool {
+                        if (offer_store == nullptr) return false;   // persistence is off: no offer is accepted
+                        strata::core::ConversationStoreQuery query;
+                        query.selector = base;
+                        query.selector.scope = offer.scope;
+                        query.selector.cvec = offer.cvec;
+                        query.tokens = std::move(offer.tokens);
+                        query.request_id = offer.request_id;
+                        query.generation = offer.generation;
+                        query.deadline_ns = offer.deadline_ns;
+                        if (query.tokens.empty()) return false;
+                        // What the store could restore for this request at all (cheap catalog metadata, no payload).
+                        int64_t stored_cut = -1;
+                        offer_store->for_each_match(query.selector, query.tokens, query.images,
+                            [&](const strata::core::ConversationStoreMatch& match) {
+                                if (stored_cut < 0) stored_cut = match.tokens;   // longest first
+                            });
+                        if (stored_cut <= 0) return false;   // nothing eligible is stored: no read to start
+                        // An equal or longer RAM/live/resident cut makes the read pure device contention: generation
+                        // would select RAM and never touch it.  Compare exact prefixes, in one pass over the prompt.
+                        std::shared_ptr<const RamView> view;
+                        {
+                            std::lock_guard<std::mutex> lock(ram_view_mu);
+                            view = ram_view;
+                        }
+                        bool covered = false;
+                        if (view && !view->cuts.empty()) {
+                            std::vector<int64_t> wanted;
+                            for (const RamCut& cut : view->cuts)
+                                if (cut.scope.matches(offer.scope) && cut.cvec == offer.cvec &&
+                                    cut.tokens >= stored_cut && cut.tokens <= (int64_t) query.tokens.size())
+                                    wanted.push_back(cut.tokens);
+                            if (!wanted.empty()) {
+                                std::sort(wanted.begin(), wanted.end());
+                                wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+                                std::vector<std::pair<int64_t, uint64_t>> hashes;
+                                uint64_t h = 1469598103934665603ull;
+                                size_t at = 0;
+                                for (size_t i = 0; i < query.tokens.size() && at < wanted.size(); ++i) {
+                                    h = (h ^ uint64_t(uint32_t(query.tokens[i]))) * 1099511628211ull;
+                                    while (at < wanted.size() && wanted[at] == (int64_t) (i + 1)) {
+                                        hashes.emplace_back(wanted[at], h);
+                                        ++at;
+                                    }
+                                }
+                                for (const RamCut& cut : view->cuts) {
+                                    if (!cut.scope.matches(offer.scope) || cut.cvec != offer.cvec ||
+                                        cut.tokens < stored_cut) continue;
+                                    for (const auto& [n, hash] : hashes)
+                                        if (n == cut.tokens && hash == cut.hash) covered = true;
+                                }
+                            }
+                        }
+                        if (covered) {
+                            prefetch_suppressed.fetch_add(1, std::memory_order_relaxed);
+                            return false;   // RAM already covers it: no speculative read, the demand revalidates
+                        }
+                        std::string why;
+                        if (!offer_store->prefetch(query, why)) return false;
+                        offer_book->remember(offer.request_id, offer.generation, offer.deadline_ns, query.tokens.size());
+                        store_prefetched.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    },
+                    [offer_store, offer_book](uint64_t request_id, uint64_t generation) {
+                        if (offer_store == nullptr) return;
+                        offer_store->cancel(request_id, generation);
+                        offer_book->forget(request_id, generation);
+                    });
+                std::string why;
+                const std::array<uint8_t, 32> key = store_on ? conversation_store->issuer_key() : std::array<uint8_t, 32>{};
+                if (!offer_channel->start(key, store_on ? conversation_store->epoch() : 0, store_on, why)) {
+                    std::fprintf(stderr, "strata serve: conversation offer channel unavailable (%s); prepared "
+                                         "requests are not offered\n", why.c_str());
+                    offer_channel.reset();
+                }
+            }
+        }
+        // The mounted image's own reference: the store drops its alias when the read is handed over, so this keeps the
+        // payloads alive exactly as long as the engine's incoming image needs them.
+        // Demand restore at the request's own safe seam.  The store re-confirms the exact authorized prefix from its
+        // catalog, builds the whole image on the host - never through GPU state - and hands it over complete and
+        // byte-verified.  A missing, corrupt, stale, refused or cancelled record is an ordinary miss: the caller
+        // keeps the selection it already had and reads the prompt itself.  Nothing here runs under the request
+        // admission or the generation pipe lock, and the wait is bounded and cancellable.
+        struct StoreDemandResult {
+            strata::core::ConversationStoreReadStatus status = strata::core::ConversationStoreReadStatus::none;
+            uint64_t head_id = 0;
+            int64_t tokens = 0;
+            bool live = false;
+            uint32_t stages = 0;
+            uint64_t payload_bytes = 0;
+            bool mounted = false;      // the engine took an alias: the read is transferred and must be released
+            uint64_t request_id = 0, generation = 0;
+        };
+        auto store_demand_restore = [&](const std::vector<int32_t>& prompt,
+                                        const std::vector<ImgKey>& imgs,
+                                        const strata::core::ConversationScope& scope, bool want_cvec,
+                                        uint64_t offer_id, uint64_t offer_generation,
+                                        const std::function<bool()>& cancelled,
+                                        std::optional<strata::core::SavedConversation>& incoming) -> StoreDemandResult {
+            StoreDemandResult out;
+            if (!store_on) {
+                out.status = strata::core::ConversationStoreReadStatus::disabled;
+                return out;
+            }
+            const auto now_ns = [] {
+                return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now().time_since_epoch()).count();
+            };
+            uint64_t deadline_ns = 0;
+            if (offer_id != 0) {
+                const auto remembered = offer_book->deadline(offer_id, offer_generation);
+                if (remembered && *remembered > now_ns()) deadline_ns = *remembered;
+            }
+            const uint64_t wait_until = std::min<uint64_t>(
+                deadline_ns ? deadline_ns : UINT64_MAX, now_ns() + kConversationDemandWaitMs * 1000000ull);
+            strata::core::ConversationStoreQuery query;
+            query.selector = store_selector_base;
+            query.selector.scope = scope;
+            query.selector.cvec = want_cvec;
+            query.tokens = prompt;
+            query.images = imgs;
+            query.request_id = offer_id != 0 ? offer_id : ++demand_serial;
+            query.generation = offer_id != 0 ? offer_generation : conversation_store->epoch();
+            query.deadline_ns = deadline_ns;
+            store_allowance();
+            std::string why;
+            if (!conversation_store->demand(query, why)) {
+                out.status = conversation_store->request_status(query.request_id, query.generation);
+                if (!why.empty())
+                    std::fprintf(stderr, "strata serve: conversation store: demand refused (%s)\n", why.c_str());
+                return out;
+            }
+            strata::core::ConversationStoreRead read;
+            const uint64_t wait_started = now_ns();
+            for (;;) {
+                if (cancelled()) {
+                    conversation_store->cancel(query.request_id, query.generation);
+                    ++store_cancelled;
+                    out.status = strata::core::ConversationStoreReadStatus::cancelled;
+                    std::fprintf(stderr, "strata serve: conversation store: demand cancelled after %.1f ms\n",
+                                 (double) (now_ns() - wait_started) / 1e6);
+                    return out;
+                }
+                const uint64_t now = now_ns();
+                if (now >= wait_until) break;
+                const uint64_t slice_ms = std::min<uint64_t>(250, (wait_until - now) / 1000000ull + 1);
+                if (conversation_store->wait_ready(read, slice_ms)) break;
+            }
+            if (read.status != strata::core::ConversationStoreReadStatus::ready || !read.image) {
+                // Abandon it: an issued filesystem operation may still finish, but its completion must not publish.
+                conversation_store->cancel(query.request_id, query.generation);
+                out.status = read.status == strata::core::ConversationStoreReadStatus::none
+                    ? conversation_store->request_status(query.request_id, query.generation) : read.status;
+                std::fprintf(stderr, "strata serve: conversation store: demand for %lld tokens did not produce a "
+                                     "restorable image (%s %s)\n", (long long) prompt.size(),
+                             strata::core::conversation_store_read_status_name(out.status), read.detail.c_str());
+                return out;
+            }
+            out.status = read.status;
+            out.head_id = read.head_id;
+            out.tokens = read.tokens;
+            out.live = read.live;
+            out.stages = read.stages;
+            out.payload_bytes = read.payload_bytes;
+            // Cheap immutable alias: metadata is copied, payloads are shared with the read image, and the read
+            // image is released here, so the mounted copy owns its buffers alone (a later write never detaches).
+            incoming.emplace(read.image->frozen_alias());
+            read.image.reset();
+            out.mounted = true;
+            out.request_id = query.request_id;
+            out.generation = query.generation;
+            // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
+            // (ram_lease_bytes) until the engine's own alias dies: the caller records the transfer and releases it
+            // through release_read() at its own end-of-request seam.  cancel() is refused for a transferred image.
+            conversation_store->transfer_read_image(query.request_id, query.generation);
+            conversation_store->confirmed_restore(out.head_id);
+            ++store_restored;
+            return out;
+        };
         using strata::program::PrefixTransfer;
         using strata::program::PrefixWork;
         strata::program::PrefixCosts prefix_costs;
@@ -10772,38 +11393,7 @@ int main(int argc, char** argv) {
                     return false;
                 model_fp = fp;
             }
-            if (!config_fp) {
-                strata::core::SessionConfig c;
-                c.engine_version = STRATA_VERSION;
-#if defined(STRATA_USE_HIP)
-                c.backend = "hip";
-#else
-                c.backend = "cuda";
-#endif
-                c.kv = o.kv;
-                c.max_context = o.max_context;
-                c.kv_resident = o.kv_resident;
-                c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
-                const char* rot = std::getenv("STRATA_KV_ROT");
-                c.kv_rot = rot != nullptr && rot[0] == '1';
-                c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
-                          rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
-                          rope_cfg.beta_slow};
-                c.cvec = cvec_digest;
-                c.switches = {
-                    {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
-                    {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
-                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
-                    {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
-                    {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
-                    {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
-                    {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
-                    {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
-                    {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
-                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
-                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
-                config_fp = strata::core::session_config_fingerprint(c);
-            }
+            if (!config_fp) config_fp = strata::core::session_config_fingerprint(session_config_now());
             id.model = *model_fp;
             id.config = *config_fp;
             return true;
@@ -11055,6 +11645,57 @@ int main(int argc, char** argv) {
                         (unsigned long long) r.duplicate_bytes, (unsigned long long) r.aliased_bytes);
                 };
                 if (extent_probe_on && held_image) observe("held-incoming", 0, image, *held_image);
+                // ---- persistent publication ------------------------------------------
+                // The captured image is frozen in place - its payloads move into shared allocations, no byte is
+                // copied - and the store receives a cheap immutable alias for an asynchronous, chunk-wise write
+                // straight out of those buffers.  The RAM cache keeps the mutable image and the very same bytes, so
+                // parking costs nothing extra; the lease is charged to the same envelope while it lives and given
+                // back when the store releases the alias.  A busy, full or unhealthy store only skips the write: the
+                // request keeps its result either way.
+                if (store_on && valid_image(image)) {
+                    reap_publishes(0);
+                    // A publication may retire its predecessor head only when this image provably still covers the
+                    // restored cut it continues from: same authorized scope and the same token prefix.
+                    uint64_t supersedes = 0;
+                    bool cover = false;
+                    if (store_lineage.valid && store_lineage.scope.matches(live_scope) &&
+                        (int64_t) live.size() >= store_lineage.cut && store_lineage.cut > 0 &&
+                        token_prefix_hash(live.data(), (size_t) store_lineage.cut) == store_lineage.prefix_hash) {
+                        supersedes = store_lineage.head;
+                        cover = true;
+                    }
+                    const size_t lease = image.bytes();
+                    if (conversations.try_reserve_lease(lease)) {
+                        auto alias = strata::core::conversation_image_freeze_share(image);
+                        // Freezing added one owner per segment; charge the alias's own accounting, not the estimate.
+                        const size_t exact = alias->bytes();
+                        if (exact > lease) conversations.try_reserve_lease(exact - lease);
+                        strata::core::ConversationStorePublish publish;
+                        publish.request_id = ++publication_serial;
+                        publish.generation = ++capture_generation;
+                        publish.supersedes = supersedes;
+                        publish.cover = cover;
+                        std::string why;
+                        if (conversation_store->publish(std::move(alias), publish, why)) {
+                            pending_publishes.push_back(PendingPublish{publish.request_id, publish.generation,
+                                                                       publish.supersedes, exact});
+                            // The store's own writer and pending slots bound how many can be outstanding; a very
+                            // slow writer must not let this list grow without bound.
+                            while (pending_publishes.size() > 8) {
+                                if (reap_publishes(1000) == 0) break;
+                            }
+                        } else {
+                            conversations.release_lease(exact);
+                            ++store_refused;
+                            std::fprintf(stderr, "strata serve: conversation store: publication skipped (%s)\n",
+                                         why.c_str());
+                        }
+                    } else {
+                        ++store_refused;
+                        std::fprintf(stderr, "strata serve: conversation store: publication skipped (no RAM "
+                                             "envelope left for a %zu MiB lease)\n", lease >> 20);
+                    }
+                }
                 const size_t previous_superseded = conversations.superseded();
                 const bool stored = conversations.put(std::move(image), held, held_entries);
                 if (const size_t dropped = conversations.superseded() - previous_superseded)
@@ -12183,6 +12824,8 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                        "conversation_cache_persist=%d conversation_cache_disk_mib=%lld "
+                        "conversation_cache_disk_heads=%lld "
                         "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -12196,6 +12839,8 @@ int main(int argc, char** argv) {
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                        int(persistence_configured), (long long) o.conversation_cache_disk_mib,
+                        (long long) o.conversation_cache_disk_heads,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
@@ -12458,6 +13103,45 @@ int main(int argc, char** argv) {
         // this loop retains only scheduling policy and protocol emission.
         using BSlot = strata::program::ResidentSlot;
         const auto& bs = resident.slots();
+        // Now that the resident slots exist, the published RAM availability view can be built from every source the
+        // engine already holds: the live session and its checkpoints (only while the session is reusable), each parked
+        // conversation's live record and cuts, and each completed resident owner.  One entry (the longest) per
+        // authorized scope and steering mode, with the exact prefix hash of that cut's own tokens, so the offer
+        // callback can suppress a speculative read whose bytes generation would never use.  Called at the owner's own
+        // mutation points, never from the channel thread.
+        publish_ram_view = [&]() {
+            auto view = std::make_shared<RamView>();
+            auto add = [&](const strata::core::ConversationScope& scope, bool cvec, const std::vector<int32_t>& ids) {
+                if (!scope.valid() || ids.empty()) return;
+                for (RamCut& cut : view->cuts) {
+                    if (!cut.scope.matches(scope) || cut.cvec != cvec) continue;
+                    if ((int64_t) ids.size() > cut.tokens) {
+                        cut.tokens = (int64_t) ids.size();
+                        cut.hash = token_prefix_hash(ids.data(), ids.size());
+                    }
+                    return;
+                }
+                view->cuts.push_back(RamCut{scope, cvec, (int64_t) ids.size(),
+                                            token_prefix_hash(ids.data(), ids.size())});
+            };
+            if (live_ok && live_scope.valid()) {
+                add(live_scope, cvec_cached, live);
+                for (const ConvCheckpoint& c : checks) add(live_scope, cvec_cached, c.ids);
+            }
+            conversations.for_each_image([&](size_t, const strata::core::SavedConversation& image) {
+                add(image.scope, image.cvec, image.live.ids);
+                for (const ConvCheckpoint& c : image.checkpoints) add(image.scope, image.cvec, c.ids);
+            });
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                const BSlot& sl = bs[(size_t) b];
+                if (sl.active || sl.failed || !sl.cached || sl.request == 0) continue;
+                add(sl.input.scope, sl.cvec, sl.ids);
+                for (const ConvCheckpoint& c : sl.checks) add(sl.input.scope, sl.cvec, c.ids);
+            }
+            std::lock_guard<std::mutex> lock(ram_view_mu);
+            ram_view = std::move(view);
+        };
+        publish_ram_view();
         struct BatchDraftCounts { uint64_t request = 0; int64_t offered = 0, accepted = 0; };
         BatchDraftCounts batch_drafts[strata::kernels::kVerifyMaxT] = {};
         const bool batch_mtp_trace = split_batch_mtp && std::getenv("STRATA_STATE_HASH");
@@ -13781,6 +14465,15 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // Between requests: harvest finished store publications (their RAM leases go back to the envelope) and
+            // republish the store's read allowance from live accounting.  Both are non-blocking and CPU-only; the
+            // serving path never waits for storage here.
+            if (store_on) {
+                reap_publishes(0);
+                store_allowance();
+                // The RAM the next request's offers must be filtered against changed at the end of the last request.
+                publish_ram_view();
+            }
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
@@ -14003,6 +14696,11 @@ int main(int argc, char** argv) {
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
+                        // The poison may sit in any stored image of this execution domain, so the domain's epoch
+                        // advances durably here as well: a restart must not resurrect what RAM deliberately dropped.
+                        if (store_on) conversation_store->invalidate_domain("non-finite logits");
+                        store_lineage.valid = false;   // the epoch advanced: no head of it may be superseded
+                        if (store_on) publish_ram_view();   // the parked set just went away
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
@@ -14033,6 +14731,12 @@ int main(int argc, char** argv) {
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            // INTERNAL (frontend -> native, not a client key): cache_offer=ID and cache_generation=GEN bind this
+            // request's demand to the prepared offer the frontend already sent on the private channel, so generation
+            // consumes that exact prepared result instead of preparing it again.  Absent (or unknown here) means the
+            // demand does its own lookup; the request itself is never refused, reordered or validated differently
+            // because of them.
+            uint64_t req_cache_offer = 0, req_cache_generation = 0;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -14065,6 +14769,8 @@ int main(int argc, char** argv) {
                         bad_scope = bad_scope || !strata::core::conversation_scope_parse(std::string_view(tok).substr(eq + 1), req_scope);
                     else if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "cache_offer") req_cache_offer = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "cache_generation") req_cache_generation = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -14306,6 +15012,12 @@ int main(int argc, char** argv) {
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
+                // Same domain invalidation as the session-file path: every stored image of this execution domain is
+                // suspect once the poison is in the K/V, and the durable epoch advance is what makes a later restart
+                // refuse it.  A failed commit leaves the run intent armed, so the next start is conservative too.
+                if (store_on) conversation_store->invalidate_domain("non-finite logits");
+                store_lineage.valid = false;   // the epoch advanced: no head of it may be superseded
+                if (store_on) publish_ram_view();   // the parked set just went away
                 const auto slots_dropped = resident.invalidate_after_nonfinite();   // running tainted, idle caches dropped
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
@@ -14313,7 +15025,7 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", slots_dropped.second,
                              slots_dropped.second == 1 ? "" : "s", slots_dropped.first, slots_dropped.first == 1 ? "" : "s");
             }
-            enum class PrefixSource { cold, live, checkpoint, resident, parked };
+            enum class PrefixSource { cold, live, checkpoint, resident, parked, disk };
             struct PrefixCandidate {
                 PrefixSource source = PrefixSource::cold;
                 int64_t tokens = 0;
@@ -14323,6 +15035,7 @@ int main(int argc, char** argv) {
                 PrefixWork work{};
                 PrefixTransfer transfer = PrefixTransfer::checkpoint;
                 std::optional<double> total_ms{}, restore_ms{}, prefill_ms{}, park_ms{};
+                uint64_t store_head = 0;   ///< PrefixSource::disk: the stored branch head to materialize
             };
             const int yielded_source = resident.working().resume_slot;
             const uint64_t prefill_route = uint64_t(std::clamp(int(req_pcie_frac * 256.0 + 0.5), 0, 256)) |
@@ -14449,6 +15162,45 @@ int main(int argc, char** argv) {
                               session_work((int64_t) image.live.ids.size(), false), PrefixTransfer::parked},
                              prefix_costs.transfer_ms(PrefixTransfer::checkpoint, rewind));
                 });
+            // The persistent store's own candidates: a bounded, metadata-only scan of catalog-authorized manifests,
+            // longest cut first and newest first on ties, with no payload and no GPU pointer exposed.  Persistence
+            // extends the retained history; it never changes which existing source is preferred, and an equally long
+            // RAM/live/resident cut keeps winning because this enumeration runs after theirs.  Its restore time stays
+            // uncalibrated on purpose: cost selection then keeps its longest-prefix rollback rather than inventing an
+            // SSD rate.  The selection without the store is kept in case the stored image cannot be materialized: a
+            // miss must fall back to exactly the source this request would otherwise have used.
+            struct StoreCandidateBackup {
+                PrefixCandidate longest, cheapest;
+                bool considered = false;
+            };
+            StoreCandidateBackup store_candidate_backup;
+            // The store's queries carry exact prompt tokens as int32 (its own prefix confirmation hashes int32 ids);
+            // parse_i64_list already bounds every request id, so this narrowing is checked, not truncating.
+            std::vector<int32_t> store_prompt;
+            if (store_on && yielded_source < 0 && o.prompt_cache > 0 && req_scope.valid() && ids.size() <= (size_t) o.max_context) {
+                store_prompt.reserve(ids.size());
+                for (const int64_t id : ids) store_prompt.push_back((int32_t) id);
+                strata::core::ConversationStoreSelector store_selector = store_selector_base;
+                store_selector.scope = req_scope;
+                store_selector.cvec = want_cvec;
+                const PrefixCandidate longest_before_store = longest, cheapest_before_store = cheapest;
+                bool store_seen = false;
+                conversation_store->for_each_match(store_selector, store_prompt, req_imgs,
+                    [&](const strata::core::ConversationStoreMatch& match) {
+                        if (store_seen) return;                    // longest first: the first is the best cut
+                        if (match.stages != (uint32_t) stages.size()) return;   // another layout's image
+                        if (match.tokens <= 0) return;
+                        store_seen = true;
+                        PrefixCandidate candidate;
+                        candidate.source = PrefixSource::disk;
+                        candidate.tokens = match.tokens;
+                        candidate.parked = strata::core::ConversationCache::Match{0, match.tokens, match.live};
+                        candidate.store_head = match.head_id;
+                        candidate.transfer = PrefixTransfer::parked;   // accounting label only: no rate is claimed
+                        consider(std::move(candidate), std::nullopt);
+                    });
+                store_candidate_backup = {longest_before_store, cheapest_before_store, store_seen};
+            }
             PrefixCandidate selected = choice.using_cost() ? cheapest : longest;
             if (yielded_source >= 0) {
                 // Exact resend of a yielded request is an ownership continuation, never an economic choice.
@@ -14456,6 +15208,68 @@ int main(int argc, char** argv) {
                 selected.transfer = PrefixTransfer::resident_live;
                 if (!resident.resume_work(yielded_source, nullptr, selected.work, err)) {
                     std::printf("ERR restoring yielded prefix: %s\n", err.c_str()); return 1;
+                }
+            }
+            // A stored candidate is materialized here, at the request's own safe seam and before any GPU state is
+            // touched: the store re-confirms the exact authorized prefix, builds the whole image on the host and
+            // hands it over verified, and the code below validates and restores it exactly like a parked image.  A
+            // miss - missing, corrupt, stale, refused, cancelled or outlasted - consumes nothing and falls back to
+            // the source this request would have used without the store.
+            bool restored_from_store = false;
+            StoreDemandResult store_demand;
+            // The mounted image's RAM charge while this request owns it, plus the store's handed-out read: an RAII
+            // guard, so a validation failure, a skipped request or a fatal restore failure cannot leave either the
+            // envelope or the store's own RAM accounting permanently charged.  The explicit release below is the
+            // ordinary path (the bytes then belong to the live session or to the retained reuse).
+            struct StoreLeaseGuard {
+                strata::core::ConversationCache* cache = nullptr;
+                strata::core::ConversationStore* store = nullptr;
+                uint64_t request_id = 0;
+                uint64_t generation = 0;
+                size_t bytes = 0;
+                ~StoreLeaseGuard() { release(); }
+                void release() {
+                    if (store != nullptr && request_id != 0) store->release_read(request_id, generation);
+                    if (cache != nullptr && bytes != 0) cache->release_lease(bytes);
+                    store = nullptr; request_id = 0; generation = 0; bytes = 0;
+                }
+            } store_demand_lease{&conversations, nullptr, 0, 0, 0};
+            if (selected.source == PrefixSource::disk) {
+                store_demand = store_demand_restore(store_prompt, req_imgs, req_scope, want_cvec,
+                                                    req_cache_offer, req_cache_generation,
+                                                    [&] { return stop_req.load(); }, incoming);
+                if (store_demand.mounted) {   // arm the guard for every path, including a rejected mount
+                    store_demand_lease.store = conversation_store.get();
+                    store_demand_lease.request_id = store_demand.request_id;
+                    store_demand_lease.generation = store_demand.generation;
+                }
+                if (store_demand.status == strata::core::ConversationStoreReadStatus::ready &&
+                    store_demand.stages == (uint32_t) stages.size() && store_demand.tokens > 0) {
+                    restored_from_store = true;
+                    selected.tokens = store_demand.tokens;
+                    selected.parked = strata::core::ConversationCache::Match{0, store_demand.tokens, store_demand.live};
+                    // The store selects and re-confirms the cut itself (a newer manifest may even have superseded the
+                    // one the enumeration saw), so the mounted cut is authoritative; a different head is noted, never
+                    // refused, because the prefix was re-proved against this exact prompt.
+                    if (selected.store_head != 0 && store_demand.head_id != selected.store_head)
+                        std::fprintf(stderr, "strata serve: conversation store: demand mounted head %llu (planned "
+                                             "%llu)\n", (unsigned long long) store_demand.head_id,
+                                     (unsigned long long) selected.store_head);
+                    // The store has already dropped its reference, so this is the only charge for the mounted bytes
+                    // while the request owns them; it is given back once they belong to the live session or to the
+                    // retained reuse.  Best effort: a full envelope must not refuse a required restore.
+                    const size_t charge = incoming->bytes();
+                    if (conversations.try_reserve_lease(charge)) store_demand_lease.bytes = charge;
+                } else {
+                    incoming.reset();
+                    selected = choice.using_cost() ? store_candidate_backup.cheapest : store_candidate_backup.longest;
+                    std::fprintf(stderr, "strata serve: conversation store: reading the prompt instead (source=%s "
+                                         "tokens=%lld)\n",
+                                 selected.source == PrefixSource::live ? "live" :
+                                 selected.source == PrefixSource::checkpoint ? "checkpoint" :
+                                 selected.source == PrefixSource::resident ? "resident" :
+                                 selected.source == PrefixSource::parked ? "parked" : "cold",
+                                 (long long) selected.tokens);
                 }
             }
             int64_t resume = selected.source == PrefixSource::checkpoint || selected.source == PrefixSource::live
@@ -14466,7 +15280,6 @@ int main(int argc, char** argv) {
             const ConvCheckpoint* slot_ck = slot_source >= 0 ? selected.checkpoint : nullptr;
             bool resumed_from0 = false;
             const auto parked = selected.parked;
-            std::optional<strata::core::SavedConversation> incoming;
             if (selected.source == PrefixSource::parked) incoming.emplace(conversations.take(parked.index));
             if (o.prefix_cost_selection)
                 std::fprintf(stderr, "strata serve: prefix selection: source=%s tokens=%lld longest=%lld policy=%s "
@@ -14543,6 +15356,14 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // QUIT has no later request to park the last completed conversation, so the clean-shutdown seam parks it
+            // itself.  Only the decision the next request would have taken is recorded: this request's own keys say
+            // whether its history is continued at all (ckpt=0 is a one-shot that must neither be parked nor supersede
+            // a donor) and whether it left only a pinned-sibling suffix, which is deliberately not parked.
+            exit_park_allowed = req_ckpt != 0 && !pin_sibling;
+            // The park above changed what RAM holds (a new/refreshed entry, or an eviction): refresh the view the
+            // next request's offers are filtered against.  Metadata only, on this thread.
+            if (store_on) publish_ram_view();
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 // Retained RAM K/V belongs to the previous working state, not
@@ -14657,6 +15478,20 @@ int main(int argc, char** argv) {
                 live_scope = incoming->scope;
                 resume = parked.tokens;
                 from_live = parked.live || direct_cut;
+                // A store-mounted image sets the lineage a later publication may supersede: the head the live state
+                // now continues from, the cut it was mounted at, and the prefix hash that proves coverage when the
+                // conversation is parked again (the same predicate the RAM cache applies before retiring a
+                // predecessor, plus the authorized scope).
+                if (restored_from_store) {
+                    store_lineage.valid = false;
+                    if (resume > 0 && (int64_t) live.size() >= resume) {
+                        store_lineage.head = store_demand.head_id;
+                        store_lineage.cut = resume;
+                        store_lineage.prefix_hash = token_prefix_hash(live.data(), (size_t) resume);
+                        store_lineage.scope = req_scope;
+                        store_lineage.valid = true;
+                    }
+                }
                 if (req_ckpt && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -14679,6 +15514,12 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
+            // The mounted bytes now belong to the live session, to the retained reuse or to nothing: the request's own
+            // charge for them ends here (the guard would do it at the end of the iteration; the cache's accounting is
+            // fresher if the next seam in this request already sees it).
+            store_demand_lease.release();
+            // The take/restore above changed the parked set too: keep the offer filter honest.
+            if (store_on) publish_ram_view();
             if (!live_scope.matches(req_scope) || want_cvec != cvec_cached) {
                 conversations.limit_reuse(0);
                 live_ok = false;
@@ -16887,6 +17728,87 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        // ---- clean shutdown ---------------------------------------------------
+        // QUIT (or the server closing stdin) has no later request to park the last completed conversation, so the
+        // final owners are captured here: the serial session this engine is holding, and every resident owner a batch
+        // slot completed.  Their capture is what publishes them.  Then the offer channel is stopped BEFORE the store
+        // is drained and destroyed - a callback must never reach a retired store - outstanding publications are
+        // drained with a bounded wait, and the store is closed: only a clean close durably clears this domain's run
+        // intent, which is what lets eligible completed publications survive a restart.  A GPU fault, the poison path
+        // or a killed process deliberately leaves the intent armed (the destructor does exactly that).
+        if (store_on) {
+            bool any = false;
+            if (exit_park_allowed && live_ok && live_scope.valid() && !live.empty()) {
+                any = true;
+                if (!park_current(0, nullptr))
+                    std::fprintf(stderr, "strata serve: conversation store: the last serial conversation could not be "
+                                         "parked at shutdown (%s)\n", err.c_str());
+                err.clear();
+            }
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                // An owner that finished a turn: the same source the serving path would park when the next request
+                // replaced it.  A slot with nothing completed reports no source and is skipped.
+                std::string probe;
+                if (!resident.completed_snapshot_source(b, probe)) continue;
+                any = true;
+                if (!park_completed(b, 0, nullptr))
+                    std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d could not be "
+                                         "parked at shutdown (%s)\n", b, err.c_str());
+                err.clear();
+            }
+            if (!any)
+                std::fprintf(stderr, "strata serve: conversation store: nothing to park at shutdown (a one-shot, a "
+                                     "pinned sibling or an incomplete session)\n");
+        }
+        if (offer_channel) offer_channel->stop();
+        if (store_on) {
+            // Bounded: the frontend's QUIT grace is 15 s inside the host's 20 s, and the lifetime already reserves
+            // its own window, so storage work that has not finished by then is abandoned rather than waited out.
+            const auto now_ms = [] {
+                return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count();
+            };
+            const uint64_t deadline = now_ms() + 8000;
+            while (!pending_publishes.empty() && now_ms() < deadline) reap_publishes(250);
+            for (const PendingPublish& pending : pending_publishes)
+                std::fprintf(stderr, "strata serve: conversation store: publication %llu still outstanding at shutdown "
+                                     "(%zu MiB lease)\n", (unsigned long long) pending.request_id,
+                             pending.lease_bytes >> 20);
+            if (offer_channel) {
+                const strata::program::ConversationOfferStats s = offer_channel->stats();
+                std::fprintf(stderr, "strata serve: conversation offers: accepted=%llu cancelled=%llu rejected=%llu "
+                                     "token_bytes=%llu\n", (unsigned long long) s.accepted,
+                             (unsigned long long) s.cancelled, (unsigned long long) s.rejected,
+                             (unsigned long long) s.accepted_token_bytes);
+            }
+            const strata::core::ConversationStoreCounters c = conversation_store->counters();
+            std::fprintf(stderr, "strata serve: conversation store at shutdown: enabled=%d healthy=%d run_intent=%d "
+                                 "heads=%llu pinned=%llu objects=%llu object_bytes=%llu manifests=%llu published=%llu "
+                                 "replaced=%llu retained_branches=%llu coalesced=%llu refused_quota=%llu "
+                                 "reads_served=%llu reads_cancelled=%llu reads_stale=%llu reads_corrupt=%llu "
+                                 "misses=%llu evictions=%llu bytes_written=%llu bytes_read=%llu orphan_bytes=%llu "
+                                 "pending_delete_bytes=%llu corrupt_records=%llu epoch_advances=%llu; engine: restored=%llu "
+                                 "prefetched=%llu suppressed_prefetches=%llu published_results=%llu skipped=%llu "
+                                 "coalesced_results=%llu cancelled=%llu\n",
+                             int(conversation_store->enabled()), int(conversation_store->healthy()),
+                             int(conversation_store->run_intent_active()),
+                             (unsigned long long) c.heads, (unsigned long long) c.pinned_heads,
+                             (unsigned long long) c.objects, (unsigned long long) c.object_bytes,
+                             (unsigned long long) c.manifests, (unsigned long long) c.published,
+                             (unsigned long long) c.replaced, (unsigned long long) c.retained_branches,
+                             (unsigned long long) c.coalesced_publishes, (unsigned long long) c.refusals_quota,
+                             (unsigned long long) c.reads_served, (unsigned long long) c.reads_cancelled,
+                             (unsigned long long) c.reads_stale, (unsigned long long) c.reads_corrupt,
+                             (unsigned long long) c.misses, (unsigned long long) c.evictions,
+                             (unsigned long long) c.bytes_written, (unsigned long long) c.bytes_read,
+                             (unsigned long long) c.orphan_bytes, (unsigned long long) c.pending_delete_bytes,
+                             (unsigned long long) c.corrupt_records, (unsigned long long) c.epoch_advances,
+                             (unsigned long long) store_restored, (unsigned long long) store_prefetched.load(),
+                             (unsigned long long) prefetch_suppressed.load(),
+                             (unsigned long long) store_published, (unsigned long long) store_refused,
+                             (unsigned long long) store_coalesced, (unsigned long long) store_cancelled);
+            conversation_store->close();
+        }
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {
             std::fprintf(stderr, "strata cross-help capture REFUSED: the requested request/window was not "
                                  "completely observed and emitted before serving QUIT/EOF\n");

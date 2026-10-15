@@ -9,15 +9,23 @@
 #include <limits>
 
 namespace strata::core {
+
+// Exported: the RAM cache and the persistent conversation store both bucket on exactly this key, so a caller that has
+// to build a store selector before it owns an image (a prepared offer, a demand lookup) uses the same 18 fields the
+// captured images carry.  A mismatch is an incompatible runtime geometry, never a conversion.
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g) {
+    return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
+            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
+            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
+            g.hc, g.hc_lr, g.n_expert, g.n_ff};
+}
+
 namespace {
 using conversation_detail::add;
 using conversation_detail::product;
 
 std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
-    return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
-            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
-            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
-            g.hc, g.hc_lr, g.n_expert, g.n_ff};
+    return conversation_geometry_key(g);
 }
 
 bool fail(std::string& error, const char* message) {

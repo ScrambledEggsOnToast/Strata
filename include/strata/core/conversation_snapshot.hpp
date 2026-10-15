@@ -19,6 +19,9 @@ bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, con
                                    int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error);
+// The 18-field runtime geometry key every captured image carries.  The RAM conversation cache and the persistent
+// conversation store bucket on exactly this key, so a caller can build a store selector before it owns an image.
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g);
 // KV first, then live running state or the selected host checkpoint, so a cut's
 // spare pooled row is repaired after copying rows from the longer-lived source.
 // Caller joins consumers and keeps owner metadata stable; this function owns

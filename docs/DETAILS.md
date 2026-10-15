@@ -1494,6 +1494,102 @@ Unknown telemetry or insufficient RAM skips parking, and the same figure and flo
 decide whether a session file may be saved or restored (below). An 8 GiB budget
 is a cap, not a recommendation for every machine.
 
+**Persistent histories on NVMe (opt-in).** Parking above keeps histories in host RAM; with
+`--conversation-cache-dir PATH` the same completed histories are also written to a private directory on the cache
+device and looked up there when RAM no longer holds them. Persistence needs parking to be on
+(`--prompt-cache > 0`, `--conversation-cache-mib > 0`, `--conversation-cache-slots > 0`) and **both verified release
+identities**: `--conversation-cache-model-id HEX64` (the common model/pack identity, draft and layout excluded) and
+`--conversation-cache-engine-id HEX64` (the resolved execution domain). Anything missing - either identity, the
+directory, or a root that cannot be opened or locked exclusively - leaves parking RAM-only and says why
+(`persistent conversation caching stays off: ...`); it is never a serving failure and never an error exit. A second
+engine pointing at the same root serves without persistent caching instead of sharing the store.
+
+Capacity is **one shared physical quota** for every layout: `--conversation-cache-disk-mib` (default 131072 = 128 GiB),
+lazily allocated, with `--conversation-cache-disk-min-free-mib` (default 131072) as the filesystem floor a new
+reservation must leave free, and `--conversation-cache-disk-heads` (default 128) as the retained branch-head ceiling
+across the whole store - independent of the RAM `--conversation-cache-slots`. Neither quota nor head limit is part of
+an image's identity, so both layouts borrow the same capacity. Refusals are ordinary cache misses: a full store, a
+floor that cannot be met, a busy writer or an unhealthy root skips the write or the read and the request completes as
+it would without persistence.
+
+*What is stored.* One **immutable manifest per complete image** and immutable 1 MiB payload objects, with a small
+checksummed binary **root catalog** as the only authority (atomically replaced; flush file data, then the immutable
+manifest, then the catalog). Files that the catalog does not authorize are accounted and then deleted - a corrupt
+catalog means cold caching, never a directory-based resurrection. A manifest binds the live record, every retained
+checkpoint with its exact pin flags, every stage's own running state, every K/V layer part (main layers and the draft)
+and the exact token/image prefixes it was captured at. Publication order is file data, manifest, catalog, and only then
+are superseded roots and unreferenced objects reclaimed. Bytes deduplicate by payload digest, so two separately
+validated manifests can share an identical object.
+
+*Three separate identities.* The **authorized scope** is the frontend's 32-byte per-tenant/per-conversation value
+derived from the store's private issuer key; it is never logged and a scope change discards reuse exactly as it does
+for parking. The **execution domain** is a canonical digest of the resolved engine identity, the runtime geometry, the
+main session's and every stage's layer carve/device/authoritative K/V form, the draft's own form and presence, and the
+engine's declared setting fingerprint - profile names, paths, quotas and queue limits are absent by construction. The
+**object** identity is the digest of schema/layer/state-kind, the authorized scope and the actual chunk bytes. Two
+images of different layouts never restore each other's complete snapshot, and a restore revalidates the exact
+token/image prefix instead of trusting a hash.
+
+*Ownership: an immutable lease, never a copy.* A captured image is **frozen in place** - each payload moves into a
+shared allocation with no byte copied - and the store receives a cheap immutable alias of it for an asynchronous,
+chunk-wise write straight out of those buffers, while the RAM cache keeps the mutable image and the very same bytes.
+A later mutation of either side detaches its own allocation first (copy-on-write), so a writer can never reach bytes a
+lease is reading, and a store that is busy, full or unhealthy only skips the write. The lease is charged to the
+conversation RAM envelope while it lives and given back when the store releases the alias; every reference is charged
+in full, so the envelope is conservative rather than optimistic, and a publication lease that does not fit the
+envelope is skipped instead of over-committing it. A restore hands the engine an owned, complete, byte-verified image
+(never a live GPU pointer or a borrowed visitor), and the mounted copy owns its buffers alone.
+
+*Publication.* A publication is bound to a head only when the engine *proves* the outgoing image still covers the cut
+it was captured from - the same authorized scope and the same token prefix, checked by hash - so a divergent sibling
+keeps its own head, a one-shot descendant (a `ckpt=0` request) neither consumes nor supersedes its donor, and a stale
+completion cannot overwrite a newer covered descendant. `generation` is assigned at capture ordering, not worker
+completion. The store keeps one admitted writer and coalesces pending publications per bucket.
+
+*Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
+first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the
+**existing** source enumeration (live session, resident slots, parked RAM, checkpoints) rather than becoming a second
+selector, and the default choice is unchanged: the longest eligible prefix, with resident/RAM preferred at an equal
+cut, so a stored image is only preferred when it cuts strictly longer. Cost selection (`--prefix-selection cost`)
+treats a stored candidate like any other unpriced source - its rate is not invented, and an unpriced longest candidate
+keeps the longest rollback. A required restore is materialized **before any GPU mutation** (the whole host image is
+read, verified and validated first) and then restored exactly like a parked one; a missing, corrupt, stale, refused,
+cancelled or outlasted read is an ordinary miss that falls back to the source the request would have used, so the
+engine still reads the prompt itself. The wait is bounded, honours `STOP`/cancellation, and never runs under the
+request admission or generation-pipe lock.
+
+The frontend may prepare the queued frontier early over a **private inherited control socket** (one
+`SOCK_SEQPACKET` endpoint passed as `STRATA_CONVERSATION_OFFER_FD` - never a listening service, never a public
+endpoint). Its reader thread is CPU-only and cannot touch GPU state; it hands the validated prepared request to the
+store, which does its own bounded lookup and bounded read. A request then carries the two internal keys
+`cache_offer=ID` and `cache_generation=GEN` on `GEN`/`GENI`/`BGEN`/`BGENI`, binding its demand to that prepared
+result; absent keys mean the demand does its own lookup, and neither key changes request validation, ordering or
+sampling. Because a speculative read must never duplicate work the engine is about to do from RAM, the callback
+consults a small published view of what RAM already holds (per authorized scope and steering, the longest live/
+checkpoint/parked/resident cut with the exact hash of its own tokens) and skips the read when the offered prompt
+provably starts with an equal or longer RAM cut. Sketchy offers cost nothing; a useful one is already in flight when
+the request arrives.
+
+*Restart, poison and shutdown.* An execution domain's run intent is durably marked active before persistent reuse is
+enabled, and every lookup, capture and publication ticket carries its epoch. Non-finite logits invalidate the domain
+(an epoch advance, the same moment RAM drops its parked state), so a restart cannot resurrect state the engine
+deliberately discarded. Only a **clean** exit - `QUIT`, or the server closing stdin - parks the final completed
+serial and resident owners, drains outstanding publications with a bounded wait, stops the offer channel and then
+closes the store, which is what durably clears the run intent. A killed process, a GPU fault or an error exit leaves
+the intent armed, so the next start conservatively invalidates that domain instead of reusing it. Recovery after a
+clean switch (same profile, or pair → three-GPU → pair) covers only compatible, catalog-authorized state; the newest
+uncommitted response tail is never promised.
+
+*Known limits of this first implementation.* Retained-K/V reuse intervals are not passed to the store yet: the engine
+proves its unchanged extents as token counts, not as per-stream chunk-aligned byte intervals, so every publication
+re-hashes the outgoing image's chunks and only the store's content addressing avoids duplicate writes. The store's RAM
+(index, read images, publication leases) and the parked payloads share the single `--conversation-cache-mib` envelope,
+which is a bounded budget and not a measurement. Kernel/arithmetic environment overrides that are not part of the
+engine's declared setting fingerprint are outside the execution-domain digest, so a deployment must keep them
+identical across a restart for stored histories to remain eligible. No performance claim is made here: the design has
+not been benchmarked or adopted, and matched measurements (disk-off returns, restart recovery, refusal/cancellation
+boundaries, residency and host floors) are what qualify it.
+
 **The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
 numbers, sampled each time it is asked and not a reservation (other writers can take the
 room afterwards):

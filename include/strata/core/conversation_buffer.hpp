@@ -174,6 +174,28 @@ public:
         }
         return retained;
     }
+    // Freeze for immutable sharing (the NVMe store's publication lease): every
+    // payload moves into a shared allocation - no byte is copied and this buffer
+    // keeps reading exactly the bytes it held. A later mutation detaches this
+    // side's allocation first, so an alias taken after this call never observes a
+    // byte written here afterwards. Each frozen segment is charged one owner.
+    void freeze() {
+        for (auto& segment : segments_) segment.freeze();
+    }
+    bool frozen() const {
+        for (const auto& segment : segments_) if (!segment.frozen()) return false;
+        return true;
+    }
+    // A cheap alias: every payload is shared with `source`, which must be frozen
+    // (a segment that is not frozen yet is copied - still correct, just not free).
+    // Neither side may be mutated without the detach that mutation performs.
+    ConversationBuffer frozen_alias() const {
+        ConversationBuffer out(sharing_);
+        out.segments_.reserve(segments_.size());
+        for (const auto& segment : segments_) out.segments_.push_back(segment.frozen_alias());
+        out.size_ = size_;
+        return out;
+    }
     // Allocation identities, not pairwise byte comparisons. Visitors cannot
     // mutate payload. Used by the bounded, opt-in retained-backing diagnostic.
     template<class Fn> void for_each_backing(Fn fn) const {
@@ -211,6 +233,18 @@ private:
             return owner ? *owner : local;
         }
         bool shared() const { return owner && owner.use_count() > 1; }
+        // Move the payload into a shared allocation (O(1); the local vector is
+        // left empty). A write through any other reference copies first.
+        void freeze() {
+            if (!owner) owner = std::make_shared<std::vector<uint8_t>>(std::move(local));
+        }
+        bool frozen() const { return bool(owner); }
+        Segment frozen_alias() const {
+            Segment out(false);   // no empty owner to replace
+            if (owner) out.owner = owner;
+            else out.local = local;   // not frozen: a real copy, still correct
+            return out;
+        }
         size_t size() const { return read().size(); }
         size_t capacity() const { return read().capacity(); }
         size_t bytes() const { return capacity() + (owner ? owner_bytes : 0); }

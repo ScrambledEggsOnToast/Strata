@@ -967,5 +967,124 @@ int main() {
               cache.best(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope).tokens == 4,
               "economic ranking leaves parked history, byte accounting and lifecycle state unchanged");
     }
+    {
+        // Freezing for an immutable publication lease: payloads are shared, not copied, and the alias never observes
+        // a byte written through the image afterwards (copy-on-write detach).
+        auto original = image({1, 2, 3, 4});
+        original.live.ple.resize(1024, 11);
+        original.checkpoints.push_back(ConversationCheckpoint{});
+        original.checkpoints.back().ids = {1, 2};
+        original.checkpoints.back().gdn.resize(64, 12);
+        original.kv.push_back(ConversationKv{});
+        original.kv.back().k.resize(4096, 13);
+        const std::vector<uint8_t> before_gdn = original.live.gdn.read();
+        const std::vector<uint8_t> before_k = original.kv.back().k.read();
+        auto lease = conversation_image_freeze_share(original);
+        check(lease != nullptr && lease->scope == original.scope && lease->live.ids == original.live.ids &&
+              lease->checkpoints.size() == original.checkpoints.size() &&
+              lease->checkpoints.back().ids == original.checkpoints.back().ids &&
+              lease->live.gdn.read() == before_gdn && lease->kv.size() == 1 &&
+              lease->kv.back().k.read() == before_k,
+              "a frozen alias carries the image's metadata and bytes");
+        check(original.live.gdn.sealed() && original.live.ple.sealed() &&
+              original.checkpoints.back().gdn.sealed() && original.kv.back().k.frozen(),
+              "freezing seals every state array and freezes every buffer");
+        check(original.live.gdn.data() == lease->live.gdn.data() &&
+              original.kv.back().k.data() == lease->kv.back().k.data(),
+              "the alias shares the frozen allocations instead of copying the payload");
+        // A write through the image after the lease exists can only reach the lease's bytes if it did not detach.
+        auto* gdn_bytes = original.live.gdn.write().data();
+        gdn_bytes[0] = 0xEE;
+        check(lease->live.gdn.read() == before_gdn, "a post-freeze write through the image detaches and cannot reach the lease");
+        check(original.live.gdn.read() != before_gdn, "the detaching write is visible on the image's own side");
+        check(original.live.gdn.write().data() != lease->live.gdn.data(),
+              "the image and its lease hold different allocations after the detach");
+        // Freezing reaches the nested owners too: a stage image's payloads and a checkpoint's stage parts.
+        auto nested = image({8});
+        nested.stage_images.push_back(image({8}));
+        nested.stage_images.back().live.dead.resize(128, 4);
+        nested.checkpoints.push_back(ConversationCheckpoint{});
+        nested.checkpoints.back().stage_parts.push_back(ConversationCheckpoint{});
+        nested.checkpoints.back().stage_parts.back().ple.resize(64, 5);
+        auto nested_alias = conversation_image_freeze_share(nested);
+        check(nested.stage_images.back().live.dead.frozen() &&
+              nested.checkpoints.back().stage_parts.back().ple.sealed() &&
+              nested_alias->stage_images.back().live.dead.data() ==
+                  nested.stage_images.back().live.dead.data() &&
+              nested_alias->checkpoints.back().stage_parts.back().ple.data() ==
+                  nested.checkpoints.back().stage_parts.back().ple.data(),
+              "freezing reaches stage images and checkpoint stage parts, sharing their allocations");
+    }
+    {
+        // The unfrozen fallback is still correct: an alias of a buffer that was never frozen copies, so a later write
+        // to the source cannot reach it either.
+        auto source = image({5, 6, 7});
+        source.live.tails.resize(256, 21);
+        auto copy = source.frozen_alias();
+        check(!source.live.tails.frozen(), "a capture that was never frozen is not reported as frozen");
+        check(copy.live.tails.read() == source.live.tails.read(), "the fallback alias starts equal");
+        check(copy.live.tails.data() != source.live.tails.data(),
+              "the fallback alias owns its own bytes, so the source is free to move on");
+        source.live.tails.write()[0] = 0x5A;
+        check(copy.live.tails.read()[0] == 21, "a write to the source cannot reach an unfrozen alias");
+    }
+    {
+        // Publication leases are charged to the same envelope as the parked payloads, and releasing them restores
+        // admission exactly.  Every reference is charged in full, so the peak can never over-commit.
+        auto one = image({1, 2, 3});
+        one.live.gdn.resize(4096, 9);
+        const size_t unit = one.bytes();
+        ConversationCache cache(unit * 3, 4);
+        check(cache.try_reserve_lease(unit * 3), "a lease may use the whole envelope when nothing is parked");
+        check(cache.envelope_bytes() == unit * 3 && cache.leased_bytes() == unit * 3,
+              "the lease is visible in the envelope and its own accounting");
+        check(!cache.try_reserve_lease(1), "a lease cannot exceed the budget");
+        check(!cache.can_fit(unit) && !cache.reserve_snapshot(unit) && !cache.put(image({9, 8, 7})),
+              "parking and capture admission both stop while the envelope is fully leased");
+        cache.release_lease(unit);
+        check(cache.leased_bytes() == unit * 2 && cache.can_fit(unit),
+              "releasing part of a lease restores exactly that much admission");
+        cache.release_lease(unit * 4);
+        check(cache.leased_bytes() == 0, "releasing more than was reserved never underflows");
+        check(cache.put(image({9, 8, 7})), "parking works again once the leases are released");
+        // A frozen, published image is charged in full even though its bytes are shared with the parked entry: the
+        // bookkeeping stays conservative and the physical floor remains the real gate.
+        auto parked = image({4, 5, 6});
+        parked.live.gdn.resize(4096, 3);
+        check(cache.put(std::move(parked)), "park the image that will be published");
+        const size_t parked_bytes = cache.bytes();
+        auto published = image({4, 5, 6, 7});
+        published.live.gdn.resize(4096, 3);
+        auto alias = conversation_image_freeze_share(published);
+        check(cache.try_reserve_lease(alias->bytes()), "the publication lease is admitted beside the parked entry");
+        check(cache.envelope_bytes() > parked_bytes && cache.bytes() == parked_bytes,
+              "the lease changes the envelope, not the parked payload accounting");
+        cache.release_lease(alias->bytes());
+        check(cache.envelope_bytes() == parked_bytes,
+              "releasing the publication lease returns the envelope to the parked payloads alone");
+        check(published.live.gdn.data() == alias->live.gdn.data() &&
+              published.live.gdn.read() == alias->live.gdn.read(),
+              "the publication alias shares the frozen image's allocations with no payload copy");
+    }
+    {
+        // The stored candidate's contract inside the existing selector (the demand path feeds its disk candidate
+        // through the same PrefixChoice, never a second selector): an equal cut never outranks the RAM/live/resident
+        // source enumerated first, and an unpriced longer candidate keeps the longest-prefix rollback rather than
+        // inventing an SSD rate.
+        strata::program::PrefixChoice choice(false);
+        choice.consider(0, 1000, 5.0);          // the RAM/live cut, priced by real observations
+        choice.consider(1, 1000, std::nullopt); // an equal stored cut, unpriced
+        check(choice.selected() == 0, "an equal stored cut does not displace the RAM source enumerated first");
+        strata::program::PrefixChoice cost(true);
+        cost.consider(0, 1000, 5.0);
+        cost.consider(1, 2000, std::nullopt);
+        check(cost.longest() == 1 && cost.selected() == 1 && !cost.using_cost(),
+              "an unpriced longer stored cut keeps the longest rollback instead of a measured choice");
+        strata::program::PrefixChoice priced(true);
+        priced.consider(0, 1000, 5.0);
+        priced.consider(1, 2000, 9.0);
+        check(priced.using_cost() && priced.selected() == 0,
+              "a priced stored candidate competes in the existing cost policy like any other source");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
