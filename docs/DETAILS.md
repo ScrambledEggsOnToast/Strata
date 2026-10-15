@@ -1578,11 +1578,15 @@ envelope is skipped instead of over-committing it. A restore hands the engine an
 it was captured from - the same authorized scope and the same token prefix, checked by hash - so a divergent sibling
 keeps its own head, a one-shot descendant (a `ckpt=0` request) neither consumes nor supersedes its donor, and a stale
 completion cannot overwrite a newer covered descendant. `generation` is assigned at capture ordering, not worker
-completion. The store admits one writer at a time. Reuse of a physical slot does not coalesce unrelated queued
-captures. The engine advances publications on its owner thread at prefill chunk boundaries, decode iterations and
-idle command waits, rather than waiting for another request. These CPU-only handovers reap completed results and
-may prepare metadata, but do not wait for the writer. Whole-prompt reads without an owner-thread chunk boundary
-(the no-slot bypass and a layer split with no time budget) retain once-per-request handover.
+completion, and it is the execution domain's chronology rather than one process's own count: a run numbers its
+captures above the greatest generation its own domain has already persisted (`publication_generation_floor()`), so the
+first capture after a clean restart can still cover the head it just restored, while a completion numbered at or below
+its predecessor's stays a stale one. The store admits one writer at a time. Reuse of a physical slot does not
+coalesce unrelated queued captures. The engine advances publications on its owner thread at prefill chunk
+boundaries, decode iterations and idle command waits, rather than waiting for another request. These CPU-only
+handovers reap completed results and may prepare metadata, but do not wait for the writer. Whole-prompt reads without
+an owner-thread chunk boundary (the no-slot bypass and a layer split with no time budget) retain once-per-request
+handover.
 
 *Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the

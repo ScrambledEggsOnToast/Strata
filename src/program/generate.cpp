@@ -10959,7 +10959,7 @@ int main(int argc, char** argv) {
         constexpr size_t kPendingPublishes = 8;   // the store's own writer plus its pending slots, plus slack
         uint64_t capture_generation = 0;   // publication ordering at capture, never worker completion
         uint64_t demand_serial = 0;        // demand identifiers for requests that arrived without an offer
-        uint64_t publication_serial = 0;   // publication identifiers, to match asynchronous results
+        uint64_t publication_serial = 0;   // publication identifiers and capture generations; seeded from the store
         uint64_t store_published = 0, store_restored = 0;
         uint64_t store_refused = 0, store_coalesced = 0, store_cancelled = 0, store_dropped = 0;
         // Internal identifiers must stay unique for as long as a completion can still arrive: a wrapped demand id
@@ -11236,6 +11236,14 @@ int main(int argc, char** argv) {
             }
         }
         const bool store_on = conversation_store && conversation_store->enabled();
+        // A publication's generation is the store's chronology, not this process's own count: the head a capture
+        // covers was written by whichever process captured it - possibly an earlier one - and the store admits a cover
+        // only when its generation is strictly newer than that head's.  Start this run's numbering above everything
+        // this execution domain has already persisted, so the first capture after a clean reopen can still cover the
+        // head it just restored, and mint upward from there.  The floor belongs to the domain, never to the physical
+        // owner: which slot holds a state does not enter the ordering, so an owner migrating onto this engine is
+        // covered by exactly the same rule.
+        if (store_on) publication_serial = conversation_store->publication_generation_floor();
         bool store_faulted = false;
         auto poison_store = [&] {
             store_faulted = true;

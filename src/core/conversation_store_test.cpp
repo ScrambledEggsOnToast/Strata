@@ -479,6 +479,7 @@ void check_native_split_restore();
 void check_request_specific();
 void check_incoming_lifetime();
 void check_publication_rules();
+void check_restart_generation_ordering();
 void check_pinned_branch();
 void check_reuse();
 void check_leases_and_budget();
@@ -521,6 +522,7 @@ int main() {
     check_request_specific();
     check_incoming_lifetime();
     check_publication_rules();
+    check_restart_generation_ordering();
     check_pinned_branch();
     check_reuse();
     check_leases_and_budget();
@@ -1639,6 +1641,96 @@ void check_publication_rules() {
     while (store.wait_publish(drain, 2000)) {
     }
     store.close();
+}
+
+// The ordering a restart must respect.  A generation is the store's chronology rather than one process's own count:
+// the head a cover names was captured by whichever process wrote it, so a restarted engine that minted from zero
+// again would name a figure this domain has already used and the cover of the head it just restored would be refused
+// as a stale completion.  The floor it must start above is this domain's own persisted history - and the floor
+// relaxes nothing: the numbering that ignores it is still refused, and the same-run ordering is unchanged.
+void check_restart_generation_ordering() {
+    TempRoot root;
+    const SavedConversation restored = fixture(91, 128);
+    const SavedConversation sibling = fixture(92, 160);
+    uint64_t predecessor = 0;
+    {
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, restored, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the pre-restart head is stored");
+        predecessor = stored.head_id;
+        ConversationStorePublishResult branch;
+        check(publish_and_wait(store, sibling, 2, 2, branch) &&
+                  branch.status == ConversationStorePublishStatus::stored,
+              "a second pre-restart head is stored");
+        check_eq(store.publication_generation_floor(), 2,
+                 "the floor is the domain's greatest retained generation");
+        store.close();
+    }
+
+    {
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        check(store.enabled() && store.healthy(), "the domain reopens cleanly after the close");
+        check_eq(uint64_t(store.counters().heads), 2, "both pre-restart heads survive the clean close");
+        check_eq(store.publication_generation_floor(), 2,
+                 "the reopened domain reports the generations it has already written");
+
+        // The numbering a process that restarted from zero would mint: the predecessor's own generation is not newer
+        // than itself, so this cover is a stale completion and can never overwrite the head it names.
+        auto restart_numbering = std::make_shared<SavedConversation>(appended_turn(restored, 192, 91));
+        ConversationStorePublish stale;
+        stale.request_id = 1;
+        stale.generation = 1;
+        stale.supersedes = predecessor;
+        stale.cover = true;
+        std::string why;
+        check(store.publish(restart_numbering, stale, why), "the stale cover is admitted as a ticket");
+        ConversationStorePublishResult refused;
+        check(store.wait_publish(refused, 5000), "the stale cover settles");
+        check(refused.status == ConversationStorePublishStatus::stale,
+              "a cover numbered from zero is still refused as a stale completion");
+        check(store.counters().refusals_stale > 0, "the stale refusal is counted");
+        check_eq(store.counters().replaced, 0, "a stale completion replaces nothing");
+
+        // Minting strictly above the floor covers the head the reopen restored: the first capture after a restart is
+        // admitted, exactly as the engine's own numbering now is.
+        auto restarted_cover = std::make_shared<SavedConversation>(appended_turn(restored, 192, 91));
+        const uint64_t generation = store.publication_generation_floor() + 1;
+        ConversationStorePublish cover;
+        cover.request_id = generation;
+        cover.generation = generation;
+        cover.supersedes = predecessor;
+        cover.cover = true;
+        check(store.publish(restarted_cover, cover, why), "a cover minted above the floor is admitted");
+        ConversationStorePublishResult replaced;
+        check(store.wait_publish(replaced, 5000), "the restarted cover settles");
+        check(replaced.status == ConversationStorePublishStatus::replaced,
+              "a cover minted above the floor retires the head the restart restored");
+        check_eq(replaced.superseded, predecessor, "the retired predecessor is the restored head");
+        store.close();
+    }
+
+    // The floor is this domain's chronology, never the catalog's: a head another execution domain wrote orders
+    // nothing here, so one profile's numbering can never inflate or reorder another's covers.
+    {
+        ConversationStoreOptions other_options = options_for(root.path, uint64_t(1) << 30, 0);
+        other_options.domain = bytes_from("domain:other");
+        ConversationStore other(other_options);
+        check(other.enabled(), "a second execution domain opens on the same root");
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(other, fixture(93, 96), 1, 40, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the other domain writes a far newer generation");
+        check_eq(other.publication_generation_floor(), 40, "the other domain's floor is its own");
+        other.close();
+    }
+    {
+        ConversationStore again(options_for(root.path, uint64_t(1) << 30, 0));
+        check_eq(again.publication_generation_floor(), 3,
+                 "another domain's generations never order this domain's covers");
+        again.close();
+    }
 }
 
 void check_reuse() {

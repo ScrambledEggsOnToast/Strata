@@ -3666,6 +3666,17 @@ uint64_t ConversationStore::epoch() const {
     return impl_->epoch;
 }
 
+uint64_t ConversationStore::publication_generation_floor() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    // Every head the catalog holds for this domain - including one waiting to be retired for an unclean start or a
+    // retired epoch: a figure the catalog has already recorded is never minted again, whether or not the head it
+    // belongs to is still reachable, so a cover can never name a generation this domain has already used.
+    uint64_t floor = 0;
+    for (const auto& head : impl_->catalog.heads)
+        if (head.domain == impl_->domain_index) floor = std::max(floor, head.generation);
+    return floor;
+}
+
 const std::array<uint8_t, 32>& ConversationStore::issuer_key() const { return impl_->issuer_key; }
 
 bool ConversationStore::run_intent_active() const {

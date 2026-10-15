@@ -455,6 +455,18 @@ public:
     const std::array<uint8_t, 32>& issuer_key() const;
     bool run_intent_active() const;
     uint64_t domain_digest_truncated() const;
+    // The durable publication-ordering floor of this store's own execution domain: the greatest generation the
+    // catalog records for a head of this domain, across every head it has not retired yet.  A cover is admitted only
+    // when its generation is *strictly* newer than the predecessor head's, and that predecessor's figure was written
+    // by the process that captured it - which may have been an earlier one.  A caller that mints its own generations
+    // (Publish::generation) must therefore start a fresh process above this value and mint upward from there: a
+    // counter restarting at zero would name a figure this domain has already used, and its cover of the head it just
+    // restored would be refused as a stale completion.  The ordering is per domain because the store compares a cover
+    // only with a predecessor of this domain and epoch, and it is a floor rather than a reservation: a refused
+    // publication leaves the value behind the numbers its caller minted, which is harmless while the caller keeps
+    // minting upward.  Cheap, read-only; 0 when this domain retains no head (an instance that never read a catalog
+    // has none to report).
+    uint64_t publication_generation_floor() const;
 
     // --- lookup (read-only, cheap, CPU only) ---------------------------------------------------------------
     // Exact authorized cuts for one selector, longest first and, within equal lengths, newest first.  Never exposes
