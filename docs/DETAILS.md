@@ -1356,7 +1356,11 @@ at assistant-turn boundaries and every `--prompt-cache-every` tokens). Prefix to
 mode must still match. Supply a stable `"strata_conversation_id": "your-thread-id"` (a nonempty UTF-8 string of
 at most 256 bytes) on every turn when a client keeps separate conversations: it is that client's **declared
 group**. The server binds it to the **tenant**, the loaded model,
-the tokenizer and the template, then sends a fixed 32-byte `scope` to the native engine. Codex's explicit
+the tokenizer and the template, then sends a fixed 32-byte `scope` to the native engine. With a persistent
+conversation store the binding is also **stable across restarts**: the digest is keyed with the store's issuer key
+and names the tokenizer and template *content* (plus the fingerprint of the credential that attested the caller), so
+the next server process derives the same scope for the same conversation, while a rotated issuer key or credential
+isolates the records the old one authorized. Codex's explicit
 session/thread turn metadata also declares a group; its `prompt_cache_key` alone does not, because forks can share
 that grouping key. The web chat supplies and persists its own ID, rotating it for New chat.
 The tenant is the caller: the API key that request authenticated with, or — when it carries the tenant token
@@ -1366,8 +1370,9 @@ all reach the engine under its single credential; a caller without the token may
 sends is ignored. A request that declares no group belongs to its tenant's single content space, where what it may
 reuse is still only a **prefix it also sends**: the engine requires the same tokens from the start of the prompt,
 so text after the first difference is never taken from another conversation, and one tenant never shares a
-namespace with another. Scope metadata is process-local,
-not a durable session credential. Changed scopes discard the live checkpoint chain; resident and parked searches require an
+namespace with another. Scope metadata is a digest, not a durable session credential: with a persistent store it
+names the same conversation in every process that serves it, and without one it is process-local.
+Changed scopes discard the live checkpoint chain; resident and parked searches require an
 exact scope match before token/image matching. Existing snapshot geometry, format and model/config checks remain.
 The oldest checkpoint remains a root **within that conversation**, not a shared system-prompt cache. Other leaves
 rotate by LRU. Options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no root
@@ -1381,6 +1386,19 @@ It still starts from a checkpoint it matches, and still saves the system-prompt 
 the prior working/resident history is preserved before overwrite, and a parked donor is returned
 unchanged before prefill. The one-shot extension does not replace it, so an ordinary later request
 can still reuse the previously completed history. Without the field (or with `true`) nothing changes.
+
+**Prepared queued requests.** With a persistent store the engine advertises a private channel: an inherited socket
+(`STRATA_CONVERSATION_OFFER_FD`), on which it says how many queued requests it will consider at once — the
+**frontier** (one, or two for an engine running two pipeline groups). This server prepares up to that many queued
+**text** requests ahead of admission — resolved, rendered and tokenized exactly as the run would, but with no image,
+no temporary file and no engine turn — and offers each one's tokens to the store, sealed and read-only, so a matching
+history is validated and read while the request is still waiting. The generation that runs consumes that same
+prepared result (the prompt is never rendered twice) and binds it with the internal `cache_offer`/`cache_generation`
+keys on `GEN`/`BGEN`; the offer is retired with the request that made it (its client, its deadline or its
+cancellation). Queue order, the foreground/background rule, deadlines, image handling and every existing endpoint
+behaviour are unchanged, and an offer that cannot be sent is only a cache miss. A request behind the frontier is not
+prepared at all, and this channel is between this server and its own engine — never a client-facing API.
+`serve.test_conversation_offers` covers the stable scope, the prepared frontier and the transport.
 
 **Cost-aware continuation (opt-in).** `--prefix-selection cost` considers every valid active,
 resident-slot and parked-RAM live/checkpoint prefix, and fresh recomputation, before taking or

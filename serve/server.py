@@ -25,6 +25,7 @@ import argparse
 import contextlib
 import collections
 import base64
+import dataclasses
 import hashlib
 import hmac
 import codecs
@@ -64,13 +65,26 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from serve import scoring as score_api  # noqa: E402
+from serve import scoring as score_api
+from serve import conversation_offers
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 DEFAULT_REQUEST_QUEUE_LIMIT = 32
 MAX_REQUEST_QUEUE_LIMIT = 256  # bounded HTTP workers/metadata, not a native serving-capacity claim
 MAX_RETRY_AFTER_S = 30  # bounded advisory backoff, never a readiness/completion promise
+TOKENIZER_FILES = ("vocab.json", "merges.txt", "token_type.json")   # what a prompt's tokenizer content identity is
+
+
+def credential_fingerprint(credential: str) -> str:
+    """A short fingerprint of the credential a request was authenticated with - never the credential's bytes.
+
+    It only ever enters an HMAC message (see Service.cache_scope), which is what keeps a rotated gateway or client
+    key from naming the records the old key authorized.  Nothing here is logged, stored or sent to a client.
+    """
+    if not credential:
+        return ""
+    return hashlib.sha256(credential.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def popen(what: str, args: list, **kw):
@@ -266,6 +280,11 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+# A frontend shutdown has a grace period of its own (docker stop, a systemd unit, whatever started it): everything the
+# frontend does on the way out - refusing new requests, cancelling the accepted ones and letting the engine drain its
+# own work after QUIT - is bounded by this, after which the engine is terminated and then killed.  STRATA_SHUTDOWN_WAIT_S
+# overrides it; the engine is still never counted as cleanly drained unless it ended on its own terms.
+SHUTDOWN_WAIT_S = _timeout_env("STRATA_SHUTDOWN_WAIT_S", 15.0) or 15.0
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -369,6 +388,15 @@ class GpuBusy(RuntimeError):
     def __init__(self, message="", retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class RequestAnswered(Exception):
+    """A handler-owned gate already wrote this request's response (the app's own page check): stop without error.
+
+    It exists so endpoint resolution can be shared with the queued frontier's own preparation (see
+    Service.resolve_openai): that path passes no such gate, while the running request's does, and a gate that refused
+    has nothing left to say - exactly as a `return` from the handler used to mean.
+    """
 
 
 def unload_wait(value, default: float) -> float:
@@ -855,6 +883,9 @@ class StrataEngine:
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
+        # The private conversation-offer channel of this incarnation (None before it is spawned, on a system
+        # without one, or after close()): the engine inherits its child end and we read the engine's HELLO on ours.
+        self.offers = None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
@@ -910,8 +941,29 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
-        self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
+        link = None
+        if conversation_offers.SUPPORTED:
+            try:
+                link = conversation_offers.ConversationOfferLink()
+            except OSError as e:                         # too many descriptors: the ordinary demand path remains
+                print(f"[strata] no private conversation-offer channel: {e}", flush=True)
+        if link is not None:
+            env = link.child_environment(env)            # a copy: the spawn config itself must not carry our fd
+            pin["pass_fds"] = link.pass_fds()
+        try:
+            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1,
+                              env=env, **pin)
+        except BaseException:
+            if link is not None:
+                link.close()
+            raise
+        finally:
+            if link is not None:
+                link.release_child()                     # the engine owns the child's end from here on
+        if link is not None:                             # the engine's HELLO arrives with (or after) its READY
+            self.offers = link
+            link.start()
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
@@ -1417,6 +1469,16 @@ class StrataEngine:
             if not isinstance(scope, str) or not re.fullmatch(r"[0-9a-f]{64}", scope) or int(scope, 16) == 0:
                 raise ValueError("invalid internal conversation cache scope")
             keys += f" scope={scope}"
+        # The prepared offer this request's demand consumes: the store binds the scope's candidates to the tokens it
+        # already validated and read, so a queued request's restore was decided before it was admitted.  Both keys
+        # are the frontend's own (never a client's: see Service.prepare and the POST dispatch).
+        offered = sampling.get("_strata_cache_offer")
+        if offered is not None:
+            generation = sampling.get("_strata_cache_generation")
+            if (isinstance(offered, bool) or not isinstance(offered, int) or offered <= 0
+                    or isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0):
+                raise ValueError("invalid internal prepared conversation offer")
+            keys += f" cache_offer={offered} cache_generation={generation}"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -2596,9 +2658,22 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
-    def close(self):
+    def close(self, timeout_s: float | None = None):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three.
+
+        `timeout_s` bounds the whole sequence instead (a shutdown has a grace period of its own: see SHUTDOWN_WAIT_S),
+        spending what is left of it on QUIT first - the only step the engine can drain its own storage work on - and
+        forcing what remains.  The QUIT line and the closed stdin are the engine's signal to end on its own terms; the
+        frontend never reports a forced ending as a clean one."""
+        deadline = None if timeout_s is None else time.monotonic() + max(0.5, float(timeout_s))
+
+        def left(default: float) -> float:
+            return default if deadline is None else max(0.1, deadline - time.monotonic())
+
+        link, self.offers = getattr(self, "offers", None), None
+        if link is not None:                             # the channel belongs to the incarnation that owned it
+            link.close()
         if self.proc is None:
             return
         try:
@@ -2607,14 +2682,14 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=left(20))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=left(20))
         except subprocess.TimeoutExpired:
             self.proc.kill()
             try:
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=left(20))
             except subprocess.TimeoutExpired:
                 raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
@@ -3495,12 +3570,41 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+@dataclasses.dataclass
+class ResolvedGeneration:
+    """A generation request's endpoint-specific inputs, resolved once for both the queued frontier and its own run.
+
+    `Service.resolve_*` produce it: every formatting, tool, setting, forced-opening, output/context and validation
+    decision the endpoint has always made, with no engine load, no rendering and no I/O of its own.  A request that is
+    queued on the frontier is *prepared* from it (rendered, tokenized and offered - see Service.prefetch_offer), and
+    the demand path that later runs the request resolves it again and consumes that exact prepared result instead of
+    rendering the prompt a second time.
+    """
+
+    api: str                            # which endpoint resolved it
+    req: dict                           # the request as the endpoint resolved it; also the sampling dict of its run
+    messages: list
+    tools: list | None
+    kw: dict
+    max_new_requested: int              # the output room the client asked for (0/-1: whatever the context leaves)
+    force: str | None = None            # forced_call: the opening the reply must make
+    validator: Any = None               # structured-output validator, when the request asked for one
+    names: list | None = None           # /v1/responses: the names of the tools the request offered
+    skipped: list | None = None         # /v1/responses: hosted tools this server cannot run
+    shown: list | None = None           # /v1/responses: the tools the prompt is rendered with (#924)
+    mcp_use: bool = False               # the chat route's MCP block decided to use its extra tools
+    mcp_extra: set = dataclasses.field(default_factory=set)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, tokenizer_dir=None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.cache_secret = uuid.uuid4().bytes
+        self.tokenizer_dir = tokenizer_dir    # the artifacts a prompt's tokenizer content identity is taken from
+        self.scope_lock = threading.Lock()
+        self._render_identity = None          # computed once, and only when a persistent store asks for a scope
         self.supervised = os.environ.get("STRATA_SUPERVISED") == "1"
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -3562,6 +3666,7 @@ class Service:
         self.admission_active = {}
         self.admission_foreground = {False: 0, True: 0}  # independent generation / score fairness
         self._foreground_pending = False
+        self.shutting_down = False                       # a shutdown refuses new requests and cancels the accepted
         self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
         self.request_timeout_s = 600.0
         self.request_body_bytes = 4 * 1024 * 1024
@@ -3755,6 +3860,11 @@ class Service:
                   "_deadline": now + timeout, "_cancel": cancel}
         with self.admission_cv:
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
+            if self.shutting_down:
+                record.update(state="rejected", error="the server is shutting down", completion_s=0.0)
+                record["events"].append({"state": "rejected", "elapsed_s": 0.0})
+                self.lifecycles.append(record)
+                raise AdmissionError("the server is shutting down; no new request is accepted", 503)
             # SCORE uses its own bounded control lane, not a generation reservation.
             limit = score_api.capabilities(self.engine)["max_pending"] if score else capacity + self.request_queue_limit
             pending = (sum(bool(r.get("_score")) == score for r in self.admission_active.values()) +
@@ -3780,9 +3890,17 @@ class Service:
             if len(record["events"]) < 128:
                 record["events"].append({"state": state, "elapsed_s": round(time.perf_counter() - record["_clock"], 6)})
 
-    def acquire_request(self, record):
-        with self.admission_cv:
-            while True:
+    def acquire_request(self, record, on_wait=None):
+        """Wait for this server's admission decision: FIFO within a priority class, with a background admission after
+        at most three foreground ones.
+
+        `on_wait` runs once per wait, outside every admission lock, before the next decision: that is when a queued
+        request may prepare and offer itself (see prefetch_offer).  It never changes the decision below - a later,
+        warmer request cannot overtake the head - and it may not hold anything up but itself.
+        """
+        while True:
+            admitted = False
+            with self.admission_cv:
                 if record["_cancel"].is_set():
                     raise AdmissionError(record.get("cancel_reason", "cancelled"),
                                          408 if record.get("cancel_reason") == "timeout" else 409)
@@ -3805,9 +3923,29 @@ class Service:
                     self.status["queued"] -= 1
                     record["queue_s"] = round(time.perf_counter() - record["_clock"], 6)
                     self.admission_cv.notify_all()
-                    break
-                self.admission_cv.wait(timeout=0.25)
+                    admitted = True
+                else:
+                    self.admission_cv.wait(timeout=0.25)
+            if admitted:
+                break
+            if on_wait is not None:
+                on_wait()
         self.lifecycle_note(record, "admitted")
+
+    def stop_admission(self) -> None:
+        """Shut the door and cancel everything already accepted: the first thing a shutdown does.
+
+        New requests are refused from here on, and every queued or running one is cancelled - which unwinds its
+        handler thread, retires its prepared offer (withdraw_offer) and closes its generators - before the engine is
+        asked to end.  So the engine is never told to drain while a request of ours is still writing to its stdin.
+        """
+        with self.admission_cv:
+            self.shutting_down = True
+            records = list(self.admission_waiters) + list(self.admission_active.values())
+            for record in records:
+                record["cancel_reason"] = "shutting down"
+                record["_cancel"].set()
+            self.admission_cv.notify_all()
 
     def finish_lifecycle(self, record):
         with self.admission_cv:
@@ -4456,7 +4594,7 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def cache_scope(self, req: dict, tenant: str) -> str:
+    def cache_scope(self, req: dict, tenant: str, *, gateway: bool = False, credential: str = "") -> str:
         """A fixed namespace per (tenant, declared group) - not a conversation registry, and not a
         token-similarity key.
 
@@ -4466,6 +4604,16 @@ class Service:
         tenant has one content space, where reuse still requires the same tokens from the start of
         the prompt: what a request can pick up is a prefix it also sends, never another
         conversation's text.
+
+        With a persistent store (the native side's HELLO carries an issuer key) the namespace is *stable across
+        restarts* - the next server process derives the same scope for the same conversation, which is what makes a
+        stored history discoverable at all.  The key is that issuer key, never a per-process secret, and the message
+        names the tagged principal that was authenticated with the fingerprint of the credential that attested it
+        (so rotating that credential isolates the records it authorized), the group, the model this server is
+        configured for and the content identity of the tokenizer and template the prompt is rendered with.  Only the
+        digest leaves this process; key and credential bytes are never logged, stored or sent anywhere.  Without a
+        store the scope stays exactly what it was: process-local, so a parked conversation is reused by the process
+        that parked it and by no one else.
         """
         group = req.get("strata_conversation_id")
         if group is not None:
@@ -4478,13 +4626,343 @@ class Service:
         # Model/config/geometry and resolved placement cannot change inside a
         # loaded engine. Replacement tokenizer/template objects or template source
         # invalidate this namespace before native token/image/steering validation.
-        identity = [tenant, group, self.model, id(self.tok), self.template.source]
-        return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
+        key = self.scope_key()
+        if key is None:
+            identity = [tenant, group, self.model, id(self.tok), self.template.source]
+            return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
+        identity = ["scc1", ["gateway" if gateway else "principal", tenant, credential_fingerprint(credential)],
+                    group, self.model, self.render_identity()]
+        return hmac.new(key, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
+
+    def scope_key(self) -> bytes | None:
+        """The persistent store's issuer key for this incarnation, or None when it keeps nothing on disk."""
+        link = self.offer_link()
+        return link.scope_key() if link is not None else None
+
+    def offer_link(self) -> "conversation_offers.ConversationOfferLink | None":
+        """This incarnation's private offer channel, when it exists and the engine has answered its HELLO."""
+        link = getattr(self.engine, "offers", None)
+        if isinstance(link, conversation_offers.ConversationOfferLink) and not link.closed:
+            return link
+        return None
+
+    def render_identity(self) -> str:
+        """The content identity of what a prompt is rendered and tokenized with (computed once per server).
+
+        The template's source, the tokenizer's own artifacts and the tokenizer's shape: a re-exported template or a
+        replaced/updated tokenizer directory is a different conversation namespace, so records tokenized another way
+        are never reused.  What the model artifact is, authoritatively, is the native store's own execution-domain
+        key; this only names the content the prompt was made of, and it is only ever computed when a persistent
+        store asks for a stable scope.
+        """
+        with self.scope_lock:
+            if self._render_identity is None:
+                h = hashlib.sha256()
+                h.update(b"scc1")
+                h.update(self.template.source.encode("utf-8", "surrogatepass"))
+                h.update(type(self.tok).__name__.encode("utf-8", "surrogatepass"))
+                control = getattr(self.tok, "control_tokens", ()) or ()
+                h.update(repr(sorted(str(t) for t in control)).encode("utf-8", "surrogatepass"))
+                files = 0
+                for name in TOKENIZER_FILES:
+                    path = Path(self.tokenizer_dir) / name if self.tokenizer_dir else None
+                    try:
+                        if path is None or not path.is_file():
+                            continue
+                        with open(path, "rb") as f:
+                            h.update(name.encode() + b"\0")
+                            for block in iter(lambda: f.read(1 << 20), b""):
+                                h.update(block)
+                        files += 1
+                    except OSError:
+                        continue
+                if not files:                       # no artifacts to read (the tests' byte tokenizer, say): the
+                    tokens = getattr(self.tok, "tokens", None)   # tokenizer's own shape is what is left to name
+                    if isinstance(tokens, (list, tuple)):
+                        h.update(b"tokens=" + str(len(tokens)).encode())
+                self._render_identity = h.hexdigest()
+            return self._render_identity
+
+    # -- the queued frontier: preparing and offering a request before it is admitted --------------------------------
+
+    OFFER_PATHS = ("/v1/chat/completions", "/v1/messages", "/v1/responses")   # the text generation endpoints
+
+    def offers_ready(self) -> bool:
+        """True when this incarnation has a channel whose store persists histories: only then is there anything to
+        offer (an engine without one, or one whose store is disabled, keeps the ordinary demand path)."""
+        link = self.offer_link()
+        return link is not None and link.store_enabled
+
+    def offer_frontier(self, link) -> int:
+        """How many queued requests this incarnation prepares ahead of admission (its HELLO's frontier)."""
+        return max(1, link.frontier())
+
+    def offer_stats(self) -> dict:
+        """This incarnation's offer counters (for tests and the operators' own monitoring, never a client API)."""
+        link = getattr(self.engine, "offers", None)
+        if isinstance(link, conversation_offers.ConversationOfferLink):
+            return link.stats()
+        return {"store": False, "frontier": 0, "accepted": 0, "cancelled": 0, "rejected": 0,
+                "accepted_token_bytes": 0, "outstanding": 0, "outstanding_bytes": 0, "malformed": 0,
+                "received_fds": 0, "closed": True, "reader_error": None}
+
+    def offer_position(self, record) -> int:
+        """How many preparable requests wait ahead of `record` in queue order (-1: it is not waiting at all).
+
+        Queue order is the arrival order of the admitted-bound waiters - the order the admission selector scans - and
+        preparation follows it, so no later request is prepared (or can be run) ahead of the head of the queue.
+        """
+        with self.admission_cv:
+            ahead = 0
+            for waiter in self.admission_waiters:
+                if waiter is record:
+                    return ahead
+                if waiter.get("_resolved") is not None:
+                    ahead += 1
+            return -1
+
+    def resolve_for_offer(self, path: str, req: dict, images_gate=None) -> ResolvedGeneration | None:
+        """The endpoint resolution of a request that is only queued, or None when it may not be prepared early.
+
+        Only a plain text generation is resolved ahead of admission: a request that asks for MCP tools waits for the
+        app's own page and for those servers, an image request keeps the guarded path it has always had, and a
+        malformed request is refused - with its own status and words - by the demand path that owns it.  Nothing here
+        loads the engine, renders a prompt, reads a file or writes anything.
+        """
+        if path not in self.OFFER_PATHS or not self.offers_ready():
+            return None
+        try:
+            if path == "/v1/chat/completions":
+                if req.get("strata_mcp") is True:            # its tools wait for the app's own page and its servers
+                    return None
+                resolved = self.resolve_openai(req, images_gate=images_gate, mcp=None, load=False)
+            elif path == "/v1/messages":
+                resolved = self.resolve_anthropic(req, images_gate=images_gate, load=False)
+            else:
+                if self.codex_thread_titles and responses_api.thread_title_events(
+                        req, self.model_for(req)) is not None:
+                    return None                              # a thread title is answered without the engine
+                resolved = self.resolve_responses(req, images_gate=images_gate, load=False)
+        except Exception:            # noqa: BLE001 - every refusal belongs to the demand path that reports it
+            return None
+        if images_of(resolved.messages):                     # an image request keeps its existing guarded path
+            return None
+        return resolved
+
+    def prefetch_offer(self, record) -> None:
+        """Prepare and offer `record`'s queued request when it is on the frontier and the engine can serve it.
+
+        Runs on the queued request's own thread, outside every admission lock and without touching the engine's own
+        stdin: it may hold up nothing but itself.  Any failure leaves the request exactly as it was - the demand path
+        resolves, prepares and runs it as it always has, which is also what a missing preparation resource means.
+        """
+        resolved = record.get("_resolved")
+        if resolved is None or record.get("_prepared") is not None:
+            return
+        link = self.offer_link()
+        if link is None or not link.store_enabled or record["_cancel"].is_set():
+            return
+        if self.offer_position(record) >= self.offer_frontier(link):
+            return                                           # behind the frontier: nothing is prepared for it yet
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        if not self.loaded() or ctx <= 0:
+            return                                           # a queued request never starts or restarts the engine
+        try:
+            prepared = self.freeze_generation(resolved, ctx)
+        except Exception:            # noqa: BLE001 - the demand path reports every refusal, in its own words
+            return
+        self.offer_prepared(record, link, prepared)
+
+    def freeze_generation(self, resolved: ResolvedGeneration, ctx: int) -> "conversation_offers.PreparedGeneration":
+        """Render and tokenize `resolved`'s prompt now, for the generation that will consume it.
+
+        This is the whole CPU text preparation of a queued request: no image, no temporary file, no vision worker, no
+        engine turn and no client I/O - everything that needs the request's own turn stays in the demand path.
+        """
+        digest = conversation_offers.generation_digest(resolved.messages, resolved.tools, resolved.kw,
+                                                       resolved.max_new_requested, resolved.force)
+        ids, thinking, max_new = self.prepare(resolved.messages, resolved.tools, resolved.kw,
+                                              resolved.max_new_requested, force=resolved.force, req=resolved.req)
+        return conversation_offers.PreparedGeneration(ids=tuple(ids), thinking=thinking, max_new=max_new,
+                                                      digest=digest, ctx=ctx)
+
+    def offer_prepared(self, record, link, prepared) -> None:
+        """Tell the store about a prepared queued request and keep its answer on the request.
+
+        The offer is advisory: when the store cannot take it (no scope, too long, its byte budget is spent, or the
+        write fails) the prepared tokens are kept for the request itself and no generation key is bound later.
+        """
+        scope = (record.get("_resolved").req or {}).get("_strata_cache_scope")
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        request_id = 0
+        if scope and 0 < len(prepared.ids) <= ctx:
+            request_id = link.next_request_id()
+            if not link.offer(request_id=request_id, generation=link.epoch(),
+                              deadline_ns=int(record["_deadline"] * 1_000_000_000), scope=scope,
+                              tokens=prepared.ids, token_limit=ctx):
+                request_id = 0
+        prepared.link = link
+        prepared.generation = link.epoch()
+        prepared.offer_id = request_id
+        record["_prepared"] = prepared
+
+    def take_prepared(self, record, messages, tools, kwargs, max_new, force):
+        """The prepared result `record` may consume once, or None (nothing prepared, or it is not this prompt).
+
+        A match means the generation asks for exactly what was prepared, in the same engine incarnation (the store
+        binds the scope's candidate to that offer, so the tokens must be the ones it already read).
+        """
+        prepared = record.get("_prepared") if record else None
+        if prepared is None:
+            return None
+        ctx = int(getattr(self.engine, "max_context", 0) or 0)
+        digest = conversation_offers.generation_digest(messages, tools, kwargs, max_new, force)
+        prepared.consumed = True            # a prepared result is consumed once, whether or not it matches
+        return prepared if prepared.reusable(digest, ctx) else None
+
+    def bind_offer(self, req: dict, prepared) -> None:
+        """Bind this generation to the offer the store already validated (or clear any client's fields of that name).
+
+        These two keys are internal: they are put here from the request's own prepared result, in the incarnation that
+        really offered it, and never from a client - exactly like the conversation scope.
+        """
+        req.pop("_strata_cache_offer", None)
+        req.pop("_strata_cache_generation", None)
+        if prepared is None or not prepared.offered or prepared.withdrawn:
+            return
+        link = self.offer_link()
+        if link is None or link is not prepared.link or link.epoch() != prepared.generation:
+            return                                           # another incarnation: its own demand restore decides
+        req["_strata_cache_offer"] = int(prepared.offer_id)
+        req["_strata_cache_generation"] = int(prepared.generation)
+
+    def withdraw_offer(self, record) -> None:
+        """Retire a prepared offer this request will not (or no longer does) need: its deadline, its client or its
+        cancellation ends the offer with it, so the store's two frontiers are never held by a finished request."""
+        prepared = record.get("_prepared") if record else None
+        if prepared is None or not prepared.offered or prepared.withdrawn:
+            return
+        prepared.withdrawn = True
+        link = prepared.link
+        if link is not None:
+            link.cancel(prepared.offer_id, prepared.generation)
+
+    # -- the endpoints' own resolution, shared by the queued frontier and the run that consumes it ----------------
+
+    def resolve_openai(self, req, *, images_gate=None, mcp=None, load=True) -> ResolvedGeneration:
+        """POST /v1/chat/completions' resolution, in the order this handler has always used.
+
+        `load` starts the engine, as the running request does and the queued one may not.  `mcp` is the handler's own
+        opt-in MCP block (the app's page gate, the wait for its servers, their extra tools): None means "this request
+        is not the app's page's, or it is only being prepared", and then no MCP tool is offered at all.
+        """
+        req = self.with_shared(req, "openai")
+        bias_api.normalize(req.get("logit_bias"), len(getattr(self.tok, "tokens", ())) or None)
+        messages, tools, kw = openai_to_messages(req)
+        if images_gate is not None:
+            images_gate(messages)
+        if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
+            tools = None
+        force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+        messages, validator = prepare_format(req.get("response_format"), messages)
+        if validator is not None and (tools or req.get("strata_mcp")):
+            raise ValueError("structured response_format with tools/MCP is not supported")
+        if load:
+            self.load()
+        max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+        bias_api.validate_request(req, self.engine, len(getattr(self.tok, "tokens", ())) or None)
+        use_mcp, extra = False, set()
+        if mcp is not None:
+            tools, use_mcp, extra = mcp(req, tools, force)
+        if force and use_mcp:
+            raise ValueError("a forced tool_choice with MCP tools is not supported")
+        self.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+        stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+        check_request_sampling(req)                       # ... and a sampling field of the wrong type
+        return ResolvedGeneration(api="/v1/chat/completions", req=req, messages=messages, tools=tools, kw=kw,
+                                  max_new_requested=max_new, force=force, validator=validator, mcp_use=use_mcp,
+                                  mcp_extra=extra)
+
+    def resolve_anthropic(self, req, *, images_gate=None, load=True) -> ResolvedGeneration:
+        """POST /v1/messages' resolution, in the order this handler has always used (it loads the engine first)."""
+        if load:
+            self.load()
+        req = self.with_shared(req, "anthropic")
+        messages, tools, kw = anthropic_to_messages(req, self.anthropic_think_unasked)
+        if images_gate is not None:
+            images_gate(messages)
+        if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
+            tools = None
+        force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+        max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+        self.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+        stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+        check_request_sampling(req)                       # ... and a sampling field of the wrong type
+        return ResolvedGeneration(api="/v1/messages", req=req, messages=messages, tools=tools, kw=kw,
+                                  max_new_requested=max_new, force=force)
+
+    def resolve_responses(self, req, *, images_gate=None, load=True) -> ResolvedGeneration:
+        """POST /v1/responses' resolution, with its own error type and parameter names (serve/responses.py), in the
+        order this handler has always used."""
+        responses_api.check_request(req)
+        messages = responses_api.input_messages(req)
+        tools, names, skipped = responses_api.request_tools(req)
+        kw = responses_api.template_kwargs(req, self.shared)
+        if images_gate is not None:
+            try:
+                images_gate(messages)                        # as on the chat route: no file read for a foreign page
+            except ValueError as e:
+                raise ResponsesError(str(e), "input") from None
+        try:
+            messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+        except ValueError as e:
+            raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
+        noted = self.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
+        if set(skipped) - noted:
+            print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                  f"(this server cannot run them)", flush=True)
+            noted.update(skipped)
+        if req.get("max_output_tokens") is None and "max_tokens" in self.shared:   # the shared Chat settings
+            req = {**req, "max_output_tokens": self.shared["max_tokens"]}
+        try:
+            self.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
+        except ValueError as e:
+            raise ResponsesError(str(e), "reasoning_budget_tokens") from None
+        try:
+            stop_strings(req)
+        except ValueError as e:
+            raise ResponsesError(str(e), "stop") from None
+        try:
+            check_request_sampling(req)                   # the request is also the sampling dict (see below)
+        except ValueError as e:                           # its message starts with the field's name: the param
+            raise ResponsesError(str(e), str(e).partition(":")[0]) from None
+        if load:
+            self.load()
+        # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
+        # starts as the cached one did; the parser and the response keep the request's own tools
+        shown = responses_api.prompt_tools(req, tools) if self.codex_compaction_cache else tools
+        return ResolvedGeneration(api="/v1/responses", req=req, messages=messages, tools=tools, kw=kw,
+                                  max_new_requested=req.get("max_output_tokens") or 0, validator=validator,
+                                  names=names, skipped=skipped, shown=shown)
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
-        prompt; with thinking, Service.run writes it once the thinking is over."""
+        prompt; with thinking, Service.run writes it once the thinking is over.
+
+        A queued request this server already prepared (prefetch_offer, on the queue frontier) is consumed here: the
+        demand path gets exactly the tokens the store was offered, and the prompt is not resolved or rendered a second
+        time.  The two internal keys that bind the generation to that offer are put on `req` here, never taken from a
+        client, and only for the incarnation that really offered them."""
+        record = getattr(self.lifecycle_local, "record", None)
+        prepared = self.take_prepared(record, messages, tools, kwargs, max_new, force)
+        if prepared is not None:
+            self.embeddings.path = None       # a prepared request is text-only (see resolve_for_offer)
+            if req is not None:
+                self.bind_offer(req, prepared)
+            return list(prepared.ids), prepared.thinking, prepared.max_new
+        if req is not None:
+            self.bind_offer(req, None)        # a re-rendered prompt never carries a stale offer's keys
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
@@ -6246,21 +6724,30 @@ def make_handler(svc: Service):
                     # A tenant is a key. The label a gateway attests is trusted only from the token
                     # only the gateway holds; a header from anyone else is ignored, not rejected, so
                     # one request shape serves trusted and direct callers alike.
-                    tenant = principal
+                    tenant, gateway = principal, False
                     if svc.tenant_token and key_matches(given, svc.tenant_token):
                         attested = self.headers.get(TENANT_HEADER, "").strip()
                         if attested:
-                            tenant = attested
+                            tenant, gateway = attested, True
                     # Never trust a client-supplied internal scope or cache grouping key.
                     if path != "/v1/score":        # scores never reuse a conversation prefix
-                        req["_strata_cache_scope"] = svc.cache_scope(req, tenant)
+                        req["_strata_cache_scope"] = svc.cache_scope(req, tenant, gateway=gateway, credential=given)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
                     # A client that stops consuming must not hold a resident slot forever in a socket write.
                     self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
                     self._watch_client(self.request_cancel)
-                    svc.acquire_request(self.lifecycle)
+                    # A queued text request may prepare and offer itself to the store while it waits (only while it
+                    # is on the queue frontier: see Service.prefetch_offer).  A client's own fields of those internal
+                    # names are dropped here, exactly like a client-supplied scope.
+                    req.pop("_strata_cache_offer", None)
+                    req.pop("_strata_cache_generation", None)
+                    resolved = svc.resolve_for_offer(path, req, self._no_local_images) if path in svc.OFFER_PATHS \
+                        else None
+                    if resolved is not None:
+                        self.lifecycle["_resolved"] = resolved
+                    svc.acquire_request(self.lifecycle, on_wait=self._prefetch_offer)
                     if self.record is not None:
                         with svc.status_lock:
                             self.record["queue_s"] += self.lifecycle["queue_s"]
@@ -6344,6 +6831,7 @@ def make_handler(svc: Service):
                             self._note(error={"type": "drain_error", "message": str(e)})
                     self.lifecycle["_generators"] = []
                 if self.lifecycle is not None:
+                    svc.withdraw_offer(self.lifecycle)       # a prepared offer's lifetime is its request's
                     svc.finish_lifecycle(self.lifecycle)
                     attribution = _response_attribution(self.lifecycle, path)
                     with svc.status_lock:
@@ -6561,42 +7049,41 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
-        def _openai(self, req):
-            req = svc.with_shared(req, "openai")
-            bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
-            messages, tools, kw = openai_to_messages(req)
-            self._no_local_images(messages)
-            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
-                tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+        def _prefetch_offer(self):
+            """This queued request's one chance to prepare and offer itself while it waits (see prefetch_offer)."""
+            if self.lifecycle is not None:
+                svc.prefetch_offer(self.lifecycle)
+
+        def _openai_mcp(self, req, tools, force):
+            """The chat route's opt-in MCP block: the app's own page gate, the wait for servers still starting and the
+            extra tools they offer.  -> (tools, use_mcp, names).  Raises RequestAnswered when this is not the app's
+            own page, which has already been answered."""
+            if req.get("strata_mcp") is not True or svc.mcp is None:
+                return tools, False, set()
+            if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
+                raise RequestAnswered()
+            svc.mcp.wait(10)                                  # servers still starting (only right after start)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
-            if use_mcp:
-                if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
-                    return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
-                use_mcp = bool(extra)
-                tools = (tools or []) + extra or None
-            if force and use_mcp:
-                raise ValueError("a forced tool_choice with MCP tools is not supported")
-            svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
-            check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+            if not extra:
+                return tools, False, set()
+            return (tools or []) + extra or None, True, {t["name"] for t in extra}
+
+        def _openai(self, req):
+            try:
+                resolved = svc.resolve_openai(req, images_gate=self._no_local_images, mcp=self._openai_mcp)
+            except RequestAnswered:
+                return
+            req, messages, tools, kw, force = resolved.req, resolved.messages, resolved.tools, resolved.kw, resolved.force
             cancel = self.request_cancel
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, resolved.max_new_requested, force=force, req=req,
+                                                 cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, resolved.max_new_requested,
+                               req, cancel, resolved.mcp_extra) if resolved.mcp_use else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
-            if validator is not None:
-                chunks = structured_chunks(chunks, validator)
+            if resolved.validator is not None:
+                chunks = structured_chunks(chunks, resolved.validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
@@ -6737,50 +7224,18 @@ def make_handler(svc: Service):
                 pass
 
         def _responses_prepare(self, req, cancel=None):
-            responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
-            tools, names, skipped = responses_api.request_tools(req)
-            kw = responses_api.template_kwargs(req, svc.shared)
-            try:
-                self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
-            except ValueError as e:
-                raise ResponsesError(str(e), "input") from None
-            try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
-            except ValueError as e:
-                raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
-            if set(skipped) - noted:
-                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
-                      f"(this server cannot run them)", flush=True)
-                noted.update(skipped)
-            if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
-                req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
-            try:
-                svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
-            except ValueError as e:
-                raise ResponsesError(str(e), "reasoning_budget_tokens") from None
-            try:
-                stop_strings(req)
-            except ValueError as e:
-                raise ResponsesError(str(e), "stop") from None
-            try:
-                check_request_sampling(req)                   # the request is also the sampling dict (see below)
-            except ValueError as e:                           # its message starts with the field's name: the param
-                raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
-            # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
-            # starts as the cached one did; the parser and the response keep the request's own tools
-            shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
+            resolved = svc.resolve_responses(req, images_gate=self._no_local_images)
+            req, messages, tools, kw = resolved.req, resolved.messages, resolved.tools, resolved.kw
+            shown = resolved.shown
             try:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, resolved.max_new_requested, req=req,
                                                           cancel=cancel)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, resolved.max_new_requested, req=req,
                                                           cancel=cancel)
             except ResponsesError:
                 raise
@@ -6791,10 +7246,10 @@ def make_handler(svc: Service):
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
-            asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
-                                          "reasoning.encrypted_content" in include, validator is not None)
+            asm = responses_api.Assembler(req, svc.model_for(req), len(ids), resolved.names,
+                                          "reasoning.encrypted_content" in include, resolved.validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, resolved.validator, req
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
@@ -6806,19 +7261,11 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
-            req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            self._no_local_images(messages)
-            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
-                tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
-            check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            resolved = svc.resolve_anthropic(req, images_gate=self._no_local_images)
+            req, messages, tools, kw, force = resolved.req, resolved.messages, resolved.tools, resolved.kw, resolved.force
             cancel = self.request_cancel
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, resolved.max_new_requested, force=force, req=req,
+                                                 cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
@@ -7528,6 +7975,7 @@ def main() -> int:
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  tokenizer_dir=tpath,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
@@ -7713,7 +8161,13 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, httpd.server_close, getattr(engine, "close", None),
+        # A healthy stop ends the engine on its own terms and gives it SHUTDOWN_WAIT_S to drain its own work: first
+        # this server stops accepting and cancels what it already accepted (so nothing of ours is still writing to
+        # the engine's stdin), then the engine is asked to end (QUIT, and its stdin's EOF), and only what is left of
+        # that budget is spent forcing it.  A forced ending is never reported as a clean one.
+        closers = [svc.stop_admission, httpd.shutdown, httpd.server_close,
+                   (lambda: engine.close(timeout_s=SHUTDOWN_WAIT_S)) if callable(getattr(engine, "close", None))
+                   else None,
                    vision.shutdown if vision else None, hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
