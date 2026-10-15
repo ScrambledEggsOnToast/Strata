@@ -31,6 +31,7 @@ fail = "--fail-window" in args
 groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
 STEP = 0.02
 hold = args[args.index("--hold-replies") + 1] if "--hold-replies" in args else None
+hold_badm = args[args.index("--hold-badm") + 1] if "--hold-badm" in args else None
 drafts = [pair.split(",") for pair in args[args.index("--draft-counters") + 1].split(":")] if "--draft-counters" in args else None
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -274,7 +275,8 @@ while True:
             if log:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {read_reused}", flush=True)
+            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {read_reused}" +
+                  (f" 0 0 0 0 0.0 {given[1] - read_reused}" if READF else ""), flush=True)
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
@@ -290,11 +292,13 @@ while True:
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
         print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {read_reused}" +
-              (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
+              (f" 0 0 0 0 0.0 {len(ids) - read_reused}" if READF else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
                 active[slot] = [toks[1:], max_new, 1]
+            while hold_badm and os.path.exists(hold_badm):
+                time.sleep(.005)
             print(f"BADM {slot} {1 if cont else 0}", flush=True)
         continue
     if line:
@@ -746,9 +750,9 @@ class ParallelService(unittest.TestCase):
         ta.join(30); tb.join(30)
         return out
 
-    def attributed_chat(self, *, max_tokens=4, stream=False, stop=None):
-        body = {"messages": [{"role": "user", "content": "hello"}], "max_tokens": max_tokens,
-                "reasoning_effort": "none", "stream": stream}
+    def attributed_chat(self, *, max_tokens=4, stream=False, stop=None, text="hello", priority="foreground"):
+        body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
+                "reasoning_effort": "none", "stream": stream, "strata_priority": priority}
         if stop is not None:
             body["stop"] = stop
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
@@ -772,13 +776,65 @@ class ParallelService(unittest.TestCase):
             identity, result = self.attributed_chat(**kwargs)
             deadline = time.monotonic() + 2
             prefix = "[strata] response_attribution: "
-            while prefix not in log.getvalue() and time.monotonic() < deadline:
+            matching = []
+            while time.monotonic() < deadline:
+                records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
+                           if line.startswith(prefix)]
+                matching = [record for record in records if record["request_id"] == identity]
+                if matching:
+                    break
                 time.sleep(0.005)
-        records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
-                   if line.startswith(prefix)]
-        self.assertEqual(len(records), 1, log.getvalue())
-        self.assertEqual(records[0]["request_id"], identity)
-        return result, records[0]
+        self.assertEqual(len(matching), 1, log.getvalue())
+        return result, matching[0]
+
+    def _yielded_accounting(self, *, reuse=False, yields=1):
+        self.start(2, reuse=reuse, more=("--resident-multiplex", "--says-multiplex", "--says-budget",
+                                        "--readfield", "--draft-counters", "0,0"))
+        replies, failures = [], []
+        def long_request():
+            try:
+                replies.append(self.recorded_chat(text="long " * 600, priority="background"))
+            except Exception as error:
+                failures.append(error)
+        worker = threading.Thread(target=long_request)
+        worker.start()
+        def wait_read(admissions):
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                lines = self.log.read_text().splitlines() if self.log.exists() else []
+                long_reads = [i for i, line in enumerate(lines) if line.startswith("BGEN ") and int(line.split()[2]) > 500]
+                if len(long_reads) >= admissions and any(line.startswith("PREFILL ") for line in lines[long_reads[-1] + 1:]):
+                    return
+                time.sleep(.005)
+            self.fail("long admission did not reach its prefill barrier")
+        try:
+            for wave in range(yields):
+                wait_read(wave + 1)
+                self.attributed_chat(text=f"short {wave}")
+        finally:
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        result, record = replies[0]
+        self.assertEqual(result["usage"]["completion_tokens"], 4)
+        self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 3 if reuse else 0)
+        self.assertEqual(result["timings"]["prompt_ms"], 5 * (yields + 1))
+        self.assertEqual((record["committed_tokens"], record["output_tokens"]), (4, 4))
+        self.assertEqual(len(record["legs"]), yields + 1)
+        self.assertEqual([leg["generated"] for leg in record["legs"]], [0] * yields + [4])
+        self.assertEqual(record["legs"][-1]["admission"]["generated"], 1)
+        self.assertEqual(sum(leg["prompt_read"] for leg in record["legs"]) + record["legs"][0]["reused"],
+                         result["usage"]["prompt_tokens"])
+        self.assertEqual(sum(leg["prompt_ms"] for leg in record["legs"]), result["timings"]["prompt_ms"])
+
+    def test_cold_yielded_prefill_is_read_work_not_an_external_cache_hit(self):
+        self._yielded_accounting()
+
+    def test_warm_yield_preserves_original_cache_and_sums_remaining_reads(self):
+        self._yielded_accounting(reuse=True)
+
+    def test_two_yields_keep_disjoint_prompt_work_and_one_final_batch_commit(self):
+        self._yielded_accounting(yields=2)
 
     def test_bdone_response_record_binds_identity_interval_and_slot_work(self):
         self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "79,107"))
@@ -795,6 +851,66 @@ class ParallelService(unittest.TestCase):
         self.assertEqual((leg["drafts_accepted"], leg["drafts_offered"]), (79, 107))
         self.assertEqual(leg["admission"]["generated"], 1)
         self.assertEqual(result["timings"]["draft_n"], 107)
+
+    def test_close_after_admission_done_drains_badm_and_one_batch_terminal(self):
+        import http.client
+        import socket
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "hold-badm"
+            gate.touch()
+            self.start(2, more=("--resident-multiplex", "--says-multiplex", "--says-budget",
+                                "--hold-badm", str(gate), "--draft-counters", "1,2"))
+            parsed = threading.Event()
+            parse_done = self.engine._parse_done
+            def note_done(*args, **kwargs):
+                parse_done(*args, **kwargs)
+                parsed.set()
+            connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=5)
+            response, transport = None, None
+            with contextlib.redirect_stdout(io.StringIO()) as log, \
+                    mock.patch.object(self.engine, "_parse_done", side_effect=note_done):
+                try:
+                    connection.request("POST", "/v1/chat/completions", json.dumps({
+                        "messages": [{"role": "user", "content": "hello"}], "max_tokens": 4,
+                        "reasoning_effort": "none", "stream": True}), {"Content-Type": "application/json"})
+                    transport = connection.sock.dup()
+                    response = connection.getresponse()
+                    identity = response.getheader("X-Strata-Request-Id")
+                    self.assertTrue(parsed.wait(3), "admission DONE was not ingested before BADM gate")
+                    transport.shutdown(socket.SHUT_RDWR)
+                    response.close()
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline and not any(
+                            row["id"] == identity and row["state"] == "draining" for row in self.svc.lifecycle_records()):
+                        time.sleep(.005)
+                    self.assertTrue(any(row["id"] == identity and row["state"] == "draining"
+                                        for row in self.svc.lifecycle_records()))
+                    self.assertEqual(len(self.engine.slot_claims), 1)
+                    claimed = next(iter(self.engine.slot_claims))
+                    self.assertTrue(self.engine.slot_busy[claimed], "claim released before BADM/BDONE")
+                    gate.unlink()
+                    prefix, records = "[strata] response_attribution: ", []
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        records = [json.loads(line[len(prefix):]) for line in log.getvalue().splitlines()
+                                   if line.startswith(prefix)]
+                        records = [record for record in records if record["request_id"] == identity]
+                        if records: break
+                        time.sleep(.005)
+                    self.assertEqual(len(records), 1, log.getvalue())
+                    record = records[0]
+                    self.assertEqual(len(record["legs"]), 1)
+                    terminal = record["legs"][0]
+                    self.assertEqual((terminal["kind"], terminal["admission"]["generated"]), ("batch", 1))
+                    self.assertEqual(record["committed_tokens"], terminal["generated"])
+                    self.assertEqual(record["drafts_offered"], 2)
+                    self.assertFalse(self.engine.slot_claims)
+                    self.assertFalse(any(self.engine.slot_busy))
+                finally:
+                    gate.unlink(missing_ok=True)
+                    if transport: transport.close()
+                    if response: response.close()
+                    connection.close()
 
     def test_bdone_counters_survive_early_stop_and_synchronous_drain(self):
         self.start(2, more=("--resident-multiplex", "--says-multiplex", "--draft-counters", "1,2"))
@@ -1652,15 +1768,25 @@ class ParallelService(unittest.TestCase):
     def test_left_alone_it_goes_back_to_the_solo_path(self):
         """A request decoding in a slot whose neighbour finished goes back to the solo path (MTP drafts), continued
         from its slot - only with an engine that keeps the slots' conversations (INFO slot_cache=1)."""
-        self.start(2, slot_cache=True)
+        self.start(2, slot_cache=True, reuse=True, more=("--readfield", "--draft-counters", "7,11"))
         res = {}
-        long = threading.Thread(target=lambda: res.setdefault("long", self.chat("LONGREPLY please", max_tokens=200)))
+        long = threading.Thread(target=lambda: res.setdefault("long", self.recorded_chat(text="LONGREPLY please", max_tokens=200)))
         long.start()
         time.sleep(0.05)
         short = self.chat("short", max_tokens=200)
         long.join(30)
         self.assertEqual(short["choices"][0]["message"]["content"], "ok, done.")
-        self.assertEqual(res["long"]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        response, record = res["long"]
+        self.assertEqual(response["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        self.assertEqual([leg["kind"] for leg in record["legs"]], ["solo", "batch", "solo"])
+        self.assertTrue(all(leg["generated"] > 0 for leg in record["legs"]))
+        self.assertEqual(record["committed_tokens"], response["usage"]["completion_tokens"])
+        self.assertEqual(record["committed_tokens"], sum(leg["generated"] for leg in record["legs"]))
+        self.assertEqual((response["timings"]["draft_n_accepted"], response["timings"]["draft_n"]), (7, 11))
+        self.assertEqual(response["timings"]["prompt_ms"], sum(leg["prompt_ms"] for leg in record["legs"]))
+        self.assertEqual(response["timings"]["prompt_ms"], 15.0)
+        self.assertEqual(response["usage"]["prompt_tokens_details"]["cached_tokens"], 3)
+        self.assertEqual(sum(leg["prompt_read"] for leg in record["legs"]), response["usage"]["prompt_tokens"] - 3 + 2)
         kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
         # solo, then both in slots, then the long one alone again: a GEN after the BGENs
         self.assertIn("BGEN", kinds)
@@ -2212,7 +2338,7 @@ while True:
                 destination=int(command.split()[1]);break
         yielded=parked=True
         print(f'YIELDED {destination} 64',flush=True)
-        print('DONE 0 481 1 0 cancel 0 0 0',flush=True)
+        print('DONE 0 481 1 0 cancel 0 0 0 0 0 0 0 0.0 64 0',flush=True)
         if slot is not None: print(f'BADM {slot} 0',flush=True)
         continue
     # A later identical request gets the parked identity unless cancelled.
@@ -2229,12 +2355,13 @@ while True:
                                    lambda cmd, **kw: popen([sys.executable, str(script), *cmd[1:]], **kw)):
                 engine = StrataEngine('strata', [])
             long_cancel, short_release, long_started = threading.Event(), threading.Event(), threading.Event()
-            errors, output = [], {}
+            errors, output, native_work = [], {}, {}
 
             def consume(name, prompt, cancel, ready):
                 try:
                     output[name] = [t for t in engine.generate(prompt, 2, {'_strata_control_ready': ready}, cancel)
                                     if t is not None]
+                    native_work[name] = dict(engine.last)
                 except Exception as error:
                     errors.append(error)
 
@@ -2252,6 +2379,15 @@ while True:
                 short.start()
                 long.join(4)
                 self.assertFalse(long.is_alive(), 'cancelled parked request did not terminate')
+                self.assertEqual(len(native_work["long"]["legs"]), 1)
+                self.assertEqual((native_work["long"]["prompt_read"], native_work["long"]["prompt_ms"]), (64, 1.0))
+                self.assertEqual(native_work["long"]["generated"], 0)
+                cancelled = threading.Event()
+                cancelled.set()
+                engine.last = {"generated": 999, "prompt_ms": 123, "legs": [{"kind": "solo", "generated": 999}]}
+                self.assertEqual([t for t in engine.generate([3] * 4, 2, {}, cancelled) if t is not None], [])
+                self.assertEqual(engine.last["legs"], [])
+                self.assertIsNone(engine.last.get("generated"))
                 short_release.set()
                 short.join(4)
                 self.assertFalse(short.is_alive())

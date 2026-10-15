@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, add_carry, carry_leg, request_timings, serve
+from serve.server import ByteTokenizer, EngineDied, Service, request_timings, serve
 from serve.test_server import ThinkingEngine
 
 
@@ -26,6 +26,7 @@ class ClockedThinkingEngine(ThinkingEngine):
         self.done = []
         self.fail_continuation = False
         self.cancel_continuation = False
+        self.unknown_initial_drafts = False
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.attempts += 1
@@ -51,6 +52,9 @@ class ClockedThinkingEngine(ThinkingEngine):
                              hits=9 if first else 7, lookups=10 if first else 8,
                              ram_blobs=1 if first else 3, file_blobs=2 if first else 4,
                              file_mb=1.5 if first else 2.5)
+            if first and self.unknown_initial_drafts:
+                self.last.pop("drafts_offered")
+                self.last.pop("drafts_accepted")
             self.done.append(dict(self.last))
 
 
@@ -148,6 +152,21 @@ class RequestAccounting(unittest.TestCase):
         self.assertLess(record["committed_tokens"], record["output_tokens"],
                         "frontend wrap-up tokens must not become native commits")
 
+    def test_unknown_earlier_drafts_cannot_become_a_known_partial_response_total(self):
+        self.engine.unknown_initial_drafts = True
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            response = self.chat()
+            deadline = time.monotonic() + 2
+            while "response_attribution: " not in log.getvalue() and time.monotonic() < deadline:
+                time.sleep(.005)
+        self.assertNotIn("draft_n", response["timings"])
+        self.assertNotIn("draft_n_accepted", response["timings"])
+        record, = [json.loads(line.split("response_attribution: ", 1)[1])
+                   for line in log.getvalue().splitlines() if "response_attribution: " in line]
+        self.assertIsNone(record["drafts_offered"])
+        self.assertIsNone(record["drafts_accepted"])
+        self.assertEqual([leg["drafts_offered"] for leg in record["legs"]], [None, 11])
+
     def test_openai_stream_keeps_original_cache_and_all_segment_work(self):
         events = self.chat(stream=True)
         final = events[-1]
@@ -203,49 +222,7 @@ class RequestAccounting(unittest.TestCase):
 
 
 class SlotLegAccounting(unittest.TestCase):
-    """#1869: a request that decoded in a batch slot and finished on the solo path keeps the slot leg's decode time and
-    tokens (the solo DONE alone said 1 token in 18 ms); #1870: prompt_n is what the engine read."""
-
-    def test_solo_leg_adds_to_the_slot_leg(self):
-        carry = {}
-        slot_leg = {"generated": 134, "decode_ms": 2900.0, "prompt_ms": 3794.7, "prompt_read": 2052, "finish": "cancel"}
-        carry_leg(carry, slot_leg)
-        solo_done = {"generated": 1, "decode_ms": 18.4, "prompt_ms": 2.0, "prompt_read": 1, "finish": "stop", "reused": 0}
-        total = add_carry(carry, solo_done)
-        self.assertEqual((total["generated"], total["decode_ms"]), (135, 2918.4))
-        self.assertEqual((total["prompt_ms"], total["prompt_read"], total["finish"]), (3794.7, 2052, "stop"))
-        timings = request_timings(2052, 135, total)
-        self.assertEqual(timings["predicted_ms"], 2918.4)
-        self.assertAlmostEqual(timings["predicted_per_second"], 46.3, places=1)
-
-    def test_two_hand_backs_sum(self):
-        carry = {}
-        carry_leg(carry, {"generated": 10, "decode_ms": 100.0, "prompt_ms": 50.0})
-        carry_leg(carry, {"generated": 20, "decode_ms": 300.0, "prompt_ms": 1.0})
-        total = add_carry(carry, {"generated": 5, "decode_ms": 50.0, "prompt_ms": 1.0})
-        self.assertEqual((total["generated"], total["decode_ms"], total["prompt_ms"]), (35, 450.0, 50.0))
-        self.assertNotIn("prompt_read", total)
-
-    def test_drafts_and_attribution_legs_survive_two_hand_backs(self):
-        carry = {}
-        solo = {"generated": 3, "decode_ms": 30.0, "prompt_ms": 50.0,
-                "drafts_accepted": 2, "drafts_offered": 4}
-        batch = {"generated": 8, "decode_ms": 80.0, "prompt_ms": 1.0,
-                 "drafts_accepted": 7, "drafts_offered": 11}
-        final = {"generated": 4, "decode_ms": 40.0, "prompt_ms": 1.0,
-                 "drafts_accepted": 3, "drafts_offered": 5}
-        solo["legs"] = [{"kind": "solo", **solo}]
-        batch["legs"] = [{"kind": "batch", "slot": 1, **batch}]
-        final["legs"] = [{"kind": "solo", **final}]
-        carry_leg(carry, solo)
-        carry_leg(carry, batch)
-        total = add_carry(carry, final)
-        self.assertEqual((total["drafts_accepted"], total["drafts_offered"]), (12, 20))
-        self.assertEqual((total["generated"], total["decode_ms"]), (15, 150.0))
-        self.assertEqual([leg["kind"] for leg in total["legs"]], ["solo", "batch", "solo"])
-        self.assertEqual([leg["generated"] for leg in total["legs"]], [3, 8, 4])
-        self.assertEqual((request_timings(100, 15, total)["draft_n_accepted"],
-                          request_timings(100, 15, total)["draft_n"]), (12, 20))
+    """Prompt timing uses real original-input read counts, including a held-slot prefix."""
 
     def test_prompt_n_is_what_was_read(self):
         # the slot already held the whole prompt: 1 token read, the conversation cache off (reused 0)

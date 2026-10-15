@@ -778,6 +778,32 @@ class SpeculationPolicy:
             return solo > batch * self.MARGIN and left * (1 / batch - 1 / solo) > handoff
 
 
+class _NativeRequestWork:
+    """Canonical completed native hops for one generation, including synchronous drains."""
+    def __init__(self):
+        self._segments = []
+
+    def done(self, figures):
+        self._segments.append(dict(figures))
+
+    def batch_done(self, figures):
+        # BDONE includes the admission token: replace that hop, never add it twice.
+        if self._segments:
+            self._segments[-1] = dict(figures)
+        else:
+            self._segments.append(dict(figures))
+
+    def figures(self):
+        if not self._segments:
+            return {"legs": []}  # No DONE is unknown native work, not a zero-token completion.
+        result = request_stats(self._segments)
+        if all(segment.get("prompt_read") is not None for segment in self._segments):
+            result["prompt_read"] = sum(segment["prompt_read"] for segment in self._segments)
+        else:
+            result.pop("prompt_read", None)
+        return result
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1348,6 +1374,9 @@ class StrataEngine:
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
         self.last["legs"] = [_native_leg("admission" if slot is not None else "solo", self.last, slot)]
+        work = getattr(getattr(self, "_tl", None), "native_work", None)
+        if work is not None:
+            work.done(self.last)
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1596,6 +1625,9 @@ class StrataEngine:
                          "drafts_accepted": int(counters["draft_accepted"]) if "draft_accepted" in counters else None,
                          "drafts_offered": int(counters["draft_offered"]) if "draft_offered" in counters else None}
             self.last["legs"] = [{**_native_leg("batch", self.last, int(f[1])), "admission": admission}]
+            work = getattr(getattr(self, "_tl", None), "native_work", None)
+            if work is not None:
+                work.batch_done(self.last)
 
     def _bdone_after_eos(self, slot: int, owner, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -1823,6 +1855,19 @@ class StrataEngine:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+        local = self.__dict__.setdefault("_tl", threading.local())
+        previous = getattr(local, "native_work", None)
+        work = local.native_work = _NativeRequestWork()
+        self.last = {"legs": []}
+        try:
+            yield from self._generate_batched(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            try:
+                self.last = work.figures()
+            finally:
+                local.native_work = previous
+
+    def _generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -1847,8 +1892,6 @@ class StrataEngine:
         on_wait = (sampling or {}).get("_strata_native_waiting")
         on_submit = (sampling or {}).get("_strata_submitted")
         foreground_pending = (sampling or {}).get("_strata_foreground_pending")
-        reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
-        carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         background_due = None
         slot = None
         def slot_ready():
@@ -1924,8 +1967,6 @@ class StrataEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # its DONE is read
-                    if reused0 is None:
-                        reused0 = (self.last or {}).get("reused")  # A zero-output parked leg is still the first read.
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -1945,10 +1986,6 @@ class StrataEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
-                        if reused0 is None:
-                            reused0 = (self.last or {}).get("reused")
-                        carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
-                                                            # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -2078,8 +2115,6 @@ class StrataEngine:
                         self._park_slot(slot, slot_owner)
                         slot = None
                         continue
-                    if reused0 is None:
-                        reused0 = (self.last or {}).get("reused")
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     if not cont and self._yielded is not None and self._yielded[0] == slot:
@@ -2146,7 +2181,6 @@ class StrataEngine:
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
-                            carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
                             slot_live[slot] = None
                             slot_used[slot] = time.time()
                             with self.slot_cv:
@@ -2154,8 +2188,6 @@ class StrataEngine:
                                 slot_claims.discard(slot)
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
-                            if reused0 is None:
-                                reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
                             solo_again += 1
                             btrace("back to the solo path")
@@ -2198,38 +2230,31 @@ class StrataEngine:
                 if admit_wait:
                     with self.slot_cv:
                         self.admitting = max(0, self.admitting - 1)
-            try:
-                if reserved is not None:
-                    with self.slot_cv:
-                        slot_busy[reserved] = False
-                        slot_claims.discard(reserved)
-                        self.slot_cv.notify_all()
-                if slot is not None:
-                    slot_live[slot] = None
-                    slot_used[slot] = time.time()
-                    if phase == "slot" and self.gen == born:
-                        if bdone_in:
-                            stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                            slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
-                            with self.slot_cv:
-                                slot_busy[slot] = False
-                                slot_claims.discard(slot)
-                                self.slot_cv.notify_all()
-                        else:
-                            slot_held[slot] = []
-                            stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                            self._release_slot_when_done(slot, stream, slot_owner)  # synchronous drain retires its claim
-                    else:
+            if reserved is not None:
+                with self.slot_cv:
+                    slot_busy[reserved] = False
+                    slot_claims.discard(reserved)
+                    self.slot_cv.notify_all()
+            if slot is not None:
+                slot_live[slot] = None
+                slot_used[slot] = time.time()
+                if phase == "slot" and self.gen == born:
+                    if bdone_in:
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                         with self.slot_cv:
                             slot_busy[slot] = False
                             slot_claims.discard(slot)
                             self.slot_cv.notify_all()
-            finally:
-                # A synchronous BSTOP drain may replace the admission with its slot's BDONE.
-                if reused0 is not None and isinstance(self.last, dict):
-                    self.last = {**self.last, "reused": reused0}
-                if carry and isinstance(self.last, dict):
-                    self.last = add_carry(carry, self.last)
+                    else:
+                        slot_held[slot] = []
+                        stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
+                        self._release_slot_when_done(slot, stream, slot_owner)  # synchronous drain retires its claim
+                else:
+                    with self.slot_cv:
+                        slot_busy[slot] = False
+                        slot_claims.discard(slot)
+                        self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -5191,37 +5216,8 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
 def _native_leg(kind: str, figures: dict, slot=None) -> dict:
     """Only native completion figures; a batch leg includes its admission token, so admission is nested detail."""
     return {"kind": kind, **({"slot": slot} if slot is not None else {}),
-            **{key: figures.get(key) for key in ("generated", "prompt_tokens", "prompt_read", "prompt_ms", "decode_ms",
+            **{key: figures.get(key) for key in ("generated", "prompt_tokens", "reused", "prompt_read", "prompt_ms", "decode_ms",
                                                "drafts_accepted", "drafts_offered", "finish")}}
-
-
-def carry_leg(carry: dict, leg: dict) -> None:
-    """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE, which
-    replaces the engine's figures: keep each leg's decode time, tokens, drafts and prompt figures to add to it."""
-    carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
-    carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
-    carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
-    if leg.get("prompt_read") is not None:
-        carry.setdefault("prompt_read", int(leg["prompt_read"]))
-    for key in ("drafts_accepted", "drafts_offered"):
-        if leg.get(key) is not None:
-            carry[key] = carry.get(key, 0) + int(leg[key])
-    carry.setdefault("legs", []).extend(leg.get("legs") or [_native_leg("solo", leg)])
-
-
-def add_carry(carry: dict, last: dict) -> dict:
-    """The request's totals: the earlier legs' decode time and tokens plus the final one's; the prompt figures of the leg
-    that read the prompt (the solo continuation reads next to nothing)."""
-    out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
-           "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
-           "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
-    if "prompt_read" in carry:
-        out["prompt_read"] = carry["prompt_read"]
-    for key in ("drafts_accepted", "drafts_offered"):
-        if carry.get(key) is not None or last.get(key) is not None:
-            out[key] = int(last.get(key) or 0) + carry.get(key, 0)
-    out["legs"] = carry.get("legs", []) + (last.get("legs") or [_native_leg("solo", last)])
-    return out
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -5260,10 +5256,12 @@ def request_stats(segments: list[dict]) -> dict:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
-        if any(segment.get(key) is not None for segment in segments):
-            result[key] = sum(segment.get(key) or 0 for segment in segments)
+        if all(segment.get(key) is not None for segment in segments):
+            result[key] = sum(segment[key] for segment in segments)
+        else:
+            result.pop(key, None)
     result["legs"] = [leg for segment in segments for leg in
-                      (segment.get("legs") or [_native_leg("solo", segment)])]
+                      (segment["legs"] if segment.get("legs") is not None else [_native_leg("solo", segment)])]
     return result
 
 
