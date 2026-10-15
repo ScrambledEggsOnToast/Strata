@@ -12079,6 +12079,7 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
                             std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr))
                         return false;
+                    part.scope = live_scope;
                     for (strata::core::ConversationRetainedPrefix& prefix : stage_prefixes) {
                         prefix.stage = (uint32_t) (k + 1);   // this capture's own stage tag: the store's stream stage
                         retained_prefixes.push_back(prefix);
