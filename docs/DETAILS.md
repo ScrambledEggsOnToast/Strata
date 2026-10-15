@@ -1526,15 +1526,12 @@ Capacity is **one shared physical quota** for every layout: `--conversation-cach
 lazily allocated, with `--conversation-cache-disk-min-free-mib` (default 131072) as the filesystem floor a new
 reservation must leave free, and `--conversation-cache-disk-heads` (default 128) as the retained branch-head ceiling
 across the whole store - independent of the RAM `--conversation-cache-slots`. Neither quota nor head limit is part of
-an image's identity, so both layouts borrow the same capacity. A publication that cannot fit is never a lost history:
-the store separates *occupied* from *over cap*. A defective or unrepresentable shape, a counted peak that cannot fit
-the published RAM envelope or the preparation ceiling however little else is resident, a busy writer, a full store, a
-floor that cannot be met or an unhealthy root is a **refusal** - the write is skipped and the request completes as it
-would without persistence. A counted peak that fits on its own but finds the envelope or the preparation ceiling
-occupied by work the store may not free (a running read and its preparation, a handed-out image, a publication in
-flight) is a **deferral**: nothing is allocated, charged or transferred, the capture keeps its own image and lease and
-stays queued for the next safe seam without spending one of its bounded retries, and it is admitted once that work
-settles. Only speculation - an unhanded, undemanded prefetch - is revoked to make room.
+an image's identity, so both layouts borrow the same capacity. Refused publications do not persist their capture;
+the request can still complete normally without persistence. The store distinguishes an image that exceeds its
+admission limits from resources temporarily occupied by other work. Temporary pressure defers the capture without
+transferring its image or lease or spending a retry. It stays queued for a later safe seam, subject to the existing
+queue and shutdown bounds; this is not a guarantee that every capture will persist. Only unhanded, undemanded
+speculation may be revoked to make room, and an active worker retains its reservation until it settles.
 
 **One root, several profiles.** A run's stage count, checkpoint policy (`--prompt-cache`),
 context and image/state budgets decide what it may create or restore—not whether another
@@ -1603,6 +1600,12 @@ prefill chunk boundaries, decode iterations and idle command waits, rather than 
 CPU-only handovers reap completed results and may prepare metadata, but do not wait for the writer. Whole-prompt reads
 without an owner-thread chunk boundary (the no-slot bypass and a layer split with no time budget) retain
 once-per-request handover.
+
+A fresh branch promises its live cut in the publication metadata, so a later cover cannot retire the root unless
+it preserves that cut. Subsequent covering captures remain replaceable: the policy retains a root and a latest cut,
+not every turn. This internal cut promise does not make the head immune to quota eviction. Replacement completions
+clear retired-head references independently of owner adoption; a queued divergent capture becomes a fresh branch
+rather than claiming a retired predecessor. A completion can attach to an owner only at its original generation.
 
 *Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the

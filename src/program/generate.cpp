@@ -11225,7 +11225,7 @@ int main(int argc, char** argv) {
         // this engine: where its diagnostics go, the export cache's lease, the read allowance, and the store
         // chronology this engine's own capture counter mints publication identifiers from.
         strata::program::ConversationPublicationSink publication_sink;
-        publication_sink.report = [](const std::string& line) { std::fputs(line.c_str(), stderr); };
+        publication_sink.report = [](const char* line) { std::fputs(line, stderr); };
         publication_sink.release_lease = [&](size_t lease_bytes) { conversations.release_lease(lease_bytes); };
         publication_sink.refresh_allowance = [&] { store_allowance(); };
         publication_sink.next_publication_id = [&](uint64_t& out) {

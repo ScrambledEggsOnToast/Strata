@@ -3303,7 +3303,7 @@ void check_many_stream_reuse_admission() {
 
     // A dense carve with a few live tokens: every K/V part is a real four-byte stream, and the geometry says the
     // carve really holds one stream per (layer, kind) - the correction the dense-manifest tests use.
-    SavedConversation dense = hollow_fixture(4711, 0, 8);
+    SavedConversation dense = hollow_fixture(4711, 0, 32);
     dense.geometry[1] = dense.layer_hi = 4 * int64_t(dense.kv.size());
     for (auto& layer : dense.kv) {
         layer.cells = 4;
@@ -3474,12 +3474,12 @@ void check_ready_speculation_yields() {
     request.generation = 1;
     check(store.publish(image, request, why) == kAccepted,
           "a ready speculation yields its bytes to a required publication");
-    check_eq(store.ram_lease_bytes(), 0, "the yielded speculation is refunded in full");
     check(store.request_status(401, 1) == ConversationStoreReadStatus::cancelled,
           "the unhanded speculation is revoked rather than served");
     ConversationStorePublishResult settled;
     check(store.wait_publish(settled, 5000), "the publication that displaced speculation settles");
     check(settled.status == ConversationStorePublishStatus::stored, "the displacing publication is stored");
+    check_eq(store.ram_lease_bytes(), 0, "both revoked speculation and completed publication release their leases");
 
     // The same completion, adopted as demand and handed out, is not speculation: its lease survives the attempt and
     // the publication is deferred instead of being paid for with the caller's bytes.
@@ -3571,6 +3571,8 @@ void check_active_reader_defers_publication() {
     check(store.request_status(501, 1) == ConversationStoreReadStatus::none,
           "the deferred publication neither cancels the worker nor gives it a verdict");
     check(!store.writer_busy(), "a deferred publication never becomes the writer's work");
+    // A lower allowance preserves the existing reservation, not permission for later growth.
+    store.publish_read_allowance(uint64_t(64) << 20);
     {
         std::lock_guard<std::mutex> lock(gate.mutex);
         gate.open = true;
@@ -3580,6 +3582,7 @@ void check_active_reader_defers_publication() {
     ConversationStoreRead read;
     check(store.wait_ready(501, 1, read, 5000) && read.image != nullptr, "the worker completes and hands out its image");
     check(store.ram_lease_bytes() > 0, "the completed image is the caller's lease");
+    store.publish_read_allowance(uint64_t(8) << 20);
     auto second = std::make_shared<SavedConversation>(small);
     ConversationStorePublish again;
     again.request_id = 503;

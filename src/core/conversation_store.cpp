@@ -768,11 +768,12 @@ struct ConversationStore::Impl {
     // storage wait while the lock is held.
     uint64_t sample_free_locked();
     uint64_t resident_locked() const { return ram_held + metadata + prep + decode; }
-    // The complete preparation ledger the ceiling bounds: the in-RAM index, every read descriptor's own copy, every
-    // admitted read's decode/restore preparation (already inside that read's RAM reservation, so a view rather than a
-    // second charge) and any diagnostic decode workspace.  Readers, the writer and diagnostic decodes therefore share
-    // one total instead of each being checked alone.
-    uint64_t preparation_locked() const { return sat_add(resident_locked(), read_prep); }
+    // Preparation excludes payload images. Reader and writer workspace is already charged in ram_held;
+    // these views enforce the separate metadata ceiling without charging RAM a second time.
+    uint64_t preparation_locked() const {
+        const uint64_t writer = publishing ? publishing->workspace_bytes : 0;
+        return sat_add(sat_add(metadata, prep), sat_add(decode, sat_add(read_prep, writer)));
+    }
     std::string temp_name();
     std::string intent_name() const;
     bool store_is_empty(std::string& why);
@@ -1650,22 +1651,16 @@ DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePubl
         // stream of that donor carries - independent streams stay one manifest wide, while a stream named repeatedly
         // is charged for every time it can name the same chunk again.  One count per donor would let repeats
         // reference chunks nothing reserved; summing per donor manifest is what this replaces.
-        std::vector<std::pair<ConversationStoreStreamId, uint64_t>> streams;   // one entry per distinct named stream
         uint64_t heaviest = 0;
-        for (const auto& entry : request.reuse) {
+        for (size_t i = 0; i < request.reuse.size(); ++i) {
+            const auto& entry = request.reuse[i];
             if (entry.head_id != head.head_id) continue;
-            uint64_t* named = nullptr;
-            for (auto& seen : streams)
-                if (seen.first == entry.stream) {
-                    named = &seen.second;
-                    break;
-                }
-            if (named == nullptr) {
-                streams.push_back({entry.stream, 0});
-                named = &streams.back().second;
+            uint64_t named = 1;
+            for (size_t j = 0; j < i; ++j) {
+                const auto& earlier = request.reuse[j];
+                if (earlier.head_id == head.head_id && earlier.stream == entry.stream) ++named;
             }
-            ++*named;
-            heaviest = std::max(heaviest, *named);
+            heaviest = std::max(heaviest, named);
         }
         prep.chunks = sat_add(prep.chunks, sat_mul(sat_add(raw / 44, 2), heaviest));
     }
@@ -1729,7 +1724,7 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
         return true;
     }
     const uint64_t delta = workspace - job->workspace_bytes;
-    if (workspace > options.metadata_bytes || preparation_locked() > options.metadata_bytes - workspace) {
+    if (workspace > options.metadata_bytes || preparation_locked() > options.metadata_bytes - delta) {
         why = "the writer's workspace does not fit the store's preparation ceiling";
         return false;
     }
@@ -2729,7 +2724,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
                                      (sizeof(conversation_store_detail::RestoreTarget) + 64) +
                                  uint64_t(meta.containers.size()) * sizeof(ContainerMeta) +
                                  uint64_t(meta.objects.size()) * kObjectBytesEstimate;
-    const uint64_t needed = uint64_t(meta.payload_bytes) + uint64_t(meta.payload_bytes) / 4 + raw.size() +
+    const uint64_t needed = uint64_t(meta.payload_bytes) + uint64_t(meta.payload_bytes) / 4 + job->prepared_bytes +
                             job->prep_bytes + kReadSlabBytes + kReadFixedOverhead + scaffolding;
     {
         std::lock_guard<std::mutex> guard(mutex);
@@ -2744,12 +2739,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
             job->reserved_bytes = needed;
             counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
         }
-        // What this read holds as *preparation* is the decode its admission reserved, or - now that the manifest is
-        // decoded and its restore targets exist - the raw manifest plus the scaffolding it is about to fill, whichever
-        // is larger.  Those bytes are already inside the RAM reservation `needed`, so this is a view of them rather
-        // than a second charge; they are charged to the preparation ceiling because the writer and the diagnostic
-        // decodes have to be admitted beside this read.
-        const uint64_t prepared = std::max(job->prepared_bytes, sat_add(raw.size(), scaffolding));
+        // The decoded manifest remains live beside the restore scaffolding. Its admission bound already
+        // includes the raw manifest; neither can be refunded until read_body has returned.
+        const uint64_t prepared = sat_add(job->prepared_bytes, scaffolding);
         if (prepared > job->prepared_bytes) {
             const uint64_t growth = prepared - job->prepared_bytes;
             if (sat_add(preparation_locked(), growth) > options.metadata_bytes) {
@@ -4109,10 +4101,10 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
     // image and the whole counted workspace into ram_held_bytes().
     const uint64_t credit = std::min(request.external_lease_bytes, image_bytes);
     const uint64_t envelope = sat_add(self.ram_budget, credit);
-    if (!self.ram_budget || needed > self.options.metadata_bytes || required > envelope) {
-        // The shape's own terms: no allowance has been published yet, the writer's workspace alone is larger than the
-        // preparation ceiling, or the image and its whole counted workspace exceed the envelope even with nothing else
-        // resident.  Permanent, so nothing is revoked and a retry finds the same answer.
+    if (!self.ram_budget || sat_add(self.metadata, needed) > self.options.metadata_bytes ||
+        sat_add(self.metadata, required) > envelope) {
+        // The persistent index cannot be refunded by settling another operation. Include it in the
+        // isolated publication floor; only transient reservations belong to the deferral path.
         self.counters.refused_limits++;
         why = credit
                   ? "the publication image and its writer workspace do not fit the published RAM allowance plus the "

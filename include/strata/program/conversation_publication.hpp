@@ -107,7 +107,7 @@ struct ConversationPublicationRetry {
 // What a handover needs from the serving engine.
 struct ConversationPublicationSink {
     // One bounded line per event, already formatted.  The engine owns the destination and the file descriptor.
-    std::function<void(const std::string& line)> report;
+    std::function<void(const char* line)> report;
     // Give up the export cache's lease on exactly these bytes: the store charges them from here on.
     std::function<void(size_t lease_bytes)> release_lease;
     // Republish the read allowance from live accounting: an accepted handover changes what the store itself holds.

@@ -378,20 +378,12 @@ enum class ConversationStorePublishStatus : uint8_t {
 
 const char* conversation_store_publish_status_name(ConversationStorePublishStatus status);
 
-// What one publish() call decided about the caller's image and its lease.  The split is the difference between
-// resources that are *occupied* and a shape that is *over cap*:
-//   accepted  the counted peak fits an envelope whose only occupants are work this store may not free, so the image
-//             was admitted: the store owns the image's accounting from this instant (the caller releases its lease),
-//             and the eventual outcome of the attempt is reported by take_publish()/wait_publish().
-//   deferred  the counted peak fits the allowance and the preparation ceiling on its own, but resources that are
-//             occupied right now - an active reader's reservation, a handed-out or demanded image's lease, a
-//             publication in flight - keep it out, and nothing this store may free is left to revoke.  Nothing was
-//             allocated, charged or transferred: the caller keeps its image and its lease and may offer the same
-//             publication again later.  A deferral is not an attempt.
-//   refused   the image is refused on its own terms: it is not representable under this profile's figures, its
-//             counted peak (image plus writer workspace) can never fit the published allowance or the preparation
-//             ceiling, another branch is already admitted, or this store is not serving.  Offering the same image
-//             again cannot change that.
+// Admission owns the accounting transition, independently of the asynchronous result:
+// accepted transfers the image's charge to the store; the caller releases its matching lease immediately.
+// deferred means occupied resources prevent admission; the caller retains image and lease for a later seam.
+// refused means an invalid/over-cap image, an incompatible writer already admitted, or a non-serving store.
+// Neither deferred nor refused transfers ownership. Demand/handed leases and active worker reservations
+// cannot be refunded to admit another operation.
 enum class ConversationStorePublishAdmission : uint8_t { accepted = 0, deferred = 1, refused = 2 };
 
 const char* conversation_store_publish_admission_name(ConversationStorePublishAdmission admission);
@@ -569,13 +561,10 @@ public:
     // exactly like a read: the image *and* the bounded writer workspace this attempt will allocate (its copied
     // request, layout, prefix chains, parent/donor decode, chunk vectors and scratch, object/orphan records, encoded
     // manifest and catalog copy) must both fit the envelope, and the workspace must also fit the preparation ceiling
-    // beside the index, the live read descriptors' own copies and any diagnostic decode.  Admission is classified
-    // (see ConversationStorePublishAdmission): `accepted` when the counted peak fits an envelope whose only occupants
-    // are work this store may not free, `deferred` when it fits that envelope on its own but resources occupied right
-    // now keep it out - after every *speculative* read that may be revoked has been revoked and the admission retried
-    // under the same lock (an active worker, a demand and a handed-out image are never revoked: their charges are
-    // released only when they settle) - and `refused` when the shape itself can never fit, another branch is already
-    // admitted, or this store is not serving.  While the writer is busy, a new publication is admitted only
+    // beside the index, read descriptors, admitted read preparation and diagnostic decode.
+    // Eligible speculation is revoked before an occupied-resource deferral; active workers keep their
+    // reservations until settlement and handed-out images keep their leases until owner release.
+    // While the writer is busy, a new publication is admitted only
     // when it is proven to be the *same lineage* as the one in flight (both carry `cover` for the same nonzero
     // `supersedes` and this one is the newer generation): it then
     // replaces it, and the replaced request's result is reported as `coalesced`.  A different branch - including a

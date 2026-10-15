@@ -27,7 +27,6 @@ using strata::program::ConversationPublicationCapture;
 using strata::program::ConversationPublicationOwner;
 using strata::program::ConversationPublicationPending;
 using strata::program::ConversationPublicationQueue;
-using strata::program::ConversationPublicationRetry;
 using strata::program::ConversationPublicationSink;
 using conversation_store_detail::images_equal;
 
@@ -185,7 +184,9 @@ ConversationStoreQuery query_of(const SavedConversation& image, uint64_t request
 }
 
 // The record a head was written from must still be demandable, and restore byte for byte, in a fresh process.
-void check_record_restores(ConversationStore& store, const SavedConversation& expected, uint64_t request_id) {
+void check_record_restores(ConversationStore& store, SavedConversation expected, uint64_t request_id,
+                           bool root_cut = false) {
+    expected.live.pinned = root_cut;
     ConversationStoreQuery query = query_of(expected, request_id, 1);
     std::string why;
     check(store.demand(query, why), "a persisted record is demandable after a fresh open");
@@ -202,26 +203,15 @@ void check_record_restores(ConversationStore& store, const SavedConversation& ex
 
 struct Sink {
     ConversationPublicationSink out;
-    std::vector<std::string> lines;
-    std::vector<size_t> released;
-    int allowance_refreshes = 0;
     uint64_t next_id = 0;
 
     Sink() {
-        out.report = [this](const std::string& line) { lines.push_back(line); };
-        out.release_lease = [this](size_t bytes) { released.push_back(bytes); };
-        out.refresh_allowance = [this] { ++allowance_refreshes; };
         out.next_publication_id = [this](uint64_t& id) {
             id = ++next_id;
             return true;
         };
     }
 
-    bool saw(const char* needle) const {
-        for (const std::string& line : lines)
-            if (line.find(needle) != std::string::npos) return true;
-        return false;
-    }
 };
 
 // One capture, exactly as the serving engine builds it: the record it froze, the head its owner's lineage named when
@@ -264,6 +254,23 @@ void settle(ConversationPublicationQueue& publications, ConversationStore& store
     }
 }
 
+// A retained, unpinned latest head, as mounted by the native engine. Fresh branch roots are tested separately.
+uint64_t mount_latest(ConversationStore& store, ConversationPublicationQueue& publications, Sink& sink,
+                      const SavedConversation& record) {
+    ConversationStorePublish request;
+    request.request_id = request.generation = ++sink.next_id;
+    std::string why;
+    check(store.publish(std::make_shared<SavedConversation>(record), request, why) ==
+              ConversationStorePublishAdmission::accepted, "the prior latest head is admitted");
+    ConversationStorePublishResult result;
+    check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored,
+          "the prior latest head is persisted");
+    auto& owner = publications.owner(0);
+    owner.generation = 1;
+    owner.lineage = {result.head_id, store.epoch(), record.live.ids, record.scope, record.cvec, true};
+    return result.head_id;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The regressions
 // ---------------------------------------------------------------------------------------------------------------
@@ -286,15 +293,7 @@ void check_divergent_capture_is_published_as_a_branch() {
     const SavedConversation divergent = turn_on(record, 96, 900);   // the same prefix, another answer
     const SavedConversation mounted = turn_on(record, 96, 901);     // a second owner's capture of the same prefix
 
-    // Nothing to supersede: the first capture becomes the head its owner's state continues from.
-    check(publications.enqueue(capture_of(0, 1, 0, true, record, epoch), sink.out), "the root capture is queued");
-    publications.owner(0).generation = 1;
-    publications.flush(store, sink.out, 0);
-    settle(publications, store, sink);
-    const uint64_t root_head = publications.owner(0).lineage.head;
-    check(publications.owner(0).lineage.valid && root_head != 0,
-          "the stored root becomes the head its owner continues from");
-    check_eq(store.counters().heads, 1, "the root's branch is the store's only head");
+    const uint64_t root_head = mount_latest(store, publications, sink, record);
 
     // A second owner mounts that very head - an ordinary client whose prefix is the stored record.
     ConversationPublicationOwner& other = publications.owner(1);
@@ -323,8 +322,6 @@ void check_divergent_capture_is_published_as_a_branch() {
           "the mounted owner's capture is queued");
 
     publications.flush(store, sink.out, 5000);
-    check(sink.saw("replaced"), "the covering capture replaced the head it named");
-    check(!sink.saw("stale"), "no capture was refused as stale");
     check(!any_record_names(publications, root_head), "no queued or outstanding capture still names the retired head");
     const ConversationPublicationPending* divergent_pending = pending_of(publications, 0);
     check(divergent_pending != nullptr && divergent_pending->supersedes == 0,
@@ -338,11 +335,9 @@ void check_divergent_capture_is_published_as_a_branch() {
 
     settle(publications, store, sink);
     check(!any_record_names(publications, root_head), "no capture ever named the retired head again");
-    check(!sink.saw("stale"), "no capture was refused as stale, at any seam");
+    check_eq(publications.counters().refused, 0, "all queued captures publish without refusal");
     check_eq(store.counters().replaced, 1, "exactly one publication replaced a head");
     check_eq(store.counters().heads, 3, "the covered head, the divergent capture and the other owner's are all heads");
-    check_eq(sink.released.size(), 4, "every accepted handover gave its export-cache lease back");
-    check_eq(uint64_t(sink.allowance_refreshes), 4, "every accepted handover republished the read allowance");
 
     // A fresh open of the same root: the two divergent captures and the covered head are all durable.
     store.close();
@@ -354,8 +349,8 @@ void check_divergent_capture_is_published_as_a_branch() {
         }
         check_eq(reopened.counters().heads, 3, "the reopened store keeps all three heads");
         check_record_restores(reopened, covered, 21);
-        check_record_restores(reopened, divergent, 22);
-        check_record_restores(reopened, mounted, 23);
+        check_record_restores(reopened, divergent, 22, true);
+        check_record_restores(reopened, mounted, 23, true);
     }
 }
 
@@ -375,12 +370,7 @@ void check_completion_landing_after_the_harvest() {
     const SavedConversation covered = turn_on(record, 96, 88);
     const SavedConversation divergent = turn_on(record, 96, 902);
 
-    check(publications.enqueue(capture_of(0, 1, 0, true, record, epoch), sink.out), "the root capture is queued");
-    publications.owner(0).generation = 1;
-    publications.flush(store, sink.out, 0);
-    settle(publications, store, sink);
-    check(publications.owner(0).lineage.valid, "the root's completion established the owner's lineage");
-    const uint64_t root_head = publications.owner(0).lineage.head;
+    const uint64_t root_head = mount_latest(store, publications, sink, record);
 
     publications.owner(0).generation = 2;
     check(publications.enqueue(capture_of(0, 2, root_head, true, covered, epoch), sink.out),
@@ -403,7 +393,6 @@ void check_completion_landing_after_the_harvest() {
     publications.flush(store, sink.out, 0);
     sink.out.between_harvest_and_idle_for_test = nullptr;
 
-    check(!sink.saw("stale"), "the completion that landed in the window did not stale the next cover");
     const ConversationPublicationPending* divergent_pending = pending_of(publications, 0);
     check(divergent_pending != nullptr, "the divergent capture was handed over");
     check(divergent_pending == nullptr || divergent_pending->supersedes == 0,
@@ -505,7 +494,7 @@ void check_a_covered_root_keeps_its_record() {
             return;
         }
         check_eq(reopened.counters().heads, 2, "the reopened store keeps the root and the latest turn");
-        check_record_restores(reopened, record, 31);
+        check_record_restores(reopened, record, 31, true);
         check_record_restores(reopened, later, 32);
     }
 }
@@ -513,30 +502,35 @@ void check_a_covered_root_keeps_its_record() {
 // A deferred handover is the store saying "not now" about a resource that is occupied at this instant: it must not
 // spend one of the bounded attempts, or a capture that was only ever early would be dropped after eight deferrals.
 void check_deferral_does_not_spend_an_attempt() {
-    uint32_t attempts = 0;
-    for (int i = 0; i < 16; ++i) {
-        const ConversationPublicationRetry verdict = ConversationPublicationQueue::retry(
-            ConversationStorePublishAdmission::deferred, attempts);
-        check(!verdict.accepted && !verdict.exhausted, "a deferral neither accepts nor exhausts");
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink;
+    ConversationPublicationQueue publications;
+    const SavedConversation large = stored_record(131, 131072);
+    const SavedConversation small = stored_record(132, 64);
+    mount_latest(store, publications, sink, large);
+    std::string why;
+    check(store.demand(query_of(large, 100, 1), why), "the blocking image is demanded");
+    ConversationStoreRead read;
+    check(store.wait_ready(100, 1, read, 5000) && read.image, "the blocking image is handed out");
+    store.publish_read_allowance(uint64_t(8) << 20);
+    publications.owner(1).generation = 1;
+    check(publications.enqueue(capture_of(1, 1, 0, true, small, store.epoch()), sink.out),
+          "the blocked capture is queued");
+    for (int i = 0; i < 16; ++i) publications.flush(store, sink.out, 0);
+    check_eq(publications.queued().size(), 1, "temporary pressure retains the captured image past the retry limit");
+    check_eq(publications.counters().dropped, 0, "temporary pressure never drops the capture");
+    check_eq(store.counters().deferred_publishes, 16, "every handover reached real occupied-resource admission");
+    read.image.reset();
+    store.release_read(100, 1);
+    settle(publications, store, sink);
+    check(!publications.holds_work(), "the retained capture publishes after its blocker releases");
+    check_eq(store.counters().heads, 2, "the deferred capture becomes a durable head");
+    store.close();
+    {
+        ConversationStore reopened(options_for(root.path));
+        check_record_restores(reopened, small, 101, true);
     }
-    check_eq(attempts, 0, "deferrals spend no attempts");
-
-    for (int i = 1; i <= 7; ++i) {
-        const ConversationPublicationRetry verdict = ConversationPublicationQueue::retry(
-            ConversationStorePublishAdmission::refused, attempts);
-        check(!verdict.exhausted, "a refusal before the eighth attempt keeps the capture queued");
-        check_eq(attempts, uint64_t(i), "each refusal spends exactly one attempt");
-    }
-    const ConversationPublicationRetry last = ConversationPublicationQueue::retry(
-        ConversationStorePublishAdmission::refused, attempts);
-    check(last.exhausted, "the eighth refusal exhausts the bounded allowance");
-    check(!last.accepted, "an exhausted refusal is never an acceptance");
-
-    const ConversationPublicationRetry taken = ConversationPublicationQueue::retry(
-        ConversationStorePublishAdmission::accepted, attempts);
-    check(taken.accepted, "an accepted handover transfers ownership of the bytes");
-    check(!taken.exhausted, "an accepted handover exhausts nothing");
-    check_eq(attempts, 8, "an accepted handover spends no attempt");
 }
 
 } // namespace

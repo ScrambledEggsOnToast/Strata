@@ -18,7 +18,7 @@ void ConversationPublicationQueue::report(const ConversationPublicationSink& sin
     const int written = std::vsnprintf(line, sizeof line, format, args);
     va_end(args);
     if (written < 0) return;
-    sink.report(std::string(line));
+    sink.report(line);
 }
 
 ConversationPublicationOwner& ConversationPublicationQueue::owner(uint64_t id) {
@@ -262,7 +262,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             if (sink.refresh_allowance) sink.refresh_allowance();
             continue;
         }
-        entry.image = std::move(image);
+        entry.image = offered;
         pending_.pop_back();
         if (admission == strata::core::ConversationStorePublishAdmission::deferred) {
             // A resource is occupied for the moment.  The entry keeps its image, its lease and its whole attempt
