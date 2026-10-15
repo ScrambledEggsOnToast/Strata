@@ -1377,7 +1377,10 @@ A one-shot request that no later request continues (a classification call, a pro
 `"strata_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
-`--prompt-cache-root`. Without the field (or with `true`) nothing changes.
+`--prompt-cache-root`. On Linux/CUDA, within the cache limits, borrowing an existing prefix is non-consuming:
+the prior working/resident history is preserved before overwrite, and a parked donor is returned
+unchanged before prefill. The one-shot extension does not replace it, so an ordinary later request
+can still reuse the previously completed history. Without the field (or with `true`) nothing changes.
 
 **Cost-aware continuation (opt-in).** `--prefix-selection cost` considers every valid active,
 resident-slot and parked-RAM live/checkpoint prefix, and fresh recomputation, before taking or
@@ -1436,8 +1439,10 @@ without it. The engine's own key is `pin=N` on the `GEN` line.
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
-their requests alternate; it does not execute requests concurrently. Each worker must
-declare its own conversation identity; no cross-conversation sharing is performed.
+their requests alternate; parking does not itself add execution slots. Declared conversation
+identities separate groups within an authenticated tenant. Requests without a declared group
+share only that tenant's content space and must still send the matching token/image prefix.
+No cross-scope reuse is permitted.
 The default budget is 0 (disabled); `--prompt-cache 0` also disables parking.
 With `--layer-split`, a parked conversation holds one image per stage (each later stage's
 session and its share of the conversation checkpoints), every image is validated before
@@ -1447,6 +1452,13 @@ it decodes when the conversation never left (`tools/parking_test.py`). FP16,
 INT8, Q4_0 and identity-layout K8V4 snapshots are supported; the K8V4 draft ring
 remains INT8, as in upstream. Windows/HIP and multi-GPU runtime coverage must be
 reported separately from Linux/CUDA evidence.
+
+The CUDA scheduler captures completed private resident histories directly before admission replacement or
+cooperative prefill parking overwrites their seat. This includes the committed response prefix,
+not merely the earlier input prompt; the last predicted token has not yet been fed. Capture
+never mounts a foreign owner through the working verifier. Layer-split parking retains the
+first complete root, the latest complete cut and every complete explicit pin; other unpinned
+rewind cuts remain working but may cold-read after parking.
 
 The web page's Monitor tab has a **Conversation cache** card (0.1.39, #596): the parked conversations against the
 slots and the RAM budget, how many were parked, restored and evicted, and the last switch (read from the engine's
@@ -1462,13 +1474,16 @@ checkpoints are captured again. Retained active K/V counts against the same byte
 budget and is discarded before evicting parked entries under memory pressure.
 If reserving space for growth would evict another conversation, parking uses a
 full capture instead.
-Oldest parked entries are evicted first.
-Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
+Oldest unpinned parked entries are evicted first. A replacement supersedes an older image only
+after capture succeeds and full live-prefix lineage, scope, images, steering, layout and pins match.
+Capture reservations count bytes independently from publication entries. A non-consuming donor
+reserves both its bytes and its return entry. Refused/failed captures publish no partial image;
+failed restores refuse rather than decode from partially restored state.
 `--conversation-cache-min-tokens N` (default 0 = park every conversation) parks only conversations of at least N
 tokens. A parked conversation costs one of the slots whatever its length, and parking is a switch-time decision, so a
 client that interleaves short side requests with one long conversation spends the cache on the side requests and, once
 it is full, evicts the long one oldest-first - exactly the reuse it wanted. Setting the minimum above the side
-requests' length keeps the long conversation parked. The check runs before `make_room()`, so a skipped park evicts
+requests' length keeps the long conversation parked. The check runs before capture reservation, so a skipped park evicts
 nothing and stores nothing; the log line is `conversation cache: skip parking (N tokens, below the M minimum;
 parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
 conversations keep a slot.

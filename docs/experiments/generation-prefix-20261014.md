@@ -289,3 +289,41 @@ to the shared selected-cut API. Source compatibility repairs do not establish a 
 qualification must cover shared-prefix donor isolation during selected restore
 and repark, and retained-prefill cancellation with the third owner active;
 individual feature results do not establish those interactions.
+
+## Queued-history ownership and prefill scheduling, 2026-10-15
+
+The cache ownership contract is documented in [DETAILS](../DETAILS.md). Completed
+private owners now have a read-only snapshot source with their own main/draft
+sessions. Capture happens before admission replacement or cooperative `BYIELD`,
+without mounting the victim through working state or consuming its retained K/V.
+This preserves the completed response prefix, not only the original input.
+Non-checkpointing requests borrow existing parked state without consuming it:
+checkpoint payloads stay with the donor, and both bytes and a return entry are
+reserved while outgoing state is captured. Working live donors are preserved
+before a non-checkpointing extension mutates them.
+
+Budgeted grouped prefill offers bounded resident rounds at completed, ownership-safe
+boundaries, including short and final parts. Contended work uses one arithmetic
+quantum; idle work can overlap at most two existing quanta without skipping the
+last eligible yield frontier. A final short tail can share that span when its
+interior frontier was already ineligible. Neither the arithmetic partition nor
+prefill-buffer admission grows. Background progress earns credit without training
+the isolated-full-quantum estimator on tails or overlapped spans.
+
+Ordered cancellation/retirement does not require decode credit. Controls never scan
+past a pending admission and therefore cannot affect a later incarnation of the
+same slot. All consumers drain before state changes, and the borrowed first-token
+verifier residual is consumed before resident decoding can overwrite it.
+
+Frontend accounting folds all native `DONE` hops. A `BDONE` replaces its nested
+admission detail rather than counting it twice. Original external cache reuse is
+the first native hop's explicit reuse, not a prefix reread during internal resume.
+Unknown optional counters remain unknown, and a request cancelled before native
+submission has no native legs.
+
+Linux/CUDA source builds, functional GPU observations, retained failures, exact
+profiles and bounded comparisons live in the
+[project qualification record](https://github.com/ScrambledEggsOnToast/ai-optimise/blob/main/evidence/threegpu-scheduling-20261015/record.json).
+Those observations supersede the initial unverified-runtime note above only for
+their named configurations. They do not qualify SYCL/HIP, arbitrary sixteen-history
+context sizes, sustained arrival fairness, or the broader historical #44/#45 matrix.
