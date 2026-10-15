@@ -13424,7 +13424,9 @@ int main(int argc, char** argv) {
             } else
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(time_budget.enabled() ? decode_round(false) : piped ? pipeline_step(true) : batch_step())) return 1;
+                    // No admission is waiting: keep the native pipeline filled,
+                    // rather than imposing a drained boundary on decode-only work.
+                    if (!(piped ? pipeline_step(true) : time_budget.enabled() ? decode_round(false) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
