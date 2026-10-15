@@ -325,6 +325,8 @@ SavedConversation split_stage(const SavedConversation& primary, uint8_t tag, int
 // half - and one saved image per later stage holding both, as that stage's own records.
 SavedConversation split_fixture(uint64_t seed, int64_t tokens, size_t stages) {
     SavedConversation image = fixture(seed, tokens);
+    image.geometry[1] = int64_t(4 * stages);
+    image.kv.resize(1);  // One attention layer per four-layer stage carve.
     image.layer_hi = 4;
     image.checkpoints.clear();
     for (int64_t at : {tokens / 4, tokens / 2}) {

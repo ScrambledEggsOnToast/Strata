@@ -530,8 +530,8 @@ bool restored_cut_matches(const SavedConversation& image, const conversation_sto
     // A split image carries the later stages in one of two encodings, and a cut is only coherent when the encoding it
     // uses names exactly one part per later stage.  A record-container image keeps the parts on the record itself
     // (`stage_parts`); the native parked split leaves a primary record's `stage_parts` empty and carries each part as
-    // that stage's own image record, which the stage loop below confirms holds this exact prefix.  A running
-    // checkpoint never owns parts: whole-session parking is single-GPU.
+    // that stage's own image record, which the stage loop below confirms holds this exact prefix.
+    // Live records always use the per-stage image representation rather than embedded checkpoint parts.
     if (!selected->stage_parts.empty() && (live || selected->stage_parts.size() + 1 != meta.stages)) {
         why = "the selected cut has an inconsistent stage-part count";
         return false;
