@@ -11324,7 +11324,7 @@ int main(int argc, char** argv) {
                 } else {
                     ++store_published;
                     std::fprintf(stderr, "strata serve: conversation store: %s head=%llu owner=%llu supersedes=%llu "
-                                         "tokens_published=%llu new=%llu reused=%llu released=%d\n",
+                                         "payload_bytes=%llu new=%llu reused=%llu released=%d\n",
                                  strata::core::conversation_store_publish_status_name(result.status),
                                  (unsigned long long) result.head_id, (unsigned long long) pending.owner,
                                  (unsigned long long) pending.supersedes,
