@@ -151,20 +151,27 @@ struct WriterWorkspace {
     uint64_t manifest = 0;        // its own encoded manifest
     uint64_t catalog_apply = 0;   // the candidate catalog copy, the apply staging and the retire queue's room
 
-    // I + J + max(W_layout/decode, W_chunks/maps/orphans + B, W_manifest/catalog/apply)
-    uint64_t peak() const {
-        uint64_t chunk_phase = sat_mul(chunks, sizeof(conversation_store_detail::ChunkRecord) + kAllocSlackBytes);
+    // Every structure that is live while one chunk is read and written, kept apart from the manifest and the catalog
+    // plan because those overlap with it rather than replace it: the chunk records, the referenced and charged object
+    // maps' nodes, the new-object map's nodes, the persistent index's entries, the head's own object-list slots and
+    // the pending-file entries a write adds.
+    uint64_t chunk_state() const {
+        uint64_t state = sat_mul(chunks, sizeof(conversation_store_detail::ChunkRecord) + kAllocSlackBytes);
         // Every prospective chunk may be a distinct object: its node in the referenced/charged object maps, its node
         // in the new-object map, its entry in the persistent index and its slot in the head's own object list.
-        chunk_phase = sat_add(chunk_phase,
-                              sat_mul(chunks, 4 * conversation_store_detail::kMapNodeBytes + 2 * sizeof(Digest) + 40 +
+        state = sat_add(state, sat_mul(chunks, 4 * conversation_store_detail::kMapNodeBytes + 2 * sizeof(Digest) + 40 +
                                                  2 * kAllocSlackBytes));
         // Every object this attempt writes is accounted before it is written, by name and by shard.
-        chunk_phase = sat_add(chunk_phase, sat_mul(chunks, sizeof(PendingFile) + 2 * kAllocSlackBytes));
-        chunk_phase = sat_add(chunk_phase, 2 * kAllocSlackBytes);   // the per-stream chunk reservations
-        chunk_phase = sat_add(chunk_phase, buffer);
+        state = sat_add(state, sat_mul(chunks, sizeof(PendingFile) + 2 * kAllocSlackBytes));
+        return sat_add(state, 2 * kAllocSlackBytes);   // the per-stream chunk reservations
+    }
+
+    // I + J + chunk_state + max(B, W_manifest/catalog/apply).  The chunk, map, orphan and index state is *retained*
+    // while the manifest is encoded and the catalog transaction is planned, so it is added rather than maximized
+    // away; the single chunk buffer and the manifest/apply phase do not coexist.
+    uint64_t peak() const {
         const uint64_t base = sat_add(sat_add(request_copy, layout), donor_decoded);
-        return sat_add(base, std::max(chunk_phase, sat_add(manifest, catalog_apply)));
+        return sat_add(sat_add(base, chunk_state()), std::max(buffer, sat_add(manifest, catalog_apply)));
     }
 };
 
@@ -177,7 +184,8 @@ struct DonorPrep {
     // covers the transient peak of a decode that has not happened yet.  The heads are decoded one at a time and their
     // metadata is retained, so this sum is never below what is really held.
     uint64_t decoded = 0;
-    uint64_t chunks = 0;      // the most chunks those donors can contribute through reuse intervals
+    uint64_t chunks = 0;      // the most chunks those donors can contribute through reuse intervals, per donor
+                              // whole-manifest bound times that donor's heaviest single-stream interval count
 };
 
 // The shared charge of one file: its blocks plus one block for its directory entry (and inode).  Deliberately
@@ -642,6 +650,11 @@ struct ConversationStore::Impl {
     uint64_t decode = 0;          // the live manifest read+decode workspace charged to the preparation ceiling (see
                                   // reserve_decode_locked); a read's and a writer's own decodes are charged to their
                                   // reservations instead, so this is only ever a path that has no reservation
+    uint64_t read_prep = 0;       // the live read descriptors' own preparation beyond `prep` - the manifest read and
+                                  // decode each admitted read reserved, plus the workspace it grew into while it
+                                  // restored.  It is a *view* of bytes the read's RAM reservation already holds, not
+                                  // another RAM charge: it is what makes readers, the writer and the diagnostic
+                                  // decodes share one preparation total (see preparation_locked())
 
     // ---- RAM ledger ----
     uint64_t ram_held = 0;        // admitted read peaks, materialized images, the publication alias, scratch
@@ -665,6 +678,9 @@ struct ConversationStore::Impl {
         uint64_t lease_bytes = 0;         // the finished image's charge, refunded by release_read()
         uint64_t peak_bytes = 0;          // the peak its admission reserved
         uint64_t prep_bytes = 0;          // its own query copy, charged to `prep`
+        uint64_t prepared_bytes = 0;      // the part of `reserved_bytes` that is this read's own preparation - its
+                                          // manifest read and decode and the scaffolding it restores into - charged to
+                                          // `read_prep` while the read is live
         uint64_t epoch_at_admission = 0;
         uint64_t head_id = 0;
         uint64_t tokens = 0;
@@ -752,6 +768,11 @@ struct ConversationStore::Impl {
     // storage wait while the lock is held.
     uint64_t sample_free_locked();
     uint64_t resident_locked() const { return ram_held + metadata + prep + decode; }
+    // The complete preparation ledger the ceiling bounds: the in-RAM index, every read descriptor's own copy, every
+    // admitted read's decode/restore preparation (already inside that read's RAM reservation, so a view rather than a
+    // second charge) and any diagnostic decode workspace.  Readers, the writer and diagnostic decodes therefore share
+    // one total instead of each being checked alone.
+    uint64_t preparation_locked() const { return sat_add(resident_locked(), read_prep); }
     std::string temp_name();
     std::string intent_name() const;
     bool store_is_empty(std::string& why);
@@ -845,13 +866,25 @@ struct ConversationStore::Impl {
     void release_head_lease_locked(const std::shared_ptr<ReadJob>& job);
     void erase_job_locked(const std::shared_ptr<ReadJob>& job);
     void free_job_prep_locked(const std::shared_ptr<ReadJob>& job);
+    void release_job_preparation_locked(const std::shared_ptr<ReadJob>& job);
     bool deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation, bool specific);
     void push_publish_result_locked(ConversationStorePublishResult&& result);
 
     void writer_body();
     void reader_body();
     void publish_body(const std::shared_ptr<PublishJob>& job, ConversationStorePublishResult& out);
-    void read_body(const std::shared_ptr<ReadJob>& job);
+    // One read's own verdict.  The body allocates its raw manifest bytes, its decoded metadata, its restore targets,
+    // its I/O slab and its restored image in its own frame, and settlement is what refunds the reservation those
+    // bytes were charged under - so the body never settles itself.  It records what it decided here and reader_body
+    // settles the job, and releases its charge, only after that frame and every buffer in it are gone.
+    struct ReadOutcome {
+        ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
+        std::string detail;
+        std::shared_ptr<SavedConversation> image;   // the restored image, on a `ready` verdict
+        uint64_t payload_bytes = 0;
+        uint32_t stages = 0;
+    };
+    void read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out);
 
     bool open_root(std::string& why);
     // Reads and decodes the durable catalog and decides this domain's epoch.  It may not write anything: the first
@@ -1597,7 +1630,8 @@ bool ConversationStore::Impl::stream_identity_of(const std::vector<ContainerMeta
 DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePublish& request) const {
     DonorPrep prep;
     // The writer retains one decoded copy per distinct donor, even when many
-    // streams name it. Its predecessor is a separate retained copy.
+    // streams name it. Its predecessor is a separate retained copy: `supersedes` is charged here whenever it is
+    // named, and again through the donor loop when it is also a donor of its own (the writer really does load both).
     for (const auto& head : catalog.heads) {
         const uint64_t raw = manifest_read_cap(head.manifest_bytes, limits);
         if (head.head_id == request.supersedes)
@@ -1605,14 +1639,35 @@ DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePubl
         bool donor_counted = false;
         for (const auto& entry : request.reuse) {
             if (entry.head_id != head.head_id) continue;
-            if (!donor_counted) {
-                prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
-                donor_counted = true;
-            }
-            // Repeated intervals can contribute repeated chunk references, but
-            // do not cause another manifest decode.
-            prep.chunks = sat_add(prep.chunks, sat_add(raw / 44, 2));
+            donor_counted = true;
+            break;
         }
+        if (!donor_counted) continue;
+        prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
+        // Repeated intervals contribute repeated chunk references, but do not cause another manifest decode.  Every
+        // chunk of a donor belongs to exactly one stream and one interval can reference at most every chunk of the
+        // stream it names, so the donor's whole-manifest chunk bound is multiplied by the most intervals any *single*
+        // stream of that donor carries - independent streams stay one manifest wide, while a stream named repeatedly
+        // is charged for every time it can name the same chunk again.  One count per donor would let repeats
+        // reference chunks nothing reserved; summing per donor manifest is what this replaces.
+        std::vector<std::pair<ConversationStoreStreamId, uint64_t>> streams;   // one entry per distinct named stream
+        uint64_t heaviest = 0;
+        for (const auto& entry : request.reuse) {
+            if (entry.head_id != head.head_id) continue;
+            uint64_t* named = nullptr;
+            for (auto& seen : streams)
+                if (seen.first == entry.stream) {
+                    named = &seen.second;
+                    break;
+                }
+            if (named == nullptr) {
+                streams.push_back({entry.stream, 0});
+                named = &streams.back().second;
+            }
+            ++*named;
+            heaviest = std::max(heaviest, *named);
+        }
+        prep.chunks = sat_add(prep.chunks, sat_mul(sat_add(raw / 44, 2), heaviest));
     }
     return prep;
 }
@@ -1674,7 +1729,7 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
         return true;
     }
     const uint64_t delta = workspace - job->workspace_bytes;
-    if (workspace > options.metadata_bytes || metadata + prep > options.metadata_bytes - workspace) {
+    if (workspace > options.metadata_bytes || preparation_locked() > options.metadata_bytes - workspace) {
         why = "the writer's workspace does not fit the store's preparation ceiling";
         return false;
     }
@@ -1687,7 +1742,7 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
     }
     ram_held += delta;
     job->workspace_bytes = workspace;
-    counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+    counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
     return true;
 }
 
@@ -1700,7 +1755,7 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
 bool ConversationStore::Impl::reserve_decode_locked(uint64_t workspace, std::string& why) {
     std::lock_guard<std::mutex> guard(mutex);
     if (!workspace) return true;
-    if (workspace > options.metadata_bytes || metadata + prep + decode > options.metadata_bytes - workspace) {
+    if (workspace > options.metadata_bytes || preparation_locked() > options.metadata_bytes - workspace) {
         why = "the workspace a manifest read and decode needs does not fit the store's preparation ceiling";
         return false;
     }
@@ -2263,7 +2318,17 @@ void ConversationStore::Impl::release_head_lease_locked(const std::shared_ptr<Re
     if (lease->second == 0) head_leases.erase(lease);
 }
 
+// The read's own preparation beyond its query copy - the manifest read and decode it reserved and the scaffolding it
+// restored into - stops being the store's preparation the moment its image is handed out or its descriptor is dropped:
+// from the hand-out on, those bytes are the caller's image, charged as its lease.  Released on the ready transition
+// and whenever the descriptor is erased, so `read_prep` never keeps a view of bytes that are no longer live.
+void ConversationStore::Impl::release_job_preparation_locked(const std::shared_ptr<ReadJob>& job) {
+    read_prep -= std::min(read_prep, job->prepared_bytes);
+    job->prepared_bytes = 0;
+}
+
 void ConversationStore::Impl::free_job_prep_locked(const std::shared_ptr<ReadJob>& job) {
+    release_job_preparation_locked(job);
     prep -= std::min(prep, job->prep_bytes);
     job->prep_bytes = 0;
     job->query.tokens.clear();
@@ -2299,12 +2364,15 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
         default: break;
     }
     if (status == ConversationStoreReadStatus::ready && job->image) {
+        // The reservation is refunded and the image's own bytes are charged as its lease; the read's preparation view
+        // ends here too, because from now on those bytes are the image the caller receives.
         release_reservation_locked(job);
+        release_job_preparation_locked(job);
         const uint64_t bytes = job->image->bytes();
         ram_held += bytes;
         ram_lease += bytes;
         job->lease_bytes = bytes;
-        counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+        counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
         if (job->released) {
             // The caller already released this request: the image is dropped and its charge is not kept.
             release_lease_locked(job);
@@ -2445,7 +2513,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         return false;
     }
     if (query.tokens.size() > size_t(limits.max_tokens) || query.images.size() > size_t(limits.max_images) ||
-        metadata + prep + own_prep > options.metadata_bytes) {
+        sat_add(preparation_locked(), own_prep) > options.metadata_bytes) {
         counters.refused_limits++;
         why = "the store's preparation ceiling cannot hold another read descriptor";
         return false;
@@ -2476,7 +2544,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     // before it runs, never charged after the fact.
     const uint64_t decode_workspace =
         conversation_store_detail::manifest_read_workspace_bound(manifest_read_cap(best.manifest_bytes, limits));
-    if (metadata + prep + own_prep + decode_workspace > options.metadata_bytes) {
+    if (sat_add(sat_add(preparation_locked(), own_prep), decode_workspace) > options.metadata_bytes) {
         counters.refused_limits++;
         why = "the store's preparation ceiling cannot hold this read and the manifest decode it needs";
         return false;
@@ -2494,6 +2562,11 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     job->prep_bytes = own_prep;
     job->epoch_at_admission = epoch;
     prep += own_prep;
+    // The decode this read will do is preparation the store holds beside every other read, the writer and the
+    // diagnostic decodes, so it is tracked from here on: it is already inside the peak this read reserved as RAM (a
+    // view of those bytes, never a second charge), and it is released with the descriptor or the hand-out.
+    job->prepared_bytes = decode_workspace;
+    read_prep = sat_add(read_prep, decode_workspace);
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
     job->live = best.live;
@@ -2544,34 +2617,37 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
     return false;
 }
 
-void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
+void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out) {
     const ConversationStoreQuery& query = job->query;
     const uint64_t head_id = job->head_id;
     const uint64_t tokens = job->tokens;
     const uint64_t epoch_at_admission = job->epoch_at_admission;
+    // This records a verdict; it never settles.  Settlement refunds this read's reservation, and the reservation is
+    // what every buffer allocated below is charged under, so reader_body settles only once this frame - and every
+    // local in it - is gone.
     const auto stop_with = [&](ConversationStoreReadStatus status, const std::string& detail) {
-        std::lock_guard<std::mutex> guard(mutex);
-        settle_job_locked(job, status, detail);
+        out.status = status;
+        out.detail = detail;
     };
     Digest manifest_id{};
     uint64_t manifest_bytes = 0;
     {
         std::lock_guard<std::mutex> guard(mutex);
         if (!on || closing) {
-            settle_job_locked(job, ConversationStoreReadStatus::disabled,
+            stop_with(ConversationStoreReadStatus::disabled,
                       reason.empty() ? std::string("the store stopped serving") : reason);
             return;
         }
         if (faulted) {
-            settle_job_locked(job, ConversationStoreReadStatus::disabled, fault_reason);
+            stop_with(ConversationStoreReadStatus::disabled, fault_reason);
             return;
         }
         if (epoch != epoch_at_admission) {
-            settle_job_locked(job, ConversationStoreReadStatus::stale, "the execution domain advanced before this read started");
+            stop_with(ConversationStoreReadStatus::stale, "the execution domain advanced before this read started");
             return;
         }
         if (!head_manifest_locked(head_id, manifest_id, manifest_bytes)) {
-            settle_job_locked(job, ConversationStoreReadStatus::stale, "the head this read selected is no longer retained");
+            stop_with(ConversationStoreReadStatus::stale, "the head this read selected is no longer retained");
             return;
         }
     }
@@ -2613,8 +2689,8 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         std::lock_guard<std::mutex> guard(mutex);
         if (job->cancelled.load()) return;
         if (epoch != epoch_at_admission) {
-            settle_job_locked(job, ConversationStoreReadStatus::stale,
-                              "the execution domain advanced before this read started");
+            stop_with(ConversationStoreReadStatus::stale,
+                      "the execution domain advanced before this read started");
             return;
         }
     }
@@ -2660,13 +2736,29 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         if (job->cancelled.load()) return;
         if (needed > job->reserved_bytes) {
             if (needed > ram_budget || resident_locked() - job->reserved_bytes > ram_budget - needed) {
-                settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
-                                  "the restored image does not fit the published RAM allowance");
+                stop_with(ConversationStoreReadStatus::refused_budget,
+                          "the restored image does not fit the published RAM allowance");
                 return;
             }
             ram_held += needed - job->reserved_bytes;
             job->reserved_bytes = needed;
-            counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+            counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
+        }
+        // What this read holds as *preparation* is the decode its admission reserved, or - now that the manifest is
+        // decoded and its restore targets exist - the raw manifest plus the scaffolding it is about to fill, whichever
+        // is larger.  Those bytes are already inside the RAM reservation `needed`, so this is a view of them rather
+        // than a second charge; they are charged to the preparation ceiling because the writer and the diagnostic
+        // decodes have to be admitted beside this read.
+        const uint64_t prepared = std::max(job->prepared_bytes, sat_add(raw.size(), scaffolding));
+        if (prepared > job->prepared_bytes) {
+            const uint64_t growth = prepared - job->prepared_bytes;
+            if (sat_add(preparation_locked(), growth) > options.metadata_bytes) {
+                stop_with(ConversationStoreReadStatus::refused_limits,
+                          "the restored image does not fit the store's preparation ceiling");
+                return;
+            }
+            read_prep = sat_add(read_prep, growth);
+            job->prepared_bytes = prepared;
         }
     }
     std::vector<conversation_store_detail::RestoreTarget> targets;
@@ -2692,8 +2784,8 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
             {
                 std::lock_guard<std::mutex> guard(mutex);
                 if (epoch != epoch_at_admission) {
-                    settle_job_locked(job, ConversationStoreReadStatus::stale,
-                                      "the execution domain advanced before this read completed");
+                    stop_with(ConversationStoreReadStatus::stale,
+                              "the execution domain advanced before this read completed");
                     return;
                 }
             }
@@ -2731,18 +2823,23 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job) {
         return;
     }
     image.freeze();
-    auto shared = std::make_shared<SavedConversation>(std::move(image));
+    // The restored image is the one buffer that must outlive this frame: reader_body takes it from the verdict and
+    // settles the job - which is what charges it as this read's lease - only after everything else here is gone.
+    out.image = std::make_shared<SavedConversation>(std::move(image));
+    out.payload_bytes = meta.payload_bytes;
+    out.stages = meta.stages;
     std::lock_guard<std::mutex> guard(mutex);
-    if (job->cancelled.load()) return;
-    if (shared->bytes() > job->reserved_bytes) {
-        settle_job_locked(job, ConversationStoreReadStatus::failed,
-                          "the restored image is larger than the peak it was admitted under");
+    if (job->cancelled.load()) {
+        out.image.reset();
         return;
     }
-    job->image = shared;
-    job->payload_bytes = meta.payload_bytes;
-    job->stages = meta.stages;
-    settle_job_locked(job, ConversationStoreReadStatus::ready, std::string());
+    if (out.image->bytes() > job->reserved_bytes) {
+        out.image.reset();
+        stop_with(ConversationStoreReadStatus::failed,
+                  "the restored image is larger than the peak it was admitted under");
+        return;
+    }
+    out.status = ConversationStoreReadStatus::ready;
 }
 
 void ConversationStore::Impl::reader_body() {
@@ -2779,7 +2876,10 @@ void ConversationStore::Impl::reader_body() {
                     const std::shared_ptr<ReadJob> job = *it;   // a copy: the entry may be erased below
                     if (job->cancelled) continue;
                     if (job->demand != (pass == 0)) continue;          // asks for a demand, then a prefetch
-                    if (ram_held + job->peak_bytes > ram_budget) {
+                    // The complete resident ledger, not ram_held alone: the index, every live descriptor's own copy,
+                    // the admitted reads' decode preparation and any diagnostic decode are resident too, and only
+                    // this read's peak is about to be added to them.
+                    if (ram_budget != 0 && sat_add(resident_locked(), job->peak_bytes) > ram_budget) {
                         if (job->demand) continue;                     // a demand waits for room
                         queue.erase(it);
                         settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
@@ -2801,7 +2901,7 @@ void ConversationStore::Impl::reader_body() {
         chosen->active = true;
         chosen->reserved_bytes = chosen->peak_bytes;
         ram_held += chosen->peak_bytes;
-        counters.peak_bytes = std::max(counters.peak_bytes, ram_held);
+        counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
         chosen->holds_slot = true;
         ++incoming;
         if (chosen->head_id) {
@@ -2817,8 +2917,18 @@ void ConversationStore::Impl::reader_body() {
 #ifdef STRATA_STORE_TEST_HOOKS
             if (gate) gate(gate_context);
 #endif
-            read_body(chosen);
+            ReadOutcome outcome;
+            read_body(chosen, outcome);
             lock.lock();
+            // Every buffer the body allocated is gone now, so this is the first moment its reservation may be
+            // refunded: settlement is what releases it, and the verdict carries the one buffer that had to outlive
+            // the frame.
+            if (outcome.status != ConversationStoreReadStatus::none) {
+                chosen->payload_bytes = outcome.payload_bytes;
+                chosen->stages = outcome.stages;
+                chosen->image = std::move(outcome.image);
+                settle_job_locked(chosen, outcome.status, std::move(outcome.detail));
+            }
         } catch (const std::bad_alloc&) {
             if (!lock.owns_lock()) lock.lock();
             settle_job_locked(chosen, ConversationStoreReadStatus::failed,
@@ -3953,71 +4063,78 @@ void ConversationStore::confirmed_restore(uint64_t head_id) {
     self.cv_work.notify_all();
 }
 
-bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, const ConversationStorePublish& request,
-                                std::string& why) {
+ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<const SavedConversation> image,
+                                                             const ConversationStorePublish& request,
+                                                             std::string& why) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
     if (!self.on || self.closed) {
         why = self.reason.empty() ? "the store is not enabled" : self.reason;
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     if (self.faulted) {
         why = self.fault_reason;
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     if (self.closing) {
         why = "the store is closing";
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     if (!image) {
         why = "no image was supplied";
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     if (request.epoch != 0 && request.epoch != self.epoch) {
         self.counters.refusals_stale++;
         why = "the image was captured in a previous execution-domain epoch";
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     const uint64_t image_bytes = image->bytes();
     // The image is not the workspace.  Count what this publication will really allocate - the copied request, the
     // layout skeleton, its per-record prefix chains and the parent/donor manifest decode - before one byte of it is
-    // allocated, and count the image itself separately: a ticket whose workspace cannot fit settles as refused_limits
-    // instead of overrunning either the allowance or the preparation ceiling.
+    // allocated, and count the image itself separately: a shape whose own counted peak cannot fit is refused as such,
+    // never deferred, because no revoked speculation and no settled lease can make room for it.
     conversation_store_detail::ImageShape shape;
     if (!conversation_store_detail::image_shape(*image, self.limits, shape, why)) {
         self.counters.refused_limits++;
         why = "the publication image is not representable: " + why;
-        return false;
+        return ConversationStorePublishAdmission::refused;
     }
     const WriterWorkspace workspace = self.writer_workspace_locked(request, shape);
     const uint64_t needed = workspace.peak();
     const uint64_t required = sat_add(image_bytes, needed);
-    // The preparation sub-cap covers the index and the writer alike, so the whole counted peak is checked against
-    // it: the writer's workspace is preparing an index entry, not a payload.
-    if (needed > self.options.metadata_bytes ||
-        self.metadata + self.prep > self.options.metadata_bytes - needed) {
-        self.counters.refused_limits++;
-        why = "the publication's writer workspace does not fit the store's preparation ceiling";
-        return false;
-    }
     // A transferred lease: the caller's own cache still holds exactly this entry's bytes outside the store's
     // allowance, so this one publication is fitted against the allowance *plus* that credit.  The credit is clamped
     // to the image's own size, is granted to no read, and widens nothing else: the store still charges the full
     // image and the whole counted workspace into ram_held_bytes().
     const uint64_t credit = std::min(request.external_lease_bytes, image_bytes);
     const uint64_t envelope = sat_add(self.ram_budget, credit);
-    if (self.ram_budget == 0 || required > envelope) {
-        // Speculative read resources are revocable, and an outgoing capture is required work: outstanding prefetch
-        // gives way to it before the store declines to persist the image at all.
-        self.revoke_speculation_locked(false);
-    }
-    if (self.ram_budget == 0 || required > envelope || self.resident_locked() > envelope - required) {
+    if (!self.ram_budget || needed > self.options.metadata_bytes || required > envelope) {
+        // The shape's own terms: no allowance has been published yet, the writer's workspace alone is larger than the
+        // preparation ceiling, or the image and its whole counted workspace exceed the envelope even with nothing else
+        // resident.  Permanent, so nothing is revoked and a retry finds the same answer.
         self.counters.refused_limits++;
         why = credit
                   ? "the publication image and its writer workspace do not fit the published RAM allowance plus the "
                     "lease the caller transferred"
                   : "the publication image and its writer workspace do not fit the published RAM allowance";
-        return false;
+        return ConversationStorePublishAdmission::refused;
+    }
+    // What is left is *occupancy*: another operation's live preparation, or a read's reservation and lease, may be
+    // holding the ceiling or the allowance at this instant.  Speculative reads are revocable and an outgoing capture
+    // is required work, so they give way first - never an active worker, a demand or a handed-out image, whose charges
+    // are released only when they settle (see revoke_speculation_locked) - and the admission is then retried under
+    // this same lock.  A publication that still cannot fit is deferred: nothing was allocated, charged or transferred,
+    // so the caller keeps its image and its lease and may offer it again at a later seam.
+    if (self.preparation_locked() > self.options.metadata_bytes - needed ||
+        self.resident_locked() > envelope - required) {
+        self.revoke_speculation_locked(false);
+        if (self.preparation_locked() > self.options.metadata_bytes - needed ||
+            self.resident_locked() > envelope - required) {
+            self.counters.deferred_publishes++;
+            why = "the store's RAM allowance or preparation ceiling is occupied by work it cannot free right now";
+            return ConversationStorePublishAdmission::deferred;
+        }
     }
     if (self.publishing) {
         const std::shared_ptr<Impl::PublishJob>& current = self.publishing;
@@ -4030,7 +4147,7 @@ bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, 
             self.counters.refusals_busy++;
             why = current->started ? "the writer is already serializing another image"
                                    : "another branch is already admitted";
-            return false;
+            return ConversationStorePublishAdmission::refused;
         }
         ConversationStorePublishResult coalesced;
         coalesced.status = ConversationStorePublishStatus::coalesced;
@@ -4066,11 +4183,11 @@ bool ConversationStore::publish(std::shared_ptr<const SavedConversation> image, 
     // The image alias is the only part of this that is also a lease: the workspace belongs to the writer alone.
     self.ram_held += job->ram_bytes + needed;
     self.ram_lease += job->ram_bytes;
-    self.counters.peak_bytes = std::max(self.counters.peak_bytes, self.ram_held);
+    self.counters.peak_bytes = std::max(self.counters.peak_bytes, self.resident_locked());
     self.publishing = job;
     self.cv_work.notify_all();
     self.cv_publish.notify_all();
-    return true;
+    return ConversationStorePublishAdmission::accepted;
 }
 
 bool ConversationStore::take_publish(ConversationStorePublishResult& out) {
@@ -4099,7 +4216,7 @@ bool ConversationStore::writer_busy() const {
 
 uint64_t ConversationStore::ram_held_bytes() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->ram_held + impl_->metadata + impl_->prep;
+    return impl_->resident_locked();
 }
 
 uint64_t ConversationStore::ram_lease_bytes() const {
@@ -4114,7 +4231,7 @@ uint64_t ConversationStore::ram_read_budget() const {
 
 uint64_t ConversationStore::ram_available_bytes() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    const uint64_t held = impl_->ram_held + impl_->metadata + impl_->prep;
+    const uint64_t held = impl_->resident_locked();
     return impl_->ram_budget > held ? impl_->ram_budget - held : 0;
 }
 
@@ -4373,8 +4490,10 @@ std::string ConversationStore::describe() const {
             ", pending files " + std::to_string(impl_->pending_files.size()) + ", free sampled " +
             std::to_string(impl_->free_sample) + "\n";
     text += "index: " + std::to_string(impl_->metadata) + " of " + std::to_string(impl_->options.metadata_bytes) +
-            " bytes estimated, preparation " + std::to_string(impl_->prep) + " bytes\n";
-    text += "ram: held " + std::to_string(impl_->ram_held + impl_->metadata + impl_->prep) + ", leased " +
+            " bytes estimated, preparation " + std::to_string(impl_->prep) + " bytes, read preparation " +
+            std::to_string(impl_->read_prep) + " bytes, diagnostic decode " + std::to_string(impl_->decode) +
+            " bytes\n";
+    text += "ram: held " + std::to_string(impl_->resident_locked()) + ", leased " +
             std::to_string(impl_->ram_lease) + ", budget " + std::to_string(impl_->ram_budget) +
             (impl_->admission_suspended ? " (admission suspended)" : "") + "\n";
     text += "reads: queued " + std::to_string(impl_->queue.size()) + ", incoming " +
@@ -4436,6 +4555,15 @@ const char* conversation_store_publish_status_name(ConversationStorePublishStatu
         case ConversationStorePublishStatus::coalesced: return "coalesced";
         case ConversationStorePublishStatus::failed: return "failed";
         case ConversationStorePublishStatus::disabled: return "disabled";
+    }
+    return "unknown";
+}
+
+const char* conversation_store_publish_admission_name(ConversationStorePublishAdmission admission) {
+    switch (admission) {
+        case ConversationStorePublishAdmission::accepted: return "accepted";
+        case ConversationStorePublishAdmission::deferred: return "deferred";
+        case ConversationStorePublishAdmission::refused: return "refused";
     }
     return "unknown";
 }

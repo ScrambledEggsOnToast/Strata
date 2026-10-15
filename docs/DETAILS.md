@@ -1526,14 +1526,22 @@ Capacity is **one shared physical quota** for every layout: `--conversation-cach
 lazily allocated, with `--conversation-cache-disk-min-free-mib` (default 131072) as the filesystem floor a new
 reservation must leave free, and `--conversation-cache-disk-heads` (default 128) as the retained branch-head ceiling
 across the whole store - independent of the RAM `--conversation-cache-slots`. Neither quota nor head limit is part of
-an image's identity, so both layouts borrow the same capacity. Refusals are ordinary cache misses: a full store, a
-floor that cannot be met, a busy writer or an unhealthy root skips the write or the read and the request completes as
-it would without persistence.
+an image's identity, so both layouts borrow the same capacity. A publication that cannot fit is never a lost history:
+the store separates *occupied* from *over cap*. A defective or unrepresentable shape, a counted peak that cannot fit
+the published RAM envelope or the preparation ceiling however little else is resident, a busy writer, a full store, a
+floor that cannot be met or an unhealthy root is a **refusal** - the write is skipped and the request completes as it
+would without persistence. A counted peak that fits on its own but finds the envelope or the preparation ceiling
+occupied by work the store may not free (a running read and its preparation, a handed-out image, a publication in
+flight) is a **deferral**: nothing is allocated, charged or transferred, the capture keeps its own image and lease and
+stays queued for the next safe seam without spending one of its bounded retries, and it is admitted once that work
+settles. Only speculation - an unhanded, undemanded prefetch - is revoked to make room.
 
 **One root, several profiles.** A run's stage count, checkpoint policy (`--prompt-cache`),
 context and image/state budgets decide what it may create or restore—not whether another
-profile's valid record is corrupt. Capacity refusals return `refused_limits` and preserve the
-record. Shared-quota eviction, valid replacement and epoch retirement still apply.
+profile's valid record is corrupt. A shape this run cannot serve is refused as
+`refused_limits` before a byte is allocated, while RAM or preparation that is merely
+occupied defers the ticket instead; both preserve the record. Shared-quota eviction, valid
+replacement and epoch retirement still apply.
 
 Retention validation uses format bounds derived from the manifest's encoding. Its logical
 payload can exceed the physical quota because repeated chunks share one on-disk object;
@@ -1569,10 +1577,15 @@ shared allocation with no byte copied - and the store receives a cheap immutable
 chunk-wise write straight out of those buffers, while the RAM cache keeps the mutable image and the very same bytes.
 A later mutation of either side detaches its own allocation first (copy-on-write), so a writer can never reach bytes a
 lease is reading, and a store that is busy, full or unhealthy only skips the write. The lease is charged to the
-conversation RAM envelope while it lives and given back when the store releases the alias; every reference is charged
-in full, so the envelope is conservative rather than optimistic, and a publication lease that does not fit the
-envelope is skipped instead of over-committing it. A restore hands the engine an owned, complete, byte-verified image
-(never a live GPU pointer or a borrowed visitor), and the mounted copy owns its buffers alone.
+conversation RAM envelope while it lives and given back when the caller releases it; every reference is charged in
+full, so the envelope is conservative rather than optimistic, and a publication that does not fit is never
+over-committed. Admission says which of the two it was: a **deferred** image fits the allowance and the preparation
+ceiling on their own, but resources the store may not free - a running worker, a handed-out or demanded image, or a
+publication in flight - are occupying them right now, so the caller keeps both its image and its lease and offers it
+again at the next seam; a **refused** image cannot fit however little else is resident, or is not representable at
+all. On an **accepted** admission the store owns the image's accounting from that instant, so the caller releases its
+lease there and then, whatever the write later settles as. A restore hands the engine an owned, complete,
+byte-verified image (never a live GPU pointer or a borrowed visitor), and the mounted copy owns its buffers alone.
 
 *Publication.* A publication is bound to a head only when the engine *proves* the outgoing image still covers the cut
 it was captured from - the same authorized scope and the same token prefix, checked by hash - so a divergent sibling
@@ -1581,12 +1594,15 @@ completion cannot overwrite a newer covered descendant. `generation` is assigned
 completion, and it is the execution domain's chronology rather than one process's own count: a run numbers its
 captures above the greatest generation its own domain has already persisted (`publication_generation_floor()`), so the
 first capture after a clean restart can still cover the head it just restored, while a completion numbered at or below
-its predecessor's stays a stale one. The store admits one writer at a time. Reuse of a physical slot does not
-coalesce unrelated queued captures. The engine advances publications on its owner thread at prefill chunk
-boundaries, decode iterations and idle command waits, rather than waiting for another request. These CPU-only
-handovers reap completed results and may prepare metadata, but do not wait for the writer. Whole-prompt reads without
-an owner-thread chunk boundary (the no-slot bypass and a layer split with no time budget) retain once-per-request
-handover.
+its predecessor's stays a stale one. The store admits one writer at a time, against the published RAM allowance and
+the preparation ceiling together with everything else the store holds - the index, every read descriptor, the
+admitted reads' decode preparation - and it makes room only by revoking speculation: a running worker's reservation
+and a handed-out image's lease are released when they settle, never to pay for another operation's write. Reuse of a
+physical slot does not coalesce unrelated queued captures. The engine advances publications on its owner thread at
+prefill chunk boundaries, decode iterations and idle command waits, rather than waiting for another request. These
+CPU-only handovers reap completed results and may prepare metadata, but do not wait for the writer. Whole-prompt reads
+without an owner-thread chunk boundary (the no-slot bypass and a layer split with no time budget) retain
+once-per-request handover.
 
 *Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the
@@ -1626,10 +1642,14 @@ the intent armed, so the next start conservatively invalidates that domain inste
 clean switch (same profile, or pair → three-GPU → pair) covers only compatible, catalog-authorized state; the newest
 uncommitted response tail is never promised.
 
-*Known limits of this first implementation.* Retained-K/V reuse intervals are not passed to the store yet: the engine
-proves its unchanged extents as token counts, not as per-stream chunk-aligned byte intervals, so every publication
-re-hashes the outgoing image's chunks and only the store's content addressing avoids duplicate writes. The store's RAM
-(index, read images, publication leases) and the parked payloads share the single `--conversation-cache-mib` envelope,
+*Known limits of this first implementation.* Retained-K/V reuse intervals are offered only for a capture that kept a
+donor's own K/V head (`conversation_store_reuse_intervals`), and the store re-validates every one of them: the donor
+still authorized and in this bucket and epoch, each adopted chunk on the donor's own chunk grid and still present, and
+the stream mapping to the same physical identity. The admission that precedes that work charges a named donor's
+whole-manifest chunk bound once per **repeated stream** of that donor - independent streams stay one manifest wide -
+so a capture that keeps many K/V heads at once is not charged a manifest per stream, while a stream named repeatedly
+is still charged for every way it can name the same chunk again. The store's RAM (index, read images, publication
+leases) and the parked payloads share the single `--conversation-cache-mib` envelope,
 which is a bounded budget and not a measurement. Kernel/arithmetic environment overrides that are not part of the
 engine's declared setting fingerprint are outside the execution-domain digest, so a deployment must keep them
 identical across a restart for stored histories to remain eligible. No performance claim is made here: the design has

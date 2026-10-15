@@ -3,6 +3,8 @@
 // matches, statuses, leases, epochs and byte counts.  Every check is a consumer-visible behaviour, not an internal.
 #include "strata/core/conversation_store.hpp"
 
+#include "strata/core/conversation_reuse.hpp"
+
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
 
@@ -56,6 +58,12 @@ void check_eq(uint64_t got, uint64_t want, const char* what) {
 Digest digest_of(const std::string& text) { return sha256(text.data(), text.size()); }
 
 std::array<uint8_t, 32> bytes_from(const std::string& text) { return digest_of(text); }
+
+// The three admission classes a publication can come back with (see ConversationStorePublishAdmission), spelled once
+// so every call site states its own expectation: only `kAccepted` means the store took the image and its lease.
+constexpr auto kAccepted = ConversationStorePublishAdmission::accepted;
+constexpr auto kDeferred = ConversationStorePublishAdmission::deferred;
+constexpr auto kRefused = ConversationStorePublishAdmission::refused;
 
 // The digest of a whole file, for the tests that must show a store wrote nothing to the authority.
 std::string file_digest(const std::string& path) {
@@ -423,26 +431,35 @@ std::vector<std::string> directory_names(const std::string& path) {
 
 // One probe of a publication admission against one published allowance.  Every probe uses its own root and its own
 // store: `attempt` seeds whatever state the publication needs (a donor, a predecessor) and returns the request, so no
-// probe can drift with another one's commits.
-bool publication_is_admitted(const ConversationStoreOptions& shape, const SavedConversation& image,
-                             const std::function<ConversationStorePublish(ConversationStore&)>& attempt,
-                             uint64_t allowance) {
+// probe can drift with another one's commits.  The result is the admission class the store chose, which is what the
+// boundary checks assert on.
+ConversationStorePublishAdmission publication_admission_probe(
+    const ConversationStoreOptions& shape, const SavedConversation& image,
+    const std::function<ConversationStorePublish(ConversationStore&)>& attempt, uint64_t allowance) {
     TempRoot root;
     ConversationStoreOptions options = shape;
     options.root = root.path;
     ConversationStore store(options);
-    if (!store.enabled()) return false;
+    if (!store.enabled()) return kRefused;
     store.publish_read_allowance(allowance);
     const ConversationStorePublish request = attempt(store);
     auto shared = std::make_shared<SavedConversation>(image);
     std::string why;
-    const bool admitted = store.publish(shared, request, why);
-    if (admitted) {
+    const ConversationStorePublishAdmission admission = store.publish(shared, request, why);
+    if (admission == kAccepted) {
         ConversationStorePublishResult result;
         store.wait_publish(result, 5000);
     }
     store.close();
-    return admitted;
+    return admission;
+}
+
+// Whether this shape, image and allowance admit the publication at all: only an `accepted` admission transfers the
+// image's accounting to the store.
+bool publication_is_admitted(const ConversationStoreOptions& shape, const SavedConversation& image,
+                             const std::function<ConversationStorePublish(ConversationStore&)>& attempt,
+                             uint64_t allowance) {
+    return publication_admission_probe(shape, image, attempt, allowance) == kAccepted;
 }
 
 // The smallest published allowance that admits one publication: the admission figure is counted and deterministic, so
@@ -497,6 +514,11 @@ void check_stream_identity();
 void check_corruption();
 void check_writer_workspace();
 void check_reuse_reservation();
+void check_many_stream_reuse_admission();
+void check_reuse_multiplicity_reservation();
+void check_ready_speculation_yields();
+void check_active_reader_defers_publication();
+void check_permanent_admission_boundaries();
 void check_catalog_headroom();
 void check_commit_outcomes();
 void check_bootstrap_and_intent();
@@ -540,6 +562,11 @@ int main() {
     check_corruption();
     check_writer_workspace();
     check_reuse_reservation();
+    check_many_stream_reuse_admission();
+    check_reuse_multiplicity_reservation();
+    check_ready_speculation_yields();
+    check_active_reader_defers_publication();
+    check_permanent_admission_boundaries();
     check_catalog_headroom();
     check_commit_outcomes();
     check_bootstrap_and_intent();
@@ -835,8 +862,10 @@ bool publish_and_wait(ConversationStore& store, const SavedConversation& image, 
     request.request_id = request_id;
     request.generation = generation;
     std::string why;
-    if (!store.publish(shared, request, why)) {
-        std::fprintf(stderr, "Publication admission: %s\n", why.c_str());
+    const ConversationStorePublishAdmission admission = store.publish(shared, request, why);
+    if (admission != kAccepted) {
+        std::fprintf(stderr, "Publication admission (%s): %s\n",
+                     conversation_store_publish_admission_name(admission), why.c_str());
         return false;
     }
     const bool settled = store.wait_publish(out, 5000);
@@ -1204,7 +1233,7 @@ void check_profile_recovery() {
         ConversationStorePublish request;
         request.request_id = 32;
         request.generation = 1;
-        check(!store->publish(image, request, why), "this profile refuses to publish a record it cannot serve");
+        check(store->publish(image, request, why) == kRefused, "this profile refuses to publish a record it cannot serve");
         check(store->counters().refused_limits > 0, "the refused publication is counted as a limit refusal");
         check_eq(store->counters().heads, retained_heads, "the refused publication authorizes no head");
         store->close();
@@ -1248,7 +1277,7 @@ void check_profile_recovery() {
         ConversationStorePublish request;
         request.request_id = 46;
         request.generation = 1;
-        check(!store->publish(std::make_shared<SavedConversation>(pair), request, why),
+        check(store->publish(std::make_shared<SavedConversation>(pair), request, why) == kRefused,
               "publication cannot create state this profile refuses to restore");
         check_eq(store->counters().reads_corrupt, 0, "state capacity is not corruption");
         store->close();
@@ -1604,7 +1633,7 @@ void check_publication_rules() {
     covered.supersedes = first.head_id;
     covered.cover = true;
     std::string why;
-    check(store.publish(newer, covered, why), "a covered publication of the same lineage is admitted");
+    check(store.publish(newer, covered, why) == kAccepted, "a covered publication of the same lineage is admitted");
     ConversationStorePublishResult replaced;
     check(store.wait_publish(replaced, 5000), "the covered publication settles");
     check(replaced.status == ConversationStorePublishStatus::replaced, "a covered predecessor is replaced");
@@ -1629,12 +1658,12 @@ void check_publication_rules() {
     ConversationStorePublish request;
     request.request_id = 10;
     request.generation = 1;
-    check(store.publish(first_image, request, why), "the first of two back-to-back publications is admitted");
+    check(store.publish(first_image, request, why) == kAccepted, "the first of two back-to-back publications is admitted");
     auto second_image = std::make_shared<SavedConversation>(other);
     ConversationStorePublish busy;
     busy.request_id = 11;
     busy.generation = 1;
-    check(!store.publish(second_image, busy, why), "a second image is refused while the writer is busy");
+    check(store.publish(second_image, busy, why) == kRefused, "a second image is refused while the writer is busy");
     check(!why.empty(), "the refusal carries a reason");
     check(store.counters().refusals_busy > 0, "the refusal is counted");
     ConversationStorePublishResult drain;
@@ -1685,7 +1714,7 @@ void check_restart_generation_ordering() {
         stale.supersedes = predecessor;
         stale.cover = true;
         std::string why;
-        check(store.publish(restart_numbering, stale, why), "the stale cover is admitted as a ticket");
+        check(store.publish(restart_numbering, stale, why) == kAccepted, "the stale cover is admitted as a ticket");
         ConversationStorePublishResult refused;
         check(store.wait_publish(refused, 5000), "the stale cover settles");
         check(refused.status == ConversationStorePublishStatus::stale,
@@ -1702,7 +1731,7 @@ void check_restart_generation_ordering() {
         cover.generation = generation;
         cover.supersedes = predecessor;
         cover.cover = true;
-        check(store.publish(restarted_cover, cover, why), "a cover minted above the floor is admitted");
+        check(store.publish(restarted_cover, cover, why) == kAccepted, "a cover minted above the floor is admitted");
         ConversationStorePublishResult replaced;
         check(store.wait_publish(replaced, 5000), "the restarted cover settles");
         check(replaced.status == ConversationStorePublishStatus::replaced,
@@ -1772,7 +1801,7 @@ void check_reuse() {
     request.reuse.push_back(ids_interval);
     request.reuse.push_back(kv_interval);
     std::string why;
-    check(store.publish(image, request, why), "a publication carrying proven intervals is admitted");
+    check(store.publish(image, request, why) == kAccepted, "a publication carrying proven intervals is admitted");
     ConversationStorePublishResult reused;
     check(store.wait_publish(reused, 5000), "the reuse publication settles");
     check(reused.status == ConversationStorePublishStatus::stored, "the reuse publication is stored");
@@ -1806,7 +1835,7 @@ void check_reuse() {
     ConversationStoreReuse stranger = ids_interval;
     stranger.head_id = 0xdeadbeef;
     unaligned.reuse.push_back(stranger);
-    check(store.publish(second, unaligned, why), "an unusable interval still admits the publication");
+    check(store.publish(second, unaligned, why) == kAccepted, "an unusable interval still admits the publication");
     ConversationStorePublishResult ignored;
     check(store.wait_publish(ignored, 5000), "the unaligned publication settles");
     check_eq(ignored.reused_bytes, 0, "an unusable interval is ignored");
@@ -1827,7 +1856,7 @@ void check_leases_and_budget() {
     ConversationStorePublish blocked;
     blocked.request_id = 1;
     blocked.generation = 1;
-    check(!store.publish(std::make_shared<SavedConversation>(image), blocked, why),
+    check(store.publish(std::make_shared<SavedConversation>(image), blocked, why) == kRefused,
           "zero shared RAM allowance refuses a publication");
     store.publish_read_allowance(uint64_t(64) << 20);
     check(publish_and_wait(store, image, 1, 1, result) &&
@@ -2058,7 +2087,7 @@ void check_pinned_branch() {
     request.supersedes = first.head_id;
     request.cover = true;
     std::string why;
-    check(store.publish(dropped, request, why), "a covered descendant is admitted");
+    check(store.publish(dropped, request, why) == kAccepted, "a covered descendant is admitted");
     ConversationStorePublishResult retained;
     check(store.wait_publish(retained, 5000), "the covered descendant settles");
     check(retained.status == ConversationStorePublishStatus::retained_branch,
@@ -2074,7 +2103,7 @@ void check_pinned_branch() {
     cover.generation = 3;
     cover.supersedes = first.head_id;
     cover.cover = true;
-    check(store.publish(kept, cover, why), "a pin-preserving cover is admitted");
+    check(store.publish(kept, cover, why) == kAccepted, "a pin-preserving cover is admitted");
     ConversationStorePublishResult replaced;
     check(store.wait_publish(replaced, 5000), "the pin-preserving cover settles");
     check(replaced.status == ConversationStorePublishStatus::replaced,
@@ -2089,7 +2118,7 @@ void check_pinned_branch() {
     stale.generation = 2;
     stale.supersedes = replaced.head_id;
     stale.cover = true;
-    check(store.publish(older, stale, why), "the older cover is admitted as a ticket");
+    check(store.publish(older, stale, why) == kAccepted, "the older cover is admitted as a ticket");
     ConversationStorePublishResult refused;
     check(store.wait_publish(refused, 5000), "the older cover settles");
     check(refused.status == ConversationStorePublishStatus::stale,
@@ -2118,10 +2147,13 @@ void check_tight_ram() {
     check(store.manifest_info(small_result.head_id, small_info), "the small head's metadata is readable");
 
     // An allowance that fits one small read (payload, manifest, the job's own query copy, one I/O slab and the fixed
-    // scaffolding) and nothing of the large one.
+    // scaffolding) *and* everything the store already holds resident - its index, this read's own descriptor copy and
+    // any diagnostic decode - and nothing of the large one: a read is admitted against the complete ledger, so the
+    // allowance that admits it has to cover the ledger too.
     const uint64_t prep = uint64_t(small.live.ids.size() + 1) * sizeof(int32_t) + 1024;
+    const uint64_t resident_before = store.ram_held_bytes();
     const uint64_t allowance = small_payload + small_payload / 4 + 2 * small_info.manifest_bytes + prep +
-                               (uint64_t(1) << 20) + (uint64_t(320) << 10);
+                               (uint64_t(1) << 20) + (uint64_t(320) << 10) + resident_before;
     check(large_payload > allowance + (uint64_t(1) << 20),
           "the large image is larger than the allowance by construction");
     check_eq(store.publish_read_allowance(allowance), allowance, "the allowance is absolute");
@@ -2132,7 +2164,7 @@ void check_tight_ram() {
     big_request.request_id = 3;
     big_request.generation = 3;
     std::string why;
-    check(!store.publish(big, big_request, why), "a publication image larger than the allowance is refused");
+    check(store.publish(big, big_request, why) == kRefused, "a publication image larger than the allowance is refused");
     check(!why.empty(), "the refusal carries a reason");
     check(store.counters().refused_limits > 0, "the publication refusal is counted");
 
@@ -2374,7 +2406,7 @@ void check_ownership_and_close() {
     check(!second.healthy(), "a refused owner is not healthy");
     check(second.counters().lock_conflicts > 0, "the lock conflict is counted");
     std::string why;
-    check(!second.publish(std::make_shared<SavedConversation>(image), ConversationStorePublish{}, why),
+    check(second.publish(std::make_shared<SavedConversation>(image), ConversationStorePublish{}, why) == kRefused,
           "a refused owner cannot publish");
     check(second.matches(selector_of(image), query_of(image, 9, 9).tokens, {}).empty(),
           "a refused owner matches nothing");
@@ -2459,7 +2491,7 @@ void check_quota_credit() {
         request.request_id = 2;
         request.generation = 2;
         std::string why;
-        check(store.publish(other, request, why), "a second branch is admitted as a ticket");
+        check(store.publish(other, request, why) == kAccepted, "a second branch is admitted as a ticket");
         ConversationStorePublishResult refused;
         check(store.wait_publish(refused, 5000), "the second branch settles");
         check(refused.status == ConversationStorePublishStatus::refused_quota,
@@ -2505,7 +2537,7 @@ void check_quota_credit() {
         request.request_id = 3;
         request.generation = 3;
         std::string why;
-        check(store.publish(replacement, request, why), "an evictable publication is admitted");
+        check(store.publish(replacement, request, why) == kAccepted, "an evictable publication is admitted");
         ConversationStorePublishResult stored;
         check(store.wait_publish(stored, 5000), "the evicting publication settles");
         if (stored.status != ConversationStorePublishStatus::stored)
@@ -2562,7 +2594,7 @@ void check_writer_workspace() {
         request.request_id = 2;
         request.generation = 1;
         std::string why;
-        check(!store.publish(image, request, why),
+        check(store.publish(image, request, why) == kRefused,
               "a workspace larger than the store's preparation ceiling is refused");
         check(!why.empty(), "the refusal carries a reason");
         check_eq(store.ram_held_bytes(), held, "a refused workspace allocates nothing");
@@ -2582,7 +2614,7 @@ void check_writer_workspace() {
         request.request_id = 3;
         request.generation = 1;
         std::string why;
-        check(store.publish(image, request, why), "a publication with a fault ahead of it is admitted");
+        check(store.publish(image, request, why) == kAccepted, "a publication with a fault ahead of it is admitted");
         ConversationStorePublishResult result;
         check(store.wait_publish(result, 5000), "the failed publication settles");
         check(result.status == ConversationStorePublishStatus::failed,
@@ -2627,7 +2659,7 @@ void check_writer_workspace() {
         request.request_id = 5;
         request.generation = 1;
         std::string why;
-        check(store.publish(image, request, why), "a large publication is admitted for cancellation");
+        check(store.publish(image, request, why) == kAccepted, "a large publication is admitted for cancellation");
         store.cancel_publication(5, 1);
         ConversationStorePublishResult settled;
         bool got = false;
@@ -2680,7 +2712,7 @@ void check_writer_workspace() {
         request.generation = 1;
         request.external_lease_bytes = uint64_t(leased.bytes()) * 4;   // a claim far beyond the entry itself
         std::string why;
-        check(store.publish(image, request, why), "the publication is admitted on its own lease's credit");
+        check(store.publish(image, request, why) == kAccepted, "the publication is admitted on its own lease's credit");
         check_eq(store.ram_read_budget(), floor - 1,
                  "a transferred lease is never added to the published allowance");
         check_eq(store.ram_available_bytes(), 0,
@@ -2793,7 +2825,7 @@ void check_reuse_reservation() {
         request.reuse.push_back(interval_for(donor_head));
         request.reuse.push_back(interval_for(donor_head));   // repeated: it must not be adopted twice
         std::string why;
-        check(store.publish(image, request, why), "the repeated-donor publication is admitted");
+        check(store.publish(image, request, why) == kAccepted, "the repeated-donor publication is admitted");
         ConversationStorePublishResult result;
         check(store.wait_publish(result, 5000), "the repeated-donor publication settles");
         check(result.status == ConversationStorePublishStatus::stored, "the repeated-donor publication is stored");
@@ -2812,7 +2844,7 @@ void check_reuse_reservation() {
         cover.supersedes = donor_head;
         cover.cover = true;
         cover.reuse.push_back(interval_for(donor_head));
-        check(store.publish(cover_image, cover, why),
+        check(store.publish(cover_image, cover, why) == kAccepted,
               "a cover that also names its own predecessor as a donor is admitted");
         ConversationStorePublishResult covered;
         check(store.wait_publish(covered, 5000), "the cover settles");
@@ -2928,7 +2960,7 @@ void check_catalog_headroom() {
         request.request_id = 2;
         request.generation = 2;
         std::string why;
-        check(store.publish(image, request, why), "the publication is admitted as a ticket");
+        check(store.publish(image, request, why) == kAccepted, "the publication is admitted as a ticket");
         ConversationStorePublishResult refused;
         check(store.wait_publish(refused, 5000), "the publication settles");
         check(refused.status == ConversationStorePublishStatus::refused_quota,
@@ -3011,7 +3043,7 @@ void check_catalog_headroom() {
         request.request_id = 2;
         request.generation = 2;
         std::string why;
-        check(store.publish(image, request, why), "the displacing publication is admitted");
+        check(store.publish(image, request, why) == kAccepted, "the displacing publication is admitted");
         ConversationStorePublishResult stored;
         check(store.wait_publish(stored, 5000), "the displacing publication settles");
         check(stored.status == ConversationStorePublishStatus::stored,
@@ -3055,7 +3087,7 @@ void check_commit_outcomes() {
         cover.supersedes = head.head_id;
         cover.cover = true;
         std::string why;
-        check(store.publish(image, cover, why), "the covering publication is admitted");
+        check(store.publish(image, cover, why) == kAccepted, "the covering publication is admitted");
         ConversationStorePublishResult refused;
         check(store.wait_publish(refused, 5000), "the refused commit settles");
         check(refused.status == ConversationStorePublishStatus::failed, "a refused catalog commit fails the publication");
@@ -3073,7 +3105,7 @@ void check_commit_outcomes() {
         // The store is still a working store: the same publication succeeds once the fault is gone.
         ConversationStorePublishResult retry;
         auto retry_image = std::make_shared<SavedConversation>(head_image);
-        check(store.publish(retry_image, cover, why), "the retry is admitted");
+        check(store.publish(retry_image, cover, why) == kAccepted, "the retry is admitted");
         check(store.wait_publish(retry, 5000), "the retry settles");
         check(retry.status == ConversationStorePublishStatus::replaced, "the retry replaces the predecessor");
         store.close();
@@ -3104,7 +3136,7 @@ void check_commit_outcomes() {
             request.request_id = 2;
             request.generation = 2;
             std::string why;
-            check(store.publish(image2, request, why), "the publication that will be uncertain is admitted");
+            check(store.publish(image2, request, why) == kAccepted, "the publication that will be uncertain is admitted");
             ConversationStorePublishResult uncertain;
             check(store.wait_publish(uncertain, 5000), "the uncertain publication settles");
             check(uncertain.status == ConversationStorePublishStatus::failed,
@@ -3138,7 +3170,7 @@ void check_commit_outcomes() {
             ConversationStorePublish blocked;
             blocked.request_id = 3;
             blocked.generation = 3;
-            check(!store.publish(third, blocked, why), "a faulted store admits no further publication");
+            check(store.publish(third, blocked, why) == kRefused, "a faulted store admits no further publication");
             const ConversationStoreQuery query = query_of(fixture(362, 2048), 4, 4);
             check(store.matches(query.selector, query.tokens, query.images).empty(),
                   "a faulted store answers no lookup");
@@ -3250,6 +3282,377 @@ void check_bootstrap_and_intent() {
             check(store.run_intent_active(), "the reopened store arms its own intent");
             store.close();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Admission boundaries: occupied resources against an over-cap shape
+// ---------------------------------------------------------------------------------------------------------------
+
+// The warm-publication estimate charges a donor's whole-manifest chunk bound once per *repeated* stream, never once
+// per interval: an alias that reuses many independent K/V streams at once must fit a ceiling that is not widened for
+// it.  Before the tightening, every interval added a whole-donor-manifest chunk bound, so 64 independent K/V
+// intervals reserved 64 manifests' worth of chunks and this admission was refused.
+void check_many_stream_reuse_admission() {
+    TempRoot root;
+    ConversationStoreOptions options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.metadata_bytes = uint64_t(8) << 20;   // unchanged: the ceiling is not widened for this record
+    options.chunk_bytes = 4096;
+    ConversationStore store(options);
+    if (!store.enabled()) return;
+
+    // A dense carve with a few live tokens: every K/V part is a real four-byte stream, and the geometry says the
+    // carve really holds one stream per (layer, kind) - the correction the dense-manifest tests use.
+    SavedConversation dense = hollow_fixture(4711, 0, 8);
+    dense.geometry[1] = dense.layer_hi = 4 * int64_t(dense.kv.size());
+    for (auto& layer : dense.kv) {
+        layer.cells = 4;
+        layer.k.resize(4, 12);
+        layer.v.resize(4, 13);
+    }
+    dense.live.ids.assign(4, 11);
+    dense.live.gdn.resize(4, 12);
+    dense.live.block_pos.resize(4, 13);
+    dense.live.used = 4711;
+
+    ConversationStorePublishResult seed;
+    check(publish_and_wait(store, dense, 1, 1, seed) && seed.status == ConversationStorePublishStatus::stored,
+          "the many-stream donor is stored under the unchanged ceiling");
+    if (seed.head_id == 0) {
+        store.close();
+        return;
+    }
+
+    // The outgoing image's own canonical stream table, plus one whole-stream retained prefix per K/V part: exactly the
+    // intervals a capture that kept the whole K/V head of the image it retained would claim.
+    const std::vector<ConversationStoreStreamInfo> streams = conversation_store_streams(dense);
+    std::vector<ConversationRetainedPrefix> retained;
+    uint64_t kv_streams = 0, kv_bytes = 0;
+    for (const auto& info : streams) {
+        if (!conversation_store_kv_kind(info.id.kind) || info.bytes == 0) continue;
+        ConversationRetainedPrefix part;
+        part.stage = info.id.stage;
+        part.layer = uint32_t(info.id.ordinal);
+        part.part = uint32_t(info.id.kind - uint16_t(ConversationStoreStreamKind::kv_k));
+        part.bytes = info.bytes;
+        part.donor_bytes = info.bytes;
+        retained.push_back(part);
+        ++kv_streams;
+        kv_bytes += info.bytes;
+    }
+    const std::vector<ConversationStoreReuse> intervals = conversation_store_reuse_intervals(
+        streams, retained, seed.head_id, store.epoch(), store.epoch(), uint64_t(4096));
+    check(kv_streams >= 64, "the dense carve carries many independent K/V streams");
+    check_eq(uint64_t(intervals.size()), kv_streams,
+             "every independent K/V stream is offered as one whole-stream interval");
+    check(intervals.size() > 1, "the reuse spans independent streams rather than repeats of a single one");
+    {
+        std::vector<ConversationStoreStreamId> distinct;
+        for (const auto& interval : intervals) {
+            bool seen = false;
+            for (const auto& id : distinct) seen = seen || (id == interval.stream);
+            if (!seen) distinct.push_back(interval.stream);
+        }
+        check_eq(uint64_t(distinct.size()), uint64_t(intervals.size()),
+                 "no interval repeats another interval's own stream");
+    }
+
+    // A newer immutable alias of the same bytes: it covers the head it came from, adopts every K/V stream, and must be
+    // admitted under the ceiling that was never widened for it.
+    auto image = std::make_shared<SavedConversation>(dense);
+    ConversationStorePublish request;
+    request.request_id = 2;
+    request.generation = 2;
+    request.supersedes = seed.head_id;
+    request.cover = true;
+    request.reuse = intervals;
+    std::string why;
+    check(store.publish(image, request, why) == kAccepted,
+          "many independent K/V reuse streams fit the unchanged preparation ceiling");
+    ConversationStorePublishResult replaced;
+    check(store.wait_publish(replaced, 5000), "the many-stream alias settles");
+    check(replaced.status == ConversationStorePublishStatus::replaced, "the alias replaces the head it covers");
+    check_eq(replaced.reused_bytes, kv_bytes, "every independent K/V stream was adopted instead of re-read");
+    check(store.counters().reused_chunks >= intervals.size(), "the adopted chunks are counted");
+    store.close();
+
+    // Byte equality across a clean reopen: what the alias wrote is the donor's own bytes, restorable from scratch.
+    {
+        ConversationStore again(options_for(root.path, uint64_t(1) << 30, 0));
+        check(again.enabled(), "the many-stream root reopens");
+        const ConversationStoreQuery query = query_of(dense, 3, 1);
+        std::string reopened_why;
+        check(again.demand(query, reopened_why), "the many-stream record is demanded after a reopen");
+        ConversationStoreRead read;
+        check(again.wait_ready(3, 1, read, 5000), "the many-stream demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "the many-stream record restores");
+        check(read.image != nullptr, "the restored many-stream image is handed out");
+        if (read.image) {
+            std::string diff;
+            check(images_equal(*read.image, dense, diff),
+                  "the restored many-stream image is byte-identical to the fixture");
+        }
+        again.release_read(3, 1);
+        again.close();
+    }
+}
+
+// A donor's chunk bound is charged for every time a stream can name the same chunk again, and never multiplied by
+// streams that are independent: the tightening may not be so deep that a repeated interval references chunks nothing
+// reserved, and it may not charge one manifest per stream either.
+void check_reuse_multiplicity_reservation() {
+    const SavedConversation base = fixture(321, 2048);
+    const SavedConversation grown = appended_turn(base, 3072, 321);
+    ConversationStoreOptions shape = options_for("/unused", uint64_t(1) << 30, 0);
+    shape.chunk_bytes = uint64_t(1) << 20;   // far coarser than the donor's own grid
+    const uint64_t donor_stream_bytes = uint64_t(base.live.ids.size()) * sizeof(int32_t);
+    const uint16_t ids_kind = uint16_t(ConversationStoreStreamKind::ids);
+    const uint16_t kv_k_kind = uint16_t(ConversationStoreStreamKind::kv_k);
+    // `streams` names one interval per entry: repeating a kind repeats the stream, while one entry per K/V ordinal
+    // names that many independent streams of the same family.
+    const auto intervals_on = [&](const std::vector<std::pair<uint16_t, uint64_t>>& streams) {
+        return [&, streams](ConversationStore& store) {
+            ConversationStorePublishResult stored;
+            check(publish_and_wait(store, base, 1, 1, stored) && stored.status == ConversationStorePublishStatus::stored,
+                  "the multiplicity donor is stored");
+            ConversationStorePublish request;
+            request.request_id = 2;
+            request.generation = 2;
+            for (const auto& named : streams) {
+                ConversationStoreReuse interval;
+                interval.head_id = stored.head_id;
+                interval.stream = ConversationStoreStreamId{0, named.first, 0, named.second};
+                interval.bytes = donor_stream_bytes;
+                request.reuse.push_back(interval);
+            }
+            return request;
+        };
+    };
+    const auto one = intervals_on({{ids_kind, 0}});
+    const auto four_repeats = intervals_on({{ids_kind, 0}, {ids_kind, 0}, {ids_kind, 0}, {ids_kind, 0}});
+    const auto four_streams = intervals_on({{kv_k_kind, 0}, {kv_k_kind, 1}, {kv_k_kind, 2}, {kv_k_kind, 3}});
+    const uint64_t high = uint64_t(8) << 20;
+    const uint64_t single_floor = publication_admission_floor(shape, grown, one, high);
+    const uint64_t repeats_floor = publication_admission_floor(shape, grown, four_repeats, high);
+    const uint64_t streams_floor = publication_admission_floor(shape, grown, four_streams, high);
+
+    check(repeats_floor > single_floor, "a repeated same-stream interval is charged again, not counted once");
+    check(repeats_floor > streams_floor, "independent streams of one donor are not multiplied by the donor's manifest");
+    check(publication_is_admitted(shape, grown, four_repeats, repeats_floor),
+          "the repeated-interval publication is admitted at exactly its counted peak");
+    check(!publication_is_admitted(shape, grown, four_repeats, repeats_floor - 1),
+          "one byte below the repeated-interval peak is refused");
+    check(publication_is_admitted(shape, grown, four_streams, streams_floor),
+          "the independent-stream publication is admitted at exactly its counted peak");
+    check(!publication_is_admitted(shape, grown, four_streams, streams_floor - 1),
+          "one byte below the independent-stream peak is refused");
+}
+
+// A ready but unhanded speculative image yields its bytes to a required publication; a demanded, handed-out image is
+// the caller's and is never refunded to make room for one.
+void check_ready_speculation_yields() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation large = fixture(331, 131072);
+    const SavedConversation small = fixture(332, 4096);
+    ConversationStorePublishResult stored;
+    check(publish_and_wait(store, large, 1, 1, stored) && stored.status == ConversationStorePublishStatus::stored,
+          "the speculation-versus-publication branch is stored");
+    std::string why;
+
+    // A materialized speculation holds a real lease; the allowance is then lowered *under* it (which never revokes
+    // admitted work), so a publication now has to fit beside bytes this store may free only by revoking speculation.
+    check(store.prefetch(query_of(large, 401, 1), why), "the speculative read is admitted under a generous allowance");
+    check(await_status(store, 401, 1, ConversationStoreReadStatus::ready), "the speculative image materializes");
+    check(store.ram_lease_bytes() > 0, "the unhanded speculation holds a lease");
+    store.publish_read_allowance(uint64_t(8) << 20);
+    check(store.ram_lease_bytes() > 0, "a lowered allowance never revokes work the store already admitted");
+
+    auto image = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish request;
+    request.request_id = 402;
+    request.generation = 1;
+    check(store.publish(image, request, why) == kAccepted,
+          "a ready speculation yields its bytes to a required publication");
+    check_eq(store.ram_lease_bytes(), 0, "the yielded speculation is refunded in full");
+    check(store.request_status(401, 1) == ConversationStoreReadStatus::cancelled,
+          "the unhanded speculation is revoked rather than served");
+    ConversationStorePublishResult settled;
+    check(store.wait_publish(settled, 5000), "the publication that displaced speculation settles");
+    check(settled.status == ConversationStorePublishStatus::stored, "the displacing publication is stored");
+
+    // The same completion, adopted as demand and handed out, is not speculation: its lease survives the attempt and
+    // the publication is deferred instead of being paid for with the caller's bytes.
+    check_eq(store.publish_read_allowance(uint64_t(64) << 20), uint64_t(64) << 20,
+             "the allowance is restored for the second probe");
+    check(store.prefetch(query_of(large, 403, 1), why), "a second speculative read starts under the allowance again");
+    check(await_status(store, 403, 1, ConversationStoreReadStatus::ready), "the second speculative image materializes");
+    check(store.demand(query_of(large, 403, 1), why), "the demand adopts the completed speculation");
+    ConversationStoreRead read;
+    check(store.wait_ready(403, 1, read, 5000) && read.image != nullptr, "the adopted demand is handed out");
+    const uint64_t leased = store.ram_lease_bytes();
+    check(leased > 0, "the handed-out image is charged to its caller");
+    store.publish_read_allowance(uint64_t(8) << 20);
+    auto second = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish blocked;
+    blocked.request_id = 404;
+    blocked.generation = 1;
+    check(store.publish(second, blocked, why) == kDeferred,
+          "a handed-out image defers a publication instead of being refunded for it");
+    check(store.counters().deferred_publishes > 0, "the deferral is counted");
+    check_eq(store.ram_lease_bytes(), leased, "the handed-out lease survives the deferred publication");
+    check(store.request_status(403, 1) == ConversationStoreReadStatus::ready,
+          "the handed-out read keeps its verdict and its image");
+    read.image.reset();
+    store.release_read(403, 1);
+    check_eq(store.ram_lease_bytes(), 0, "only the caller's release ends the lease");
+
+    auto third = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish after;
+    after.request_id = 405;
+    after.generation = 2;
+    check(store.publish(third, after, why) == kAccepted,
+          "the same publication is admitted once the caller releases the lease");
+    ConversationStorePublishResult released;
+    check(store.wait_publish(released, 5000), "the deferred-then-admitted publication settles");
+    check(released.status == ConversationStorePublishStatus::stored, "the deferred-then-admitted publication is stored");
+    store.close();
+}
+
+// A worker that is still materializing keeps every byte it reserved - its RAM peak and the preparation it holds -
+// until it settles, and a publication that cannot fit beside it is deferred rather than served by refunding it.
+void check_active_reader_defers_publication() {
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false, open = false, timed_out = false;
+    } gate;
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.max_read_requests = 3;
+    ConversationStore store(options);
+    const SavedConversation large = fixture(341, 131072);
+    const SavedConversation small = fixture(342, 4096);
+    ConversationStorePublishResult stored;
+    check(publish_and_wait(store, large, 1, 1, stored) && stored.status == ConversationStorePublishStatus::stored,
+          "the active-reader branch is stored");
+    if (stored.head_id == 0) {
+        store.close();
+        return;
+    }
+    store.set_read_gate_for_test([](void* context) {
+        auto& state = *static_cast<Gate*>(context);
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.entered = true;
+        state.cv.notify_all();
+        if (!state.cv.wait_for(lock, std::chrono::seconds(5), [&] { return state.open; })) state.timed_out = true;
+    }, &gate);
+    std::string why;
+    check(store.demand(query_of(large, 501, 1), why), "the demand starts and reserves its whole peak");
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        check(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.entered; }),
+              "the real reader holds its reservation before any publication is offered");
+    }
+    const uint64_t resident = store.ram_held_bytes();
+    check(resident > 0, "the running worker's reservation is charged");
+
+    // The allowance is lowered *under* the running worker, which keeps every byte it reserved and keeps working.
+    store.publish_read_allowance(uint64_t(8) << 20);
+    check_eq(store.ram_held_bytes(), resident, "a lowered allowance never revokes a running worker");
+    auto image = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish request;
+    request.request_id = 502;
+    request.generation = 1;
+    check(store.publish(image, request, why) == kDeferred,
+          "a running worker defers a publication until it settles");
+    check(store.counters().deferred_publishes > 0, "the deferral is counted");
+    check_eq(store.ram_held_bytes(), resident, "the deferred publication leaves the worker's reservation charged");
+    check(store.request_status(501, 1) == ConversationStoreReadStatus::none,
+          "the deferred publication neither cancels the worker nor gives it a verdict");
+    check(!store.writer_busy(), "a deferred publication never becomes the writer's work");
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        gate.open = true;
+    }
+    gate.cv.notify_all();
+
+    ConversationStoreRead read;
+    check(store.wait_ready(501, 1, read, 5000) && read.image != nullptr, "the worker completes and hands out its image");
+    check(store.ram_lease_bytes() > 0, "the completed image is the caller's lease");
+    auto second = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish again;
+    again.request_id = 503;
+    again.generation = 2;
+    check(store.publish(second, again, why) == kDeferred,
+          "a handed-out lease defers the publication until the caller releases it");
+    check(store.ram_lease_bytes() > 0, "the handed-out lease survives the deferral");
+    read.image.reset();
+    store.release_read(501, 1);
+
+    auto third = std::make_shared<SavedConversation>(small);
+    ConversationStorePublish admitted;
+    admitted.request_id = 504;
+    admitted.generation = 3;
+    check(store.publish(third, admitted, why) == kAccepted, "the publication is admitted once the reader is released");
+    ConversationStorePublishResult result;
+    check(store.wait_publish(result, 5000), "the deferred-then-admitted publication settles");
+    check(result.status == ConversationStorePublishStatus::stored, "it is stored");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    store.close();
+    check(!gate.timed_out, "the worker gate was released explicitly, not by timeout");
+}
+
+// The other half of the classification: a shape that can never fit is refused - at exactly one byte below its counted
+// peak, with no allowance published, and under the preparation ceiling - and never reported as a deferral.
+void check_permanent_admission_boundaries() {
+    const ConversationStoreOptions shape = options_for("/unused", uint64_t(1) << 30, 0);
+    const auto fresh_branch = [](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = 1;
+        request.generation = 1;
+        return request;
+    };
+    const SavedConversation image = fixture(351, 4096);
+    const uint64_t floor = publication_admission_floor(shape, image, fresh_branch, uint64_t(16) << 20);
+    check(publication_admission_probe(shape, image, fresh_branch, floor) == kAccepted,
+          "the publication is admitted at exactly its counted peak");
+    check(publication_admission_probe(shape, image, fresh_branch, floor - 1) == kRefused,
+          "one byte below the counted peak is a permanent refusal, never a deferral");
+    check(publication_admission_probe(shape, image, fresh_branch, 0) == kRefused,
+          "no published allowance is a permanent refusal");
+
+    // A transferred lease widens one ticket's own fit and nothing else: it admits the same publication at one byte
+    // below the plain floor, and a claim larger than the image is clamped so a one-byte allowance still refuses.
+    const auto with_credit = [&](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = 1;
+        request.generation = 1;
+        request.external_lease_bytes = uint64_t(image.bytes());
+        return request;
+    };
+    check(publication_admission_probe(shape, image, with_credit, floor - 1) == kAccepted,
+          "the entry's own lease credit admits the publication at one byte below the plain floor");
+    check(publication_admission_probe(shape, image, with_credit, 1) == kRefused,
+          "a credit larger than the image is clamped, so a one-byte allowance still refuses");
+
+    // The preparation ceiling is the other permanent bound: a workspace it cannot hold is refused, not deferred.
+    {
+        TempRoot root;
+        ConversationStoreOptions options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.metadata_bytes = uint64_t(4) << 10;
+        ConversationStore store(options);
+        check(store.enabled(), "a store opens with a four-kilobyte preparation ceiling");
+        auto candidate = std::make_shared<SavedConversation>(hollow_fixture(352, 64, 2));
+        ConversationStorePublish request;
+        request.request_id = 1;
+        request.generation = 1;
+        std::string why;
+        check(store.publish(candidate, request, why) == kRefused,
+              "a workspace larger than the preparation ceiling is refused, never deferred");
+        check(store.counters().refused_limits > 0, "the permanent refusal is counted as a limit refusal");
+        check_eq(store.counters().deferred_publishes, 0, "a permanent refusal is never counted as a deferral");
+        store.close();
     }
 }
 

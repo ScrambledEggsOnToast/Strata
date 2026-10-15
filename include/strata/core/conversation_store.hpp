@@ -349,9 +349,11 @@ struct ConversationStorePublish {
     // The store fits this one publication against `ram_read_budget() + external_lease_bytes - what it already holds`;
     // it never grants the credit to read admission, and it still charges the full image *and* its whole counted
     // writer workspace, so a transferred lease can never become a second shared allowance.
-    // Caller contract: on a successful admission the caller MUST release its matching lease and republish the
-    // allowance (the store now owns the bytes); when the publication is refused or a ticket settles as anything but
-    // stored/replaced/retained_branch, the caller MUST keep its lease.  The store clamps the figure to the image's
+    // Caller contract, decided at *admission* (see ConversationStorePublishAdmission): an `accepted` image transfers
+    // its accounting to this store at that instant, so the caller MUST release its matching lease and republish the
+    // allowance straight away - whatever the attempt later settles as, because the store charges the whole image from
+    // then on.  A `deferred` or `refused` image transfers nothing: the caller MUST keep both its image and its lease,
+    // and a deferred one may be offered again unchanged at a later seam.  The store clamps the figure to the image's
     // own size, so a caller can never claim more credit than the bytes it is handing over, and a publication whose
     // actual counted peak does not fit is refused before any payload is allocated.
     uint64_t external_lease_bytes = 0;
@@ -375,6 +377,24 @@ enum class ConversationStorePublishStatus : uint8_t {
 };
 
 const char* conversation_store_publish_status_name(ConversationStorePublishStatus status);
+
+// What one publish() call decided about the caller's image and its lease.  The split is the difference between
+// resources that are *occupied* and a shape that is *over cap*:
+//   accepted  the counted peak fits an envelope whose only occupants are work this store may not free, so the image
+//             was admitted: the store owns the image's accounting from this instant (the caller releases its lease),
+//             and the eventual outcome of the attempt is reported by take_publish()/wait_publish().
+//   deferred  the counted peak fits the allowance and the preparation ceiling on its own, but resources that are
+//             occupied right now - an active reader's reservation, a handed-out or demanded image's lease, a
+//             publication in flight - keep it out, and nothing this store may free is left to revoke.  Nothing was
+//             allocated, charged or transferred: the caller keeps its image and its lease and may offer the same
+//             publication again later.  A deferral is not an attempt.
+//   refused   the image is refused on its own terms: it is not representable under this profile's figures, its
+//             counted peak (image plus writer workspace) can never fit the published allowance or the preparation
+//             ceiling, another branch is already admitted, or this store is not serving.  Offering the same image
+//             again cannot change that.
+enum class ConversationStorePublishAdmission : uint8_t { accepted = 0, deferred = 1, refused = 2 };
+
+const char* conversation_store_publish_admission_name(ConversationStorePublishAdmission admission);
 
 struct ConversationStorePublishResult {
     ConversationStorePublishStatus status = ConversationStorePublishStatus::disabled;
@@ -407,6 +427,7 @@ struct ConversationStoreCounters {
     uint64_t bytes_written = 0, bytes_read = 0, peak_bytes = 0;
     uint64_t orphan_bytes = 0, pending_delete_bytes = 0, corrupt_records = 0, epoch_advances = 0;
     uint64_t refusals_stale = 0, refusals_busy = 0, refusals_floor = 0, refusals_quota = 0;
+    uint64_t deferred_publishes = 0;   // admissions held back by occupied resources (see publish())
     uint64_t lock_conflicts = 0, aborted_publications = 0, recovered_orphans = 0;
 };
 
@@ -490,9 +511,11 @@ public:
     bool manifest_streams(uint64_t head_id, std::vector<ConversationStoreStreamInfo>& out) const;
 
     // --- reads --------------------------------------------------------------------------------------------
-    // demand: required by a request that will consume a slot; admit it when its whole peak fits the published
-    //   allowance (or when no allowance is published yet, in which case it waits).  When it can never fit it is
-    //   refused immediately as refused_budget, so the caller falls back to its ordinary prefill.
+    // demand: required by a request that will consume a slot; admit its whole peak against the published allowance
+    //   *together with every other byte the store holds* - the index, the live descriptors' own copies, the admitted
+    //   reads' decode preparation and any diagnostic decode - or, when no allowance is published yet, let it wait.
+    //   When it can never fit it is refused immediately as refused_budget, so the caller falls back to its ordinary
+    //   prefill.
     // prefetch: optional, only admitted while spare allowance exists, never overtaking a demand, and refused (never
     //   left pending) when the allowance has no room for it.
     // Both select the longest exact authorized prefix themselves, deduplicate by (request_id, generation), enforce
@@ -545,15 +568,21 @@ public:
     // keeps its own.  One admitted writer image at a time, and it is admitted against the published RAM allowance
     // exactly like a read: the image *and* the bounded writer workspace this attempt will allocate (its copied
     // request, layout, prefix chains, parent/donor decode, chunk vectors and scratch, object/orphan records, encoded
-    // manifest and catalog copy) must both fit, and a ticket that cannot fit is refused (refused_limits) instead of
-    // overrunning the envelope or the metadata sub-cap.  While the writer is busy, a new publication is admitted only
+    // manifest and catalog copy) must both fit the envelope, and the workspace must also fit the preparation ceiling
+    // beside the index, the live read descriptors' own copies and any diagnostic decode.  Admission is classified
+    // (see ConversationStorePublishAdmission): `accepted` when the counted peak fits an envelope whose only occupants
+    // are work this store may not free, `deferred` when it fits that envelope on its own but resources occupied right
+    // now keep it out - after every *speculative* read that may be revoked has been revoked and the admission retried
+    // under the same lock (an active worker, a demand and a handed-out image are never revoked: their charges are
+    // released only when they settle) - and `refused` when the shape itself can never fit, another branch is already
+    // admitted, or this store is not serving.  While the writer is busy, a new publication is admitted only
     // when it is proven to be the *same lineage* as the one in flight (both carry `cover` for the same nonzero
     // `supersedes` and this one is the newer generation): it then
     // replaces it, and the replaced request's result is reported as `coalesced`.  A different branch - including a
     // second new branch - is never coalesced: it is refused as `refused_busy`, the in-flight predecessor is left
     // untouched and the newer, optional store is dropped as a safe miss.  The call returns immediately.
-    bool publish(std::shared_ptr<const SavedConversation> image, const ConversationStorePublish& request,
-                 std::string& why);
+    ConversationStorePublishAdmission publish(std::shared_ptr<const SavedConversation> image,
+                                              const ConversationStorePublish& request, std::string& why);
     // Cancel only a not-yet-started publication, never a read with coincident identifiers.
     void cancel_publication(uint64_t request_id, uint64_t generation);
     bool take_publish(ConversationStorePublishResult& out);
@@ -564,11 +593,16 @@ public:
     // Two authoritative numbers in two scopes that must never be mixed: a caller neither subtracts the shared disk
     // quota from a RAM envelope, nor treats a RAM lease as free disk.
     //   ram_held_bytes()       every byte this module currently owns in host memory *or has committed to
-    //                          allocating*: index metadata, bounded preparation/descriptors, the full peak of every
-    //                          read that has begun allocating, materialized read images, the shared image of an
-    //                          in-flight publication, and I/O scratch.  No allocation is ever made that this figure
-    //                          did not already include, and the figure never exceeds the published allowance (a read
-    //                          or publication that cannot fit is refused instead of overrunning it).
+    //                          allocating*: index metadata, bounded preparation and read descriptors, diagnostic
+    //                          decode workspace, the full peak of every read that has begun allocating, materialized
+    //                          read images, the shared image of an in-flight publication, and I/O scratch.  No
+    //                          allocation is ever made that this figure did not already include, and a read or a
+    //                          publication whose counted peak cannot fit is refused or deferred instead of overrunning
+    //                          the allowance.  The figure stays inside the published allowance except in the two
+    //                          documented cases: a caller that lowers the allowance under admitted work (see
+    //                          publish_read_allowance(), which never revokes what is already admitted), and a
+    //                          publication admitted on its own transferred-image credit (`external_lease_bytes`),
+    //                          which widens that one ticket's fit and nothing else.
     //   ram_lease_bytes()      the handed-out share of it: a read image returned by take_ready()/wait_ready() and not
     //                          yet released, plus the publication image alias.  Charge this to your own envelope; the
     //                          module will not hand those bytes to another read, and never refunds them on its own.
