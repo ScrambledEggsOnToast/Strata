@@ -1,6 +1,5 @@
 // Execute generate.cpp's complete read_part lambda on the CPU with the real batch_read_piece and TimeBudget.
-// Only GPU work, the clock and the conversation store are synthetic. This proves control-flow reachability,
-// not device/state exactness.
+// Only GPU work and the clock are synthetic. This proves control-flow reachability, not device/state exactness.
 #include "strata/program/batch_read.hpp"
 #include "strata/program/time_budget.hpp"
 #include "strata/program/serve_controls.hpp"
@@ -27,7 +26,12 @@ struct Clock {
 
 struct ConvCheckpoint { std::vector<int32_t> ids; };
 namespace strata::program {
-struct ResidentAdmission { int unused; const ConvCheckpoint* checkpoint; };
+struct ResidentAdmission {
+    int32_t next_token = 0;
+    const std::vector<ConvCheckpoint>* checkpoints = nullptr;
+    const float* residual = nullptr;
+    int64_t checkpoint_limit = -1;
+};
 }
 // The narrow parking sink records the production lambda's chosen frontier;
 // device transfers and slot ownership are exercised by the real-model probe.
@@ -54,9 +58,6 @@ struct Result {
     bool okay = false, fatal = false;
     int drains = 0;
     std::string error;
-    // The synthetic store: handovers the read performed, publications that then finished, captures still waiting.
-    int64_t store_seams = 0, store_published = 0;
-    size_t store_queued = 0;
 };
 
 // Inject Prefill's terminal outcome at the existing read_part seam. This
@@ -94,8 +95,7 @@ inline void progress_at(const char*) {}
 
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
                           const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
-                          double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1,
-                          size_t queued_captures = 0) {
+                          double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1) {
     Clock::ms = 0;
     Result result;
     const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
@@ -165,22 +165,8 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     struct Slot { bool failed = false; };
     const std::vector<Slot> bs(4);
 
-    // The store's side of a handover, reduced to the part the seam must do: exactly one publication is admitted at a
-    // time, the writer finishes within one prefill chunk (a chunk is seconds of GPU work, a publication is the same
-    // order), and nothing starts the next one until this thread's pump hands it over.  `queued_captures` is the
-    // backlog a serving run accumulates; without a seam it would only leave the queue when a request boundary came.
-    struct StoreSink {
-        size_t queued = 0;
-        bool busy = false;
-        int64_t seams = 0, published = 0;
-        void pump() {
-            ++seams;
-            if (busy) { busy = false; ++published; }   // the admitted publication finished before this seam
-            if (queued) { --queued; busy = true; }     // and the oldest capture is handed over now
-        }
-    } store;
-    store.queued = queued_captures;
-    const auto store_seam = [&] { store.pump(); };
+    // Disk publication is exercised by the real-engine persistence qualification, not this scheduling fixture.
+    const auto store_seam = [] {};
 
     // CMake extracts this verbatim from generate.cpp and regenerates it whenever that source changes.
 #include "prefill_read_part.inc"
@@ -189,9 +175,6 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.okay = read_part(0, n, e);
     result.fatal = batch_fatal;
     result.error = e;
-    result.store_seams = store.seams;
-    result.store_published = store.published;
-    result.store_queued = store.queued;
     if (!retained_prefill && !expects_yield &&
         (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
         throw std::runtime_error("read_part did not finish: " + e);
@@ -278,25 +261,6 @@ int main() {
     CHECK(!failed_drain.okay && failed_drain.fatal && failed_drain.error == "descendant drain failed" && failed_drain.drains == 1);
     const auto retained = read_prompt(0, true, true, true, 4, "");
     CHECK(retained.okay && !retained.fatal && retained.error.empty() && retained.drains == 1 && retained.reads == chunks);
-    // A capture the engine already paid for waits for the store's one admitted writer, and only a seam starts the
-    // next publication: a queued backlog must advance once per prefill chunk.  Before the chunk loop pumped, a
-    // backlog of 6 stayed at 6 through a whole 8-21 s prompt read (the writer idle), and the leftovers reached
-    // shutdown; the pump is now reached once per chunk, hands one capture over each time, and reaps the writer's
-    // completion at the next one.
-    for (bool piped : {false, true}) {
-        const auto backlog = read_prompt(1000, piped, true, true, 4, nullptr, true, 10000, 1200, false, -1, 6);
-        CHECK(backlog.store_seams == (int64_t) backlog.reads.size());   // one handover per chunk, none inside one
-        CHECK(backlog.store_seams > 1);
-        CHECK(backlog.store_queued == (size_t) std::max<int64_t>(0, 6 - backlog.store_seams));
-        CHECK(backlog.store_published == std::min<int64_t>(6, backlog.store_seams) - 1);   // the writer is kept busy
-    }
-    // The retained (peer-expert) read pumps at its own 2048-token boundaries, which are the only seams it has.
-    const auto retained_backlog = read_prompt(0, true, true, true, 4, "", true, 10000, 0, false, -1, 3);
-    CHECK(retained_backlog.store_seams == (int64_t) retained_backlog.reads.size());
-    CHECK(retained_backlog.store_queued == 0 && retained_backlog.store_published == 3);
-    // Nothing queued: the seams still run, and no publication is invented for a writer with nothing to write.
-    const auto cold = read_prompt(1000, true, true, true, 4, nullptr, true, 10000, 1200);
-    CHECK(cold.store_seams == (int64_t) cold.reads.size() && cold.store_published == 0 && cold.store_queued == 0);
     if (fails == 0) std::printf("prefill_interleave_test: ok (positive piped: prefill/decode/prefill; zero: legacy)\n");
     return fails == 0 ? 0 : 1;
 }

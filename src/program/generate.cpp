@@ -11428,26 +11428,14 @@ int main(int argc, char** argv) {
                 break;
             }
         };
-        // ---- store handover seams (this thread only) -------------------------------
-        // The store admits exactly one image at a time (ConversationStore::writer_busy) and starts the next one only
-        // when the engine hands it over, so a capture the engine already paid for waits in store_queue until a seam
-        // calls flush_publishes.  Request boundaries alone are not enough seams: a prompt read runs 8-21 s of chunks
-        // with no boundary in it, a batch of slots decodes for as long as it is admitted, and an idle engine waits
-        // for a command - in all three the queue used to sit still while the writer had nothing to write, which is
-        // what left queued and outstanding publications at shutdown.  Every long main-thread stretch therefore pumps:
-        // this is the same CPU-only, non-blocking allowance + flush_publishes(0) pair every existing seam performs,
-        // so no capture, no GPU state, no admission or priority change, and every bound is unchanged - the queue
-        // ceiling (kQueuedPublishes), the writer's own pending slots (kPendingPublishes), the image leases, the
-        // capture-epoch check, the bounded retries and the 8 s shutdown drain.
-        // Two whole-prompt reads keep the previous once-per-request handover: the no-slot bypass (batch <= 0) and a
-        // layer split with no time budget read the prompt in one `sp.run`, whose only per-chunk callback runs on a
-        // stage's worker thread - the cache's leases and every owner lineage belong to this thread, so they are never
-        // pumped from there.
+        // Only this thread may release capture leases and update owner lineages. Pump at
+        // chunk/decode/idle boundaries: the writer cannot consume store_queue on its own.
+        // Do not use sp.on_chunk, which can run on a successor stage's worker thread.
+        // Whole-prompt bypasses still hand over work only at request boundaries.
         const std::thread::id store_seam_thread = std::this_thread::get_id();
         auto store_seam = [&]() {
-            // A layer split's prefill callback can run on a stage's worker thread: the cache's leases and every owner
-            // lineage belong to this thread, and another thread must never touch them here.
             if (std::this_thread::get_id() != store_seam_thread) return;
+            if (!store_on || (store_queue.empty() && pending_publishes.empty())) return;
             store_allowance();
             flush_publishes(0);
         };
@@ -13298,12 +13286,8 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
-        // Waiting for the next command is the only place this thread has nothing else to do, so it is the seam where a
-        // capture the engine already paid for can be handed over without delaying anything.  A line still wakes this
-        // wait immediately - the store never holds a request back - and the wait only becomes periodic while the store
-        // still holds queued or outstanding work (the same predicate the shutdown drain uses) and for the same bounded
-        // 250 ms it waits on: an engine with nothing to publish sleeps exactly as it did before, and the queue drains
-        // for as long as it takes rather than waiting for the next request to arrive.
+        // Wake for commands immediately; poll completed publications only while storage work remains.
+        // Release the input mutex before handover, which can prepare metadata but never waits for the writer.
         constexpr uint64_t kIdleHandoverMs = 250;
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
@@ -13316,7 +13300,7 @@ int main(int argc, char** argv) {
                     in_cv.wait(lk, [&] { return line_ready() || store_holds_work(); });
                     continue;
                 }
-                lk.unlock();            // the pump is this thread's, and it never blocks
+                lk.unlock();
                 store_seam();           // reap what the writer finished, hand over the oldest queued capture
                 lk.lock();
                 if (line_ready()) break;
