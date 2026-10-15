@@ -106,15 +106,19 @@ struct ImageLayout {
 ConversationStoreLimits unconstrained_limits();
 
 // The limits a *retained* record must satisfy: the figures under which a record this run did not write may still be
-// kept on disk and indexed for the shared physical ledger.  Derived from the one shared quota and the format's own
-// structural ceilings, never narrower than `configured` (a run always keeps what it can itself create) and bounded
-// rather than unbounded: no parsing ceiling is relaxed (the manifest, container and stream caps stay exactly as
-// configured, and every count is still checked against the bytes left in the file), the byte figures are bounded by
-// the quota every layout is charged to, and the per-element counts by what a file within the configured ceilings
-// could encode.  The recovery, index and planner paths decode with these; every read and every publication is
-// admitted against `configured` itself, and a record a run may not serve is refused there rather than discarded here.
-ConversationStoreLimits retention_limits(const ConversationStoreOptions& options,
-                                        const ConversationStoreLimits& configured);
+// kept on disk and indexed for the shared physical ledger.  Derived from the format's own representability bounds and
+// the configured parsing ceilings, never from this run's admitted capacity and never from the physical quota:
+// identical chunks share one physical object, so a sound record's logical bytes can exceed the whole quota, and a
+// quota or profile reduction must never turn it into corruption.  The byte figures and the token ceiling come from
+// the widest record a manifest within the configured manifest ceiling could declare (its encoded chunks times the
+// widest chunk its own length field can carry, saturating rather than wrapping), the stage depth from the format's
+// structural ceiling, and each per-element count from what such a manifest could encode at all.  The derived set is
+// never narrower than `configured` (a run always keeps what it can itself create) and never wider than the format:
+// no parsing ceiling is relaxed (the manifest ceiling stays exactly as configured and every count is still checked
+// against the bytes left in the file).  Recovery, the index and the planner paths decode with these; every read and
+// every publication is admitted against `configured` itself, and a record a run may not serve is refused there rather
+// than discarded here.  The physical quota is enforced against the unique files the ledger charges, at admission.
+ConversationStoreLimits retention_limits(const ConversationStoreLimits& configured);
 
 // Canonical container/stream/cut enumeration of one image tree.  Fails (with a reason) on anything the format cannot
 // represent exactly: a stage deeper than one level, a record's own parts having parts, duplicate stream identities,
@@ -196,6 +200,11 @@ Digest manifest_id_of(const uint8_t* bytes, size_t size);
 // Verifies the trailing digest and every bounded count before returning the decoded metadata.
 bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreLimits& limits, ManifestMeta& out,
                      std::string& why);
+// Whether already-decoded metadata satisfies these figures at all: the same structural and capacity predicate the
+// decoder applies, exposed so metadata decoded under the wider retention figures can be classified against this run's
+// admitted ones without decoding the file a second time.  A record this predicate refuses while the retention figures
+// accept is one this run cannot serve: refused capacity, never a defect in the record.
+bool manifest_within_limits(const ManifestMeta& meta, const ConversationStoreLimits& limits, std::string& why);
 std::vector<ConversationStoreStreamInfo> manifest_stream_infos(const ManifestMeta& meta);
 
 // The exact encoded size of a manifest with these counts, and of a manifest that already exists.  Exact, so the
@@ -218,6 +227,13 @@ uint64_t manifest_encoded_size(const ManifestMeta& meta);
 // vectors and the allocator's overhead.  Derived from the encoded size (whose every element is backed by at least
 // one encoded byte), so it needs no decode to compute.
 uint64_t manifest_workspace_bound(uint64_t encoded_bytes);
+
+// Everything one manifest read and decode holds at once: the raw file, the decoded metadata
+// (manifest_workspace_bound) and the two tables the consistency pass builds (one node per declared object and one
+// per declared stream).  Counted from the size the read is capped at, so it needs neither a decode nor a configured
+// maximum, and charged before a manifest is read or decoded (see ConversationStoreOptions::metadata_bytes).  A
+// caller that has already reserved this figure for the same decode must not reserve it twice.
+uint64_t manifest_read_workspace_bound(uint64_t encoded_bytes);
 
 struct CatalogHead {
     uint64_t head_id = 0;

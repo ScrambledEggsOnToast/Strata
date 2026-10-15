@@ -210,8 +210,14 @@ private:
 // never whether an existing record is kept.  A store root is shared by every profile that opens it, so records
 // captured under other figures (another stage count, another checkpoint policy, another image budget) are retained,
 // indexed and left on disk; a run that cannot serve one refuses the read or the publication (refused_limits) instead
-// of treating it as corrupt.  The retention figures are derived by the store from the one shared quota and the
-// configured ceilings, so this contract cannot be widened or narrowed by an owner by accident.
+// of treating it as corrupt - including when only `max_state_bytes` is smaller than the record's state, which is a
+// capacity figure for a state stream exactly as it is for a K/V part.  The retention figures are derived by the store
+// from the format's own representability bounds and these configured ceilings - never from the physical quota, since
+// identical chunks share one physical object and a sound record's logical bytes can therefore exceed the whole quota -
+// so this contract cannot be widened or narrowed by an owner by accident, and a change of quota or profile alone
+// never discards a valid record.  A record this run cannot even read under its own parsing ceiling or preparation
+// budget is refused by declining to serve - recovery disables persistence (the caller's cold path) and leaves the
+// catalog, every file and every charge untouched - rather than being deleted or labelled corrupt.
 struct ConversationStoreLimits {
     uint64_t max_image_bytes = uint64_t(16) << 30;
     uint64_t max_stream_bytes = uint64_t(8) << 30;

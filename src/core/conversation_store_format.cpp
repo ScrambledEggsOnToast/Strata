@@ -52,13 +52,26 @@ constexpr uint32_t kCatalogCeiling = 1u << 22;
 // admitted.  A stage part belongs to an image stage and never owns further parts, so one level of parts below the
 // image is everything the format encodes and the deepest stage index it can name is this bound.
 constexpr uint32_t kFormatMaxStages = 64;
-// The smallest encoded form of the two per-element counts a manifest carries: one checkpoint record (its token count,
-// its retained size, its pin flag and its part count) and one K/V layer's metadata (seven geometry fields and five
-// part lengths).  A manifest that fits `max_manifest_bytes` cannot hold more of either than that ceiling divided by
-// these, so they are the widest ceilings a retention read can use without accepting a count the file's own bytes do
-// not justify (Reader::count bounds every count by the bytes left in the file as well).
+// The smallest encoded form of every section a manifest carries, one figure per section, so the decoder's count
+// bounds, the retention figures and the decode's workspace all derive from the same numbers: one container (its two
+// flags, scope, record metadata, geometry and the two section counts), one checkpoint record (token count, retained
+// size, pin flag, part count), one K/V layer's metadata (seven geometry fields and five part lengths), one stream
+// (identity, length and its chunk count), one chunk (offset, length, content address), one object (its content
+// address and size) and one cut (length, digest, two flags).  A manifest that fits `max_manifest_bytes` cannot hold
+// more of a section than that ceiling divided by the section's own figure, and Reader::count bounds every count by
+// the bytes left in the file as well.  The container figure is exactly what manifest_encode() writes for the
+// shortest container, so bounding the container count by it - rather than by a looser allowance - is what lets the
+// whole workspace of a decode be counted from the encoded size alone: no section can then be charged for more
+// decoded bytes than the file spends encoding it (see manifest_workspace_bound).
+constexpr uint64_t kContainerEncodedMin = 244;
 constexpr uint64_t kCheckpointEncodedMin = 21;
 constexpr uint64_t kKvLayerEncodedMin = 96;
+constexpr uint64_t kStreamEncodedMin = 34;
+constexpr uint64_t kChunkEncodedMin = 44;
+constexpr uint64_t kObjectEncodedMin = 40;
+constexpr uint64_t kCutEncodedMin = 42;
+// The widest single chunk the format can declare: a chunk's length is a uint32 field.
+constexpr uint64_t kMaxChunkBytes = std::numeric_limits<uint32_t>::max();
 
 class Writer {
 public:
@@ -676,6 +689,16 @@ bool check_streams(const ManifestMeta& meta, const ConversationStoreLimits& limi
         }
         if (!(meta.streams[index].id == slot.id)) {
             reason = "a manifest stream does not match the canonical identity of its position";
+            return false;
+        }
+        // The state figure is a *capacity* figure, not a structural one: bind_streams() refuses a running-state array
+        // or a K/V part longer than ConversationStoreLimits::max_state_bytes, so the predicate has to apply exactly
+        // the same rule.  Otherwise a run that serves from a smaller state budget than the profile that wrote the
+        // record would read a perfectly sound record as a contradiction in itself - and recovery, which deletes what
+        // it believes is corrupt, would discard it.  It is checked here, beside every other figure that describes this
+        // run's admitted capacity, so the retention decode can classify the record as capacity it lacks instead.
+        if (slot.buffer >= Buffer::gdn && meta.streams[index].bytes > limits.max_state_bytes) {
+            reason = "a state stream is larger than ConversationStoreLimits::max_state_bytes";
             return false;
         }
         ++index;
@@ -1533,7 +1556,26 @@ uint64_t manifest_workspace_bound(uint64_t encoded_bytes) {
     // Every decoded element is at most about 1.5x the bytes that encode it (ContainerMeta 300/244, StreamRecord
     // 48/34, ChunkRecord 48/44, CutRecord 48/42) and each of its vectors carries one allocator header, at most one
     // per 21 decoded bytes in the manifest's densest section.  Twice the encoding plus a quarter covers both.
+    //
+    // This is an upper bound for *any* limits set, not only the configured one: every count the decoder accepts is
+    // bounded by Reader::count against the bytes left for that section's smallest encoded entry (kContainerEncodedMin
+    // and its siblings), so the sections' decoded bytes are bounded by the encoding times the largest element-to-entry
+    // ratio in the format - a corner where each section is charged its own maximum at once cannot arise, because the
+    // sections' own encoded bytes have to cover the whole file between them.
     return sat_add(sat_mul(encoded_bytes, 2), sat_add(encoded_bytes / 4, 2 * kAllocSlackBytes));
+}
+
+uint64_t manifest_read_workspace_bound(uint64_t encoded_bytes) {
+    // Everything one manifest read and decode holds at once: the raw file, the decoded metadata
+    // (manifest_workspace_bound) and the two tables the consistency pass builds - one kMapNodeBytes node per declared
+    // object and one per declared stream.  The tables are bounded by the encoding itself rather than by a decode: the
+    // object and stream sections are the format's densest, at kObjectEncodedMin and kStreamEncodedMin encoded bytes
+    // per entry, so no more than encoded_bytes / 34 nodes of either can exist at all; four times the encoding covers
+    // both generously (128/34 is 3.77) and no configured maximum, quota or decoded count takes part.  A caller that
+    // has already reserved this figure for the same decode (a read's whole peak, a writer's donor preparation) must
+    // not reserve it twice (see ConversationStore::Impl::load_manifest_of).
+    const uint64_t tables = sat_mul(encoded_bytes, 4);
+    return sat_add(sat_add(encoded_bytes, manifest_workspace_bound(encoded_bytes)), tables);
 }
 
 std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
@@ -1645,7 +1687,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         why = "the manifest's header is truncated";
         return false;
     }
-    if (!r.count(count, limits.max_images, 64)) {
+    if (!r.count(count, limits.max_images, kContainerEncodedMin)) {
         why = "the manifest's container count is invalid";
         return false;
     }
@@ -1718,7 +1760,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         out.containers.push_back(std::move(c));
     }
     uint32_t streams = 0;
-    if (!r.count(streams, limits.max_streams, 34)) {
+    if (!r.count(streams, limits.max_streams, kStreamEncodedMin)) {
         why = "the manifest's stream count is invalid";
         return false;
     }
@@ -1731,7 +1773,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
             return false;
         }
         uint32_t chunks = 0;
-        if (!r.count(chunks, kCatalogCeiling, 44)) {
+        if (!r.count(chunks, kCatalogCeiling, kChunkEncodedMin)) {
             why = "a manifest stream's chunk count is invalid";
             return false;
         }
@@ -1747,7 +1789,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         out.streams.push_back(std::move(stream));
     }
     uint32_t objects = 0;
-    if (!r.count(objects, kCatalogCeiling, 40)) {
+    if (!r.count(objects, kCatalogCeiling, kObjectEncodedMin)) {
         why = "the manifest's object count is invalid";
         return false;
     }
@@ -1762,7 +1804,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         out.objects.emplace_back(digest, bytes);
     }
     uint32_t cuts = 0;
-    if (!r.count(cuts, limits.max_checkpoints + 1, 42)) {
+    if (!r.count(cuts, limits.max_checkpoints + 1, kCutEncodedMin)) {
         why = "the manifest's cut count is invalid";
         return false;
     }
@@ -1786,6 +1828,13 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
     return check_manifest(out, limits, why);
 }
 
+bool manifest_within_limits(const ManifestMeta& meta, const ConversationStoreLimits& limits, std::string& why) {
+    // The same structural *and* capacity predicate the decoder applies to a record it has just decoded, asked of
+    // metadata that was decoded under the wider retention figures.  A read decodes once and classifies with this, so
+    // a record this run may not serve is refused (refused_limits) rather than decoded a second time to find that out.
+    return check_manifest(meta, limits, why);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Retention: the figures a record must satisfy to be *kept*, as opposed to the figures that decide whether a run may
 // create or serve it
@@ -1798,28 +1847,43 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
 // is answered from the configured figures and is enforced on every read and every publication.  A recovery pass that
 // mixed the two would delete a history this profile cannot read but the profile that wrote it still can.
 //
-// Retention is bounded by what is shared and physical rather than by what this run admitted:
-//   * the byte figures (image, stream and state) by the one quota every layout's bytes are charged to - a record that
-//     claims more than the whole store could hold has no bytes behind it;
-//   * the token ceiling by that same quota, because a token id is four bytes of a stream charged to it;
+// Retention is therefore bounded by what the *format* can represent, never by this run's capacity and never by the
+// physical quota:
+//   * the byte figures (image, stream and state) and the token ceiling by the widest record a manifest within the
+//     configured manifest ceiling could declare at all - its encoded chunks, times the widest chunk its own length
+//     field can carry.  A physical bound would be wrong in both directions here: identical chunks share one physical
+//     object (object_hasher() excludes the chunk's offset and the unchanging-prefix rule charges an object once), so
+//     a perfectly sound record's logical bytes may exceed the whole quota, and a quota reduction alone could then
+//     turn a retained history into corruption;
 //   * the stage depth by the format's own structural ceiling;
-//   * the two per-element counts (checkpoints and K/V layers) by what a manifest within the configured manifest
-//     ceiling could encode at all - the manifest is read under that ceiling, so nothing wider can be observed.
-// Nothing here widens a parsing ceiling: the manifest, container, stream and image caps stay exactly as configured,
-// and every count is still bounded by the bytes actually left in the file.
-ConversationStoreLimits retention_limits(const ConversationStoreOptions& options,
-                                        const ConversationStoreLimits& configured) {
+//   * every per-element count (containers, checkpoints, K/V layers and streams) by what a manifest within the
+//     configured manifest ceiling could encode at all - the manifest is read under that ceiling, so nothing wider
+//     can be observed, and a reduction of any of these is a smaller parsing ceiling for *this* run, never a reason to
+//     call a record this run did not write corrupt.
+// The physical quota is enforced where it belongs: against the unique files the store's ledger charges, at
+// admission.  No parsing ceiling is relaxed - the manifest ceiling itself stays exactly as configured and every count
+// is still bounded by the bytes actually left in the file - and the derived set is never narrower than the configured
+// one, so a run always keeps everything it could itself create.
+ConversationStoreLimits retention_limits(const ConversationStoreLimits& configured) {
     ConversationStoreLimits kept = configured;
-    const uint64_t envelope = options.quota_bytes;
-    kept.max_image_bytes = std::max(configured.max_image_bytes, envelope);
-    kept.max_stream_bytes = std::max(configured.max_stream_bytes, envelope);
-    kept.max_state_bytes = std::max(configured.max_state_bytes, envelope);
-    kept.max_tokens = std::max(configured.max_tokens, envelope / uint64_t(sizeof(int32_t)));
-    kept.max_stages = std::max(configured.max_stages, kFormatMaxStages);
+    // Every logical byte a manifest describes comes from a chunk it encodes, and within the configured manifest
+    // ceiling there can be no more than that ceiling divided by kChunkEncodedMin chunks, each at most kMaxChunkBytes
+    // long.  Their product bounds one stream's bytes, an image's whole payload and a record's token-id stream (an
+    // int32 per token), independently of every physical figure.  Saturating multiplication: a ceiling wide enough to
+    // overflow the product saturates to "no representable limit" rather than wrapping to a small one.
+    const uint64_t chunks = std::min<uint64_t>(kCatalogCeiling, configured.max_manifest_bytes / kChunkEncodedMin);
+    const uint64_t widest = sat_mul(chunks, kMaxChunkBytes);
+    kept.max_stream_bytes = std::max(configured.max_stream_bytes, widest);
+    kept.max_state_bytes = std::max(configured.max_state_bytes, widest);
+    kept.max_image_bytes = std::max(configured.max_image_bytes, widest);
+    kept.max_tokens = std::max(configured.max_tokens, widest / uint64_t(sizeof(int32_t)));
+    kept.max_stages = std::max(configured.max_stages, uint32_t(kFormatMaxStages));
+    kept.max_images = std::max(configured.max_images, encoded_ceiling(configured.max_manifest_bytes, kContainerEncodedMin));
     kept.max_checkpoints =
         std::max(configured.max_checkpoints, encoded_ceiling(configured.max_manifest_bytes, kCheckpointEncodedMin));
     kept.max_kv_layers =
         std::max(configured.max_kv_layers, encoded_ceiling(configured.max_manifest_bytes, kKvLayerEncodedMin));
+    kept.max_streams = std::max(configured.max_streams, encoded_ceiling(configured.max_manifest_bytes, kStreamEncodedMin));
     return kept;
 }
 

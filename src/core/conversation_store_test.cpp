@@ -468,6 +468,9 @@ void check_identity();
 void check_manifest();
 void check_round_trip();
 void check_profile_recovery();
+void check_dedup_beyond_the_quota();
+void check_dense_manifest_workspace_refusal();
+void check_damaged_manifest_is_still_reclaimed();
 void check_multi_stage_restore();
 void check_native_split_restore();
 void check_request_specific();
@@ -505,6 +508,9 @@ int main() {
     check_manifest();
     check_round_trip();
     check_profile_recovery();
+    check_dedup_beyond_the_quota();
+    check_dense_manifest_workspace_refusal();
+    check_damaged_manifest_is_still_reclaimed();
     check_multi_stage_restore();
     check_native_split_restore();
     check_request_specific();
@@ -1252,6 +1258,233 @@ void check_profile_recovery() {
     }
     check(file_inventory(root.path) == inventory, "the original profile's own open changed nothing");
     check(file_digest(root.path + "/catalog") == catalog_digest, "the original profile's own open rewrote no authority");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Retention: what a record's own bytes say about it, as opposed to what this run admitted or what the device holds
+// ---------------------------------------------------------------------------------------------------------------
+
+// An image whose K/V state is long runs of identical bytes.  Under a 1 MiB chunk grid every chunk of such a run has the
+// same content, so it has the same content address and the publication writes one object for all of them: the record's
+// *logical* bytes are then far larger than the bytes it costs on the device, which is exactly why a retention ceiling
+// derived from the physical quota would be wrong (see conversation_store_detail::retention_limits).
+SavedConversation repeated_state_fixture(uint64_t seed, int64_t tokens, size_t state_bytes) {
+    SavedConversation image = fixture(seed, tokens);
+    image.kv.resize(1);
+    ConversationKv& layer = image.kv[0];
+    // Two heads of eight values per cell, so both extents below are coherent with the layout the metadata declares.
+    layer.cells = int64_t(state_bytes / 16);
+    layer.heads = 2;
+    layer.head_dim = 8;
+    layer.k.resize(state_bytes, uint8_t(seed));
+    layer.v.resize(state_bytes, uint8_t(seed + 1));
+    layer.k_scale.resize(8, uint8_t(seed + 2));
+    layer.v_scale.resize(8, uint8_t(seed + 3));
+    return image;
+}
+
+// A record whose logical payload exceeds the whole physical quota is still a sound record, and the run that opens the
+// root next must keep it whatever its own admitted budget happens to be: a smaller budget refuses the read, it never
+// deletes the record.
+void check_dedup_beyond_the_quota() {
+    TempRoot root;
+    const uint64_t quota = uint64_t(4) << 20;        // the whole device allowance
+    const size_t state_bytes = size_t(3) << 20;      // three identical 1 MiB chunks in each state extent
+    const SavedConversation image = repeated_state_fixture(451, 4096, state_bytes);
+    const uint64_t payload = image_payload_bytes(image);
+    check(payload > quota, "the fixture's logical payload exceeds the whole physical quota");
+    if (payload <= quota) return;
+
+    ConversationStoreOptions options = options_for(root.path, quota, 0);
+    options.chunk_bytes = uint64_t(1) << 20;
+    // The profile that writes it serves from a budget that covers what the record declares.
+    const ConversationStoreLimits wide = profile_limits(1, 2, payload * 2);
+    uint64_t head = 0;
+    {
+        ConversationStore store(options, wide);
+        if (!store.enabled()) return;
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, image, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "a record whose logical bytes exceed the quota is published inside it");
+        head = stored.head_id;
+        check(store.disk_charged_bytes() < quota, "the record's physical charge stays inside the shared quota");
+        check(store.counters().dedup_chunks > 0, "its repeated chunks were deduplicated onto one object");
+        store.close();
+    }
+    const std::vector<std::string> inventory = file_inventory(root.path);
+    const std::string catalog_digest = file_digest(root.path + "/catalog");
+    check(head != 0 && !inventory.empty(), "the published root holds the record");
+
+    // A profile whose admitted budget is a third of the record's own: it cannot serve it, and that is all it may
+    // conclude.  A retention ceiling taken from the quota would call this record corrupt and retire it here, taking
+    // its manifest and every object only it names.
+    const ConversationStoreLimits narrow = profile_limits(1, 2, uint64_t(2) << 20);
+    check(narrow.max_image_bytes < payload, "the narrower profile's budget is below the record's payload");
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, narrow, 1);
+        if (!store->enabled()) return;
+        ConversationStoreQuery query = query_of(image, 21, 1);
+        std::string why;
+        check(store->demand(query, why), "the demand for a record beyond this profile's budget is admitted");
+        ConversationStoreRead read;
+        check(store->wait_ready(21, 1, read, 5000), "the oversized-state demand settles");
+        check(read.status == ConversationStoreReadStatus::refused_limits,
+              "a record whose logical state exceeds this run's budget is refused, never served");
+        check(read.image == nullptr, "the refused record hands out no image");
+        check_eq(store->counters().reads_corrupt, 0, "a quota-independent record is never reported as corruption");
+        check_eq(store->counters().heads, 1, "the record is still retained under the smaller budget");
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the smaller budget deleted and wrote nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the smaller budget rewrote no authority");
+
+    // Back under the profile that wrote it: the record is still there and still restores byte for byte.
+    {
+        std::unique_ptr<ConversationStore> store = open_profile(root.path, quota, wide, 1);
+        if (!store->enabled()) return;
+        ConversationStoreQuery query = query_of(image, 31, 1);
+        std::string why;
+        check(store->demand(query, why), "the writing profile's demand is admitted again");
+        ConversationStoreRead read;
+        check(store->wait_ready(31, 1, read, 5000), "the retained demand settles");
+        check(read.status == ConversationStoreReadStatus::ready,
+              "the record published inside the physical quota is served again");
+        check(read.image && images_equal(*read.image, image, why),
+              "the restored repeated-chunk image is byte-identical to the one that was published");
+        store->release_read(31, 1);
+        store->close();
+    }
+    check(file_inventory(root.path) == inventory, "the writing profile's own open changed nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the writing profile's own open rewrote no authority");
+}
+
+// A record's decoded metadata can be several times its file: a record with thousands of K/V layers and checkpoints
+// makes a manifest dominated by its per-element entries, and the tables the consistency pass builds are charged on top
+// of them.  This run's preparation ceiling must cover all of it before the decode allocates any of it, and a record
+// that does not fit is refused - never deleted, and never the reason a root is called corrupt.
+void check_dense_manifest_workspace_refusal() {
+    TempRoot root;
+    const uint64_t quota = uint64_t(1) << 30;
+    // A dense record with a couple of live tokens, so it advertises a cut a read can ask for.
+    SavedConversation dense = hollow_fixture(461, 64, 4096);
+    dense.live.ids.assign(4, 11);
+    dense.live.gdn.resize(4, 12);
+    dense.live.block_pos.resize(4, 13);
+    dense.live.used = 461;
+
+    ConversationStoreOptions roomy = options_for(root.path, quota, 0);
+    roomy.metadata_bytes = uint64_t(64) << 20;
+    uint64_t head = 0;
+    {
+        ConversationStore store(roomy);
+        if (!store.enabled()) return;
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, dense, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the dense record is published under a preparation ceiling that covers its writer");
+        head = stored.head_id;
+        store.close();
+    }
+    const std::vector<std::string> inventory = file_inventory(root.path);
+    const std::string catalog_digest = file_digest(root.path + "/catalog");
+    check(head != 0 && !inventory.empty(), "the published root holds the dense record");
+
+    // A ceiling that holds the store's index and the record's manifest but not its read and decode: the run declines
+    // to serve, keeps every byte and every charge where they are, and never reports the record as corrupt.
+    {
+        ConversationStoreOptions tight = roomy;
+        tight.metadata_bytes = uint64_t(1) << 20;
+        ConversationStore store(tight);
+        check(!store.enabled(), "a run whose preparation ceiling cannot hold the decode refuses to serve the root");
+        check(!store.disabled_reason().empty(), "the refusal carries a reason");
+        check_eq(store.counters().corrupt_records, 0, "an unreadable record is never called corrupt");
+    }
+    check(file_inventory(root.path) == inventory, "the refused open deleted nothing");
+    check(file_digest(root.path + "/catalog") == catalog_digest, "the refused open rewrote no authority");
+
+    // The run that can pay for the decode reads the same record back: its stream table and its image both come out.
+    {
+        ConversationStore store(roomy);
+        check(store.enabled(), "a run whose ceiling covers the decode serves the same root");
+        check_eq(store.counters().heads, 1, "the dense record is still catalog-authorized");
+        std::vector<ConversationStoreStreamInfo> streams;
+        check(store.manifest_streams(head, streams) && !streams.empty(),
+              "the dense record's stream table is readable under a ceiling that covers the decode");
+        ConversationStoreQuery query = query_of(dense, 41, 1);
+        std::string why;
+        check(store.demand(query, why), "the dense record's demand is admitted");
+        ConversationStoreRead read;
+        check(store.wait_ready(41, 1, read, 5000), "the dense demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "the dense record is served");
+        check(read.image && images_equal(*read.image, dense, why),
+              "the restored dense image is byte-identical to the one that was published");
+        store.release_read(41, 1);
+        store.close();
+    }
+    check(file_inventory(root.path) == inventory, "the reading run deleted and wrote nothing");
+}
+
+// The classification that preserves a record this run cannot read must never excuse one that is really damaged: a
+// manifest whose bytes no longer match its checksum is still corrupt, is dropped, and its bytes are reclaimed, while
+// every record around it survives unchanged.
+void check_damaged_manifest_is_still_reclaimed() {
+    TempRoot root;
+    const uint64_t quota = uint64_t(1) << 30;
+    const SavedConversation survivor = fixture(471, 1024);
+    const SavedConversation damaged = fixture(472, 1024);
+    std::string damaged_manifest;
+    uint64_t damaged_head = 0;
+    {
+        ConversationStore store(options_for(root.path, quota, 0));
+        if (!store.enabled()) return;
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, survivor, 1, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the record that must survive is stored");
+        const std::vector<std::string> before = directory_names(root.path + "/manifests");
+        check(publish_and_wait(store, damaged, 2, 1, stored) &&
+                  stored.status == ConversationStorePublishStatus::stored,
+              "the record that will be damaged is stored");
+        damaged_head = stored.head_id;
+        const std::vector<std::string> after = directory_names(root.path + "/manifests");
+        for (const auto& candidate : after)
+            if (!inventory_contains(before, candidate)) damaged_manifest = candidate;
+        check(!damaged_manifest.empty(), "the second publication wrote its own manifest");
+        store.close();
+        // One flipped byte in the file.  It still reads - it is far inside this run's manifest ceiling - so nothing
+        // about it may be excused as capacity this run lacks: it is a defect in the record.
+        const std::string path = root.path + "/manifests/" + damaged_manifest;
+        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        check(fd >= 0, "the manifest opens for damage");
+        if (fd >= 0) {
+            uint8_t byte = 0;
+            check(::read(fd, &byte, 1) == 1, "the manifest is readable");
+            byte ^= 0x40;
+            check(::lseek(fd, 0, SEEK_SET) == 0, "the manifest seeks to its first byte");
+            check(::write(fd, &byte, 1) == 1, "the manifest is damaged");
+            ::fsync(fd);
+            ::close(fd);
+        }
+    }
+    {
+        ConversationStore store(options_for(root.path, quota, 0));
+        check(store.enabled(), "a damaged manifest does not disable the store");
+        check_eq(store.counters().corrupt_records, 1, "exactly the damaged record is called corrupt");
+        check_eq(store.counters().heads, 1, "only the damaged record is dropped");
+        ConversationStoreManifestInfo info;
+        check(!store.manifest_info(damaged_head, info), "the damaged record is no longer catalog-authorized");
+        ConversationStoreQuery query = query_of(survivor, 51, 1);
+        std::string why;
+        check(store.demand(query, why), "the surviving record's demand is admitted");
+        ConversationStoreRead read;
+        check(store.wait_ready(51, 1, read, 5000), "the surviving demand settles");
+        check(read.status == ConversationStoreReadStatus::ready, "the surviving record is still served");
+        check(read.image && images_equal(*read.image, survivor, why),
+              "the restored surviving image is byte-identical to the one that was published");
+        store.release_read(51, 1);
+        store.close();
+    }
 }
 
 void check_request_specific() {
@@ -2243,7 +2476,11 @@ void check_reuse_reservation() {
           "the donor publication is admitted at its floor");
     check(!publication_is_admitted(shape, grown, with_donor, donor_floor - 1),
           "one byte below the donor publication's floor is refused");
-    check(donor_floor - uint64_t(grown.bytes()) < (uint64_t(256) << 10),
+    // The donor's preparation is a few times the donor's own manifest charge and nothing more: one decode holds the
+    // raw file, the decoded metadata and the tables the consistency pass builds at once (see
+    // manifest_read_workspace_bound).  What it must never scale with is a configured maximum - head_limit x
+    // max_manifest_bytes is hundreds of megabytes here - so a megabyte is the assertion's own generous ceiling.
+    check(donor_floor - uint64_t(grown.bytes()) < (uint64_t(1) << 20),
           "the donor's preparation is bounded by its own manifest charge, not by a head-limit maximum");
 
     // The same counts with many named donors, including one this store does not retain: an unknown name is a lookup
