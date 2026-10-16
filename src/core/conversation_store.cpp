@@ -2958,6 +2958,12 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     read_prep = sat_add(read_prep, decode_workspace);
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
+    // The reissue's new selection renews the admission lease: a demand that revalidated to a newer head keeps that
+    // head protected for its queued life, exactly like a fresh admission.
+    if (job->head_id) {
+        head_leases[job->head_id] += 1;
+        job->leased = true;
+    }
     job->live = best.live;
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
@@ -3105,6 +3111,13 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     read_prep = sat_add(read_prep, decode_workspace);
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
+    // The selection itself is the protection (#243): a queued read holds the same head lease a started reader
+    // would, so ceiling pressure cannot retire the newest cut it just re-validated. The lease follows the job's
+    // whole life and is released wherever its slot is; a catalog reissue re-grants it for the new head.
+    if (job->head_id) {
+        head_leases[job->head_id] += 1;
+        job->leased = true;
+    }
     job->live = best.live;
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
@@ -3456,7 +3469,7 @@ void ConversationStore::Impl::reader_body() {
         counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
         chosen->holds_slot = true;
         ++incoming;
-        if (chosen->head_id) {
+        if (chosen->head_id && !chosen->leased) {
             head_leases[chosen->head_id] += 1;
             chosen->leased = true;
         }

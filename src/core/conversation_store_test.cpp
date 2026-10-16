@@ -602,6 +602,7 @@ void check_incoming_lifetime();
 void check_publication_rules();
 void check_restart_generation_ordering();
 void check_pinned_branch();
+void check_queued_read_protects_frontier();
 void check_reuse();
 void check_leases_and_budget();
 void check_tight_ram();
@@ -658,6 +659,7 @@ int main() {
     check_publication_rules();
     check_restart_generation_ordering();
     check_pinned_branch();
+    check_queued_read_protects_frontier();
     check_reuse();
     check_leases_and_budget();
     check_tight_ram();
@@ -2256,6 +2258,52 @@ void check_pinned_branch() {
     check(refused.status == ConversationStorePublishStatus::stale,
           "an older capture can never cover a newer descendant");
     check(store.counters().refusals_stale > 0, "the stale refusal is counted");
+    store.close();
+}
+
+void check_queued_read_protects_frontier() {
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 3;
+    ConversationStore store(options);
+    const SavedConversation latest = fixture(601, 256);
+    for (auto& checkpoint : const_cast<SavedConversation&>(latest).checkpoints) checkpoint.pinned = false;
+    check(!latest.pinned(), "the frontier fixture carries no pin");
+    ConversationStorePublishResult latest_result;
+    check(publish_and_wait(store, latest, 1, 1, latest_result) &&
+              latest_result.status == ConversationStorePublishStatus::stored,
+          "the protected frontier is stored");
+    const SavedConversation neighbour = fixture(602, 128);
+    ConversationStorePublishResult neighbour_result;
+    check(publish_and_wait(store, neighbour, 2, 2, neighbour_result) &&
+              neighbour_result.status == ConversationStorePublishStatus::stored,
+          "the neighbour head fills the ceiling");
+
+    // A queued (admitted, not started) read has selected the frontier cut: until it starts or is retired, that
+    // selection must hold the same protection a started reader's lease has. Otherwise publications under head
+    // pressure retire the newest checkpoint out from under the queued demand, and its later run finds only an
+    // older cut (the #243 latest-history loss).
+    store.suspend_read_admission();
+    std::string why;
+    check(store.demand(query_of(latest, 801, 8), why), "the queued demand is admitted while admission is suspended");
+    for (uint64_t id = 3; id <= 4; ++id) {
+        const SavedConversation pressure = fixture(602 + id, 128);
+        auto pressure_image = std::make_shared<SavedConversation>(pressure);
+        ConversationStorePublish request;
+        request.request_id = id;
+        request.generation = id;
+        check(store.publish(pressure_image, request, why) == kAccepted, "the ceiling-pressure publication is admitted");
+        ConversationStorePublishResult stored;
+        check(store.wait_publish(stored, 5000), "the pressure publication settles");
+    }
+    store.publish_read_allowance(uint64_t(64) << 20);   // resume admission
+    ConversationStoreRead read;
+    check(store.wait_ready(801, 8, read, 5000) && read.status == ConversationStoreReadStatus::ready,
+          "the queued demand's selected frontier survived the pressure publications");
+    check(read.image != nullptr && read.tokens == 256, "the demand mounts its full latest cut, not an older one");
+    if (read.image) store.release_read(801, 8);
+    ConversationStoreManifestInfo info;
+    check(store.manifest_info(latest_result.head_id, info), "the frontier head is still authorized after the read");
     store.close();
 }
 
