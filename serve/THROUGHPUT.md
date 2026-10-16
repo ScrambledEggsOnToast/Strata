@@ -38,3 +38,10 @@ server and replica suites. Real-engine execution and installation are separate
 qualification steps; this source change does not install a service or model.
 
 Idle services use a two-second window; active services retain five seconds. Reading idle metrics does not mutate the active five-second observation window. Dashboard display smoothing resets on resumption. Missing prefill support remains null.
+
+With STRATA_THROUGHPUT=1, metrics also includes request_activity: a content-free
+boot identity and up to 128 opaque request IDs with queued/processing/completed/failed/cancelled states.
+Active records take priority; truncation is explicit. This sampled display feed
+never changes admission limits and does not expose prompt, output or error text.
+Queued includes admitted preparation; processing follows the native execution flag.
+Terminal outcomes follow handler completion, cancellation and recorded errors.
