@@ -106,6 +106,15 @@ RoPE table still belong to each owner; only per-layer state follows the range. A
 needs its primary QSA. The corrected fixed price leaves more room for the existing expert-cache grant, without
 changing its ceiling, headroom, blob rounding or profile cap. An admitted/carved extent disagreement is an error.
 Before an `auto` split search has chosen ranges, admission keeps the conservative whole-model per-stage bound.
+
+The `--prompt-cache` conversation checkpoint cache is priced the same way. Every stage that saves a part
+(`conversation_checkpoint_save` runs on the primary session and on each split stage's session) pays its own GDN
+rows and indexer layers, while each stage's whole PLE history - `session.cpp` allocates one in every session -
+and the checkpoint's token-ID vector are charged once per stage. That is the resident seat's state-only
+convention (below); no checkpoint carries draft/MTP state, so the cache adds none. An unresolved `auto` split
+keeps the whole-model bound for the first stage and one primary QSA, its PLE history and its IDs for each later
+stage.
+
 **The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
 layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the
 prompt path does it in batches (`Prefill::draft_kv`, a few large matrix products per chunk); on a split the drafter's own

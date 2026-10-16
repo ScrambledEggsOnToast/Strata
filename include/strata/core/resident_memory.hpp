@@ -15,35 +15,58 @@ static_assert(sizeof(ConversationCheckpoint) <= strata::plan::kResidentCheckpoin
               sizeof(ConversationKv) <= strata::plan::kResidentCheckpointMetadataBytes,
               "increase checkpoint/image metadata envelope in native and Python planner");
 
-// Explicit splits use the same layer counts as SessionOwner. For an unresolved
-// auto split, the full model bounds the largest stage, with one extra primary
+// One conversation checkpoint as the cache holds it: every stage that saves its own part (the primary
+// session plus each split stage) prices its own GDN rows and indexer layers, but the whole PLE history
+// and the token-ID vector once per stage - session.cpp allocates the PLE history in every session, and a
+// split capture writes the same IDs into every stage's part. `split_at` holds the `stages - 1` ascending
+// layer boundaries; for an unresolved auto split the whole model bounds the first stage, and each later
+// stage keeps one primary QSA (a stage with no attention still allocates that primary) plus its own PLE
+// history and token IDs. No checkpoint carries draft/MTP state. False on an invalid stage count or
+// geometry, a non-ascending split, or arithmetic overflow; `out` stays empty then.
+inline bool conversation_checkpoint_payload(const ModelGeometry& g, int64_t cells, uint64_t stages,
+                                           const int64_t* split_at,
+                                           strata::plan::ResidentCheckpointPayload& out) {
+    out = {};
+    if (!stages || stages > (uint64_t) g.n_layers || cells <= 0 || cells > INT32_MAX ||
+        g.qsa_interval <= 0) return false;
+    auto shape = strata::kernels::qsa_real_shapes();
+    shape.idx_dim = g.idx_key_dim;
+    strata::plan::ResidentCheckpointPayload priced;
+    int64_t lo = 0;
+    for (uint64_t stage = 0; stage < stages; ++stage) {
+        int64_t from = lo, to = g.n_layers;
+        if (split_at) {
+            if (stage + 1 < stages) to = split_at[stage];
+            if (to <= from || to > g.n_layers) return false;
+        } else if (stage != 0) {
+            from = 0; to = 0;   // an unresolved split: one primary QSA, its PLE history and IDs
+        }
+        lo = to;
+        const auto layers = strata::plan::session_layer_counts(g.n_layers, g.qsa_interval, from, to);
+        strata::plan::CheckpointStateBytes state;
+        if (!strata::plan::checkpoint_state_bytes((uint64_t) layers.gdn, g.ssm_state_size, g.ssm_v_heads,
+                g.ssm_conv_channels, g.ssm_d_conv, shape, state) ||
+            !strata::plan::resident_checkpoint_stage((uint64_t) cells, (uint64_t) layers.qsa, state, priced))
+            return false;
+    }
+    out = priced;
+    return true;
+}
+
+// Explicit splits use the same layer counts as SessionOwner, priced by conversation_checkpoint_payload
+// above: for an unresolved auto split, the full model bounds the largest stage, with one extra primary
 // QSA per later stage (a stage with no attention still allocates that primary).
 inline bool resident_host_payload(const ModelGeometry& g, int64_t cells, bool mtp,
                                    const strata::plan::QsaRolePlacements& roles,
                                    uint64_t stages, const int64_t* split_at,
                                    strata::plan::ResidentHostBytes& out) {
     out = {};
-    if (!stages || stages > (uint64_t) g.n_layers || cells <= 0 || cells > INT32_MAX ||
-        g.qsa_interval <= 0) return false;
+    strata::plan::ResidentCheckpointPayload checkpoint;
+    if (!conversation_checkpoint_payload(g, cells, stages, split_at, checkpoint)) return false;
     auto shape = strata::kernels::qsa_real_shapes();
     shape.n_head_kv = g.n_head_kv;
     shape.head_dim = g.head_dim;
     shape.idx_dim = g.idx_key_dim;
-    strata::plan::ResidentCheckpointPayload checkpoint;
-    int64_t lo = 0;
-    for (uint64_t stage = 0; stage < stages; ++stage) {
-        const int64_t hi = split_at && stage + 1 < stages ? split_at[stage] : g.n_layers;
-        if (split_at && (hi <= lo || hi > g.n_layers)) return false;
-        const int64_t q_range = split_at ? hi / g.qsa_interval - lo / g.qsa_interval
-                                         : stage == 0 ? g.n_qsa_layers() : 0;
-        const uint64_t nq = std::max<int64_t>(q_range, g.n_qsa_layers() ? 1 : 0);
-        const uint64_t ng = split_at ? (hi - lo) - q_range : stage == 0 ? g.n_gdn_layers() : 0;
-        strata::plan::CheckpointStateBytes state;
-        if (!strata::plan::checkpoint_state_bytes(ng, g.ssm_state_size, g.ssm_v_heads,
-            g.ssm_conv_channels, g.ssm_d_conv, shape, state) ||
-            !strata::plan::resident_checkpoint_stage(cells, nq, state, checkpoint)) return false;
-        lo = hi;
-    }
     strata::plan::QsaImageBytes main, draft;
     if (g.n_qsa_layers() && !strata::plan::qsa_image_bytes(shape, cells, roles.working_main.format, true, main)) return false;
     if (mtp && !strata::plan::qsa_image_bytes(shape, cells, roles.working_draft.format, false, draft)) return false;

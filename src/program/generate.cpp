@@ -5344,16 +5344,16 @@ int main(int argc, char** argv) {
                                  o.ple_io == "ram" ? ByteMeaning::locked_file : ByteMeaning::clean_file);
             }
         }
-        strata::core::ConversationStateSizes checkpoint;
         if (o.serve && o.prompt_cache > 0) {
-            if (strata::core::conversation_state_sizes(g, checkpoint, err)) {
-                const uint64_t one = byte_add(byte_add(checkpoint.gdn, checkpoint.ple),
-                    byte_add(byte_mul((uint64_t) g.n_qsa_layers(),
-                                      byte_add(byte_add(checkpoint.tail, checkpoint.dead), checkpoint.block_pos)),
-                             byte_mul((uint64_t) o.max_context, sizeof(int32_t))));
-                ram("conversation_checkpoints", byte_mul(one, byte_add((uint64_t) o.prompt_cache, 1)),
-                    "conversation_state_sizes + context IDs; cache plus checkpoint being captured");
-            } else ram_unknown("conversation_checkpoints", "conversation_state_sizes failed");
+            // Every stage that saves a part (the primary session and each split stage) prices its own GDN
+            // rows and indexer layers, but the whole PLE history - session.cpp allocates one per session -
+            // and the checkpoint's token IDs once per stage.
+            strata::plan::ResidentCheckpointPayload checkpoint;
+            if (strata::core::conversation_checkpoint_payload(g, o.max_context, stage_count,
+                    split_real && !split_auto ? split_at.data() : nullptr, checkpoint))
+                ram("conversation_checkpoints", byte_mul(checkpoint.bytes, byte_add((uint64_t) o.prompt_cache, 1)),
+                    "every saving stage's own GDN rows and indexer layers, whole PLE history and token IDs per stage; cache plus checkpoint being captured");
+            else ram_unknown("conversation_checkpoints", "conversation_checkpoint_payload failed");
         }
         if (admission_prefill) {
             const char* ring_env = std::getenv("STRATA_STAGER_RING");
