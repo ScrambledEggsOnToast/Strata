@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <string_view>
 #include <type_traits>
@@ -239,6 +240,8 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 struct SavedConversation {
     // RAM-only namespace; session files keep their existing model/config schema.
     ConversationScope scope;
+    // Transient sole publication owner; never serialized or propagated to an alias.
+    uint64_t publication_ticket = 0;
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
@@ -260,7 +263,7 @@ struct SavedConversation {
         for (auto& stage : stage_images) stage.freeze();
     }
     /// Cheap alias: metadata is copied, every payload is shared with this image
-    /// (which must be frozen for the alias to be free).
+    /// (which must be frozen for the alias to be free). Publication ownership is not copied.
     SavedConversation frozen_alias() const {
         SavedConversation out;
         out.scope = scope; out.geometry = geometry;
@@ -340,13 +343,10 @@ public:
     size_t evictions() const { return evictions_; }
 
     // ---- Immutable publication leases -------------------------------------
-    // The store holds an immutable alias of a parked image's payloads while it
-    // writes them (conversation_image_freeze_share). The lease is charged in full
-    // even though its payload is physically shared with the parked entry - the
-    // same "every reference in full" convention the buffers use - so the envelope
-    // never over-commits; the peak is one admitted writer plus one incoming
-    // restore, and release is idempotent per reservation. Refusal is a safe cache
-    // miss: the caller skips publication, not the request.
+    // Waiting publications protect their existing parked owner, without a
+    // second image or charge. take_publication transfers that exact charge to a
+    // held lease when the writer acquires it. Separately reserved aliases remain
+    // charged in full, so every live ownership path stays inside one envelope.
     bool try_reserve_lease(size_t bytes) {
         const size_t occupied = envelope_bytes();
         if (occupied > budget_ || bytes > budget_ - occupied) return false;
@@ -435,11 +435,53 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) visit(i, entries_[i]);
     }
 
-    SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
+    // A pending publication keeps its sole parked owner: restore gets a frozen
+    // alias and must not reserve a return slot or put that alias back afterwards.
+    SavedConversation take(size_t index, bool& retained_in_cache) {
+        retained_in_cache = false;
+        auto& entry = entries_.at(index);
+        if (entry.publication_ticket != 0) {
+            auto alias = entry.frozen_alias();
+            retained_in_cache = true;
+            return alias;
+        }
+        SavedConversation out = std::move(entry);
         bytes_ -= out.bytes();
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         return out;
+    }
+
+    bool has_publication(uint64_t ticket) const noexcept {
+        if (ticket == 0) return false;
+        return std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
+            return entry.publication_ticket == ticket;
+        });
+    }
+
+    // The caller allocates its shared root first. Commit only moves ownership:
+    // no allocation or payload copy, and the total envelope stays identical.
+    std::optional<SavedConversation> take_publication(uint64_t ticket) noexcept {
+        if (ticket == 0) return std::nullopt;
+        for (auto entry = entries_.begin(); entry != entries_.end(); ++entry) {
+            if (entry->publication_ticket != ticket) continue;
+            const size_t n = entry->bytes();
+            std::optional<SavedConversation> out(std::in_place, std::move(*entry));
+            bytes_ -= n;
+            held_bytes_ += n;
+            entries_.erase(entry);
+            return out;
+        }
+        return std::nullopt;
+    }
+
+    // Drop/invalidation removes only parked protection, never a separately
+    // acquired lease. Missing tickets (including already acquired ones) are safe.
+    void release_publication(uint64_t ticket) noexcept {
+        if (ticket == 0) return;
+        for (auto& entry : entries_) if (entry.publication_ticket == ticket) {
+            entry.publication_ticket = 0;
+            return;
+        }
     }
 
     // Admit capture bytes, not a published entry. A full entry table must not
@@ -449,18 +491,18 @@ public:
         if (!enabled() || held > budget_ || incoming > room(held)) return false;
         if (bytes() > room(held) - incoming) reuse_ = {};
         while (!entries_.empty() && bytes_ > room(held) - incoming) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+            // Only ordinary, unpinned entries may leave. Pending publications
+            // keep their sole owner even when genuine capacity refusal follows.
             if (!evict_oldest()) return false;
         }
         return true;
     }
 
-    // Release the oldest unpinned image for byte/physical-memory pressure.
+    // Release the oldest unpinned, nonpending image for byte/physical-memory pressure.
     // Buffer extents are released before the caller resamples available memory.
-    // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+    // False when empty or all remaining entries are pinned/pending.
     bool evict_oldest() {
-        auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
+        auto victim = std::find_if(entries_.begin(), entries_.end(), evictable);
         if (victim == entries_.end()) return false;
         bytes_ -= victim->bytes();
         entries_.erase(victim);
@@ -468,8 +510,9 @@ public:
         return true;
     }
 
-    // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
-    // may carry the poison.  Returns how many were parked.
+    // #879: every parked conversation (pinned/pending too) and retained K/V go -
+    // after non-finite logits any may carry poison. Acquired leases stay charged.
+    // Returns how many were parked.
     size_t clear() {
         const size_t n = entries_.size();
         entries_.clear();
@@ -483,17 +526,22 @@ public:
 
     // Latest-history retention, not state-equivalent deduplication: an older
     // unpinned rewind cut may cold-read after an exact live-prefix extension.
-    // Divergent branches and every explicitly pinned cut remain protected.
+    // Divergent branches, explicitly pinned cuts and pending publications remain protected.
     size_t superseded() const { return superseded_; }
 
-    // A non-consuming restore also reserves its eventual publication entry.
+    // A non-consuming restore of a removed owner reserves its eventual return
+    // entry. Pending owners already remain parked and need no such reservation.
+    // Ticketed candidates freeze before sizing/admission; refusal may leave the
+    // candidate frozen, but never consumes it or changes the cache.
     bool put(SavedConversation&& image, size_t held = 0, size_t held_entries = 0) {
         static_assert(std::is_nothrow_move_constructible_v<SavedConversation>);
         static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
         static_assert(std::is_nothrow_destructible_v<SavedConversation>);
+        if (!enabled() || !image.scope.valid() || held_entries >= slots_ || held > budget_ ||
+            has_publication(image.publication_ticket)) return false;
+        if (image.publication_ticket != 0) image.freeze();
         const size_t n = image.bytes();
-        if (!enabled() || !image.scope.valid() || held_entries >= slots_ ||
-            held > budget_ || n > room(held)) return false;
+        if (n > room(held)) return false;
         const size_t available_entries = slots_ - held_entries;
         const size_t limit = room(held) - n;
         size_t count = entries_.size(), remaining = bytes_, replaced = 0, victims = 0;
@@ -507,7 +555,7 @@ public:
         const size_t payload_limit = discard_reuse ? limit : limit - reuse_bytes;
         for (const auto& old : entries_) {
             if (count < available_entries && remaining <= payload_limit) break;
-            if (!old.pinned() && !replaces(old, image)) {
+            if (evictable(old) && !replaces(old, image)) {
                 --count;
                 remaining -= old.bytes();
                 ++victims;
@@ -526,7 +574,7 @@ public:
         for (size_t read = 0; read < old_count; ++read) {
             const auto& old = entries_[read];
             if (replaces(old, next)) continue;
-            if (ordinary_left && !old.pinned()) { --ordinary_left; continue; }
+            if (ordinary_left && evictable(old)) { --ordinary_left; continue; }
             if (write != read) entries_[write] = std::move(entries_[read]);
             ++write;
         }
@@ -573,7 +621,10 @@ private:
         return true;
     }
     static bool replaces(const SavedConversation& old, const SavedConversation& next) noexcept {
-        return old.scope.matches(next.scope) && compatible_pins(old, next);
+        return old.publication_ticket == 0 && old.scope.matches(next.scope) && compatible_pins(old, next);
+    }
+    static bool evictable(const SavedConversation& image) noexcept {
+        return image.publication_ticket == 0 && !image.pinned();
     }
 
     // Bytes the envelope can still admit for a new image: budget minus this

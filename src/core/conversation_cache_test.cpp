@@ -26,6 +26,34 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
     s.cvec = cvec;
     return s;
 }
+bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
+    if (a.ids != b.ids || a.imgs != b.imgs || a.used != b.used || a.pinned != b.pinned ||
+        a.gdn != b.gdn || a.ple != b.ple || a.tails != b.tails || a.dead != b.dead ||
+        a.block_pos != b.block_pos || a.stage_parts.size() != b.stage_parts.size()) return false;
+    for (size_t i = 0; i < a.stage_parts.size(); ++i)
+        if (!same_checkpoint(a.stage_parts[i], b.stage_parts[i])) return false;
+    return true;
+}
+// Publication tickets are ownership metadata, not part of the saved image.
+bool same_image(const SavedConversation& a, const SavedConversation& b) {
+    if (a.scope != b.scope || a.geometry != b.geometry || a.layer_lo != b.layer_lo ||
+        a.layer_hi != b.layer_hi || a.cvec != b.cvec || !same_checkpoint(a.live, b.live) ||
+        a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size() ||
+        a.stage_images.size() != b.stage_images.size()) return false;
+    for (size_t i = 0; i < a.checkpoints.size(); ++i)
+        if (!same_checkpoint(a.checkpoints[i], b.checkpoints[i])) return false;
+    for (size_t i = 0; i < a.kv.size(); ++i) {
+        const auto& x = a.kv[i];
+        const auto& y = b.kv[i];
+        if (x.format != y.format || x.cells != y.cells || x.heads != y.heads || x.head_dim != y.head_dim ||
+            x.page_size != y.page_size || x.pooled_rows != y.pooled_rows || x.idx_dim != y.idx_dim ||
+            !(x.k == y.k) || !(x.v == y.v) || !(x.k_scale == y.k_scale) ||
+            !(x.v_scale == y.v_scale) || !(x.pooled == y.pooled)) return false;
+    }
+    for (size_t i = 0; i < a.stage_images.size(); ++i)
+        if (!same_image(a.stage_images[i], b.stage_images[i])) return false;
+    return true;
+}
 }
 
 int main() {
@@ -235,8 +263,9 @@ int main() {
         ConversationCache cache(32u << 20, 4);
         check(cache.put(std::move(owner)) && cache.put(std::move(survivor)), "shared siblings occupy original cache slots");
         check(cache.evict_oldest(), "donor can be evicted with live sibling references");
-        auto remaining = cache.take(0);
-        check(pointer(remaining.kv[0].k, 0) == surviving && *surviving == 7,
+        bool retained_in_cache = true;
+        auto remaining = cache.take(0, retained_in_cache);
+        check(!retained_in_cache && pointer(remaining.kv[0].k, 0) == surviving && *surviving == 7,
               "eviction and take preserve exactly the surviving allocation");
         cache.retain(std::move(remaining.kv), 2305);
         auto active = cache.take_reuse();
@@ -383,8 +412,9 @@ int main() {
         check(cache.put(image({9, 8, 7})), "park B");
         auto match = cache.best(a, {}, true, test_scope);
         check(match.tokens == 3 && match.live, "A/B/A: recover A");
-        auto restored = cache.take(match.index);
-        check(restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
+        bool retained_in_cache = true;
+        auto restored = cache.take(match.index, retained_in_cache);
+        check(!retained_in_cache && restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
         check(cache.size() == 1 && cache.best(b, {}, true, test_scope).tokens == 3, "B remains parked");
         check(cache.bytes() == image({9,8,7}).bytes(), "byte accounting after take");
         check(cache.put(std::move(restored)), "park returned A as newest");
@@ -465,8 +495,9 @@ int main() {
         ConversationCache cache(one*2, 8);
         cache.put(image({1,2,3})); cache.put(image({9,8,7}));
         check(cache.bytes() == one*2, "budget holds two exact-sized images");
-        auto held = cache.take(cache.best(a, {}, true, test_scope).index);
-        check(cache.reserve_snapshot(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
+        bool retained_in_cache = true;
+        auto held = cache.take(cache.best(a, {}, true, test_scope).index, retained_in_cache);
+        check(!retained_in_cache && cache.reserve_snapshot(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
         check(cache.size() == 0, "in-flight reservation evicts otherwise fitting B");
         check(cache.put(image({5,6,7}), held.bytes()), "insert with in-flight accounting");
         check(cache.bytes()+held.bytes() <= one*2, "exchange obeys byte budget");
@@ -485,8 +516,9 @@ int main() {
         }
         other.checkpoints = {other.live}; other.checkpoints.back().pinned = true;
         check(cache.put(std::move(donor)) && cache.put(std::move(other)), "park a donor beside a pinned history");
-        auto held = cache.take(cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true, test_scope).index);
-        check(!cache.put(image({6, 5, 4}), held.bytes(), 1),
+        bool retained_in_cache = true;
+        auto held = cache.take(cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true, test_scope).index, retained_in_cache);
+        check(!retained_in_cache && !cache.put(image({6, 5, 4}), held.bytes(), 1),
               "outgoing capture cannot spend a non-consuming donor's reserved entry");
         check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3,
               "refused outgoing capture preserves the existing pinned history");
@@ -498,8 +530,10 @@ int main() {
     {
         ConversationCache cache(1 << 20, 2);
         check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "fill ordinary donor table");
-        auto held = cache.take(0);
-        check(cache.put(image({6, 5, 4}), held.bytes(), 1), "reserved-entry capture may evict an unrelated unpinned history");
+        bool retained_in_cache = true;
+        auto held = cache.take(0, retained_in_cache);
+        check(!retained_in_cache && cache.put(image({6, 5, 4}), held.bytes(), 1),
+              "reserved-entry capture may evict an unrelated unpinned history");
         check(cache.put(std::move(held)) && cache.size() == 2 && cache.evictions() == 1 &&
               cache.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true, test_scope).tokens == 3 &&
               cache.best(std::vector<int32_t>{6, 5, 4, 3}, {}, true, test_scope).tokens == 3,
@@ -1074,6 +1108,211 @@ int main() {
         check(published.live.gdn.data() == alias->live.gdn.data() &&
               published.live.gdn.read() == alias->live.gdn.read(),
               "the publication alias shares the frozen image's allocations with no payload copy");
+    }
+    {
+        // Ordinary restore may borrow a pending image, but cannot consume its publication owner.
+        auto pending = image({1, 2, 3, 4});
+        pending.publication_ticket = 101;
+        pending.geometry[0] = 7;
+        pending.layer_hi = 2;
+        pending.live.imgs = {{1, 42}};
+        pending.live.ple.resize(32, 11);
+        pending.live.tails.resize(48, 12);
+        pending.live.dead.resize(16, 13);
+        pending.live.block_pos.resize(8, 14);
+        pending.live.stage_parts.push_back(image({1, 2, 3, 4}).live);
+        pending.live.stage_parts.back().tails.resize(24, 15);
+        auto cut = pending.live;
+        cut.ids.resize(2);
+        cut.pinned = true;
+        pending.checkpoints.push_back(std::move(cut));
+        ConversationKv layer;
+        layer.format = 3; layer.cells = 4; layer.heads = 1; layer.head_dim = 64;
+        layer.page_size = 16; layer.pooled_rows = 1; layer.idx_dim = 8;
+        layer.k.resize(256, 21); layer.v.resize(128, 22);
+        layer.k_scale.resize(16, 23); layer.v_scale.resize(16, 24); layer.pooled.resize(8, 25);
+        pending.kv.push_back(std::move(layer));
+        auto stage = image({1, 2, 3, 4});
+        stage.live.dead.resize(32, 31);
+        stage.kv = pending.kv;
+        pending.stage_images.push_back(std::move(stage));
+        const auto expected = pending;
+        const auto* original_gdn = pending.live.gdn.data();
+        auto data = [](const ConversationBuffer& bytes) {
+            const uint8_t* result = nullptr;
+            bytes.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { result = p; return false; });
+            return result;
+        };
+        const auto* original_k = data(pending.kv.front().k);
+        ConversationCache cache(1u << 20, 4);
+        check(cache.put(std::move(pending)), "park an unfrozen ticketed image");
+        bool frozen = false;
+        cache.for_each_image([&](size_t, const SavedConversation& saved) {
+            frozen = saved.publication_ticket == 101 && saved.live.gdn.sealed() && saved.live.ple.sealed() &&
+                saved.live.tails.sealed() && saved.live.dead.sealed() && saved.live.block_pos.sealed() &&
+                saved.live.stage_parts.front().gdn.sealed() && saved.checkpoints.front().gdn.sealed() &&
+                saved.checkpoints.front().stage_parts.front().tails.sealed() &&
+                saved.kv.front().k.frozen() && saved.kv.front().v.frozen() &&
+                saved.kv.front().k_scale.frozen() && saved.kv.front().v_scale.frozen() &&
+                saved.kv.front().pooled.frozen() && saved.stage_images.front().live.dead.sealed() &&
+                saved.stage_images.front().kv.front().v.frozen() &&
+                saved.live.gdn.data() == original_gdn && data(saved.kv.front().k) == original_k;
+        });
+        check(frozen, "pending visibility already has every nested payload frozen without copying bytes");
+        const size_t parked = cache.bytes(), envelope = cache.envelope_bytes();
+        bool retained_in_cache = false;
+        auto restored = cache.take(0, retained_in_cache);
+        check(retained_in_cache && restored.publication_ticket == 0 &&
+              restored.stage_images.front().publication_ticket == 0 && same_image(restored, expected),
+              "pending take reports a ticket-free alias with exactly the original all-stage image");
+        check(cache.has_publication(101) && cache.size() == 1 && cache.bytes() == parked &&
+              cache.envelope_bytes() == envelope && cache.leased_bytes() == 0,
+              "pending take leaves the sole owner and its exact charge parked");
+        check(restored.live.gdn.data() == original_gdn && data(restored.kv.front().k) == original_k,
+              "pending take aliases frozen payloads instead of copying them");
+        restored.live.ids.front() = 99;
+        restored.live.gdn.write().front() = 99;
+        restored.checkpoints.front().stage_parts.front().tails.write().front() = 99;
+        restored.kv.front().k.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 99; return true; });
+        restored.stage_images.front().live.dead.write().front() = 99;
+        restored.stage_images.front().kv.front().v.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p = 99; return true; });
+        auto publication = cache.take_publication(101);
+        check(publication && publication->publication_ticket == 101 && same_image(*publication, expected) &&
+              publication->live.gdn.data() == original_gdn && data(publication->kv.front().k) == original_k,
+              "restore-side writes cannot change any original publication bytes or ownership");
+        check(cache.bytes() == 0 && cache.size() == 0 && cache.leased_bytes() == parked &&
+              cache.envelope_bytes() == envelope && !cache.has_publication(101),
+              "acquiring the owner transfers its exact parked charge without growing the envelope");
+        cache.release_lease(publication->bytes());
+        check(cache.envelope_bytes() == 0, "releasing the acquired pending owner drains its exact charge");
+    }
+    {
+        // Victim planning and compaction must skip the same protected entry.
+        auto pending = image({1, 2, 3});
+        pending.publication_ticket = 201;
+        pending.freeze();
+        const size_t protected_bytes = pending.bytes(), budget = 1u << 20;
+        ConversationCache cache(budget, 3);
+        check(cache.put(std::move(pending)) && cache.put(image({9, 8, 7})) && cache.put(image({6, 5, 4})),
+              "fill a table with its pending owner oldest");
+        auto next = image({1, 2, 3, 4});
+        const size_t next_bytes = next.bytes();
+        check(cache.put(std::move(next)) && cache.has_publication(201) &&
+              cache.evictions() == 1 && cache.superseded() == 0 && cache.size() == 3 &&
+              cache.bytes() == protected_bytes + image({6, 5, 4}).bytes() + next_bytes,
+              "put neither supersedes nor compacts away a pending owner when evicting an ordinary victim");
+        check(cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 0 &&
+              cache.best(std::vector<int32_t>{6, 5, 4, 3}, {}, true, test_scope).tokens == 3,
+              "protected compaction removes the planned oldest ordinary entry, not its successor");
+        check(cache.evict_oldest() && cache.evict_oldest() && !cache.evict_oldest() &&
+              cache.size() == 1 && cache.bytes() == protected_bytes && cache.has_publication(201),
+              "physical pressure evicts every ordinary image but preserves the pending sole owner");
+        auto incoming = image({8, 7, 6});
+        incoming.live.gdn.resize(budget - protected_bytes + 1, 5);
+        check(incoming.bytes() <= budget && !cache.reserve_snapshot(incoming.bytes()) &&
+              !cache.put(std::move(incoming)) && cache.bytes() == protected_bytes && cache.has_publication(201),
+              "snapshot and put honestly refuse byte pressure rather than spending a pending owner");
+        cache.release_publication(0);
+        cache.release_publication(999);
+        check(cache.has_publication(201), "zero and unknown releases cannot unprotect another entry");
+        cache.release_publication(201);
+        cache.release_publication(201);
+        check(!cache.has_publication(201) && cache.leased_bytes() == 0 && cache.evict_oldest() && cache.bytes() == 0,
+              "releasing pending protection is safe to repeat and restores ordinary eviction");
+    }
+    {
+        ConversationCache cache(1u << 20, 1);
+        auto pending = image({1, 2, 3});
+        pending.publication_ticket = 211;
+        check(cache.put(std::move(pending)), "fill the only slot with a pending publication");
+        const size_t parked = cache.bytes();
+        auto duplicate = image({9, 8, 7});
+        duplicate.publication_ticket = 211;
+        check(!cache.put(std::move(duplicate)) && duplicate.publication_ticket == 211 &&
+              duplicate.live.ids == std::vector<int32_t>({9, 8, 7}) && !duplicate.live.gdn.sealed(),
+              "a duplicate ticket cannot acquire a second parked owner");
+        auto next = image({1, 2, 3, 4});
+        next.publication_ticket = 212;
+        const auto expected = next;
+        check(!cache.put(std::move(next)) && next.publication_ticket == 212 && same_image(next, expected) &&
+              next.live.gdn.sealed() && cache.bytes() == parked && cache.has_publication(211) &&
+              !cache.has_publication(212) && cache.evictions() == 0 && cache.superseded() == 0,
+              "a full pending slot refuses even its extension without losing either candidate or owner");
+        check(!cache.put(image({1, 2, 3, 4})), "an ordinary extension cannot supersede a pending owner either");
+        cache.release_publication(211);
+        check(cache.put(std::move(next)) && cache.size() == 1 && cache.has_publication(212) &&
+              cache.superseded() == 1 && cache.evictions() == 0,
+              "unprotection restores normal compatible supersession without relaxing the slot limit");
+    }
+    {
+        auto pinned = image({1, 2, 3});
+        pinned.publication_ticket = 221;
+        pinned.checkpoints = {pinned.live};
+        pinned.checkpoints.front().ids.resize(2);
+        pinned.checkpoints.front().pinned = true;
+        ConversationCache cache(1u << 20, 1);
+        check(cache.put(std::move(pinned)) && cache.try_reserve_lease(17), "park a pending explicit pin beside a separate lease");
+        cache.release_publication(221);
+        check(!cache.has_publication(221) && cache.leased_bytes() == 17 && !cache.evict_oldest() &&
+              !cache.put(image({1, 2, 3, 4})),
+              "unprotection clears no explicit pin, spends no separate lease and changes no ordinary pin policy");
+        cache.release_lease(17);
+    }
+    {
+        // The shared root is allocated before the allocation-free lease-transfer commit.
+        auto first = image({2, 4, 6});
+        first.publication_ticket = 301;
+        first.freeze();
+        const size_t first_bytes = first.bytes(), separate_lease = 17;
+        const auto* payload = first.live.gdn.data();
+        const auto expected = first;
+        auto second = image({3, 6, 9});
+        second.publication_ticket = 302;
+        ConversationCache cache(1u << 20, 4);
+        check(cache.try_reserve_lease(separate_lease) && cache.put(std::move(first)) && cache.put(std::move(second)),
+              "park two protected owners beside an existing acquired lease");
+        std::vector<ConversationKv> reuse(1);
+        reuse.front().k.resize(128, 8);
+        cache.retain(std::move(reuse), 3);
+        check(cache.retained_bytes() > 0, "retain optional K/V beside the waiting owners");
+        const size_t parked = cache.bytes(), envelope = cache.envelope_bytes();
+        auto root = std::make_shared<SavedConversation>();
+        static_assert(noexcept(cache.take_publication(301)));
+        auto acquired = cache.take_publication(301);
+        check(acquired.has_value(), "acquire a waiting owner after root allocation");
+        *root = std::move(*acquired);
+        check(root->publication_ticket == 301 && root->bytes() == first_bytes && root->live.gdn.data() == payload &&
+              same_image(*root, expected) && cache.bytes() == parked - first_bytes &&
+              cache.leased_bytes() == separate_lease + first_bytes && cache.envelope_bytes() == envelope &&
+              !cache.has_publication(301) && cache.has_publication(302),
+              "allocation-free transfer preserves payload identity and the complete envelope including other leases and reuse");
+        check(!cache.has_publication(0) && !cache.take_publication(0) && !cache.take_publication(301) &&
+              !cache.take_publication(999) && cache.envelope_bytes() == envelope,
+              "zero, missing and already acquired tickets cannot charge another lease");
+        cache.release_publication(301);
+        check(cache.leased_bytes() == separate_lease + first_bytes,
+              "releasing an already acquired ticket never subtracts its outstanding lease");
+        check(cache.clear() == 1 && cache.bytes() == 0 && cache.retained_bytes() == 0 &&
+              !cache.has_publication(302) && cache.leased_bytes() == separate_lease + first_bytes &&
+              same_image(*root, expected),
+              "clear invalidates parked publications and reuse without touching separately acquired leases or bytes");
+        cache.release_publication(302);
+        cache.release_lease(root->bytes());
+        check(cache.leased_bytes() == separate_lease && cache.envelope_bytes() == separate_lease,
+              "the acquired owner's exact lease release leaves the unrelated reservation intact");
+        cache.release_lease(separate_lease);
+        check(cache.envelope_bytes() == 0, "all separately acquired leases drain independently after clear");
+    }
+    {
+        auto pending = image({4, 5, 6});
+        pending.publication_ticket = 401;
+        const size_t unfrozen_bytes = pending.bytes();
+        const auto expected = pending;
+        ConversationCache cache(unfrozen_bytes, 1);
+        check(!cache.put(std::move(pending)) && pending.publication_ticket == 401 &&
+              pending.live.gdn.sealed() && pending.bytes() > unfrozen_bytes && same_image(pending, expected) &&
+              cache.size() == 0 && cache.envelope_bytes() == 0,
+              "ticketed admission prices frozen owner metadata before commit and refuses a genuinely too-small envelope");
     }
     {
         // The stored candidate's contract inside the existing selector (the demand path feeds its disk candidate
