@@ -3582,6 +3582,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     {
         StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (job->cancelled.load()) return;
+        // Retain the decoded peak even on refusal, so a smaller allowance
+        // increase cannot reissue the same manifest read and fail again.
+        job->peak_bytes = std::max(job->peak_bytes, needed);
         if (needed > job->reserved_bytes) {
             if (needed > ram_budget || resident_locked() - job->reserved_bytes > ram_budget - needed) {
                 stop_with(ConversationStoreReadStatus::refused_budget,

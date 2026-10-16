@@ -613,6 +613,7 @@ void check_selected_hold_terminal_release();
 void check_selected_retirement_allocation_retry();
 void check_selected_equal_cut_order();
 void check_budget_deferred_prefetch();
+void check_budget_deferred_expanded_peak();
 void check_budget_deferred_terminals();
 void check_budget_deferred_head_hold();
 void check_revoked_headless_demand();
@@ -719,6 +720,7 @@ int main() {
     check_selected_retirement_allocation_retry();
     check_selected_equal_cut_order();
     check_budget_deferred_prefetch();
+    check_budget_deferred_expanded_peak();
     check_budget_deferred_terminals();
     check_budget_deferred_head_hold();
     check_revoked_headless_demand();
@@ -2612,6 +2614,52 @@ void check_budget_deferred_prefetch() {
         check_eq(reissues, 1, "one meaningful capacity recovery causes exactly one retry");
         check_eq(starts, 1, "the recovered offer materializes once, not again at demand adoption");
     }
+}
+
+void check_budget_deferred_expanded_peak() {
+    StoreReadTraceCapture trace;
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation image = fixture(624, 256);
+    ConversationStorePublishResult published;
+    check(publish_and_wait(store, image, 1, 1, published), "the expanded-peak head is stored");
+    SelectedHoldGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+    std::string why;
+    check(store.prefetch(query_of(image, 935, 1), why), "the expanded-peak offer is accepted");
+    gate.await();
+    // The active reader already owns its original reservation. Leave exactly
+    // that much room, so decoded restore scaffolding discovers the larger peak.
+    const uint64_t admitted_bytes = store.ram_held_bytes();
+    store.publish_read_allowance(admitted_bytes);
+    gate.resume();
+    check(await_status(store, 935, 1, ConversationStoreReadStatus::refused_budget),
+          "decoded restore scaffolding exceeds the original read reservation");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    check(!gate.timed_out, "the expanded-peak reader was released explicitly");
+    const auto first = trace.records();
+    check_eq(read_trace_count(first, "read_start", 935), 1,
+             "the first refusal follows one real manifest read");
+    store.publish_read_allowance(admitted_bytes + 1);
+    const auto insufficient = trace.records();
+    check_eq(read_trace_count(insufficient, "reissue", 935), 0,
+             "capacity below the discovered restore peak does not repeat materialization");
+    store.publish_read_allowance(uint64_t(64) << 20);
+    check(await_status(store, 935, 1, ConversationStoreReadStatus::ready),
+          "sufficient capacity rearms the same offer before demand");
+    check(store.demand(query_of(image, 935, 1), why), "demand adopts the recovered expanded-peak offer");
+    ConversationStoreRead restored;
+    check(store.wait_ready(935, 1, restored, 5000) && restored.image &&
+              images_equal(*restored.image, image, why),
+          "expanded-peak recovery preserves every restored byte");
+    restored.image.reset();
+    store.release_read(935, 1);
+    store.close();
+    const auto finished = trace.records();
+    check_eq(read_trace_count(finished, "reissue", 935), 1,
+             "only sufficient capacity creates one replacement attempt");
+    check_eq(read_trace_count(finished, "read_start", 935), 2,
+             "the original and recovered materializations each execute once");
 }
 
 void check_budget_deferred_terminals() {
