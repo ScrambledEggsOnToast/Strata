@@ -523,6 +523,9 @@ void check_permanent_admission_boundaries();
 void check_catalog_headroom();
 void check_commit_outcomes();
 void check_bootstrap_and_intent();
+void check_inflight_object_lease();
+void check_failed_write_charges_once();
+void check_postcommit_reclamation_cannot_undo_commit();
 
 } // namespace
 
@@ -572,6 +575,9 @@ int main() {
     check_catalog_headroom();
     check_commit_outcomes();
     check_bootstrap_and_intent();
+    check_inflight_object_lease();
+    check_failed_write_charges_once();
+    check_postcommit_reclamation_cannot_undo_commit();
     std::printf("conversation_store_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 #endif
@@ -3720,6 +3726,273 @@ void check_permanent_admission_boundaries() {
               "a workspace larger than the preparation ceiling is refused, never deferred");
         check(store.counters().refused_limits > 0, "the permanent refusal is counted as a limit refusal");
         check_eq(store.counters().deferred_publishes, 0, "a permanent refusal is never counted as a deferral");
+        store.close();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Failure paths at the operation boundary: the in-flight object lease, one charge per file, and a commit whose
+// reclamation cannot allocate
+// ---------------------------------------------------------------------------------------------------------------
+
+// A publication that names a chunk it did not create must keep that chunk's file alive until it commits.  Its only
+// owner may be evicted for room *while the manifest that will name the chunk is still being written*: a store that
+// reclaimed those bytes then would commit a manifest describing an object it had already deleted.  The fixture's
+// shared streams are exact multiples of the chunk size where the grown branch is longer, so the prefix really is the
+// same physical object: 1024 token ids are one full 4 KiB chunk and each K/V layer is four.
+void check_inflight_object_lease() {
+    SavedConversation owner = fixture(281, 1024);
+    for (auto& checkpoint : owner.checkpoints) checkpoint.pinned = false;
+    check(!owner.pinned(), "the shared owner carries no pin, so it can be evicted for room");
+    const SavedConversation grown = appended_turn(owner, 8192, 281);
+
+    // (1) The figures the tight root has to meet, measured in their own roots: what the store holds once only the
+    // grown branch remains (its predecessor reclaimed, every chunk the two share kept), and the headroom the store
+    // holds back for its own catalog copy.
+    uint64_t charged_owner = 0;
+    {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, owner, 1, 1, result) &&
+                  result.status == ConversationStorePublishStatus::stored,
+              "the shared owner is stored under a permissive quota");
+        charged_owner = store.disk_charged_bytes();
+        store.close();
+    }
+    uint64_t charged_replaced = 0;
+    uint64_t catalog_reserve = 0;
+    TempRoot probe;
+    {
+        ConversationStore store(options_for(probe.path, uint64_t(1) << 30, 0));
+        check(store.enabled(), "the probe root opens");
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, owner, 1, 1, first) &&
+                  first.status == ConversationStorePublishStatus::stored,
+              "the probe root stores the shared owner");
+        auto image = std::make_shared<SavedConversation>(grown);
+        ConversationStorePublish cover;
+        cover.request_id = 2;
+        cover.generation = 2;
+        cover.supersedes = first.head_id;
+        cover.cover = true;
+        std::string why;
+        check(store.publish(image, cover, why) == kAccepted, "the covering branch is admitted");
+        ConversationStorePublishResult second;
+        check(store.wait_publish(second, 5000), "the covering branch settles");
+        check(second.status == ConversationStorePublishStatus::replaced,
+              "the covering branch replaces the head it was captured from");
+        charged_replaced = store.disk_charged_bytes();
+        catalog_reserve = store.disk_quota_bytes() - store.disk_charged_bytes() - store.disk_available_bytes();
+        check(catalog_reserve > 0, "the store holds back the headroom its own catalog copy needs");
+        check_eq(store.counters().heads, 1, "only the grown branch remains in the probe root");
+        store.close();
+    }
+
+    // (2) The real store.  Its quota is exactly what the grown branch leaves behind once it has reclaimed the owner,
+    // plus that headroom and one block: high enough that keeping every chunk the branch shares with its predecessor
+    // still fits, low enough that the branch cannot finish without evicting the only head that names them.
+    TempRoot tight;
+    ConversationStoreOptions options = options_for(tight.path, 0, 0);
+    options.quota_bytes = charged_replaced + catalog_reserve + 8192;
+    check(options.quota_bytes > charged_owner + catalog_reserve,
+          "the tight quota still admits the shared owner it starts from");
+    uint64_t grown_head = 0;
+    {
+        ConversationStore store(options);
+        check(store.enabled(), "the tight root opens");
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, owner, 1, 1, first) &&
+                  first.status == ConversationStorePublishStatus::stored,
+              "the shared owner is stored in the tight root");
+        auto image = std::make_shared<SavedConversation>(grown);
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why) == kAccepted, "the grown branch is admitted");
+        ConversationStorePublishResult stored;
+        check(store.wait_publish(stored, 5000), "the grown branch settles");
+        check(stored.status == ConversationStorePublishStatus::stored,
+              "the grown branch commits even though it had to evict the only head that owned a chunk it names");
+        check(store.counters().evictions > 0, "the grown branch really did evict the shared owner for room");
+        check(store.healthy(), "evicting for room under a publication is not a fault");
+        grown_head = stored.head_id;
+        store.close();
+    }
+
+    // (3) The consumer-visible consequence: the committed record must still restore.  A store that reclaimed a chunk
+    // its own committed manifest names has no such record left, and the next start says so.
+    {
+        ConversationStore store(options_for(tight.path, uint64_t(1) << 30, 0));
+        check(store.enabled(), "the tight root reopens");
+        check_eq(store.counters().corrupt_records, 0,
+                 "no stored record names an object the store deleted for room");
+        check_eq(store.counters().heads, 1, "the grown branch is still authorized");
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(grown_head, info), "the grown branch keeps its manifest");
+        ConversationStoreQuery query = query_of(grown, 3, 3);
+        std::string why;
+        check(store.demand(query, why), "the grown record's demand is admitted");
+        ConversationStoreRead read;
+        check(store.wait_ready(3, 3, read, 5000), "the grown demand settles");
+        check(read.status == ConversationStoreReadStatus::ready,
+              "the grown record is served, not reported as a miss or a corrupt record");
+        check(read.image && images_equal(*read.image, grown, why), "the grown record restores byte for byte");
+        if (read.image) store.release_read(3, 3);
+        store.close();
+    }
+}
+
+// One failed write, one charge.  A write that fails before its file reaches its own name leaves bytes only in the
+// temporary, and the store must credit that one file exactly once - never a temporary *and* the name it never
+// reached.  The failure is injected at the operation itself (the directory refuses the write), not ahead of it.
+void check_failed_write_charges_once() {
+    // (1) The object write: its temporary directory refuses the write, so the shard never receives the object.
+    {
+        TempRoot root;
+        const std::string path = root.path + "/objects";
+        ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+        check(store.enabled(), "the object-write root opens");
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, fixture(291, 2048), 1, 1, head) &&
+                  head.status == ConversationStorePublishStatus::stored,
+              "the object-write root stores a first branch");
+        const uint64_t charged = store.disk_charged_bytes();
+        const uint64_t reclaimed = store.counters().reclaimed_objects;
+        check(::chmod((path + "/tmp").c_str(), 0500) == 0, "the store's temporary directory can be made unwritable");
+        auto image = std::make_shared<SavedConversation>(fixture(292, 2048));
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why) == kAccepted, "the publication that will fail is admitted");
+        ConversationStorePublishResult failed;
+        check(store.wait_publish(failed, 5000), "the failing publication settles");
+        check(failed.status == ConversationStorePublishStatus::failed, "a refused object write fails the publication");
+        check(!failed.detail.empty(), "the failure carries a reason");
+        check(store.healthy(), "a failed object write is an ordinary failure, not a fault");
+        check_eq(store.counters().reclaimed_objects, reclaimed,
+                 "an object that was never written is never counted as reclaimed");
+        check(store.disk_charged_bytes() >= charged,
+              "a file that was never created is never credited, even when its removal reports exactly that");
+        check(store.counters().pending_delete_bytes > 0,
+              "the one file this attempt may have left stays charged until it is confirmed gone");
+        check(::chmod((path + "/tmp").c_str(), 0700) == 0, "the temporary directory is made writable again");
+        store.close();
+        check_eq(store.disk_charged_bytes(), charged,
+                 "the single charge this attempt took is credited exactly once, when its one file is confirmed gone");
+        check_eq(store.counters().pending_delete_bytes, 0, "the failed write leaves nothing queued for deletion");
+    }
+
+    // (2) The manifest write: its own directory refuses the rename, so the bytes stay in the temporary.  Its objects
+    // were written and are reclaimed normally; only the manifest's single charge must follow the one file there is.
+    {
+        TempRoot root;
+        const std::string path = root.path + "/manifests";
+        ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+        check(store.enabled(), "the manifest-write root opens");
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, fixture(293, 2048), 1, 1, head) &&
+                  head.status == ConversationStorePublishStatus::stored,
+              "the manifest-write root stores a first branch");
+        const uint64_t charged = store.disk_charged_bytes();
+        check(::chmod((path + "/manifests").c_str(), 0500) == 0,
+              "the store's manifest directory can be made unwritable");
+        auto image = std::make_shared<SavedConversation>(fixture(294, 2048));
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why) == kAccepted, "the failing manifest publication is admitted");
+        ConversationStorePublishResult failed;
+        check(store.wait_publish(failed, 5000), "the failing manifest publication settles");
+        check(failed.status == ConversationStorePublishStatus::failed,
+              "a refused manifest rename fails the publication");
+        check(store.healthy(), "a failed manifest rename is an ordinary failure, not a fault");
+        check(store.disk_charged_bytes() >= charged,
+              "the manifest's one charge is never credited twice");
+        check_eq(store.counters().pending_delete_bytes, 0,
+                 "one file, one removal: the name the manifest never reached is not left queued for deletion");
+        check(::chmod((path + "/manifests").c_str(), 0700) == 0,
+              "the manifest directory is made writable again");
+        store.close();
+        check_eq(store.disk_charged_bytes(), charged,
+                 "the manifest's one charge is credited exactly once, when its one file is confirmed gone");
+        check_eq(store.counters().pending_delete_bytes, 0, "the failed manifest write leaves nothing queued");
+    }
+}
+
+// A transaction that has already committed stays committed even when the reclamation that follows it cannot allocate
+// its own batch.  The publication has to learn `stored`, the manifest and every object it authorized have to survive,
+// and the files the reclamation never reached have to stay queued and charged rather than be credited or deleted.
+void check_postcommit_reclamation_cannot_undo_commit() {
+    TempRoot root;
+    const std::string path = root.path + "/commit";
+    SavedConversation first_image = fixture(295, 2048);
+    for (auto& checkpoint : first_image.checkpoints) checkpoint.pinned = false;
+    check(!first_image.pinned(), "the head the ceiling retires carries no pin");
+    ConversationStoreOptions options = options_for(path, uint64_t(1) << 30, 0);
+    options.head_limit = 1;   // the second branch's commit has to retire the first, so reclamation has real work
+    uint64_t second_head = 0;
+    {
+        ConversationStore store(options);
+        check(store.enabled(), "the one-head root opens");
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, first_image, 1, 1, first) &&
+                  first.status == ConversationStorePublishStatus::stored,
+              "the first branch is stored");
+        check_eq(store.counters().heads, 1, "the one-head root holds exactly one head");
+        store.set_publish_fault_for_test("catalog-reclaim");
+        auto image = std::make_shared<SavedConversation>(fixture(296, 2048));
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        std::string why;
+        check(store.publish(image, request, why) == kAccepted, "the second branch is admitted");
+        ConversationStorePublishResult stored;
+        check(store.wait_publish(stored, 5000), "the second branch settles");
+        check(stored.status == ConversationStorePublishStatus::stored,
+              "a reclamation that cannot allocate does not undo the commit it follows");
+        check(store.healthy(), "a failed reclamation is not a fault: the authority was never in doubt");
+        second_head = stored.head_id;
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(second_head, info), "the committed head keeps its authority");
+        check_eq(store.counters().heads, 1, "the ceiling retired the first branch and kept the second");
+        check(store.counters().reclaimed_objects > 0,
+              "the retired branch's objects were still reclaimed, on the pass that follows the commit");
+        // The same record must still be servable in this very instance: what the commit authorized may not have been
+        // handed to the reclaimer as an orphan.
+        const SavedConversation second_image = fixture(296, 2048);
+        ConversationStoreQuery query = query_of(second_image, 3, 3);
+        check(store.demand(query, why), "the committed record's demand is admitted");
+        ConversationStoreRead read;
+        check(store.wait_ready(3, 3, read, 5000), "the committed demand settles");
+        check(read.status == ConversationStoreReadStatus::ready,
+              "the committed record is served, not reported as corrupt");
+        check(read.image && images_equal(*read.image, second_image, why),
+              "the committed record restores byte for byte");
+        if (read.image) store.release_read(3, 3);
+        store.close();
+        check_eq(store.counters().pending_delete_bytes, 0,
+                 "every file the reclamation owed is reclaimed once the pass can run");
+    }
+    {
+        ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
+        check(store.enabled(), "the root reopens after the committed transaction");
+        check_eq(store.counters().corrupt_records, 0,
+                 "the committed manifest and every object it names are still there");
+        check_eq(store.counters().heads, 1, "the committed branch is still authorized");
+        const SavedConversation second_image = fixture(296, 2048);
+        ConversationStoreQuery query = query_of(second_image, 4, 4);
+        std::string why;
+        check(store.demand(query, why), "the committed record's demand is admitted after a restart");
+        ConversationStoreRead read;
+        check(store.wait_ready(4, 4, read, 5000), "the committed demand settles after a restart");
+        check(read.status == ConversationStoreReadStatus::ready, "the committed record is served after a restart");
+        check(read.image && images_equal(*read.image, second_image, why),
+              "the committed record restores byte for byte after a restart");
+        if (read.image) store.release_read(4, 4);
         store.close();
     }
 }

@@ -140,7 +140,9 @@ struct ConversationStoreOptions {
     // The quota covers *everything* this module owns on the device: objects, manifests, the catalog and its
     // temporary, the issuer key, the run-intent marker and any file awaiting deletion.  Every byte is charged at the
     // conservative allocated size (block-rounded, plus one block per file for its directory entry), and a charge is
-    // credited only once the file is confirmed gone.  Nothing is ever admitted against a promise to delete later.
+    // credited only once the file is confirmed gone.  A file a failed write never reached its own name carries its
+    // one charge under the name it did reach - the temporary - and never under both.  Nothing is ever admitted
+    // against a promise to delete later.
     uint64_t quota_bytes = uint64_t(128) << 30;    // one shared physical quota for every layout
     // Filesystem floor, resampled before every reservation.  A failed or zero sample refuses the reservation: an
     // unreadable filesystem is never treated as an empty one.
@@ -326,6 +328,13 @@ struct ConversationStoreRead {
 // and to have been captured in this epoch, and adopts whole aligned chunks only when its stream identity maps to the
 // same physical identity as the outgoing image's.  An unverified or differently mapped donor is ignored, never
 // guessed at, and every donor is protected from eviction while the publication is in flight.
+//
+// Protection is not limited to the named heads.  Every object the publication will *name without creating* - an
+// adopted donor chunk, a chunk the outgoing image reproduces byte for byte, or a complete file adopted from an
+// accounted orphan - is leased for the life of the attempt: a head that happens to be its only owner may be evicted
+// for room while the manifest is still being written, and the file must survive until the transaction settles, or the
+// committed manifest would name an object the store has already deleted and credited.  The lease ends with the
+// attempt: an object no retained head and no other publication still names is then reclaimable again.
 struct ConversationStoreReuse {
     uint64_t head_id = 0;
     ConversationStoreStreamId stream;
@@ -648,6 +657,8 @@ public:
     //   "catalog-rename"  the catalog rename fails: nothing durable changed
     //   "catalog-sync"    the rename succeeded and the root directory flush failed: durability is uncertain
     //   "catalog-apply"   the rename succeeded and the apply could not allocate: durability is uncertain
+    //   "catalog-reclaim" the transaction committed and the reclamation that follows it could not allocate: the
+    //                     commit stands, nothing is deleted or credited, and the files stay queued and charged
     //   "intent-unlink-sync"  the flush after removing the run-intent marker failed (it is then re-armed)
     //   "intent-rearm-sync"   the flush of the re-armed run-intent marker failed
     // An unrecognised step is never taken, so arming one costs nothing.

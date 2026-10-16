@@ -153,12 +153,17 @@ struct WriterWorkspace {
 
     // Every structure that is live while one chunk is read and written, kept apart from the manifest and the catalog
     // plan because those overlap with it rather than replace it: the chunk records, the referenced and charged object
-    // maps' nodes, the new-object map's nodes, the persistent index's entries, the head's own object-list slots and
-    // the pending-file entries a write adds.
+    // maps' nodes, the new-object map's nodes, the object-lease map's nodes, the attempt's own lease list, the
+    // persistent index's entries, the head's own object-list slots and the pending-file entries a write adds.
     uint64_t chunk_state() const {
         uint64_t state = sat_mul(chunks, sizeof(conversation_store_detail::ChunkRecord) + kAllocSlackBytes);
-        // Every prospective chunk may be a distinct object: its node in the referenced/charged object maps, its node
-        // in the new-object map, its entry in the persistent index and its slot in the head's own object list.
+        // Every prospective chunk may be a distinct object.  An object this attempt *creates* spends a node in each
+        // of the two new-object maps beside its referenced-map node; an object it merely *names* - a deduplicated
+        // chunk, an adopted donor interval or a file revived from an accounted orphan - spends no new-object node and
+        // charges nothing, and holds its place in the object-lease map and in this attempt's own lease list instead
+        // (see reclaim_pending()).  A chunk is one or the other, never both, so the four-node and two-Digest budget
+        // below already covers either side of that choice: at most two of the nodes are ever spent on one object's
+        // write phase, and the persistent index contributes the last.
         state = sat_add(state, sat_mul(chunks, 4 * conversation_store_detail::kMapNodeBytes + 2 * sizeof(Digest) + 40 +
                                                  2 * kAllocSlackBytes));
         // Every object this attempt writes is accounted before it is written, by name and by shard.
@@ -636,6 +641,16 @@ struct ConversationStore::Impl {
     };
     std::map<Digest, ObjectState> objects;                  // every object the catalog authorizes
     std::map<uint64_t, std::vector<Digest>> head_objects;   // head id -> the objects its manifest names
+    // In-flight publication leases: every object a publication will *reference without creating* is pinned here from
+    // the instant the publication finds it until that transaction settles.  A deduplicated chunk is usually owned by
+    // some retained head, and make_room() may evict that head - its sole owner - while the publication that names it
+    // is still writing.  Reclamation treats a leased object as referenced (see reclaim_pending()), which is what
+    // keeps a file this publication will name from being deleted and credited before it commits.
+    struct ObjectLease {
+        uint64_t charge = 0;    // the object's own recorded charge, credited only once the file is confirmed gone
+        uint32_t users = 0;     // publications still referencing it
+    };
+    std::map<Digest, ObjectLease> object_leases;
     std::map<uint64_t, uint64_t> head_manifest_bytes;       // head id -> its manifest's allocated charge
     std::map<uint64_t, uint32_t> head_leases;               // head id -> images still using it
     std::map<uint64_t, uint64_t> head_recency;              // RAM-only eviction recency (published order is fallback)
@@ -719,6 +734,9 @@ struct ConversationStore::Impl {
         // this attempt created may be referenced by either catalog, so none of them may be deleted.
         bool retain_files = false;
         std::vector<PendingFile> orphans; // files this attempt has created and not yet authorized
+        // The objects this attempt references without creating, in the order it took their leases: released once the
+        // transaction settles, so an abandoned attempt's objects become reclaimable again.
+        std::vector<Digest> leased_objects;
     };
     std::shared_ptr<PublishJob> publishing;
     std::deque<ConversationStorePublishResult> publish_done;
@@ -780,6 +798,13 @@ struct ConversationStore::Impl {
     void latch_fault_locked(const std::string& why);
     void recount_metadata_locked();
     bool revive_object_locked(const Digest& object);
+    // The charge an accounted orphan object already carries, or 0 when it is not queued for deletion.
+    uint64_t pending_object_charge_locked(const Digest& object) const;
+    // Pins one object a publication will reference without creating, for as long as the transaction is in flight.
+    void lease_object_locked(const std::shared_ptr<PublishJob>& job, const Digest& object, uint64_t charge);
+    // Drops every lease one settled publication holds.  An object left unreferenced and not already queued becomes
+    // reclaimable again (the file really does exist); a faulted store queues nothing, because no file may be deleted.
+    void release_object_leases(const std::shared_ptr<PublishJob>& job);
     uint64_t retire_head_locked(uint64_t head_id);
     void touch_recency_locked(uint64_t head_id);
     uint64_t recency_of_locked(const CatalogHead& head) const;
@@ -1441,6 +1466,63 @@ bool ConversationStore::Impl::revive_object_locked(const Digest& object) {
     return false;
 }
 
+uint64_t ConversationStore::Impl::pending_object_charge_locked(const Digest& object) const {
+    for (const auto& file : pending_files)
+        if (file.where == Where::objects && file.object == object) return file.charge;
+    return 0;
+}
+
+void ConversationStore::Impl::lease_object_locked(const std::shared_ptr<PublishJob>& job, const Digest& object,
+                                                 uint64_t charge) {
+    auto entry = object_leases.find(object);
+    if (entry == object_leases.end()) {
+        ObjectLease lease;
+        lease.charge = charge;
+        entry = object_leases.emplace(object, lease).first;
+        job->leased_objects.push_back(object);
+    }
+    if (entry->second.charge == 0) entry->second.charge = charge;
+    entry->second.users += 1;
+}
+
+// The attempt's leases end here, after the transaction has settled.  Every object it referenced without creating is
+// dropped from the lease table; one that no retained head and no other publication still names is queued for deletion
+// exactly once, at the charge its own file carries, so the credit follows the file and nothing is credited twice.
+void ConversationStore::Impl::release_object_leases(const std::shared_ptr<PublishJob>& job) {
+    std::lock_guard<std::mutex> guard(mutex);
+    for (const Digest& object : job->leased_objects) {
+        const auto lease = object_leases.find(object);
+        if (lease == object_leases.end()) continue;
+        if (lease->second.users > 1) {
+            lease->second.users -= 1;
+            continue;
+        }
+        const uint64_t charge = lease->second.charge;
+        object_leases.erase(lease);
+        // A faulted or uncertain store may not delete or credit anything: the catalog that would say which file is
+        // authorized is exactly the one this process cannot read.  The lease goes; the file and its charge stay.
+        if (faulted) continue;
+        const auto state = objects.find(object);
+        if (state != objects.end() && state->second.refs != 0) continue;   // still owned by a retained head
+        if (pending_object_charge_locked(object) != 0) continue;           // already queued for deletion
+        // A record that cannot even be built stays unqueued and charged: the next start accounts the file from the
+        // directory listing, and nothing is ever credited for a file that was not confirmed gone.
+        try {
+            PendingFile file;
+            file.where = Where::objects;
+            file.object = object;
+            file.shard = sha256_hex(object).substr(0, 2);
+            file.name = sha256_hex(object);
+            file.charge = state != objects.end() ? state->second.bytes : charge;
+            reclaimable += file.charge;
+            pending_files.push_back(std::move(file));
+        } catch (...) {
+            continue;
+        }
+    }
+    job->leased_objects.clear();
+}
+
 uint64_t ConversationStore::Impl::retire_head_locked(uint64_t head_id) {
     PendingFile manifest;
     bool have_manifest = false;
@@ -1824,6 +1906,9 @@ void ConversationStore::Impl::reclaim_pending() {
         if (faulted) return;
         std::vector<PendingFile> keep;
         keep.reserve(pending_files.size());
+        // Every move below stays inside the room reserved here, so a failed allocation can neither lose a pending
+        // record between the queue and the batch nor leave the two lists describing the same file twice.
+        batch.reserve(std::min<size_t>(pending_files.size(), kMaxReclaimPerPass));
         for (auto& file : pending_files) {
             // A file whose head still has an open hold or a handed-out image is not deleted yet: a reader's
             // descriptors may still name it, and its bytes are still in use.
@@ -1840,13 +1925,18 @@ void ConversationStore::Impl::reclaim_pending() {
         pending_files = std::move(keep);
     }
     std::vector<PendingFile> retry;
+    retry.reserve(batch.size());
     for (PendingFile& file : batch) {
         if (file.where == Where::objects) {
             bool referenced = false;
             {
                 std::lock_guard<std::mutex> guard(mutex);
                 const auto state = objects.find(file.object);
-                referenced = state != objects.end() && state->second.refs != 0;
+                // A lease is a reference: an in-flight publication has already named this object in the manifest it
+                // is writing, so its file may not be deleted and credited even though no *committed* head names it
+                // any more.  Keeping the file is what a later apply (or the lease's release) settles.
+                referenced = (state != objects.end() && state->second.refs != 0) ||
+                             object_leases.count(file.object) != 0;
             }
             if (referenced) {
                 // Referenced again: the file is needed, so the pending record goes away and its charge stays.
@@ -2159,7 +2249,17 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         return CommitOutcome::uncertain;
     }
     // Deletions happen here: the authority that named these files is already durable, and the mutex is released.
-    reclaim_pending();
+    // The transaction is committed at this point, so a reclamation that cannot allocate its own batch must never be
+    // reported as a transaction failure: the caller would then treat the manifest and the objects this commit just
+    // authorized as orphans and queue them for deletion.  A failure here leaves every pending file pending and
+    // charged - the safe direction - and the next pass, or the next start, reclaims them.
+    try {
+        if (take_fault("catalog-reclaim")) throw std::bad_alloc();
+        reclaim_pending();
+    } catch (...) {
+        // Nothing durable changes: the committed catalog is already the authority and no file was credited for a
+        // deletion that did not happen.
+    }
     return CommitOutcome::durable_applied;
 }
 
@@ -2996,6 +3096,11 @@ void ConversationStore::Impl::writer_body() {
                 escaped = true;
                 escape_detail = "the publication aborted unexpectedly; the authority is not trusted";
             }
+            // The attempt's in-flight object leases end here, whatever it settled as: an object it named but did not
+            // create becomes reclaimable again only if no retained head and no other publication still names it (and
+            // a faulted store queues nothing at all, because no file may be deleted against an unreadable catalog).
+            // Released before the pass below, so a file this attempt abandoned is reclaimed in the same pass.
+            release_object_leases(job);
             // This helper acquires the coordinator lock itself.  When the catalog transaction could not confirm its
             // own durability, every file this attempt created may be named by either catalog and must be retained:
             // nothing is queued, nothing is deleted, nothing is credited, and the charge stays where it is.
@@ -3065,9 +3170,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         out.detail = detail;
     };
     // Every file this attempt creates is recorded here first, so an abandoned (or escaped) attempt can never lose
-    // track of a charged file.
+    // track of a charged file.  The index is returned so a write that fails *before* the file reaches its own name
+    // can move that one record to the temporary it really left behind, instead of charging both names.
     const auto note_file = [&job](Where where, const std::string& name, uint64_t charge, const Digest& object,
-                                  const std::string& shard) {
+                                  const std::string& shard) -> size_t {
         PendingFile file;
         file.where = where;
         file.name = name;
@@ -3075,6 +3181,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         file.object = object;
         file.shard = shard;
         job->orphans.push_back(std::move(file));
+        return job->orphans.size() - 1;
     };
 
     Digest bucket{};
@@ -3218,6 +3325,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     // may reallocate past the reserved workspace, and a chunk vector that grew geometrically would do exactly that.
     // (The two per-chunk maps have no reserve: their node growth is what the reservation counted.)
     job->orphans.reserve(size_t(peak_chunks));
+    job->leased_objects.reserve(size_t(peak_chunks));
 
     for (const auto& stream : layout.streams) {
         const ConversationStoreStreamId id = stream.info.id;
@@ -3259,11 +3367,21 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                     }
                     known = charged_objects.count(object) != 0 || objects.count(object) != 0;
                     if (known) counters.dedup_chunks++;
+                    const bool ours = known && charged_objects.count(object) != 0;
+                    uint64_t lease_charge = 0;
                     if (!known) {
                         // A complete file for this content address may exist as an accounted orphan: adopting it
                         // rather than rewriting it keeps its charge honest and keeps it out of the reclaimer's way.
+                        lease_charge = pending_object_charge_locked(object);
                         known = revive_object_locked(object);
+                    } else if (!ours) {
+                        const auto state = objects.find(object);
+                        lease_charge = state == objects.end() ? 0 : state->second.bytes;
                     }
+                    // An object this attempt will name but did not create is leased until the transaction settles:
+                    // the head that owns it may be evicted - and the object reclaimed - by a later make_room() while
+                    // this manifest is still being written.
+                    if (known && !ours) lease_object_locked(job, object, lease_charge);
                 }
                 if (!known) {
                     const uint64_t charge = allocated_charge(size);
@@ -3281,13 +3399,19 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                         std::lock_guard<std::mutex> guard(mutex);
                         charged += charge;
                     }
-                    note_file(Where::objects, sha256_hex(object), charge, object, sha256_hex(object).substr(0, 2));
+                    const std::string object_name = sha256_hex(object);
+                    const size_t object_slot =
+                        note_file(Where::objects, object_name, charge, object, object_name.substr(0, 2));
                     const std::string scratch_name = "ob-" + temp_name();
                     PendingFile scratch;
                     if (!write_object_file(dirs, scratch_name, object, buffer.data(), size_t(size), scratch, why)) {
+                        // The object is charged once, so the attempt carries exactly one record for the file that
+                        // may really exist.  The scratch is reported whenever the bytes never reached their shard
+                        // (a failed write, or a rename that did not happen), and it is empty when they did: there
+                        // the destination record already names the one file, whatever the shard's flush then did.
                         if (!scratch.name.empty()) {
                             scratch.charge = charge;
-                            job->orphans.push_back(std::move(scratch));
+                            job->orphans[object_slot] = std::move(scratch);
                         }
                         abandon(ConversationStorePublishStatus::failed, why);
                         return false;
@@ -3363,8 +3487,21 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                 if (usable) {
                     // Every adopted object must still be present and authorized, or the interval is not usable.
                     std::lock_guard<std::mutex> guard(mutex);
+                    bool present = true;
                     for (size_t i = first; i <= last; ++i)
-                        if (objects.count(source_stream->chunks[i].object) == 0) usable = false;
+                        if (objects.count(source_stream->chunks[i].object) == 0) {
+                            present = false;
+                            break;
+                        }
+                    usable = present;
+                    // An adopted object is named by the new manifest without being created here, so it takes the
+                    // same in-flight lease a deduplicated chunk does: a later make_room() may otherwise evict the
+                    // head that owns it and reclaim the file this manifest is about to authorize.
+                    if (usable)
+                        for (size_t i = first; i <= last; ++i) {
+                            const auto state = objects.find(source_stream->chunks[i].object);
+                            if (state != objects.end()) lease_object_locked(job, state->first, state->second.bytes);
+                        }
                 }
                 if (usable) {
                     if (!emit(covered_until, entry->offset)) break;
@@ -3459,7 +3596,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             std::lock_guard<std::mutex> guard(mutex);
             charged += charge;
         }
-        note_file(Where::manifests, manifest_name, charge, Digest{}, std::string());
+        const size_t manifest_slot = note_file(Where::manifests, manifest_name, charge, Digest{}, std::string());
         std::string temp = temp_name();
         bool written = false;
         for (uint32_t attempt = 0; attempt < kTempNameAttempts && !written; ++attempt) {
@@ -3471,17 +3608,26 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             temp = temp_name();
             why.clear();
         }
-        if (written && ::renameat(dirs.tmp, temp.c_str(), dirs.manifests, manifest_name.c_str()) != 0) {
-            why = std::string("cannot publish the manifest: ") + std::strerror(errno);
-            written = false;
+        bool renamed = false;
+        if (written) {
+            if (::renameat(dirs.tmp, temp.c_str(), dirs.manifests, manifest_name.c_str()) != 0) {
+                why = std::string("cannot publish the manifest: ") + std::strerror(errno);
+            } else {
+                renamed = true;
+            }
         }
-        if (written) written = fsync_dir(dirs.manifests, "manifests", why);
-        if (!written) {
-            PendingFile scratch;
-            scratch.where = Where::tmp;
-            scratch.name = temp;
-            scratch.charge = charge;
-            job->orphans.push_back(std::move(scratch));
+        // The rename is what moves the file, so a flush the rename already outran leaves the manifest under its own
+        // name: the destination record stands and the temporary it left behind is not charged a second time.
+        if (renamed && !fsync_dir(dirs.manifests, "manifests", why)) {
+            fail(ConversationStorePublishStatus::failed,
+                 why.empty() ? "the manifest was published but its directory could not be flushed" : why);
+            return;
+        }
+        if (!renamed) {
+            // The bytes never reached the manifest's own name (a failed write, or a rename that did not happen), so
+            // the one charge this attempt took follows the temporary name instead of the name it never reached.
+            job->orphans[manifest_slot].where = Where::tmp;
+            job->orphans[manifest_slot].name = temp;
             fail(ConversationStorePublishStatus::failed, why.empty() ? "the manifest could not be written" : why);
             return;
         }
