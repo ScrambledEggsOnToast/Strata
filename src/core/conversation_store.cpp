@@ -28,8 +28,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cinttypes>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <dirent.h>
@@ -103,6 +107,128 @@ uint64_t manifest_read_cap(uint64_t recorded, const ConversationStoreLimits& lim
 // every directory that changed was flushed; `uncertain` means the rename happened but its durability could not be
 // confirmed, so nothing may be deleted, credited or reused until a restart re-reads the authority.
 enum class CommitOutcome : uint8_t { unchanged = 0, durable_applied = 1, uncertain = 2 };
+
+// Private, opt-in read diagnostics. A batch belongs to one mutex scope (or one reader iteration), not a background
+// logger. Callers declare it before their lock so destruction emits only after unlock. No query, scope, path, digest,
+// error detail or image bytes enter a record. IDs are native store identities, not frontend request identities.
+// All times are steady-clock nanoseconds. admit_ns owns a peak/slot; start_ns enters read_body; finish_ns is sampled
+// after that allocation frame unwinds, before reacquiring the catalog mutex. A missing start means the body has not
+// run; a missing finish means it has not unwound. Queue, dispatch, body-lock wait, completion-lock wait and ready
+// residence are separate. materialize_ns is the logical body's wall time less its catalog-lock acquisition waits:
+// filesystem/page-cache access, hashing, copying and restore work, never a claim of physical disk latency.
+uint64_t store_timing_ns() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// A read's existing catalog lock, with opt-in acquisition wait accounting. The counter is updated only after the
+// mutex is held. This introduces neither another lock nor a diagnostic clock call on the disabled path.
+class StoreReadTimedLock {
+    uint64_t started_;
+    std::lock_guard<std::mutex> guard_;
+public:
+    StoreReadTimedLock(std::mutex& mutex, bool timing, uint64_t& waited)
+        : started_(timing ? store_timing_ns() : 0), guard_(mutex) {
+        if (timing) waited += store_timing_ns() - started_;
+    }
+};
+
+std::atomic<uint64_t> store_read_attempt{0}; // process-wide: a retired descriptor may overlap its replacement
+
+struct StoreReadTrace {
+    const char* event;
+    const char* reason;
+    ConversationStoreReadStatus status;
+    uint64_t ts_ns, request_id, generation, attempt_id, previous_attempt_id, head, cut, epoch;
+    uint64_t call_ns, call_lock_wait_ns, enqueue_ns, admit_ns, start_ns, finish_ns, ready_ns, ready_end_ns;
+    uint64_t body_lock_wait_ns, completion_lock_wait_ns;
+    uint64_t peak_bytes, reserved_bytes, lease_bytes, resident_bytes, budget_bytes, prepared_bytes;
+    uint64_t preparation_bytes, metadata_limit, incoming, max_reads, queued, descriptors, wait_mask;
+    uint64_t demand, active, holds_slot, cancelled, io_attempted, bytes_read;
+};
+
+struct StoreReadTraceBatch {
+    // Deliberately fixed and allocation-free. Ordinary operations produce at most a few records per descriptor.
+    // An unusually large configured request set reports loss explicitly; an overflow is not evidence of no work.
+    StoreReadTrace records[64];
+    size_t count = 0;
+    uint64_t dropped = 0;
+    uint64_t call_ns = 0, call_lock_wait_ns = 0; // this API call only; workers have no caller lock interval
+
+    void add(const StoreReadTrace& record) {
+        if (count < sizeof records / sizeof records[0]) {
+            records[count] = record;
+            records[count].call_ns = call_ns;
+            records[count].call_lock_wait_ns = call_lock_wait_ns;
+            ++count;
+        } else ++dropped;
+    }
+    void emit() {
+        if (!count && !dropped) return; // disabled: no clocks, formatting, allocations or I/O
+        const int saved_errno = errno;
+        for (size_t i = 0; i < count; ++i) {
+            const auto& r = records[i];
+            const uint64_t queue_ns = r.admit_ns ? r.admit_ns - r.enqueue_ns : 0;
+            const uint64_t dispatch_ns = r.admit_ns && (r.start_ns || r.finish_ns)
+                ? (r.start_ns ? r.start_ns : r.finish_ns) - r.admit_ns : 0;
+            const uint64_t read_ns = r.finish_ns && r.start_ns ? r.finish_ns - r.start_ns : 0;
+            const uint64_t materialize_ns = read_ns - std::min(read_ns, r.body_lock_wait_ns);
+            const uint64_t residence = r.ready_ns ? (r.ready_end_ns ? r.ready_end_ns : r.ts_ns) - r.ready_ns : 0;
+            char line[2048];
+            const int length = std::snprintf(line, sizeof line,
+                "store_read event=%s reason=%s status=%s ts_ns=%" PRIu64
+                " request_id=%" PRIu64 " generation=%" PRIu64 " attempt_id=%" PRIu64
+                " previous_attempt_id=%" PRIu64 " head=%" PRIu64 " cut=%" PRIu64 " epoch=%" PRIu64
+                " call_ns=%" PRIu64 " call_lock_wait_ns=%" PRIu64
+                " enqueue_ns=%" PRIu64 " admit_ns=%" PRIu64 " start_ns=%" PRIu64
+                " finish_ns=%" PRIu64 " ready_ns=%" PRIu64 " ready_end_ns=%" PRIu64
+                " queue_ns=%" PRIu64 " dispatch_ns=%" PRIu64 " read_ns=%" PRIu64
+                " body_lock_wait_ns=%" PRIu64 " materialize_ns=%" PRIu64 " completion_lock_wait_ns=%" PRIu64
+                " ready_residence_ns=%" PRIu64
+                " peak_bytes=%" PRIu64 " reserved_bytes=%" PRIu64 " lease_bytes=%" PRIu64
+                " resident_bytes=%" PRIu64 " budget_bytes=%" PRIu64 " prepared_bytes=%" PRIu64
+                " preparation_bytes=%" PRIu64 " metadata_limit=%" PRIu64 " incoming=%" PRIu64
+                " max_reads=%" PRIu64 " queued=%" PRIu64 " descriptors=%" PRIu64 " wait_mask=%" PRIu64
+                " demand=%" PRIu64 " active=%" PRIu64 " holds_slot=%" PRIu64 " cancelled=%" PRIu64
+                " io_attempted=%" PRIu64 " bytes_read=%" PRIu64 "\n",
+                r.event, r.reason, conversation_store_read_status_name(r.status), r.ts_ns,
+                r.request_id, r.generation, r.attempt_id, r.previous_attempt_id, r.head, r.cut, r.epoch,
+                r.call_ns, r.call_lock_wait_ns, r.enqueue_ns, r.admit_ns, r.start_ns, r.finish_ns, r.ready_ns, r.ready_end_ns,
+                queue_ns, dispatch_ns, read_ns, r.body_lock_wait_ns, materialize_ns, r.completion_lock_wait_ns, residence,
+                r.peak_bytes, r.reserved_bytes, r.lease_bytes, r.resident_bytes, r.budget_bytes, r.prepared_bytes,
+                r.preparation_bytes, r.metadata_limit, r.incoming, r.max_reads, r.queued, r.descriptors, r.wait_mask,
+                r.demand, r.active, r.holds_slot, r.cancelled, r.io_attempted, r.bytes_read);
+            if (length > 0 && size_t(length) < sizeof line) write_line(line, size_t(length));
+        }
+        if (dropped) {
+            char line[128];
+            const int length = std::snprintf(line, sizeof line, "store_read event=trace_overflow dropped=%" PRIu64 "\n",
+                                             dropped);
+            if (length > 0 && size_t(length) < sizeof line) write_line(line, size_t(length));
+        }
+        count = 0;
+        dropped = 0;
+        errno = saved_errno;
+    }
+    void flush(std::unique_lock<std::mutex>& lock) {
+        if (!count && !dropped) return;
+        lock.unlock();
+        emit();
+        lock.lock();
+    }
+    ~StoreReadTraceBatch() { emit(); }
+
+private:
+    static void write_line(const char* line, size_t bytes) {
+        while (bytes) {
+            const ssize_t written = ::write(STDERR_FILENO, line, bytes);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) return;
+            line += written;
+            bytes -= size_t(written);
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // POSIX helpers.  Each is exact or fails with a reason, none throws, and all are descriptor relative: no path is
@@ -609,6 +735,7 @@ struct ConversationStore::Impl {
     std::string root;                 // diagnostics only: every access goes through `dirs`
     RootDirs dirs;
     uint32_t reader_threads = 1;
+    bool read_timing = false;          // STRATA_STORE_TIMING=1, sampled once before workers start
 
     // ---- authority ----
     std::mutex mutex;
@@ -704,6 +831,15 @@ struct ConversationStore::Impl {
         uint64_t payload_bytes = 0;
         std::shared_ptr<const SavedConversation> image;
         std::string detail;
+        // Diagnostic scalars only. They do not participate in cancellation, admission or accounting.
+        uint64_t trace_attempt = 0, trace_previous = 0;
+        uint64_t trace_enqueue = 0, trace_admit = 0, trace_start = 0, trace_finish = 0, trace_ready = 0;
+        uint64_t trace_ready_end = 0; // adoption/retirement ends ready residence; caller lease time is not ready time
+        uint64_t trace_body_lock_wait = 0, trace_completion_lock_wait = 0;
+        uint64_t trace_wait_mask = UINT64_MAX;
+        const char* trace_retire_reason = "none";
+        bool trace_io_attempted = false;
+        uint64_t trace_bytes_read = 0;
     };
     std::vector<std::shared_ptr<ReadJob>> jobs;      // queued, active, ready or handed out (bounded)
     std::deque<std::shared_ptr<ReadJob>> queue;      // waiting for the allowance and a slot (demand before prefetch)
@@ -880,13 +1016,25 @@ struct ConversationStore::Impl {
                          std::vector<ConversationStoreMatch>& out) const;
 
     // Read pipeline.  Settlement is idempotent and every path funnels through it.
-    bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why);
-    bool refresh_read_locked(const std::shared_ptr<ReadJob>& job);
-    void settle_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail);
+    bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why,
+                          StoreReadTraceBatch& trace);
+    bool refresh_read_locked(const std::shared_ptr<ReadJob>& job, StoreReadTraceBatch& trace);
+    void settle_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail,
+                           StoreReadTraceBatch& trace);
     void retire_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status,
-                           const std::string& detail);
-    void retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail);
-    void revoke_speculation_locked(bool because_of_demand = true);
+                           const std::string& detail, StoreReadTraceBatch& trace, const char* reason);
+    void retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail,
+                             StoreReadTraceBatch& trace, const char* reason);
+    void revoke_speculation_locked(StoreReadTraceBatch& trace, bool because_of_demand = true);
+    StoreReadTrace trace_state_locked(const char* event, const char* reason, ConversationStoreReadStatus status) const;
+    uint64_t trace_wait_locked(const ReadJob& job) const;
+    void trace_job_locked(StoreReadTraceBatch& trace, const ReadJob& job, const char* event, const char* reason,
+                          ConversationStoreReadStatus status = ConversationStoreReadStatus::none) const;
+    void trace_refusal_locked(StoreReadTraceBatch& trace, const ConversationStoreQuery& query, bool demand,
+                              ConversationStoreReadStatus status, const char* reason, uint64_t previous = 0,
+                              uint64_t head = 0, uint64_t cut = 0, uint64_t peak = 0) const;
+    void trace_begin_locked(ReadJob& job, uint64_t previous = 0);
+    void trace_waiters_locked(StoreReadTraceBatch& trace);
     void release_reservation_locked(const std::shared_ptr<ReadJob>& job);
     void release_lease_locked(const std::shared_ptr<ReadJob>& job);
     void release_slot_locked(const std::shared_ptr<ReadJob>& job);
@@ -894,7 +1042,8 @@ struct ConversationStore::Impl {
     void erase_job_locked(const std::shared_ptr<ReadJob>& job);
     void free_job_prep_locked(const std::shared_ptr<ReadJob>& job);
     void release_job_preparation_locked(const std::shared_ptr<ReadJob>& job);
-    bool deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation, bool specific);
+    bool deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation, bool specific,
+                        StoreReadTraceBatch& trace);
     void push_publish_result_locked(ConversationStorePublishResult&& result);
 
     void writer_body();
@@ -911,7 +1060,7 @@ struct ConversationStore::Impl {
         uint64_t payload_bytes = 0;
         uint32_t stages = 0;
     };
-    void read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out);
+    void read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out, StoreReadTraceBatch& trace);
 
     bool open_root(std::string& why);
     // Reads and decodes the durable catalog and decides this domain's epoch.  It may not write anything: the first
@@ -2382,6 +2531,114 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
 // never loses its slot to a prefetch; a prefetch is speculative and is refused or revoked instead.
 // ---------------------------------------------------------------------------------------------------------------
 
+StoreReadTrace ConversationStore::Impl::trace_state_locked(const char* event, const char* why,
+                                                           ConversationStoreReadStatus status) const {
+    StoreReadTrace record{};
+    record.event = event;
+    record.reason = why;
+    record.status = status;
+    record.ts_ns = store_timing_ns();
+    record.epoch = epoch;
+    record.resident_bytes = resident_locked();
+    record.budget_bytes = ram_budget;
+    record.preparation_bytes = preparation_locked();
+    record.metadata_limit = options.metadata_bytes;
+    record.incoming = incoming;
+    record.max_reads = options.max_reads;
+    record.queued = queue.size();
+    record.descriptors = jobs.size();
+    return record;
+}
+
+uint64_t ConversationStore::Impl::trace_wait_locked(const ReadJob& job) const {
+    if (job.active || job.status != ConversationStoreReadStatus::none) return 0;
+    // Independent blockers, not a guessed cause or a sum of durations: 1 = no published allowance,
+    // 2 = suspended, 4 = incoming slots held, 8 = resident ledger + peak cannot fit, 16 = reader workers occupied.
+    // Count real active owners, including retiring workers; ready/handed leases occupy slots but not workers.
+    uint64_t active_readers = 0;
+    for (const auto& candidate : jobs)
+        if (candidate->active) ++active_readers;
+    return uint64_t(ram_budget == 0) | (uint64_t(admission_suspended) << 1) |
+           (uint64_t(incoming >= options.max_reads) << 2) |
+           (uint64_t(ram_budget != 0 && sat_add(resident_locked(), job.peak_bytes) > ram_budget) << 3) |
+           (uint64_t(active_readers >= reader_threads) << 4);
+}
+
+void ConversationStore::Impl::trace_job_locked(StoreReadTraceBatch& trace, const ReadJob& job, const char* event,
+                                               const char* why, ConversationStoreReadStatus status) const {
+    if (!read_timing) return;
+    auto record = trace_state_locked(event, why,
+        status == ConversationStoreReadStatus::none ? job.status : status);
+    record.request_id = job.query.request_id;
+    record.generation = job.query.generation;
+    record.attempt_id = job.trace_attempt;
+    record.previous_attempt_id = job.trace_previous;
+    record.head = job.head_id;
+    record.cut = job.tokens;
+    record.epoch = job.epoch_at_admission;
+    record.enqueue_ns = job.trace_enqueue;
+    record.admit_ns = job.trace_admit;
+    record.start_ns = job.trace_start;
+    record.finish_ns = job.trace_finish;
+    record.ready_ns = job.trace_ready;
+    record.ready_end_ns = job.trace_ready_end;
+    record.body_lock_wait_ns = job.trace_body_lock_wait;
+    record.completion_lock_wait_ns = job.trace_completion_lock_wait;
+    record.peak_bytes = job.peak_bytes;
+    record.reserved_bytes = job.reserved_bytes;
+    record.lease_bytes = job.lease_bytes;
+    record.prepared_bytes = job.prepared_bytes;
+    record.wait_mask = trace_wait_locked(job);
+    record.demand = job.demand;
+    record.active = job.active;
+    record.holds_slot = job.holds_slot;
+    record.cancelled = job.cancelled.load();
+    record.io_attempted = job.trace_io_attempted;
+    record.bytes_read = job.trace_bytes_read;
+    trace.add(record);
+}
+
+void ConversationStore::Impl::trace_refusal_locked(StoreReadTraceBatch& trace, const ConversationStoreQuery& query,
+                                                   bool demand, ConversationStoreReadStatus status, const char* why,
+                                                   uint64_t previous, uint64_t head, uint64_t cut, uint64_t peak) const {
+    if (!read_timing) return;
+    auto record = trace_state_locked("admission_refused", why, status);
+    record.request_id = query.request_id;
+    record.generation = query.generation;
+    record.attempt_id = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
+    record.previous_attempt_id = previous;
+    record.demand = demand;
+    record.head = head;
+    record.cut = cut;
+    record.peak_bytes = peak;
+    trace.add(record);
+}
+
+void ConversationStore::Impl::trace_begin_locked(ReadJob& job, uint64_t previous) {
+    if (!read_timing) return;
+    job.trace_attempt = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
+    job.trace_previous = previous;
+    job.trace_enqueue = store_timing_ns();
+    job.trace_admit = job.trace_start = job.trace_finish = job.trace_ready = 0;
+    job.trace_ready_end = 0;
+    job.trace_body_lock_wait = job.trace_completion_lock_wait = 0;
+    job.trace_io_attempted = false;
+    job.trace_bytes_read = 0;
+    job.trace_retire_reason = "none";
+    job.trace_wait_mask = trace_wait_locked(job);
+}
+
+void ConversationStore::Impl::trace_waiters_locked(StoreReadTraceBatch& trace) {
+    if (!read_timing) return;
+    for (const auto& job : queue) {
+        if (job->cancelled || job->released) continue;
+        const uint64_t mask = trace_wait_locked(*job);
+        if (mask == job->trace_wait_mask) continue;
+        job->trace_wait_mask = mask;
+        trace_job_locked(trace, *job, "wait", "resources");
+    }
+}
+
 void ConversationStore::Impl::release_reservation_locked(const std::shared_ptr<ReadJob>& job) {
     if (!job->reserved_bytes) return;
     ram_held -= std::min(ram_held, job->reserved_bytes);
@@ -2442,7 +2699,8 @@ void ConversationStore::Impl::erase_job_locked(const std::shared_ptr<ReadJob>& j
 }
 
 void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& job,
-                                                ConversationStoreReadStatus status, std::string detail) {
+                                                ConversationStoreReadStatus status, std::string detail,
+                                                StoreReadTraceBatch& trace) {
     if (job->status != ConversationStoreReadStatus::none) return;   // exactly one settlement per job
     job->active = false;
     job->status = status;
@@ -2460,7 +2718,7 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
     }
     if (job->refresh_on_completion) {
         job->refresh_on_completion = false;
-        if (refresh_read_locked(job)) return;
+        if (refresh_read_locked(job, trace)) return;
     }
     if (status == ConversationStoreReadStatus::ready && job->image) {
         // The reservation is refunded and the image's own bytes are charged as its lease; the read's preparation view
@@ -2479,9 +2737,12 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
             release_head_lease_locked(job);
             job->image.reset();
             erase_job_locked(job);
+            trace_job_locked(trace, *job, "settled", "released");
             return;
         }
         ready.push_back(job);
+        if (read_timing) job->trace_ready = store_timing_ns();
+        trace_job_locked(trace, *job, "settled", "ready");
         cv_ready.notify_all();
         return;
     }
@@ -2492,23 +2753,33 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
     job->image.reset();
     if (job->released) {
         erase_job_locked(job);
+        trace_job_locked(trace, *job, "settled", "released");
         return;
     }
     if (!job->cancelled) {
         ready.push_back(job);
+        if (read_timing) job->trace_ready = store_timing_ns();
+        trace_job_locked(trace, *job, "settled", job->trace_start ? "read_result" : "no_io");
         cv_ready.notify_all();
         return;
     }
     // A cancelled request reports its terminal status but is never delivered; its descriptor is spent.
     free_job_prep_locked(job);
+    trace_job_locked(trace, *job, "settled", job->trace_retire_reason);
     cv_ready.notify_all();
 }
 
 void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& job,
-                                                ConversationStoreReadStatus status, const std::string& detail) {
+                                                ConversationStoreReadStatus status, const std::string& detail,
+                                                StoreReadTraceBatch& trace, const char* why) {
     if (job->handed) return;                       // already the caller's image: release_read() is its way out
+    if (read_timing && !job->cancelled) job->trace_retire_reason = why;
+    if (read_timing && job->trace_ready && !job->trace_ready_end) job->trace_ready_end = store_timing_ns();
     job->cancelled = true;
-    if (job->active) return;                       // the reader drops it at its next chunk boundary
+    if (job->active) {
+        trace_job_locked(trace, *job, "retire", why, status);
+        return;                                   // the reader drops it at its next chunk boundary
+    }
     for (auto q = queue.begin(); q != queue.end(); ++q)
         if (*q == job) {
             queue.erase(q);
@@ -2529,6 +2800,7 @@ void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& 
     if (job->status != ConversationStoreReadStatus::none &&
         job->status != ConversationStoreReadStatus::ready) {
         free_job_prep_locked(job);
+        trace_job_locked(trace, *job, "retire", why);
         return;
     }
     job->status = status;
@@ -2539,14 +2811,16 @@ void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& 
         default: break;
     }
     free_job_prep_locked(job);
+    trace_job_locked(trace, *job, "retire", why);
 }
 
-void ConversationStore::Impl::retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail) {
-    for (const auto& job : jobs) retire_job_locked(job, status, detail);
+void ConversationStore::Impl::retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail,
+                                                  StoreReadTraceBatch& trace, const char* why) {
+    for (const auto& job : jobs) retire_job_locked(job, status, detail, trace, why);
     cv_ready.notify_all();
 }
 
-void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) {
+void ConversationStore::Impl::revoke_speculation_locked(StoreReadTraceBatch& trace, bool because_of_demand) {
     if (because_of_demand) {
         bool waiting_demand = false;
         for (const auto& job : jobs)
@@ -2557,14 +2831,15 @@ void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) 
         if (job->demand || job->handed || job->released || job->cancelled) continue;
         // Revoking speculative I/O does not cancel the request that may later need this prefix.
         job->speculation_revoked = true;
-        retire_job_locked(job, ConversationStoreReadStatus::cancelled, "revoked in favour of a required operation");
+        retire_job_locked(job, ConversationStoreReadStatus::cancelled, "revoked in favour of a required operation",
+                          trace, because_of_demand ? "demand_revoke" : "publication_revoke");
     }
     cv_work.notify_all();
 }
 
 // Reuse the descriptor and its original authorized query/deadline. An active reader reaches this only after its
 // allocation frame has unwound, so replacing its image never overlaps a second materialization or refunds live bytes.
-bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job) {
+bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job, StoreReadTraceBatch& trace) {
     if (job->active || job->cancelled || job->released || job->handed || job->epoch_at_admission != epoch) return false;
     std::vector<ConversationStoreMatch> found;
     try {
@@ -2618,11 +2893,16 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     job->payload_bytes = best.payload_bytes;
     job->peak_bytes = peak;
     counters.matches++;
+    trace_begin_locked(*job, job->trace_attempt);
+    trace_job_locked(trace, *job, "reissue", "catalog_refresh");
     cv_work.notify_all();
     return true;
 }
 
-bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why) {
+bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why,
+                                                StoreReadTraceBatch& trace) {
+    uint64_t previous = 0;
+    const char* reissue_reason = "new";
     // Dedupe by (request_id, generation); demand revalidates speculation without replacing its request ownership.
     for (auto it = jobs.begin(); it != jobs.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;
@@ -2633,31 +2913,41 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         if (demand && retryable && !job->handed && !job->released) {
             // Keep active retired workers inside the descriptor/byte/slot bounds until they settle.
             // Retirement removes any queued result before the fresh query can reuse this identity.
-            retire_job_locked(job, ConversationStoreReadStatus::cancelled, "reissued as demand");
+            if (read_timing) {
+                previous = job->trace_attempt;
+                reissue_reason = job->speculation_revoked ? "revoked_demand" : "refused_budget";
+            }
+            retire_job_locked(job, ConversationStoreReadStatus::cancelled, "reissued as demand", trace, "reissue");
             job->released = true;
             if (!job->active) erase_job_locked(job);
             break; // Rebuild the descriptor and revalidate the catalog under the current allowance.
         }
         if (job->cancelled) {
             why = "that request was cancelled";
+            trace_job_locked(trace, *job, "admission_refused", "cancelled", ConversationStoreReadStatus::cancelled);
             return false;
         }
         if (job->handed || job->released) {
             why = "that request has already been handed out";
+            trace_job_locked(trace, *job, "admission_refused", "already_handed");
             return false;
         }
         if (demand && !job->demand) {
+            const char* adoption = job->active ? "active" :
+                (job->status == ConversationStoreReadStatus::ready ? "ready_hit" : "queued");
+            const uint64_t old_attempt = job->trace_attempt;
             job->demand = true;
             if (job->active) {
                 job->refresh_on_completion = true;
-            } else if (!refresh_read_locked(job)) {
+            } else if (!refresh_read_locked(job, trace)) {
                 for (auto it = queue.begin(); it != queue.end(); ++it)
                     if (*it == job) {
                         std::rotate(queue.begin(), it, std::next(it));
                         break;
                     }
             }
-            revoke_speculation_locked();
+            trace_job_locked(trace, *job, "demand", old_attempt == job->trace_attempt ? adoption : "catalog_refresh");
+            revoke_speculation_locked(trace);
         }
         return true;
     }
@@ -2671,12 +2961,15 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     if (jobs.size() >= options.max_read_requests) {
         counters.refused_budget++;
         why = "the store is already holding the maximum number of read requests";
+        trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_budget, "descriptor_limit", previous);
         return false;
     }
     if (query.tokens.size() > size_t(limits.max_tokens) || query.images.size() > size_t(limits.max_images) ||
         sat_add(preparation_locked(), own_prep) > options.metadata_bytes) {
         counters.refused_limits++;
         why = "the store's preparation ceiling cannot hold another read descriptor";
+        trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_limits, "descriptor_preparation",
+                             previous);
         return false;
     }
     std::vector<ConversationStoreMatch> found;
@@ -2693,6 +2986,14 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         jobs.push_back(job);
         ready.push_back(job);
         counters.misses++;
+        trace_begin_locked(*job, previous);
+        if (read_timing) {
+            job->trace_enqueue = 0; // a catalog miss never joined the materialization queue
+            job->trace_ready = store_timing_ns();
+        }
+        trace_job_locked(trace, *job, "admission", "missing");
+        if (previous) trace_job_locked(trace, *job, "reissue", reissue_reason);
+        trace_job_locked(trace, *job, "settled", "no_io");
         cv_ready.notify_all();
         return true;
     }
@@ -2708,6 +3009,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     if (sat_add(sat_add(preparation_locked(), own_prep), decode_workspace) > options.metadata_bytes) {
         counters.refused_limits++;
         why = "the store's preparation ceiling cannot hold this read and the manifest decode it needs";
+        trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_limits, "manifest_preparation",
+                             previous, best.head_id, uint64_t(best.tokens));
         return false;
     }
     const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
@@ -2715,6 +3018,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     if (ram_budget != 0 && peak > ram_budget) {
         counters.refused_budget++;
         why = "the read's peak does not fit the published RAM allowance";
+        trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_budget, "peak_budget",
+                             previous, best.head_id, uint64_t(best.tokens), peak);
         return false;
     }
     auto job = std::make_shared<ReadJob>();
@@ -2737,13 +3042,16 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     jobs.push_back(job);
     queue.push_back(job);
     counters.matches++;
-    if (demand) revoke_speculation_locked();
+    trace_begin_locked(*job, previous);
+    trace_job_locked(trace, *job, "admission", "queued");
+    if (previous) trace_job_locked(trace, *job, "reissue", reissue_reason);
+    if (demand) revoke_speculation_locked(trace);
     cv_work.notify_all();
     return true;
 }
 
 bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation,
-                                             bool specific) {
+                                             bool specific, StoreReadTraceBatch& trace) {
     for (auto it = ready.begin(); it != ready.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;   // a copy: the ready entry is erased before the last uses
         if (job->cancelled || job->released) continue;
@@ -2763,8 +3071,10 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
         out.image = job->image;
         out.detail = job->detail;
         job->handed = true;
+        if (read_timing) job->trace_ready_end = store_timing_ns();
         counters.reads_handed_out++;
         ready.erase(it);
+        trace_job_locked(trace, *job, "adopt", job->status == ConversationStoreReadStatus::ready ? "ready" : "terminal");
         if (job->lease_bytes) {
             // The store drops its own alias: the caller holds the only remaining one, and the image's RAM stays
             // charged until release_read(), because an alias derived from it may outlive it.
@@ -2778,7 +3088,9 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
     return false;
 }
 
-void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out) {
+void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out,
+                                        StoreReadTraceBatch& trace) {
+    const uint64_t started = read_timing ? store_timing_ns() : 0;
     const ConversationStoreQuery& query = job->query;
     const uint64_t head_id = job->head_id;
     const uint64_t tokens = job->tokens;
@@ -2793,7 +3105,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     Digest manifest_id{};
     uint64_t manifest_bytes = 0;
     {
-        std::lock_guard<std::mutex> guard(mutex);
+        StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
+        if (read_timing) job->trace_start = started;
+        trace_job_locked(trace, *job, "read_start", "materialization");
         if (!on || closing) {
             stop_with(ConversationStoreReadStatus::disabled,
                       reason.empty() ? std::string("the store stopped serving") : reason);
@@ -2811,6 +3125,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
             stop_with(ConversationStoreReadStatus::stale, "the head this read selected is no longer retained");
             return;
         }
+        if (read_timing) job->trace_io_attempted = true;
     }
     std::vector<uint8_t> raw;
     std::string why;
@@ -2821,8 +3136,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         return;
     }
     {
-        std::lock_guard<std::mutex> guard(mutex);
+        StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         counters.bytes_read += raw.size();
+        if (read_timing) job->trace_bytes_read += raw.size();
     }
     conversation_store_detail::ManifestMeta meta;
     // One decode, under the *retention* figures: they are the widest set that still describes what a sound record is
@@ -2847,7 +3163,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         return;
     }
     {
-        std::lock_guard<std::mutex> guard(mutex);
+        StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (job->cancelled.load()) return;
         if (epoch != epoch_at_admission) {
             stop_with(ConversationStoreReadStatus::stale,
@@ -2893,7 +3209,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     const uint64_t needed = uint64_t(meta.payload_bytes) + uint64_t(meta.payload_bytes) / 4 + job->prepared_bytes +
                             job->prep_bytes + kReadSlabBytes + kReadFixedOverhead + scaffolding;
     {
-        std::lock_guard<std::mutex> guard(mutex);
+        StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (job->cancelled.load()) return;
         if (needed > job->reserved_bytes) {
             if (needed > ram_budget || resident_locked() - job->reserved_bytes > ram_budget - needed) {
@@ -2940,7 +3256,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         for (const auto& chunk : meta.streams[i].chunks) {
             if (job->cancelled.load()) return;
             {
-                std::lock_guard<std::mutex> guard(mutex);
+                StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
                 if (epoch != epoch_at_admission) {
                     stop_with(ConversationStoreReadStatus::stale,
                               "the execution domain advanced before this read completed");
@@ -2969,8 +3285,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
                 return;
             }
             {
-                std::lock_guard<std::mutex> guard(mutex);
+                StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
                 counters.bytes_read += chunk.length;
+                if (read_timing) job->trace_bytes_read += chunk.length;
             }
             source_bytes_read += chunk.length;
         }
@@ -2986,7 +3303,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     out.image = std::make_shared<SavedConversation>(std::move(image));
     out.payload_bytes = meta.payload_bytes;
     out.stages = meta.stages;
-    std::lock_guard<std::mutex> guard(mutex);
+    StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
     if (job->cancelled.load()) {
         out.image.reset();
         return;
@@ -3001,9 +3318,12 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
 }
 
 void ConversationStore::Impl::reader_body() {
+    StoreReadTraceBatch trace;
     std::unique_lock<std::mutex> lock(mutex);
     while (!stop.load()) {
-        revoke_speculation_locked();
+        trace.flush(lock);
+        revoke_speculation_locked(trace);
+        trace_waiters_locked(trace);
         for (auto it = queue.begin(); it != queue.end();) {
             const std::shared_ptr<ReadJob> job = *it;   // a copy: the entry itself is about to be erased
             if (job->cancelled) {
@@ -3014,14 +3334,14 @@ void ConversationStore::Impl::reader_body() {
                 // A read whose whole peak can never fit the allowance is refused instead of waiting forever.
                 it = queue.erase(it);
                 settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
-                                  "the read's peak does not fit the published allowance");
+                                  "the read's peak does not fit the published allowance", trace);
                 continue;
             }
             if (!job->demand && (ram_budget == 0 || admission_suspended || incoming >= options.max_reads)) {
                 // Speculative work never waits: it is refused when it cannot start now.
                 it = queue.erase(it);
                 settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
-                                  "the read allowance has no spare room for a prefetch");
+                                  "the read allowance has no spare room for a prefetch", trace);
                 continue;
             }
             ++it;
@@ -3041,7 +3361,7 @@ void ConversationStore::Impl::reader_body() {
                         if (job->demand) continue;                     // a demand waits for room
                         queue.erase(it);
                         settle_job_locked(job, ConversationStoreReadStatus::refused_budget,
-                                          "the read allowance has no spare room for a prefetch");
+                                          "the read allowance has no spare room for a prefetch", trace);
                         break;
                     }
                     chosen = job;
@@ -3051,6 +3371,10 @@ void ConversationStore::Impl::reader_body() {
             }
         }
         if (!chosen) {
+            if (trace.count || trace.dropped) {
+                trace.flush(lock);
+                continue; // recheck state after unlocked logging; never sleep through a wake delivered during it
+            }
             cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs));
             continue;
         }
@@ -3066,18 +3390,34 @@ void ConversationStore::Impl::reader_body() {
             head_leases[chosen->head_id] += 1;
             chosen->leased = true;
         }
+        if (read_timing) chosen->trace_admit = store_timing_ns();
+        trace_job_locked(trace, *chosen, "read_admitted", "slot_reserved");
 #ifdef STRATA_STORE_TEST_HOOKS
         const auto gate = read_gate;
         void* const gate_context = read_gate_context;
 #endif
         lock.unlock();
+        trace.emit();
+        bool frame_recorded = false;
+        const auto frame_unwound = [&](ConversationStoreReadStatus status, uint64_t finished) {
+            if (!read_timing || frame_recorded) return;
+            chosen->trace_finish = finished;
+            chosen->trace_completion_lock_wait = store_timing_ns() - finished;
+            trace_job_locked(trace, *chosen, "read_finish",
+                             chosen->cancelled ? chosen->trace_retire_reason : "frame_unwound", status);
+            frame_recorded = true;
+        };
         try {
 #ifdef STRATA_STORE_TEST_HOOKS
             if (gate) gate(gate_context);
 #endif
             ReadOutcome outcome;
-            read_body(chosen, outcome);
+            read_body(chosen, outcome, trace);
+            const uint64_t finished = read_timing ? store_timing_ns() : 0;
             lock.lock();
+            frame_unwound(outcome.status != ConversationStoreReadStatus::none ? outcome.status :
+                (chosen->cancelled ? ConversationStoreReadStatus::cancelled : ConversationStoreReadStatus::failed),
+                finished);
             // Every buffer the body allocated is gone now, so this is the first moment its reservation may be
             // refunded: settlement is what releases it, and the verdict carries the one buffer that had to outlive
             // the frame.
@@ -3085,17 +3425,21 @@ void ConversationStore::Impl::reader_body() {
                 chosen->payload_bytes = outcome.payload_bytes;
                 chosen->stages = outcome.stages;
                 chosen->image = std::move(outcome.image);
-                settle_job_locked(chosen, outcome.status, std::move(outcome.detail));
+                settle_job_locked(chosen, outcome.status, std::move(outcome.detail), trace);
             }
         } catch (const std::bad_alloc&) {
+            const uint64_t finished = read_timing && !frame_recorded ? store_timing_ns() : 0;
             if (!lock.owns_lock()) lock.lock();
+            frame_unwound(ConversationStoreReadStatus::failed, finished);
             settle_job_locked(chosen, ConversationStoreReadStatus::failed,
-                              "the read could not allocate within its admitted peak");
+                              "the read could not allocate within its admitted peak", trace);
             cv_work.notify_all();
             continue;
         } catch (...) {
+            const uint64_t finished = read_timing && !frame_recorded ? store_timing_ns() : 0;
             if (!lock.owns_lock()) lock.lock();
-            settle_job_locked(chosen, ConversationStoreReadStatus::failed, "the read aborted unexpectedly");
+            frame_unwound(ConversationStoreReadStatus::failed, finished);
+            settle_job_locked(chosen, ConversationStoreReadStatus::failed, "the read aborted unexpectedly", trace);
             cv_work.notify_all();
             continue;
         }
@@ -3105,7 +3449,7 @@ void ConversationStore::Impl::reader_body() {
                               chosen->cancelled.load() ? ConversationStoreReadStatus::cancelled
                                                        : ConversationStoreReadStatus::failed,
                               chosen->cancelled.load() ? "the request was cancelled"
-                                                       : "the read ended without a verdict");
+                                                       : "the read ended without a verdict", trace);
         }
         cv_work.notify_all();
     }
@@ -3868,6 +4212,8 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
 ConversationStore::ConversationStore(ConversationStoreOptions options, ConversationStoreLimits limits)
     : impl_(std::make_unique<Impl>()) {
     Impl& self = *impl_;
+    const char* timing = std::getenv("STRATA_STORE_TIMING");
+    self.read_timing = timing && std::strcmp(timing, "1") == 0;
     self.options = std::move(options);
     self.limits = limits;
     // The retention figures are derived here, from the format's own representability bounds and the configured
@@ -3968,11 +4314,12 @@ bool ConversationStore::healthy() const {
 }
 
 void ConversationStore::set_unhealthy(const char* reason) {
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
     // A latched fault is permanent: the engine observed something that must stop reuse, and only a restart (which
     // re-reads the run-intent marker) may trust this domain again.
     impl_->retire_reads_locked(ConversationStoreReadStatus::failed,
-                               "the store faulted before this read completed");
+                               "the store faulted before this read completed", trace, "store_fault");
     impl_->latch_fault_locked(reason ? reason : "the owner observed a failure");
     impl_->cv_work.notify_all();
 }
@@ -4080,29 +4427,39 @@ bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<Conversat
 }
 
 bool ConversationStore::demand(const ConversationStoreQuery& query, std::string& why) {
+    StoreReadTraceBatch trace;
+    if (impl_->read_timing) trace.call_ns = store_timing_ns();
     std::lock_guard<std::mutex> guard(impl_->mutex);
+    if (impl_->read_timing) trace.call_lock_wait_ns = store_timing_ns() - trace.call_ns;
     if (!impl_->on) {
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
+        impl_->trace_refusal_locked(trace, query, true, ConversationStoreReadStatus::disabled, "disabled");
         return false;
     }
     if (impl_->faulted) {
         why = impl_->fault_reason;
+        impl_->trace_refusal_locked(trace, query, true, ConversationStoreReadStatus::disabled, "store_fault");
         return false;
     }
-    return impl_->admit_read_locked(query, true, why);
+    return impl_->admit_read_locked(query, true, why, trace);
 }
 
 bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::string& why) {
+    StoreReadTraceBatch trace;
+    if (impl_->read_timing) trace.call_ns = store_timing_ns();
     std::lock_guard<std::mutex> guard(impl_->mutex);
+    if (impl_->read_timing) trace.call_lock_wait_ns = store_timing_ns() - trace.call_ns;
     if (!impl_->on) {
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
+        impl_->trace_refusal_locked(trace, query, false, ConversationStoreReadStatus::disabled, "disabled");
         return false;
     }
     if (impl_->faulted) {
         why = impl_->fault_reason;
+        impl_->trace_refusal_locked(trace, query, false, ConversationStoreReadStatus::disabled, "store_fault");
         return false;
     }
-    return impl_->admit_read_locked(query, false, why);
+    return impl_->admit_read_locked(query, false, why, trace);
 }
 
 void ConversationStore::cancel_publication(uint64_t request_id, uint64_t generation) {
@@ -4140,12 +4497,14 @@ void ConversationStore::cancel_publication(uint64_t request_id, uint64_t generat
 
 void ConversationStore::cancel_read(uint64_t request_id, uint64_t generation) {
     Impl& self = *impl_;
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
     for (const auto& job : self.jobs) {
         if (job->released) continue;
         if (job->query.request_id != request_id || job->query.generation != generation) continue;
         job->speculation_revoked = false; // explicit cancellation wins over a previous internal revocation
-        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the caller cancelled this read");
+        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the caller cancelled this read",
+                               trace, "caller_cancel");
         self.cv_work.notify_all();
         return;
     }
@@ -4153,12 +4512,14 @@ void ConversationStore::cancel_read(uint64_t request_id, uint64_t generation) {
 
 void ConversationStore::withdraw_prefetch(uint64_t request_id, uint64_t generation) {
     Impl& self = *impl_;
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
     for (const auto& entry : self.jobs) {
         const std::shared_ptr<Impl::ReadJob> job = entry;
         if (job->released || job->query.request_id != request_id || job->query.generation != generation) continue;
         if (job->demand || job->handed) return; // the demand owner, not the advisory channel, now owns it
-        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the advisory prefetch was withdrawn");
+        self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the advisory prefetch was withdrawn",
+                               trace, "withdraw");
         job->released = true;
         if (!job->active) self.erase_job_locked(job);
         self.cv_work.notify_all();
@@ -4167,27 +4528,31 @@ void ConversationStore::withdraw_prefetch(uint64_t request_id, uint64_t generati
 }
 
 bool ConversationStore::take_ready(ConversationStoreRead& out) {
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->deliver_locked(out, 0, 0, false);
+    return impl_->deliver_locked(out, 0, 0, false, trace);
 }
 
 bool ConversationStore::take_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out) {
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    return impl_->deliver_locked(out, request_id, generation, true);
+    return impl_->deliver_locked(out, request_id, generation, true, trace);
 }
 
 bool ConversationStore::wait_ready(ConversationStoreRead& out, uint64_t timeout_ms) {
+    StoreReadTraceBatch trace;
     std::unique_lock<std::mutex> lock(impl_->mutex);
-    if (impl_->deliver_locked(out, 0, 0, false)) return true;
+    if (impl_->deliver_locked(out, 0, 0, false, trace)) return true;
     if (timeout_ms == 0) return false;
     impl_->cv_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                              [&] { return !impl_->ready.empty() || impl_->closed; });
-    return impl_->deliver_locked(out, 0, 0, false);
+    return impl_->deliver_locked(out, 0, 0, false, trace);
 }
 
 bool ConversationStore::wait_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out,
                                    uint64_t timeout_ms) {
     Impl& self = *impl_;
+    StoreReadTraceBatch trace;
     std::unique_lock<std::mutex> lock(self.mutex);
     const auto settled = [&]() {
         for (const auto& job : self.jobs)
@@ -4199,11 +4564,12 @@ bool ConversationStore::wait_ready(uint64_t request_id, uint64_t generation, Con
     if (!settled() && timeout_ms)
         self.cv_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms), settled);
     if (!settled()) return false;
-    return self.deliver_locked(out, request_id, generation, true);
+    return self.deliver_locked(out, request_id, generation, true, trace);
 }
 
 void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
     Impl& self = *impl_;
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
     for (const auto& job : self.jobs) {
         if (job->released) continue;
@@ -4213,6 +4579,10 @@ void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
             self.counters.reads_released++;
         }
         job->cancelled = true;                       // a released request is never delivered
+        if (self.read_timing) {
+            job->trace_retire_reason = "release";
+            if (job->trace_ready && !job->trace_ready_end) job->trace_ready_end = store_timing_ns();
+        }
         for (auto q = self.queue.begin(); q != self.queue.end(); ++q)
             if (*q == job) {
                 self.queue.erase(q);
@@ -4230,8 +4600,10 @@ void ConversationStore::release_read(uint64_t request_id, uint64_t generation) {
             self.release_slot_locked(job);
             self.release_head_lease_locked(job);
             job->image.reset();
+            self.trace_job_locked(trace, *job, "release", "caller_release");
             self.erase_job_locked(job);
         }
+        else self.trace_job_locked(trace, *job, "release", "active_release");
         self.cv_work.notify_all();
         return;
     }
@@ -4273,6 +4645,7 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
                                                              const ConversationStorePublish& request,
                                                              std::string& why) {
     Impl& self = *impl_;
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
     if (!self.on || self.closed) {
         why = self.reason.empty() ? "the store is not enabled" : self.reason;
@@ -4334,7 +4707,7 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
     // so the caller keeps its image and its lease and may offer it again at a later seam.
     if (self.preparation_locked() > self.options.metadata_bytes - needed ||
         self.resident_locked() > envelope - required) {
-        self.revoke_speculation_locked(false);
+        self.revoke_speculation_locked(trace, false);
         if (self.preparation_locked() > self.options.metadata_bytes - needed ||
             self.resident_locked() > envelope - required) {
             self.counters.deferred_publishes++;
@@ -4442,11 +4815,14 @@ uint64_t ConversationStore::ram_available_bytes() const {
 }
 
 void ConversationStore::suspend_read_admission() {
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
     impl_->admission_suspended = true;
+    impl_->trace_waiters_locked(trace);
 }
 
 uint64_t ConversationStore::publish_read_allowance(uint64_t bytes) {
+    StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
     // Absolute, and never retroactive: a lower bound admits no new work but revokes nothing already admitted.
     impl_->ram_budget = bytes;
@@ -4454,6 +4830,7 @@ uint64_t ConversationStore::publish_read_allowance(uint64_t bytes) {
     // lease it released after publish(). Do not add that transfer a second time.
     if (impl_->publishing) impl_->publishing->external_credit_bytes = 0;
     impl_->admission_suspended = false;
+    impl_->trace_waiters_locked(trace);
     impl_->cv_work.notify_all();
     return impl_->ram_budget;
 }
@@ -4485,6 +4862,7 @@ bool ConversationStore::invalidate_domain(const char* reason) {
     Impl& self = *impl_;
     std::shared_ptr<Impl::DurableWork> work;
     {
+        StoreReadTraceBatch trace;
         std::lock_guard<std::mutex> guard(self.mutex);
         if (!self.on || !self.initialized) return false;
         if (self.faulted) return false;
@@ -4495,7 +4873,8 @@ bool ConversationStore::invalidate_domain(const char* reason) {
         // Every unhanded completion of the previous epoch is retired here, never relabelled, and nothing of the
         // previous epoch is delivered again.
         self.retire_reads_locked(ConversationStoreReadStatus::stale,
-                                 "the execution domain was invalidated before this read completed");
+                                 "the execution domain was invalidated before this read completed",
+                                 trace, "domain_invalidated");
         work = std::make_shared<Impl::DurableWork>();
         work->plan.kind = Impl::CommitPlan::Kind::invalidate;
         work->plan.epoch = self.epoch;
@@ -4528,6 +4907,7 @@ bool ConversationStore::invalidate_domain(const char* reason) {
 void ConversationStore::close() {
     Impl& self = *impl_;
     {
+        StoreReadTraceBatch trace;
         std::lock_guard<std::mutex> guard(self.mutex);
         if (self.closed) return;
         self.closed = true;
@@ -4545,7 +4925,8 @@ void ConversationStore::close() {
         }
         self.closing = true;
         self.admission_suspended = true;
-        self.retire_reads_locked(ConversationStoreReadStatus::disabled, "the store closed before this read completed");
+        self.retire_reads_locked(ConversationStoreReadStatus::disabled, "the store closed before this read completed",
+                                 trace, "closed");
         self.queue.clear();
         if (self.publishing && !self.publishing->started) {
             // A publication the writer never began is settled here, with its alias and its charge released.

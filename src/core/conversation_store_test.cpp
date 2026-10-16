@@ -21,6 +21,8 @@
 #include <fcntl.h>
 #include <functional>
 #include <memory>
+#include <map>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -103,6 +105,105 @@ bool await_status(ConversationStore& store, uint64_t request_id, uint64_t genera
         ::usleep(1000);
     }
     return store.request_status(request_id, generation) == want;
+}
+
+// Capture the real opt-in diagnostic, not a test-only mirror of the read state. The store samples the environment at
+// construction; each capture outlives its stores so all worker writes have drained before stderr is restored.
+struct StoreReadTraceRecord {
+    std::map<std::string, std::string> fields;
+    std::string text(const char* key) const {
+        const auto found = fields.find(key);
+        return found == fields.end() ? std::string() : found->second;
+    }
+    uint64_t number(const char* key) const { return std::strtoull(text(key).c_str(), nullptr, 10); }
+};
+
+struct StoreReadTraceCapture {
+    bool had_environment = false;
+    std::string old_environment;
+    FILE* file = nullptr;
+    int saved_stderr = -1;
+
+    explicit StoreReadTraceCapture(bool enabled = true) {
+        if (const char* previous = std::getenv("STRATA_STORE_TIMING")) {
+            had_environment = true;
+            old_environment = previous;
+        }
+        ::setenv("STRATA_STORE_TIMING", enabled ? "1" : "0", 1);
+        file = std::tmpfile();
+        check(file != nullptr, "the native read diagnostic capture opens");
+        if (!file) return;
+        std::fflush(stderr);
+        saved_stderr = ::dup(STDERR_FILENO);
+        check(saved_stderr >= 0 && ::dup2(::fileno(file), STDERR_FILENO) >= 0,
+              "the native read diagnostic capture redirects stderr");
+    }
+
+    std::string contents() const {
+        if (!file) return {};
+        std::string result;
+        char block[4096];
+        off_t offset = 0;
+        for (;;) {
+            const ssize_t count = ::pread(::fileno(file), block, sizeof block, offset);
+            if (count <= 0) return result;
+            result.append(block, size_t(count));
+            offset += count;
+        }
+    }
+
+    std::vector<StoreReadTraceRecord> records() const {
+        std::vector<StoreReadTraceRecord> result;
+        std::istringstream lines(contents());
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.compare(0, 11, "store_read ") != 0) continue;
+            StoreReadTraceRecord record;
+            std::istringstream fields(line.substr(11));
+            std::string field;
+            while (fields >> field) {
+                const size_t equals = field.find('=');
+                if (equals != std::string::npos)
+                    record.fields.emplace(field.substr(0, equals), field.substr(equals + 1));
+            }
+            result.push_back(std::move(record));
+        }
+        return result;
+    }
+
+    ~StoreReadTraceCapture() {
+        std::fflush(stderr);
+        if (saved_stderr >= 0) {
+            ::dup2(saved_stderr, STDERR_FILENO);
+            ::close(saved_stderr);
+        }
+        // Keep ordinary test failures visible even when a diagnostic assertion fails inside this capture.
+        std::istringstream lines(contents());
+        std::string line;
+        while (std::getline(lines, line))
+            if (line.compare(0, 11, "store_read ") != 0) std::fprintf(stderr, "%s\n", line.c_str());
+        if (file) std::fclose(file);
+        if (had_environment)
+            ::setenv("STRATA_STORE_TIMING", old_environment.c_str(), 1);
+        else
+            ::unsetenv("STRATA_STORE_TIMING");
+    }
+};
+
+const StoreReadTraceRecord* read_trace(const std::vector<StoreReadTraceRecord>& records, const char* event,
+                                       uint64_t request_id, const char* reason = nullptr) {
+    for (const auto& record : records)
+        if (record.text("event") == event && record.number("request_id") == request_id &&
+            (!reason || record.text("reason") == reason))
+            return &record;
+    return nullptr;
+}
+
+uint64_t read_trace_count(const std::vector<StoreReadTraceRecord>& records, const char* event, uint64_t request_id) {
+    uint64_t count = 0;
+    for (const auto& record : records)
+        if (record.text("event") == event && record.number("request_id") == request_id) ++count;
+    return count;
 }
 
 // The store's own physical identity of one stream: the authorized scope digest and the global ordinal that the
@@ -504,6 +605,7 @@ void check_reuse();
 void check_leases_and_budget();
 void check_tight_ram();
 void check_cancel_and_release();
+void check_read_timing();
 void check_revoked_prefetch_demand();
 void check_active_prefetch_replacement();
 void check_prefetch_catalog_refresh();
@@ -560,6 +662,7 @@ int main() {
     check_tight_ram();
     check_cancel_and_release();
     check_revoked_prefetch_demand();
+    check_read_timing();
     check_active_prefetch_replacement();
     check_prefetch_catalog_refresh();
     check_prefetch_catalog_reuse_and_cancel();
@@ -1989,6 +2092,7 @@ void check_capacity_floor() {
 }
 
 void check_corruption() {
+    StoreReadTraceCapture trace;
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
     const SavedConversation image = fixture(121, 128);
@@ -2041,6 +2145,15 @@ void check_corruption() {
     check(read.image == nullptr, "a corrupt read hands out no image");
     check(store.counters().reads_corrupt > 0, "the corruption is counted");
     store.close();
+    const auto records = trace.records();
+    const auto* finish = read_trace(records, "read_finish", 1);
+    const auto* settled = read_trace(records, "settled", 1);
+    check(finish && finish->text("status") == "corrupt" && finish->number("io_attempted") &&
+              finish->number("start_ns") && finish->number("finish_ns") && finish->number("reserved_bytes") &&
+              finish->number("holds_slot"), "corruption reports real materialization before refunding its holds");
+    check(settled && settled->text("status") == "corrupt" && !settled->number("reserved_bytes") &&
+              !settled->number("lease_bytes") && !settled->number("holds_slot"),
+          "the corrupt completion releases its reservation and slot without inventing a ready image");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2336,7 +2449,157 @@ void check_tight_ram() {
     store.close();
 }
 
+void check_read_timing() {
+    for (bool enabled : {false, true}) {
+        StoreReadTraceCapture trace(enabled);
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_reads = 2;
+        ConversationStore store(options);
+        const SavedConversation image = fixture(161, 4096);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published) &&
+                  published.status == ConversationStorePublishStatus::stored, "the timed-read fixture is stored");
+        std::string why;
+        auto missing = query_of(image, 7001, 8);
+        missing.selector.scope = bytes_from("private:never-log-this-scope");
+        check(store.demand(missing, why), "a timed miss is admitted without materialization");
+        ConversationStoreRead miss;
+        check(store.wait_ready(7001, 8, miss, 5000) && miss.status == ConversationStoreReadStatus::missing,
+              "the timed miss reports its actual no-I/O result");
+        store.publish_read_allowance(1);
+        check(!store.demand(query_of(image, 7002, 8), why), "an impossible timed read is refused at admission");
+        store.publish_read_allowance(uint64_t(64) << 20);
+        store.suspend_read_admission();
+        check(store.demand(query_of(image, 7003, 8), why), "a suspended timed demand is queued");
+        check(store.request_status(7003, 8) == ConversationStoreReadStatus::none,
+              "a suspended timed demand has not materialized");
+        store.publish_read_allowance(uint64_t(64) << 20);
+        check(await_status(store, 7003, 8, ConversationStoreReadStatus::ready), "the resumed timed demand materializes");
+
+        if (enabled) {
+            const auto queued_records = trace.records();
+            const auto* admission = read_trace(queued_records, "admission", 7003);
+            check(admission && (admission->number("wait_mask") & 2) && !admission->number("start_ns"),
+                  "the enqueue record identifies suspension before the read starts");
+            check(admission && admission->number("call_ns") &&
+                      admission->number("call_ns") + admission->number("call_lock_wait_ns") <=
+                          admission->number("enqueue_ns"),
+                  "native API lock acquisition precedes enqueue and is not charged as queue residence");
+            const uint64_t lease = store.ram_lease_bytes();
+            check(lease > 32768, "the timed fixture provides meaningful memory pressure");
+            const uint64_t peak = admission ? admission->number("peak_bytes") : 0;
+            store.publish_read_allowance(peak + store.ram_held_bytes() - lease + lease / 2);
+            check(store.demand(query_of(image, 7004, 8), why), "a timed demand can wait for memory with a spare slot");
+            const auto memory_records = trace.records();
+            const auto* memory = read_trace(memory_records, "admission", 7004);
+            check(memory && (memory->number("wait_mask") & 8) && !(memory->number("wait_mask") & 4),
+                  "the waiting record separates memory pressure from slot pressure");
+            store.publish_read_allowance(uint64_t(64) << 20);
+            check(await_status(store, 7004, 8, ConversationStoreReadStatus::ready),
+                  "the memory-blocked read runs after its allowance grows");
+            check(store.demand(query_of(image, 7005, 8), why), "a third timed demand waits behind two ready leases");
+            const auto slot_records = trace.records();
+            const auto* slots = read_trace(slot_records, "admission", 7005);
+            check(slots && (slots->number("wait_mask") & 4) && !(slots->number("wait_mask") & 16) &&
+                      slots->number("incoming") == 2,
+                  "ready leases occupy slots without pretending the materialization workers are busy");
+        }
+
+        ConversationStoreRead read;
+        check(store.wait_ready(7003, 8, read, 5000) && read.image && images_equal(*read.image, image, why),
+              "timing does not change the restored bytes");
+        read.image.reset();
+        store.release_read(7003, 8);
+        if (enabled) {
+            ConversationStoreRead second, third;
+            check(store.wait_ready(7004, 8, second, 5000) && second.image, "the memory waiter remains deliverable");
+            check(store.wait_ready(7005, 8, third, 5000) && third.image, "releasing a lease admits the slot waiter");
+            second.image.reset();
+            third.image.reset();
+            store.release_read(7004, 8);
+            store.release_read(7005, 8);
+            store.set_read_gate_for_test([](void*) { throw std::bad_alloc(); }, nullptr);
+            check(store.demand(query_of(image, 7006, 8), why), "an exception-path timed demand is admitted");
+            ConversationStoreRead failed;
+            check(store.wait_ready(7006, 8, failed, 5000) && failed.status == ConversationStoreReadStatus::failed &&
+                      !failed.image, "a real reader exception settles as a failed cache read");
+            store.set_read_gate_for_test(nullptr, nullptr);
+        }
+        store.close();
+        const auto records = trace.records();
+        if (!enabled) {
+            check(records.empty(), "disabled timing produces no native read records");
+            continue;
+        }
+        const auto* miss_record = read_trace(records, "settled", 7001);
+        const auto* refusal = read_trace(records, "admission_refused", 7002);
+        check(miss_record && miss_record->text("status") == "missing" && !miss_record->number("io_attempted") &&
+                  !miss_record->number("start_ns") && !miss_record->number("finish_ns"),
+              "a catalog miss has no invented queue or materialization interval");
+        check(refusal && refusal->text("status") == "refused_budget" && !refusal->number("io_attempted") &&
+                  !refusal->number("start_ns") && !read_trace_count(records, "read_start", 7002),
+              "an admission refusal records no materialization or filesystem attempt");
+        const auto* failed_finish = read_trace(records, "read_finish", 7006);
+        const auto* failed_settled = read_trace(records, "settled", 7006);
+        check(failed_finish && failed_finish->text("status") == "failed" && !failed_finish->number("io_attempted") &&
+                  !failed_finish->number("start_ns") && !failed_finish->number("read_ns") &&
+                  failed_finish->number("admit_ns") && failed_finish->number("dispatch_ns") &&
+                  failed_finish->number("reserved_bytes") && failed_finish->number("holds_slot"),
+              "a pre-I/O worker exception reports unwind with its real holds, not fictitious filesystem work");
+        check(failed_settled && !failed_settled->number("reserved_bytes") && !failed_settled->number("holds_slot"),
+              "exception settlement refunds the worker only after its unwind record");
+        const auto* admitted = read_trace(records, "read_admitted", 7003);
+        const auto* start = read_trace(records, "read_start", 7003);
+        const auto* finish = read_trace(records, "read_finish", 7003);
+        const auto* settled = read_trace(records, "settled", 7003);
+        const auto* adopted = read_trace(records, "adopt", 7003);
+        const auto* released = read_trace(records, "release", 7003);
+        check(admitted && start && finish && settled && adopted, "the real timed read records each ownership boundary");
+        if (admitted && start && finish && settled && adopted) {
+            check(start->number("attempt_id") && start->number("attempt_id") == finish->number("attempt_id") &&
+                      finish->number("attempt_id") == adopted->number("attempt_id"),
+                  "one materialization retains one unique attempt identity through adoption");
+            check_eq(start->number("head"), published.head_id, "the trace names the selected native head");
+            check_eq(start->number("cut"), 4096, "the trace names only the selected cut length");
+            check_eq(start->number("generation"), 8, "the trace retains the request generation");
+            check(start->number("enqueue_ns") <= admitted->number("admit_ns") &&
+                      admitted->number("admit_ns") <= start->number("start_ns") &&
+                      start->number("start_ns") <= finish->number("finish_ns") &&
+                      finish->number("finish_ns") <= settled->number("ready_ns") &&
+                      settled->number("ready_ns") <= adopted->number("ts_ns"),
+                  "timestamps order queueing, worker dispatch, frame unwind, ready residence and adoption");
+            check_eq(finish->number("queue_ns"), admitted->number("admit_ns") - start->number("enqueue_ns"),
+                     "queue residence ends where the real worker reserves the slot");
+            check_eq(finish->number("dispatch_ns"), start->number("start_ns") - admitted->number("admit_ns"),
+                     "worker dispatch is not counted as materialization");
+            check_eq(adopted->number("read_ns"), finish->number("finish_ns") - start->number("start_ns"),
+                     "ready residence does not inflate materialization time");
+            check_eq(finish->number("read_ns"), finish->number("materialize_ns") + finish->number("body_lock_wait_ns"),
+                     "body catalog-lock acquisition waits are distinct from logical materialization");
+            check(finish->number("finish_ns") + finish->number("completion_lock_wait_ns") <= finish->number("ts_ns"),
+                  "post-unwind settlement lock wait is measured after materialization has ended");
+            check_eq(adopted->number("ready_residence_ns"), adopted->number("ready_end_ns") - settled->number("ready_ns"),
+                     "ready residence ends separately at adoption");
+            check(released && released->number("ready_end_ns") == adopted->number("ready_end_ns") &&
+                      released->number("ready_residence_ns") == adopted->number("ready_residence_ns"),
+                  "the caller's handed-out lease lifetime does not inflate ready residence");
+            check(finish->number("io_attempted") && finish->number("bytes_read") &&
+                      finish->number("reserved_bytes") && finish->number("holds_slot"),
+                  "frame-unwound records precede settlement refunds of real byte and slot holds");
+            check(!settled->number("reserved_bytes") && settled->number("lease_bytes") &&
+                      settled->number("holds_slot"), "settlement replaces the peak with a ready lease, not read work");
+        }
+        check(!read_trace(records, "trace_overflow", 0), "the bounded native trace did not lose ownership records");
+        check(trace.contents().find(root.path) == std::string::npos &&
+                  trace.contents().find("private:never-log-this-scope") == std::string::npos &&
+                  trace.contents().find(sha256_hex(missing.selector.scope)) == std::string::npos,
+              "read diagnostics contain neither paths nor private scope material");
+    }
+}
+
 void check_revoked_prefetch_demand() {
+    StoreReadTraceCapture trace;
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
     const SavedConversation image = fixture(162, 256);
@@ -2381,9 +2644,24 @@ void check_revoked_prefetch_demand() {
     check(!store.demand(query_of(image, 103, 1), why), "explicit caller cancellation cannot be revived as demand");
     store.release_read(103, 1);
     store.close();
+    const auto records = trace.records();
+    const auto* revoked = read_trace(records, "retire", 101, "demand_revoke");
+    const auto* replacement = read_trace(records, "reissue", 101, "revoked_demand");
+    check(revoked && replacement && replacement->number("previous_attempt_id") == revoked->number("attempt_id") &&
+              replacement->number("attempt_id") != revoked->number("attempt_id"),
+          "a revoked ready image and its demand redo have linked, distinct attempt identities");
+    const auto* budget = read_trace(records, "settled", 104);
+    const auto* retry = read_trace(records, "reissue", 104, "refused_budget");
+    check(budget && budget->text("status") == "refused_budget" && !budget->number("io_attempted") &&
+              !budget->number("start_ns") && retry &&
+              retry->number("previous_attempt_id") == budget->number("attempt_id"),
+          "a speculative no-I/O refusal is distinct from its later demand materialization");
+    check(read_trace(records, "retire", 103, "caller_cancel") &&
+              !read_trace(records, "reissue", 103), "explicit cancellation is logged without a fabricated retry");
 }
 
 void check_active_prefetch_replacement() {
+    StoreReadTraceCapture trace;
     struct Gate {
         std::mutex mutex;
         std::condition_variable cv;
@@ -2444,12 +2722,36 @@ void check_active_prefetch_replacement() {
     }
     store.close();
     check(!gate.timed_out, "the worker gate was released explicitly, not by timeout");
+    const auto records = trace.records();
+    const auto* revoked = read_trace(records, "retire", 201, "demand_revoke");
+    const auto* old_finish = read_trace(records, "read_finish", 201);
+    const auto* retry = read_trace(records, "reissue", 201, "revoked_demand");
+    const auto* old_admitted = read_trace(records, "read_admitted", 201);
+    const auto* old_start = read_trace(records, "read_start", 201);
+    const auto* waiting = read_trace(records, "admission", 202);
+    check(waiting && (waiting->number("wait_mask") & 16), "a real gated reader is reported as an occupied worker");
+    check(old_admitted && revoked && old_start &&
+              old_admitted->number("admit_ns") <= revoked->number("ts_ns") &&
+              revoked->number("ts_ns") <= old_start->number("start_ns") && !revoked->number("start_ns"),
+          "the real gate exposes dispatch residence without falsely reporting an entered materialization frame");
+    check(revoked && revoked->number("active") && revoked->number("reserved_bytes") &&
+              revoked->number("holds_slot") && !revoked->number("finish_ns"),
+          "active retirement reports the real byte and slot holds before unwind");
+    check(old_finish && revoked && old_finish->number("attempt_id") == revoked->number("attempt_id") &&
+              old_finish->number("reserved_bytes") && old_finish->number("holds_slot") &&
+              old_finish->text("status") == "cancelled",
+          "the retiring reader keeps its holds through its own frame-unwound event");
+    check(retry && revoked && retry->number("previous_attempt_id") == revoked->number("attempt_id") &&
+              retry->number("attempt_id") != revoked->number("attempt_id") &&
+              read_trace_count(records, "read_start", 201) == 2,
+          "active retirement never conflates the old and replacement materializations");
 }
 
 void check_prefetch_catalog_refresh() {
     // Ready and active speculation must both follow a longer cut published after the offer. A ready image remains
     // useful when the replacement cannot fit the current allowance; demand must not turn that image into a miss.
     for (int scenario = 0; scenario < 3; ++scenario) {
+        StoreReadTraceCapture trace;
         struct Gate {
             std::mutex mutex;
             std::condition_variable cv;
@@ -2528,6 +2830,22 @@ void check_prefetch_catalog_refresh() {
         check_eq(store.ram_lease_bytes(), 0, "refreshing leaves no old or new image lease behind");
         store.close();
         check(!gate.timed_out, "the prefetch gate was explicitly released");
+        const auto records = trace.records();
+        const auto* original = read_trace(records, "admission", 301);
+        const auto* reissue = read_trace(records, "reissue", 301, "catalog_refresh");
+        const auto* adopted = read_trace(records, "adopt", 301);
+        check(original && adopted, "catalog selection diagnostics cover the real offer and adoption");
+        if (limited) {
+            check(!reissue && read_trace(records, "demand", 301, "ready_hit") &&
+                      read_trace_count(records, "read_start", 301) == 1,
+                  "an unaffordable refresh is a ready hit, not a fabricated redo");
+        } else {
+            check(reissue && original && reissue->number("previous_attempt_id") == original->number("attempt_id") &&
+                      reissue->number("attempt_id") != original->number("attempt_id") &&
+                      reissue->number("head") == newer.head_id && reissue->number("cut") == 512 &&
+                      read_trace_count(records, "read_start", 301) == 2,
+                  "ready and active catalog refreshes each identify their one actual replacement read");
+        }
     }
 }
 
@@ -3725,6 +4043,7 @@ void check_reuse_multiplicity_reservation() {
 // A ready but unhanded speculative image yields its bytes to a required publication; a demanded, handed-out image is
 // the caller's and is never refunded to make room for one.
 void check_ready_speculation_yields() {
+    StoreReadTraceCapture trace;
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
     const SavedConversation large = fixture(331, 131072);
@@ -3791,6 +4110,10 @@ void check_ready_speculation_yields() {
     check(store.wait_publish(released, 5000), "the deferred-then-admitted publication settles");
     check(released.status == ConversationStorePublishStatus::stored, "the deferred-then-admitted publication is stored");
     store.close();
+    const auto records = trace.records();
+    check(read_trace(records, "retire", 401, "publication_revoke") &&
+              !read_trace(records, "retire", 403, "publication_revoke"),
+          "publication revocation is distinguished from demand revocation without revoking the adopted owner");
 }
 
 // A worker that is still materializing keeps every byte it reserved - its RAM peak and the preparation it holds -
