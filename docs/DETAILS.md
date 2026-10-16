@@ -1477,6 +1477,22 @@ separate **reuse-off** correctness control, not the rollback for this selection 
 promotion requires a matched full-model and held-out comparison; source/CPU checks alone do not
 establish latency gains or committed-token equality.
 
+**Exact prompt prefixes across conversations (opt-in).** On the three text-generation endpoints,
+`"strata_shared_prefix": {"messages": K}`, `{"message": I, "chars": N}` or `{"tokens": N}` opts the rendered
+prompt's token-zero prefix into a separate shared store namespace. It resolves by the same head rendering,
+tokenization and longest-common-start rule as `strata_prefix` below, and supplies the ordinary resolved pin.
+If both fields resolve to different token counts, the server returns 400; the same count is idempotent.
+Malformed fields are 400s; an unusable head is logged and ignored.
+
+Sharing requires a configured API key, an authenticated principal, a persistent store issuer key and verified
+model/tokenizer/template identities. Anonymous requests, images (including omitted tool images), scores and
+fallback rendering never share. The namespace binds the principal kind, tenant, accepted credential fingerprint,
+model/render identities, exact count and exact prefix tokens, not the conversation ID or the private suffix.
+The same authorized tenant and credential can therefore opt identical prefixes into reuse across distinct
+`strata_conversation_id` values without merging their private histories. A different credential, tenant or exact
+prefix is isolated. Clients cannot supply the internal shared scope; absent the public field, defaults and private
+conversation behavior are unchanged.
+
 **One long document, many questions in one conversation: a pinned prefix (opt-in, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
 A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),
 `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and
@@ -1499,7 +1515,7 @@ in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories wh
 their requests alternate; parking does not itself add execution slots. Declared conversation
 identities separate groups within an authenticated tenant. Requests without a declared group
 share only that tenant's content space and must still send the matching token/image prefix.
-No cross-scope reuse is permitted.
+Private histories never cross scopes; the separate opt-in shared-prefix namespace above does not change their ownership.
 The default budget is 0 (disabled); `--prompt-cache 0` also disables parking.
 With `--layer-split`, a parked conversation holds one image per stage (each later stage's
 session and its share of the conversation checkpoints), every image is validated before

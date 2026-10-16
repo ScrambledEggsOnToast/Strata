@@ -1541,6 +1541,18 @@ class StrataEngine:
             if not isinstance(scope, str) or not re.fullmatch(r"[0-9a-f]{64}", scope) or int(scope, 16) == 0:
                 raise ValueError("invalid internal conversation cache scope")
             keys += f" scope={scope}"
+        shared_scope = sampling.get("_strata_cache_shared_scope")
+        if shared_scope is not None:
+            prefix = sampling.get("strata_prefix")
+            pin = prefix.get("tokens") if isinstance(prefix, dict) else None
+            if (not isinstance(shared_scope, str) or not re.fullmatch(r"[0-9a-f]{64}", shared_scope)
+                    or int(shared_scope, 16) == 0):
+                raise ValueError("invalid internal shared prefix cache scope")
+            if isinstance(pin, bool) or not isinstance(pin, int) or pin <= 0:
+                raise ValueError("invalid internal shared prefix boundary")
+            if scope is None:
+                raise ValueError("invalid internal shared prefix private scope")
+            keys += f" sscope={shared_scope}"
         # The prepared offer this request's demand consumes: the store binds the scope's candidates to the tokens it
         # already validated and read, so a queued request's restore was decided before it was admitted.  Both keys
         # are the frontend's own (never a client's: see Service.prepare and the POST dispatch).
@@ -1610,8 +1622,8 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
-        # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
-        # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
+        # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): pin this conversation's checkpoint
+        # at the first N prompt tokens. Cross-conversation sharing needs the separate opt-in and internal sscope.
         prefix = sampling.get("strata_prefix")
         if isinstance(prefix, dict):
             pn = prefix.get("tokens")
@@ -3709,6 +3721,7 @@ class Service:
         self.scope_lock = threading.Lock()
         self._render_identity = None          # computed once, and only when a persistent store asks for a scope
         self._render_identity_checked = False
+        self.template_fallback = False       # startup sets this when the model's exported template is missing
         self.supervised = os.environ.get("STRATA_SUPERVISED") == "1"
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -4683,6 +4696,7 @@ class Service:
         if history is None or full is None or mine is None:
             return None
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
+            self.lifecycle_local.render_fallback = True
             return full
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         if limit is not None and len(history) + len(tail) + len(full) - len(mine) > limit:
@@ -4802,6 +4816,40 @@ class Service:
             return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
         identity = ["scc1", ["gateway" if gateway else "principal", tenant, credential_fingerprint(credential)],
                     group, model_id, render_id]
+        return hmac.new(key, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
+
+    def shared_cache_scope(self, req: dict, principal: tuple[str, str, str] | None, ids, *,
+                           has_images=False, fallback=False, score=False) -> str | None:
+        """Authorize only an explicitly shared, exact token-zero prefix; never fall back to a process secret.
+
+        `principal` is the transport's trusted (kind, tenant, credential fingerprint), kept on the lifecycle rather
+        than in client JSON. Conversation IDs, request IDs and deadlines deliberately do not name this namespace.
+        The token digest is SHA-256 of nonnegative signed-int32 token IDs encoded little-endian, in order; its exact
+        length is bound separately in the HMAC. The private scope's domain and payload remain unchanged.
+        """
+        prefix = req.get("strata_shared_prefix")
+        n = prefix.get("tokens") if isinstance(prefix, dict) and set(prefix) == {"tokens"} else None
+        if (not self.api_key or has_images or fallback or self.template_fallback or score
+                or isinstance(n, bool) or not isinstance(n, int) or not 0 < n < len(ids) - 1
+                or not isinstance(principal, tuple) or len(principal) != 3):
+            return None
+        kind, tenant, fingerprint = principal
+        if (kind not in ("principal", "gateway") or not isinstance(tenant, str) or not tenant
+                or not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{32}", fingerprint) is None):
+            return None
+        key = self.scope_key()
+        model_id = getattr(self.engine, "cache_model_id", "")
+        render_id = self.render_identity() if key is not None else None
+        if (key is None or not isinstance(model_id, str) or re.fullmatch(r"[0-9a-f]{64}", model_id) is None
+                or not isinstance(render_id, str) or re.fullmatch(r"[0-9a-f]{64}", render_id) is None):
+            return None
+        digest = hashlib.sha256()
+        for i in range(n):
+            token = ids[i]
+            if isinstance(token, bool) or not isinstance(token, int) or not 0 <= token < 1 << 31:
+                return None
+            digest.update(struct.pack("<i", token))
+        identity = ["scc-shared1", principal, model_id, render_id, n, digest.hexdigest()]
         return hmac.new(key, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
 
     def scope_key(self) -> bytes | None:
@@ -5216,6 +5264,8 @@ class Service:
         if result is None:
             return None
         ids, thinking, max_new = result
+        if request.get("strata_shared_prefix") is not None and getattr(self.lifecycle_local, "render_fallback", False):
+            return None                                     # demand owns a fallback rendering; it must never share
         prefix = request.get("strata_prefix")
         digest = conversation_offers.generation_digest(resolved.messages, tools, resolved.kw,
                                                        resolved.max_new_requested, resolved.force, walk=walk)
@@ -5478,6 +5528,9 @@ class Service:
         opening, the pin) is the demand's own arithmetic, on the same inputs the digest checked.
         """
         record = getattr(self.lifecycle_local, "record", None)
+        self.lifecycle_local.render_fallback = False
+        if req is not None:
+            req.pop("_strata_cache_shared_scope", None)
         prepared = self.take_prepared(record, messages, tools, kwargs, max_new, force, req=req)
         if prepared is not None:
             self.embeddings.path = None       # a prepared request is text-only (see resolve_for_offer)
@@ -5485,12 +5538,14 @@ class Service:
             if req is not None:
                 self.bind_offer(req, prepared, record=record)
                 prepared.apply_to(req)        # the pin boundary the store was offered, not a second resolution
+                self.resolve_shared_prefix(req, messages, tools, kwargs, ids)
             prepared.release()                # the demand owns the tokens now: the request keeps only the offer
             return ids, thinking, wanted
         if req is not None:
             self.bind_offer(req, None)        # a re-rendered prompt never carries a stale offer's keys
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        shared_has_images = bool(req is not None and req.get("strata_shared_prefix") is not None and images_of(messages))
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = self.encode_prompt(messages, tools, kwargs, limit)
         if ids is None:
@@ -5583,11 +5638,42 @@ class Service:
             if prefix is None:              # preparation only: the pin's own head is over the allowance too
                 return None
             req["strata_prefix"] = prefix
+        if req is not None and not self.resolve_shared_prefix(
+                req, messages, tools, kwargs, ids, shared_has_images, limit):
+            return None
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def resolve_shared_prefix(self, req, messages, tools, kwargs, ids, has_images=False, limit=None) -> bool:
+        """Resolve the public opt-in using the existing pin seam; over-budget preparation never publishes a scope."""
+        spec = req.get("strata_shared_prefix")
+        if spec is None:
+            return True
+        prefix = self.resolve_prefix(spec, messages, tools, kwargs, ids, has_images, limit,
+                                     field="strata_shared_prefix")
+        if prefix is None:
+            return False
+        req["strata_shared_prefix"] = prefix
+        if not prefix:
+            return True
+        private = req.get("strata_prefix")
+        if isinstance(private, dict) and private.get("tokens") is not None and private != prefix:
+            raise ValueError("strata_shared_prefix: resolves to a different boundary than strata_prefix")
+        req["strata_prefix"] = dict(prefix)
+        record = getattr(self.lifecycle_local, "record", None)
+        scope = self.shared_cache_scope(
+            req, record.get("_cache_principal") if record else None, ids, has_images=has_images,
+            fallback=getattr(self.lifecycle_local, "render_fallback", False), score=bool(record and record.get("_score")))
+        if scope is not None:
+            req["_strata_cache_shared_scope"] = scope
+        else:
+            print("[strata] strata_shared_prefix ignored: authenticated store and verified text rendering required",
+                  flush=True)
+        return True
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
-    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False, limit=None) -> dict | None:
+    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False, limit=None, *,
+                       field="strata_prefix") -> dict | None:
         """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
         short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
         I, "chars": N}` (the first N characters of message I's text: a document and its question in one message) or
@@ -5603,13 +5689,13 @@ class Service:
         keys = ("messages", "message", "chars", "tokens")
         if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
                 set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
-            raise ValueError('strata_prefix: {"messages": K} (the first K messages), {"message": I, "chars": N} (the first '
+            raise ValueError(f'{field}: {{"messages": K}} (the first K messages), {{"message": I, "chars": N}} (the first '
                              'N characters of message I) or {"tokens": N}')
         for k, v in spec.items():
             if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
-                raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
+                raise ValueError(f"{field}.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
         if has_images:
-            print("[strata] strata_prefix ignored: the request has images", flush=True)
+            print(f"[strata] {field} ignored: the request has images", flush=True)
             return {}
         what = ",".join(f"{k}={v}" for k, v in spec.items())
 
@@ -5656,7 +5742,7 @@ class Service:
         elif "messages" in spec:
             k = spec["messages"]
             if k >= len(messages):
-                print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and the "
+                print(f"[strata] {field}.messages={k} ignored: the request has {len(messages)} message(s) and the "
                       "prefix must leave at least the last one", flush=True)
                 return {}
             head = head_ids(messages[:k])
@@ -5667,7 +5753,7 @@ class Service:
             i, chars = spec["message"], spec["chars"]
             text = messages[i].get("content") if 0 <= i < len(messages) else None
             if not isinstance(text, str) or chars > len(text):
-                print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                print(f"[strata] {field} ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
             head = head_ids(cut)
@@ -5675,7 +5761,7 @@ class Service:
                 return None
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
-            print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+            print(f"[strata] {field} {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
@@ -7308,12 +7394,16 @@ def make_handler(svc: Service):
                         if attested:
                             tenant, gateway, credential = attested, True, gateway_credential
                     # Never trust a client-supplied internal scope or cache grouping key.
+                    req.pop("_strata_cache_shared_scope", None)
                     if path != "/v1/score":        # scores never reuse a conversation prefix
                         req["_strata_cache_scope"] = svc.cache_scope(
                             req, tenant, gateway=gateway, credential=credential)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
+                    if path != "/v1/score" and accepted:
+                        self.lifecycle["_cache_principal"] = (
+                            "gateway" if gateway else "principal", tenant, credential_fingerprint(credential))
                     if path != "/v1/score":        # the deadline is generation-only, exactly like the scope above:
                         # the store ages a prompt out by its own request's deadline, and a score owns no
                         # conversation prefix - its prepare refuses unknown fields outright (see scoring.prepare),
@@ -8603,6 +8693,7 @@ def main() -> int:
                   tokenizer_dir=tpath,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.template_fallback = not tpl.is_file()
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")

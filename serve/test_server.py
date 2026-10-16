@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
-                          PP_DONE_TAIL, Service, TENANT_HEADER,
+                          PP_DONE_TAIL, Service, TENANT_HEADER, credential_fingerprint,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, make_handler,
                           prompt_progress, prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
@@ -40,6 +40,7 @@ class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
         self.last_cache_scope = sampling.get("_strata_cache_scope")
+        self.last_sampling = dict(sampling)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
@@ -1943,6 +1944,223 @@ class SharedPrefix(unittest.TestCase):
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)
         self.assertEqual(req, {"temperature": 0})
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
+
+
+class CrossConversationPrefix(unittest.TestCase):
+    """Explicit shared prefixes name exact rendered tokens, not private conversations or client-chosen scopes."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.tokenizer_dir = Path(directory.name)
+        for name in ("vocab.json", "merges.txt", "token_type.json"):
+            (self.tokenizer_dir / name).write_text("test identity", encoding="utf-8")
+        self.tok = ByteTokenizer()
+        self.engine = RecordingEngine(self.tok, "blue", max_context=CTX)
+        self.engine.cache_model_id = "ab" * 32
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                           tokenizer_dir=self.tokenizer_dir)
+        self.svc.api_key = "client-key,gateway-token,gateway-next"
+        self.svc.tenant_token = ["gateway-token", "gateway-next"]
+        patch = mock.patch.object(self.svc, "scope_key", return_value=bytes(range(32)))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.svc.lifecycle_local.record = {
+            "_cache_principal": ("principal", "client-key", credential_fingerprint("client-key")), "_score": False}
+        self.httpd = None
+
+    def post(self, body, *, path="/v1/chat/completions", token="client-key", tenant=None):
+        if self.httpd is None:
+            self.httpd = serve(self.svc, port=0)
+            self.addCleanup(self.httpd.server_close)
+            self.addCleanup(self.httpd.shutdown)
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if tenant is not None:
+            headers[TENANT_HEADER] = tenant
+        request = urllib.request.Request(f"http://127.0.0.1:{self.httpd.server_address[1]}{path}",
+                                         data=json.dumps(body).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as response:
+            with response:
+                return response.code, json.load(response)
+
+    def test_all_public_head_shapes_resolve_to_the_existing_pin(self):
+        for spec in ({"messages": 2}, {"message": 1, "chars": 100}, {"tokens": 100}):
+            with self.subTest(spec=spec):
+                private = {"strata_prefix": dict(spec)}
+                expected = self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=private)
+                request = {"strata_shared_prefix": dict(spec)}
+                actual = self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+                self.assertEqual(actual, expected)
+                self.assertEqual(request["strata_shared_prefix"], private["strata_prefix"])
+                self.assertEqual(request["strata_prefix"], private["strata_prefix"])
+                scope = request["_strata_cache_shared_scope"]
+                self.assertRegex(scope, r"^[0-9a-f]{64}$")
+                keys = StrataEngine.sampling_keys({**request, "_strata_cache_scope": "cd" * 32}).split()
+                self.assertEqual([key for key in keys if key.startswith("sscope=")], [f"sscope={scope}"])
+                self.assertEqual([key for key in keys if key.startswith("pin=")],
+                                 [f"pin={private['strata_prefix']['tokens']}"])
+
+    def test_equal_boundaries_are_idempotent_and_different_boundaries_refuse(self):
+        shared = {"strata_shared_prefix": {"messages": 2}}
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=shared)
+        n = shared["strata_prefix"]["tokens"]
+        for ordinary in ({"messages": 2}, {"tokens": n}):
+            request = {"strata_prefix": ordinary, "strata_shared_prefix": {"messages": 2}}
+            self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+            self.assertEqual(request["_strata_cache_shared_scope"], shared["_strata_cache_shared_scope"])
+        for private, public in ((n - 1, n), (n, n - 1)):
+            request = {"strata_prefix": {"tokens": private}, "strata_shared_prefix": {"tokens": public}}
+            with self.assertRaisesRegex(ValueError, "strata_shared_prefix.*different boundary"):
+                self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        status, body = self.post({"messages": SharedPrefix.MSGS, "max_tokens": 4,
+                                  "strata_prefix": {"tokens": n - 1}, "strata_shared_prefix": {"tokens": n}})
+        self.assertEqual(status, 400)
+        self.assertIn("different boundary", body["error"]["message"])
+
+    def test_bad_shared_specs_name_the_public_field_and_unusable_heads_only_drop_sharing(self):
+        for bad in ({"messages": 0}, {"messages": "2"}, {"messages": True}, {"tokens": 1.5}, {"x": 1},
+                    {"messages": 1, "tokens": 2}, {"message": 1}, {"chars": 3}, {"message": -1, "chars": 3}, [], "pin", {}):
+            with self.subTest(spec=bad), self.assertRaisesRegex(ValueError, "^strata_shared_prefix"):
+                self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req={"strata_shared_prefix": bad})
+        for unusable in ({"messages": 3}, {"messages": 9}, {"tokens": 10000},
+                         {"message": 1, "chars": 5000}, {"message": 7, "chars": 3}):
+            with self.subTest(spec=unusable), contextlib.redirect_stdout(io.StringIO()) as log:
+                request = {"strata_shared_prefix": unusable, "strata_prefix": {"tokens": 2},
+                           "_strata_cache_shared_scope": "de" * 32}
+                self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+                self.assertEqual(request["strata_shared_prefix"], {})
+                self.assertEqual(request["strata_prefix"], {"tokens": 2})
+                self.assertNotIn("_strata_cache_shared_scope", request)
+                self.assertIn("strata_shared_prefix", log.getvalue())
+
+    def test_client_internal_scope_is_stripped_even_without_the_public_opt_in(self):
+        request = {"_strata_cache_shared_scope": "de" * 32}
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        self.assertEqual(request, {})
+        request = {"strata_shared_prefix": {"tokens": 4}, "_strata_cache_shared_scope": "de" * 32}
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        self.assertNotEqual(request["_strata_cache_shared_scope"], "de" * 32)
+        self.svc.lifecycle_local.record = None
+        request = {"strata_shared_prefix": {"tokens": 4}, "_strata_cache_shared_scope": "de" * 32,
+                   "_cache_principal": ("principal", "client-key", credential_fingerprint("client-key"))}
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        self.assertNotIn("_strata_cache_shared_scope", request, "JSON must not establish the trusted principal")
+
+    def test_http_same_tenant_can_share_across_private_conversations_but_not_authorization(self):
+        body = {"messages": SharedPrefix.MSGS, "max_tokens": 4, "strata_shared_prefix": {"messages": 2},
+                "strata_conversation_id": "A"}
+        status, response = self.post(body, token="gateway-token", tenant="tenant-a")
+        self.assertEqual(status, 200, response)
+        private_a = self.engine.last_cache_scope
+        shared_a = self.engine.last_sampling["_strata_cache_shared_scope"]
+        other = {**body, "messages": [*SharedPrefix.MSGS[:-1], {"role": "user", "content": "A different question?"}],
+                 "strata_conversation_id": "B"}
+        status, response = self.post(other, token="gateway-token", tenant="tenant-a")
+        self.assertEqual(status, 200, response)
+        self.assertNotEqual(private_a, self.engine.last_cache_scope)
+        self.assertEqual(shared_a, self.engine.last_sampling["_strata_cache_shared_scope"])
+        for token, tenant in (("gateway-token", "tenant-b"), ("gateway-next", "tenant-a"),
+                              ("client-key", "tenant-a")):
+            with self.subTest(token=token, tenant=tenant):
+                status, response = self.post(body, token=token, tenant=tenant)
+                self.assertEqual(status, 200, response)
+                self.assertNotEqual(shared_a, self.engine.last_sampling["_strata_cache_shared_scope"])
+        status, response = self.post(body, tenant="attacker-selected")
+        self.assertEqual(status, 200, response)
+        direct = self.engine.last_sampling["_strata_cache_shared_scope"]
+        status, response = self.post(body, tenant=None)
+        self.assertEqual(status, 200, response)
+        self.assertEqual(direct, self.engine.last_sampling["_strata_cache_shared_scope"])
+
+    def test_each_generation_endpoint_uses_only_a_server_derived_internal_scope(self):
+        for path, fields in (("/v1/chat/completions", {"messages": SharedPrefix.MSGS, "max_tokens": 4}),
+                             ("/v1/messages", {"messages": SharedPrefix.MSGS, "max_tokens": 4}),
+                             ("/v1/responses", {"input": SharedPrefix.MSGS, "max_output_tokens": 4})):
+            for opt_in in (False, True):
+                with self.subTest(path=path, opt_in=opt_in):
+                    request = {**fields, "_strata_cache_shared_scope": "de" * 32}
+                    if opt_in:
+                        request["strata_shared_prefix"] = {"tokens": 4}
+                    status, response = self.post(request, path=path)
+                    self.assertEqual(status, 200, response)
+                    shared = self.engine.last_sampling.get("_strata_cache_shared_scope")
+                    if opt_in:
+                        self.assertRegex(shared, r"^[0-9a-f]{64}$")
+                        self.assertNotEqual(shared, "de" * 32)
+                        self.assertEqual(self.engine.last_sampling["strata_prefix"], {"tokens": 4})
+                    else:
+                        self.assertIsNone(shared)
+                    self.assertGreater(self.engine.last_sampling["_strata_cache_deadline_ns"], 0)
+
+    def test_unauthenticated_http_never_shares_even_with_a_claimed_key_or_gateway_tenant(self):
+        self.svc.api_key = ""
+        request = {"messages": SharedPrefix.MSGS, "max_tokens": 4, "strata_shared_prefix": {"tokens": 4},
+                   "_strata_cache_shared_scope": "de" * 32}
+        for token in (None, "unverified-key", "gateway-token"):
+            with self.subTest(token=token):
+                status, response = self.post(request, token=token, tenant="tenant-a")
+                self.assertEqual(status, 200, response)
+                self.assertNotIn("_strata_cache_shared_scope", self.engine.last_sampling)
+
+    def test_images_and_even_omitted_tool_images_cannot_share(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.svc.vision = ImageMarkers.FakeVision(directory)
+            messages = [{"role": "user", "content": [{"type": "text", "text": "look"},
+                                                     {"type": "image", "source": "x.png"}]}]
+            request = {"strata_shared_prefix": {"tokens": 2}}
+            self.svc.prepare(messages, None, {}, 4, req=request)
+            self.assertEqual(request["strata_shared_prefix"], {})
+            self.assertNotIn("_strata_cache_shared_scope", request)
+            self.svc.drop_embeddings()
+        self.svc.vision = None
+        messages = [{"role": "user", "content": "look"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": {}}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": [{"type": "image", "source": "x.png"}]},
+                    {"role": "user", "content": "what did it show?"}]
+        request = {"strata_shared_prefix": {"tokens": 2}}
+        self.svc.prepare(messages, None, {}, 4, req=request)
+        self.assertNotIn("_strata_cache_shared_scope", request)
+        self.assertIn("image omitted", messages[2]["content"][0]["text"])
+
+    def test_score_and_fallback_rendering_never_share(self):
+        self.svc.lifecycle_local.record["_score"] = True
+        request = {"strata_shared_prefix": {"tokens": 4}}
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        self.assertNotIn("_strata_cache_shared_scope", request)
+        self.svc.lifecycle_local.record["_score"] = False
+        self.svc.template_fallback = True
+        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
+        self.assertNotIn("_strata_cache_shared_scope", request)
+        self.svc.template_fallback = False
+        source = self.tokenizer_dir / "fallback-template.jinja"
+        source.write_text("{{ 'generation' if add_generation_prompt else 'history' }}"
+                          "{% for m in messages %}{{ m['content'] }}{% endfor %}", encoding="utf-8")
+        self.svc.template = ChatTemplate(source)
+        self.svc.effort_end = True
+        self.svc.prepare(SharedPrefix.MSGS, None, {"enable_thinking": False}, 4, req=request)
+        self.assertNotIn("_strata_cache_shared_scope", request)
+        self.assertTrue(self.svc.lifecycle_local.render_fallback)
+        self.svc.effort_end = False
+        self.svc.prepare(SharedPrefix.MSGS, None, {"enable_thinking": False}, 4, req=request)
+        self.assertIn("_strata_cache_shared_scope", request, "a prior fallback must not taint the next rendering")
+
+    def test_internal_shared_scope_validation_requires_a_lowercase_nonzero_digest_and_pin(self):
+        valid = {"_strata_cache_scope": "ab" * 32, "strata_prefix": {"tokens": 2}}
+        self.assertIn("sscope=" + "cd" * 32, StrataEngine.sampling_keys({**valid, "_strata_cache_shared_scope": "cd" * 32}))
+        for invalid in ("", "00" * 32, "AB" * 32, "a" * 63, "a" * 65, True, 7, "g" * 64, "a" * 64 + " pin=9"):
+            with self.subTest(scope=invalid), self.assertRaisesRegex(ValueError, "internal shared prefix cache scope"):
+                StrataEngine.sampling_keys({**valid, "_strata_cache_shared_scope": invalid})
+        for prefix in (None, {}, {"messages": 1}, {"tokens": 0}, {"tokens": True}, {"tokens": 1.0}):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, "internal shared prefix boundary"):
+                StrataEngine.sampling_keys({"_strata_cache_shared_scope": "cd" * 32, "strata_prefix": prefix})
+        with self.assertRaisesRegex(ValueError, "internal shared prefix private scope"):
+            StrataEngine.sampling_keys({"_strata_cache_shared_scope": "cd" * 32, "strata_prefix": {"tokens": 2}})
 
 
 class GpuChoice(unittest.TestCase):

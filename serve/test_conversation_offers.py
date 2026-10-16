@@ -9,6 +9,8 @@ requests open so a real queue forms.
 """
 import array
 import fcntl
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -184,7 +186,7 @@ class ChannelTestCase(unittest.TestCase):
         """The scripted engine this case's service runs on (one that holds its first request open by default)."""
         return QueuedEngine(self.tok, link=self.link, batch=self.batch, hold=self.hold)
 
-    def start_request(self, text="hello", body=None, path="/v1/chat/completions"):
+    def start_request(self, text="hello", body=None, path="/v1/chat/completions", headers=None):
         """Send one request on its own thread; -> (thread, outcome dict).  A queued request never returns here."""
         outcome: dict = {}
 
@@ -192,7 +194,7 @@ class ChannelTestCase(unittest.TestCase):
             conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=20)
             try:
                 payload = body if body is not None else {"messages": [{"role": "user", "content": text}]}
-                conn.request("POST", path, json.dumps(payload), {"Content-Type": "application/json"})
+                conn.request("POST", path, json.dumps(payload), {"Content-Type": "application/json", **(headers or {})})
                 response = conn.getresponse()
                 outcome["status"] = response.status
                 outcome["body"] = response.read()
@@ -357,6 +359,124 @@ class StableScope(unittest.TestCase):
         self.assertEqual(service.cache_scope(claimed, "tenant-a"), service.cache_scope({"messages": []}, "tenant-a"))
         self.assertEqual(service.cache_scope(claimed, "tenant-a", credential="k"),
                          service.cache_scope({"messages": []}, "tenant-a", credential="k"))
+
+    def shared_service(self, **kwargs):
+        service = self.service(**kwargs)
+        service.api_key = "client-key,gateway-token"
+        return service
+
+    def test_shared_scope_binds_the_canonical_exact_token_prefix(self):
+        service = self.shared_service()
+        principal = ("gateway", "tenant-a", server.credential_fingerprint("gateway-token"))
+        request = {"strata_shared_prefix": {"tokens": 2}}
+        ids = [1, 0x102, 3, 4]
+        payload = ["scc-shared1", principal, "ab" * 32, service.render_identity(), 2,
+                   hashlib.sha256(b"\x01\x00\x00\x00\x02\x01\x00\x00").hexdigest()]
+        expected = hmac.new(KEY, json.dumps(payload, separators=(",", ":")).encode(), "sha256").hexdigest()
+        scope = service.shared_cache_scope(request, principal, ids)
+        self.assertEqual(scope, expected)
+        self.assertRegex(scope, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(scope, service.cache_scope(request, "tenant-a", gateway=True, credential="gateway-token"))
+        self.assertNotEqual(service.shared_cache_scope(request, principal, [1, 23, 3, 4]),
+                            service.shared_cache_scope(request, principal, [12, 3, 3, 4]))
+
+    def test_shared_scope_survives_restart_without_adopting_a_conversation_identity(self):
+        first, second = self.shared_service(), self.shared_service()
+        principal = ("gateway", "tenant-a", server.credential_fingerprint("gateway-token"))
+        a = {"strata_shared_prefix": {"tokens": 2}, "strata_conversation_id": "A"}
+        b = {**a, "strata_conversation_id": "B", "seed": 99, "_strata_request_id": "other",
+             "_strata_cache_deadline_ns": 42}
+        scope = first.shared_cache_scope(a, principal, [1, 2, 3, 4])
+        self.assertIsNotNone(scope)
+        self.assertNotEqual(first.cache_secret, second.cache_secret)
+        self.assertEqual(scope, second.shared_cache_scope(b, principal, [1, 2, 99, 100]))
+        self.assertNotEqual(first.cache_scope(a, "tenant-a"), first.cache_scope(b, "tenant-a"))
+
+    def test_every_shared_scope_binding_isolates_records(self):
+        service = self.shared_service()
+        principal = ("gateway", "tenant-a", server.credential_fingerprint("gateway-token"))
+        request = {"strata_shared_prefix": {"tokens": 2}}
+        ids = [1, 2, 3, 4, 5]
+        baseline = service.shared_cache_scope(request, principal, ids)
+        self.assertIsNotNone(baseline)
+        cases = {
+            "issuer": (self.shared_service(key=bytes(reversed(KEY))), principal, request, ids),
+            "kind": (service, ("principal", *principal[1:]), request, ids),
+            "tenant": (service, ("gateway", "tenant-b", principal[2]), request, ids),
+            "credential": (service, ("gateway", "tenant-a", server.credential_fingerprint("rotated")), request, ids),
+            "model": (self.shared_service(model_id="cd" * 32), principal, request, ids),
+            "template": (self.shared_service(template=self.other_template()), principal, request, ids),
+            "tokenizer": (self.shared_service(tok=OtherTokenizer()), principal, request, ids),
+            "count": (service, principal, {"strata_shared_prefix": {"tokens": 3}}, ids),
+            "tokens": (service, principal, request, [1, 99, 3, 4, 5]),
+        }
+        for dimension, (other, authorization, req, tokens) in cases.items():
+            with self.subTest(dimension=dimension):
+                scope = other.shared_cache_scope(req, authorization, tokens)
+                self.assertIsNotNone(scope)
+                self.assertNotEqual(baseline, scope)
+        alias = self.shared_service(model="renamed-public-alias")
+        self.assertEqual(baseline, alias.shared_cache_scope(request, principal, ids))
+
+    def test_shared_scope_binds_each_complete_tokenizer_artifact(self):
+        principal = ("principal", "client-key", server.credential_fingerprint("client-key"))
+        request = {"strata_shared_prefix": {"tokens": 2}}
+        baseline = self.shared_service().shared_cache_scope(request, principal, [1, 2, 3, 4])
+        self.assertIsNotNone(baseline)
+        for name in server.TOKENIZER_FILES:
+            with self.subTest(artifact=name):
+                path = self.tokenizer_dir / name
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(original + b"\n")
+                    changed = self.shared_service().shared_cache_scope(request, principal, [1, 2, 3, 4])
+                    self.assertIsNotNone(changed)
+                    self.assertNotEqual(baseline, changed)
+                finally:
+                    path.write_bytes(original)
+
+    def test_sharing_never_invents_authorization_or_identity(self):
+        principal = ("gateway", "tenant-a", server.credential_fingerprint("gateway-token"))
+        request = {"strata_shared_prefix": {"tokens": 2}}
+        ids = [1, 2, 3, 4]
+        service = self.shared_service()
+        for flags in ({"has_images": True}, {"fallback": True}, {"score": True}):
+            with self.subTest(flags=flags):
+                self.assertIsNone(service.shared_cache_scope(request, principal, ids, **flags))
+        for unauthorized in (None, ("gateway", "", principal[2]), ("gateway", "tenant-a", ""),
+                             ("anonymous", "tenant-a", principal[2]), list(principal)):
+            with self.subTest(principal=unauthorized):
+                self.assertIsNone(service.shared_cache_scope(request, unauthorized, ids))
+        service.api_key = ""
+        self.assertIsNone(service.shared_cache_scope(request, principal, ids))
+        service.api_key = "client-key"
+        service.template_fallback = True
+        self.assertIsNone(service.shared_cache_scope(request, principal, ids))
+        for key in (None, b"\0" * 32):
+            with self.subTest(key=key):
+                self.assertIsNone(self.shared_service(key=key).shared_cache_scope(request, principal, ids))
+        for model_id in ("", None, "AB" * 32):
+            with self.subTest(model_id=model_id):
+                self.assertIsNone(self.shared_service(model_id=model_id).shared_cache_scope(request, principal, ids))
+        for render_id in (None, "", "AB" * 32):
+            with self.subTest(render_id=render_id):
+                service = self.shared_service()
+                with mock.patch.object(service, "render_identity", return_value=render_id):
+                    self.assertIsNone(service.shared_cache_scope(request, principal, ids))
+        (self.tokenizer_dir / "merges.txt").unlink()
+        self.assertIsNone(self.shared_service().shared_cache_scope(request, principal, ids))
+
+    def test_shared_scope_refuses_unresolved_or_unusable_boundaries_and_noncanonical_tokens(self):
+        service = self.shared_service()
+        principal = ("principal", "client-key", server.credential_fingerprint("client-key"))
+        for prefix in (None, {}, {"messages": 1}, {"tokens": 0}, {"tokens": True}, {"tokens": 1.0},
+                       {"tokens": 3}, {"tokens": 4}, {"tokens": 2, "message": 1}):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(service.shared_cache_scope({"strata_shared_prefix": prefix}, principal, [1, 2, 3, 4]))
+        for invalid in (-1, True, 1.0, 1 << 31):
+            with self.subTest(token=invalid):
+                self.assertIsNone(service.shared_cache_scope({"strata_shared_prefix": {"tokens": 2}},
+                                                             principal, [1, invalid, 3, 4]))
 
     def test_a_request_without_an_id_keeps_one_namespace_per_tenant(self):
         service = self.service()
@@ -1368,6 +1488,86 @@ class UnofferedDeadline(ChannelTestCase):
         self.assertEqual(int(re.search(r" cache_deadline_ns=(\d+)", queued).group(1)), original,
                          "the deadline the engine saw was not the one the request was accepted with")
         self.assertNotIn("cache_offer", self.keys_of(self.engine.samplings[1]))
+
+
+class SharedQueuedPrefix(ChannelTestCase):
+    """Shared-prefix derivation is identical on the bounded frontier and on an unoffered direct demand."""
+
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.tokenizer_dir = Path(directory.name)
+        for name in server.TOKENIZER_FILES:
+            (self.tokenizer_dir / name).write_text("test identity", encoding="utf-8")
+        self.svc.tokenizer_dir = self.tokenizer_dir
+        self.engine.cache_model_id = "ab" * 32
+        self.svc.api_key = "client-key"
+        self.headers = {"Authorization": "Bearer client-key"}
+        self.principal = ("principal", "client-key", server.credential_fingerprint("client-key"))
+
+    def test_prepared_and_direct_demands_keep_the_same_shared_scope_and_distinct_private_owners(self):
+        body = {"messages": [{"role": "user", "content": "a shared document " * 20},
+                             {"role": "user", "content": "the question"}],
+                "strata_conversation_id": "A", "strata_shared_prefix": {"messages": 1},
+                "strata_prefix": {"messages": 1}, "max_tokens": 4}
+        resolved = self.svc.resolve_openai(dict(body), load=False)
+        self.svc.lifecycle_local.record = {"_cache_principal": self.principal}
+        direct_ids, _, _ = self.svc.prepare(resolved.messages, resolved.tools, resolved.kw, resolved.max_new_requested,
+                                           force=resolved.force, req=resolved.req)
+        expected_scope = resolved.req["_strata_cache_shared_scope"]
+        expected_pin = resolved.req["strata_prefix"]
+        self.svc.lifecycle_local.record = None
+        with mock.patch.object(self.svc, "encode_prompt", wraps=self.svc.encode_prompt) as encoded:
+            first = self.start_request("first", headers=self.headers)
+            self.assertTrue(self.engine.entered.wait(5))
+            second = self.start_request(body=body, headers=self.headers)
+            self.wait_queued(1)
+            offered = self.peer.next_offer(5)
+            self.assertIsNotNone(offered)
+            self.engine.release.set()
+            self.join(first, second)
+            self.assertEqual(second[1].get("status"), 200, second[1])
+            self.assertEqual(encoded.call_count, 2, "a prepared shared demand rendered its full prompt again")
+        sampling = self.engine.samplings[1]
+        self.assertEqual(self.engine.prompts[1], direct_ids)
+        self.assertEqual(sampling["_strata_cache_shared_scope"], expected_scope)
+        self.assertEqual(sampling["strata_prefix"], expected_pin)
+        self.assertEqual(sampling["strata_shared_prefix"], expected_pin)
+        self.assertEqual(offered["tokens"], direct_ids)
+        self.assertEqual(offered["scope"].hex(), sampling["_strata_cache_scope"])
+        self.assertEqual(offered["request_id"], sampling["_strata_cache_offer"])
+        self.assertEqual(offered["deadline_ns"], sampling["_strata_cache_deadline_ns"])
+        self.assertIn("sscope=" + expected_scope, self.keys_of(sampling))
+        another = {**body, "strata_conversation_id": "B",
+                   "messages": [body["messages"][0], {"role": "user", "content": "a different question"}]}
+        third = self.start_request(body=another, headers=self.headers)
+        self.join(third)
+        self.assertEqual(third[1].get("status"), 200, third[1])
+        direct = self.engine.samplings[2]
+        self.assertEqual(direct["_strata_cache_shared_scope"], expected_scope)
+        self.assertNotEqual(direct["_strata_cache_scope"], sampling["_strata_cache_scope"])
+        self.assertNotIn("_strata_cache_offer", direct)
+        self.assertGreater(direct["_strata_cache_deadline_ns"], 0)
+        self.assertEqual(self.peer.other, [], "sharing must not extend the private offer wire protocol")
+
+    def test_an_effort_fallback_is_never_frozen_for_a_shared_demand(self):
+        path = self.tokenizer_dir / "fallback.jinja"
+        path.write_text("{{ 'generation' if add_generation_prompt else 'history' }}"
+                        "{% for m in messages %}{{ m['content'] }}{% endfor %}", encoding="utf-8")
+        self.svc.template = ChatTemplate(path)
+        self.svc.effort_end = True
+        body = {"messages": [{"role": "user", "content": "a document and a question"}],
+                "strata_shared_prefix": {"tokens": 2}, "max_tokens": 4, "reasoning_effort": "none"}
+        resolved = self.svc.resolve_openai(body, load=False)
+        self.svc.lifecycle_local.record = {"_cache_principal": self.principal}
+        self.assertIsNone(self.svc.freeze_generation(resolved))
+        self.assertTrue(self.svc.lifecycle_local.render_fallback)
+        self.assertNotIn("_strata_cache_shared_scope", resolved.req)
+        self.svc.prepare(resolved.messages, resolved.tools, resolved.kw, resolved.max_new_requested,
+                         force=resolved.force, req=resolved.req)
+        self.assertNotIn("_strata_cache_shared_scope", resolved.req)
+        self.svc.lifecycle_local.record = None
 
 
 class Ancillary(unittest.TestCase):
