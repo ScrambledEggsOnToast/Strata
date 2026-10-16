@@ -622,6 +622,7 @@ void check_leases_and_budget();
 void check_tight_ram();
 void check_demand_reclaim_quote();
 void check_demand_reclaim_owner();
+void check_demand_reclaim_accepted_reader();
 void check_demand_reclaim_interleavings();
 void check_cancel_and_release();
 void check_read_timing();
@@ -707,6 +708,7 @@ int main() {
     check_tight_ram();
     check_demand_reclaim_quote();
     check_demand_reclaim_owner();
+    check_demand_reclaim_accepted_reader();
     check_demand_reclaim_interleavings();
     check_cancel_and_release();
     check_revoked_prefetch_demand();
@@ -3384,6 +3386,51 @@ void check_demand_reclaim_owner() {
         cache.release_lease(lease);
         store.close();
     }
+}
+
+void check_demand_reclaim_accepted_reader() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation disk = fixture(173, 4096);
+    ConversationStorePublishResult published;
+    check(publish_and_wait(store, disk, 1, 1, published), "the accepted-reader image is durable");
+    const uint64_t baseline = store.ram_held_bytes();
+    auto query = query_of(disk, 2, 2);
+    const auto now = [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()); };
+    query.deadline_ns = now() + uint64_t(60) * 1000000000;
+    SelectedHoldGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+    std::string why;
+    check(store.prefetch(query, why), "the speculative reader owns its reservation before revocation");
+    gate.await();
+    const uint64_t held = store.ram_held_bytes();
+    SavedConversation victim = fixture(175, 16), fallback = fixture(177, 32);
+    victim.checkpoints.clear();
+    fallback.checkpoints.clear();
+    victim.live.gdn.resize(size_t(16) << 20, 17);
+    const size_t envelope = victim.bytes() + fallback.bytes() + baseline + 1;
+    ConversationCache cache(envelope, 2);
+    check(cache.put(std::move(victim)) && cache.put(SavedConversation(fallback)),
+          "the owner has reclaimable RAM beside its protected rollback");
+    const size_t before = cache.envelope_bytes();
+    size_t protected_index = 1;
+    // Publishing this smaller allowance revokes the paused speculative reader,
+    // but its original reservation remains charged until that worker returns.
+    const auto result = strata::program::admit_store_demand(
+        store, cache, query, why, {envelope, 0, 0}, &protected_index,
+        now, [] { return false; }, [] {}, []() noexcept {});
+    check(!result.accepted && !result.recovery_attempted && !result.retried,
+          "an accepted revoked reader cannot be mistaken for a fresh reclamation demand");
+    check(cache.size() == 2 && cache.evictions() == 0 &&
+              cache.envelope_bytes() == before && protected_index == 1,
+          "retrying an accepted reader does not evict another history or rebase rollback");
+    check(store.ram_held_bytes() == held,
+          "refusing the accepted retry preserves its active worker's existing charge");
+    gate.resume();
+    store.release_read(query.request_id, query.generation);
+    store.close();
+    check(!gate.timed_out, "the accepted revoked worker is explicitly released");
 }
 
 void check_demand_reclaim_interleavings() {

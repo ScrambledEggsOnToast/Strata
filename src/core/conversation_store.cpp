@@ -3370,7 +3370,10 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         // read_body also holds restore scaffolding beside its decoded manifest.
         // The existing manifest workspace bound covers that scaffolding too;
         // quote it separately, without reserving a second decode in the reader.
-        if (refusal) refusal->additional_ram_bytes = sat_add(sat_add(peak, own_prep), decode_workspace);
+        // An accepted revoked worker still owns its reservation; it is not a
+        // fresh demand and cannot authorize eviction of another RAM history.
+        if (refusal && !previous_job)
+            refusal->additional_ram_bytes = sat_add(sat_add(peak, own_prep), decode_workspace);
         trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_budget, "peak_budget",
                              previous, best.head_id, uint64_t(best.tokens), peak);
         return false;
