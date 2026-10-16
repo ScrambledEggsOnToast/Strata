@@ -1574,20 +1574,19 @@ engine's declared setting fingerprint - profile names, paths, quotas and queue l
 images of different layouts never restore each other's complete snapshot, and a restore revalidates the exact
 token/image prefix instead of trusting a hash.
 
-*Ownership: an immutable lease, never a copy.* A captured image is **frozen in place** - each payload moves into a
-shared allocation with no byte copied - and the store receives a cheap immutable alias of it for an asynchronous,
-chunk-wise write straight out of those buffers, while the RAM cache keeps the mutable image and the very same bytes.
-A later mutation of either side detaches its own allocation first (copy-on-write), so a writer can never reach bytes a
-lease is reading, and a store that is busy, full or unhealthy only skips the write. The lease is charged to the
-conversation RAM envelope while it lives and given back when the caller releases it; every reference is charged in
-full, so the envelope is conservative rather than optimistic, and a publication that does not fit is never
-over-committed. Admission says which of the two it was: a **deferred** image fits the allowance and the preparation
-ceiling on their own, but resources the store may not free - a running worker, a handed-out or demanded image, or a
-publication in flight - are occupying them right now, so the caller keeps both its image and its lease and offers it
-again at the next seam; a **refused** image cannot fit however little else is resident, or is not representable at
-all. On an **accepted** admission the store owns the image's accounting from that instant, so the caller releases its
-lease there and then, whatever the write later settles as. A restore hands the engine an owned, complete,
-byte-verified image (never a live GPU pointer or a borrowed visitor), and the mounted copy owns its buffers alone.
+*Ownership: one protected waiting image.* A captured image is **frozen in place** without copying its payload.
+While publication waits, a bounded metadata ticket identifies the image's single protected RAM-cache owner.
+Eviction and supersession cannot remove that owner; a restore borrows a copy-on-write alias and leaves the
+publication ticket behind. Only the next writer acquires an image, transferring its cache charge into a lease
+without increasing the charged envelope. Protected admission also reserves the configured metadata-workspace
+ceiling, so waiting images cannot consume the room needed to publish them.
+
+On **accepted** admission the store takes the full image charge and the caller releases its lease immediately.
+An optional RAM alias is kept only when spare capacity admits its separate conservative charge. A **deferred**
+publication retains its acquired image and lease for the next safe seam; a **refused** publication is subject to
+the bounded retry policy. Queue/capacity refusal before protection can still park the image ordinarily, but does
+not promise persistence. A restore returns a complete, byte-verified owned image, never a live GPU pointer or a
+borrowed visitor. Mutating a frozen alias detaches its buffers before writing.
 
 *Publication.* A publication is bound to a head only when the engine *proves* the predecessor's whole persisted record
 is an exact prefix of the outgoing image in the same authorized scope, so a divergent sibling

@@ -2567,7 +2567,11 @@ void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) 
 bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job) {
     if (job->active || job->cancelled || job->released || job->handed || job->epoch_at_admission != epoch) return false;
     std::vector<ConversationStoreMatch> found;
-    collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images, found);
+    try {
+        collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images, found);
+    } catch (const std::bad_alloc&) {
+        return false; // keep useful prepared work when optional revalidation cannot allocate
+    }
     if (found.empty() || uint64_t(found.front().tokens) <= job->tokens) return false;
     const ConversationStoreMatch& best = found.front();
     // A ready shorter cut is still useful if the longer image cannot fit. Check the replacement's own peak and
@@ -2580,11 +2584,18 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
                           job->prep_bytes + kReadSlabBytes + kReadFixedOverhead;
     if ((ram_budget != 0 && peak > ram_budget) || (ram_budget == 0 && job->image)) return false;
-    for (auto it = queue.begin(); it != queue.end(); ++it)
-        if (*it == job) {
-            queue.erase(it);
-            break;
+    // Secure the replacement's queue position before releasing the old image or its leases.
+    // Reordering an existing descriptor needs no allocation; a failed new slot leaves it ready.
+    const auto queued = std::find(queue.begin(), queue.end(), job);
+    if (queued != queue.end()) {
+        std::rotate(queue.begin(), queued, std::next(queued));
+    } else {
+        try {
+            queue.push_front(job);
+        } catch (const std::bad_alloc&) {
+            return false;
         }
+    }
     for (auto it = ready.begin(); it != ready.end(); ++it)
         if (*it == job) {
             ready.erase(it);
@@ -2606,7 +2617,6 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
     job->peak_bytes = peak;
-    queue.push_front(job);
     counters.matches++;
     cv_work.notify_all();
     return true;
@@ -2643,8 +2653,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
             } else if (!refresh_read_locked(job)) {
                 for (auto it = queue.begin(); it != queue.end(); ++it)
                     if (*it == job) {
-                        queue.erase(it);
-                        queue.push_front(job);
+                        std::rotate(queue.begin(), it, std::next(it));
                         break;
                     }
             }

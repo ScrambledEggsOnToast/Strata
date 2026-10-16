@@ -10893,6 +10893,7 @@ int main(int argc, char** argv) {
         // persistence does not change today's choice.  A store that cannot open (no root, a missing identity, another
         // owner's lock, an unusable catalog) is an ordinary miss - never a serving failure - and says why.
         std::unique_ptr<strata::core::ConversationStore> conversation_store;
+        size_t store_publication_headroom = 0;
         // ---- publication lineage, queued captures and their handover, per state owner ---------------------------
         // The head an owner's state continues from, the capture queue, the retirement bookkeeping a replacement
         // requires and the retry policy all live in strata/program/conversation_publication.hpp, as one module whose
@@ -10965,6 +10966,7 @@ int main(int argc, char** argv) {
         };
         if (persistence_configured) {
             strata::core::ConversationStoreOptions options;
+            store_publication_headroom = options.metadata_bytes;
             options.root = o.conversation_cache_dir;
             // A required hardware identity this process cannot obtain declines persistence - never serving, and never
             // by binding a stand-in: see the per-card query below.
@@ -11202,10 +11204,11 @@ int main(int argc, char** argv) {
         // same envelope as the parked conversations (--conversation-cache-mib).  The allowance is what the parked
         // payloads and the store's own held bytes leave over: a demand request is always admitted and charged, while
         // an optional prefetch only takes spare allowance, so a full envelope never delays a required restore.
+        uint64_t publication_outside_bytes = 0; // a taken incoming image and any not-yet-parked capture
         auto store_allowance = [&]() -> uint64_t {
             if (!store_on) return 0;
             const uint64_t spare = conversation_store_ram_limit(conversations,
-                (uint64_t) o.conversation_cache_mib << 20);
+                (uint64_t) o.conversation_cache_mib << 20, publication_outside_bytes);
             conversation_store->publish_read_allowance(spare);
             return spare;
         };
@@ -11226,13 +11229,40 @@ int main(int argc, char** argv) {
         };
         // The handover's bookkeeping - harvesting settled results, retiring every reference to a head a replacement
         // removed, the generation-guarded adoption of a completion, the coverage proof and the bounded retry policy -
-        // lives in strata/program/conversation_publication.hpp.  These four callbacks are everything it needs from
-        // this engine: where its diagnostics go, the export cache's lease, the read allowance, and the store
-        // chronology this engine's own capture counter mints publication identifiers from.
+        // lives in strata/program/conversation_publication.hpp. Waiting tickets refer to protected RAM entries;
+        // only the writer's next image moves into a separately charged lease.
         strata::program::ConversationPublicationSink publication_sink;
+        publication_sink.publication_headroom_bytes = store_publication_headroom;
         publication_sink.report = [](const char* line) { std::fputs(line, stderr); };
         publication_sink.release_lease = [&](size_t lease_bytes) { conversations.release_lease(lease_bytes); };
         publication_sink.refresh_allowance = [&] { store_allowance(); };
+        publication_sink.acquire_image = [&](uint64_t ticket)
+                -> std::shared_ptr<const strata::core::SavedConversation> {
+            // Allocate the shared root before removing the cache's sole protected owner.
+            auto image = std::make_shared<strata::core::SavedConversation>();
+            auto owned = conversations.take_publication(ticket);
+            if (!owned) return {};
+            *image = std::move(*owned);
+            return image;
+        };
+        publication_sink.release_publication = [&](uint64_t ticket) {
+            conversations.release_publication(ticket);
+        };
+        publication_sink.retain_image = [&](const std::shared_ptr<const strata::core::SavedConversation>& image) {
+            if (!image) return;
+            const uint64_t external = conversation_store->ram_held_bytes() +
+                kConversationPreparationBytes + kConversationOfferBytes;
+            if (publication_outside_bytes > SIZE_MAX || external > SIZE_MAX - publication_outside_bytes) return;
+            const size_t held = (size_t) (external + publication_outside_bytes);
+            if (!conversations.can_fit(image->bytes(), held)) return;
+            try {
+                // Retain a cheap read-through alias only in spare RAM; never displace a pending publication.
+                conversations.put(image->frozen_alias(), held);
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: RAM alias allocation failed; "
+                                     "the store retains publication ownership\n");
+            }
+        };
         publication_sink.next_publication_id = [&](uint64_t& out) {
             return next_scheduled_serial(publication_serial, out);
         };
@@ -11746,6 +11776,12 @@ int main(int argc, char** argv) {
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
+            struct PublicationOutsideScope {
+                uint64_t& current;
+                uint64_t previous;
+                ~PublicationOutsideScope() { current = previous; }
+            } publication_outside_scope{publication_outside_bytes, publication_outside_bytes};
+            publication_outside_bytes = held;
             // A capture is about to spend GPU time on copies; hand the store's writer whatever is already queued
             // first.  This is a real retry seam (the entry stays queued if the writer is busy), and it is also what
             // lets this capture's own publication find the writer free.
@@ -11967,16 +12003,13 @@ int main(int argc, char** argv) {
                 };
                 if (extent_probe_on && held_image) observe("held-incoming", 0, image, *held_image);
                 // ---- persistent publication ------------------------------------------
-                // The captured image is frozen in place - its payloads move into shared allocations, no byte is
-                // copied - and the store receives a cheap immutable alias for an asynchronous, chunk-wise write
-                // straight out of those buffers.  The RAM cache keeps the mutable image and the very same bytes, so
-                // parking costs nothing extra; the lease is charged to the same envelope while it lives and given
-                // back when the store releases the alias.  A busy, full or unhealthy store only skips the write: the
-                // request keeps its result either way.
+                // Waiting publications keep one protected owner in the existing RAM cache. Only the writer's
+                // next ticket transfers that image into a lease; queued identifiers do not double-charge payloads.
+                const size_t previous_superseded = conversations.superseded();
+                bool stored = false;
+                bool publication_attempted = false;
+                publication_outside_bytes = image.bytes() <= UINT64_MAX - held ? held + image.bytes() : UINT64_MAX;
                 if (store_on && valid_image(image)) {
-                    // A busy writer first: drain what is already queued before this capture adds to it, so the queue
-                    // is a handover, not an accumulation, and no seam spends GPU work on a write that cannot start.
-                    // The allowance this handover is admitted against subtracts the held incoming image.
                     store_admission.publish(image.bytes());
                     flush_publishes(0);
                     StoreOwner& owner = store_owner(source.owner);
@@ -11997,51 +12030,33 @@ int main(int argc, char** argv) {
                             streams, retained_prefixes, reuse_donor_head, reuse_donor_epoch, capture_epoch,
                             kConversationStoreChunkBytes);
                     }
-                    const size_t lease = image.bytes();
-                    // Reserve both references before freezing: the store owns the publication's own charge, and the
-                    // cache's lease covers exactly the window in which the entry is queued and the store does not yet
-                    // hold it, so neither side can hand those bytes to another image while it waits.
-                    const size_t overhead = 1u << 20;
-                    const uint64_t external_now = store_admission.held();
-                    const bool admitted = lease <= (SIZE_MAX - overhead) / 2 && external_now <= SIZE_MAX - held &&
-                        conversations.reserve_snapshot(lease * 2 + overhead, held + (size_t) external_now) &&
-                        conversations.try_reserve_lease(lease);
-                    if (admitted) {
-                        queued.image = strata::core::conversation_image_freeze_share(image);
-                        queued.lease_bytes = lease;
-                        if (!next_scheduled_serial(capture_generation, queued.publication_id)) {
-                            conversations.release_lease(lease);
-                            ++publications.counters().dropped;
-                            std::fprintf(stderr, "strata serve: conversation store: the capture identifier namespace "
-                                                 "is exhausted; this capture is not published\n");
-                        } else {
-                            // This capture becomes the owner's current generation: an older completion of the same
-                            // owner is now dropped rather than attached to a state it no longer describes.
-                            const uint64_t previous_generation = owner.generation;
-                            owner.generation = queued.publication_id;
-                            queued.owner_generation = queued.publication_id;
-                            // Slot ownership does not establish conversation ancestry. Do not replace an unwritten
-                            // conversation merely because a later request reused its slot: the queue keeps their
-                            // publications distinct, and the image leases and its fixed entry ceiling bound it
-                            // independently of slot identity.
-                            if (publications.enqueue(std::move(queued), publication_sink)) {
-                                flush_publishes(0);
-                            } else {
-                                owner.generation = previous_generation;
-                                conversations.release_lease(lease);
-                            }
-                        }
+                    if (!next_scheduled_serial(capture_generation, queued.image_ticket)) {
+                        ++publications.counters().dropped;
+                        std::fprintf(stderr, "strata serve: conversation store: the capture identifier namespace "
+                                             "is exhausted; this capture is not published\n");
                     } else {
-                        ++publications.counters().refused;
-                        std::fprintf(stderr, "strata serve: conversation store: publication not queued (writer or "
-                                             "RAM admission; %zu MiB)\n", lease >> 20);
+                        queued.owner_generation = queued.image_ticket;
+                        const uint64_t external_now = store_admission.held();
+                        if (external_now <= SIZE_MAX - held) {
+                            publication_attempted = true;
+                            const auto admitted = publications.capture(conversations, std::move(image),
+                                std::move(queued), held + (size_t) external_now, held_entries, publication_sink);
+                            stored = admitted.parked;
+                        }
                     }
                 }
-                const size_t previous_superseded = conversations.superseded();
-                store_admission.publish(image.bytes());
-                const uint64_t final_external = store_admission.held();
-                const bool stored = final_external <= SIZE_MAX - held &&
-                    conversations.put(std::move(image), held + (size_t) final_external, held_entries);
+                if (!publication_attempted) {
+                    store_admission.publish(image.bytes());
+                    const uint64_t final_external = store_admission.held();
+                    stored = final_external <= SIZE_MAX - held &&
+                        conversations.put(std::move(image), held + (size_t) final_external, held_entries);
+                }
+                publication_outside_bytes = stored ? held :
+                    (image.bytes() <= UINT64_MAX - held ? held + image.bytes() : UINT64_MAX);
+                if (store_on) {
+                    store_allowance();
+                    flush_publishes(0);
+                }
                 if (const size_t dropped = conversations.superseded() - previous_superseded)
                     std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                                          "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
@@ -15643,6 +15658,18 @@ int main(int argc, char** argv) {
                                  (long long) selected.tokens);
                 }
             }
+            bool incoming_retained_in_cache = false;
+            if (selected.source == PrefixSource::parked) {
+                try {
+                    incoming.emplace(conversations.take(selected.parked.index, incoming_retained_in_cache));
+                } catch (const std::bad_alloc&) {
+                    // A pending publication keeps its sole owner; an optional restore alias may fail safely.
+                    incoming_retained_in_cache = false;
+                    selected = PrefixCandidate{};
+                    std::fprintf(stderr, "strata serve: conversation cache: restore alias allocation failed; "
+                                         "reading the prompt instead\n");
+                }
+            }
             int64_t resume = selected.source == PrefixSource::checkpoint || selected.source == PrefixSource::live
                 ? selected.tokens : 0;
             bool from_live = selected.source == PrefixSource::live;
@@ -15651,7 +15678,6 @@ int main(int argc, char** argv) {
             const ConvCheckpoint* slot_ck = slot_source >= 0 ? selected.checkpoint : nullptr;
             bool resumed_from0 = false;
             const auto parked = selected.parked;
-            if (selected.source == PrefixSource::parked) incoming.emplace(conversations.take(parked.index));
             if (o.prefix_cost_selection)
                 std::fprintf(stderr, "strata serve: prefix selection: source=%s tokens=%lld longest=%lld policy=%s "
                                      "estimated_ms=%.3f park_ms=%.3f restore_ms=%.3f prefill_ms=%.3f\n",
@@ -15724,7 +15750,8 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             if ((!from_live || incoming || slot_source >= 0 || !req_ckpt) && !pin_sibling &&
                 !park_current(incoming && !restored_from_store ? incoming->bytes() : 0,
-                              incoming ? &*incoming : nullptr, incoming && !restored_from_store && !req_ckpt ? 1 : 0,
+                              incoming ? &*incoming : nullptr,
+                              incoming && !restored_from_store && !incoming_retained_in_cache && !req_ckpt ? 1 : 0,
                               // A one-shot borrow (ckpt=0) leaves its donor alone: its capture is a branch of its
                               // own, and it never supersedes the head that donor came from.
                               req_ckpt != 0)) {
@@ -15967,7 +15994,7 @@ int main(int argc, char** argv) {
             if (incoming) {
                 // Capture reserved both these bytes and this entry. Failure to
                 // return a validated donor is an ownership fault, not a cache miss.
-                if (!restored_from_store && !conversations.put(std::move(*incoming))) {
+                if (!restored_from_store && !incoming_retained_in_cache && !conversations.put(std::move(*incoming))) {
                     std::printf("ERR returning a borrowed conversation snapshot failed\n");
                     return 1;
                 }
