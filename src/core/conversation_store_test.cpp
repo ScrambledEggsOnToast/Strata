@@ -3404,6 +3404,10 @@ void check_demand_reclaim_accepted_reader() {
     std::string why;
     check(store.prefetch(query, why), "the speculative reader owns its reservation before revocation");
     gate.await();
+    store.suspend_read_admission();
+    check(store.demand(query_of(disk, 3, 2), why),
+          "a distinct demand revokes the gated speculative reader");
+    store.release_read(3, 2);
     const uint64_t held = store.ram_held_bytes();
     SavedConversation victim = fixture(175, 16), fallback = fixture(177, 32);
     victim.checkpoints.clear();
@@ -3415,8 +3419,8 @@ void check_demand_reclaim_accepted_reader() {
           "the owner has reclaimable RAM beside its protected rollback");
     const size_t before = cache.envelope_bytes();
     size_t protected_index = 1;
-    // Publishing this smaller allowance revokes the paused speculative reader,
-    // but its original reservation remains charged until that worker returns.
+    // The competing demand revoked this worker, but its original reservation
+    // remains charged. A lower allowance must not turn its retry into a fresh demand.
     const auto result = strata::program::admit_store_demand(
         store, cache, query, why, {envelope, 0, 0}, &protected_index,
         now, [] { return false; }, [] {}, []() noexcept {});
