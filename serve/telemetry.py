@@ -7,6 +7,10 @@ A background thread samples once a second and keeps the last 60 readings of each
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
+
+Completed samples publish a process-local unsigned-64 seq in now; pressure, when present, carries the same seq.
+The existing pressure/lifecycle boot_id identifies the process-reset scope. A failed optional extra() leaves the
+base sample intact with extra_error=true and no fabricated pressure payload. These fields are display-only.
 """
 from __future__ import annotations
 
@@ -20,6 +24,9 @@ import threading
 import time
 
 HISTORY = 60
+# Display-only sample IDs, process-local (the pressure/lifecycle boot_id identifies their reset scope).
+# At 1 Hz the unsigned 64-bit range lasts over 584 billion years.
+_SAMPLE_SEQ = iter(range(1, 1 << 64))
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -454,7 +461,7 @@ class Telemetry:
             try:
                 s.update(self.extra())
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
-                pass
+                s["extra_error"] = True
         return s
 
     def _loop(self):
@@ -462,6 +469,9 @@ class Telemetry:
             s = self.sample()
             with self.lock:
                 self.now = s
+                s["seq"] = next(_SAMPLE_SEQ)
+                if isinstance(s.get("pressure"), dict):
+                    s["pressure"] = {**s["pressure"], "seq": s["seq"]}
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)

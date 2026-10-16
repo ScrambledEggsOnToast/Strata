@@ -5,14 +5,17 @@
 import contextlib
 import io
 import json
+import tempfile
+import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, request_timings, serve
+from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, request_timings, serve
 from serve.test_server import ThinkingEngine
 
 
@@ -219,6 +222,57 @@ class RequestAccounting(unittest.TestCase):
         self.assertEqual(row["engine_generated"], 20)
         self.assertEqual((row["prompt_ms"], row["decode_ms"]), (40.0, 200.0))
         self.assertEqual((metrics["totals"]["drafts_offered"], metrics["totals"]["drafts_accepted"]), (18, 8))
+
+
+class PressureHistory(unittest.TestCase):
+    def test_finished_history_and_cache_events_join_the_same_completed_sample(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Hello.", max_context=4096)
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).with_name("chat_template.jinja")))
+        with contextlib.redirect_stdout(io.StringIO()):
+            list(svc.run(tok.encode("hi"), False, None, 20, {}, threading.Event()))
+        self.assertIsNone(svc.history[-1]["pressure_seq"])  # telemetry remains optional
+        reader = mock.Mock(spec=["ok", "name", "read", "close"])
+        reader.ok.return_value = False
+        with mock.patch("serve.telemetry.gpu_reader", return_value=reader), \
+                mock.patch.object(threading.Thread, "start"):
+            svc.start_telemetry()
+        sampler = svc.telemetry
+        self.addCleanup(sampler._readers.close)  # no background thread was started
+        cases = [(99.0, True), (101.0, True), (98.99, False), (101.01, False), (None, False)]
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("", encoding="utf-8")
+            engine.log_path, engine.log_start = str(log), 0
+            previous_seqs = []
+            for sampled_at, fresh in cases:
+                with self.subTest(sampled_at=sampled_at):
+                    def extra():
+                        if sampled_at is None:
+                            raise RuntimeError("no pressure payload")
+                        return {"pressure": {"boot_id": svc.lifecycle_boot, "sampled_at_unix_s": sampled_at}}
+
+                    sampler.extra = extra
+                    sampler._stop.clear()
+                    with mock.patch("serve.server.time.time", return_value=100.0), \
+                            mock.patch.object(sampler._stop, "wait", side_effect=lambda _: sampler._stop.set()), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        sampler._loop()
+                        seq = sampler.snapshot()["now"]["seq"]
+                        list(svc.run(tok.encode("hi"), False, None, 20, {}, threading.Event()))
+                        with log.open("a", encoding="utf-8") as f:
+                            f.write("strata serve: conversation cache: restored 2 tokens (live) in 3.5 ms; "
+                                    "parked=0 bytes=0\n")
+                        metrics = svc.metrics()
+                    expected = seq if fresh else None
+                    previous_seqs.append(expected)
+                    self.assertEqual(svc.history[-1]["pressure_seq"], expected)
+                    self.assertEqual(metrics["requests"][0]["pressure_seq"], expected)
+                    event = metrics["conversation_cache"]["events"][-1]
+                    self.assertEqual(event["pressure_seq"], expected)
+                    self.assertEqual((event["restore_kind"], event["duration_ms"]), ("live", 3.5))
+                    self.assertEqual([row["pressure_seq"] for row in list(svc.history)[1:]], previous_seqs)
+                    self.assertTrue(all(row["finish"] == "stop" for row in svc.history))
 
 
 class SlotLegAccounting(unittest.TestCase):

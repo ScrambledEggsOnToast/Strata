@@ -568,61 +568,129 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def fresh_pressure_seq(pressure, now=None):
+    """Display-only join to a completed sample in this process's lifecycle boot_id scope.
+
+    Both cache events and finished history rows accept at most one second of wall-clock skew.
+    Missing/failed pressure reads have no join; no PSI values are inferred.
+    """
+    if not isinstance(pressure, dict):
+        return None
+    sampled_at, seq = pressure.get("sampled_at_unix_s"), pressure.get("seq")
+    if (isinstance(sampled_at, bool) or not isinstance(sampled_at, (int, float)) or
+            isinstance(seq, bool) or not isinstance(seq, int) or not 0 < seq < 1 << 64):
+        return None
+    return seq if abs((time.time() if now is None else now) - sampled_at) <= 1.0 else None
+
+
 class ConvCacheLog:
-    """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
-    cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
-    which is the log): read on from where it was last read, from the start of the engine's current run."""
-    EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
-                       r"(?: evictions=(\d+))?")
+    """Bounded, display-only cache log snapshots; seq resets on (path, start), unlike run_changes.
+
+    Each event carries the observed cache counters so a client can resynchronize after missing a poll.
+    Gaps mark incomplete counters after lost log bytes; the last 32 events include gap records.
+    """
+    EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens"
+                       r"(?: \(([^)]{1,64})\))?(?: in ([0-9]+(?:\.[0-9]+)?) ms)?"
+                       r".*?parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
-        self.key, self.pos = None, 0
+        self.lock = threading.Lock()
+        self.key, self.pos, self.identity = None, 0, None
+        self.run_changes = 0
         self.reset()
 
     def reset(self):
+        self.events = collections.deque(maxlen=32)
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "last_duration_ms": None, "last_restore_kind": None,
+                      "seq": 0, "gaps": 0, "gap_reason": None}
 
-    def poll(self, path, start) -> dict:
-        """The state after the log's new lines; `start` is where the engine's current run began in it."""
+    def _snapshot(self):
+        return {**self.state, "run_changes": self.run_changes, "events": [dict(e) for e in self.events]}
+
+    def _event(self, event, now, pressure, *, tokens=None, duration_ms=None, restore_kind=None):
+        st = self.state
+        st["seq"] += 1
+        self.events.append({"seq": st["seq"], "event": event, "at": now, "tokens": tokens,
+                            "duration_ms": duration_ms, "restore_kind": restore_kind,
+                            "pressure_seq": fresh_pressure_seq(pressure, now),
+                            **{k: st[k] for k in ("parked", "bytes", "evictions", "parks", "restores",
+                                                 "gaps", "gap_reason")}})
+
+    def _gap(self, reason, now, pressure):
+        self.state["gaps"] += 1
+        self.state["gap_reason"] = reason
+        self._event("gap", now, pressure)
+
+    def poll(self, path, start, pressure=None) -> dict:
+        """Read new whole lines; pressure is the optional latest completed 1 Hz pressure sample."""
+        with self.lock:
+            return self._poll(path, start, pressure)
+
+    def _poll(self, path, start, pressure):
         if not path or start is None:
-            return dict(self.state)
-        if self.key != (path, start):                   # another start of the engine: its cache starts empty
-            self.key, self.pos = (path, start), start
+            return self._snapshot()
+        if self.key != (path, start):
+            if self.key is not None:
+                self.run_changes += 1
+            self.key, self.pos, self.identity = (path, start), start, None
             self.reset()
+        now = time.time()
         try:
-            size = os.path.getsize(path)
-            if size < self.pos:                         # the log was emptied or replaced
-                self.pos = 0
-            if size - self.pos > self.READ_MAX:
-                self.pos = size - self.READ_MAX
             with open(path, "rb") as f:
+                stat = os.fstat(f.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                size = stat.st_size
+                if self.identity is not None and identity != self.identity:
+                    self._gap("log_rotated", now, pressure)
+                    self.pos = 0
+                elif size < self.pos:
+                    self._gap("log_truncated", now, pressure)
+                    self.pos = 0
+                self.identity = identity
+                skipped = size - self.pos > self.READ_MAX
+                if skipped:
+                    self._gap("read_max", now, pressure)
+                    self.pos = size - self.READ_MAX
                 f.seek(self.pos)
                 data = f.read(size - self.pos)
         except OSError:
-            return dict(self.state)
-        end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
+            return self._snapshot()
+        if skipped:
+            # The seek may land inside a line: never parse that fragment as a whole event.
+            first = data.find(b"\n") + 1
+            if not first:
+                self.pos += len(data)
+                return self._snapshot()
+            self.pos += first
+            data = data[first:]
+        end = data.rfind(b"\n") + 1
         self.pos += end
-        now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
             if m:
+                event, tokens, kind, duration, parked, size, evictions = m.groups()
                 st = self.state
-                st["parked"], st["bytes"] = int(m.group(3)), int(m.group(4))
-                if m.group(5) is not None:
-                    st["evictions"] = int(m.group(5))
-                if m.group(1) != "skipped":
-                    st["parks" if m.group(1) == "parked" else "restores"] += 1
-                    st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                st["parked"], st["bytes"] = int(parked), int(size)
+                if evictions is not None:
+                    st["evictions"] = int(evictions)
+                duration = float(duration) if duration is not None else None
+                kind = kind if event == "restored" else None
+                if event != "skipped":
+                    st["parks" if event == "parked" else "restores"] += 1
+                    st.update(last_event=event, last_tokens=int(tokens), last_at=now,
+                              last_duration_ms=duration, last_restore_kind=kind)
+                self._event(event, now, pressure, tokens=int(tokens), duration_ms=duration, restore_kind=kind)
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
-        return dict(self.state)
+                self._event("dropped", now, pressure)
+        return self._snapshot()
 
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
@@ -3895,7 +3963,7 @@ class Service:
         now = time.perf_counter()
         record: dict[str, Any] = {"id": uuid.uuid4().hex, "_score": score, "priority": priority, "state": "queued", "started_at": time.time(),
                   "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
-                  "events": [{"state": "queued", "elapsed_s": 0.0}], "_clock": now,
+                  "events": [{"state": "queued", "elapsed_s": 0.0}], "events_dropped": 0, "_clock": now,
                   "_deadline": now + timeout, "_cancel": cancel}
         with self.admission_cv:
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
@@ -3928,6 +3996,8 @@ class Service:
             self._refresh_foreground_pending()
             if len(record["events"]) < 128:
                 record["events"].append({"state": state, "elapsed_s": round(time.perf_counter() - record["_clock"], 6)})
+            else:
+                record["events_dropped"] += 1
 
     def acquire_request(self, record, on_wait=None):
         """Wait for this server's admission decision: FIFO within a priority class, with a background admission after
@@ -4500,7 +4570,8 @@ class Service:
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None),
+                                    (tel.get("now") or {}).get("pressure"))
         return {**({"request_activity": request_activity} if os.environ.get("STRATA_THROUGHPUT") == "1" else {}), "throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
@@ -6074,6 +6145,8 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            telemetry = getattr(self, "telemetry", None)
+                            pressure = (telemetry.snapshot().get("now") or {}).get("pressure") if telemetry else None
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -6081,6 +6154,7 @@ class Service:
                                 "duration_s": round(time.perf_counter() - (lifecycle["_clock"] if lifecycle else waiting), 3),
                                 "queue_s": lifecycle["queue_s"] if lifecycle else None,
                                 "first_token_s": lifecycle["first_token_s"] if lifecycle else None,
+                                "pressure_seq": fresh_pressure_seq(pressure),
                                 "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)

@@ -148,6 +148,26 @@ class Lifecycle(unittest.TestCase):
             data = response.read().decode()
             return response.status, data if "event-stream" in response.headers.get("Content-Type", "") else json.loads(data)
 
+    def test_lifecycle_event_cap_accounts_for_discarded_notes(self):
+        record = self.svc.register_lifecycle({}, threading.Event())
+        self.assertEqual(record["events_dropped"], 0)
+        try:
+            for i in range(127):
+                self.svc.lifecycle_note(record, "queued", observation=i)
+            full = self.svc.lifecycle_records(record["id"])
+            self.assertEqual((len(full["events"]), full["events_dropped"]), (128, 0))
+            for i in range(5):
+                self.svc.lifecycle_note(record, "queued", observation=127 + i)
+            capped = self.svc.lifecycle_records(record["id"])
+            self.assertEqual((len(capped["events"]), capped["events_dropped"]), (128, 5))
+            self.assertEqual(capped["events"], full["events"])
+            self.assertEqual(capped["observation"], 131)  # the display cap cannot suppress state updates
+        finally:
+            self.svc.finish_lifecycle(record)
+        finished = self.svc.lifecycle_records(record["id"])
+        self.assertEqual((finished["state"], len(finished["events"]), finished["events_dropped"]),
+                         ("completed", 128, 6))
+
     def test_discover_chat_unload_and_stream_reload(self):
         self.assertEqual(self.request("/api/health")[1]["service"], "strata")
         self.assertFalse(self.request("/v1/status")[1]["loaded"])

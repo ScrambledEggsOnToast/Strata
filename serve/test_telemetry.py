@@ -220,6 +220,75 @@ class SamplerOwnership(unittest.TestCase):
             reader.close.assert_called_once_with()
 
 
+class SampleSequences(unittest.TestCase):
+    def test_completed_samples_advance_once_even_when_extra_fails(self):
+        reader = SamplerOwnership().reader()
+        reader.read.return_value = {"util": 42}
+        calls = 0
+
+        def extra():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("pressure reader failed")
+            return {"pressure": {"boot_id": "process-boot", "sampled_at_unix_s": 100.0}}
+
+        with mock.patch.object(telemetry, "gpu_reader", return_value=reader), \
+                mock.patch.object(threading.Thread, "start"):
+            sampler = telemetry.Telemetry(extra=extra)
+        samples = []
+
+        def tick(interval):
+            self.assertEqual(interval, 1.0)
+            samples.append(sampler.snapshot())
+            self.assertEqual(sampler.snapshot(), samples[-1])  # readers never consume an ID
+            if len(samples) == 3:
+                sampler._stop.set()
+
+        try:
+            self.assertNotIn("seq", sampler.snapshot()["now"])
+            with mock.patch.object(sampler._stop, "wait", side_effect=tick):
+                sampler._loop()
+            seqs = [s["now"]["seq"] for s in samples]
+            self.assertGreater(seqs[0], 0)
+            self.assertLess(seqs[-1], 1 << 64)
+            self.assertEqual(seqs, list(range(seqs[0], seqs[0] + 3)))
+            self.assertEqual(calls, 3)
+            self.assertEqual([s["now"]["gpu_util"] for s in samples], [42] * 3)
+            self.assertEqual(samples[-1]["history"]["gpu_util"], [42] * 3)
+            failed = samples[1]["now"]
+            self.assertTrue(failed["extra_error"])
+            self.assertNotIn("pressure", failed)
+            for sample in (samples[0], samples[2]):
+                now = sample["now"]
+                self.assertEqual(now["pressure"]["seq"], now["seq"])
+                self.assertEqual(now["pressure"]["boot_id"], "process-boot")
+                self.assertNotIn("extra_error", now)
+
+            # An incomplete hardware read is not a completed sample and cannot consume an ID.
+            sampler._stop.clear()
+            reader.read.side_effect = RuntimeError("incomplete read")
+            with self.assertRaisesRegex(RuntimeError, "incomplete read"):
+                sampler._loop()
+            self.assertEqual(sampler.snapshot(), samples[-1])
+            reader.read.side_effect = None
+            with mock.patch.object(sampler._stop, "wait", side_effect=lambda _: sampler._stop.set()):
+                sampler._loop()
+            self.assertEqual(sampler.snapshot()["now"]["seq"], seqs[-1] + 1)
+            previous = sampler.snapshot()["now"]["seq"]
+            with mock.patch.object(telemetry, "gpu_reader", return_value=self.reader()), \
+                    mock.patch.object(threading.Thread, "start"):
+                second = telemetry.Telemetry()
+            try:
+                with mock.patch.object(second._stop, "wait", side_effect=lambda _: second._stop.set()):
+                    second._loop()
+                self.assertEqual(second.snapshot()["now"]["seq"], previous + 1)
+            finally:
+                second._readers.close()
+        finally:
+            sampler._readers.close()  # the constructor's thread was deliberately never started
+
+
 class ServingOwnership(unittest.TestCase):
     def service(self):
         tok = server.ByteTokenizer()

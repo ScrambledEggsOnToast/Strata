@@ -1,5 +1,6 @@
 """Request inspection through HTTP; no native model or GPU is required."""
 import json
+import tempfile
 import threading
 import time
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, serve
+from serve.server import ByteTokenizer, ConvCacheLog, EngineDied, MockEngine, Service, serve
 
 
 class ReloadableEngine(MockEngine):
@@ -221,6 +222,109 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), start)["parked"], 1)
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
+
+    def test_event_snapshots_parse_duration_kind_and_are_detached(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.PARK + self.RESTORE +
+                           self.RESTORE.replace(" (exact)", "") +
+                           "strata serve: conversation cache: skipped 20 tokens; parked=2 bytes=99 evictions=3\n",
+                           encoding="utf-8")
+            c = ConvCacheLog()
+            st = c.poll(str(log), 0)
+            self.assertEqual(st["seq"], 4)
+            self.assertEqual([e["seq"] for e in st["events"]], [1, 2, 3, 4])
+            park, restore, untyped, skipped = st["events"]
+            self.assertEqual((park["event"], park["duration_ms"], park["restore_kind"]), ("parked", 12.0, None))
+            self.assertEqual((restore["duration_ms"], restore["restore_kind"]), (30.0, "exact"))
+            self.assertEqual((untyped["duration_ms"], untyped["restore_kind"]), (30.0, None))
+            self.assertEqual((skipped["event"], skipped["duration_ms"], skipped["evictions"]), ("skipped", None, 3))
+            self.assertEqual((st["last_event"], st["last_duration_ms"], st["last_restore_kind"]),
+                             ("restored", 30.0, None))
+            self.assertEqual((st["parks"], st["restores"]), (1, 2))
+            self.assertTrue(all(e["pressure_seq"] is None for e in st["events"]))
+            restore["parked"] = -1
+            st["events"].clear()
+            self.assertEqual(c.poll(str(log), 0)["events"][1]["parked"], 2)
+
+    def test_event_window_is_bounded_and_run_changes_reset_only_run_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.PARK * 40, encoding="utf-8")
+            c = ConvCacheLog()
+            st = c.poll(str(log), 0)
+            self.assertEqual((st["seq"], st["run_changes"], st["parks"]), (40, 0, 40))
+            self.assertEqual(len(st["events"]), 32)
+            self.assertEqual([e["seq"] for e in st["events"]], list(range(9, 41)))
+            self.assertEqual(st["events"][0]["parks"], 9)
+            start = log.stat().st_size
+            reset = c.poll(str(log), start)
+            self.assertEqual((reset["seq"], reset["run_changes"], reset["gaps"]), (0, 1, 0))
+            self.assertEqual((reset["parks"], reset["events"], reset["last_event"]), (0, [], None))
+            self.assertIsNone(reset["gap_reason"])
+            self.assertEqual(c.poll(None, None), reset)
+            self.assertEqual(c.poll(str(log), start), reset)
+            other = Path(d) / "other.log"
+            other.write_text(self.RESTORE, encoding="utf-8")
+            changed = c.poll(str(other), 0)
+            self.assertEqual((changed["seq"], changed["run_changes"], changed["restores"]), (1, 2, 1))
+            self.assertEqual(changed["events"][0]["restore_kind"], "exact")
+
+    def test_truncation_and_rotation_are_visible_even_when_replacement_is_larger(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.PARK * 3, encoding="utf-8")
+            c = ConvCacheLog()
+            c.poll(str(log), 0)
+            log.write_text(self.RESTORE, encoding="utf-8")
+            truncated = c.poll(str(log), 0)
+            self.assertEqual((truncated["gaps"], truncated["gap_reason"], truncated["seq"]),
+                             (1, "log_truncated", 5))
+            self.assertEqual([e["event"] for e in truncated["events"][-2:]], ["gap", "restored"])
+            log.rename(Path(d) / "old.log")
+            log.write_text(self.PARK * 4, encoding="utf-8")
+            rotated = c.poll(str(log), 0)
+            self.assertEqual((rotated["gaps"], rotated["gap_reason"], rotated["seq"]),
+                             (2, "log_rotated", 10))
+            self.assertEqual(rotated["events"][-5]["event"], "gap")
+            self.assertEqual(rotated["run_changes"], 0)
+            self.assertEqual(c.poll(str(log), 0), rotated)  # a repeated poll cannot duplicate the gap
+            reset = c.poll(str(log), log.stat().st_size)
+            self.assertEqual((reset["gaps"], reset["gap_reason"], reset["seq"], reset["run_changes"]),
+                             (0, None, 0, 1))
+
+    def test_backlog_skip_marks_gap_and_discards_partial_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            # The capped seek lands on a valid-looking event inside a non-event line.
+            fragment = self.PARK + self.RESTORE
+            log.write_text(self.PARK + "x" * 400 + fragment, encoding="utf-8")
+            c = ConvCacheLog()
+            c.READ_MAX = len(fragment.encode())
+            st = c.poll(str(log), 0)
+            self.assertEqual((st["gaps"], st["gap_reason"], st["seq"]), (1, "read_max", 2))
+            self.assertEqual([e["event"] for e in st["events"]], ["gap", "restored"])
+            self.assertEqual((st["parks"], st["restores"]), (0, 1))
+            self.assertEqual(st["events"][-1]["parked"], 2)
+            self.assertEqual(c.poll(str(log), 0), st)
+
+    def test_pressure_join_uses_absolute_one_second_freshness(self):
+        pressures = [(None, None), ({}, None),
+                     ({"seq": 17, "sampled_at_unix_s": 99.0}, 17),
+                     ({"seq": 18, "sampled_at_unix_s": 101.0}, 18),
+                     ({"seq": 19, "sampled_at_unix_s": 98.99}, None),
+                     ({"seq": 20, "sampled_at_unix_s": 101.01}, None),
+                     ({"seq": 21, "sampled_at_unix_s": float("nan")}, None),
+                     ({"seq": None, "sampled_at_unix_s": 100.0}, None)]
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            for pressure, expected in pressures:
+                with self.subTest(pressure=pressure):
+                    log.write_text(self.RESTORE, encoding="utf-8")
+                    c = ConvCacheLog()
+                    with mock.patch("serve.server.time.time", return_value=100.0):
+                        st = c.poll(str(log), 0, pressure)
+                    self.assertEqual(st["events"][-1]["pressure_seq"], expected)
 
     def test_metrics(self):
         tok = ByteTokenizer()
