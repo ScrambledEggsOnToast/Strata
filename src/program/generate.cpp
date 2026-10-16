@@ -12177,6 +12177,8 @@ int main(int argc, char** argv) {
                                 owner.cvec, true, &*source, kResidentOwnerFirst + (uint64_t) slot, true},
                                held, held_image);
         };
+        const char* throughput_env = std::getenv("STRATA_THROUGHPUT");
+        const bool report_throughput = throughput_env && std::string(throughput_env) == "1";
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -12327,8 +12329,13 @@ int main(int argc, char** argv) {
             const int64_t done = p0 + T;
             pp_reached = done;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
-                        ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+            if (report_throughput) {
+                std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
+                            ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) (done - pp_from));
+            } else {
+                std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
+                            ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+            }
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
@@ -16065,6 +16072,7 @@ int main(int argc, char** argv) {
                 part_at.clear();
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
+            if (report_throughput) std::printf("INFO throughput_progress=1\n");
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
@@ -16193,8 +16201,13 @@ int main(int argc, char** argv) {
                 pl_drain();   // nothing in flight: both stages' commits and the drafter's rows have landed
                 pl_mtp_live[0] = pl_mtp_live[1] = false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
-                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                if (report_throughput) {
+                    std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) b, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0, (long long) (b - pp_from));
+                } else {
+                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                }
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -16286,8 +16299,13 @@ int main(int argc, char** argv) {
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
-                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                if (report_throughput) {
+                    std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) b, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0, (long long) (b - pp_from));
+                } else {
+                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                }
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -16843,6 +16861,15 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
+            // Publish committed prompt work before decode, on the same basis as PP.
+            auto report_prompt_work = [&](int64_t reached) {
+                if (report_throughput) {
+                    std::printf("INFO fresh_prompt_tokens=%lld\n",
+                                (long long) std::max<int64_t>(0, reached - pp_from));
+                    std::fflush(stdout);
+                }
+            };
+            report_prompt_work(std::max(at, pp_reached));
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             if (!o.score_reference.empty()) {
                 // The prompt reader stops at n-1. Consume its final input token,
@@ -17444,6 +17471,7 @@ int main(int argc, char** argv) {
                     const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
+                        if (produced_n == 0) report_prompt_work(n);
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -17797,6 +17825,7 @@ int main(int argc, char** argv) {
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i < keep; ++i) {
+                    if (produced_n == 0) report_prompt_work(n);
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;

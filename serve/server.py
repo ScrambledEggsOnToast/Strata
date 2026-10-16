@@ -21,6 +21,8 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 """
 from __future__ import annotations
 
+from serve.throughput import Throughput
+
 import argparse
 import contextlib
 import collections
@@ -1237,6 +1239,7 @@ class StrataEngine:
                     self._release_control()
 
     def _pump(self):
+        throughput = self.throughput = Throughput()
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         score_q = getattr(self, "score_q", {})
@@ -1244,6 +1247,7 @@ class StrataEngine:
         policy = getattr(self, "speculation_policy", None)  # this process's cost state, never a restarted successor's
         line = None
         for line in proc.stdout:
+            throughput.wire(line)
             if _BTRACE:
                 btrace("wire<", line.rstrip())
             # checked before batch routing: a fatal line is never a slot's own
@@ -4441,6 +4445,8 @@ class Service:
             state = "unloaded"
         else:
             state = "idle"
+        throughput = getattr(self.engine, "throughput", None)
+        aggregate = throughput.snapshot() if throughput is not None and self.loaded() else None
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
@@ -4470,7 +4476,7 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
+        return {"throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":

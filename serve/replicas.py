@@ -275,6 +275,18 @@ class ReplicaEngine:
         return next((e.progress for e in self.engines if getattr(e, "progress", None)), None)
 
     @property
+    def throughput(self):
+        return self
+
+    def snapshot(self):
+        samples = [getattr(e, "throughput", None) for e in self.engines]
+        snapshots = [s.snapshot() if s is not None and e.alive() else None
+                     for e, s in zip(self.engines, samples)]
+        def total(key):
+            return sum(s[key] for s in snapshots) if all(s is not None and s.get(key) is not None for s in snapshots) else None
+        return {"window_s": 5.0, "decode_tok_s": total("decode_tok_s"), "prefill_tok_s": total("prefill_tok_s")}
+
+    @property
     def prefill_tok_s_mean(self):
         c = getattr(self.tl, "cur", None)
         if c is not None:
