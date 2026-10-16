@@ -163,10 +163,11 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
         }
     }
     if (!restore_residency(to, g, upto, error)) return false;
-    // Repairs run on the default stream; MTP's consumer stream is nonblocking.
+    // Repairs run on the legacy/default stream; synchronize that stream without
+    // stalling unrelated work on MTP's nonblocking consumer stream.
     // Do not publish the copied owner until its map/ring repair has completed.
     if (to.kv_mode != 0) {
-        const auto status = cudaDeviceSynchronize();
+        const auto status = cudaStreamSynchronize((cudaStream_t) 0);
         if (status != cudaSuccess) {
             error = std::string("resident direct copy residency synchronize: ") + cudaGetErrorString(status);
             return false;

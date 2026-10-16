@@ -1449,6 +1449,10 @@ park/restore. The estimate predicts existing root/message/turn/pin cuts; it does
 arithmetic. Transfer timings include synchronization and host metadata overhead, so the byte
 extent is a cost-model input, **not measured PCIe or DRAM traffic**.
 
+Draft-slot host-bounce restores join any legacy-stream ring-residency repair
+before publishing or consuming the owner; synchronizing MTP's nonblocking
+stream alone does not establish that ordering.
+
 Unknown or out-of-bound alternatives never win; if the longest valid source itself is unpriced,
 selection stays longest. Cost ties and gains no larger than `--prefix-min-savings-ms N` (integer
 0–60000, default 0) keep the original longest source and tie order. Observations are bounded to

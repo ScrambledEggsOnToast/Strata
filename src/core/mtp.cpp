@@ -1213,12 +1213,22 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
     Operation operation(*this, err);
     if (!operation) return false;
     if (!idle(err)) return false;
+    const QsaState& target = slots_[(size_t) slot].state;
     if (resident_direct_copy_enabled()) {
-        if (!conversation_kv_copy(st_, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+        if (!conversation_kv_copy(st_, target, *g_, cells, false, err)) return false;
     } else {
         ConversationKv image;
         if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
-            !conversation_kv_restore(image, slots_[(size_t) slot].state, *g_, cells, false, err)) return false;
+            !conversation_kv_restore(image, target, *g_, cells, false, err)) return false;
+        // Map/ring residency repair runs on the legacy stream.  cs_ is nonblocking, so
+        // Operation::finish() cannot publish this owner until that repair completes.
+        if (target.kv_mode == 1 || (target.kv_mode == 2 && cells > 0)) {
+            const cudaError_t status = cudaStreamSynchronize((cudaStream_t) 0);
+            if (status != cudaSuccess) {
+                err = std::string("mtp draft slot save synchronize: ") + cudaGetErrorString(status);
+                return false;
+            }
+        }
     }
     slots_[(size_t) slot].cells = cells;
     slots_[(size_t) slot].proposal = -1;
@@ -1246,6 +1256,14 @@ bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
         ConversationKv image;
         if (!conversation_kv_save(image, slots_[(size_t) slot].state, *g_, cells, false, err) ||
             !conversation_kv_restore(image, st_, *g_, cells, false, err)) return false;
+        // Join the legacy-stream repair before restore_ring() or a proposal consumes st_.
+        if (st_.kv_mode == 1 || (st_.kv_mode == 2 && cells > 0)) {
+            const cudaError_t status = cudaStreamSynchronize((cudaStream_t) 0);
+            if (status != cudaSuccess) {
+                err = std::string("mtp draft slot resume synchronize: ") + cudaGetErrorString(status);
+                return false;
+            }
+        }
     }
     if (!restore_ring(cells, err)) return false;
     const bool ok = operation.finish(err);
