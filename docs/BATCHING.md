@@ -468,15 +468,31 @@ subtracting the measured decode cost. A cold estimate permits one chunk. A conse
 adapts to observed costs; it is an estimate, not worst-case execution time.
 Changing the memory-admitted chunk invalidates its timing estimate: a cheap short-request chunk cannot
 train a larger background chunk downward. The new geometry gets one cold indivisible chunk.
-No workspace is enlarged, placement re-resolved, recurrent chunk resized, route changed or draft counted as output. Initial solo
+By default no workspace is enlarged, placement re-resolved, recurrent chunk resized, route changed or draft counted as output. Initial solo
 reads and pipelined groups reach the same parking/interleave path. Each pipeline group runs once per
 bounded decode round, then every stage drains before prompt/verifier scratch is reused.
 The legacy `batch_read_piece` helper still selects one whole run for pipelined groups; only budget `0`
 uses that selection to bypass the quantum loop. A positive budget instead selects quanta with `TimeBudget`.
 
+`STRATA_PREFILL_SPLIT_OVER_BUDGET=1024` separately opts into an execution split, not a smaller allocation.
+It applies only with a positive foreground budget, an admitted 2048-token chunk whose measured cost
+exceeds that budget, a currently served decoder, one selected contended chunk rather than pipeline fill,
+and at least 2048 tokens remaining. That chunk runs as two 1024-token launches through the same loop:
+controls, cancellation, store handoff, decode-first service and carried debt are revisited at the midpoint.
+Together the halves reach the selected chunk's original endpoint; the original final tail is unchanged.
+Neither `Prefill::chunk()`, workspace, loans nor ring sizing changes. Each half earns background credit
+from its actual elapsed time without training the 2048-token cost estimate downward.
+Scheduling records for both halves include `split_over_budget=1024`; `indivisible_over_budget=1` still
+means the **actual launch**, including a 1024-token half, exceeded the target.
+Unset or `0` retains the original partition; other values are refused at startup, not used as a new
+partition. No experimental subquantum below 1024 is selected (an unchanged final tail may be shorter).
+This execution partition can change recurrent rounding and needs its own arithmetic/runtime qualification;
+the CPU scheduling harness is not that qualification or a token-gap guarantee.
+
 `ctest --test-dir <build> -R '^prefill_interleave_test$' --output-on-failure` checks this composed decision
 on the CPU by compiling the actual prompt-read loop with synthetic GPU work and a deterministic clock.
-It checks prefill/decode/prefill ordering and the original tail, not device arithmetic or pipeline-drain correctness.
+It checks prefill/decode/prefill ordering, opt-in midpoint controls and cancellation, exact prompt tiling,
+unchanged estimates and gate-off behavior, not device arithmetic or pipeline-drain correctness.
 
 Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
 An indivisible decode-round overrun remains debt for later quanta. Background control entries get a
@@ -496,10 +512,11 @@ Later internal prefix reuse does not convert this request's own fresh prefill in
 Silent control reads also expose cooperative-yield polling every 0.5 s, rather than waiting for the
 legacy ten-second HTTP heartbeat or for a completed `PP` chunk before sending `BYIELD`.
 
-An indivisible chunk may exceed the target; the engine reports `indivisible_over_budget=1`, never silently
-shrinks it or advertises success. Qualify a smaller `--prefill` profile separately if needed: changing
-chunk geometry changes recurrent rounding. `STRATA_PREFILL_EQUAL`, `STRATA_SPLIT_SMALL_OWN` and
-`STRATA_PREFILL_HELP` are refused in time-budget mode pending separate partition/resume qualification.
+Without the explicit split opt-in, an indivisible chunk may exceed the target; the engine reports
+`indivisible_over_budget=1`, never silently shrinks it or advertises success. Qualify any smaller execution
+partition separately: changing it changes recurrent rounding. `STRATA_PREFILL_EQUAL`,
+`STRATA_SPLIT_SMALL_OWN` and `STRATA_PREFILL_HELP` are refused in time-budget mode pending separate
+partition/resume qualification.
 Images and the final short tail retain their existing non-preemptible behavior. Saved scopes, identities,
 RNG ownership, sampled-speculation acceptance and completed-slot retention keep their existing owners.
 

@@ -57,6 +57,8 @@ public:
         if (charge) decode_credit_ms_ -= wall_ms;
     }
     double chunk_ms() const { return chunk_ms_; }
+    // Policy decisions may only use a cost measured for this exact allocation.
+    double chunk_ms(int64_t memory_chunk) const { return chunk_tokens_ == memory_chunk ? chunk_ms_ : 0; }
     double decode_ms() const { return decode_ms_; }
 private:
     double foreground_ms_, background_share_;

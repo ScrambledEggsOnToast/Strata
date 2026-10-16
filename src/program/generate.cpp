@@ -2890,6 +2890,13 @@ int main(int argc, char** argv) {
                              "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
         return 2;
     }
+    const char* prefill_split_setting = std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET");
+    if (prefill_split_setting && std::strcmp(prefill_split_setting, "0") != 0 &&
+        std::strcmp(prefill_split_setting, "1024") != 0) {
+        std::fprintf(stderr, "strata scheduling: STRATA_PREFILL_SPLIT_OVER_BUDGET must be unset, 0 or exactly 1024; "
+                             "other execution partitions are not qualified\n");
+        return 2;
+    }
     if (o.foreground_budget_ms > 0 &&
         ((std::getenv("STRATA_PREFILL_EQUAL") && std::atoi(std::getenv("STRATA_PREFILL_EQUAL")) != 0) ||
          (std::getenv("STRATA_PREFILL_HELP") && std::atoi(std::getenv("STRATA_PREFILL_HELP")) != 0) ||
@@ -16454,8 +16461,8 @@ int main(int argc, char** argv) {
             auto park_replaced = [&](int slot) -> bool {
                 return park_completed(slot, incoming ? incoming->bytes() : 0, incoming ? &*incoming : nullptr);
             };
-            // Prompt quanta retain the memory-admitted arithmetic partition. A
-            // positive foreground budget replaces the legacy previous-chunk share.
+            // Prompt quanta keep the memory-admitted geometry. The opt-in
+            // over-budget split changes only the drained execution boundaries.
             // Decode rounds and parking run only after sp.run drains all stages.
             static const double decode_share = [] {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
@@ -16561,6 +16568,9 @@ int main(int argc, char** argv) {
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 // A zero legacy piece must not bypass time-budget quanta (notably piped groups).
                 if (!time_budget.enabled() && piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                const char* split_setting = std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET");
+                const bool split_over_budget = split_setting && std::strcmp(split_setting, "1024") == 0;
+                int64_t split_until = a0;
                 bool yield_requested = false;
                 auto prompt_controls = [&](int64_t q) -> bool {
                     if (stop_req.load()) { e = "cancelled"; return false; }
@@ -16624,24 +16634,37 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lk(in_mu);
                         fill = in_lines.empty();
                     }
-                    const int64_t quantum = grouped_budget
+                    int64_t quantum = grouped_budget
                         ? strata::program::batch_read_quantum(b0 - q, C, fill, std::max<int64_t>(C, o.short_read))
                         : time_budget.enabled() ? time_budget.prefill_tokens(b0 - q, C, batch_on() ? age() : 0)
                         : std::min(C, b0 - q);
+                    // Split one selected contended C, never an idle pipeline
+                    // fill. Remember its endpoint so a short remainder cannot
+                    // absorb the second half or change the original tail.
+                    bool split_launch = q < split_until;
+                    if (!split_launch && split_over_budget && time_budget.enabled() &&
+                        C == 2048 && quantum == C && b0 - q >= C && batch_on() &&
+                        time_budget.chunk_ms(C) > o.foreground_budget_ms) {
+                        split_until = q + C; // remaining >= C proves this fits
+                        split_launch = true;
+                    }
+                    if (split_launch) quantum = 1024;
                     const bool pipeline_fill = grouped_budget && quantum > C;
                     const int64_t r = time_budget.enabled() ? q + quantum : std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     const double chunk_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     if (time_budget.enabled()) {
-                        if (!pipeline_fill && quantum % C == 0) time_budget.prefilled(chunk_wall_ms, quantum / C, C);
-                        else time_budget.background_work(chunk_wall_ms); // overlapped spans and tails cannot price isolated C
+                        if (!pipeline_fill && !split_launch && quantum % C == 0)
+                            time_budget.prefilled(chunk_wall_ms, quantum / C, C);
+                        else time_budget.background_work(chunk_wall_ms); // fills, halves and tails cannot price isolated C
                         credited_prefill_ms += chunk_wall_ms;
                         std::fprintf(stderr, "strata scheduling: prefill [%lld,%lld) chunk=%lld wall_ms=%.3f "
-                                             "estimate_ms=%.3f budget_ms=%.3f%s\n",
+                                             "estimate_ms=%.3f budget_ms=%.3f%s%s\n",
                                      (long long) q, (long long) r, (long long) C, chunk_wall_ms,
                                      time_budget.chunk_ms(), o.foreground_budget_ms,
-                                     quantum <= C && chunk_wall_ms > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
+                                     split_launch ? " split_over_budget=1024" : "",
+                                     r - q <= C && chunk_wall_ms > o.foreground_budget_ms ? " indivisible_over_budget=1" : "");
                     }
                     // A prompt with tokens left is this thread's longest stretch with no request boundary: the chunk
                     // boundary hands the store's writer the oldest queued capture, outside the chunk's own timing
