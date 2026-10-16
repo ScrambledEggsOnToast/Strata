@@ -3255,8 +3255,12 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         }
         const uint64_t workspace = conversation_store_detail::manifest_read_workspace_bound(
             manifest_read_cap(previous_job->manifest_bytes, limits));
+        // This settled selection owns no active reservation or ready image. Zero allowance cannot start it, and
+        // the sole serving owner cannot republish capacity while waiting on an accepted demand. Refuse before
+        // removing its terminal result or requeueing; its descriptor and selected-head hold stay owned until release.
+        // Active workers and ready images never enter this branch; positive-budget suspension still queues normally.
         if (sat_add(preparation_locked() - std::min(read_prep, previous_job->prepared_bytes), workspace) >
-            options.metadata_bytes || (ram_budget && previous_job->peak_bytes > ram_budget)) {
+            options.metadata_bytes || previous_job->peak_bytes > ram_budget) {
             why = "the retained selection cannot fit the current read allowance or preparation ceiling";
             return false;
         }

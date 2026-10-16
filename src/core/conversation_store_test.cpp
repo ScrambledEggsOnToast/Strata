@@ -623,6 +623,8 @@ void check_tight_ram();
 void check_demand_reclaim_quote();
 void check_demand_reclaim_owner();
 void check_demand_reclaim_accepted_reader();
+void check_zero_allowance_demand_adoption();
+void check_zero_allowance_adoption_controls();
 void check_demand_reclaim_interleavings();
 void check_cancel_and_release();
 void check_read_timing();
@@ -672,6 +674,8 @@ int main() {
         check_budget_deferred_head_hold();
         check_revoked_headless_demand();
         check_revoked_prefetch_demand();
+        check_zero_allowance_demand_adoption();
+        check_zero_allowance_adoption_controls();
         check_corruption();
         std::printf("conversation_store_test deferred: %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
@@ -709,6 +713,8 @@ int main() {
     check_demand_reclaim_quote();
     check_demand_reclaim_owner();
     check_demand_reclaim_accepted_reader();
+    check_zero_allowance_demand_adoption();
+    check_zero_allowance_adoption_controls();
     check_demand_reclaim_interleavings();
     check_cancel_and_release();
     check_revoked_prefetch_demand();
@@ -3395,6 +3401,154 @@ void check_demand_reclaim_owner() {
     }
 }
 
+void check_zero_allowance_demand_adoption() {
+    for (bool revoked : {false, true}) for (bool zero_allowance : {true, false}) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_read_requests = 2;
+        ConversationStore store(options);
+        const SavedConversation disk = fixture(179, 256), fallback = fixture(179, 32);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, disk, 1, 1, published) &&
+                  published.status == ConversationStorePublishStatus::stored,
+              "the demand-adoption fixture is durable");
+        const uint64_t baseline = store.ram_held_bytes();
+        auto query = query_of(disk, 2, 2);
+        const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        query.deadline_ns = now + uint64_t(60) * 1000000000;
+        std::string why;
+        if (!revoked) store.suspend_read_admission();
+        check(store.prefetch(query, why), "the selected prefetch is accepted before demand");
+        check(await_status(store, 2, 2, revoked ? ConversationStoreReadStatus::ready :
+                           ConversationStoreReadStatus::refused_budget),
+              "the prefetch reaches its asserted state before demand adoption");
+        if (revoked) {
+            // Retiring an already-ready offer completes revocation synchronously, with no worker left to refund.
+            store.suspend_read_admission();
+            check(store.demand(query_of(disk, 3, 2), why), "a suspended peer internally revokes the ready offer");
+            store.release_read(3, 2);
+            check(store.request_status(2, 2) == ConversationStoreReadStatus::cancelled,
+                  "internal revocation has settled before the original demand returns");
+        }
+        const auto settled_status = store.request_status(2, 2);
+        const uint64_t held = store.ram_held_bytes(), io = store.counters().bytes_read;
+        check_eq(store.ram_lease_bytes(), 0, "the settled offer has no image lease to reclaim");
+        if (zero_allowance) {
+            // The real serving-owner seam publishes zero once. A false admission must return to the RAM fallback;
+            // this test never waits for a refused adoption or supplies a later allowance to rescue it.
+            const size_t lease = 512;
+            ConversationCache cache(fallback.bytes() + lease, 1);
+            check(cache.put(SavedConversation(fallback)) && cache.try_reserve_lease(lease),
+                  "the owner retains its fallback and an unrelated live RAM lease");
+            const size_t cache_charge = cache.envelope_bytes();
+            size_t protected_index = 0;
+            const auto result = strata::program::admit_store_demand(
+                store, cache, query, why, {cache_charge, 0, 0}, &protected_index,
+                [&] { return now; }, [] { return false; },
+                [] { check(false, "refused adoption must not refresh a reclaimed cache view"); },
+                []() noexcept { check(false, "refused adoption must not invalidate the fallback view"); });
+            check(!result.accepted && !result.recovery_attempted && !result.retried &&
+                      !result.required_increment_bytes && !why.empty(),
+                  "a settled accepted offer refuses zero allowance synchronously without a fresh-demand reclaim");
+            check_eq(store.ram_read_budget(), 0, "the sole owner published no materialization allowance");
+            check(store.request_status(2, 2) == settled_status,
+                  "refusal preserves the settled descriptor instead of requeueing it pending");
+            check_eq(store.ram_held_bytes(), held, "refusal preserves the selected metadata without reserving an image");
+            check_eq(store.counters().bytes_read, io, "refused adoption performs no new payload read");
+            check(cache.size() == 1 && cache.evictions() == 0 && cache.envelope_bytes() == cache_charge &&
+                      cache.leased_bytes() == lease && protected_index == 0,
+                  "refused adoption evicts no history and refunds no unrelated RAM lease");
+            bool retained = true;
+            const auto restored = cache.take(protected_index, retained);
+            check(!retained && images_equal(restored, fallback, why),
+                  "the owner consumes its original byte-identical fallback without waiting on the store");
+            cache.release_lease(lease);
+            check_eq(cache.leased_bytes(), 0, "only the fallback owner releases its separate RAM lease");
+        } else {
+            ConversationStoreReadRefusal refusal{UINT64_MAX};
+            check(store.demand(query, why, &refusal) && refusal.additional_ram_bytes == 0,
+                  "positive-budget suspension still permits adoption of a settled selection");
+            ConversationStoreRead pending;
+            check(store.request_status(2, 2) == ConversationStoreReadStatus::none &&
+                      !store.take_ready(2, 2, pending) && !store.ram_lease_bytes(),
+                  "positive-budget adoption remains queued without allocating while admission is suspended");
+            store.publish_read_allowance(uint64_t(64) << 20);
+            check(store.wait_ready(2, 2, pending, 5000) && pending.image &&
+                      pending.head_id == published.head_id && images_equal(*pending.image, disk, why),
+                  "resuming positive-budget admission restores the retained selection byte for byte");
+            pending.image.reset();
+        }
+        const uint64_t releases = store.counters().reads_released;
+        store.release_read(2, 2);
+        check(store.request_status(2, 2) == ConversationStoreReadStatus::none,
+              "normal owner release forgets the retained descriptor");
+        check_eq(store.ram_lease_bytes(), 0, "normal release leaves no incoming image lease");
+        check_eq(store.ram_held_bytes(), baseline, "normal release balances every query, decode and image charge");
+        check_eq(store.counters().reads_released, releases + 1, "the accepted descriptor is released exactly once");
+        store.release_read(2, 2);
+        check_eq(store.counters().reads_released, releases + 1, "repeated owner release cannot refund the descriptor twice");
+        store.close();
+        if (zero_allowance) {
+            const auto records = trace.records();
+            check_eq(read_trace_count(records, "reissue", 2), 0, "zero-allowance refusal never creates a pending attempt");
+            check_eq(read_trace_count(records, "read_start", 2), revoked ? 1 : 0,
+                     "only the original ready prefetch, when present, enters materialization");
+            const auto* released = read_trace(records, "release", 2);
+            check(released && !released->number("reserved_bytes") && !released->number("lease_bytes") &&
+                      !released->number("holds_slot"),
+                  "the refused adoption releases with no outstanding worker reservation or incoming slot");
+        }
+    }
+}
+
+void check_zero_allowance_adoption_controls() {
+    for (bool active : {false, true}) {
+        TempRoot root;
+        SelectedHoldGate gate;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const SavedConversation image = fixture(181, 256);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published), "the zero-allowance control image is durable");
+        const uint64_t baseline = store.ram_held_bytes();
+        if (active)
+            store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+        const auto query = query_of(image, 2, 2);
+        std::string why;
+        check(store.prefetch(query, why), "the control prefetch is accepted");
+        if (active) gate.await();
+        else check(await_status(store, 2, 2, ConversationStoreReadStatus::ready), "the control image is already ready");
+        const uint64_t held = store.ram_held_bytes(), leased = store.ram_lease_bytes();
+        check(active ? held > baseline && !leased : leased > 0,
+              "the control owns a real active reservation or a materialized image lease");
+        store.publish_read_allowance(0);
+        ConversationStoreReadRefusal refusal{UINT64_MAX};
+        check(store.demand(query, why, &refusal) && refusal.additional_ram_bytes == 0,
+              "zero allowance still permits adoption of ready images and genuinely active reads");
+        check_eq(store.ram_held_bytes(), held, "control adoption never refunds an active reservation or ready image");
+        check_eq(store.ram_lease_bytes(), leased, "control adoption preserves the existing image lease");
+        if (active) {
+            store.release_read(2, 2);
+            check_eq(store.ram_held_bytes(), held, "even explicit release cannot refund a gated active worker");
+            gate.resume();
+        } else {
+            ConversationStoreRead read;
+            check(store.wait_ready(2, 2, read, 5000) && read.image && read.head_id == published.head_id &&
+                      images_equal(*read.image, image, why),
+                  "the pre-existing ready image remains deliverable without another allowance publication");
+            read.image.reset();
+            store.release_read(2, 2);
+            check_eq(store.ram_held_bytes(), baseline, "ready-image release balances its pre-existing full charge");
+        }
+        store.set_read_gate_for_test(nullptr, nullptr);
+        store.close();
+        check_eq(store.ram_lease_bytes(), 0, "the control owner releases its image lease normally");
+        check(store.ram_held_bytes() <= baseline, "worker unwind and normal release leave no read-owned charge");
+        check(!gate.timed_out, "the active control is released by its explicit gate, never a timing-dependent sleep");
+    }
+}
+
 void check_demand_reclaim_accepted_reader() {
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
@@ -3738,12 +3892,16 @@ void check_revoked_prefetch_demand() {
     store.publish_read_allowance(0);
     check(store.prefetch(query_of(image, 104, 1), why), "a budget-limited prefetch is registered");
     check(await_status(store, 104, 1, ConversationStoreReadStatus::refused_budget), "the speculative read is refused");
-    check(store.demand(query_of(image, 104, 1), why), "demand adopts a budget deferral before allowance recovery");
+    check(!store.demand(query_of(image, 104, 1), why),
+          "demand refuses a settled budget deferral while the published allowance is zero");
+    check(store.request_status(104, 1) == ConversationStoreReadStatus::refused_budget,
+          "zero-allowance refusal preserves the deferred selection for a later retry");
     ConversationStoreRead premature;
-    check(!store.take_ready(104, 1, premature), "demand adoption removes the old budget-refusal result");
     SelectedHoldGate gate;
     store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
     store.publish_read_allowance(uint64_t(64) << 20);
+    check(store.demand(query_of(image, 104, 1), why),
+          "the owner can retry the preserved selection after publishing positive allowance");
     gate.await();
     check(!store.take_ready(104, 1, premature), "an active adopted reader cannot deliver an unfinished descriptor");
     gate.resume();
@@ -3769,11 +3927,11 @@ void check_revoked_prefetch_demand() {
               replacement->number("attempt_id") != revoked->number("attempt_id"),
           "a revoked ready image and its demand redo have linked, distinct attempt identities");
     const auto* budget = read_trace(records, "settled", 104);
-    const auto* retry = read_trace(records, "reissue", 104, "refused_budget");
+    const auto* retry = read_trace(records, "reissue", 104, "allowance_recovery");
     check(budget && budget->text("status") == "refused_budget" && !budget->number("io_attempted") &&
               !budget->number("start_ns") && retry &&
               retry->number("previous_attempt_id") == budget->number("attempt_id"),
-          "a speculative no-I/O refusal is distinct from its later demand materialization");
+          "a speculative no-I/O refusal is retried only by the later positive-allowance publication seam");
     check(read_trace(records, "retire", 103, "caller_cancel") &&
               !read_trace(records, "reissue", 103), "explicit cancellation is logged without a fabricated retry");
 }
