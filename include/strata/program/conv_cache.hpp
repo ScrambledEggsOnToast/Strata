@@ -77,4 +77,17 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, con
     return v;
 }
 
+/// pin=N (the serve loop's `pin_checkpoint`): make the checkpoint of exactly `length` tokens the chain's single
+/// explicit pin - one pinned prefix at a time, so a request that names a new prefix retargets the old one.  The
+/// chain is the working history's checkpoints in order; each carries its tokens in `ids` and its mark in `pinned`.
+template <class Checkpoints>
+inline bool pin_checkpoint(Checkpoints& checks, int64_t length) {
+    bool found = false;
+    for (auto& c : checks) {
+        c.pinned = (int64_t) c.ids.size() == length;
+        found = found || c.pinned;
+    }
+    return found;
+}
+
 }  // namespace strata::program::conv_cache

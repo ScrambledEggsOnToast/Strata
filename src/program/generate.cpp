@@ -16695,14 +16695,6 @@ int main(int argc, char** argv) {
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
             int64_t pin_at = -1;
-            auto pin_checkpoint = [&](int64_t L) {
-                bool found = false;
-                for (ConvCheckpoint& c : checks) {
-                    c.pinned = (int64_t) c.ids.size() == L;
-                    found = found || c.pinned;
-                }
-                return found;
-            };
             if (req_pin > 0) {
                 if (o.prompt_cache < 3 || !req_ckpt)
                     std::fprintf(stderr, "strata serve: pin=%lld ignored: %s\n", (long long) req_pin,
@@ -16711,7 +16703,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld ignored: the prefix must be shorter than the prompt "
                                  "(%lld tokens)\n", (long long) req_pin, (long long) n);
                 else if (req_pin > read_from) pin_at = req_pin;
-                else if (!pin_checkpoint(req_pin))
+                else if (!strata::program::conv_cache::pin_checkpoint(checks, req_pin))
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
@@ -16777,7 +16769,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
-                if (to == pin_at && !pin_checkpoint(pin_at))
+                if (to == pin_at && !strata::program::conv_cache::pin_checkpoint(checks, pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",

@@ -13,6 +13,8 @@
 //   4. a one-slot budget has no room for root and leaf, so the pin is off and the oldest leaves (the
 //      newest point stays, as before);
 //   5. the policy is pure: the same stamps, the same victim.
+//   6. pin=N: one checkpoint is the single explicit pin; a target the chain does not hold resolves nothing and
+//      must leave the pin the working history holds in place (only a target that is there retargets it).
 #include "strata/program/conv_cache.hpp"
 
 #include <cstdint>
@@ -20,6 +22,7 @@
 #include <vector>
 
 using strata::program::conv_cache::eviction_victim;
+using strata::program::conv_cache::pin_checkpoint;
 
 namespace {
 int g_fail = 0;
@@ -27,6 +30,11 @@ void check(bool ok, const char* what) {
     std::printf("  %-66s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
+// As far as the pin choice sees a checkpoint: the working history's tokens and the mark a request left on it.
+struct PinItem {
+    std::vector<int32_t> ids;
+    bool pinned = false;
+};
 }  // namespace
 
 int main() {
@@ -86,6 +94,21 @@ int main() {
         const std::vector<uint64_t> s4 = {1, 9, 3, 5};
         check(eviction_victim(s4.data(), s4.size(), 4, nullptr, all) == 2, "everything pinned: the oldest pin leaves, never the root");
         check(eviction_victim(s4.data(), s4.size(), 1, nullptr, all) == 0, "a one-slot budget keeps no pin: the oldest leaves");
+    }
+    {   // pin=N: one explicit pin per chain; a target the chain no longer holds must not drop it
+        std::vector<PinItem> chain(3);
+        chain[0].ids.assign(10, 0);
+        chain[1].ids.assign(20, 0);
+        chain[2].ids.assign(30, 0);
+        chain[1].pinned = true;   // the pin the working history holds from the request that last retargeted it
+        check(!pin_checkpoint(chain, 25), "an absent pin target resolves nothing");
+        check(chain[1].pinned && !chain[0].pinned && !chain[2].pinned,
+              "an absent target leaves the pin the working history holds");
+        check(pin_checkpoint(chain, 30), "a target the chain holds resolves");
+        check(chain[2].pinned && !chain[1].pinned && !chain[0].pinned,
+              "a new pin replaces the one at another length");
+        check(pin_checkpoint(chain, 30) && chain[2].pinned && !chain[1].pinned && !chain[0].pinned,
+              "re-pinning the same target is stable");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
