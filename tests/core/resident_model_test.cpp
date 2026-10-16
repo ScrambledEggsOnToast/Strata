@@ -426,6 +426,33 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(owner.finish(1, error), "cancel survivor after failed peer");
         require(owner.release_resources(error) && owner.init_resources(error) && !owner.available(0) && owner.available(1),
                 "resource re-init restores valid contexts only");
+        // #879 taint ownership through the real bind transition: the taint belongs to the identity that
+        // ran, never to the seat. A fresh (non-continuing) admission retires it with the old identity and
+        // the seat caches again; a continuing rebind of the same identity keeps it, and that identity's
+        // completion stays out of the cache.
+        require(owner.begin(1, prompt, request, error), "begin the run that will be tainted");
+        const uint64_t poisoned = owner.working().request;
+        require(owner.admit(1, prefix, admission, error), "admit the run that will be tainted");
+        owner.taint(1);
+        require(owner.finish(1, error), "finish the poisoned run");
+        require(!owner.slots()[1].cached && !owner.completed_snapshot_source(1, error).has_value(),
+                "a tainted completion is neither cached nor reusable");
+        require(owner.begin(1, prompt, request, error), "begin a fresh identity over the tainted seat");
+        require(owner.working().request != poisoned && owner.working().resume_slot == -1,
+                "a finished poisoned identity is never continued");
+        require(owner.admit(1, prefix, admission, error), "the fresh non-continuing admission takes the seat");
+        require(!owner.slots()[1].tainted, "a fresh non-continuing bind retires the seat's stale taint");
+        const uint64_t fresh = owner.working().request;
+        require(owner.finish(1, error), "finish the fresh run");
+        require(owner.completed_snapshot_source(1, error).has_value(), "the fresh identity completes reusable");
+        require(owner.park(1, prefix, admission, true, error), "yield the fresh identity");
+        require(owner.begin(1, prompt, request, error) && owner.working().request == fresh &&
+                owner.working().resume_slot == 1, "promote the yielded identity for its continuing rebind");
+        owner.taint(1);
+        require(owner.park(1, prefix, admission, true, error), "rebind the same tainted identity continuing");
+        require(owner.slots()[1].tainted, "a continuing rebind keeps the identity's own taint");
+        require(!owner.completed_snapshot_source(1, error).has_value(),
+                "the continuing tainted identity stays non-reusable");
         require(owner.begin(1, prompt, request, error), "select retained B for restore failure");
         transfer_failed = false;
         fail_destination = main.ple_hist;

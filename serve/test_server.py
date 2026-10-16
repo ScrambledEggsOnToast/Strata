@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service, TENANT_HEADER,
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen,
+                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, make_handler,
+                          prompt_progress, prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -3827,6 +3827,20 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertTrue(int(headers["Retry-After"]) > 0)
         self.assertEqual(self.engine.starts, 0)
+
+    def test_caller_retry_after_wins_whatever_its_spelling(self):
+        """The admission snapshot only fills an absence of a caller hint: a preexisting Retry-After spelled in
+        any letter case is the one hint on the answer, never a second default beside it."""
+        handler = make_handler(self.svc).__new__(make_handler(self.svc))   # no socket: _json's decision alone
+        sent = []
+        handler.send_response = lambda code: sent.append((":status", code))
+        handler.send_header = lambda name, value: sent.append((name, str(value)))
+        handler._note = lambda **_: None
+        handler._cors = lambda: None
+        handler.wfile = io.BytesIO()
+        handler._json(503, {"error": {"type": "server_error", "message": "busy"}}, headers={"retry-AFter": "7"})
+        self.assertEqual([code for name, code in sent if name == ":status"], [503])
+        self.assertEqual([value for name, value in sent if name.lower() == "retry-after"], ["7"])
 
     def test_failing_before_load_without_a_vram_limit_loads(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
