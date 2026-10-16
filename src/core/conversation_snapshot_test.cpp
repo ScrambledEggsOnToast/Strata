@@ -181,6 +181,8 @@ void direct_kv(int fmt, int source_mode, int target_mode) {
 void release_reinit(int fmt, int mode) {
     Fixture source(fmt,0);
     source.fill(37);
+    // conversation_kv_save requires the producing device work to be complete.
+    cuda_check(cudaDeviceSynchronize());
     const bool index=mode!=2;
     std::string err;
     ConversationKv image;
@@ -193,6 +195,9 @@ void release_reinit(int fmt, int mode) {
     cuda_check(cudaMalloc(&arena,bytes));
     QsaState state;
     check(qsa_state_init(source.g,cells,arena,state,nullptr,0,&placement,bytes)==bytes,"real allocator initializes requested residency");
+    // qsa_state_init may initialize the new owner on the legacy stream.
+    // Complete it before restore switches to the private copy stream.
+    cuda_check(cudaDeviceSynchronize());
     check(state.kv_mode==mode && qsa_kv_format(state)==fmt,"native main/ring format and residency match placement");
     const uint64_t first_owner=state.allocation_id;
     uint64_t fingerprint=0;
@@ -546,6 +551,9 @@ int main() {
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
+            // Restore uses the private non-blocking copy stream, so finish the
+            // legacy-stream fixture mutation before both save B and restore A.
+            cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
             check(upto==0 || !equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
@@ -614,6 +622,7 @@ int main() {
                 // Two cuts cover complete and partial pages after the old ring has wrapped.
                 for (int64_t cut : {4,5}) {
                     f.fill(177);
+                    cuda_check(cudaDeviceSynchronize());
                     check(conversation_kv_restore(a,f.state,f.g,cut,false,err,upto),
                           "restore selected draft prefix from longer wrapped image");
                     cuda_check(cudaDeviceSynchronize());
