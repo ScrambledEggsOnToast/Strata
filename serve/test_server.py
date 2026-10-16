@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import hmac
 import io
 import json
 import os
@@ -1577,6 +1578,39 @@ class ConversationScopes(unittest.TestCase):
         self.svc.model = "another-model"
         self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a"))
 
+    def test_fallback_scope_binds_authorization_when_persistent_identity_is_unavailable(self):
+        req = {"strata_conversation_id": "A"}
+        for reason, key, model_id, render_id in (
+                ("no issuer key", None, "ab" * 32, "cd" * 32),
+                ("no model identity", b"k" * 32, "", "cd" * 32),
+                ("no render identity", b"k" * 32, "ab" * 32, None)):
+            with self.subTest(reason=reason), mock.patch.object(self.svc, "scope_key", return_value=key), \
+                    mock.patch.object(self.svc, "render_identity", return_value=render_id):
+                self.engine.cache_model_id = model_id
+                first = self.svc.cache_scope(req, "tenant-a", gateway=True, credential="gateway-old")
+                self.assertEqual(first, self.svc.cache_scope(req, "tenant-a", gateway=True,
+                                                           credential="gateway-old"))
+                self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a", gateway=True,
+                                                              credential="gateway-new"))
+                self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-a", gateway=False,
+                                                              credential="gateway-old"))
+                self.assertNotEqual(first, self.svc.cache_scope(req, "tenant-b", gateway=True,
+                                                              credential="gateway-old"))
+
+    def test_persistent_scope_digest_payload_is_unchanged(self):
+        key = bytes(range(32))
+        self.engine.cache_model_id = "ab" * 32
+        req = {"strata_conversation_id": "A"}
+        with mock.patch.object(self.svc, "scope_key", return_value=key), \
+                mock.patch.object(self.svc, "render_identity", return_value="cd" * 32):
+            for kind in ("principal", "gateway"):
+                with self.subTest(kind=kind):
+                    payload = ('["scc1",["' + kind + '","tenant-a","ba7816bf8f01cfea414140de5dae2223"],'
+                               '["declared","A"],"' + "ab" * 32 + '","' + "cd" * 32 + '"]')
+                    self.assertEqual(self.svc.cache_scope(req, "tenant-a", gateway=kind == "gateway",
+                                                         credential="abc"),
+                                     hmac.new(key, payload.encode(), "sha256").hexdigest())
+
     def test_without_a_declared_group_a_tenant_has_one_content_space(self):
         """No group is not a private request: the tenant's requests share a namespace, and what such a
         request may reuse is decided by the exact token-prefix match, never by the namespace alone."""
@@ -1607,8 +1641,8 @@ class ConversationScopes(unittest.TestCase):
     def test_http_trusts_an_attested_tenant_only_from_the_token_that_may_name_one(self):
         """The header naming a tenant is honoured only when the request carries the gateway's own
         token; from a client that merely holds a key of its own it is ignored, not rejected."""
-        self.svc.api_key = "client-key,gateway-token"
-        self.svc.tenant_token = ["gateway-token"]
+        self.svc.api_key = "client-key,gateway-token,gateway-next"
+        self.svc.tenant_token = ["gateway-token", "gateway-next"]
         httpd = serve(self.svc, port=0)
         body = {"messages": [{"role": "system", "content": "You are a careful assistant."},
                              {"role": "user", "content": "first question"}], "max_tokens": 8}
@@ -1623,17 +1657,84 @@ class ConversationScopes(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     json.load(response)
                 return self.engine.last_cache_scope
-            own = self.svc.cache_scope(body, "client-key")
+            self.assertIsNone(self.svc.scope_key(), "this exercises the process-local fallback")
+            own = self.svc.cache_scope(body, "client-key", credential="client-key")
             self.assertEqual(request("client-key"), own)
             self.assertEqual(request("client-key", attested="somebody-else"), own,
                              "a client cannot name a tenant")
             attested = request("gateway-token", attested="josh-macbook")
-            self.assertEqual(attested, self.svc.cache_scope(body, "josh-macbook"))
+            self.assertEqual(attested, self.svc.cache_scope(body, "josh-macbook", gateway=True,
+                                                          credential="gateway-token"))
+            self.assertEqual(attested, request("gateway-token", attested="josh-macbook"),
+                             "identical accepted authorization inputs still reuse")
+            self.assertNotEqual(attested, request("gateway-next", attested="josh-macbook"),
+                                "overlapping accepted gateway credentials must not share a scope")
             self.assertNotEqual(attested, request("gateway-token", attested="pi-debian-host"),
                                 "two attested labels are two tenants")
-            self.assertEqual(request("gateway-token"), self.svc.cache_scope(body, "gateway-token"),
+            principal = request("gateway-token")
+            self.assertEqual(principal, self.svc.cache_scope(body, "gateway-token", credential="gateway-token"),
                              "the gateway's own key is its identity when it attests nothing")
+            self.assertNotEqual(principal, request("gateway-token", attested="gateway-token"),
+                                "gateway and principal kinds must not collide even with the same text and credential")
             self.assertNotEqual(attested, own, "the gateway's clients do not share the gateway's space")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_http_without_api_key_keeps_anonymous_scope_and_ignores_untrusted_tenant(self):
+        self.assertFalse(self.svc.api_key)
+        self.assertFalse(self.svc.tenant_token)
+        self.assertIsNone(self.svc.scope_key())
+        httpd = serve(self.svc, port=0)
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1,
+                "strata_conversation_id": "A"}
+        try:
+            def request(token=None, attested=None):
+                headers = {"Content-Type": "application/json"}
+                if token is not None:
+                    headers["Authorization"] = f"Bearer {token}"
+                if attested is not None:
+                    headers[TENANT_HEADER] = attested
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                             data=json.dumps(body).encode(), headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    json.load(response)
+                return self.engine.last_cache_scope
+            anonymous = request()
+            self.assertEqual(anonymous, self.svc.cache_scope(body, ""))
+            self.assertEqual(anonymous, request(attested="untrusted-tenant"),
+                             "an unauthenticated tenant header grants no identity")
+            supplied = request("unverified-key", attested="untrusted-tenant")
+            self.assertEqual(supplied, self.svc.cache_scope(body, "", credential="unverified-key"),
+                             "with no API key a supplied credential is not an authenticated principal")
+            self.assertEqual(supplied, request("unverified-key", attested="another-tenant"))
+            self.assertNotEqual(anonymous, supplied, "the fingerprint still partitions as in persistent scopes")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_http_with_api_key_rejects_unauthenticated_scope_claims(self):
+        self.svc.api_key = "accepted-key"
+        httpd = serve(self.svc, port=0)
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1,
+                "_strata_cache_scope": "1" * 64}
+        try:
+            with mock.patch.object(self.svc, "cache_scope", wraps=self.svc.cache_scope) as scope:
+                for token in (None, "wrong-key"):
+                    with self.subTest(token=token):
+                        headers = {"Content-Type": "application/json", TENANT_HEADER: "accepted-key"}
+                        if token is not None:
+                            headers["Authorization"] = f"Bearer {token}"
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                            data=json.dumps(body).encode(), headers=headers)
+                        with self.assertRaises(urllib.error.HTTPError) as rejected:
+                            urllib.request.urlopen(req, timeout=10)
+                        with rejected.exception as response:
+                            self.assertEqual(response.code, 401)
+                            json.load(response)
+                scope.assert_not_called()
         finally:
             httpd.shutdown()
             httpd.server_close()

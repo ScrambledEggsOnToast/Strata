@@ -4681,9 +4681,9 @@ class Service:
         names the tagged principal that was authenticated with the fingerprint of the credential that attested it
         (so rotating that credential isolates the records it authorized), the group, the model this server is
         configured for and the content identity of the tokenizer and template the prompt is rendered with.  Only the
-        digest leaves this process; key and credential bytes are never logged, stored or sent anywhere.  Without a
-        store the scope stays exactly what it was: process-local, so a parked conversation is reused by the process
-        that parked it and by no one else.
+        digest leaves this process; key and credential bytes are never logged, stored or sent anywhere.  When the
+        persistent identity is unavailable, the process-local scope binds the same authorization distinctions, so
+        a parked conversation is reused only by the same authorized caller in the process that parked it.
         """
         group = req.get("strata_conversation_id")
         if group is not None:
@@ -4700,7 +4700,8 @@ class Service:
         model_id = getattr(self.engine, "cache_model_id", "")
         render_id = self.render_identity() if key is not None else None
         if key is None or re.fullmatch(r"[0-9a-f]{64}", model_id) is None or render_id is None:
-            identity = [tenant, group, self.model, id(self.tok), self.template.source]
+            identity = [["gateway" if gateway else "principal", tenant, credential_fingerprint(credential)],
+                        group, self.model, id(self.tok), self.template.source]
             return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
         identity = ["scc1", ["gateway" if gateway else "principal", tenant, credential_fingerprint(credential)],
                     group, model_id, render_id]
