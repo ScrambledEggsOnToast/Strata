@@ -23,6 +23,18 @@ class PressureTests(unittest.TestCase):
         (self.proc / "self").mkdir()
         self.mount = self.base / "cgroup"
         self.mount.mkdir()
+        # Use real directory-fd mount IDs for ordinary temporary-directory fixtures.
+        # The shadow regression below models the one bit requiring CAP_SYS_ADMIN.
+        (self.proc / "self" / "fdinfo").symlink_to("/proc/self/fdinfo", target_is_directory=True)
+        fd = os.open(self.mount, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fdinfo = (self.proc / "self" / "fdinfo" / str(fd)).read_bytes()
+        finally:
+            os.close(fd)
+        ids = [line.split(b":", 1)[1] for line in fdinfo.split(b"\n") if line.startswith(b"mnt_id:")]
+        if len(ids) != 1:
+            self.skipTest("Linux directory fdinfo mnt_id is required")
+        self.mount_id = int(ids[0])
         self.member = "/service"
         self.membership(self.member)
         self.mountinfo(self.mount_line())
@@ -39,20 +51,22 @@ class PressureTests(unittest.TestCase):
 
     @staticmethod
     def escape(path):
-        return str(path).replace("\\", r"\134").replace(" ", r"\040").replace("\t", r"\011").replace("\n", r"\012")
+        return os.fsencode(path).replace(b"\\", rb"\134").replace(b" ", rb"\040").replace(b"\t", rb"\011").replace(b"\n", rb"\012")
 
-    def mount_line(self, *, root="/", mountpoint=None, mount_id=31, filesystem="cgroup2", device=None):
+    def mount_line(self, *, root="/", mountpoint=None, mount_id=None, filesystem="cgroup2", device=None):
         mountpoint = self.mount if mountpoint is None else mountpoint
+        mount_id = self.mount_id if mount_id is None else mount_id
         stat = self.mount.stat()
         device = f"{os.major(stat.st_dev)}:{os.minor(stat.st_dev)}" if device is None else device
-        return (f"{mount_id} 20 {device} {self.escape(root)} {self.escape(mountpoint)} rw,nosuid shared:7 master:2"
-                f" - {filesystem} cgroup rw\n")
+        return (f"{mount_id} 20 {device} ".encode("ascii") + self.escape(root) + b" " +
+                self.escape(mountpoint) + b" rw,nosuid shared:7 master:2 - " +
+                filesystem.encode("ascii") + b" cgroup rw\n")
 
     def mountinfo(self, text):
-        (self.proc / "self" / "mountinfo").write_text(text, encoding="utf-8")
+        (self.proc / "self" / "mountinfo").write_bytes(text.encode("utf-8") if isinstance(text, str) else text)
 
     def membership(self, path):
-        (self.proc / "self" / "cgroup").write_text(f"9:memory:/legacy\n0::{path}\n", encoding="utf-8")
+        (self.proc / "self" / "cgroup").write_bytes(b"9:memory:/legacy\n0::" + os.fsencode(path) + b"\n")
 
     def populate(self, directory, *, some=101, full=23, usage=987654321):
         directory.mkdir(parents=True, exist_ok=True)
@@ -145,6 +159,45 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(cgroup["identity"]["path"], str(directory))
         self.assertEqual(cgroup["io"]["some_total_usec"], 555)
 
+    def test_non_utf8_metadata_and_scope_names_remain_json_safe(self):
+        # Neither unrelated mount names nor legacy-controller paths invalidate v2.
+        unrelated = self.mount_line(mountpoint=os.fsdecode(os.fsencode(self.base) + b"/foreign-\xff"),
+                                    filesystem="tmpfs")
+        self.mountinfo(unrelated + self.mount_line())
+        (self.proc / "self" / "cgroup").write_bytes(b"9:memory:/legacy-\xff\n0::/service\n")
+        sample = self.reader.snapshot()
+        self.assertEqual(sample["cgroup"]["cpu_stat"]["usage_usec"], 987654321)
+        self.assertIsNone(sample["cgroup"]["reason"])
+        json.dumps(sample, ensure_ascii=False).encode("utf-8")
+
+        mount = self.base / os.fsdecode(b"cgroup-\xff")
+        root = os.fsdecode(b"/tenant-\xfe")
+        relative = os.fsdecode(b"service-\xfd")
+        directory = mount / relative
+        self.populate(directory, some=666)
+        self.membership(root + "/" + relative)
+        self.mountinfo(unrelated + self.mount_line(root=root, mountpoint=mount))
+        sample = self.reader.snapshot()
+        cgroup = sample["cgroup"]
+        self.assertIsNone(cgroup["reason"])
+        self.assertEqual(cgroup["identity"]["path"], os.fsencode(directory).decode("utf-8", "backslashreplace"))
+        self.assertEqual(cgroup["identity"]["inode"], directory.stat().st_ino)
+        self.assertEqual(cgroup["io"]["some_total_usec"], 666)
+        json.dumps(sample, ensure_ascii=False).encode("utf-8")
+
+    def test_nbsp_and_carriage_return_are_path_bytes_not_field_delimiters(self):
+        mount = self.base / "mount\u00a0name\rwith space\tand\\slash"
+        root = "/tenant\u00a0name\rwith space\tand\\slash"
+        directory = mount / "service\u00a0name\r"
+        self.populate(directory, some=777)
+        self.membership(root + "/" + directory.name)
+        self.mountinfo(self.mount_line(root=root, mountpoint=mount))
+        sample = self.reader.snapshot()
+        self.assertIsNone(sample["cgroup"]["reason"])
+        self.assertEqual(sample["cgroup"]["identity"]["path"], str(directory))
+        self.assertEqual(sample["cgroup"]["memory"]["some_total_usec"], 777)
+        json.dumps(sample, ensure_ascii=False).encode("utf-8")
+
     def test_absent_files_are_null_without_suppressing_other_files(self):
         (self.proc / "pressure" / "cpu").unlink()
         (self.scope / "io.pressure").unlink()
@@ -233,6 +286,89 @@ class PressureTests(unittest.TestCase):
         self.assertIsNone(sample["cgroup"]["identity"])
         self.assertEqual(sample["host"]["io"]["some_total_usec"], 42)
 
+    def test_same_device_bind_shadow_is_rejected_in_consumer_metrics(self):
+        scope = self.mount / "A" / "service"
+        self.populate(scope, some=999)
+        self.populate(self.mount, some=888)  # Never substitute root counters.
+        self.membership("/A/service")
+        directories = (self.mount, self.mount / "A", scope)
+        bind_id = self.mount_id + 1000000
+        fdinfo = self.proc / "self" / "fdinfo"
+        fdinfo.unlink()
+        fdinfo.mkdir()
+        svc = self.start_service_telemetry()
+        real_open = os.open
+        for index, shadow in enumerate(directories):
+            with self.subTest(shadow=shadow):
+                self.mountinfo(self.mount_line() +
+                               self.mount_line(root="/B", mountpoint=shadow, mount_id=bind_id))
+                shadow_ids = {(path.stat().st_dev, path.stat().st_ino) for path in directories[index:]}
+                self.assertEqual(scope.stat().st_dev, self.mount.stat().st_dev)
+                counter_reads = []
+
+                def open_file(path, flags, *args, **kwargs):
+                    fd = real_open(path, flags, *args, **kwargs)
+                    if flags & os.O_DIRECTORY:
+                        stat = os.fstat(fd)
+                        mount_id = bind_id if (stat.st_dev, stat.st_ino) in shadow_ids else self.mount_id
+                        # Model kernel bind-mount provenance only; directory opens,
+                        # device/inode values and counter reads remain real.
+                        (fdinfo / str(fd)).write_bytes(f"mnt_id:\t{mount_id}\n".encode("ascii"))
+                    elif kwargs.get("dir_fd") is not None:
+                        counter_reads.append(path)
+                    return fd
+
+                with mock.patch.object(psi.os, "open", side_effect=open_file):
+                    sample = svc.telemetry.sample()
+                with svc.telemetry.lock:
+                    svc.telemetry.now = sample
+                pressure = svc.metrics()["hardware"]["pressure"]
+                self.assertEqual(pressure["cgroup"]["reason"], "mount_changed")
+                self.assertIsNone(pressure["cgroup"]["identity"])
+                self.assertIsNone(pressure["cgroup"]["cpu"]["some_total_usec"])
+                self.assertEqual(pressure["cgroup"]["cpu"]["reasons"]["some_total_usec"], "mount_changed")
+                self.assertEqual(pressure["host"]["io"]["some_total_usec"], 42)
+                self.assertEqual(counter_reads, [])
+                json.dumps(svc.metrics(), ensure_ascii=False).encode("utf-8")
+
+    def test_missing_mount_id_does_not_weaken_scope_validation(self):
+        (self.proc / "self" / "fdinfo").unlink()
+        (self.proc / "self" / "fdinfo").mkdir()
+        sample = self.reader.snapshot()
+        self.assertEqual(sample["cgroup"]["reason"], "mount_id_missing")
+        self.assertIsNone(sample["cgroup"]["identity"])
+        self.assertIsNone(sample["cgroup"]["cpu_stat"]["usage_usec"])
+        self.assertEqual(sample["host"]["memory"]["some_total_usec"], 31)
+
+    def test_unavailable_or_malformed_mount_ids_fail_closed(self):
+        real_read = psi._read_bytes
+        for data, reason in ((b"pos:\t0\n", "mount_id_unavailable"),
+                             (b"mnt_id:\tbad\n", "mount_id_malformed"),
+                             (b"mnt_id:\t1\nmnt_id:\t1\n", "mount_id_malformed")):
+            with self.subTest(reason=reason, data=data):
+                def read_file(path, **kwargs):
+                    if Path(path).parent == self.proc / "self" / "fdinfo":
+                        return data, None
+                    return real_read(path, **kwargs)
+
+                with mock.patch.object(psi, "_read_bytes", side_effect=read_file):
+                    sample = self.reader.snapshot()
+                self.assertEqual(sample["cgroup"]["reason"], reason)
+                self.assertIsNone(sample["cgroup"]["identity"])
+                self.assertIsNone(sample["cgroup"]["memory_events"]["oom"])
+                self.assertEqual(sample["host"]["cpu"]["some_total_usec"], 9007199254740993)
+
+    def test_symlink_within_same_mount_does_not_redirect_membership(self):
+        other = self.mount / "other"
+        self.populate(other / "service", some=999)
+        (self.mount / "redirect").symlink_to(other, target_is_directory=True)
+        self.membership("/redirect/service")
+        sample = self.reader.snapshot()
+        self.assertIn(sample["cgroup"]["reason"], ("scope_missing", "scope_unreadable"))
+        self.assertIsNone(sample["cgroup"]["identity"])
+        self.assertIsNone(sample["cgroup"]["cpu"]["some_total_usec"])
+        self.assertEqual(sample["host"]["io"]["some_total_usec"], 42)
+
     def test_membership_mount_and_directory_identity_are_revalidated(self):
         first = self.reader.snapshot()["cgroup"]
         other = self.mount / "other"
@@ -316,7 +452,7 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(cgroup["memory"]["some_total_usec"], 101)
         self.assertEqual(cgroup["cpu_stat"]["usage_usec"], 987654321)
 
-    def test_service_callback_adds_pressure_without_changing_existing_metrics(self):
+    def start_service_telemetry(self):
         tok = server.ByteTokenizer()
         svc = server.Service(server.MockEngine(tok, "hello"), tok,
                              server.ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
@@ -328,6 +464,10 @@ class PressureTests(unittest.TestCase):
                 mock.patch.object(telemetry.Telemetry, "_loop", return_value=None):
             svc.start_telemetry()
         self.addCleanup(svc.telemetry.close)
+        return svc
+
+    def test_service_callback_adds_pressure_without_changing_existing_metrics(self):
+        svc = self.start_service_telemetry()
         first = svc.telemetry.sample()
         with svc.status_lock:
             lifecycle_boot = svc._request_activity()["boot_id"]
