@@ -506,6 +506,8 @@ void check_tight_ram();
 void check_cancel_and_release();
 void check_revoked_prefetch_demand();
 void check_active_prefetch_replacement();
+void check_prefetch_catalog_refresh();
+void check_prefetch_catalog_reuse_and_cancel();
 void check_epoch_and_intent();
 void check_dirty_close();
 void check_ownership_and_close();
@@ -559,6 +561,8 @@ int main() {
     check_cancel_and_release();
     check_revoked_prefetch_demand();
     check_active_prefetch_replacement();
+    check_prefetch_catalog_refresh();
+    check_prefetch_catalog_reuse_and_cancel();
     check_epoch_and_intent();
     check_dirty_close();
     check_ownership_and_close();
@@ -2440,6 +2444,141 @@ void check_active_prefetch_replacement() {
     }
     store.close();
     check(!gate.timed_out, "the worker gate was released explicitly, not by timeout");
+}
+
+void check_prefetch_catalog_refresh() {
+    // Ready and active speculation must both follow a longer cut published after the offer. A ready image remains
+    // useful when the replacement cannot fit the current allowance; demand must not turn that image into a miss.
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        struct Gate {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool entered = false, open = false, timed_out = false;
+        } gate;
+        const bool active = scenario == 1;
+        const bool limited = scenario == 2;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_read_requests = 1; // refreshing cannot require a second descriptor
+        ConversationStore store(options);
+        const SavedConversation old = fixture(164, 256);
+        const SavedConversation grown = appended_turn(old, 512, 164);
+        const ConversationStoreQuery query = query_of(grown, 301, 7);
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, old, 1, 1, first) &&
+                  first.status == ConversationStorePublishStatus::stored, "the old prefetch cut is stored");
+        if (active)
+            store.set_read_gate_for_test([](void* context) {
+                auto& state = *static_cast<Gate*>(context);
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.entered = true;
+                state.cv.notify_all();
+                if (!state.cv.wait_for(lock, std::chrono::seconds(5), [&] { return state.open; }))
+                    state.timed_out = true;
+            }, &gate);
+        std::string why;
+        check(store.prefetch(query, why), "the future longer request prefetches the old cut");
+        if (active) {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            check(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.entered; }),
+                  "the real prefetch reader holds the old reservation");
+        } else {
+            check(await_status(store, 301, 7, ConversationStoreReadStatus::ready),
+                  "the old prefetched image is ready before publication");
+        }
+        ConversationStorePublishResult newer;
+        check(publish_and_wait(store, grown, 2, 2, newer) &&
+                  newer.status == ConversationStorePublishStatus::stored, "a longer compatible cut is published");
+        const auto found = store.matches(query.selector, query.tokens, query.images);
+        check(!found.empty() && found.front().tokens == 512 && found.front().head_id == newer.head_id,
+              "the current catalog selects the newly published longer cut");
+        const uint64_t reads = store.counters().reads_served;
+        const uint64_t bytes = store.counters().bytes_read;
+        if (limited)
+            store.publish_read_allowance(uint64_t(256) << 10);
+        else
+            store.suspend_read_admission();
+        check(store.demand(query, why), "demand adopts the prepared request after the longer publication");
+        check(store.demand(query, why), "repeated demand does not start another refresh");
+        store.withdraw_prefetch(301, 7); // the demand owner now controls cancellation
+        if (!limited) {
+            ConversationStoreRead premature;
+            check(!store.take_ready(301, 7, premature), "the old cut is not handed out ahead of the longer demand");
+        }
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.open = true;
+        }
+        gate.cv.notify_all();
+        if (!limited) store.publish_read_allowance(uint64_t(64) << 20);
+        ConversationStoreRead read;
+        check(store.wait_ready(301, 7, read, 5000) && read.status == ConversationStoreReadStatus::ready,
+              "the upgraded demand produces a verified image");
+        check_eq(uint64_t(read.tokens), limited ? 256 : 512, "demand uses the longest cut its allowance can restore");
+        check_eq(read.head_id, limited ? first.head_id : newer.head_id, "the delivered cut names its actual image");
+        check(read.live && read.image && images_equal(*read.image, limited ? old : grown, why),
+              "the delivered image contains the exact selected live, checkpoint and K/V bytes");
+        check_eq(store.counters().reads_served - reads, limited ? 0 : (active ? 2 : 1),
+                 "one demand refresh reads at most the old in-flight image and one replacement");
+        if (limited)
+            check_eq(store.counters().bytes_read, bytes, "an unaffordable refresh reuses the valid ready bytes");
+        check(store.ram_lease_bytes() > 0, "the selected image remains leased until its demand owner releases it");
+        read.image.reset();
+        store.release_read(301, 7);
+        check_eq(store.ram_lease_bytes(), 0, "refreshing leaves no old or new image lease behind");
+        store.close();
+        check(!gate.timed_out, "the prefetch gate was explicitly released");
+    }
+}
+
+void check_prefetch_catalog_reuse_and_cancel() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation old = fixture(165, 256);
+    const SavedConversation grown = appended_turn(old, 512, 165);
+    ConversationStorePublishResult first;
+    check(publish_and_wait(store, old, 1, 1, first) &&
+              first.status == ConversationStorePublishStatus::stored, "the unchanged prefetch cut is stored");
+    const ConversationStoreQuery same = query_of(old, 302, 1);
+    std::string why;
+    check(store.prefetch(same, why) && await_status(store, 302, 1, ConversationStoreReadStatus::ready),
+          "the unchanged cut is materialized before demand");
+    ConversationStorePublishResult duplicate;
+    check(publish_and_wait(store, old, 2, 2, duplicate) &&
+              duplicate.status == ConversationStorePublishStatus::stored, "a newer head publishes the same cut");
+    const uint64_t bytes = store.counters().bytes_read;
+    const uint64_t leased = store.ram_lease_bytes();
+    check(store.demand(same, why), "demand reuses a ready cut despite a newer equal-length head");
+    ConversationStoreRead reused;
+    check(store.take_ready(302, 1, reused) && reused.status == ConversationStoreReadStatus::ready &&
+              reused.head_id == first.head_id && reused.tokens == 256 && reused.image &&
+              images_equal(*reused.image, old, why), "unchanged ready work is immediately handed out byte-identically");
+    check_eq(store.counters().bytes_read, bytes, "an equal-length publication causes no second payload read");
+    check_eq(store.ram_lease_bytes(), leased, "adoption keeps the original image lease");
+    reused.image.reset();
+    store.release_read(302, 1);
+
+    const ConversationStoreQuery cancelled = query_of(grown, 303, 1);
+    check(store.prefetch(cancelled, why) && await_status(store, 303, 1, ConversationStoreReadStatus::ready),
+          "the cancellable generation prefetches the shorter cut");
+    ConversationStorePublishResult newer;
+    check(publish_and_wait(store, grown, 3, 3, newer) &&
+              newer.status == ConversationStorePublishStatus::stored, "the cancellation case publishes a longer cut");
+    store.cancel_read(303, 1);
+    check(!store.demand(cancelled, why), "a longer publication cannot revive an explicitly cancelled generation");
+    ConversationStoreRead absent;
+    check(!store.take_ready(303, 1, absent), "the cancelled old image is never handed out");
+    check(store.demand(query_of(grown, 303, 2), why), "a new cancellation generation can demand the longer cut");
+    store.cancel_read(303, 1);
+    ConversationStoreRead next;
+    check(store.wait_ready(303, 2, next, 5000) && next.status == ConversationStoreReadStatus::ready &&
+              next.generation == 2 && next.tokens == 512 && next.image && images_equal(*next.image, grown, why),
+          "cancelling the old generation cannot cancel the new longer demand");
+    next.image.reset();
+    store.release_read(303, 2);
+    store.release_read(303, 1);
+    check_eq(store.ram_lease_bytes(), 0, "reuse and cancellation release every image lease");
+    store.close();
 }
 
 void check_cancel_and_release() {
