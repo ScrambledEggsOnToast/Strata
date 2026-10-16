@@ -3837,6 +3837,7 @@ class SharingTheGpu(unittest.TestCase):
         handler.send_header = lambda name, value: sent.append((name, str(value)))
         handler._note = lambda **_: None
         handler._cors = lambda: None
+        handler.end_headers = lambda: None
         handler.wfile = io.BytesIO()
         handler._json(503, {"error": {"type": "server_error", "message": "busy"}}, headers={"retry-AFter": "7"})
         self.assertEqual([code for name, code in sent if name == ":status"], [503])
