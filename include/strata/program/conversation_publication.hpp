@@ -10,9 +10,9 @@
 // branch keeps its reusable root as well as its latest.  Keeping them here lets a test drive them against the real
 // store instead of re-deriving them beside it.
 //
-// What deliberately stays in the serving engine: the images themselves, the export cache's lease on them, the
-// published read allowance and every diagnostic destination.  Nothing here allocates beyond the queue it owns, and
-// every collection it owns is bounded by a compile-time ceiling.
+// The serving engine owns the cache, its image-acquisition and optional read-through retention callbacks, the
+// published read allowance and every diagnostic destination. Waiting entries own only bounded metadata and a ticket
+// to an already-budgeted cache image; only the queue head may acquire an image and its transferred lease.
 
 #include "strata/core/conversation_store.hpp"
 
@@ -51,26 +51,30 @@ struct ConversationPublicationOwner {
                const strata::core::ConversationScope& scope, bool cvec);
 };
 
-// A capture the engine already paid for (GPU copies included), waiting for the store's single bounded writer.  The
-// image is frozen in place and its RAM stays charged through the export cache while it waits, so losing the parked
-// copy can never silently drop the only snapshot that is still to be written.  Owner slots can be reused by unrelated
-// conversations: the queue keeps their publications distinct, and the image leases and its fixed entry ceiling bound
-// it independently of slot identity.
+// A capture the engine already paid for (GPU copies included), waiting for the store's single bounded writer. Its
+// ticket protects the sole parked owner against eviction and supersession; a waiting entry owns no image alias or
+// extra lease. Only the queue head may transfer that owner from parked bytes to leased bytes while it retries.
 struct ConversationPublicationCapture {
     uint64_t owner = 0;
     uint64_t owner_generation = 0;
     uint64_t capture_epoch = 0;
     uint64_t publication_id = 0;       // assigned when it is handed to the store, so results can be matched
+    uint64_t image_ticket = 0;         // unique nonzero capture generation; transient cache ownership, never on disk
     uint64_t supersedes_hint = 0;      // the owner's lineage head at capture (0: this capture starts a branch)
     bool continues = true;             // false: a one-shot borrow; never supersedes and never sets a lineage
     strata::core::ConversationScope scope;
     bool cvec = true;
     std::vector<int32_t> live;         // the captured record, for the coverage proof and the lineage
     std::vector<strata::core::ConversationStoreReuse> reuse;   // the proven intervals, donor already resolved
-    std::shared_ptr<const strata::core::SavedConversation> image;   // frozen alias: payloads are shared
-    size_t lease_bytes = 0;            // its charge in the export cache's envelope while it waits
+    std::shared_ptr<const strata::core::SavedConversation> image;   // acquired only by the head, retained on retry
+    size_t lease_bytes = 0;            // acquired head's exact charge; zero while its image is still parked
     uint32_t attempts = 0;             // bounded retries; a permanently refused entry is dropped and counted
     bool deferred_reported = false;    // one diagnostic per entry: a deferral repeats by design
+};
+
+struct ConversationPublicationCaptureResult {
+    bool parked = false;   // the image entered the cache, with or without publication protection
+    bool queued = false;   // its protected ticket and queue metadata were committed together
 };
 
 // One record per publication the store has admitted and not yet reported, so its result can move the exact owner
@@ -113,6 +117,18 @@ struct ConversationPublicationRetry {
 struct ConversationPublicationSink {
     // One bounded line per event, already formatted.  The engine owns the destination and the file descriptor.
     std::function<void(const char* line)> report;
+    // Preserve real writer/index workspace while admitting protected parked owners: production sets this to the
+    // configured store metadata_bytes ceiling. It is additional outside-cache headroom, never image/lease credit.
+    size_t publication_headroom_bytes = 0;
+    // Allocate an empty shared root before taking the cache's protected owner. Missing ticket returns null;
+    // allocation failure throws without consuming the protected image. Taking transfers parked bytes to lease
+    // bytes without widening the envelope or copying any payload.
+    std::function<std::shared_ptr<const strata::core::SavedConversation>(uint64_t ticket)> acquire_image;
+    // Drop/invalidation of a ticket that still belongs to the cache: remove protection, never subtract a lease.
+    std::function<void(uint64_t ticket)> release_publication;
+    // Optional read-through after an accepted handoff and lease release. Admit an alias only from spare budget,
+    // accounting for the store's new ownership; never evict a protected pending image to retain it.
+    std::function<void(std::shared_ptr<const strata::core::SavedConversation>)> retain_image;
     // Give up the export cache's lease on exactly these bytes: the store charges them from here on.
     std::function<void(size_t lease_bytes)> release_lease;
     // Republish the read allowance from live accounting: an accepted handover changes what the store itself holds.
@@ -146,10 +162,15 @@ public:
     bool holds_work() const noexcept { return !queued_.empty() || !pending_.empty(); }
     size_t size() const noexcept { return queued_.size() + pending_.size(); }
 
-    // Take a capture into the queue.  False means the queue is full (bounded by kMaxQueued): the caller keeps
-    // ownership of everything it passed and the capture is not persisted.
-    bool enqueue(ConversationPublicationCapture&& entry, const ConversationPublicationSink& sink);
-    // Drop one queued capture, returning its lease to the caller.
+    // Commit metadata and one protected cache owner together, with every queue allocation before cache.put().
+    // The caller supplies an unused nonzero image_ticket and metadata only (no image/lease). No second image
+    // reservation is needed. held/held_entries describe current outside-cache ownership; protected admission also
+    // leaves the sink's configured publication workspace headroom free. Only successful queuing moves the owner's
+    // generation. Refusal preserves ordinary parking where possible; allocation failure never destroys the image.
+    ConversationPublicationCaptureResult capture(strata::core::ConversationCache& cache,
+        strata::core::SavedConversation&& image, ConversationPublicationCapture&& entry,
+        size_t held, size_t held_entries, const ConversationPublicationSink& sink);
+    // Drop one queued capture, releasing its parked protection or its acquired lease, never both charges.
     void drop(size_t index, const char* why, const ConversationPublicationSink& sink);
     // The execution domain advanced: no head of the retired epoch may ever be superseded, so every queued capture is
     // abandoned and every owner lineage is forgotten.  Storage work the store already admitted is the store's own.

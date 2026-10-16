@@ -4,6 +4,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <utility>
 
 namespace strata::program {
@@ -41,30 +43,89 @@ ConversationPublicationOwner& ConversationPublicationQueue::owner(uint64_t id) {
     return owners_[size_t(id)];
 }
 
-bool ConversationPublicationQueue::enqueue(ConversationPublicationCapture&& entry,
-                                           const ConversationPublicationSink& sink) {
-    if (queued_.size() >= kMaxQueued) {
-        report(sink, "strata serve: conversation store: %zu publications are already waiting; this capture is not "
-                     "queued for persistence\n", queued_.size());
-        return false;
+ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
+    strata::core::ConversationCache& cache, strata::core::SavedConversation&& image,
+    ConversationPublicationCapture&& entry, size_t held, size_t held_entries,
+    const ConversationPublicationSink& sink) {
+    ConversationPublicationCaptureResult out;
+    const auto ordinary_park = [&] {
+        image.publication_ticket = 0;
+        try {
+            out.parked = cache.put(std::move(image), held, held_entries);
+        } catch (const std::bad_alloc&) {
+            // put allocates before committing: the caller still owns the image.
+        }
+        return out;
+    };
+    const auto refuse = [&](const char* why) {
+        ++counters_.refused;
+        report(sink, "strata serve: conversation store: capture not queued for persistence (%s)\n", why);
+    };
+    if (image.publication_ticket != 0) {
+        refuse("the candidate already owns a publication ticket");
+        return out;
     }
-    queued_.push_back(std::move(entry));
-    return true;
+    if (entry.image_ticket == 0 || entry.image || entry.lease_bytes != 0 ||
+        cache.has_publication(entry.image_ticket) ||
+        std::any_of(queued_.begin(), queued_.end(), [&](const ConversationPublicationCapture& queued) {
+            return queued.image_ticket == entry.image_ticket;
+        })) {
+        refuse("the capture needs an unused nonzero ticket and metadata without an image or lease");
+        return ordinary_park();
+    }
+    if (queued_.size() >= kMaxQueued) {
+        refuse("the bounded publication queue is full");
+        return ordinary_park();
+    }
+    try {
+        // Both containers may allocate. Do so before put may move the candidate or retire an old cache entry.
+        owner(entry.owner);
+        queued_.push_back(std::move(entry));
+    } catch (const std::bad_alloc&) {
+        refuse("queue metadata allocation failed; the captured image is still owned");
+        return ordinary_park();
+    }
+    image.publication_ticket = queued_.back().image_ticket;
+    try {
+        if (sink.publication_headroom_bytes <= std::numeric_limits<size_t>::max() - held)
+            out.parked = cache.put(std::move(image), held + sink.publication_headroom_bytes, held_entries);
+    } catch (const std::bad_alloc&) {
+        queued_.pop_back();
+        refuse("protected image allocation failed; the captured image is still owned");
+        return ordinary_park();
+    }
+    if (!out.parked) {
+        queued_.pop_back();
+        refuse("the protected image does not fit the bounded cache");
+        return ordinary_park();
+    }
+    owners_[size_t(queued_.back().owner)].generation = queued_.back().owner_generation;
+    out.queued = true;
+    return out;
 }
 
 void ConversationPublicationQueue::drop(size_t index, const char* why, const ConversationPublicationSink& sink) {
     ConversationPublicationCapture& entry = queued_[index];
-    if (sink.release_lease) sink.release_lease(entry.lease_bytes);
+    if (entry.image) {
+        if (sink.release_lease) sink.release_lease(entry.lease_bytes);
+    } else if (sink.release_publication) {
+        sink.release_publication(entry.image_ticket);
+    }
     ++counters_.dropped;
-    report(sink, "strata serve: conversation store: queued publication of owner %llu (capture epoch %llu) dropped "
-                 "(%s, %zu MiB)\n", (unsigned long long) entry.owner, (unsigned long long) entry.capture_epoch, why,
+    report(sink, "strata serve: conversation store: queued publication of owner %llu (capture epoch %llu, ticket "
+                 "%llu) dropped (%s, %zu MiB acquired)\n", (unsigned long long) entry.owner,
+           (unsigned long long) entry.capture_epoch, (unsigned long long) entry.image_ticket, why,
            entry.lease_bytes >> 20);
     queued_.erase(queued_.begin() + (std::ptrdiff_t) index);
 }
 
 void ConversationPublicationQueue::abandon(const char* why, const ConversationPublicationSink& sink) {
     for (ConversationPublicationCapture& entry : queued_) {
-        if (sink.release_lease) sink.release_lease(entry.lease_bytes);
+        if (entry.image) {
+            if (sink.release_lease) sink.release_lease(entry.lease_bytes);
+        } else if (sink.release_publication) {
+            sink.release_publication(entry.image_ticket);
+        }
         ++counters_.dropped;
         report(sink, "strata serve: conversation store: queued publication of owner %llu dropped (%s)\n",
                (unsigned long long) entry.owner, why);
@@ -241,43 +302,73 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
         }
         ConversationPublicationCapture& entry = queued_.front();
         entry.publication_id = publication_id;
-        strata::core::ConversationStorePublish publish;
-        publish.request_id = publication_id;
-        publish.generation = publication_id;
-        publish.epoch = entry.capture_epoch;
-        publish.external_lease_bytes = entry.lease_bytes;
-        publish.reuse = entry.reuse;
-        covers(entry, owner(entry.owner), publish);
-        ConversationPublicationPending pending;
-        pending.request_id = publish.request_id;
-        pending.generation = publish.generation;
-        pending.supersedes = publish.supersedes;
-        pending.owner = entry.owner;
-        pending.owner_generation = entry.owner_generation;
-        pending.capture_epoch = entry.capture_epoch;
-        pending.continues = entry.continues;
-        pending.scope = entry.scope;
-        pending.cvec = entry.cvec;
-        pending.live = entry.live;
-        pending.lease_bytes = entry.lease_bytes;
-        pending_.push_back(std::move(pending));
         std::string why;
-        // The entry keeps its own reference across the call: a refused or deferred publication leaves the image
-        // exactly where it was, so the retry at the next seam hands over the same immutable bytes.  What the store is
-        // *offered* may carry one extra metadata promise - a fresh branch's pinned root cut - and the entry's image is
-        // left untouched for it.
-        std::shared_ptr<const strata::core::SavedConversation> image = std::move(entry.image);
-        const std::shared_ptr<const strata::core::SavedConversation> offered =
-            pins_live_cut(publish) ? pinned_live_cut(image) : image;
-        const strata::core::ConversationStorePublishAdmission admission = store.publish(offered, publish, why);
+        strata::core::ConversationStorePublishAdmission admission;
+        const size_t pending_before = pending_.size();
+        try {
+            if (!entry.image) {
+                // acquire_image allocates its shared root before consuming the ticket. A failed allocation leaves
+                // the sole protected owner parked; only this head can acquire it at a later safe seam.
+                entry.image = sink.acquire_image ? sink.acquire_image(entry.image_ticket) : nullptr;
+                if (!entry.image) {
+                    drop(0, "the protected publication ticket has no image", sink);
+                    continue;
+                }
+                entry.lease_bytes = entry.image->bytes();
+            }
+            strata::core::ConversationStorePublish publish;
+            publish.request_id = publication_id;
+            publish.generation = publication_id;
+            publish.epoch = entry.capture_epoch;
+            publish.external_lease_bytes = entry.lease_bytes;
+            publish.reuse = entry.reuse;
+            covers(entry, owner(entry.owner), publish);
+            ConversationPublicationPending pending;
+            pending.request_id = publish.request_id;
+            pending.generation = publish.generation;
+            pending.supersedes = publish.supersedes;
+            pending.owner = entry.owner;
+            pending.owner_generation = entry.owner_generation;
+            pending.capture_epoch = entry.capture_epoch;
+            pending.continues = entry.continues;
+            pending.scope = entry.scope;
+            pending.cvec = entry.cvec;
+            pending.live = entry.live;
+            pending.lease_bytes = entry.lease_bytes;
+            // Every allocation the queue needs to remember the result precedes the store's destructive handoff.
+            pending_.push_back(std::move(pending));
+            // Keep the original head image throughout refusal, deferral and allocation failure. A fresh branch's
+            // extra root-cut promise is offered through a metadata alias, never by mutating the retry image.
+            const std::shared_ptr<const strata::core::SavedConversation> offered =
+                pins_live_cut(publish) ? pinned_live_cut(entry.image) : entry.image;
+            admission = store.publish(offered, publish, why);
+        } catch (const std::bad_alloc&) {
+            if (pending_.size() != pending_before) pending_.pop_back();
+            if (!entry.deferred_reported) {
+                entry.deferred_reported = true;
+                report(sink, "strata serve: conversation store: publication of owner %llu waits for allocation; "
+                             "its protected image or acquired lease is retained (ticket %llu)\n",
+                       (unsigned long long) entry.owner, (unsigned long long) entry.image_ticket);
+            }
+            break;
+        }
         if (admission == strata::core::ConversationStorePublishAdmission::accepted) {
-            // The store charges the alias itself from here on; the export cache's lease on it ends.
+            // The store owns its full charge now. Optional RAM retention gets only spare capacity after that exact
+            // transfer; failing to retain is not a failed publication and must never undo the admitted result.
             if (sink.release_lease) sink.release_lease(entry.lease_bytes);
+            std::shared_ptr<const strata::core::SavedConversation> image = std::move(entry.image);
             queued_.pop_front();
+            if (sink.retain_image) {
+                try {
+                    sink.retain_image(std::move(image));
+                } catch (const std::bad_alloc&) {
+                    report(sink, "strata serve: conversation store: publication accepted; optional RAM retention "
+                                 "was skipped after allocation failure\n");
+                }
+            }
             if (sink.refresh_allowance) sink.refresh_allowance();
             continue;
         }
-        entry.image = offered;
         pending_.pop_back();
         if (admission == strata::core::ConversationStorePublishAdmission::deferred) {
             // A resource is occupied for the moment.  The entry keeps its image, its lease and its whole attempt

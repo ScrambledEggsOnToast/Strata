@@ -8,12 +8,15 @@
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
 #include <memory>
+#include <new>
+#include <optional>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -149,12 +152,29 @@ SavedConversation stored_record(uint64_t seed, int64_t tokens) {
     return image;
 }
 
+// The native shape: every later stage owns its own image and checkpoint records, never primary stage_parts.
+SavedConversation all_stage_record(uint64_t seed, int64_t tokens) {
+    SavedConversation image = stored_record(seed, tokens);
+    image.geometry[1] = 24;
+    image.checkpoints.clear();
+    for (size_t index = 1; index < 3; ++index) {
+        SavedConversation stage = stored_record(seed + index * 20, tokens);
+        stage.scope = image.scope;
+        stage.geometry = image.geometry;
+        stage.layer_lo = int64_t(index * 8);
+        stage.layer_hi = int64_t((index + 1) * 8);
+        stage.live.ids = image.live.ids;
+        stage.checkpoints.clear();
+        image.stage_images.push_back(std::move(stage));
+    }
+    return image;
+}
+
 // One turn later on the same branch: the live record and the K/V extents grow, so every unchanged byte of the prefix
 // keeps the physical identity the store deduplicates on.  `seed` chooses the appended bytes, so two captures taken
 // from the same head with different seeds are two different states that share only that head's prefix.
-SavedConversation turn_on(const SavedConversation& base, int64_t tokens, int seed) {
-    SavedConversation grown = base;
-    for (int64_t t = int64_t(base.live.ids.size()); t < tokens; ++t)
+void extend_record(SavedConversation& grown, int64_t tokens, int seed) {
+    for (int64_t t = int64_t(grown.live.ids.size()); t < tokens; ++t)
         grown.live.ids.push_back(int32_t(uint64_t(seed) * 7 + uint64_t(t)));
     grown.live.gdn.resize(grown.live.ids.size(), uint8_t(seed));
     grown.live.ple.resize(grown.live.ids.size() / 2, uint8_t(seed + 1));
@@ -165,6 +185,12 @@ SavedConversation turn_on(const SavedConversation& base, int64_t tokens, int see
         grown.kv[layer].k.resize(size_t(grown.live.ids.size()) * 16, uint8_t(seed + int(layer)));
         grown.kv[layer].v.resize(size_t(grown.live.ids.size()) * 16, uint8_t(seed + 10 + int(layer)));
     }
+    for (SavedConversation& stage : grown.stage_images) extend_record(stage, tokens, seed);
+}
+
+SavedConversation turn_on(const SavedConversation& base, int64_t tokens, int seed) {
+    SavedConversation grown = base;
+    extend_record(grown, tokens, seed);
     return grown;
 }
 
@@ -193,6 +219,8 @@ void check_record_restores(ConversationStore& store, SavedConversation expected,
     ConversationStoreRead read;
     check(store.wait_ready(request_id, 1, read, 5000), "the demand settles after a fresh open");
     check(read.status == ConversationStoreReadStatus::ready, "the persisted record restores after a fresh open");
+    check(read.live && read.tokens == int64_t(expected.live.ids.size()), "the restored cut is the exact latest live cut");
+    check_eq(read.stages, expected.stage_images.size() + 1, "the restored frontier includes every stage");
     check(read.image && images_equal(*read.image, expected, why), "the restored record is byte-identical");
     store.release_read(request_id, 1);
 }
@@ -203,21 +231,63 @@ void check_record_restores(ConversationStore& store, SavedConversation expected,
 
 struct Sink {
     ConversationPublicationSink out;
+    ConversationStore& store;
+    ConversationCache cache;
+    const size_t budget;
     uint64_t next_id = 0;
+    uint64_t next_ticket = 0;
+    size_t acquisitions = 0, lease_releases = 0, ticket_releases = 0, retentions = 0;
+    bool fail_acquire = false;
+    std::string reports;
 
-    Sink() {
+    explicit Sink(ConversationStore& store, size_t budget = size_t(64) << 20,
+                  size_t slots = ConversationPublicationQueue::kMaxQueued, size_t headroom = size_t(8) << 20)
+        : store(store), cache(budget, slots), budget(budget) {
+        out.publication_headroom_bytes = headroom;
+        out.report = [this](const char* line) { reports += line; };
+        out.acquire_image = [this](uint64_t ticket) -> std::shared_ptr<const SavedConversation> {
+            ++acquisitions;
+            if (fail_acquire) throw std::bad_alloc();
+            // This is the production ordering: allocate the shared owner before the allocation-free cache move.
+            auto root = std::make_shared<SavedConversation>();
+            std::optional<SavedConversation> image = cache.take_publication(ticket);
+            if (!image) return {};
+            *root = std::move(*image);
+            return root;
+        };
+        out.release_publication = [this](uint64_t ticket) {
+            ++ticket_releases;
+            cache.release_publication(ticket);
+        };
+        out.release_lease = [this](size_t bytes) {
+            ++lease_releases;
+            cache.release_lease(bytes);
+        };
+        out.retain_image = [this](std::shared_ptr<const SavedConversation> image) {
+            const size_t held = size_t(this->store.ram_held_bytes());
+            if (!cache.can_fit(image->bytes(), held)) return;
+            SavedConversation alias = image->frozen_alias();
+            if (cache.put(std::move(alias), held)) ++retentions;
+        };
+        out.refresh_allowance = [this] { refresh_allowance(); };
         out.next_publication_id = [this](uint64_t& id) {
             id = ++next_id;
             return true;
         };
+        refresh_allowance();
     }
 
+    void refresh_allowance() {
+        const size_t occupied = cache.envelope_bytes();
+        store.publish_read_allowance(occupied < budget ? budget - occupied : 0);
+    }
 };
 
-// One capture, exactly as the serving engine builds it: the record it froze, the head its owner's lineage named when
-// it was taken, and the export cache's lease on the parked image.
+// One metadata-only capture, exactly as the serving engine builds it. The public transition, not this fixture,
+// protects and parks the image, and the head's sink callback later transfers its one charge into a lease.
 ConversationPublicationCapture capture_of(uint64_t owner, uint64_t generation, uint64_t supersedes_hint,
-                                          bool continues, const SavedConversation& image, uint64_t epoch) {
+                                          bool continues, const SavedConversation& image, uint64_t epoch,
+                                          uint64_t ticket) {
     ConversationPublicationCapture entry;
     entry.owner = owner;
     entry.owner_generation = generation;
@@ -227,9 +297,19 @@ ConversationPublicationCapture capture_of(uint64_t owner, uint64_t generation, u
     entry.scope = image.scope;
     entry.cvec = image.cvec;
     entry.live = image.live.ids;
-    entry.image = std::make_shared<SavedConversation>(image);
-    entry.lease_bytes = image.bytes();
+    entry.image_ticket = ticket;
     return entry;
+}
+
+bool capture_image(ConversationPublicationQueue& publications, Sink& sink, uint64_t owner, uint64_t generation,
+                   uint64_t supersedes_hint, bool continues, const SavedConversation& image, uint64_t epoch) {
+    SavedConversation captured = image;
+    ConversationPublicationCapture entry = capture_of(owner, generation, supersedes_hint, continues, image, epoch,
+                                                       ++sink.next_ticket);
+    const auto result = publications.capture(sink.cache, std::move(captured), std::move(entry),
+                                             size_t(sink.store.ram_held_bytes()), 0, sink.out);
+    sink.refresh_allowance();
+    return result.queued;
 }
 
 const ConversationPublicationPending* pending_of(const ConversationPublicationQueue& publications, uint64_t owner) {
@@ -254,20 +334,35 @@ void settle(ConversationPublicationQueue& publications, ConversationStore& store
     }
 }
 
-// A retained, unpinned latest head, as mounted by the native engine. Fresh branch roots are tested separately.
+// Produce a real unpinned latest through the same capture/handoff as every other fixture. Its first checkpoint is
+// the pinned root, and the whole record re-carries that root promise as a checkpoint, so the root can be replaced.
 uint64_t mount_latest(ConversationStore& store, ConversationPublicationQueue& publications, Sink& sink,
                       const SavedConversation& record) {
-    ConversationStorePublish request;
-    request.request_id = request.generation = ++sink.next_id;
-    std::string why;
-    check(store.publish(std::make_shared<SavedConversation>(record), request, why) ==
-              ConversationStorePublishAdmission::accepted, "the prior latest head is admitted");
-    ConversationStorePublishResult result;
-    check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored,
-          "the prior latest head is persisted");
-    publications.owner(0).mount(result.head_id, store.epoch(), record.live.ids, int64_t(record.live.ids.size()),
+    if (record.checkpoints.empty()) {
+        check(false, "an unpinned-latest fixture needs a reusable root checkpoint");
+        return 0;
+    }
+    SavedConversation root = record;
+    root.live = record.checkpoints.front();
+    root.checkpoints.clear();
+    for (ConversationKv& kv : root.kv) {
+        kv.cells = int64_t(root.live.ids.size());
+        kv.k.resize(root.live.ids.size() * 16);
+        kv.v.resize(root.live.ids.size() * 16);
+    }
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1, 0, true, root, store.epoch()),
+          "the mount fixture's reusable root is captured");
+    settle(publications, store, sink);
+    const uint64_t root_head = publications.owner(0).lineage.head;
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1, root_head, true, record, store.epoch()),
+          "the mount fixture's whole latest record is captured");
+    settle(publications, store, sink);
+    const uint64_t head = publications.owner(0).lineage.head;
+    check(head != 0 && head != root_head && store.counters().heads == 1,
+          "the whole latest replaces its root while preserving the pinned checkpoint");
+    publications.owner(0).mount(head, store.epoch(), record.live.ids, int64_t(record.live.ids.size()),
                                 record.scope, record.cvec);
-    return result.head_id;
+    return head;
 }
 
 // Demand a real checkpoint image, then run the native mount handoff before shortening the execution record.
@@ -314,11 +409,12 @@ void check_checkpoint_mount_preserves_the_longer_branch() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
     SavedConversation record = stored_record(141, 64);
     record.cvec = false;
     const uint64_t head = mount_latest(store, publications, sink, record);
+    const uint64_t replaced_before = store.counters().replaced;
     std::vector<int32_t> live = mount_checkpoint(store, publications, record, 201);
     if (live.empty()) return;
 
@@ -333,15 +429,14 @@ void check_checkpoint_mount_preserves_the_longer_branch() {
     }
     const SavedConversation divergent = turn_on(resumed, 96, 900);
     ConversationPublicationOwner& owner = publications.owner(0);
-    ++owner.generation;
-    check(publications.enqueue(capture_of(0, owner.generation, head, true, divergent, store.epoch()), sink.out),
+    check(capture_image(publications, sink, 0, owner.generation + 1, head, true, divergent, store.epoch()),
           "the branch generated after a short disk mount is queued");
     publications.flush(store, sink.out, 0);
     const ConversationPublicationPending* pending = pending_of(publications, 0);
     check(pending && pending->supersedes == 0, "a short-mounted divergence claims no cover of the longer head");
     settle(publications, store, sink);
     check_eq(publications.counters().refused, 0, "the short-mounted branch publishes without refusal");
-    check_eq(store.counters().replaced, 0, "the longer predecessor was not retired by the divergent branch");
+    check_eq(store.counters().replaced, replaced_before, "the longer predecessor was not retired by the divergent branch");
     check_eq(store.counters().heads, 2, "the original longer record and the checkpoint branch both persist");
 
     store.close();
@@ -358,10 +453,11 @@ void check_checkpoint_mount_allows_a_whole_prefix_replacement() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
     const SavedConversation record = stored_record(151, 64);
     const uint64_t head = mount_latest(store, publications, sink, record);
+    const uint64_t replaced_before = store.counters().replaced;
     std::vector<int32_t> live = mount_checkpoint(store, publications, record, 211);
     if (live.empty()) return;
     live.insert(live.end(), record.live.ids.begin() + long(live.size()), record.live.ids.end());
@@ -370,15 +466,14 @@ void check_checkpoint_mount_allows_a_whole_prefix_replacement() {
     continued.live.ids = std::move(live);
     const SavedConversation covered = turn_on(continued, 96, 151);
     ConversationPublicationOwner& owner = publications.owner(0);
-    ++owner.generation;
-    check(publications.enqueue(capture_of(0, owner.generation, head, true, covered, store.epoch()), sink.out),
+    check(capture_image(publications, sink, 0, owner.generation + 1, head, true, covered, store.epoch()),
           "the full-prefix capture after a short disk mount is queued");
     publications.flush(store, sink.out, 0);
     const ConversationPublicationPending* pending = pending_of(publications, 0);
     check(pending && pending->supersedes == head, "the full-prefix capture still covers the mounted head");
     settle(publications, store, sink);
     check_eq(publications.counters().refused, 0, "the full-prefix capture publishes without refusal");
-    check_eq(store.counters().replaced, 1, "a valid full-prefix continuation replaces its unpinned latest head");
+    check_eq(store.counters().replaced, replaced_before + 1, "a valid full-prefix continuation replaces its unpinned latest head");
     check_eq(store.counters().heads, 1, "a valid replacement does not retain an unnecessary predecessor branch");
 
     store.close();
@@ -398,7 +493,7 @@ void check_divergent_capture_is_published_as_a_branch() {
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
     const uint64_t epoch = store.epoch();
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
 
     const SavedConversation record = stored_record(77, 64);
@@ -407,6 +502,8 @@ void check_divergent_capture_is_published_as_a_branch() {
     const SavedConversation mounted = turn_on(record, 96, 901);     // a second owner's capture of the same prefix
 
     const uint64_t root_head = mount_latest(store, publications, sink, record);
+    const uint64_t replaced_before = store.counters().replaced;
+    const uint64_t capture_generation = publications.owner(0).generation + 1;
 
     // A second owner mounts that very head - an ordinary client whose prefix is the stored record.
     ConversationPublicationOwner& other = publications.owner(1);
@@ -420,18 +517,16 @@ void check_divergent_capture_is_published_as_a_branch() {
 
     // The covering capture is handed over first; the divergent one and the mounted owner's are captured while its
     // completion is still in flight, so both name the head its completion is about to remove.
-    publications.owner(0).generation = 2;
-    check(publications.enqueue(capture_of(0, 2, root_head, true, covered, epoch), sink.out),
+    check(capture_image(publications, sink, 0, capture_generation, root_head, true, covered, epoch),
           "the covering capture is queued");
     publications.flush(store, sink.out, 0);
     check_eq(publications.pending().size(), 1, "the covering capture is in flight");
     check_eq(publications.pending().front().supersedes, root_head,
              "the cover names the head whose whole record it still contains");
 
-    publications.owner(0).generation = 3;
-    check(publications.enqueue(capture_of(0, 3, root_head, true, divergent, epoch), sink.out),
+    check(capture_image(publications, sink, 0, capture_generation + 1, root_head, true, divergent, epoch),
           "the divergent capture is queued while the cover is in flight");
-    check(publications.enqueue(capture_of(1, 5, root_head, true, mounted, epoch), sink.out),
+    check(capture_image(publications, sink, 1, 5, root_head, true, mounted, epoch),
           "the mounted owner's capture is queued");
 
     publications.flush(store, sink.out, 5000);
@@ -449,7 +544,7 @@ void check_divergent_capture_is_published_as_a_branch() {
     settle(publications, store, sink);
     check(!any_record_names(publications, root_head), "no capture ever named the retired head again");
     check_eq(publications.counters().refused, 0, "all queued captures publish without refusal");
-    check_eq(store.counters().replaced, 1, "exactly one publication replaced a head");
+    check_eq(store.counters().replaced, replaced_before + 1, "exactly one publication replaced a head after mounting");
     check_eq(store.counters().heads, 3, "the covered head, the divergent capture and the other owner's are all heads");
 
     // A fresh open of the same root: the two divergent captures and the covered head are all durable.
@@ -476,7 +571,7 @@ void check_completion_landing_after_the_harvest() {
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
     const uint64_t epoch = store.epoch();
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
 
     const SavedConversation record = stored_record(88, 64);
@@ -484,15 +579,14 @@ void check_completion_landing_after_the_harvest() {
     const SavedConversation divergent = turn_on(record, 96, 902);
 
     const uint64_t root_head = mount_latest(store, publications, sink, record);
+    const uint64_t capture_generation = publications.owner(0).generation + 1;
 
-    publications.owner(0).generation = 2;
-    check(publications.enqueue(capture_of(0, 2, root_head, true, covered, epoch), sink.out),
+    check(capture_image(publications, sink, 0, capture_generation, root_head, true, covered, epoch),
           "the covering capture is queued");
     publications.flush(store, sink.out, 0);   // handed over; its completion is deliberately not harvested yet
     check_eq(publications.pending().size(), 1, "the covering capture is in flight and unsettled");
 
-    publications.owner(0).generation = 3;
-    check(publications.enqueue(capture_of(0, 3, root_head, true, divergent, epoch), sink.out),
+    check(capture_image(publications, sink, 0, capture_generation + 1, root_head, true, divergent, epoch),
           "the divergent capture is queued");
 
     // Land the covering capture's completion inside that window: this seam's harvest has already run, and the writer
@@ -521,15 +615,14 @@ void check_a_moved_on_owner_never_receives_an_old_completion() {
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
     const uint64_t epoch = store.epoch();
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
 
     const SavedConversation first_conversation = stored_record(99, 64);
     const SavedConversation second_conversation = stored_record(101, 64);
 
-    check(publications.enqueue(capture_of(0, 1, 0, true, first_conversation, epoch), sink.out),
+    check(capture_image(publications, sink, 0, 1, 0, true, first_conversation, epoch),
           "the first conversation's capture is queued");
-    publications.owner(0).generation = 1;
     publications.flush(store, sink.out, 0);
     check_eq(publications.pending().size(), 1, "the first conversation's capture is in flight");
 
@@ -545,7 +638,7 @@ void check_a_moved_on_owner_never_receives_an_old_completion() {
     const uint64_t generation = publications.owner(0).generation;
     const uint64_t hint = publications.owner(0).lineage.valid ? publications.owner(0).lineage.head : 0;
     check_eq(hint, 0, "the moved-on owner names no predecessor");
-    check(publications.enqueue(capture_of(0, generation, hint, true, second_conversation, epoch), sink.out),
+    check(capture_image(publications, sink, 0, generation, hint, true, second_conversation, epoch),
           "the second conversation's capture is queued");
     publications.flush(store, sink.out, 0);
     const ConversationPublicationPending* second = pending_of(publications, 0);
@@ -554,7 +647,7 @@ void check_a_moved_on_owner_never_receives_an_old_completion() {
     check_eq(store.counters().heads, 2, "each conversation keeps its own head");
 
     // A one-shot borrow is published as a branch of its own and never becomes the borrowing owner's lineage.
-    check(publications.enqueue(capture_of(1, 1, 0, false, second_conversation, epoch), sink.out),
+    check(capture_image(publications, sink, 1, 1, 0, false, second_conversation, epoch),
           "the one-shot borrow is queued");
     settle(publications, store, sink);
     check(!publications.owner(1).lineage.valid, "a one-shot borrow establishes no lineage");
@@ -571,14 +664,13 @@ void check_a_covered_root_keeps_its_record() {
     ConversationStore store(options_for(root.path));
     if (!store.enabled()) return;
     const uint64_t epoch = store.epoch();
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
 
     const SavedConversation record = stored_record(121, 64);
     const SavedConversation later = turn_on(record, 96, 121);
 
-    check(publications.enqueue(capture_of(0, 1, 0, true, record, epoch), sink.out), "the root capture is queued");
-    publications.owner(0).generation = 1;
+    check(capture_image(publications, sink, 0, 1, 0, true, record, epoch), "the root capture is queued");
     publications.flush(store, sink.out, 0);
     settle(publications, store, sink);
     const uint64_t root_head = publications.owner(0).lineage.head;
@@ -586,8 +678,7 @@ void check_a_covered_root_keeps_its_record() {
     check_eq(store.counters().heads, 1, "the root is the store's only head");
 
     // The branch moves on: the next turn's capture still contains the root's whole record.
-    publications.owner(0).generation = 2;
-    check(publications.enqueue(capture_of(0, 2, root_head, true, later, epoch), sink.out),
+    check(capture_image(publications, sink, 0, 2, root_head, true, later, epoch),
           "the later turn is queued");
     publications.flush(store, sink.out, 0);
     const ConversationPublicationPending* cover = pending_of(publications, 0);
@@ -617,7 +708,7 @@ void check_a_covered_root_keeps_its_record() {
 void check_deferral_does_not_spend_an_attempt() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
-    Sink sink;
+    Sink sink(store);
     ConversationPublicationQueue publications;
     const SavedConversation large = stored_record(131, 131072);
     const SavedConversation small = stored_record(132, 64);
@@ -626,10 +717,9 @@ void check_deferral_does_not_spend_an_attempt() {
     check(store.demand(query_of(large, 100, 1), why), "the blocking image is demanded");
     ConversationStoreRead read;
     check(store.wait_ready(100, 1, read, 5000) && read.image, "the blocking image is handed out");
-    store.publish_read_allowance(uint64_t(8) << 20);
-    publications.owner(1).generation = 1;
-    check(publications.enqueue(capture_of(1, 1, 0, true, small, store.epoch()), sink.out),
+    check(capture_image(publications, sink, 1, 1, 0, true, small, store.epoch()),
           "the blocked capture is queued");
+    store.publish_read_allowance(uint64_t(8) << 20);
     for (int i = 0; i < 16; ++i) publications.flush(store, sink.out, 0);
     check_eq(publications.queued().size(), 1, "temporary pressure retains the captured image past the retry limit");
     check_eq(publications.counters().dropped, 0, "temporary pressure never drops the capture");
@@ -644,6 +734,220 @@ void check_deferral_does_not_spend_an_attempt() {
         ConversationStore reopened(options_for(root.path));
         check_record_restores(reopened, small, 101, true);
     }
+}
+
+// Waiting publications protect the only parked owner. Restore, supersession and pressure cannot consume it; an
+// allocation failure leaves the ticket parked, and acquiring only the head transfers rather than duplicates charge.
+void check_waiting_ownership_and_release() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store, size_t(64) << 20, 2);
+    ConversationPublicationQueue publications;
+    SavedConversation first = stored_record(161, 64);
+    first.checkpoints.clear();   // protection here is the publication ticket, not a pinned checkpoint
+    const SavedConversation later = turn_on(first, 96, 161);
+    check(capture_image(publications, sink, 0, 1, 0, true, first, store.epoch()), "the first protected owner is captured");
+    check(capture_image(publications, sink, 0, 2, 0, true, later, store.epoch()), "a newer waiting capture is protected too");
+    check_eq(publications.queued().size(), 2, "both metadata records are queued");
+    if (publications.queued().size() != 2) return;
+    const uint64_t first_ticket = publications.queued()[0].image_ticket;
+    const uint64_t later_ticket = publications.queued()[1].image_ticket;
+    for (const auto& entry : publications.queued())
+        check(!entry.image && entry.lease_bytes == 0, "waiting queue entries own neither image aliases nor leases");
+    check_eq(sink.cache.size(), 2, "supersession does not remove an older pending owner");
+    check_eq(sink.cache.superseded(), 0, "no protected predecessor is counted as superseded");
+    check_eq(sink.cache.leased_bytes(), 0, "queued metadata creates no second image reservation");
+    const size_t envelope = sink.cache.envelope_bytes();
+    bool retained_in_cache = false;
+    SavedConversation borrowed = sink.cache.take(0, retained_in_cache);
+    check(retained_in_cache && borrowed.publication_ticket == 0, "ordinary restore explicitly reports a borrowed pending alias");
+    check(sink.cache.has_publication(first_ticket), "ordinary restore leaves the sole publication owner protected");
+    check_eq(sink.cache.envelope_bytes(), envelope, "borrowing does not subtract the protected parked charge");
+    borrowed = {};
+    check(!sink.cache.evict_oldest(), "ordinary RAM eviction cannot remove either pending image");
+
+    SavedConversation refused = stored_record(163, 64);
+    const std::vector<int32_t> refused_live = refused.live.ids;
+    const uint64_t refused_ticket = ++sink.next_ticket;
+    auto refused_entry = capture_of(0, 3, 0, true, refused, store.epoch(), refused_ticket);
+    const auto refusal = publications.capture(sink.cache, std::move(refused), std::move(refused_entry),
+                                               size_t(store.ram_held_bytes()), 0, sink.out);
+    check(!refusal.parked && !refusal.queued, "genuine protected-slot exhaustion refuses the capture without overcommit");
+    check(refused.live.ids == refused_live && refused.publication_ticket == 0, "a refused capture retains its ordinary image");
+    check(!sink.cache.has_publication(refused_ticket), "capacity refusal creates no orphan protected ticket");
+    check_eq(publications.owner(0).generation, 2, "a failed capture does not advance its owner generation");
+    check_eq(publications.queued().size(), 2, "capacity refusal leaves existing metadata intact");
+
+    const uint64_t refused_before = publications.counters().refused;
+    sink.fail_acquire = true;
+    publications.flush(store, sink.out, 0);
+    check(sink.cache.has_publication(first_ticket) && !publications.queued().front().image,
+          "shared-root allocation failure retains the protected parked owner");
+    check_eq(sink.cache.leased_bytes(), 0, "failed acquisition transfers no charge");
+    check_eq(publications.queued().front().attempts, 0, "allocation failure spends no store-refusal attempt");
+    check_eq(publications.counters().refused, refused_before, "allocation retry is not a fabricated store refusal");
+    sink.fail_acquire = false;
+    store.publish_read_allowance(1);   // a real permanent admission refusal keeps the acquired head for retry
+    publications.flush(store, sink.out, 0);
+    check(publications.queued().front().image && !publications.queued()[1].image,
+          "only the head acquires an image while a refused handoff retries");
+    check(!sink.cache.has_publication(first_ticket) && sink.cache.has_publication(later_ticket),
+          "acquisition consumes only the head's protected ticket");
+    check_eq(sink.cache.envelope_bytes(), envelope, "parked-to-lease transfer leaves the complete envelope identical");
+    check_eq(sink.cache.leased_bytes(), publications.queued().front().lease_bytes, "the head owns the exact transferred lease");
+    check_eq(sink.acquisitions, 2, "one failed allocation and one head acquisition never acquire the waiter");
+    publications.drop(0, "explicit acquired-head drop", sink.out);
+    check_eq(sink.cache.leased_bytes(), 0, "dropping an acquired head releases its lease exactly once");
+    check_eq(sink.lease_releases, 1, "acquired-head drop uses the lease-release path");
+    publications.abandon("execution state abandoned", sink.out);
+    check(!sink.cache.has_publication(later_ticket), "abandon clears every still-parked publication protection");
+    check_eq(sink.ticket_releases, 1, "a waiting drop releases protection instead of subtracting a lease");
+    check(sink.cache.evict_oldest(), "an abandoned unpinned owner becomes ordinarily evictable");
+
+    check(capture_image(publications, sink, 0, 3, 0, true, first, store.epoch()), "an epoch-bound image is captured");
+    const uint64_t epoch_ticket = publications.queued().front().image_ticket;
+    const size_t acquisitions_before = sink.acquisitions;
+    check(store.invalidate_domain("publication epoch regression"), "the real store advances its execution epoch");
+    publications.flush(store, sink.out, 0);
+    check(publications.queued().empty() && !sink.cache.has_publication(epoch_ticket), "epoch drop releases parked protection");
+    check_eq(sink.acquisitions, acquisitions_before, "a retired-epoch image is never acquired");
+
+    check(capture_image(publications, sink, 0, 4, 0, true, first, store.epoch()), "a missing-ticket case is captured");
+    sink.cache.clear();   // the safety invalidation seam is allowed to discard the protected physical owner
+    publications.flush(store, sink.out, 0);
+    check(publications.queued().empty(), "a missing protected owner is diagnosed and dropped");
+    check(sink.reports.find("protected publication ticket has no image") != std::string::npos,
+          "missing-ticket drop is visible rather than silently counted as publication");
+    check_eq(sink.cache.leased_bytes(), 0, "a missing ticket invents no lease");
+}
+
+// Metadata exhaustion is an honest publication refusal, not lost RAM caching. No compatibility path may accept an
+// entry that already owns a full alias/lease, and neither kind of failed capture may move the owner's generation.
+void check_capture_refusal_is_atomic() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store, size_t(64) << 20, ConversationPublicationQueue::kMaxQueued + 1);
+    ConversationPublicationQueue publications;
+    for (size_t index = 0; index < ConversationPublicationQueue::kMaxQueued; ++index) {
+        const SavedConversation image = stored_record(191 + index * 2, 64);
+        check(capture_image(publications, sink, 0, index + 1, 0, true, image, store.epoch()),
+              "the bounded metadata queue accepts a protected capture");
+    }
+    SavedConversation overflow = stored_record(251, 64);
+    const uint64_t overflow_ticket = ++sink.next_ticket;
+    auto overflow_entry = capture_of(0, 99, 0, true, overflow, store.epoch(), overflow_ticket);
+    const auto result = publications.capture(sink.cache, std::move(overflow), std::move(overflow_entry),
+                                              size_t(store.ram_held_bytes()), 0, sink.out);
+    check(result.parked && !result.queued, "queue exhaustion still permits ordinary parking without publication protection");
+    check(!sink.cache.has_publication(overflow_ticket), "queue exhaustion leaves no protected ticket without metadata");
+    check_eq(publications.owner(0).generation, ConversationPublicationQueue::kMaxQueued,
+             "queue exhaustion leaves the successful capture generation unchanged");
+
+    SavedConversation invalid = stored_record(253, 64);
+    const uint64_t invalid_ticket = ++sink.next_ticket;
+    auto invalid_entry = capture_of(0, 100, 0, true, invalid, store.epoch(), invalid_ticket);
+    invalid_entry.image = std::make_shared<SavedConversation>(invalid);
+    invalid_entry.lease_bytes = invalid.bytes();
+    const auto rejected = publications.capture(sink.cache, std::move(invalid), std::move(invalid_entry),
+                                                size_t(store.ram_held_bytes()), 0, sink.out);
+    check(!rejected.queued && !sink.cache.has_publication(invalid_ticket),
+          "an already-aliased entry is rejected rather than accepted through a legacy handoff mode");
+    check_eq(publications.counters().refused, 2, "both pre-enqueue refusals are counted honestly");
+    check_eq(sink.cache.leased_bytes(), 0, "neither refused metadata capture reserves a publication lease");
+    publications.abandon("bounded queue regression complete", sink.out);
+    check_eq(publications.counters().dropped, ConversationPublicationQueue::kMaxQueued,
+             "only the captures actually queued are counted as dropped");
+}
+
+void check_optional_retention_failure_preserves_publication() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    const SavedConversation image = stored_record(181, 64);
+    sink.out.retain_image = [](std::shared_ptr<const SavedConversation>) { throw std::bad_alloc(); };
+    check(capture_image(publications, sink, 0, 1, 0, true, image, store.epoch()), "the allocation-failure image is captured");
+    settle(publications, store, sink);
+    check(!publications.holds_work(), "optional retention failure cannot undo an accepted handoff");
+    check_eq(publications.counters().published, 1, "the accepted publication is harvested after retention failure");
+    check_eq(publications.counters().refused, 0, "an optional RAM miss is not reported as a publication refusal");
+    check_eq(sink.cache.leased_bytes(), 0, "the accepted handoff releases its head lease before optional retention");
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check_record_restores(reopened, image, 301, true);
+}
+
+// The original failure happens before enqueue: a second full image reservation cannot fit even though the captured
+// image itself does. Drive that exact refusal with the real bounded cache, then capture the newer three-stage cut
+// through the production transition, pressure RAM before/after the writer seam, and demand the newest cut on reopen.
+void check_bounded_capture_persists_the_newest_all_stage_frontier() {
+    TempRoot root;
+    auto options = options_for(root.path);
+    options.chunk_bytes = uint64_t(1) << 20;   // production chunking; keep the existing 8 MiB metadata ceiling
+    SavedConversation record = all_stage_record(171, 65536);
+    SavedConversation newest = turn_on(record, 131072, 171);
+    SavedConversation pressure = all_stage_record(173, 131072);
+    record.freeze();
+    newest.freeze();
+    pressure.freeze();
+    // One metadata ceiling covers the existing store/index, the other preserves its real writer workspace. The
+    // all-stage image is larger than both together, so this still cannot admit the old second full-image charge.
+    const size_t budget = newest.bytes() + 2 * size_t(options.metadata_bytes);
+    options.read_budget_bytes = budget;
+    ConversationStore store(options);
+    Sink sink(store, budget, 1, size_t(options.metadata_bytes));
+    ConversationPublicationQueue publications;
+    check(capture_image(publications, sink, 0, 1, 0, true, record, store.epoch()), "the older all-stage root is captured");
+    settle(publications, store, sink);
+    const uint64_t root_head = publications.owner(0).lineage.head;
+    check(root_head != 0 && publications.owner(0).lineage.valid, "the older all-stage root becomes a durable predecessor");
+
+    ConversationCache old_admission(budget, 1);
+    SavedConversation old_parked = record.frozen_alias();
+    check(old_admission.put(std::move(old_parked), size_t(store.ram_held_bytes())), "the old admission seam has a parked predecessor");
+    check(!old_admission.reserve_snapshot(newest.bytes() * 2, size_t(store.ram_held_bytes())),
+          "the old pre-enqueue full-image-plus-lease reservation really fails in this envelope");
+    SavedConversation skipped = newest.frozen_alias();
+    check(old_admission.put(std::move(skipped), size_t(store.ram_held_bytes())), "the skipped publication can still park normally");
+    SavedConversation old_pressure = pressure.frozen_alias();
+    check(old_admission.put(std::move(old_pressure), size_t(store.ram_held_bytes())), "unrelated RAM pressure evicts that unprotected newest image");
+    const auto newest_query = query_of(newest, 310, 1);
+    check_eq(old_admission.best(newest_query.tokens, newest_query.images, newest.cvec, newest.scope).tokens, 0,
+             "the old refusal path loses the newest RAM-only cut under real cache pressure");
+    check(old_admission.evictions() != 0, "the reproduction exercised actual cache eviction, not only an arithmetic helper");
+
+    check(capture_image(publications, sink, 0, 2, root_head, true, newest, store.epoch()),
+          "the repaired transition queues the newer complete frontier without the second image reservation");
+    check_eq(publications.queued().size(), 1, "the newer frontier has a bounded metadata owner");
+    if (publications.queued().empty()) return;
+    const uint64_t newest_ticket = publications.queued().front().image_ticket;
+    check(!publications.queued().front().image && sink.cache.leased_bytes() == 0,
+          "the newer frontier waits in its one already-budgeted parked owner");
+    SavedConversation blocked_pressure = pressure.frozen_alias();
+    check(!sink.cache.put(std::move(blocked_pressure), size_t(store.ram_held_bytes())),
+          "unrelated pressure cannot evict the protected frontier before the writer seam");
+    check(sink.cache.has_publication(newest_ticket), "pre-handoff pressure leaves the newest publication ticket intact");
+    check(sink.cache.envelope_bytes() + store.ram_held_bytes() <= budget,
+          "capturing the newer frontier preserves bounded cache plus store accounting");
+    settle(publications, store, sink);
+    check(!publications.holds_work(), "the newer frontier drains through the real safe-seam handoff and harvest");
+    check_eq(publications.counters().published, 2, "both older and newest all-stage captures really persist");
+    check_eq(publications.counters().refused, 0, "the repaired capture does not hide a pre-enqueue or store refusal");
+    check_eq(publications.counters().dropped, 0, "RAM pressure does not drop the newer frontier");
+    check_eq(store.counters().retained_branches, 1, "the pinned root promise remains a retained predecessor");
+    check_eq(sink.cache.leased_bytes(), 0, "the accepted frontier leaves no caller-side lease");
+    SavedConversation after_pressure = pressure.frozen_alias();
+    check(sink.cache.put(std::move(after_pressure), size_t(store.ram_held_bytes())), "unrelated pressure is admitted after publication ownership transfers");
+    check_eq(sink.cache.best(newest_query.tokens, newest_query.images, newest.cvec, newest.scope).tokens, 0,
+             "the newest cut is no longer resident when persistence is exercised");
+    check(sink.cache.envelope_bytes() + store.ram_held_bytes() <= budget,
+          "the same bounded envelope still holds after pressure and writer drain");
+    store.close();
+    ConversationStore reopened(options);
+    check(reopened.enabled(), "the bounded all-stage store reopens cleanly");
+    if (!reopened.enabled()) return;
+    check_record_restores(reopened, newest, 311);
+    check_record_restores(reopened, record, 312, true);
 }
 
 } // namespace
@@ -665,6 +969,10 @@ int main() {
     check_a_covered_root_keeps_its_record();
     check_a_moved_on_owner_never_receives_an_old_completion();
     check_deferral_does_not_spend_an_attempt();
+    check_waiting_ownership_and_release();
+    check_capture_refusal_is_atomic();
+    check_optional_retention_failure_preserves_publication();
+    check_bounded_capture_persists_the_newest_all_stage_frontier();
     std::fprintf(stderr, "conversation_publication_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
