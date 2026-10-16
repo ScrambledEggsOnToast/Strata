@@ -201,9 +201,13 @@ void release_reinit(int fmt, int mode) {
     check(state.kv_mode==mode && qsa_kv_format(state)==fmt,"native main/ring format and residency match placement");
     const uint64_t first_owner=state.allocation_id;
     uint64_t fingerprint=0;
-    check(conversation_kv_restore(image,state,source.g,9,index,err) &&
-          conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"native owner restores all authoritative and ring bytes");
+    check(conversation_kv_restore(image,state,source.g,9,index,err),
+          "native owner accepts the saved image");
+    // conversation_kv_restore leaves ring refill on the legacy stream; the
+    // diagnostic verifier requires the documented completion fence.
     cuda_check(cudaDeviceSynchronize());
+    check(conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),
+          "native owner restores all authoritative and ring bytes");
     qsa_state_release(state);
     check(!state.allocation_id && !state.host_allocation && !state.host_step && !state.host_pos &&
           !state.host.present() && !state.max_cells && !state.map.page_table,"release clears all secondary allocations and map handles");
@@ -216,9 +220,11 @@ void release_reinit(int fmt, int mode) {
     cuda_check(cudaDeviceSynchronize());
     if (mode==1) check(empty_map(state),"re-initialized streamed owner starts with an empty map");
     check(!conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"fresh owner does not inherit released payload");
-    check(conversation_kv_restore(image,state,source.g,9,index,err) &&
-          conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"saved state survives release and re-initialization");
+    check(conversation_kv_restore(image,state,source.g,9,index,err),
+          "re-initialized native owner accepts the saved image");
     cuda_check(cudaDeviceSynchronize());
+    check(conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),
+          "saved state survives release and re-initialization");
     qsa_state_release(state);
     cuda_check(cudaFree(arena));
     check(qsa_kv_host_bytes()==pinned_before,"re-initialized owner releases without a pinned leak");
