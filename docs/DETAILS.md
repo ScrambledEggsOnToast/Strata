@@ -1450,9 +1450,11 @@ the document, and 20 questions cost one read of it. Without the field the server
 last turn's start, the system prompt's end and every `--prompt-cache-every` tokens, so a question that follows a long
 document in the same chat re-reads up to 16K tokens of it (55 s at 262K on a Tesla P100). The field is checked against the
 prompt's own ids (the prefix is always the longest common start), a prefix that cannot be marked is said in the server's
-window and ignored, and a malformed field is a 400. One pinned prefix at a time per engine (a new one replaces it);
-it needs `--prompt-cache 3` or more. `tools/research_run.py` runs a document and a question list against a server with and
-without it. The engine's own key is `pin=N` on the `GEN` line.
+window and ignored, and a malformed field is a 400. Each working history has one explicit pinned prefix; a successful
+retarget replaces it, while a request for an unavailable checkpoint leaves the existing pin unchanged. Independent
+parked histories retain their own pins. This needs `--prompt-cache 3` or more (checkpoint positions, not execution
+slots). `tools/research_run.py` runs a document and a question list against a server with and without it.
+The engine's own key is `pin=N` on the `GEN` line.
 
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations

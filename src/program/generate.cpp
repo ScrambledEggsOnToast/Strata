@@ -5350,10 +5350,15 @@ int main(int argc, char** argv) {
             // and the checkpoint's token IDs once per stage.
             strata::plan::ResidentCheckpointPayload checkpoint;
             if (strata::core::conversation_checkpoint_payload(g, o.max_context, stage_count,
-                    split_real && !split_auto ? split_at.data() : nullptr, checkpoint))
-                ram("conversation_checkpoints", byte_mul(checkpoint.bytes, byte_add((uint64_t) o.prompt_cache, 1)),
-                    "every saving stage's own GDN rows and indexer layers, whole PLE history and token IDs per stage; cache plus checkpoint being captured");
-            else ram_unknown("conversation_checkpoints", "conversation_checkpoint_payload failed");
+                    split_real && !split_auto ? split_at.data() : nullptr, checkpoint)) {
+                const uint64_t margin = byte_add(
+                    checkpoint.bytes / strata::plan::kResidentPayloadMarginDivisor,
+                    checkpoint.bytes % strata::plan::kResidentPayloadMarginDivisor != 0);
+                const uint64_t one = byte_add(checkpoint.bytes, byte_add(margin,
+                    byte_mul(checkpoint.stages, strata::plan::kResidentCheckpointMetadataBytes)));
+                ram("conversation_checkpoints", byte_mul(one, byte_add((uint64_t) o.prompt_cache, 1)),
+                    "all-stage checkpoint payload, capacity slack and metadata; cache plus capture in progress");
+            } else ram_unknown("conversation_checkpoints", "conversation_checkpoint_payload failed");
         }
         if (admission_prefill) {
             const char* ring_env = std::getenv("STRATA_STAGER_RING");

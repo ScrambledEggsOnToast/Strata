@@ -113,7 +113,8 @@ rows and indexer layers, while each stage's whole PLE history - `session.cpp` al
 and the checkpoint's token-ID vector are charged once per stage. That is the resident seat's state-only
 convention (below); no checkpoint carries draft/MTP state, so the cache adds none. An unresolved `auto` split
 keeps the whole-model bound for the first stage and one primary QSA, its PLE history and its IDs for each later
-stage.
+stage. Admission also includes the existing 12.5% payload-capacity margin and 4 KiB metadata allowance per stage,
+for every retained checkpoint and the checkpoint being captured. This is separate from the parked-history envelope.
 
 **The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
 layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the

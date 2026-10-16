@@ -404,14 +404,16 @@ void checkpoint_payload_stages() {
     check(strata::core::conversation_checkpoint_payload(g, cells, 2, two_stages, price) && price.stages == 2 &&
           price.bytes == stage_bytes(0, 4) + stage_bytes(4, 8),
           "two stages price every saving stage's carve, PLE history and token IDs");
-    check(price.bytes - whole_model_one == whole.ple + per_layer + ids,
-          "the whole-model price missed one stage's PLE history, indexer layers and token IDs");
+    check(price.bytes - whole_model_one == whole.ple + ids,
+          "an attention-aligned split adds one PLE history and token-ID vector");
     const int64_t three_stages[2] = {2, 6};   // [0,2) owns no attention layer of its own
     check(strata::core::conversation_checkpoint_payload(g, cells, 3, three_stages, price) && price.stages == 3 &&
           price.bytes == stage_bytes(0, 2) + stage_bytes(2, 6) + stage_bytes(6, 8),
           "three stages price every saving stage, including an attention-free one");
     check(price.stage_peak == stage_bytes(2, 6) && price.bytes > whole_model_one,
           "the largest stage sets the peak and the whole-model price is insufficient");
+    check(price.bytes - whole_model_one == 2 * (whole.ple + ids) + per_layer,
+          "an attention-free stage also adds its primary indexer state");
     const int64_t descending[2] = {6, 2};
     check(!strata::core::conversation_checkpoint_payload(g, cells, 3, descending, price) && !price.stages,
           "a non-ascending split is refused");
@@ -422,7 +424,7 @@ void checkpoint_payload_stages() {
     check(!strata::core::conversation_checkpoint_payload(g, cells, 2, empty_stage, price) && !price.stages,
           "an empty stage is refused");
     check(!strata::core::conversation_checkpoint_payload(g, cells, 0, nullptr, price) && !price.stages &&
-          !strata::core::conversation_checkpoint_payload(g, (uint64_t) g.n_layers + 1, nullptr, price) &&
+          !strata::core::conversation_checkpoint_payload(g, cells, (uint64_t) g.n_layers + 1, nullptr, price) &&
           !price.stages, "no stage, or more stages than layers, is refused");
     check(!strata::core::conversation_checkpoint_payload(g, 0, 2, two_stages, price) && !price.stages &&
           !strata::core::conversation_checkpoint_payload(g, (int64_t) INT32_MAX + 1, 2, two_stages, price) &&

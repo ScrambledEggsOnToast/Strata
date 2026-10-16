@@ -489,6 +489,7 @@ void check_manifest();
 void check_round_trip();
 void check_profile_recovery();
 void check_full_catalog_profile_restart();
+void check_split_pinned_restart();
 void check_dedup_beyond_the_quota();
 void check_dense_manifest_workspace_refusal();
 void check_damaged_manifest_is_still_reclaimed();
@@ -541,6 +542,7 @@ int main() {
     check_round_trip();
     check_profile_recovery();
     check_full_catalog_profile_restart();
+    check_split_pinned_restart();
     check_dedup_beyond_the_quota();
     check_dense_manifest_workspace_refusal();
     check_damaged_manifest_is_still_reclaimed();
@@ -2195,6 +2197,68 @@ void check_full_catalog_profile_restart() {
         ConversationStoreManifestInfo info;
         check(!store.manifest_info(replaced.head_id, info), "restart never resurrects the evicted pair");
         store.close();
+    }
+}
+
+void check_split_pinned_restart() {
+    for (size_t stages : {size_t(2), size_t(3)}) {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const auto limits = profile_limits(3, 3, uint64_t(64) << 20);
+        const auto make_pinned = [&](uint64_t seed) {
+            auto image = split_fixture(seed, 128, stages);
+            image.checkpoints[1].pinned = true;  // root32, pin64, latest96
+            auto latest = split_record(image.live, uint8_t(seed + 17));
+            latest.ids.resize(96);
+            latest.pinned = false;
+            image.checkpoints.push_back(std::move(latest));
+            image.stage_images.clear();
+            for (size_t stage = 1; stage < stages; ++stage)
+                image.stage_images.push_back(split_stage(
+                    image, uint8_t(seed + 0x20 * stage), int64_t(4 * stage), int64_t(4 * stage + 4)));
+            return image;
+        };
+        const auto first = make_pinned(211);
+        auto second = make_pinned(213);
+        second.scope = first.scope;
+        second.geometry = first.geometry;
+        for (auto& stage : second.stage_images) {
+            stage.scope = second.scope;
+            stage.geometry = second.geometry;
+        }
+        {
+            ConversationStore store(options, limits);
+            ConversationStorePublishResult a, b;
+            check(publish_and_wait(store, first, 1, 1, a) &&
+                      a.status == ConversationStorePublishStatus::stored,
+                  "persist the first all-stage pinned history");
+            check(publish_and_wait(store, second, 2, 2, b) &&
+                      b.status == ConversationStorePublishStatus::stored,
+                  "persist an independent pin in the same scope");
+            store.close();
+        }
+        {
+            ConversationStore store(options, limits);
+            uint64_t request = 10;
+            for (const SavedConversation* expected :
+                 std::array<const SavedConversation*, 2>{&first, &second}) {
+                auto query = query_of(*expected, request, 1);
+                query.tokens.resize(64);
+                query.tokens.push_back(12345);  // diverges immediately after the pin, before latest/live
+                ConversationStoreRead restored;
+                std::string why;
+                check(store.demand(query, why) && store.wait_ready(request, 1, restored, 5000),
+                      "a divergent request can demand its persisted pin after reopening");
+                check(restored.status == ConversationStoreReadStatus::ready &&
+                          restored.tokens == 64 && !restored.live && restored.stages == stages,
+                      "disk lookup selects the exact pinned cut, not the root or latest cut");
+                check(restored.image && images_equal(*restored.image, *expected, why),
+                      "both layouts preserve every stage's bytes and root/pin/latest metadata across restart");
+                restored.image.reset();
+                store.release_read(request++, 1);
+            }
+            store.close();
+        }
     }
 }
 

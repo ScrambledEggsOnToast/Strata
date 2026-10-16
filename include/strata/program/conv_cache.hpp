@@ -77,12 +77,8 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, con
     return v;
 }
 
-/// pin=N (the serve loop's `pin_checkpoint`): make the checkpoint of exactly `length` tokens the chain's single
-/// explicit pin - one pinned prefix at a time, so a request that names a new prefix retargets the old one.  The
-/// chain is the working history's checkpoints in order; each carries its tokens in `ids` and its mark in `pinned`.
-/// The target is found before any flag is written: a length the working history no longer holds resolves nothing
-/// and leaves every pin as it was (false).  Only a target that is there retargets, so a request naming a lost
-/// prefix does not strand the pin the session still serves its suffixes from.
+// Retarget the working history's single explicit pin to an existing exact-length checkpoint.
+// Return false without changing any flags when that checkpoint is absent.
 template <class Checkpoints>
 inline bool pin_checkpoint(Checkpoints& checks, int64_t length) {
     size_t target = checks.size();
