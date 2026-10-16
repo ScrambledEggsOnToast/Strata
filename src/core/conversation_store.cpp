@@ -681,6 +681,7 @@ struct ConversationStore::Impl {
         ConversationStoreQuery query;
         ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
         bool demand = false;
+        bool refresh_on_completion = false; // one demand-time catalog recheck after an active prefetch unwinds
         bool active = false;              // a reader thread is materializing it right now
         std::atomic<bool> cancelled{false};
         bool speculation_revoked = false; // internal eviction is retryable demand, unlike caller cancellation
@@ -880,6 +881,7 @@ struct ConversationStore::Impl {
 
     // Read pipeline.  Settlement is idempotent and every path funnels through it.
     bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why);
+    bool refresh_read_locked(const std::shared_ptr<ReadJob>& job);
     void settle_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail);
     void retire_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status,
                            const std::string& detail);
@@ -2456,6 +2458,10 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
         case ConversationStoreReadStatus::refused_limits: counters.refused_limits++; break;
         default: break;
     }
+    if (job->refresh_on_completion) {
+        job->refresh_on_completion = false;
+        if (refresh_read_locked(job)) return;
+    }
     if (status == ConversationStoreReadStatus::ready && job->image) {
         // The reservation is refunded and the image's own bytes are charged as its lease; the read's preparation view
         // ends here too, because from now on those bytes are the image the caller receives.
@@ -2556,8 +2562,58 @@ void ConversationStore::Impl::revoke_speculation_locked(bool because_of_demand) 
     cv_work.notify_all();
 }
 
+// Reuse the descriptor and its original authorized query/deadline. An active reader reaches this only after its
+// allocation frame has unwound, so replacing its image never overlaps a second materialization or refunds live bytes.
+bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job) {
+    if (job->active || job->cancelled || job->released || job->handed || job->epoch_at_admission != epoch) return false;
+    std::vector<ConversationStoreMatch> found;
+    collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images, found);
+    if (found.empty() || uint64_t(found.front().tokens) <= job->tokens) return false;
+    const ConversationStoreMatch& best = found.front();
+    // A ready shorter cut is still useful if the longer image cannot fit. Check the replacement's own peak and
+    // preparation before discarding anything; its decode replaces this descriptor's old decode, not its query.
+    const uint64_t decode_workspace =
+        conversation_store_detail::manifest_read_workspace_bound(manifest_read_cap(best.manifest_bytes, limits));
+    const uint64_t prepared = preparation_locked();
+    if (sat_add(prepared - std::min(prepared, job->prepared_bytes), decode_workspace) > options.metadata_bytes)
+        return false;
+    const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
+                          job->prep_bytes + kReadSlabBytes + kReadFixedOverhead;
+    if ((ram_budget != 0 && peak > ram_budget) || (ram_budget == 0 && job->image)) return false;
+    for (auto it = queue.begin(); it != queue.end(); ++it)
+        if (*it == job) {
+            queue.erase(it);
+            break;
+        }
+    for (auto it = ready.begin(); it != ready.end(); ++it)
+        if (*it == job) {
+            ready.erase(it);
+            break;
+        }
+    job->image.reset();
+    release_reservation_locked(job);
+    release_lease_locked(job);
+    release_slot_locked(job);
+    release_head_lease_locked(job);
+    release_job_preparation_locked(job);
+    job->status = ConversationStoreReadStatus::none;
+    job->detail.clear();
+    job->prepared_bytes = decode_workspace;
+    read_prep = sat_add(read_prep, decode_workspace);
+    job->head_id = best.head_id;
+    job->tokens = uint64_t(best.tokens);
+    job->live = best.live;
+    job->stages = best.stages;
+    job->payload_bytes = best.payload_bytes;
+    job->peak_bytes = peak;
+    queue.push_front(job);
+    counters.matches++;
+    cv_work.notify_all();
+    return true;
+}
+
 bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why) {
-    // Dedupe by (request_id, generation): the demand for the same request upgrades the prefetch in place.
+    // Dedupe by (request_id, generation); demand revalidates speculation without replacing its request ownership.
     for (auto it = jobs.begin(); it != jobs.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;
         if (job->released) continue; // an old worker may still own a retired descriptor with this identity
@@ -2582,13 +2638,16 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         }
         if (demand && !job->demand) {
             job->demand = true;
-            if (!job->active)
+            if (job->active) {
+                job->refresh_on_completion = true;
+            } else if (!refresh_read_locked(job)) {
                 for (auto it = queue.begin(); it != queue.end(); ++it)
                     if (*it == job) {
                         queue.erase(it);
                         queue.push_front(job);
                         break;
                     }
+            }
             revoke_speculation_locked();
         }
         return true;
@@ -3031,8 +3090,8 @@ void ConversationStore::Impl::reader_body() {
             cv_work.notify_all();
             continue;
         }
-        if (chosen->status == ConversationStoreReadStatus::none) {
-            // The body returned without a verdict because the request was cancelled or the store is closing.
+        if (chosen->active) {
+            // No verdict settled this frame. A demand refresh may instead have settled and requeued it as `none`.
             settle_job_locked(chosen,
                               chosen->cancelled.load() ? ConversationStoreReadStatus::cancelled
                                                        : ConversationStoreReadStatus::failed,

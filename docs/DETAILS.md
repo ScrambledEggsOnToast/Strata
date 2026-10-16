@@ -1631,6 +1631,9 @@ Revoked or budget-refused speculation is re-admitted from the complete query whe
 waiting on a retired prefetch. Advisory withdrawal cannot cancel an adopted demand or release its image lease.
 Explicit read cancellation remains terminal until the demand owner acknowledges it; publication cancellation is a
 separate operation. An active retired reader keeps its descriptor, query and allocation charges until it settles.
+Demand also rechecks the current catalog for a cut longer than the prefetched one, using the original authorized
+query and deadline. It reuses the descriptor, waits for an active reader's allocation frame to end, then admits at
+most one replacement read; an unchanged cut or a replacement that cannot fit keeps useful ready work and its lease.
 
 The frontend may prepare the queued frontier early over a **private inherited control socket** (one
 `SOCK_SEQPACKET` endpoint passed as `STRATA_CONVERSATION_OFFER_FD` - never a listening service, never a public
