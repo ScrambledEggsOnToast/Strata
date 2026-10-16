@@ -42,6 +42,88 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t
     }
     return __real_cudaMemcpyAsync(dst, src, size, kind, stream);
 }
+namespace {
+// Real ResidentSlots and real transfers, but no token arithmetic. Keep the
+// terminal injected-copy failure in this opt-in vehicle, outside the normal
+// lifecycle fixture, so its poisoned working owner is never reused.
+int prefill_split_owner_checks(strata::program::ResidentSlots& owner, strata::core::SessionState& main) {
+    using namespace strata;
+    std::string error;
+    int checks = 0;
+    auto require = [&](bool ok, const char* message) {
+        ++checks;
+        if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
+    };
+    try {
+        require(main.max_cells >= 4096 && owner.slots().size() >= 2 && owner.available(0),
+                "split-owner fixture needs admitted context >=4096 and initialized resident slots");
+        const std::vector<int64_t> prompt(2049, 11);
+        const std::vector<int32_t> prefix(1024, 11);
+        program::ResidentRequest request;
+        request.max_new = 2;
+        request.scope.value[0] = 71;
+        request.sampling.seed = 17;
+        program::ResidentAdmission half;
+        half.prefill_split_until = 2048;
+        require(owner.begin(0, prompt, request, error), "begin actual split-prefill request");
+        const auto first_id = owner.working().request;
+        require(owner.park(0, prefix, half, true, error), "park actual midpoint with a pending endpoint");
+        require(owner.slots()[0].request == first_id && owner.slots()[0].partial &&
+                owner.slots()[0].prefill_split_until == 2048,
+                "production parking publishes the nonzero endpoint on its actual resident owner");
+        require(owner.begin(0, prompt, request, error) && owner.working().request == first_id &&
+                owner.working().resume_slot == 0 && owner.resume(0, nullptr, error),
+                "restore the exact continuing request through ResidentSlots");
+        require(owner.slots()[0].prefill_split_until == 0 && owner.working().prefill_split_until == 2048 &&
+                owner.take_prefill_split_until() == 2048 && owner.take_prefill_split_until() == 0,
+                "production restore transfers the original endpoint exactly once");
+        require(owner.park(0, prefix, half, true, error) && owner.slots()[0].prefill_split_until == 2048,
+                "repark the continuing owner with a real pending half");
+        owner.cancel(0);
+        require(!owner.slots()[0].partial && owner.slots()[0].prefill_split_until == 0,
+                "production cancellation clears a previously nonzero endpoint");
+        require(owner.begin(0, prompt, request, error) && owner.working().request != first_id &&
+                owner.working().resume_slot == -1 && owner.working().prefill_split_until == 0,
+                "a cancelled continuation cannot transfer its endpoint to a successor");
+        const auto cancelled_successor = owner.working().request;
+        require(owner.park(0, prefix, half, true, error) && owner.slots()[0].prefill_split_until == 2048,
+                "publish a nonzero endpoint before actual identity replacement");
+        auto replacement = request;
+        replacement.sampling.seed = 23;
+        require(owner.begin(0, prompt, replacement, error) &&
+                owner.working().request != cancelled_successor && owner.working().resume_slot == -1,
+                "changed request policy creates the replacement identity");
+        const auto replacement_id = owner.working().request;
+        const program::ResidentAdmission unsplit;
+        require(owner.park(0, prefix, unsplit, true, error) &&
+                owner.slots()[0].request == replacement_id && owner.slots()[0].prefill_split_until == 0,
+                "production replacement clears the prior owner's pending endpoint");
+        require(owner.begin(0, prompt, replacement, error) && owner.resume(0, nullptr, error) &&
+                owner.take_prefill_split_until() == 0 &&
+                owner.park(0, prefix, half, true, error) && owner.slots()[0].prefill_split_until == 2048,
+                "prepare a real nonzero parked endpoint for partial-restore failure");
+        require(owner.begin(0, prompt, replacement, error) && owner.working().request == replacement_id &&
+                owner.working().resume_slot == 0 && main.ple_hist,
+                "select the exact owner and actual PLE destination for restore refusal");
+        transfer_failed = false;
+        fail_destination = main.ple_hist;
+        require(!owner.resume(0, nullptr, error) && transfer_failed,
+                "actual partial restore reaches the injected copy refusal");
+        require(owner.slots()[0].failed && !owner.available(0) &&
+                owner.slots()[0].prefill_split_until == 0 && owner.working().prefill_split_until == 0 &&
+                owner.take_prefill_split_until() == 0,
+                "production restore failure clears both pending-endpoint owners");
+        require(owner.release_resources(error), "release actual resident resources after the refusal");
+        std::printf("PREFILL_SPLIT_OWNER_CHECKS checks=%d prefix=1024 endpoint=2048 actual_owner=1 "
+                    "copy_refusal=1 failures=0\n", checks);
+        return 0;
+    } catch (const std::exception& exception) {
+        fail_destination = nullptr;
+        std::fprintf(stderr, "PREFILL_SPLIT_OWNER_CHECKS checks=%d failures=1 error=%s\n", checks, exception.what());
+        return 1;
+    }
+}
+} // namespace
 
 int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
                           const strata::core::ModelGeometry& geometry, strata::core::SessionState& main,
@@ -56,6 +138,7 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
     };
     try {
+        if (std::getenv("STRATA_TEST_PREFILL_SPLIT_OWNER")) return prefill_split_owner_checks(owner, main);
         if (std::getenv("STRATA_TEST_MIXED_RESIDENCY")) {
             // Exercise the production Verifier, not a single-sequence parity
             // kernel or a hand-written imitation of its row compaction.
@@ -489,6 +572,8 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
     };
     try {
         require(stages.size() == 3 && owner.slots().size() == 4, "retain three stages and four seats");
+        if (std::getenv("STRATA_TEST_PREFILL_SPLIT_OWNER"))
+            return prefill_split_owner_checks(owner, *stages[0].main);
         if (std::getenv("STRATA_TEST_MTP_RING_HANDOFF")) {
             const auto* slot = draft.slot_state(0);
             require(draft.kv_state().kv_mode == 0 && slot && slot->kv_mode == 2,

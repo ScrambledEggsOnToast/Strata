@@ -204,20 +204,21 @@ int main() {
         set_env("STRATA_GR_V3", nullptr);
     }
     {
-        // 7. Only the armed split policy makes the CLI budget part of the
-        // arithmetic: zero disables splitting and must not alias a positive budget.
+        // 7. Only the armed split policy makes budget/share part of the
+        // arithmetic: credit can decide whether a decoder still contends.
         const auto default_identity = identity();
-        const auto split_identity = [](double budget_ms) {
+        const auto split_identity = [](double budget_ms, double background_share = 0.25) {
             std::vector<ArithmeticIdentityValue> resolved;
-            bind_prefill_split_policy(resolved, std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET"), budget_ms);
+            bind_prefill_split_policy(resolved, std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET"),
+                                      budget_ms, background_share);
             return identity(std::move(resolved));
         };
-        check(split_identity(0) == default_identity && split_identity(1000) == default_identity,
-              "an absent split gate leaves budget changes outside the arithmetic identity");
+        check(split_identity(0, 0.25) == default_identity && split_identity(1000, 0.75) == default_identity,
+              "an absent split gate leaves budget/share changes outside the arithmetic identity");
         set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", "0");
         const auto explicit_off = identity();
-        check(split_identity(0) == explicit_off && split_identity(1200) == explicit_off,
-              "the explicit off gate retains its existing identity independently of budget");
+        check(split_identity(0, 0.25) == explicit_off && split_identity(1200, 0.75) == explicit_off,
+              "the explicit off gate retains its existing identity independently of budget/share");
         set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", "1024");
         const auto disabled_budget = split_identity(0);
         const auto budget_1000 = split_identity(1000);
@@ -227,8 +228,14 @@ int main() {
               "different split budgets and budget-disabled state cannot restore each other's recurrent image");
         check(budget_1000 != split_identity(std::nextafter(1000.0, 1200.0)),
               "split budget identity binds exact resolved double bits");
+        check(budget_1000 != split_identity(1000, 0.5),
+              "different armed background shares cannot restore each other's recurrent image");
+        check(budget_1000 != split_identity(1000, std::nextafter(0.25, 0.5)),
+              "split background-share identity binds exact resolved double bits");
+        check(disabled_budget != split_identity(0, 0.5),
+              "an armed but disabled budget still binds the resolved background share");
         set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", nullptr);
-        check(split_identity(1200) == default_identity, "clearing the split gate restores default-off identity bytes");
+        check(split_identity(1200, 0.75) == default_identity, "clearing the split gate restores default-off identity bytes");
     }
     {
         // 8. The path-backed routing override: unset or empty is not an override, anything else must refuse

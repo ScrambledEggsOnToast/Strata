@@ -11032,7 +11032,8 @@ int main(int argc, char** argv) {
                 bind_number("prompt.chunk_auto_max", o.prefill_auto_max);
                 bind_number("prompt.small_chunk", split_small);
                 bind_number("prompt.small_chunk_max", split_small_max);
-                strata::core::bind_prefill_split_policy(arithmetic, prefill_split_setting, o.foreground_budget_ms);
+                strata::core::bind_prefill_split_policy(arithmetic, prefill_split_setting,
+                                                       o.foreground_budget_ms, o.background_share);
                 // The host's own arithmetic dispatch: which kernel an unset control resolves to depends on the CPU's
                 // ISA and on each serving card (the BF16 tensor-core default, the QSA scorer's warp path, the shared
                 // memory STRATA_GR_V3 needs, the AVX-512/AVX-2 expert kernels and the per-type multi-token

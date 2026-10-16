@@ -488,9 +488,10 @@ Scheduling records for both halves include `split_over_budget=1024`; `indivisibl
 means the **actual launch**, including a 1024-token half, exceeded the target.
 Unset or `0` retains the original partition; other values are refused at startup, not used as a new
 partition. No experimental subquantum below 1024 is selected (an unchanged final tail may be shorter).
-While armed, the persistent arithmetic identity also binds the resolved split width and exact foreground
-budget, including budget `0` (disabled). Different split policies cannot restore each other's recurrent
-images; with the split gate off, no new resolved identity fields are added.
+While armed, the persistent arithmetic identity also binds the resolved split width, exact foreground
+budget (including disabled budget `0`) and exact `--background-share`: earned credit can change whether
+a decoder still contends at the next interval. Different split policies cannot restore each other's
+recurrent images; with the split gate off, no new resolved identity fields are added.
 This execution partition can change recurrent rounding and needs its own arithmetic/runtime qualification;
 the CPU scheduling harness is not that qualification or a token-gap guarantee.
 
@@ -499,6 +500,14 @@ on the CPU by compiling the actual prompt-read loop with synthetic GPU work and 
 It checks prefill/decode/prefill ordering, opt-in midpoint controls and cancellation, nonzero-frontier
 continuation, exact prompt tiling, unchanged estimates and gate-off behavior, not device arithmetic or
 pipeline-drain correctness.
+
+`STRATA_TEST_PREFILL_SPLIT_OWNER=1` selects a dedicated block in the existing `strata-resident-test`
+real-owner vehicle (single-device or three-stage host-native startup, admitted context at least 4096).
+It parks an actual 1024-token resident prefix with pending endpoint 2048, restores the exact continuing
+owner, and checks endpoint clearing on cancellation, replacement and one injected real-copy restore
+refusal. It performs no token arithmetic; unlike the CPU scheduler's parking sink, these checks traverse
+production `ResidentSlots::park` and `ResidentSlots::resume`. Removing the production parking assignment
+must fail the nonzero-endpoint assertion. This fixture is not prefill/decode performance evidence.
 
 Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
 An indivisible decode-round overrun remains debt for later quanta. Background control entries get a
