@@ -462,6 +462,12 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
     };
     try {
         require(stages.size() == 3 && owner.slots().size() == 4, "retain three stages and four seats");
+        if (std::getenv("STRATA_TEST_MTP_RING_HANDOFF")) {
+            const auto* slot = draft.slot_state(0);
+            require(draft.kv_state().kv_mode == 0 && slot && slot->kv_mode == 2,
+                    "MTP ring handoff fixture needs a resident working owner and ring-backed slot");
+            std::puts("MTP_RING_HANDOFF working=resident slot=ring");
+        }
         const std::vector<int32_t> prefix{11, 22};
         const std::vector<int64_t> prompt{11, 22, 33, 44};
         const std::vector<core::ConversationImageKey> images;
