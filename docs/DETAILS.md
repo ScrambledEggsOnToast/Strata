@@ -1661,6 +1661,18 @@ An accepted speculative descriptor that settles `refused_budget` can re-arm when
 enough before the original deadline. It keeps the same bounded descriptor and does not poll while idle;
 initially refused offers are not newly admitted by this retry. Withdrawal and expiry still end speculation.
 
+A **fresh demand** that is refused because its restore peak exceeds the
+published allowance may make one owner-side recovery attempt. The owner
+suspends new read admission, releases only optional parked/reuse RAM while
+protecting the request's selected RAM fallback, republishes the exact resulting
+allowance and retries only after positive bytes were released. Active readers,
+accepted or adopted reads, leases and pending publications retain their
+ownership and never authorize this reclamation. The original cancellation and
+deadline remain authoritative, and a refused retry performs no second reclaim.
+If manifest decoding discovers a larger restore peak, the deferred descriptor
+retains that peak: a smaller allowance increase cannot repeat the same manifest
+read, while sufficient capacity may re-arm the descriptor before its deadline.
+
 The frontend may prepare the queued frontier early over a **private inherited control socket** (one
 `SOCK_SEQPACKET` endpoint passed as `STRATA_CONVERSATION_OFFER_FD` - never a listening service, never a public
 endpoint). Its reader thread is CPU-only and cannot touch GPU state; it hands the validated prepared request to the
