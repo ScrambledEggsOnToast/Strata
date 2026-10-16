@@ -480,19 +480,25 @@ exceeds that budget, a currently served decoder, one selected contended chunk ra
 and at least 2048 tokens remaining. That chunk runs as two 1024-token launches through the same loop:
 controls, cancellation, store handoff, decode-first service and carried debt are revisited at the midpoint.
 Together the halves reach the selected chunk's original endpoint; the original final tail is unchanged.
+Midpoint parking keeps that endpoint with the request's resident slot. Only its exact full-image
+continuation restores the pending second half; replacement, cancellation, failure and completion clear it.
 Neither `Prefill::chunk()`, workspace, loans nor ring sizing changes. Each half earns background credit
 from its actual elapsed time without training the 2048-token cost estimate downward.
 Scheduling records for both halves include `split_over_budget=1024`; `indivisible_over_budget=1` still
 means the **actual launch**, including a 1024-token half, exceeded the target.
 Unset or `0` retains the original partition; other values are refused at startup, not used as a new
 partition. No experimental subquantum below 1024 is selected (an unchanged final tail may be shorter).
+While armed, the persistent arithmetic identity also binds the resolved split width and exact foreground
+budget, including budget `0` (disabled). Different split policies cannot restore each other's recurrent
+images; with the split gate off, no new resolved identity fields are added.
 This execution partition can change recurrent rounding and needs its own arithmetic/runtime qualification;
 the CPU scheduling harness is not that qualification or a token-gap guarantee.
 
 `ctest --test-dir <build> -R '^prefill_interleave_test$' --output-on-failure` checks this composed decision
 on the CPU by compiling the actual prompt-read loop with synthetic GPU work and a deterministic clock.
-It checks prefill/decode/prefill ordering, opt-in midpoint controls and cancellation, exact prompt tiling,
-unchanged estimates and gate-off behavior, not device arithmetic or pipeline-drain correctness.
+It checks prefill/decode/prefill ordering, opt-in midpoint controls and cancellation, nonzero-frontier
+continuation, exact prompt tiling, unchanged estimates and gate-off behavior, not device arithmetic or
+pipeline-drain correctness.
 
 Foreground decode credit comes from measured prefill time and is capped at one foreground budget.
 An indivisible decode-round overrun remains debt for later quanta. Background control entries get a

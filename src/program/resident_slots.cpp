@@ -98,6 +98,7 @@ bool ResidentSlots::begin(int destination, const std::vector<int64_t>& prompt,
         if (!next.sampling.seed) next.sampling.seed = (uint64_t) Clock::now().time_since_epoch().count();
     }
     working_failed_ = true;
+    working_.prefill_split_until = 0;
     if (!stages_[0].verifier->set_request_id(next.request, error) ||
         !draft_.bind_request(8, next.request, error) || !prompt_.bind_request(next.request, error)) {
         return false;
@@ -119,6 +120,7 @@ bool ResidentSlots::begin_score(std::string& error) {
     }
     if (!idle(error)) return false;
     working_failed_ = true;
+    working_.prefill_split_until = 0;
     ResidentWorking next;
     next.request = ++next_request_;
     next.sampling.greedy = true;
@@ -169,6 +171,7 @@ void ResidentSlots::cancel(int slot) {
     if (slot < 0 || (size_t) slot >= slots_.size()) return;
     auto& state = slots_[(size_t) slot];
     state.stop = true;
+    state.prefill_split_until = 0;
     if (state.partial) {
         residency("cancel", slot);
         state.partial = false;
@@ -176,14 +179,20 @@ void ResidentSlots::cancel(int slot) {
 }
 
 void ResidentSlots::taint(int slot) {
-    if (slot >= 0 && (size_t) slot < slots_.size()) slots_[(size_t) slot].tainted = true;
+    if (slot >= 0 && (size_t) slot < slots_.size()) {
+        slots_[(size_t) slot].tainted = true;
+        slots_[(size_t) slot].prefill_split_until = 0;
+    }
 }
 
 std::pair<size_t, size_t> ResidentSlots::invalidate_after_nonfinite() {
     size_t running = 0, idle = 0;
-    for (auto& sl : slots_)
+    working_.prefill_split_until = 0;
+    for (auto& sl : slots_) {
+        sl.prefill_split_until = 0;
         if (sl.active) { sl.tainted = true; ++running; }
         else if (sl.cached) { sl.cached = false; sl.partial = false; sl.checks.clear(); ++idle; }
+    }
     return {running, idle};
 }
 
@@ -293,6 +302,7 @@ void ResidentSlots::retire(int slot) {
     if (state.active || state.failed) residency("failure", slot);
     residency("release", slot);
     state.request = 0;
+    state.prefill_split_until = 0;
     dispatch_.slot_requests[slot] = 0;
 }
 
@@ -300,6 +310,8 @@ bool ResidentSlots::fail(int slot) {
     auto& state = slots_[(size_t) slot];
     state.failed = true;
     state.active = state.cached = state.partial = false;
+    state.prefill_split_until = 0;
+    if (state.request == working_.request) working_.prefill_split_until = 0;
     return false;
 }
 
@@ -322,6 +334,12 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
         (parked && (!cache_ || input_.images || !working_prompt_ || (destination_ >= 0 && destination_ != slot) ||
          prefix.size() >= working_prompt_->size() || !std::equal(prefix.begin(), prefix.end(), working_prompt_->begin())))) {
         error = "resident admission: invalid or unavailable slot/request"; return false;
+    }
+    if (request.prefill_split_until != 0 &&
+        (!parked || request.prefill_split_until <= (int64_t) prefix.size() ||
+         request.prefill_split_until - (int64_t) prefix.size() != 1024 ||
+         request.prefill_split_until > (int64_t) working_prompt_->size())) {
+        error = "resident admission: invalid pending prefill interval"; return false;
     }
     const size_t checkpoint_limit = request.checkpoint_limit < 0 ? prefix.size() :
         std::min(prefix.size(), size_t(request.checkpoint_limit));
@@ -373,6 +391,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     if (!continuing) retire(slot);
     state.active = state.cached = state.partial = false;
     state.failed = true; // every exception after this point leaves an unavailable target
+    state.prefill_split_until = 0;
     touched_ = true;
     state.checks.swap(selected);
     selected.clear();
@@ -406,6 +425,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.img = input_.images;
     state.stop = false;
     state.partial_from0 = parked && from_start;
+    state.prefill_split_until = parked ? request.prefill_split_until : 0;
     dispatch_.slot_requests[slot] = working_.request;
     if (timing) report_admission_timing(slot, "slot_metadata", -1, (int64_t) prefix.size(), phase);
     if (timing) phase = Clock::now();
@@ -553,6 +573,7 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
     if (!resume_work(slot, checkpoint, work, error) || !idle(error)) return false;
     const auto cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
     working_failed_ = true; // any partial write or exception makes the working context unusable
+    working_.prefill_split_until = 0;
     try {
         if (!copy_from(slot, checkpoint, error) ||
             (draft_.kv_state().max_cells > 0 && !draft_.restore_slot(slot, cells, error)) ||
@@ -565,7 +586,7 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
     }
     working_failed_ = false;
     residency("resume", slot);
-    if (working_.resume_slot == slot) slots_[(size_t) slot].partial = false;
+    slots_[(size_t) slot].restored(working_, slot, checkpoint == nullptr);
     return true;
 }
 

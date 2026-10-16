@@ -31,6 +31,7 @@ struct ResidentAdmission {
     const std::vector<ConvCheckpoint>* checkpoints = nullptr;
     const float* residual = nullptr;
     int64_t checkpoint_limit = -1;
+    int64_t prefill_split_until = 0;
 };
 }
 // The narrow parking sink records the production lambda's chosen frontier;
@@ -38,14 +39,18 @@ struct ResidentAdmission {
 struct NoControlRequests {
     bool allow_park = false;
     int64_t parked_at = -1;
+    int64_t prefill_split_until = 0;
+    int64_t take_prefill_split_until() { return std::exchange(prefill_split_until, 0); }
     void cancel(int) { throw std::logic_error("unexpected BSTOP"); }
     bool available(int slot) {
         if (!allow_park) throw std::logic_error("unexpected BYIELD");
         return slot == 0;
     }
-    bool park(int, const std::vector<int32_t>& prefix, const strata::program::ResidentAdmission&, bool, std::string&) {
+    bool park(int, const std::vector<int32_t>& prefix, const strata::program::ResidentAdmission& request,
+              bool, std::string&) {
         if (!allow_park || parked_at >= 0) throw std::logic_error("unexpected park");
         parked_at = (int64_t) prefix.size();
+        prefill_split_until = request.prefill_split_until;
         return true;
     }
 };
@@ -55,6 +60,7 @@ struct Result {
     int64_t interleave_boundaries = 0;
     std::vector<int64_t> store_positions;
     int64_t parked_at = -1;
+    int64_t parked_split_until = 0;
     double estimate_ms = 0;
     bool okay = false, fatal = false;
     int drains = 0;
@@ -109,7 +115,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
                           const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
                           double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1,
                           bool empty_decode_credit = false, bool cancel_first_launch = false,
-                          int64_t prior_chunk_tokens = 2048) {
+                          int64_t prior_chunk_tokens = 2048, int64_t begin_at = 0, int64_t pending_split_until = 0) {
     Clock::ms = 0;
     Result result;
     const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
@@ -131,6 +137,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const auto batch_on = [&] { return active; };
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
     sp.pipelined = piped;
+    sp.position = begin_at;
     if (cancel_first_launch) sp.cancel_after_run = &stop_req;
     const bool retained_prefill = retained_error != nullptr, retained_layer_yields = true;
     int retained_blocked_stage = -1;
@@ -170,6 +177,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     int yielded_slot = -1;
     NoControlRequests resident;
     resident.allow_park = expects_yield;
+    resident.prefill_split_until = pending_split_until;
     if (inject_yield) sp.incoming = &in_lines;
     const auto resident_control = [&](const std::string& command) {
         if (command.rfind("BSTOP ", 0) == 0) resident.cancel(std::atoi(command.c_str() + 6));
@@ -178,7 +186,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const int admit_slot = -1;
     const std::vector<int> req_imgs;
     const std::vector<ConvCheckpoint> checks;
-    const int64_t read_from = 0;
+    const int64_t read_from = begin_at;
     const bool resumed_from0 = false, trace = false;
     struct Slot { bool failed = false; };
     const std::vector<Slot> bs(4);
@@ -190,7 +198,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
 #include "prefill_read_part.inc"
 
     std::string& e = err;
-    result.okay = read_part(0, n, e);
+    result.okay = read_part(begin_at, n, e);
     result.fatal = batch_fatal;
     result.error = e;
     if (!retained_prefill && !expects_yield && !cancel_first_launch &&
@@ -199,6 +207,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.interleave_boundaries = il_parts;
     result.estimate_ms = time_budget.chunk_ms();
     result.parked_at = resident.parked_at;
+    result.parked_split_until = resident.prefill_split_until;
     return result;
 }
 
@@ -311,6 +320,25 @@ int main() {
     CHECK(!midpoint_yield.okay && !midpoint_yield.fatal && midpoint_yield.error == "yield");
     CHECK(midpoint_yield.parked_at == 1024 && midpoint_yield.reads.size() == 1);
     CHECK((midpoint_yield.store_positions == std::vector<int64_t>{1024}));
+    CHECK(midpoint_yield.parked_split_until == 2048);
+    // A parked midpoint is a nonzero-frontier continuation, not a new chunk
+    // origin. Its first 1024 must finish the original [0,2048), even if the
+    // estimate is cold by the time this request resumes.
+    const std::vector<std::pair<int64_t, int64_t>> resumed_cold{
+        {0, 1024}, {1024, 1024}, {2048, 2048}, {4096, 1}};
+    for (bool piped : {false, true}) {
+        const auto first = read_prompt(1000, piped, piped, true, 4, nullptr, true, 4097, 1200, true);
+        CHECK(first.parked_at == 1024 && first.parked_split_until == 2048);
+        for (double estimate : {0.0, 1200.0}) {
+            const auto next = read_prompt(1000, piped, piped, true, 4, nullptr, true, 4097, estimate,
+                                          false, -1, false, false, 2048, first.parked_at, first.parked_split_until);
+            auto joined = first.reads;
+            joined.insert(joined.end(), next.reads.begin(), next.reads.end());
+            CHECK(next.okay && joined == (estimate == 0 ? resumed_cold : split_tail));
+            CHECK(next.reads.front().first == 1024 && next.reads.front().second == 1024);
+            CHECK(next.parked_split_until == 0); // the continuation is consumed, not retained for a later request
+        }
+    }
     const auto midpoint_cancel = read_prompt(1000, true, true, true, 4, nullptr, true, 4097, 1200,
                                             false, -1, false, true);
     CHECK(!midpoint_cancel.okay && !midpoint_cancel.fatal && midpoint_cancel.error == "cancelled");

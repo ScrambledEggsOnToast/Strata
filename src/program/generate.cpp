@@ -11032,6 +11032,7 @@ int main(int argc, char** argv) {
                 bind_number("prompt.chunk_auto_max", o.prefill_auto_max);
                 bind_number("prompt.small_chunk", split_small);
                 bind_number("prompt.small_chunk_max", split_small_max);
+                strata::core::bind_prefill_split_policy(arithmetic, prefill_split_setting, o.foreground_budget_ms);
                 // The host's own arithmetic dispatch: which kernel an unset control resolves to depends on the CPU's
                 // ISA and on each serving card (the BF16 tensor-core default, the QSA scorer's warp path, the shared
                 // memory STRATA_GR_V3 needs, the AVX-512/AVX-2 expert kernels and the per-type multi-token
@@ -16570,7 +16571,11 @@ int main(int argc, char** argv) {
                 if (!time_budget.enabled() && piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const char* split_setting = std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET");
                 const bool split_over_budget = split_setting && std::strcmp(split_setting, "1024") == 0;
-                int64_t split_until = a0;
+                int64_t split_until = resident.take_prefill_split_until();
+                if (split_until != 0 &&
+                    (split_until <= a0 || split_until - a0 != 1024 || split_until > b0)) {
+                    e = "prefill: pending split does not match the restored frontier"; return false;
+                }
                 bool yield_requested = false;
                 auto prompt_controls = [&](int64_t q) -> bool {
                     if (stop_req.load()) { e = "cancelled"; return false; }
@@ -16599,7 +16604,8 @@ int main(int argc, char** argv) {
                         std::string ye;
                         const auto ty = Clock::now();
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                        const strata::program::ResidentAdmission request{0, &checks, nullptr, q};
+                        const strata::program::ResidentAdmission request{
+                            0, &checks, nullptr, q, q < split_until ? split_until : 0};
                         if (can && !park_replaced(ys)) { batch_fatal = true; e = err; return false; }
                         if (can && resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye)) {
                             yielded_at = q;
@@ -16671,6 +16677,7 @@ int main(int argc, char** argv) {
                     // above so no learned estimate moves (see `store_seam`).
                     store_seam();
                     q = r;
+                    if (q == split_until) split_until = 0;
                     if (q >= b0) continue;
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     if (!prompt_controls(q)) return false;

@@ -39,6 +39,7 @@ struct ResidentWorking {
     uint64_t request = 0;
     kernels::SamplerParams sampling;
     int resume_slot = -1;
+    int64_t prefill_split_until = 0; // exact full-slot continuation; consumed by the prompt loop
 };
 
 // The post-prefill request setup installs the resident owner's already-resolved policy.
@@ -67,6 +68,7 @@ struct ResidentSlot {
     bool cached = false, cvec = true, img = false;
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
+    int64_t prefill_split_until = 0; // pending second 1024 of the original selected 2048-token interval
     bool failed = false;
     // #879: a window met non-finite logits while this slot was running: its state may have started from the
     // poisoned state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends.
@@ -75,7 +77,16 @@ struct ResidentSlot {
     // Called only after the operation owner certifies this row's drain.
     void complete(bool cache_enabled) {
         active = false;
+        prefill_split_until = 0;
         cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed && !tainted;
+    }
+    // Metadata handoff after a successful drained restore. Foreign identities
+    // cannot claim it; a rewind checkpoint discards the abandoned interval.
+    void restored(ResidentWorking& working, int slot, bool full_prefix) {
+        if (working.resume_slot != slot || working.request != request) return;
+        const int64_t pending = std::exchange(prefill_split_until, 0);
+        working.prefill_split_until = full_prefix ? pending : 0;
+        partial = false;
     }
     bool reusable(const core::ConversationScope& scope, bool steering) const {
         return !active && !failed && cached && request && cvec == steering && input.scope.matches(scope);
@@ -107,6 +118,7 @@ struct ResidentAdmission {
     std::vector<core::ConversationCheckpoint>* checkpoints = nullptr;
     const float* residual = nullptr;
     int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
+    int64_t prefill_split_until = 0; // park only; zero once the selected interval has finished
 };
 
 // One host submitter, the same as Verifier. Scheduling and protocol emission
@@ -131,6 +143,7 @@ public:
     // Fresh transient scoring identity, no generated-token budget, draft or resident admission.
     bool begin_score(std::string& error);
     const ResidentWorking& working() const { return working_; }
+    int64_t take_prefill_split_until() { return std::exchange(working_.prefill_split_until, 0); }
     bool active() const;
     bool available(int slot) const;
     void cancel(int slot);

@@ -73,6 +73,16 @@ inline ArithmeticIdentityValue arithmetic_double(std::string name, double value)
     std::memcpy(&bits, &value, sizeof bits);
     return arithmetic_number(std::move(name), (int64_t) bits);
 }
+
+// With the execution split armed, the foreground target selects recurrent
+// arithmetic boundaries. Bind its exact resolved value, including disabled=0;
+// the default-off path adds no fields and keeps its existing identity bytes.
+inline void bind_prefill_split_policy(std::vector<ArithmeticIdentityValue>& resolved,
+                                     const char* setting, double foreground_budget_ms) {
+    if (!setting || std::strcmp(setting, "1024") != 0) return;
+    resolved.push_back(arithmetic_number("prompt.split_over_budget.tokens", 1024));
+    resolved.push_back(arithmetic_double("prompt.split_over_budget.foreground_budget_ms", foreground_budget_ms));
+}
 inline ArithmeticIdentityValue arithmetic_digest(std::string name, const std::array<uint8_t, 32>& value) {
     ArithmeticIdentityValue v;
     v.name = std::move(name);

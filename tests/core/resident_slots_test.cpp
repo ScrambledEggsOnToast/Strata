@@ -41,6 +41,7 @@ int main() {
         completed.sampling.seed = 99;
         completed.produced = 2;
         completed.p = 3;
+        completed.prefill_split_until = 2048;
         completed.complete(true); // same policy called after serial and pipelined row drains
         const core::ConversationScope other{{2}};
         check(completed.reusable(completed.input.scope, true),
@@ -51,6 +52,7 @@ int main() {
         check(!completed.active && completed.request == 17 && completed.produced == 2 &&
               completed.p == 3 && completed.sampling.seed == 99 && completed.ids.size() == 3,
               "retention changes neither committed output, identity, RNG nor position");
+        check(completed.prefill_split_until == 0, "completion clears any pending prefill partition endpoint");
         completed.input.checkpoint = false;
         completed.complete(true);
         check(!completed.cached, "one-shot completed turns cannot become reusable");
@@ -65,6 +67,33 @@ int main() {
         completed.failed = false;
         completed.complete(false);
         check(!completed.cached, "prompt-cache zero still disables retention");
+    }
+    {
+        program::ResidentSlot parked;
+        parked.request = 17;
+        parked.partial = true;
+        parked.prefill_split_until = 2048;
+        program::ResidentWorking other;
+        other.request = 18;
+        other.resume_slot = 0;
+        parked.restored(other, 0, true);
+        check(other.prefill_split_until == 0 && parked.prefill_split_until == 2048 && parked.partial,
+              "prefix reuse by a new identity cannot claim or erase the parked request's pending half");
+        program::ResidentWorking continued;
+        continued.request = 17;
+        continued.resume_slot = 1;
+        parked.restored(continued, 0, true);
+        check(continued.prefill_split_until == 0 && parked.prefill_split_until == 2048 && parked.partial,
+              "the same identity cannot take a different physical slot's pending half");
+        continued.resume_slot = 0;
+        parked.restored(continued, 0, true);
+        check(continued.prefill_split_until == 2048 && parked.prefill_split_until == 0 && !parked.partial,
+              "full exact continuation transfers the original endpoint once");
+        parked.partial = true;
+        parked.prefill_split_until = 2048;
+        parked.restored(continued, 0, false);
+        check(continued.prefill_split_until == 0 && parked.prefill_split_until == 0 && !parked.partial,
+              "checkpoint rewind discards the old live-frontier interval");
     }
     program::ResidentRequest oversized;
     oversized.max_new = 55; // two prompt cells + 55 output + the unchanged eight-cell margin > 64

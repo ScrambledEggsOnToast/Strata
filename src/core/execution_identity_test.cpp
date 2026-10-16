@@ -98,6 +98,7 @@ int main() {
             "STRATA_PF_HCDOWN", "STRATA_HCD_EXACT", "STRATA_EMB_REUSE_ACCOUNT", "STRATA_PREFILL_BF16X2",
             "STRATA_HC_UPMIX", "STRATA_PREFILL_CPU_SHARE", "STRATA_PREFILL_CPU_SHARE_MAX", "STRATA_DENSE_MMQ",
             "STRATA_PREFILL_MMQ", "STRATA_FUSE_CONVAB", "STRATA_NORM_ROPE", "STRATA_INDEXER_PER_TOKEN",
+            "STRATA_PREFILL_SPLIT_OVER_BUDGET",
             // the recurrence
             "STRATA_GDN_HEAD", "STRATA_GDN_PP", "STRATA_GDN_CONVL2", "STRATA_GDN_NOY", "STRATA_GDN_CHUNKED",
             "STRATA_GDN_KEYHEAD", "STRATA_GDN_PIPELINE", "STRATA_GDN_REC_HEADS", "STRATA_GDN_CONV_SERIAL",
@@ -203,7 +204,34 @@ int main() {
         set_env("STRATA_GR_V3", nullptr);
     }
     {
-        // 7. The path-backed routing override: unset or empty is not an override, anything else must refuse
+        // 7. Only the armed split policy makes the CLI budget part of the
+        // arithmetic: zero disables splitting and must not alias a positive budget.
+        const auto default_identity = identity();
+        const auto split_identity = [](double budget_ms) {
+            std::vector<ArithmeticIdentityValue> resolved;
+            bind_prefill_split_policy(resolved, std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET"), budget_ms);
+            return identity(std::move(resolved));
+        };
+        check(split_identity(0) == default_identity && split_identity(1000) == default_identity,
+              "an absent split gate leaves budget changes outside the arithmetic identity");
+        set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", "0");
+        const auto explicit_off = identity();
+        check(split_identity(0) == explicit_off && split_identity(1200) == explicit_off,
+              "the explicit off gate retains its existing identity independently of budget");
+        set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", "1024");
+        const auto disabled_budget = split_identity(0);
+        const auto budget_1000 = split_identity(1000);
+        const auto budget_1200 = split_identity(1200);
+        check(disabled_budget != identity(), "an armed but disabled budget is explicitly bound");
+        check(disabled_budget != budget_1000 && disabled_budget != budget_1200 && budget_1000 != budget_1200,
+              "different split budgets and budget-disabled state cannot restore each other's recurrent image");
+        check(budget_1000 != split_identity(std::nextafter(1000.0, 1200.0)),
+              "split budget identity binds exact resolved double bits");
+        set_env("STRATA_PREFILL_SPLIT_OVER_BUDGET", nullptr);
+        check(split_identity(1200) == default_identity, "clearing the split gate restores default-off identity bytes");
+    }
+    {
+        // 8. The path-backed routing override: unset or empty is not an override, anything else must refuse
         //    persistence (the contents decide the arithmetic and this module never reads them).
         check(arithmetic_path_override_refusal() == nullptr, "no override is not a refusal");
         set_env("STRATA_DBG_ROUTE_OVERRIDE", "");
