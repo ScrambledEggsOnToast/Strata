@@ -46,7 +46,7 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
     if (e != cudaSuccess) return e;
     e = cudaStreamSynchronize(s);
-    core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
+    if (e == cudaSuccess) core::progress_beat();   // only completed transfers are progress
     return e;
 }
 

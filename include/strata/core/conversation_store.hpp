@@ -282,7 +282,7 @@ enum class ConversationStoreReadStatus : uint8_t {
     corrupt,      // an eligible record failed validation: treat as a miss, never restore it
     cancelled,    // the caller cancelled it, or a newer one replaced it
     stale,        // the execution-domain epoch advanced before it completed
-    refused_budget,   // the read allowance did not admit it (prefetch only)
+    refused_budget,   // the published read allowance did not admit the image
     refused_quota,    // the store is full: skip storage, keep serving
     refused_limits,   // the record exceeds ConversationStoreLimits: refused, never discarded (it may belong to another profile)
     failed,       // I/O or allocation failure
@@ -290,6 +290,13 @@ enum class ConversationStoreReadStatus : uint8_t {
 };
 
 const char* conversation_store_read_status_name(ConversationStoreReadStatus status);
+
+// Advisory recovery information for a fresh demand refused solely by its image peak.
+// Includes descriptor ownership and a conservative bound for post-decode restore scaffolding.
+// The owner must also cover existing store-held bytes; a retry always revalidates admission.
+struct ConversationStoreReadRefusal {
+    uint64_t additional_ram_bytes = 0;
+};
 
 struct ConversationStoreRead {
     ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
@@ -305,6 +312,9 @@ struct ConversationStoreRead {
     bool live = false;
     uint32_t stages = 0;
     uint64_t payload_bytes = 0;
+    // Successful whole-image filesystem/page-cache read, verification, allocation and host materialization.
+    // Always measured, independent of tracing. Excludes reader queue/admission and ready residence; not raw SSD bandwidth.
+    double materialize_ms = 0;
     // Complete, byte-verified image: the live record, every checkpoint with its pins, every stage and every K/V
     // layer, exactly as it was captured.  Keep this alias instead of copying the image: a SavedConversation copy
     // deep-copies every payload buffer, while an alias of this shared_ptr shares them.  The image's RAM stays
@@ -515,15 +525,25 @@ public:
     // demand: required by a request that will consume a slot; admit its whole peak against the published allowance
     //   *together with every other byte the store holds* - the index, the live descriptors' own copies, the admitted
     //   reads' decode preparation and any diagnostic decode - or, when no allowance is published yet, let it wait.
-    //   When it can never fit it is refused immediately as refused_budget, so the caller falls back to its ordinary
-    //   prefill.
-    // prefetch: optional, only admitted while spare allowance exists, never overtaking a demand, and refused (never
-    //   left pending) when the allowance has no room for it.
+    //   When its peak exceeds the current allowance it is refused immediately. An optional refusal quote lets
+    //   the owner reclaim eligible cache memory before one revalidated attempt; otherwise use ordinary prefill.
+    // prefetch: optional, only materialized while spare allowance exists, never overtaking a demand. An initial
+    //   admission refusal returns false and owns nothing. An accepted selected descriptor that later settles
+    //   refused_budget retains its bounded query/deadline/head hold, but no image reservation or incoming slot;
+    //   publish_read_allowance retries it once usable capacity recovers enough for its unchanged peak.
     // Both select the longest exact authorized prefix themselves, deduplicate by (request_id, generation), enforce
     // the read-descriptor and preparation ceilings *before* allocating anything, bind the request to the epoch it was
     // admitted in, and return immediately; the caller consumes the result with take_ready()/wait_ready() at its own
     // safe seam.  A demand never revokes anything of its own; it does revoke outstanding speculation.
-    bool demand(const ConversationStoreQuery& query, std::string& why);
+    // Selection owns a bounded metadata/file hold, not a RAM image reservation. Internal speculative revocation
+    // drops materialized bytes and incoming slots but keeps that selection, original query and deadline within
+    // max_read_requests/metadata_bytes. Demand can retry it without losing its cut to eviction or a covered
+    // replacement. Cancellation, withdrawal, deadline expiry, domain retirement and release end the hold.
+    // Retirement staging and selection are serialized by the catalog mutex; a selection made after staging but
+    // before durable apply owns the captured immutable manifest until release, even if the catalog retires it.
+    // refusal is cleared on entry and populated only for the fresh peak-budget refusal, never an accepted read.
+    bool demand(const ConversationStoreQuery& query, std::string& why,
+                ConversationStoreReadRefusal* refusal = nullptr);
     bool prefetch(const ConversationStoreQuery& query, std::string& why);
     // Explicit read cancellation leaves a terminal verdict until its owner calls release_read().
     // Issued filesystem work may finish, but no cancelled image is delivered.
@@ -531,6 +551,12 @@ public:
     // Withdraw optional work only. Once demand adopts a read, the advisory channel cannot cancel
     // or release it. Unadopted descriptors are retired; a later demand may submit a fresh query.
     void withdraw_prefetch(uint64_t request_id, uint64_t generation);
+    // Re-run an outstanding speculative prefetch's catalog selection. This does not admit initially refused offers,
+    // and the production offer channel declines missing heads before calling prefetch. A demanded, handed-out,
+    // cancelled, active or failed read is never touched; a valid ready image is refreshed only for a longer cut.
+    // An unmaterialized selection may also rebind to a newer equal cut. Unchanged budget deferrals wait for
+    // publish_read_allowance, not catalog polling. Returns false when nothing is eligible.
+    bool refresh_speculation(uint64_t request_id, uint64_t generation);
     // Non-blocking: false when nothing is ready.  A returned image is complete and byte-verified, and it was
     // materialized in the epoch this store still serves: a completion of an older epoch, or one produced after the
     // store faulted or closed, is never delivered and never relabelled.  The caller receives the only alias of an
@@ -667,6 +693,8 @@ public:
 #ifdef STRATA_STORE_TEST_HOOKS
     // Pause the real worker after reservation, outside the store mutex. Absent from production builds.
     void set_read_gate_for_test(void (*gate)(void*), void* context);
+    // Pause a real catalog transaction outside the mutex, before staging (false) or after staging (true).
+    void set_catalog_gate_for_test(void (*gate)(void*, bool staged), void* context);
 #endif
 
 private:

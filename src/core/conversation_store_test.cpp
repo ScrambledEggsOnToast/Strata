@@ -4,12 +4,14 @@
 #include "strata/core/conversation_store.hpp"
 
 #include "strata/core/conversation_reuse.hpp"
+#include "strata/program/conversation_store_admission.hpp"
 
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <algorithm>
@@ -26,6 +28,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -603,9 +606,22 @@ void check_publication_rules();
 void check_restart_generation_ordering();
 void check_pinned_branch();
 void check_queued_read_protects_frontier();
+void check_speculation_follows_publication();
+void check_selected_hold_revocation();
+void check_selected_hold_commit_interleaving();
+void check_selected_hold_terminal_release();
+void check_selected_retirement_allocation_retry();
+void check_selected_equal_cut_order();
+void check_budget_deferred_prefetch();
+void check_budget_deferred_terminals();
+void check_budget_deferred_head_hold();
+void check_revoked_headless_demand();
 void check_reuse();
 void check_leases_and_budget();
 void check_tight_ram();
+void check_demand_reclaim_quote();
+void check_demand_reclaim_owner();
+void check_demand_reclaim_interleavings();
 void check_cancel_and_release();
 void check_read_timing();
 void check_revoked_prefetch_demand();
@@ -619,7 +635,7 @@ void check_stale_ready();
 void check_capacity_floor();
 void check_quota_credit();
 void check_stream_identity();
-void check_corruption();
+void check_corruption(bool truncate = false);
 void check_writer_workspace();
 void check_reuse_reservation();
 void check_many_stream_reuse_admission();
@@ -633,6 +649,7 @@ void check_bootstrap_and_intent();
 void check_inflight_object_lease();
 void check_failed_write_charges_once();
 void check_postcommit_reclamation_cannot_undo_commit();
+void check_read_object_boundaries();
 
 } // namespace
 
@@ -641,6 +658,29 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_REVIEW_ONLY")) {
+        check_selected_retirement_allocation_retry();
+        check_selected_equal_cut_order();
+        std::printf("conversation_store_test review: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (::getenv("STRATA_STORE_DEFERRED_ONLY")) {
+        check_budget_deferred_prefetch();
+        check_budget_deferred_terminals();
+        check_budget_deferred_head_hold();
+        check_revoked_headless_demand();
+        check_revoked_prefetch_demand();
+        check_corruption();
+        std::printf("conversation_store_test deferred: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (::getenv("STRATA_STORE_LIFETIME_ONLY")) {
+        check_selected_hold_revocation();
+        check_selected_hold_commit_interleaving();
+        check_selected_hold_terminal_release();
+        std::printf("conversation_store_test lifetime: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     check_crypto();
     check_layout();
     check_identity();
@@ -660,15 +700,28 @@ int main() {
     check_restart_generation_ordering();
     check_pinned_branch();
     check_queued_read_protects_frontier();
+    check_speculation_follows_publication();
     check_reuse();
     check_leases_and_budget();
     check_tight_ram();
+    check_demand_reclaim_quote();
+    check_demand_reclaim_owner();
+    check_demand_reclaim_interleavings();
     check_cancel_and_release();
     check_revoked_prefetch_demand();
     check_read_timing();
     check_active_prefetch_replacement();
     check_prefetch_catalog_refresh();
     check_prefetch_catalog_reuse_and_cancel();
+    check_selected_hold_revocation();
+    check_selected_hold_commit_interleaving();
+    check_selected_hold_terminal_release();
+    check_selected_retirement_allocation_retry();
+    check_selected_equal_cut_order();
+    check_budget_deferred_prefetch();
+    check_budget_deferred_terminals();
+    check_budget_deferred_head_hold();
+    check_revoked_headless_demand();
     check_epoch_and_intent();
     check_dirty_close();
     check_ownership_and_close();
@@ -677,6 +730,8 @@ int main() {
     check_quota_credit();
     check_stream_identity();
     check_corruption();
+    check_corruption(true);
+    check_read_object_boundaries();
     check_writer_workspace();
     check_reuse_reservation();
     check_many_stream_reuse_admission();
@@ -991,6 +1046,30 @@ bool publish_and_wait(ConversationStore& store, const SavedConversation& image, 
     const bool settled = store.wait_publish(out, 5000);
     if (settled && !out.detail.empty()) std::fprintf(stderr, "Publication result: %s\n", out.detail.c_str());
     return settled;
+}
+
+void check_read_object_boundaries() {
+    // The final object, empty streams, cross-stream transitions and a partial/full/partial ids chunk grid
+    // must all preserve bytes with synchronous verified reads.
+    for (const size_t tokens : {size_t(1023), size_t(1024), size_t(1025)}) {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const SavedConversation image = fixture(401, tokens);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published) &&
+                  published.status == ConversationStorePublishStatus::stored,
+              "object boundary fixture is stored");
+        std::string why;
+        check(store.demand(query_of(image, 2, 1), why), "object boundary read is admitted");
+        ConversationStoreRead restored;
+        check(store.wait_ready(2, 1, restored, 5000) &&
+                  restored.status == ConversationStoreReadStatus::ready && restored.image &&
+                  images_equal(*restored.image, image, why),
+              "synchronous reads preserve full and partial object boundaries byte for byte");
+        restored.image.reset();
+        store.release_read(2, 1);
+        store.close();
+    }
 }
 
 void check_multi_stage_restore() {
@@ -2094,7 +2173,7 @@ void check_capacity_floor() {
     store.close();
 }
 
-void check_corruption() {
+void check_corruption(bool truncate) {
     StoreReadTraceCapture trace;
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
@@ -2130,11 +2209,15 @@ void check_corruption() {
         const int fd = ::open(victim.c_str(), O_RDWR | O_CLOEXEC);
         check(fd >= 0, "the object opens for damage");
         if (fd >= 0) {
-            uint8_t byte = 0;
-            check(::read(fd, &byte, 1) == 1, "the object is readable");
-            byte ^= 0x80;
-            ::lseek(fd, 0, SEEK_SET);
-            check(::write(fd, &byte, 1) == 1, "the object is damaged");
+            if (truncate) {
+                check(::ftruncate(fd, 0) == 0, "the object's size is damaged");
+            } else {
+                uint8_t byte = 0;
+                check(::read(fd, &byte, 1) == 1, "the object is readable");
+                byte ^= 0x80;
+                ::lseek(fd, 0, SEEK_SET);
+                check(::write(fd, &byte, 1) == 1, "the object is damaged");
+            }
             ::fsync(fd);
             ::close(fd);
         }
@@ -2147,6 +2230,14 @@ void check_corruption() {
           "a damaged object is reported as corrupt, never served");
     check(read.image == nullptr, "a corrupt read hands out no image");
     check(store.counters().reads_corrupt > 0, "the corruption is counted");
+    check(store.prefetch(query_of(image, 2, 1), why), "a speculative corrupt-read descriptor is accepted");
+    check(await_status(store, 2, 1, ConversationStoreReadStatus::corrupt), "speculative integrity failure settles");
+    const uint64_t corrupt_reads = store.counters().bytes_read;
+    store.publish_read_allowance(uint64_t(64) << 20);
+    store.publish_read_allowance(uint64_t(128) << 20);
+    check(!store.refresh_speculation(2, 1), "catalog refresh cannot retry a corrupt speculative result");
+    check_eq(store.counters().bytes_read, corrupt_reads, "allowance recovery never retries corrupt work");
+    store.release_read(2, 1);
     store.close();
     const auto records = trace.records();
     const auto* finish = read_trace(records, "read_finish", 1);
@@ -2157,6 +2248,7 @@ void check_corruption() {
     check(settled && settled->text("status") == "corrupt" && !settled->number("reserved_bytes") &&
               !settled->number("lease_bytes") && !settled->number("holds_slot"),
           "the corrupt completion releases its reservation and slot without inventing a ready image");
+    check(!read_trace(records, "reissue", 2), "integrity failures have no fabricated recovery attempt");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2304,6 +2396,606 @@ void check_queued_read_protects_frontier() {
     if (read.image) store.release_read(801, 8);
     ConversationStoreManifestInfo info;
     check(store.manifest_info(latest_result.head_id, info), "the frontier head is still authorized after the read");
+    store.close();
+}
+
+// Reuse the real reader/transaction seams, never sleeps to guess whether an interleaving occurred.
+struct SelectedHoldGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false, open = false, timed_out = false;
+    void pause() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(5), [&] { return open; })) timed_out = true;
+    }
+    void await() {
+        std::unique_lock<std::mutex> lock(mutex);
+        check(cv.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }),
+              "the selected-head regression reached its real worker seam");
+    }
+    void resume() {
+        std::lock_guard<std::mutex> lock(mutex);
+        open = true;
+        cv.notify_all();
+    }
+};
+
+void check_selected_retirement_allocation_retry() {
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 1;
+    ConversationStore store(options);
+    const auto original = fixture(631, 256);
+    auto successor = original;
+    successor.live.gdn.assign(successor.live.gdn.size(), 92);
+    ConversationStorePublishResult first;
+    check(publish_and_wait(store, original, 1, 1, first), "allocation retry starts with a real stored predecessor");
+    std::string why;
+    check(store.demand(query_of(original, 831, 1), why), "the predecessor receives a request-owned hold");
+    ConversationStoreRead held;
+    check(store.wait_ready(831, 1, held, 5000) && held.image && images_equal(*held.image, original, why),
+          "the held predecessor has verified original bytes");
+    ConversationStorePublish cover;
+    cover.request_id = 2;
+    cover.generation = 2;
+    cover.supersedes = first.head_id;
+    cover.cover = true;
+    check(store.publish(std::make_shared<SavedConversation>(successor), cover, why) == kAccepted,
+          "a covered successor shares objects while changing one state stream");
+    ConversationStorePublishResult replacement;
+    check(store.wait_publish(replacement, 5000) && replacement.status == ConversationStorePublishStatus::replaced,
+          "the successor durably replaces the held catalog head");
+    store.set_publish_fault_for_test("retire-object-prepare");
+    held.image.reset();
+    store.release_read(831, 1);
+    check_eq(store.ram_lease_bytes(), 0, "the failed retirement releases the caller's image lease");
+    store.close(); // the final writer/reclamation pass retries retirement before any survivor is verified
+    ConversationStore reopened(options);
+    reopened.publish_read_allowance(uint64_t(64) << 20);
+    check(reopened.demand(query_of(successor, 832, 1), why), "a fresh store selects the retained successor");
+    ConversationStoreRead restored;
+    check(reopened.wait_ready(832, 1, restored, 5000) && restored.image &&
+              restored.head_id == replacement.head_id && images_equal(*restored.image, successor, why),
+          "allocation failure and retirement retry cannot delete the successor's shared object bytes");
+    restored.image.reset();
+    reopened.release_read(832, 1);
+    check_eq(reopened.ram_lease_bytes(), 0, "the survivor's image lease is released once after retirement retry");
+    reopened.close();
+}
+
+void check_selected_equal_cut_order() {
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 3;
+    ConversationStore store(options);
+    const auto older = fixture(641, 256);
+    auto newest = older;
+    newest.live.gdn.assign(newest.live.gdn.size(), 117);
+    const auto neighbour = fixture(642, 128);
+    ConversationStorePublishResult older_head, newest_head, neighbour_head;
+    check(publish_and_wait(store, older, 1, 1, older_head), "an older equal-length history is stored");
+    check(publish_and_wait(store, newest, 2, 2, newest_head), "a newer equal-length history is stored");
+    check(publish_and_wait(store, neighbour, 3, 3, neighbour_head), "an independent revoking demand is stored");
+    SelectedHoldGate gate;
+    store.set_catalog_gate_for_test([](void* context, bool staged) {
+        if (staged) static_cast<SelectedHoldGate*>(context)->pause();
+    }, &gate);
+    ConversationStorePublish pressure;
+    pressure.request_id = 4;
+    pressure.generation = 4;
+    pressure.supersedes = newest_head.head_id;
+    pressure.cover = true;
+    std::string why;
+    check(store.publish(std::make_shared<SavedConversation>(appended_turn(newest, 384, 641)), pressure, why) == kAccepted,
+          "a covered successor stages retirement of the newer equal-cut head");
+    gate.await();
+    store.suspend_read_admission();
+    const auto future = query_of(newest, 841, 1);
+    check(store.prefetch(future, why), "the request selects the newer head after retirement staging");
+    check(store.demand(query_of(neighbour, 842, 1), why), "a different demand revokes its speculative RAM");
+    store.release_read(842, 1);
+    gate.resume();
+    ConversationStorePublishResult published;
+    check(store.wait_publish(published, 5000) && published.status == ConversationStorePublishStatus::replaced,
+          "staged retirement completes while the selected immutable authority remains held");
+    store.set_catalog_gate_for_test(nullptr, nullptr);
+    ConversationStoreManifestInfo info;
+    check(!store.manifest_info(newest_head.head_id, info) && store.manifest_info(older_head.head_id, info),
+          "only the older equal-cut head remains catalog-visible");
+    check(store.demand(future, why), "the revoked request reuses its original selected authority");
+    store.publish_read_allowance(uint64_t(64) << 20);
+    ConversationStoreRead read;
+    check(store.wait_ready(841, 1, read, 5000) && read.image && read.head_id == newest_head.head_id &&
+              images_equal(*read.image, newest, why),
+          "equal-cut catalog lookup cannot downgrade a retained newer selection");
+    read.image.reset();
+    store.release_read(841, 1);
+    store.close();
+    check(!gate.timed_out, "equal-cut ordering is established by the real commit gate");
+}
+
+void check_budget_deferred_prefetch() {
+    // Exercise accepted descriptors, not admission refusals: zero allowance, aggregate resident pressure (the
+    // production diagnostic), suspension, and an occupied incoming slot all settle without doing object I/O.
+    for (int blocked = 0; blocked < 4; ++blocked) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_read_requests = blocked == 3 ? 2 : 1;
+        ConversationStore store(options);
+        const SavedConversation image = fixture(621, 256);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published), "the deferred-offer head is stored");
+        const uint64_t baseline = store.ram_held_bytes();
+        std::string why;
+        // Learn the actual charged peak from a no-I/O accepted descriptor, without duplicating admission math.
+        store.publish_read_allowance(0);
+        check(store.prefetch(query_of(image, 930, 1), why), "the peak probe is accepted");
+        check(await_status(store, 930, 1, ConversationStoreReadStatus::refused_budget), "the peak probe settles");
+        store.release_read(930, 1);
+        const auto probe_records = trace.records();
+        const auto* probe = read_trace(probe_records, "admission", 930);
+        const uint64_t peak = probe ? probe->number("peak_bytes") : 0;
+        check(peak > baseline && peak > 0, "the probe exposes the real bounded peak");
+        uint64_t low = 0;
+        ConversationStoreRead occupied;
+        if (blocked == 1) {
+            low = peak + baseline / 2;
+            store.publish_read_allowance(low);
+        } else if (blocked >= 2) {
+            low = uint64_t(64) << 20;
+            store.publish_read_allowance(low);
+            if (blocked == 2) store.suspend_read_admission();
+            else {
+                check(store.demand(query_of(image, 931, 1), why), "an earlier request occupies the only image slot");
+                check(store.wait_ready(931, 1, occupied, 5000) && occupied.image, "the earlier request owns its lease");
+            }
+        }
+        const uint64_t io_before = store.counters().bytes_read;
+        check(store.prefetch(query_of(image, 932, 1), why), "the real selected offer descriptor is accepted");
+        check(await_status(store, 932, 1, ConversationStoreReadStatus::refused_budget),
+              "an accepted offer settles as budget-deferred");
+        check_eq(store.counters().bytes_read, io_before, "budget-deferred work performs zero payload I/O");
+        check(!store.refresh_speculation(932, 1), "a catalog sweep does not poll an unchanged deferred head");
+        if (blocked != 2) {
+            const uint64_t refusals = store.counters().refused_budget;
+            store.publish_read_allowance(low);
+            store.publish_read_allowance(low);
+            check(store.request_status(932, 1) == ConversationStoreReadStatus::refused_budget,
+                  "unchanged unavailable capacity does not requeue a deferred offer");
+            check_eq(store.counters().refused_budget, refusals, "unchanged capacity does not create refusal attempts");
+        }
+        if (blocked == 3) {
+            occupied.image.reset();
+            store.release_read(931, 1);
+        }
+        SelectedHoldGate gate;
+        store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+        store.publish_read_allowance(uint64_t(64) << 20);
+        gate.await();
+        const uint64_t active_bytes = store.ram_held_bytes();
+        store.publish_read_allowance(uint64_t(64) << 20);
+        check(!store.refresh_speculation(932, 1), "an active recovered offer cannot be refreshed");
+        check_eq(store.ram_held_bytes(), active_bytes, "allowance publication never refunds an active reservation");
+        gate.resume();
+        check(await_status(store, 932, 1, ConversationStoreReadStatus::ready),
+              "budget recovery makes the same head background-ready BEFORE any demand");
+        store.set_read_gate_for_test(nullptr, nullptr);
+        check(!gate.timed_out, "the recovered reader was released explicitly");
+        const uint64_t ready_bytes = store.ram_held_bytes();
+        check(ready_bytes <= store.ram_read_budget(), "recovery stays within the unchanged RAM envelope");
+        check(store.demand(query_of(image, 932, 1), why), "demand adopts the already-ready recovered descriptor");
+        ConversationStoreRead read;
+        check(store.wait_ready(932, 1, read, 5000) && read.image && read.head_id == published.head_id &&
+                  read.tokens == 256 && images_equal(*read.image, image, why),
+              "recovery restores the original selected head and cut byte for byte");
+        read.image.reset();
+        store.release_read(932, 1);
+        check_eq(store.ram_lease_bytes(), 0, "recovery releases every incoming image lease");
+        check_eq(store.ram_held_bytes(), baseline, "recovery returns exactly to the original resident accounting");
+        store.close();
+        const auto records = trace.records();
+        unsigned reissues = 0, starts = 0;
+        for (const auto& record : records) {
+            if (record.number("request_id") != 932) continue;
+            if (record.text("event") == "reissue") ++reissues;
+            if (record.text("event") == "read_start") ++starts;
+        }
+        const auto* deferred = read_trace(records, "settled", 932, "no_io");
+        const auto* retry = read_trace(records, "reissue", 932, "allowance_recovery");
+        check(deferred && retry && deferred->text("status") == "refused_budget" &&
+                  !deferred->number("io_attempted") &&
+                  retry->number("previous_attempt_id") == deferred->number("attempt_id"),
+              "the accepted no-I/O refusal and its recovery have linked attempt identities");
+        check_eq(reissues, 1, "one meaningful capacity recovery causes exactly one retry");
+        check_eq(starts, 1, "the recovered offer materializes once, not again at demand adoption");
+    }
+}
+
+void check_budget_deferred_terminals() {
+    for (int terminal = 0; terminal < 5; ++terminal) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_read_requests = 1;
+        ConversationStore store(options);
+        const SavedConversation image = fixture(623, 128);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published), "the terminal deferred-offer fixture is stored");
+        std::string why;
+        store.publish_read_allowance(1);
+        check(!store.prefetch(query_of(image, 940, 1), why),
+              "an initial impossible-peak refusal is not an accepted deferred offer");
+        store.publish_read_allowance(0);
+        auto query = query_of(image, 941, 1);
+        if (terminal == 4) query.selector.scope = ConversationScope{bytes_from("no-stored-head")};
+        if (terminal == 2)
+            query.deadline_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()) + uint64_t(1000000000);
+        check(store.prefetch(query, why), "a terminal-case descriptor is accepted");
+        check(await_status(store, 941, 1, terminal == 4 ? ConversationStoreReadStatus::missing :
+                           ConversationStoreReadStatus::refused_budget), "the terminal-case descriptor settles");
+        if (terminal == 0) store.withdraw_prefetch(941, 1);
+        if (terminal == 1) store.cancel_read(941, 1);
+        if (terminal == 2)
+            std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(query.deadline_ns)));
+        if (terminal == 3) check(store.invalidate_domain("deferred test"), "domain retirement ends deferred authority");
+        const uint64_t io_before = store.counters().bytes_read;
+        store.publish_read_allowance(uint64_t(64) << 20);
+        store.release_read(941, 1);
+        check_eq(store.counters().bytes_read, io_before, "terminal and missing-head work never performs recovery I/O");
+        store.close();
+        const auto records = trace.records();
+        check(!read_trace(records, "reissue", 940) && !read_trace(records, "reissue", 941) &&
+                  !read_trace(records, "read_start", 941),
+              "initial refusal, withdrawal, cancellation, expiry, stale epoch and missing heads never re-arm");
+    }
+}
+
+void check_revoked_headless_demand() {
+    // A store-level miss is not a production accepted offer. It nevertheless owns a bounded descriptor and must
+    // reselect before pricing its manifest if an unrelated demand internally revokes it.
+    for (bool publish_head : {false, true}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_read_requests = 2;
+        ConversationStore store(options);
+        const SavedConversation wanted = fixture(625, 256), neighbour = fixture(626, 128);
+        std::string why;
+        check(store.prefetch(query_of(wanted, 950, 1), why), "the headless store-level descriptor is accepted");
+        check(store.request_status(950, 1) == ConversationStoreReadStatus::missing, "the headless descriptor misses");
+        check(store.demand(query_of(neighbour, 951, 1), why), "an unrelated demand revokes the headless descriptor");
+        store.release_read(951, 1);
+        ConversationStorePublishResult published;
+        if (publish_head)
+            check(publish_and_wait(store, wanted, 1, 1, published), "the wanted head appears after revocation");
+        check(store.demand(query_of(wanted, 950, 1), why),
+              "the original demand reselects before charging manifest workspace");
+        ConversationStoreRead read;
+        check(store.wait_ready(950, 1, read, 5000) &&
+                  read.status == (publish_head ? ConversationStoreReadStatus::ready : ConversationStoreReadStatus::missing),
+              "the revoked headless descriptor restores a newly available head or settles another bounded miss");
+        if (publish_head)
+            check(read.image && images_equal(*read.image, wanted, why), "the headless retry restores every byte");
+        read.image.reset();
+        store.release_read(950, 1);
+        check_eq(store.ram_lease_bytes(), 0, "the headless retry releases all leases");
+        store.close();
+    }
+}
+
+void check_budget_deferred_head_hold() {
+    for (bool resident_recovery : {false, true}) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 1;
+        options.max_read_requests = resident_recovery ? 2 : 1;
+        ConversationStore store(options);
+        SavedConversation selected = fixture(627, 256);
+        for (auto& checkpoint : selected.checkpoints) checkpoint.pinned = false;
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, selected, 1, 1, head), "the budget-deferred protected head is stored");
+        store.suspend_read_admission();
+        std::string why;
+        check(store.prefetch(query_of(selected, 960, 1), why), "the protected deferred descriptor is accepted");
+        check(await_status(store, 960, 1, ConversationStoreReadStatus::refused_budget),
+              "the protected descriptor defers without an image reservation");
+        const auto records = trace.records();
+        const auto* admission = read_trace(records, "admission", 960);
+        const uint64_t peak = admission ? admission->number("peak_bytes") : 0;
+        check(peak > 0, "the recovery boundary uses the reader's actual charged peak");
+        ConversationStorePublishResult pressure;
+        check(publish_and_wait(store, fixture(628, 128), 2, 2, pressure) &&
+                  pressure.status == ConversationStorePublishStatus::refused_limits,
+              "head-limit pressure cannot evict an accepted budget-deferred selection");
+        check_eq(store.ram_lease_bytes(), 0, "a deferred selected-head hold never retains an image lease");
+        const auto query = query_of(selected, 960, 1);
+        const auto matches = store.matches(query.selector, query.tokens, query.images);
+        check(!matches.empty() && matches.front().head_id == head.head_id,
+              "publication revocation preserves the deferred selection's head protection");
+        const uint64_t tight_allowance = store.ram_held_bytes() + peak + 1;
+        ConversationStoreRead occupied;
+        if (resident_recovery) {
+            check(store.demand(query_of(selected, 961, 1), why), "another demand acquires resident capacity first");
+            store.publish_read_allowance(uint64_t(64) << 20);
+            check(store.wait_ready(961, 1, occupied, 5000) && occupied.image,
+                  "the competing demand owns a real materialized image");
+            store.publish_read_allowance(tight_allowance);
+            check(store.request_status(960, 1) == ConversationStoreReadStatus::refused_budget,
+                  "unchanged tight allowance cannot bypass an occupied slot");
+        }
+        SelectedHoldGate gate;
+        store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+        if (resident_recovery) {
+            occupied.image.reset();
+            store.release_read(961, 1);
+        }
+        store.publish_read_allowance(tight_allowance);
+        gate.await();
+        check(store.ram_held_bytes() <= store.ram_read_budget(),
+              "recovered reservation fits with one manifest workspace, not two");
+        // The gate proves initial admission. Full decoded restore scaffolding is separately admitted afterwards.
+        store.publish_read_allowance(uint64_t(64) << 20);
+        gate.resume();
+        check(await_status(store, 960, 1, ConversationStoreReadStatus::ready),
+              "a revoked deferral admits at its original peak and completes in the background before demand");
+        store.set_read_gate_for_test(nullptr, nullptr);
+        check(!gate.timed_out, "tight-capacity recovery reaches the real allocation gate");
+        ConversationStoreRead read;
+        check(store.take_ready(960, 1, read) && read.image && read.head_id == head.head_id &&
+                  images_equal(*read.image, selected, why), "the protected deferred head remains fully restorable");
+        read.image.reset();
+        store.release_read(960, 1);
+        check_eq(store.ram_lease_bytes(), 0, "the protected deferred recovery releases its image");
+        store.close();
+    }
+}
+
+void check_selected_hold_revocation() {
+    for (bool active : {false, true}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 3;
+        options.max_read_requests = 2;
+        ConversationStore store(options);
+        const SavedConversation older = fixture(601, 128);
+        SavedConversation latest = appended_turn(older, 256, 601);
+        SavedConversation neighbour = fixture(602, 128);
+        for (auto& checkpoint : latest.checkpoints) checkpoint.pinned = false;
+        for (auto& checkpoint : neighbour.checkpoints) checkpoint.pinned = false;
+        ConversationStorePublishResult old_head, latest_head, neighbour_head;
+        check(publish_and_wait(store, older, 1, 1, old_head), "the original older failed-history cut is retained");
+        check(publish_and_wait(store, latest, 2, 2, latest_head), "the selected newest history is stored");
+        check(publish_and_wait(store, neighbour, 3, 3, neighbour_head), "the earlier demand's separate history is stored");
+        SelectedHoldGate gate;
+        if (active)
+            store.set_read_gate_for_test([](void* context) { static_cast<SelectedHoldGate*>(context)->pause(); }, &gate);
+        std::string why;
+        const auto future = query_of(latest, 801, 8);
+        check(store.prefetch(future, why), "the queued future request owns a selected newest cut");
+        if (active) gate.await();
+        else check(await_status(store, 801, 8, ConversationStoreReadStatus::ready), "the speculative image is ready");
+        store.suspend_read_admission();
+        check(store.demand(query_of(neighbour, 802, 8), why), "a different demand revokes only speculative RAM");
+        gate.resume();
+        if (active) {
+            // The cancelled active body must unwind before its RAM can be refunded.
+            check(await_status(store, 801, 8, ConversationStoreReadStatus::cancelled),
+                  "the revoked active body unwinds without losing request ownership");
+            store.set_read_gate_for_test(nullptr, nullptr);
+        }
+        store.release_read(802, 8);
+        check_eq(store.ram_lease_bytes(), 0, "revocation releases materialized bytes but not selected metadata");
+        // At a full head ceiling, pressure must consume another history, not the request's selected head.
+        for (uint64_t id = 4; id <= 5; ++id) {
+            ConversationStorePublishResult pressure;
+            auto image = fixture(602 + id, 128);
+            for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+            check(publish_and_wait(store, image, id, id, pressure) &&
+                      pressure.status == ConversationStorePublishStatus::stored,
+                  "useful independent pressure publications still obtain head slots");
+        }
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(latest_head.head_id, info), "RAM revocation preserved the selected newest head");
+        check(store.manifest_info(old_head.head_id, info), "the original older failed-history fallback is still present");
+        // A covered equal-cut replacement can retire the catalog head, but must not erase the queued selection.
+        ConversationStorePublish cover;
+        cover.request_id = 6;
+        cover.generation = 6;
+        cover.supersedes = latest_head.head_id;
+        cover.cover = true;
+        check(store.publish(std::make_shared<SavedConversation>(latest), cover, why) == kAccepted,
+              "a selected-head hold does not refuse useful covered publication");
+        ConversationStorePublishResult replacement;
+        check(store.wait_publish(replacement, 5000) && replacement.status == ConversationStorePublishStatus::replaced,
+              "the equal-cut cover durably replaces the selected catalog head");
+        check(store.demand(future, why), "the original descriptor becomes demand at the descriptor ceiling");
+        check(store.demand(query_of(neighbour, 803, 8), why), "the last available read descriptor is admitted");
+        check(!store.demand(query_of(neighbour, 804, 8), why), "retained selections cannot exceed max_read_requests");
+        store.release_read(803, 8);
+        store.publish_read_allowance(uint64_t(64) << 20);
+        ConversationStoreRead read;
+        check(store.wait_ready(801, 8, read, 5000) && read.image && read.tokens == 256 &&
+                  read.head_id == replacement.head_id && images_equal(*read.image, latest, why),
+              "the revoked selection rebinds the equal-cut new head, never the older failed history");
+        read.image.reset();
+        store.release_read(801, 8);
+        check_eq(store.ram_lease_bytes(), 0, "all revoked/rebound image leases end exactly once");
+        check(store.ram_held_bytes() <= store.ram_read_budget(), "metadata and byte holds stay inside the allowance");
+        check(store.disk_charged_bytes() <= store.disk_quota_bytes(), "retired selected files stay quota-accounted");
+        store.close();
+        check(!gate.timed_out, "the active revocation gate was explicitly released");
+    }
+}
+
+void check_selected_hold_commit_interleaving() {
+    // A demand racing victim selection must either win before staging, or retain immutable authority after staging.
+    // Also cover a selected predecessor absent from the catalog and a second retirement of shared object bytes.
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        const bool after_staging = scenario != 0;
+        const bool cover = scenario >= 2;
+        const bool rollback = scenario == 3;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 1;
+        ConversationStore store(options);
+        SavedConversation image = fixture(611, 256);
+        for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, image, 1, 1, first), "the retirement race starts from a stored head");
+        SelectedHoldGate gate;
+        struct Context { SelectedHoldGate* gate; bool after; } context{&gate, after_staging};
+        store.set_catalog_gate_for_test([](void* opaque, bool staged) {
+            auto& state = *static_cast<Context*>(opaque);
+            if (staged == state.after) state.gate->pause();
+        }, &context);
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        if (cover) {
+            request.cover = true;
+            request.supersedes = first.head_id;
+        }
+        std::string why;
+        // Same payload for an independent head too: this exercises shared-object ownership after two retirements.
+        check(store.publish(std::make_shared<SavedConversation>(image), request, why) == kAccepted,
+              "the racing publication is admitted before any selected hold exists");
+        gate.await();
+        store.suspend_read_admission();
+        check(store.demand(query_of(image, 811, 1), why), "the demand selects while catalog I/O is gated");
+        if (rollback) store.set_publish_fault_for_test("catalog-rename");
+        gate.resume();
+        ConversationStorePublishResult result;
+        check(store.wait_publish(result, 5000), "the racing catalog transaction settles");
+        store.set_catalog_gate_for_test(nullptr, nullptr);
+        if (!after_staging || rollback) {
+            ConversationStoreManifestInfo retained;
+            check(store.manifest_info(first.head_id, retained), "a pre-stage lease or failed rename preserves authority");
+        } else {
+            check(result.status == (cover ? ConversationStorePublishStatus::replaced : ConversationStorePublishStatus::stored),
+                  "a post-stage lease does not block the already staged durable publication");
+            ConversationStorePublishResult pressure;
+            check(publish_and_wait(store, fixture(612, 128), 3, 3, pressure) &&
+                      pressure.status == ConversationStorePublishStatus::stored,
+                  "a second retirement cannot reclaim the first selected head's shared objects");
+        }
+        store.publish_read_allowance(uint64_t(64) << 20);
+        ConversationStoreRead read;
+        check(store.wait_ready(811, 1, read, 5000) && read.image && read.head_id == first.head_id &&
+                  read.tokens == 256 && images_equal(*read.image, image, why),
+              "a staged/applying/rolled-back retirement cannot stale the captured selected manifest");
+        read.image.reset();
+        store.release_read(811, 1);
+        check_eq(store.ram_lease_bytes(), 0, "the interleaved request releases its sole image charge");
+        check(store.disk_charged_bytes() <= store.disk_quota_bytes(), "retired shared objects remain physically charged");
+        store.close();
+        check(!gate.timed_out, "the catalog gate was explicitly released without holding the store mutex");
+    }
+}
+
+void check_selected_hold_terminal_release() {
+    // A revoked request may pin metadata, never unlimited descriptors, images or an immortal eviction exemption.
+    for (int terminal = 0; terminal < 4; ++terminal) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 1;
+        options.max_read_requests = 2;
+        ConversationStore store(options);
+        SavedConversation image = fixture(621, 128);
+        for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+        ConversationStorePublishResult first;
+        check(publish_and_wait(store, image, 1, 1, first), "the terminal hold fixture is stored");
+        const uint64_t idle_bytes = store.ram_held_bytes();
+        std::string why;
+        auto query = query_of(image, 821, 1);
+        SelectedHoldGate gate;
+        if (terminal == 2) {
+            query.deadline_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()) + uint64_t(1000000000);
+            store.set_read_gate_for_test([](void* opaque) { static_cast<SelectedHoldGate*>(opaque)->pause(); }, &gate);
+        }
+        check(store.prefetch(query, why), "the terminal test admits a selected speculation");
+        if (terminal == 2) gate.await();
+        else check(await_status(store, 821, 1, ConversationStoreReadStatus::ready), "the terminal speculation is ready");
+        check(store.demand(query_of(image, 822, 1), why), "an earlier demand revokes the terminal speculation");
+        store.release_read(822, 1);
+        if (terminal == 0) store.cancel_read(821, 1);
+        if (terminal == 1) store.withdraw_prefetch(821, 1);
+        if (terminal == 2) {
+            // The gate, not a guessed reader sleep, owns the active lifetime. Wait only for the original deadline.
+            std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(query.deadline_ns)));
+            gate.resume();
+            check(await_status(store, 821, 1, ConversationStoreReadStatus::cancelled), "the expired worker settles");
+            store.set_read_gate_for_test(nullptr, nullptr);
+        }
+        if (terminal == 3) {
+            store.close();
+            check_eq(store.ram_lease_bytes(), 0, "close drops revoked speculative bytes and metadata holds");
+            check(store.ram_held_bytes() <= idle_bytes, "close releases the request-owned query/metadata hold");
+        } else {
+            // Admission synchronously sweeps expiry; cancellation/withdrawal must already have released the hold.
+            ConversationStorePublishResult pressure;
+            check(publish_and_wait(store, fixture(622, 128), 2, 2, pressure) &&
+                      pressure.status == ConversationStorePublishStatus::stored,
+                  "cancelled, withdrawn or expired selected metadata no longer blocks the head ceiling");
+            check(!store.demand(query, why) || terminal == 1,
+                  "caller cancellation and expiry cannot resurrect the retired request");
+            store.release_read(821, 1);
+            check_eq(store.ram_lease_bytes(), 0, "terminal release leaves no materialized image charge");
+            store.close();
+        }
+        check(!gate.timed_out, "terminal cleanup did not depend on a gate timeout");
+    }
+}
+
+void check_speculation_follows_publication() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const SavedConversation final_image = fixture(651, 512);
+    // Direct store-API coverage only: production's offer channel declines missing heads before prefetch.
+    // A direct speculative query can still settle as a no-I/O miss retaining its descriptor; explicit
+    // catalog refresh can reselect it, but allowance recovery must not treat it as a budget-deferred offer.
+    std::string why;
+    check(store.prefetch(query_of(final_image, 901, 4), why), "the too-early prefetch is accepted");
+    check(store.request_status(901, 4) == ConversationStoreReadStatus::missing,
+          "the too-early prefetch misses without materializing");
+    check(!store.refresh_speculation(901, 4), "revalidating before any head exists changes nothing");
+    check(store.request_status(901, 4) == ConversationStoreReadStatus::missing,
+          "the miss keeps its descriptor for the publication that will name it");
+
+    const SavedConversation first = fixture(651, 256);
+    ConversationStorePublishResult first_result;
+    check(publish_and_wait(store, first, 1, 1, first_result) &&
+              first_result.status == ConversationStorePublishStatus::stored,
+          "a first, shorter cut of the conversation is stored");
+    check(store.refresh_speculation(901, 4), "the publication revalidates the outstanding speculation");
+    check(await_status(store, 901, 4, ConversationStoreReadStatus::ready), "the refreshed prefetch materializes");
+
+    ConversationStorePublishResult final_result;
+    check(publish_and_wait(store, final_image, 2, 2, final_result) &&
+              final_result.status == ConversationStorePublishStatus::stored,
+          "a strictly longer cut of the same conversation is stored");
+    check(store.refresh_speculation(901, 4), "the speculation follows the longer cut");
+    check(await_status(store, 901, 4, ConversationStoreReadStatus::ready), "the second refresh materializes");
+    check(!store.refresh_speculation(901, 4), "revalidating an up-to-date ready speculation is refused");
+    check(store.request_status(901, 4) == ConversationStoreReadStatus::ready,
+          "the ready image survives a redundant revalidation attempt");
+    check(!store.refresh_speculation(901, 5), "an unknown generation is refused");
+    ConversationStoreRead read;
+    check(store.wait_ready(901, 4, read, 5000) && read.image && read.tokens == 512,
+          "the refreshed speculation mounts the longest cut its query can use");
+    if (read.image) {
+        check(images_equal(*read.image, final_image, why), "the revalidated speculation restores byte for byte");
+        store.release_read(901, 4);
+    }
+    check(store.demand(query_of(first, 902, 4), why), "the demand path is admitted");
+    check(await_status(store, 902, 4, ConversationStoreReadStatus::ready), "the demand materializes");
+    check(!store.refresh_speculation(902, 4), "a demand owner is never revalidated as speculation");
+    store.release_read(902, 4);
     store.close();
 }
 
@@ -2498,6 +3190,260 @@ void check_tight_ram() {
     store.close();
 }
 
+void check_demand_reclaim_quote() {
+    StoreReadTraceCapture trace;
+    TempRoot root;
+    const SavedConversation image = fixture(153, 4096);
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    ConversationStorePublishResult published;
+    check(publish_and_wait(store, image, 1, 1, published) &&
+              published.status == ConversationStorePublishStatus::stored, "the reclaim-quote image is durable");
+    std::string why;
+    const auto query = query_of(image, 2, 2);
+    const uint64_t before = store.ram_held_bytes();
+    store.publish_read_allowance(1);
+    ConversationStoreReadRefusal refusal{UINT64_MAX};
+    check(!store.demand(query, why, &refusal), "fresh demand returns a recoverable peak refusal");
+    check_eq(store.ram_held_bytes(), before, "a refused fresh demand acquires no descriptor or image charge");
+    const uint64_t enough = before + refusal.additional_ram_bytes;
+    store.publish_read_allowance(enough);
+    check(store.demand(query, why, &refusal) && refusal.additional_ram_bytes == 0,
+          "accepted demand clears the advisory quote instead of inviting a second image reservation");
+    ConversationStoreRead read;
+    check(store.wait_ready(2, 2, read, 5000) && read.status == ConversationStoreReadStatus::ready &&
+              read.image && images_equal(*read.image, image, why),
+          "the quoted capacity covers descriptor, decode and restore scaffolding without another allowance bump");
+    check(store.ram_held_bytes() <= store.ram_read_budget(), "quoted recovery never exceeds the published envelope");
+    read.image.reset();
+    store.release_read(2, 2);
+
+    store.publish_read_allowance(uint64_t(64) << 20);
+    const auto prefetched = query_of(image, 3, 3);
+    check(store.prefetch(prefetched, why) && await_status(store, 3, 3, ConversationStoreReadStatus::ready),
+          "a pre-existing ready image can be adopted independently of fresh-demand reclamation");
+    const uint64_t ready_charge = store.ram_held_bytes();
+    refusal.additional_ram_bytes = UINT64_MAX;
+    check(store.demand(prefetched, why, &refusal) && refusal.additional_ram_bytes == 0 &&
+              store.ram_held_bytes() == ready_charge,
+          "adopting a ready image neither quotes nor charges a second materialization");
+    check(store.wait_ready(3, 3, read, 5000) && read.image && images_equal(*read.image, image, why),
+          "the adopted image still belongs to its exact request");
+    refusal.additional_ram_bytes = UINT64_MAX;
+    check(!store.demand(prefetched, why, &refusal) && refusal.additional_ram_bytes == 0,
+          "an already-handed refusal cannot reuse a stale RAM-reclamation quote");
+    read.image.reset();
+    store.release_read(3, 3);
+    store.close();
+}
+
+void check_demand_reclaim_owner() {
+    enum class Case { restored, view_allocation, cancel_before, expire_before,
+                      cancel_after, expire_after, missing_objects };
+    for (const auto scenario : {Case::restored, Case::view_allocation, Case::cancel_before,
+                               Case::expire_before, Case::cancel_after, Case::expire_after,
+                               Case::missing_objects}) {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const SavedConversation disk = fixture(155, 4096);
+        SavedConversation fallback = fixture(157, 32), victim = fixture(159, 16);
+        fallback.checkpoints.clear();
+        victim.checkpoints.clear();
+        ConversationStorePublishResult published;
+        if (!publish_and_wait(store, disk, 1, 1, published) ||
+            published.status != ConversationStorePublishStatus::stored) {
+            check(false, "the owner-reclamation image is durable");
+            continue;
+        }
+        std::string why;
+        auto query = query_of(disk, 2, 2);
+        uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        query.deadline_ns = now + uint64_t(60) * 1000000000;
+        const uint64_t baseline = store.ram_held_bytes();
+        store.publish_read_allowance(baseline + 1);
+        ConversationStoreReadRefusal quote;
+        if (store.demand(query, why, &quote) || !quote.additional_ram_bytes) {
+            check(false, "the owner fixture starts at a fresh peak refusal without a descriptor");
+            continue;
+        }
+        victim.live.gdn.resize(size_t(quote.additional_ram_bytes + baseline + (1u << 20)), 9);
+        const size_t lease = 2048, preparation = 8192, outside = 4096;
+        const size_t envelope = victim.bytes() + fallback.bytes() + lease + preparation + outside + baseline + 1;
+        ConversationCache cache(envelope, 2);
+        check(cache.put(std::move(victim)) && cache.put(SavedConversation(fallback)) &&
+                  cache.try_reserve_lease(lease), "the owner holds an evictable image, fallback and separate lease");
+        const size_t before = cache.envelope_bytes();
+        size_t protected_index = 1;
+        bool cancelled = scenario == Case::cancel_before;
+        if (scenario == Case::expire_before) now = query.deadline_ns;
+        // This is the optional published coverage, not a stand-in for the store.
+        // The production function calls the real store and real cache below.
+        auto coverage = std::make_shared<size_t>(cache.size());
+        bool dirty = false;
+        const auto result = strata::program::admit_store_demand(
+            store, cache, query, why, {envelope, preparation, outside}, &protected_index,
+            [&] { return now; }, [&] { return cancelled; },
+            [&] {
+                dirty = true;
+                if (scenario == Case::view_allocation) throw std::bad_alloc();
+                coverage = std::make_shared<size_t>(cache.size());
+                dirty = false;
+                if (scenario == Case::cancel_after) cancelled = true;
+                if (scenario == Case::expire_after) now = query.deadline_ns;
+                if (scenario == Case::missing_objects) remove_tree(root.path + "/objects");
+            },
+            [&]() noexcept { coverage.reset(); dirty = true; });
+        const bool early = scenario == Case::cancel_before || scenario == Case::expire_before;
+        const bool late = scenario == Case::cancel_after || scenario == Case::expire_after;
+        if (early) {
+            check(!result.accepted && !result.recovery_attempted && !result.retried &&
+                      cache.envelope_bytes() == before && cache.size() == 2 && protected_index == 1,
+                  "cancelled or expired work mutates no cache ownership before admission");
+        } else {
+            check(result.recovery_attempted && cache.size() == 1 && protected_index == 0 &&
+                      cache.evictions() == 1 && result.released_bytes == before - cache.envelope_bytes(),
+                  "the actual owner reclaims once and rebases its original fallback");
+            check(store.ram_read_budget() == envelope - preparation - outside - cache.envelope_bytes(),
+                  "the actual owner republishes its exact remaining allowance");
+            if (late) {
+                check(!result.accepted && !result.retried && store.ram_held_bytes() == baseline,
+                      "cancellation or expiry after reclamation starts no disk read and leaves no descriptor");
+            } else {
+                check(result.accepted && result.retried, "a fresh peak refusal retries after actual ownership release");
+                ConversationStoreRead read;
+                check(store.wait_ready(2, 2, read, 5000), "the reclaimed demand settles through the real reader");
+                if (scenario == Case::missing_objects) {
+                    check(read.status == ConversationStoreReadStatus::corrupt && !read.image,
+                          "a real missing-object failure after reclamation delivers no disk image");
+                } else {
+                    check(read.status == ConversationStoreReadStatus::ready && read.image &&
+                              images_equal(*read.image, disk, why),
+                          "the owner sequence restores the authorized disk image byte for byte");
+                }
+                check(store.ram_held_bytes() <= store.ram_read_budget(),
+                      "the owner sequence preserves the live store envelope through delivery");
+                read.image.reset();
+                store.release_read(2, 2);
+            }
+        }
+        check(cache.leased_bytes() == lease, "reclamation never refunds a separate live lease");
+        if (scenario == Case::view_allocation)
+            check(!coverage && dirty, "failed optional view allocation removes stale coverage and leaves it dirty");
+        bool retained = true;
+        auto restored = cache.take(protected_index, retained);
+        check(!retained && images_equal(restored, fallback, why),
+              "the original RAM fallback remains consumable after success, cancellation or real disk failure");
+        cache.release_lease(lease);
+        store.close();
+    }
+}
+
+void check_demand_reclaim_interleavings() {
+    enum class Case { active_reader, rearmed_speculation, larger_head };
+    for (const auto scenario : {Case::active_reader, Case::rearmed_speculation, Case::larger_head}) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        SelectedHoldGate gate;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.chunk_bytes = 1u << 20; // serving object size: a peak race, not a writer-workspace refusal
+        options.max_reads = 2;
+        ConversationStore store(options);
+        const auto disk = fixture(165, 4096), peer = fixture(167, 8);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, disk, 1, 1, published) &&
+                  publish_and_wait(store, peer, 3, 1, published), "interleaved demand fixtures are durable");
+        std::string why;
+        auto query = query_of(disk, 2, 2);
+        query.deadline_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()) + uint64_t(60) * 1000000000;
+        ConversationStoreReadRefusal quote;
+        const uint64_t idle_charge = store.ram_held_bytes();
+        store.publish_read_allowance(idle_charge + 1);
+        if (store.demand(query, why, &quote) || !quote.additional_ram_bytes) {
+            check(false, "the interleaved fixture starts with a fresh peak refusal");
+            continue;
+        }
+        if (scenario != Case::larger_head) {
+            store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+            store.publish_read_allowance(scenario == Case::active_reader ? uint64_t(64) << 20 : 0);
+            check(store.prefetch(query_of(peer, 4, 2), why), "another request retains its own speculative ownership");
+            if (scenario == Case::active_reader) gate.await();
+            else check(await_status(store, 4, 2, ConversationStoreReadStatus::refused_budget),
+                       "speculation waits for actual capacity before the owner reclaims");
+        }
+        const uint64_t held = store.ram_held_bytes();
+        SavedConversation victim = fixture(169, 16), fallback = fixture(171, 32);
+        victim.checkpoints.clear();
+        fallback.checkpoints.clear();
+        victim.live.gdn.resize(scenario == Case::larger_head ? size_t(24) << 20 :
+                              size_t(quote.additional_ram_bytes + held + (1u << 20)), 11);
+        const size_t envelope = victim.bytes() + fallback.bytes() + held + 1;
+        ConversationCache cache(envelope, 2);
+        check(cache.put(std::move(victim)) && cache.put(SavedConversation(fallback)),
+              "interleaved owner has an evictable image and protected rollback");
+        size_t protected_index = 1;
+        bool reclaimed = false, interleaved = false;
+        const auto result = strata::program::admit_store_demand(
+            store, cache, query, why, {envelope, 0, 0}, &protected_index,
+            [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch()).count()); },
+            [&] {
+                // This callback gates real competing work at the post-publication
+                // cancellation check, before the production function's sole retry.
+                if (reclaimed && !interleaved) {
+                    interleaved = true;
+                    if (scenario == Case::rearmed_speculation) gate.await();
+                    if (scenario == Case::larger_head) {
+                        auto grown = disk;
+                        grown.live.gdn.resize(size_t(21) << 20, 13);
+                        ConversationStorePublishResult newer;
+                        check(publish_and_wait(store, grown, 5, 3, newer) &&
+                                  newer.status == ConversationStorePublishStatus::stored,
+                              "a real larger equal-cut head commits between allowance publication and retry");
+                    }
+                }
+                return false;
+            },
+            [&] {
+                reclaimed = true;
+                if (scenario == Case::active_reader)
+                    check(store.ram_held_bytes() == held,
+                          "suspension and cache reclamation do not refund an already active reader");
+            }, []() noexcept {});
+        check(result.recovery_attempted && result.retried && interleaved &&
+                  cache.evictions() == 1 && protected_index == 0,
+              "competing work cannot cause a second reclaim or invalidate the original fallback");
+        gate.resume();
+        if (scenario == Case::larger_head) {
+            check(!result.accepted && store.counters().refused_budget >= 3,
+                  "the sole retry revalidates a larger current head and refuses its new peak");
+        } else {
+            check(result.accepted, "the demand retains a descriptor beside independent speculative work");
+            ConversationStoreRead read;
+            check(store.wait_ready(2, 2, read, 5000) && read.image && images_equal(*read.image, disk, why),
+                  "interleaved demand restores only its own authorized image");
+            read.image.reset();
+            store.release_read(2, 2);
+            check(store.demand(query_of(peer, 4, 2), why) && store.wait_ready(4, 2, read, 5000) &&
+                      read.image && images_equal(*read.image, peer, why),
+                  "the speculative request retains its own body and completion");
+            read.image.reset();
+            store.release_read(4, 2);
+            check(!gate.timed_out, "the actual worker interleaving ends by explicit release, not timeout");
+            store.set_read_gate_for_test(nullptr, nullptr);
+        }
+        check(store.ram_held_bytes() <= store.ram_read_budget(),
+              "competing reads and publication remain within the authoritative allowance");
+        bool retained = true;
+        const auto restored = cache.take(protected_index, retained);
+        check(!retained && images_equal(restored, fallback, why), "a refused retry still has its original RAM rollback");
+        store.close();
+        const auto records = trace.records();
+        check(read_trace_count(records, "admission", 2) <= 1,
+              "the owner retry admits at most one descriptor for the demand identity");
+    }
+}
+
 void check_read_timing() {
     for (bool enabled : {false, true}) {
         StoreReadTraceCapture trace(enabled);
@@ -2516,16 +3462,18 @@ void check_read_timing() {
         ConversationStoreRead miss;
         check(store.wait_ready(7001, 8, miss, 5000) && miss.status == ConversationStoreReadStatus::missing,
               "the timed miss reports its actual no-I/O result");
+        check(miss.materialize_ms == 0, "a no-I/O miss cannot train materialization cost");
+        store.release_read(7001, 8);
         store.publish_read_allowance(1);
         check(!store.demand(query_of(image, 7002, 8), why), "an impossible timed read is refused at admission");
         store.publish_read_allowance(uint64_t(64) << 20);
+        store.release_read(7002, 8);
         store.suspend_read_admission();
         check(store.demand(query_of(image, 7003, 8), why), "a suspended timed demand is queued");
         check(store.request_status(7003, 8) == ConversationStoreReadStatus::none,
               "a suspended timed demand has not materialized");
         store.publish_read_allowance(uint64_t(64) << 20);
         check(await_status(store, 7003, 8, ConversationStoreReadStatus::ready), "the resumed timed demand materializes");
-
         if (enabled) {
             const auto queued_records = trace.records();
             const auto* admission = read_trace(queued_records, "admission", 7003);
@@ -2558,6 +3506,8 @@ void check_read_timing() {
         ConversationStoreRead read;
         check(store.wait_ready(7003, 8, read, 5000) && read.image && images_equal(*read.image, image, why),
               "timing does not change the restored bytes");
+        check(std::isfinite(read.materialize_ms) && read.materialize_ms > 0,
+              "successful full body timing remains available even when tracing is off");
         read.image.reset();
         store.release_read(7003, 8);
         if (enabled) {
@@ -2573,6 +3523,7 @@ void check_read_timing() {
             ConversationStoreRead failed;
             check(store.wait_ready(7006, 8, failed, 5000) && failed.status == ConversationStoreReadStatus::failed &&
                       !failed.image, "a real reader exception settles as a failed cache read");
+            check(failed.materialize_ms == 0, "a failed body cannot contribute a successful timing");
             store.set_read_gate_for_test(nullptr, nullptr);
         }
         store.close();
@@ -2681,11 +3632,21 @@ void check_revoked_prefetch_demand() {
     store.publish_read_allowance(0);
     check(store.prefetch(query_of(image, 104, 1), why), "a budget-limited prefetch is registered");
     check(await_status(store, 104, 1, ConversationStoreReadStatus::refused_budget), "the speculative read is refused");
+    check(store.demand(query_of(image, 104, 1), why), "demand adopts a budget deferral before allowance recovery");
+    ConversationStoreRead premature;
+    check(!store.take_ready(104, 1, premature), "demand adoption removes the old budget-refusal result");
+    SelectedHoldGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
     store.publish_read_allowance(uint64_t(64) << 20);
-    check(store.demand(query_of(image, 104, 1), why), "demand retries after its allowance becomes available");
+    gate.await();
+    check(!store.take_ready(104, 1, premature), "an active adopted reader cannot deliver an unfinished descriptor");
+    gate.resume();
     ConversationStoreRead budget_retry;
     check(store.wait_ready(104, 1, budget_retry, 5000) && budget_retry.image &&
               images_equal(*budget_retry.image, image, why), "a prior speculative budget refusal does not force cold prefill");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    check(!store.take_ready(104, 1, premature), "an adopted deferred image is delivered exactly once before release");
+    check(!gate.timed_out, "the adopted reader's pending interval was exercised deterministically");
     budget_retry.image.reset();
     store.release_read(104, 1);
 
@@ -4149,6 +5110,8 @@ void check_ready_speculation_yields() {
     check(store.demand(query_of(large, 403, 1), why), "the demand adopts the completed speculation");
     ConversationStoreRead read;
     check(store.wait_ready(403, 1, read, 5000) && read.image != nullptr, "the adopted demand is handed out");
+    check(std::isfinite(read.materialize_ms) && read.materialize_ms > 0,
+          "ready adoption preserves full prefetch body timing instead of near-zero demand wait");
     const uint64_t leased = store.ram_lease_bytes();
     check(leased > 0, "the handed-out image is charged to its caller");
     store.publish_read_allowance(uint64_t(8) << 20);

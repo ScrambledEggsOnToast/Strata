@@ -82,6 +82,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/conversation_offers.hpp"
 #include "strata/program/conversation_publication.hpp"
+#include "strata/program/conversation_store_admission.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/serial_judge.hpp"
@@ -513,41 +514,6 @@ constexpr size_t kConversationPreparationBytes = 400u << 20;
 // these objects, and the caller has to know the grid to name the bytes it actually kept.
 constexpr uint64_t kConversationStoreChunkBytes = 1u << 20;
 
-uint64_t conversation_store_ram_limit(const strata::core::ConversationCache& cache, uint64_t envelope,
-                                      uint64_t local_bytes = 0) {
-    // Python preparation and native offers share this envelope with all parked and queued images.
-    const uint64_t preparation = kConversationPreparationBytes + kConversationOfferBytes;
-    uint64_t available = envelope > preparation ? envelope - preparation : 0;
-    const uint64_t cached = cache.envelope_bytes();
-    available = available > cached ? available - cached : 0;
-    return available > local_bytes ? available - local_bytes : 0;
-}
-
-class StoreRamAdmission {
-public:
-    StoreRamAdmission(strata::core::ConversationStore* store, strata::core::ConversationCache& cache,
-                      uint64_t envelope, uint64_t outside_bytes)
-        : store_(store), cache_(cache), envelope_(envelope), outside_bytes_(outside_bytes) {
-        if (store_) store_->suspend_read_admission();
-    }
-    StoreRamAdmission(const StoreRamAdmission&) = delete;
-    StoreRamAdmission& operator=(const StoreRamAdmission&) = delete;
-    ~StoreRamAdmission() { publish(); }
-    void publish(uint64_t local_bytes = 0) {
-        if (store_) {
-            const uint64_t available = conversation_store_ram_limit(cache_, envelope_, local_bytes);
-            store_->publish_read_allowance(available > outside_bytes_ ? available - outside_bytes_ : 0);
-        }
-    }
-    uint64_t held() const {
-        return store_ ? store_->ram_held_bytes() + kConversationPreparationBytes + kConversationOfferBytes : 0;
-    }
-private:
-    strata::core::ConversationStore* store_;
-    strata::core::ConversationCache& cache_;
-    uint64_t envelope_;
-    uint64_t outside_bytes_;
-};
 
 /// Canonical, typed, length-delimited byte sequence for the persistent store's execution-domain digest.  Every field
 /// is written as an explicit little-endian u64 tag/value pair, so two builds cannot disagree about the encoding, and
@@ -11156,8 +11122,9 @@ int main(int argc, char** argv) {
             options.head_limit = (size_t) o.conversation_cache_disk_heads;
             // Named here because the reuse intervals this file offers are aligned to exactly this grid.
             options.chunk_bytes = kConversationStoreChunkBytes;
-            options.read_budget_bytes = conversation_store_ram_limit(conversations,
-                (uint64_t) o.conversation_cache_mib << 20);
+            options.read_budget_bytes = strata::program::ConversationStoreRamBudget{
+                (uint64_t) o.conversation_cache_mib << 20,
+                kConversationPreparationBytes + kConversationOfferBytes, 0}.allowance(conversations);
             strata::core::ConversationStoreLimits limits;
             limits.max_tokens = (uint64_t) o.max_context;
             limits.max_image_bytes = options.read_budget_bytes;
@@ -11200,15 +11167,16 @@ int main(int argc, char** argv) {
             store_faulted = true;
             if (conversation_store) conversation_store->set_unhealthy("non-finite logits");
         };
-        // The store's RAM - its metadata index, materialized read images and publication leases - lives inside the
-        // same envelope as the parked conversations (--conversation-cache-mib).  The allowance is what the parked
-        // payloads and the store's own held bytes leave over: a demand request is always admitted and charged, while
-        // an optional prefetch only takes spare allowance, so a full envelope never delays a required restore.
+        // The store's RAM shares the parked-conversation envelope. Publish its
+        // remaining allowance; a fresh demand refused by that peak may reclaim
+        // eligible parked ownership before one authoritative retry.
         uint64_t publication_outside_bytes = 0; // a taken incoming image and any not-yet-parked capture
         auto store_allowance = [&]() -> uint64_t {
             if (!store_on) return 0;
-            const uint64_t spare = conversation_store_ram_limit(conversations,
-                (uint64_t) o.conversation_cache_mib << 20, publication_outside_bytes);
+            const uint64_t spare = strata::program::ConversationStoreRamBudget{
+                (uint64_t) o.conversation_cache_mib << 20,
+                kConversationPreparationBytes + kConversationOfferBytes,
+                publication_outside_bytes}.allowance(conversations);
             conversation_store->publish_read_allowance(spare);
             return spare;
         };
@@ -11227,6 +11195,19 @@ int main(int argc, char** argv) {
             }
             return h;
         };
+        // Bound after resident slots exist. Publication/park callbacks capture the
+        // callable, not a partially constructed resident view.
+        std::function<void()> publish_ram_view;
+        unsigned ram_view_deferred = 0;
+        bool ram_view_dirty = false;
+        auto refresh_parked_view = [&](size_t count, size_t evictions, size_t superseded) {
+            ram_view_dirty = ram_view_dirty || conversations.size() != count ||
+                conversations.evictions() != evictions || conversations.superseded() != superseded;
+            if (ram_view_dirty && !ram_view_deferred) {
+                publish_ram_view();
+                ram_view_dirty = false;
+            }
+        };
         // The handover's bookkeeping - harvesting settled results, retiring every reference to a head a replacement
         // removed, the generation-guarded adoption of a completion, the coverage proof and the bounded retry policy -
         // lives in strata/program/conversation_publication.hpp. Waiting tickets refer to protected RAM entries;
@@ -11242,6 +11223,7 @@ int main(int argc, char** argv) {
             auto image = std::make_shared<strata::core::SavedConversation>();
             auto owned = conversations.take_publication(ticket);
             if (!owned) return {};
+            ram_view_dirty = true;
             *image = std::move(*owned);
             return image;
         };
@@ -11257,7 +11239,7 @@ int main(int argc, char** argv) {
             if (!conversations.can_fit(image->bytes(), held)) return;
             try {
                 // Retain a cheap read-through alias only in spare RAM; never displace a pending publication.
-                conversations.put(image->frozen_alias(), held);
+                if (conversations.put(image->frozen_alias(), held)) ram_view_dirty = true;
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: RAM alias allocation failed; "
                                      "the store retains publication ownership\n");
@@ -11268,24 +11250,10 @@ int main(int argc, char** argv) {
         };
         auto flush_publishes = [&](uint64_t wait_ms) {
             if (!store_on) return;
+            const size_t count = conversations.size(), evictions = conversations.evictions(),
+                         superseded = conversations.superseded();
             publications.flush(*conversation_store, publication_sink, wait_ms);
-        };
-        // Only this thread may release capture leases and update owner lineages. Pump at
-        // chunk/decode/idle boundaries: the writer cannot consume the queue on its own.
-        // Do not use sp.on_chunk, which can run on a successor stage's worker thread.
-        // Whole-prompt bypasses still hand over work only at request boundaries.
-        const std::thread::id store_seam_thread = std::this_thread::get_id();
-        auto store_seam = [&]() {
-            if (std::this_thread::get_id() != store_seam_thread) return;
-            if (!store_on || !publications.holds_work()) return;
-            store_allowance();
-            flush_publishes(0);
-        };
-        // Every head an owner holds is dropped when the execution domain is invalidated: no head of a retired epoch may
-        // ever be superseded, and a capture queued for it must not be published.  Storage work the store has already
-        // admitted is the store's own to retire when the epoch advances.
-        auto drop_store_publications = [&](const char* why) {
-            publications.abandon(why, publication_sink);
+            refresh_parked_view(count, evictions, superseded);
         };
         // The prepared offers the channel accepted.  Its own thread inserts them; the request path only looks up the
         // deadline of the offer a request binds to (the internal stdin key carries the identifiers, not the tokens,
@@ -11314,12 +11282,45 @@ int main(int argc, char** argv) {
                     if (entry.request_id == request_id && entry.generation == generation) return entry.deadline_ns;
                 return std::nullopt;
             }
+            // The publication seam's revalidation sweep: every still-remembered speculative prefetch may follow the
+            // catalog it now has. Order is oldest first; the store dedupes and refuses on its own terms. A plain
+            // std::function: this class is local, so member templates are not available.
+            void for_each(const std::function<void(uint64_t, uint64_t)>& fn) const {
+                std::lock_guard<std::mutex> lock(mu);
+                for (const auto& entry : entries) fn(entry.request_id, entry.generation);
+            }
             enum : size_t { kKeep = 8 };   // the accepted frontier, oldest first
             mutable std::mutex mu;
             std::deque<Entry> entries;
             uint64_t accepted = 0;
         };
         std::shared_ptr<OfferBook> offer_book = std::make_shared<OfferBook>();
+
+        // Only this thread may release capture leases and update owner lineages. Pump at
+        // chunk/decode/idle boundaries: the writer cannot consume the queue on its own.
+        // Do not use sp.on_chunk, which can run on a successor stage's worker thread.
+        // Whole-prompt bypasses still hand over work only at request boundaries.
+        const std::thread::id store_seam_thread = std::this_thread::get_id();
+        auto store_seam = [&]() {
+            if (std::this_thread::get_id() != store_seam_thread) return;
+            if (!store_on || !publications.holds_work()) return;
+            store_allowance();
+            flush_publishes(0);
+            // A head that just landed may be exactly what an accepted offer speculated about too early: turn those
+            // no-I/O prefetches into real background work here, so the later demand adopts a ready image instead of
+            // materializing inline at its own seam. The store revalidates on its own terms (allowance, slots,
+            // revocation) and refuses anything demanded, active or already handed out.
+            if (offer_book && conversation_store)
+                offer_book->for_each([&](uint64_t request_id, uint64_t generation) {
+                    conversation_store->refresh_speculation(request_id, generation);
+                });
+        };
+        // Every head an owner holds is dropped when the execution domain is invalidated: no head of a retired epoch may
+        // ever be superseded, and a capture queued for it must not be published.  Storage work the store has already
+        // admitted is the store's own to retire when the epoch advances.
+        auto drop_store_publications = [&](const char* why) {
+            publications.abandon(why, publication_sink);
+        };
         // ---- published RAM availability (offer filter only) --------------------
         // The offer callback runs on the channel's thread and must not inspect the mutable RAM cache or GPU state.  It
         // consults this small published view instead: per (authorized scope, steering) the longest cut the engine
@@ -11339,9 +11340,11 @@ int main(int argc, char** argv) {
         };
         std::mutex ram_view_mu;
         std::shared_ptr<const RamView> ram_view = std::make_shared<const RamView>();
-        // Assigned once the resident slots exist (the definition below captures them); empty until then, and the
-        // offers that could consult it cannot arrive before the channel is started.
-        std::function<void()> publish_ram_view = [] {};
+        auto invalidate_ram_view = [&]() noexcept {
+            std::lock_guard<std::mutex> lock(ram_view_mu);
+            ram_view.reset();
+            ram_view_dirty = true;
+        };
         std::atomic<uint64_t> prefetch_suppressed{0};
         // The private inherited channel (one SOCK_SEQPACKET endpoint, no listening socket).  It is CPU-only: the
         // callback below validates nothing about GPU state and only hands a prepared request to the store, which does
@@ -11457,6 +11460,7 @@ int main(int argc, char** argv) {
                                         const strata::core::ConversationScope& scope, bool want_cvec,
                                         uint64_t offer_id, uint64_t offer_generation, uint64_t deadline_ns,
                                         const std::function<bool()>& cancelled,
+                                        size_t* rollback_cache_index,
                                         std::optional<strata::core::SavedConversation>& incoming) -> StoreDemandResult {
             StoreDemandResult out;
             if (!store_on) {
@@ -11471,7 +11475,7 @@ int main(int argc, char** argv) {
                 const auto remembered = offer_book->deadline(offer_id, offer_generation);
                 if (remembered) deadline_ns = *remembered;
             }
-            if (deadline_ns == 0 || deadline_ns <= now_ns()) {
+            if (deadline_ns == 0 || deadline_ns <= now_ns() || cancelled()) {
                 out.status = strata::core::ConversationStoreReadStatus::cancelled;
                 return out;
             }
@@ -11499,10 +11503,32 @@ int main(int argc, char** argv) {
             query.deadline_ns = deadline_ns;
             std::fprintf(stderr, "strata serve: conversation store: demand begin request=%llu generation=%llu tokens=%zu\n",
                          (unsigned long long) query.request_id, (unsigned long long) query.generation, prompt.size());
-            store_allowance();
             std::string why;
-            if (!conversation_store->demand(query, why)) {
-                out.status = conversation_store->request_status(query.request_id, query.generation);
+            const auto admission = strata::program::admit_store_demand(
+                *conversation_store, conversations, query, why,
+                {(uint64_t) o.conversation_cache_mib << 20,
+                 kConversationPreparationBytes + kConversationOfferBytes, publication_outside_bytes},
+                rollback_cache_index, now_ns, cancelled,
+                [&] {
+                    ram_view_dirty = true;
+                    if (ram_view_deferred) {
+                        invalidate_ram_view();
+                    } else {
+                        publish_ram_view();
+                        ram_view_dirty = false;
+                    }
+                }, invalidate_ram_view);
+            const bool admitted = admission.accepted;
+            if (admission.recovery_attempted)
+                std::fprintf(stderr, "strata serve: conversation store: demand RAM reclaim request=%llu "
+                                     "required_increment_bytes=%llu released_bytes=%zu allowance_bytes=%llu retry=%d\n",
+                             (unsigned long long) query.request_id,
+                             (unsigned long long) admission.required_increment_bytes, admission.released_bytes,
+                             (unsigned long long) admission.allowance_bytes, int(admission.retried));
+            if (!admitted) {
+                out.status = cancelled() || now_ns() >= wait_until ?
+                    strata::core::ConversationStoreReadStatus::cancelled :
+                    conversation_store->request_status(query.request_id, query.generation);
                 if (!why.empty())
                     std::fprintf(stderr, "strata serve: conversation store: demand refused (%s)\n", why.c_str());
                 return out;
@@ -11515,8 +11541,8 @@ int main(int argc, char** argv) {
                 bool armed = true;
                 ~UnmountedLease() { if (armed) store.release_read(request, generation); }
             } lease{*conversation_store, query.request_id, query.generation};
-            std::fprintf(stderr, "strata serve: conversation store: demand admitted request=%llu\n",
-                         (unsigned long long) query.request_id);
+            std::fprintf(stderr, "strata serve: conversation store: demand admitted request=%llu admitted_ns=%llu\n",
+                         (unsigned long long) query.request_id, (unsigned long long) now_ns());
             strata::core::ConversationStoreRead read;
             const uint64_t wait_started = now_ns();
             for (;;) {
@@ -11583,9 +11609,9 @@ int main(int argc, char** argv) {
             out.request_id = query.request_id;
             out.generation = query.generation;
             std::fprintf(stderr, "strata serve: conversation store: demand ready request=%llu head=%llu tokens=%lld "
-                                 "wait_ms=%.1f\n", (unsigned long long) query.request_id,
+                                 "wait_ms=%.1f materialize_ms=%.3f ready_ns=%llu\n", (unsigned long long) query.request_id,
                          (unsigned long long) read.head_id, (long long) read.tokens,
-                         (double) (now_ns() - wait_started) / 1e6);
+                         (double) (now_ns() - wait_started) / 1e6, read.materialize_ms, (unsigned long long) now_ns());
             // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
             // (ram_lease_bytes) until this process reports the read finished.  That report is release_read(), and the
             // caller makes it at its own end-of-request seam - after the engine's alias of the image is gone, which
@@ -11789,8 +11815,10 @@ int main(int argc, char** argv) {
                 store_allowance();
                 flush_publishes(0);
             }
-            StoreRamAdmission store_admission(store_on ? conversation_store.get() : nullptr, conversations,
-                                              (uint64_t) o.conversation_cache_mib << 20, held);
+            strata::program::StoreRamAdmission store_admission(
+                store_on ? conversation_store.get() : nullptr, conversations,
+                {(uint64_t) o.conversation_cache_mib << 20,
+                 kConversationPreparationBytes + kConversationOfferBytes, held});
             const uint64_t capture_epoch = store_on ? conversation_store->epoch() : 0;
             const uint64_t external = store_admission.held();
             if (external > SIZE_MAX - held) return true;
@@ -12112,11 +12140,24 @@ int main(int argc, char** argv) {
         // ending the server
         auto park_source = [&](const ParkSource& source, size_t held,
                                const strata::core::SavedConversation* held_image, size_t held_entries = 0) -> bool {
-            try { return park_source_body(source, held, held_image, held_entries); }
-            catch (const std::bad_alloc&) {
-                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
-                return true;
+            const size_t count = conversations.size(), evictions = conversations.evictions(),
+                         superseded = conversations.superseded();
+            bool okay = true;
+            {
+                // Split checkpoint chains must be merged before the view walks
+                // them. Also cover pressure eviction followed by a skipped park.
+                struct DeferView {
+                    unsigned& depth;
+                    explicit DeferView(unsigned& value) : depth(value) { ++depth; }
+                    ~DeferView() { --depth; }
+                } defer(ram_view_deferred);
+                try { okay = park_source_body(source, held, held_image, held_entries); }
+                catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                }
             }
+            if (store_on) refresh_parked_view(count, evictions, superseded);
+            return okay;
         };
         auto park_current = [&](size_t held, const strata::core::SavedConversation* held_image, size_t held_entries = 0,
                                 bool continues = true) -> bool {
@@ -15412,8 +15453,8 @@ int main(int argc, char** argv) {
                 // refuse it.  A failed commit leaves the run intent armed, so the next start is conservative too.
                 if (store_on) conversation_store->invalidate_domain("non-finite logits");
                 drop_store_publications("the execution domain advanced after the capture");
-                if (store_on) publish_ram_view();   // the parked set just went away
                 const auto slots_dropped = resident.invalidate_after_nonfinite();   // running tainted, idle caches dropped
+                if (store_on) publish_ram_view();
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
@@ -15557,18 +15598,10 @@ int main(int argc, char** argv) {
                               session_work((int64_t) image.live.ids.size(), false), PrefixTransfer::parked},
                              prefix_costs.transfer_ms(PrefixTransfer::checkpoint, rewind));
                 });
-            // The persistent store's own candidates: a bounded, metadata-only scan of catalog-authorized manifests,
-            // longest cut first and newest first on ties, with no payload and no GPU pointer exposed.  Persistence
-            // extends the retained history; it never changes which existing source is preferred, and an equally long
-            // RAM/live/resident cut keeps winning because this enumeration runs after theirs.  Its restore time stays
-            // uncalibrated on purpose: cost selection then keeps its longest-prefix rollback rather than inventing an
-            // SSD rate.  The selection without the store is kept in case the stored image cannot be materialized: a
-            // miss must fall back to exactly the source this request would otherwise have used.
-            struct StoreCandidateBackup {
-                PrefixCandidate longest, cheapest;
-                bool considered = false;
-            };
-            StoreCandidateBackup store_candidate_backup;
+            // Catalog-authorized exact cuts, longest/newest first; equal RAM cuts retain their original tie order.
+            // Disk cost remains unknown, preserving the longest-prefix rollback.
+            // Keep the pre-store selection so a failed demand falls back without consuming or changing that source.
+            PrefixCandidate store_candidate_backup;
             // The store's queries carry exact prompt tokens as int32 (its own prefix confirmation hashes int32 ids);
             // parse_i64_list already bounds every request id, so this narrowing is checked, not truncating.
             std::vector<int32_t> store_prompt;
@@ -15578,7 +15611,7 @@ int main(int argc, char** argv) {
                 strata::core::ConversationStoreSelector store_selector = store_selector_base;
                 store_selector.scope = req_scope;
                 store_selector.cvec = want_cvec;
-                const PrefixCandidate longest_before_store = longest, cheapest_before_store = cheapest;
+                store_candidate_backup = choice.using_cost() ? cheapest : longest;
                 bool store_seen = false;
                 conversation_store->for_each_match(store_selector, store_prompt, req_imgs,
                     [&](const strata::core::ConversationStoreMatch& match) {
@@ -15594,7 +15627,6 @@ int main(int argc, char** argv) {
                         candidate.transfer = PrefixTransfer::parked;   // accounting label only: no rate is claimed
                         consider(std::move(candidate), std::nullopt);
                     });
-                store_candidate_backup = {longest_before_store, cheapest_before_store, store_seen};
             }
             PrefixCandidate selected = choice.using_cost() ? cheapest : longest;
             if (yielded_source >= 0) {
@@ -15628,7 +15660,9 @@ int main(int argc, char** argv) {
             if (selected.source == PrefixSource::disk) {
                 store_demand = store_demand_restore(store_prompt, req_imgs, req_scope, want_cvec,
                                                     req_cache_offer, req_cache_generation, req_cache_deadline_ns,
-                                                    [&] { return stop_req.load(); }, incoming);
+                                                    [&] { return stop_req.load(); },
+                                                    store_candidate_backup.source == PrefixSource::parked ?
+                                                        &store_candidate_backup.parked.index : nullptr, incoming);
                 if (store_demand.mounted) {   // arm the guard for every path, including a rejected mount
                     store_demand_lease.store = conversation_store.get();
                     store_demand_lease.request_id = store_demand.request_id;
@@ -15648,7 +15682,7 @@ int main(int argc, char** argv) {
                                      (unsigned long long) selected.store_head);
                 } else {
                     incoming.reset();
-                    selected = choice.using_cost() ? store_candidate_backup.cheapest : store_candidate_backup.longest;
+                    selected = store_candidate_backup;
                     std::fprintf(stderr, "strata serve: conversation store: reading the prompt instead (source=%s "
                                          "tokens=%lld)\n",
                                  selected.source == PrefixSource::live ? "live" :
@@ -15669,6 +15703,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: restore alias allocation failed; "
                                          "reading the prompt instead\n");
                 }
+                if (store_on && incoming && !incoming_retained_in_cache) publish_ram_view();
             }
             int64_t resume = selected.source == PrefixSource::checkpoint || selected.source == PrefixSource::live
                 ? selected.tokens : 0;
@@ -15684,7 +15719,7 @@ int main(int argc, char** argv) {
                     yielded_source >= 0 ? "yielded" : selected.source == PrefixSource::live ? "live" :
                     selected.source == PrefixSource::checkpoint ? "checkpoint" :
                     selected.source == PrefixSource::resident ? "resident" :
-                    selected.source == PrefixSource::parked ? "parked" : "cold",
+                    selected.source == PrefixSource::parked ? "parked" : selected.source == PrefixSource::disk ? "disk" : "cold",
                     (long long) selected.tokens, (long long) longest.tokens,
                     yielded_source >= 0 ? "forced" : choice.using_cost() ? "cost" :
                     !choice.longest_known() ? "longest-unknown" : "longest-tie-or-margin",
@@ -15763,9 +15798,6 @@ int main(int argc, char** argv) {
             // whether its history is continued at all (ckpt=0 is a one-shot that must neither be parked nor supersede
             // a donor) and whether it left only a pinned-sibling suffix, which is deliberately not parked.
             exit_park_allowed = req_ckpt != 0 && !pin_sibling;
-            // The park above changed what RAM holds (a new/refreshed entry, or an eviction): refresh the view the
-            // next request's offers are filtered against.  Metadata only, on this thread.
-            if (store_on) publish_ram_view();
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 // Retained RAM K/V belongs to the previous working state, not

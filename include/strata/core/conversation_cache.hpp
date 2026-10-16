@@ -484,17 +484,38 @@ public:
         }
     }
 
-    // Admit capture bytes, not a published entry. A full entry table must not
-    // evict a queued history before capture can fail or replace its older image.
-    // held is a taken incoming image, still alive and fully charged during capture.
-    bool reserve_snapshot(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > room(held)) return false;
-        if (bytes() > room(held) - incoming) reuse_ = {};
-        while (!entries_.empty() && bytes_ > room(held) - incoming) {
-            // Only ordinary, unpinned entries may leave. Pending publications
-            // keep their sole owner even when genuine capacity refusal follows.
-            if (!evict_oldest()) return false;
+    // Admit snapshot/materialization bytes, not a parked entry. Plan before mutation:
+    // impossible reservations preserve every owner, retained reuse and the fallback index.
+    // held is outside ownership, still alive and fully charged. A protected parked
+    // fallback survives successful reclamation and its index follows compaction.
+    bool reserve_snapshot(size_t incoming, size_t held = 0, size_t* protected_index = nullptr) {
+        if (!enabled() || held > budget_ || incoming > room(held) ||
+            (protected_index && *protected_index >= entries_.size())) return false;
+        const size_t limit = room(held) - incoming;
+        if (bytes() <= limit) return true;
+        const size_t keep = protected_index ? *protected_index : entries_.size();
+        size_t remaining = bytes_, victims = 0;
+        for (size_t i = 0; i < entries_.size() && remaining > limit; ++i) {
+            if (i != keep && evictable(entries_[i])) {
+                remaining -= entries_[i].bytes();
+                ++victims;
+            }
         }
+        if (remaining > limit) return false;
+
+        // Optional retained K/V goes first. Movement, destruction and deque
+        // shrinkage need no new allocation after the plan has been accepted.
+        reuse_ = {};
+        size_t write = 0, left = victims;
+        for (size_t read = 0; read < entries_.size(); ++read) {
+            if (left && read != keep && evictable(entries_[read])) { --left; continue; }
+            if (protected_index && read == keep) *protected_index = write;
+            if (write != read) entries_[write] = std::move(entries_[read]);
+            ++write;
+        }
+        while (entries_.size() > write) entries_.pop_back();
+        bytes_ = remaining;
+        evictions_ += victims;
         return true;
     }
 

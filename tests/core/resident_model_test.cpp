@@ -271,10 +271,11 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(owner.begin(-1, prompt, request, error), "begin request A");
         const uint64_t aid = owner.working().request, seed = owner.working().sampling.seed;
         require(seed != 0, "automatic seed resolved");
-        core::ConversationCheckpoint checkpoint;
+        std::vector<core::ConversationCheckpoint> checkpoint_chain(1);
+        auto& checkpoint = checkpoint_chain.front();
         checkpoint.ids = prefix;
         require(core::conversation_checkpoint_save(checkpoint, main, geometry, error), "save real working checkpoint");
-        program::ResidentAdmission admission{33, &checkpoint};
+        program::ResidentAdmission admission{33, &checkpoint_chain};
         const auto* main_gdn=main.gdn_state;
         const auto* slot_gdn=a.gdn_state;
         const auto* slot_qsa=a.qsa_states;
@@ -318,12 +319,14 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         require(owner.working().request == aid && owner.working().sampling.seed == seed && owner.working().resume_slot == 0,
                 "solo-to-resident promotion retains identity and automatic seed");
         require(owner.resume(0, nullptr, error), "restore yielded request");
-        admission.checkpoint = &owner.slots()[0].checks.at(0);
+        auto aliased_source = owner.completed_snapshot_source(0, error);
+        require(aliased_source.has_value(), "completed source exposes the actual mutable checkpoint chain");
+        admission.checkpoints = &aliased_source->checkpoints;
         require(owner.park(0, prefix, admission, true, error), "yield same identity again");
         require(owner.slots()[0].request == aid && &owner.slots()[0].ids == history, "repark keeps stable owner/history object");
         require(owner.slots()[0].checks.size() == 1 && owner.slots()[0].checks[0].ids == prefix,
                 "aliased checkpoint survives repark");
-        admission.checkpoint = &checkpoint;
+        admission.checkpoints = &checkpoint_chain;
         owner.cancel(0);
         require(!owner.slots()[0].partial && !owner.slots()[0].active, "cancel invalidates yielded continuation");
         require(owner.begin(0, prompt, request, error), "cancelled yield starts a new request");
@@ -529,7 +532,8 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
         require(owner.begin(-1, prompt, request, error), "begin working request");
         const auto identity = owner.working().request, seed = owner.working().sampling.seed;
         require(seed != 0, "resolved seed retained across yields");
-        core::ConversationCheckpoint checkpoint;
+        std::vector<core::ConversationCheckpoint> checkpoint_chain(1);
+        auto& checkpoint = checkpoint_chain.front();
         checkpoint.ids = prefix;
         device(stages[0].device);
         require(core::conversation_checkpoint_save(checkpoint, *stages[0].main, geometry, error),
@@ -541,7 +545,7 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
             require(core::conversation_checkpoint_save(checkpoint.stage_parts[i - 1], *stages[i].main, geometry, error),
                     "capture every later-stage checkpoint");
         }
-        program::ResidentAdmission admission{33, &checkpoint};
+        program::ResidentAdmission admission{33, &checkpoint_chain};
         auto opening = capture(-1);
         require(owner.park(0, prefix, admission, true, error), "park working request");
         require(equal(opening, capture(0)), "admission preserves every stage and draft payload");

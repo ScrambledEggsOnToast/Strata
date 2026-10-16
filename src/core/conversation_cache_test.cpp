@@ -405,6 +405,58 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {
+        const auto fallback = image({21, 22, 23});
+        const size_t one = fallback.bytes(), lease = 128, outside = 256;
+        ConversationCache cache(3 * one + lease + outside + 64, 3);
+        check(cache.put(image({11, 12, 13})) && cache.put(SavedConversation(fallback)) &&
+                  cache.put(image({31, 32, 33})),
+              "reclamation starts with an older and newer victim around the fallback");
+        check(cache.try_reserve_lease(lease), "an outstanding lease remains separately charged");
+        auto match = cache.best(std::vector<int32_t>{21, 22, 23, 24}, {}, true, test_scope);
+        check(cache.reserve_snapshot(64, outside, &match.index) && cache.size() == 3,
+              "a byte reservation needs no spare parked-entry slot");
+        check(cache.reserve_snapshot(2 * one + 64, outside, &match.index),
+              "reclamation can remove eligible entries on both sides of a protected fallback");
+        check(cache.size() == 1 && cache.evictions() == 2 && match.index == 0 &&
+                  cache.bytes() == one && cache.leased_bytes() == lease,
+              "compaction rebases the fallback without refunding held ownership");
+        bool retained = true;
+        auto restored = cache.take(match.index, retained);
+        check(!retained && same_image(restored, fallback),
+              "compaction preserves the original parked fallback for later consumption");
+    }
+    {
+        auto victim = image({11, 12, 13}), fallback = image({21, 22, 23}),
+             pinned = image({31, 32, 33}), pending = image({41, 42, 43});
+        pinned.checkpoints.push_back(pinned.live);
+        pinned.checkpoints.back().pinned = true;
+        pending.publication_ticket = 17;
+        pending.freeze();
+        std::vector<ConversationKv> layers(1);
+        layers[0].k.resize(400, 9);
+        const size_t reuse = layers.capacity() * sizeof(ConversationKv) + layers[0].bytes();
+        const size_t payload = victim.bytes() + fallback.bytes() + pinned.bytes() + pending.bytes();
+        const size_t lease = 128, outside = 256;
+        ConversationCache cache(payload + reuse + lease + outside, 4);
+        check(cache.put(SavedConversation(victim)) && cache.put(SavedConversation(fallback)) &&
+                  cache.put(SavedConversation(pinned)) && cache.put(SavedConversation(pending)),
+              "mixed reclamation fixture keeps ordinary, protected, pinned and pending ownership");
+        cache.retain(std::move(layers), 16);
+        check(cache.try_reserve_lease(lease), "mixed fixture holds a publication lease");
+        auto match = cache.best(std::vector<int32_t>{21, 22, 23, 24}, {}, true, test_scope);
+        const size_t before = cache.envelope_bytes(), original_index = match.index;
+        check(!cache.reserve_snapshot(victim.bytes() + reuse + 1, outside, &match.index),
+              "one byte beyond all eligible reclamation refuses atomically");
+        check(cache.envelope_bytes() == before && cache.retained_bytes() == reuse &&
+                  cache.evictions() == 0 && cache.size() == 4 && match.index == original_index &&
+                  cache.has_publication(17) && cache.leased_bytes() == lease,
+              "failed reclamation changes no payload, reuse, lease, publication or fallback position");
+        const SavedConversation* expected[] = {&victim, &fallback, &pinned, &pending};
+        cache.for_each_image([&](size_t index, const auto& current) {
+            check(same_image(current, *expected[index]), "impossible reclamation preserves every original image");
+        });
+    }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
     {
         ConversationCache cache(1024, 2);

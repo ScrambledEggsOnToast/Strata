@@ -281,6 +281,16 @@ struct PendingFile {
     uint64_t head_id = 0;   // the retired head it belonged to; 0 never defers
 };
 
+constexpr uint64_t kPendingMetadataBytes = sizeof(PendingFile) + 2 * kAllocSlackBytes;
+
+// Retired selected heads can outlive their publisher. Their existing index nodes and eventual retire records must
+// remain counted without relying on that writer's transient reservation; moving a last lease into the retire queue
+// consumes this reserved metadata rather than allocating an uncharged second lifetime.
+uint64_t head_hold_metadata_bytes(size_t objects) {
+    return sat_add(3 * kMapNodeBytes + kPendingMetadataBytes,
+                   sat_mul(uint64_t(objects), sizeof(Digest) + kPendingMetadataBytes));
+}
+
 // Every host byte one admitted publication can hold at once, counted before any of it is allocated.  Each field is an
 // upper bound on one phase's structures; `peak` is the largest sum of them that can be live together, so the writer
 // never allocates beyond what it reserved (see publish() and publish_body()).
@@ -616,15 +626,25 @@ bool write_object_file(RootDirs& dirs, const std::string& temp, const Digest& id
     return ok;
 }
 
-// The mandatory verification: an object is trusted only after its bytes have reproduced its own content address.  The
-// bytes are hashed and written from the *same* descriptor in one pass, so verification and restore can never disagree
-// about which bytes were checked, and no buffer is trusted before every digest has matched.
-bool hash_and_copy_object(int shard, const std::string& name, uint64_t size, conversation_store_detail::Sha256& hash,
-                          StreamWrite& write, uint64_t offset, std::vector<uint8_t>& slab, Digest& out,
-                          std::string& why) {
+// Own the current validated object descriptor through its synchronous hash/copy, including error exits.
+struct ReadObject {
+    int fd = -1;
+    ReadObject() = default;
+    ReadObject(const ReadObject&) = delete;
+    ReadObject& operator=(const ReadObject&) = delete;
+    ~ReadObject() { if (fd >= 0) ::close(fd); }
+};
+
+bool open_read_object(const RootDirs& dirs, const Digest& object, uint64_t size, ReadObject& out,
+                      std::string& why) {
+    const std::string name = sha256_hex(object);
+    const int shard = open_shard_fd(dirs, name.substr(0, 2), why);
+    if (shard < 0) return false;
     const int fd = ::openat(shard, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const int open_error = errno;
+    ::close(shard);
     if (fd < 0) {
-        why = std::string("cannot open an object: ") + std::strerror(errno);
+        why = std::string("cannot open an object: ") + std::strerror(open_error);
         return false;
     }
     struct stat info {};
@@ -633,28 +653,32 @@ bool hash_and_copy_object(int shard, const std::string& name, uint64_t size, con
         ::close(fd);
         return false;
     }
+    out.fd = fd;
+    return true;
+}
+
+// Hash and restore from the same validated descriptor. No image is delivered until every object digest matches.
+bool hash_and_copy_object(int fd, uint64_t size, conversation_store_detail::Sha256& hash,
+                          StreamWrite& write, uint64_t offset, std::vector<uint8_t>& slab, Digest& out,
+                          std::string& why) {
     uint64_t left = size;
     while (left) {
         const ssize_t n = ::read(fd, slab.data(), size_t(std::min<uint64_t>(slab.size(), left)));
         if (n < 0) {
             if (errno == EINTR) continue;
             why = std::string("cannot read an object: ") + std::strerror(errno);
-            ::close(fd);
             return false;
         }
         if (n == 0) {
             why = "an object is shorter than the manifest says";
-            ::close(fd);
             return false;
         }
         hash.update(slab.data(), size_t(n));
         if (!write(offset + size - left, slab.data(), size_t(n), why)) {
-            ::close(fd);
             return false;
         }
         left -= uint64_t(n);
     }
-    ::close(fd);
     out = hash.digest();
     return true;
 }
@@ -783,8 +807,8 @@ struct ConversationStore::Impl {
         uint64_t bytes = 0;            // its conservative allocated charge
         uint32_t refs = 0;
     };
-    std::map<Digest, ObjectState> objects;                  // every object the catalog authorizes
-    std::map<uint64_t, std::vector<Digest>> head_objects;   // head id -> the objects its manifest names
+    std::map<Digest, ObjectState> objects;                  // catalog and request-held retired object references
+    std::map<uint64_t, std::vector<Digest>> head_objects;   // retained or selected retired head -> referenced objects
     // In-flight publication leases: every object a publication will *reference without creating* is pinned here from
     // the instant the publication finds it until that transaction settles.  A deduplicated chunk is usually owned by
     // some retained head, and make_room() may evict that head - its sole owner - while the publication that names it
@@ -795,7 +819,7 @@ struct ConversationStore::Impl {
     };
     std::map<Digest, ObjectLease> object_leases;
     std::map<uint64_t, uint64_t> head_manifest_bytes;       // head id -> its manifest's allocated charge
-    std::map<uint64_t, uint32_t> head_leases;               // head id -> images still using it
+    std::map<uint64_t, uint32_t> head_leases;               // selected metadata holds, through image owner release
     std::map<uint64_t, uint64_t> head_recency;              // RAM-only eviction recency (published order is fallback)
     uint64_t recency_counter = 0;
     std::set<uint64_t> eviction_excluded;                   // heads protected by the in-flight publication
@@ -829,6 +853,8 @@ struct ConversationStore::Impl {
         bool active = false;              // a reader thread is materializing it right now
         std::atomic<bool> cancelled{false};
         bool speculation_revoked = false; // internal eviction is retryable demand, unlike caller cancellation
+        bool budget_deferred = false;    // accepted speculation, not an initial admission refusal
+        uint64_t deferred_available = 0;  // last usable capacity; retry only on a meaningful recovery
         bool released = false;
         bool handed = false;
         bool leased = false;              // this job holds a slot in head_leases
@@ -843,9 +869,13 @@ struct ConversationStore::Impl {
         uint64_t epoch_at_admission = 0;
         uint64_t head_id = 0;
         uint64_t tokens = 0;
+        uint64_t published_order = 0;    // equal-cut rebinds may only move to a newer publication
+        Digest manifest_id{};             // authority captured atomically with the selected-head lease
+        uint64_t manifest_bytes = 0;
         bool live = false;
         uint32_t stages = 0;
         uint64_t payload_bytes = 0;
+        double materialize_ms = 0;
         std::shared_ptr<const SavedConversation> image;
         std::string detail;
         // Diagnostic scalars only. They do not participate in cancellation, admission or accounting.
@@ -865,6 +895,8 @@ struct ConversationStore::Impl {
 #ifdef STRATA_STORE_TEST_HOOKS
     void (*read_gate)(void*) = nullptr;
     void* read_gate_context = nullptr;
+    void (*catalog_gate)(void*, bool) = nullptr;
+    void* catalog_gate_context = nullptr;
 #endif
 
     // ---- publication ----
@@ -1037,8 +1069,9 @@ struct ConversationStore::Impl {
 
     // Read pipeline.  Settlement is idempotent and every path funnels through it.
     bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why,
-                          StoreReadTraceBatch& trace);
+                          StoreReadTraceBatch& trace, ConversationStoreReadRefusal* refusal);
     bool refresh_read_locked(const std::shared_ptr<ReadJob>& job, StoreReadTraceBatch& trace);
+    void retry_budget_deferred_locked(StoreReadTraceBatch& trace);
     void settle_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status, std::string detail,
                            StoreReadTraceBatch& trace);
     void retire_job_locked(const std::shared_ptr<ReadJob>& job, ConversationStoreReadStatus status,
@@ -1046,6 +1079,7 @@ struct ConversationStore::Impl {
     void retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail,
                              StoreReadTraceBatch& trace, const char* reason);
     void revoke_speculation_locked(StoreReadTraceBatch& trace, bool because_of_demand = true);
+    void expire_reads_locked(StoreReadTraceBatch& trace);
     StoreReadTrace trace_state_locked(const char* event, const char* reason, ConversationStoreReadStatus status) const;
     uint64_t trace_wait_locked(const ReadJob& job) const;
     void trace_job_locked(StoreReadTraceBatch& trace, const ReadJob& job, const char* event, const char* reason,
@@ -1079,6 +1113,7 @@ struct ConversationStore::Impl {
         std::shared_ptr<SavedConversation> image;   // the restored image, on a `ready` verdict
         uint64_t payload_bytes = 0;
         uint32_t stages = 0;
+        double materialize_ms = 0;
     };
     void read_body(const std::shared_ptr<ReadJob>& job, ReadOutcome& out, StoreReadTraceBatch& trace);
 
@@ -1689,10 +1724,12 @@ void ConversationStore::Impl::release_object_leases(const std::shared_ptr<Publis
 uint64_t ConversationStore::Impl::retire_head_locked(uint64_t head_id) {
     PendingFile manifest;
     bool have_manifest = false;
+    size_t head_at = catalog.heads.size();
     for (size_t i = 0; i < catalog.heads.size(); ++i) {
         if (catalog.heads[i].head_id != head_id) continue;
+        head_at = i;
         const Digest id = catalog.heads[i].manifest_id;
-        bool shared = false;   // defensive: never queue a manifest another retained head still names
+        bool shared = false;
         for (size_t j = 0; j < catalog.heads.size(); ++j)
             if (j != i && catalog.heads[j].manifest_id == id) shared = true;
         if (digest_nonzero(id) && !shared) {
@@ -1703,37 +1740,61 @@ uint64_t ConversationStore::Impl::retire_head_locked(uint64_t head_id) {
             manifest.head_id = head_id;
             have_manifest = true;
         }
-        catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
         break;
     }
-    uint64_t freed = manifest.charge;
-    if (have_manifest) {
-        reclaimable += manifest.charge;
-        pending_files.push_back(std::move(manifest));
-    }
+    const bool held = head_leases.count(head_id) != 0;
     const auto list = head_objects.find(head_id);
+    const size_t before = pending_files.size();
+    // Prepare every allocating filename and queue slot before changing catalog
+    // authority or any object reference. A final-lease retry must never decrement
+    // a shared object twice after an allocation failure partway through a head.
+    try {
+        const size_t room = (have_manifest ? 1 : 0) + (!held && list != head_objects.end() ? list->second.size() : 0);
+        pending_files.reserve(before + room);
+        if (have_manifest) pending_files.push_back(std::move(manifest));
+        if (!held && list != head_objects.end()) {
+            for (const Digest& object : list->second) {
+                const auto state = objects.find(object);
+                if (state == objects.end() || state->second.refs != 1) continue;
+                if (!fault_steps.empty()) {
+                    const auto fault = fault_steps.find("retire-object-prepare");
+                    if (fault != fault_steps.end()) {
+                        fault_steps.erase(fault);
+                        throw std::bad_alloc();
+                    }
+                }
+                PendingFile file;
+                file.where = Where::objects;
+                file.object = object;
+                file.name = sha256_hex(object);
+                file.shard = file.name.substr(0, 2);
+                file.charge = state->second.bytes;
+                file.head_id = head_id;
+                pending_files.push_back(std::move(file));
+            }
+        }
+    } catch (...) {
+        pending_files.resize(before);
+        throw;
+    }
+    if (head_at != catalog.heads.size())
+        catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(head_at));
+    uint64_t freed = 0;
+    for (size_t i = before; i < pending_files.size(); ++i) {
+        reclaimable += pending_files[i].charge;
+        freed += pending_files[i].charge;
+    }
+    // A retired selected head retains all object references until its final
+    // request lease ends. Its pending manifest cannot be reclaimed while held.
+    if (held) return freed;
     if (list != head_objects.end()) {
         for (const Digest& object : list->second) {
             auto state = objects.find(object);
-            if (state == objects.end()) continue;
-            if (state->second.refs > 0) --state->second.refs;
-            if (state->second.refs != 0) continue;
-            PendingFile file;
-            file.where = Where::objects;
-            file.object = object;
-            file.shard = sha256_hex(object).substr(0, 2);
-            file.name = sha256_hex(object);
-            file.charge = state->second.bytes;
-            file.head_id = head_id;
-            reclaimable += file.charge;
-            freed += file.charge;
-            pending_files.push_back(std::move(file));
+            if (state != objects.end() && state->second.refs > 0) --state->second.refs;
         }
         head_objects.erase(list);
     }
     head_manifest_bytes.erase(head_id);
-    // The lease count is NOT erased here: an open hold or a handed-out image keeps it until it finishes, and only
-    // then may the files it still reads be deleted and credited.
     head_recency.erase(head_id);
     eviction_excluded.erase(head_id);
     return freed;
@@ -2068,6 +2129,15 @@ void ConversationStore::Impl::reclaim_pending() {
         // catalog's files may be deleted: every pending file is retained, stays charged, and awaits a restart that
         // re-reads the authority.
         if (faulted) return;
+        // A final-lease release may have lacked room for its retire queue. Retry before reclaiming files.
+        for (auto it = head_objects.begin(); it != head_objects.end();) {
+            const uint64_t head = it->first;
+            ++it;
+            Digest manifest{};
+            uint64_t bytes = 0;
+            if (!head_leases.count(head) && !head_manifest_locked(head, manifest, bytes))
+                retire_head_locked(head);
+        }
         std::vector<PendingFile> keep;
         keep.reserve(pending_files.size());
         // Every move below stays inside the room reserved here, so a failed allocation can neither lose a pending
@@ -2143,7 +2213,9 @@ void ConversationStore::Impl::recount_metadata_locked() {
     // exactly the escape the transaction must not have.
     uint64_t bytes = conversation_store_detail::catalog_encoded_size(catalog);
     bytes += uint64_t(objects.size()) * kObjectBytesEstimate;
-    for (const auto& entry : head_objects) bytes += uint64_t(entry.second.size()) * sizeof(Digest);
+    bytes = sat_add(bytes, sat_mul(uint64_t(pending_files.size()), kPendingMetadataBytes));
+    for (const auto& entry : head_objects)
+        bytes = sat_add(bytes, head_hold_metadata_bytes(entry.second.size()));
     metadata = bytes;
 }
 
@@ -2313,6 +2385,16 @@ void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace
 CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
     StoreReadTraceBatch trace;
     std::vector<uint8_t> encoded;
+#ifdef STRATA_STORE_TEST_HOOKS
+    void (*gate)(void*, bool) = nullptr;
+    void* gate_context = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        gate = catalog_gate;
+        gate_context = catalog_gate_context;
+    }
+    if (gate) gate(gate_context, false);
+#endif
     // ---- plan, count, admit and stage, under the lock, before any durable byte changes.  Every failure below
     // leaves the previously committed catalog as the authority ----
     try {
@@ -2354,6 +2436,15 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
                 }
                 break;
         }
+        // Selection and retirement planning use the same mutex. A lease acquired after victim choice but before
+        // staging wins; a lease acquired after staging owns its captured manifest and files through durable apply.
+        // Covered replacement is allowed: its old request-owned authority remains usable, without pinning a slot.
+        if (plan.kind != CommitPlan::Kind::invalidate)
+            for (uint64_t victim : plan.retiring)
+                if (victim != plan.replaced_head && head_leases.count(victim)) {
+                    why = "a selected-head lease was acquired before retirement staging";
+                    return CommitOutcome::unchanged;
+                }
         encoded = conversation_store_detail::catalog_encode(plan.candidate);
         plan.new_catalog_charge = allocated_charge(encoded.size());
         if (!admit_catalog_copy_locked(plan.new_catalog_charge, plan.candidate, why))
@@ -2369,6 +2460,9 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         return CommitOutcome::unchanged;
     }
     trace.emit(); // planned is not retired; logging never holds the catalog mutex
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (gate) gate(gate_context, true);
+#endif
 
     std::string temp = temp_name();
     bool written = false;
@@ -2737,7 +2831,19 @@ void ConversationStore::Impl::release_head_lease_locked(const std::shared_ptr<Re
     const auto lease = head_leases.find(job->head_id);
     if (lease == head_leases.end()) return;
     if (lease->second > 0) --lease->second;
-    if (lease->second == 0) head_leases.erase(lease);
+    if (lease->second == 0) {
+        head_leases.erase(lease);
+        Digest manifest{};
+        uint64_t bytes = 0;
+        if (head_manifest_bytes.count(job->head_id) && !head_manifest_locked(job->head_id, manifest, bytes)) {
+            try {
+                retire_head_locked(job->head_id);
+                recount_metadata_locked();
+            } catch (const std::bad_alloc&) {
+                // Keep refs and their charge if the retire queue cannot grow; reclaim_pending retries it.
+            }
+        }
+    }
 }
 
 // The read's own preparation beyond its query copy - the manifest read and decode it reserved and the scaffolding it
@@ -2760,6 +2866,7 @@ void ConversationStore::Impl::free_job_prep_locked(const std::shared_ptr<ReadJob
 }
 
 void ConversationStore::Impl::erase_job_locked(const std::shared_ptr<ReadJob>& job) {
+    release_head_lease_locked(job);
     free_job_prep_locked(job);
     for (auto it = jobs.begin(); it != jobs.end(); ++it)
         if (*it == job) {
@@ -2819,7 +2926,16 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
     release_reservation_locked(job);
     release_lease_locked(job);
     release_slot_locked(job);
-    release_head_lease_locked(job);
+    job->budget_deferred = status == ConversationStoreReadStatus::refused_budget && !job->demand &&
+        !job->cancelled && !job->released && job->epoch_at_admission == epoch && job->head_id && job->leased;
+    if (job->budget_deferred) {
+        const uint64_t held = resident_locked();
+        job->deferred_available = admission_suspended || incoming >= options.max_reads || ram_budget <= held ?
+            0 : ram_budget - held;
+    }
+    // An accepted budget-deferred selection keeps only its already-counted query/decode and head hold. No
+    // image, incoming slot or peak reservation survives; explicit retirement still ends the hold.
+    if ((!job->speculation_revoked && !job->budget_deferred) || job->released) release_head_lease_locked(job);
     job->image.reset();
     if (job->released) {
         erase_job_locked(job);
@@ -2834,7 +2950,10 @@ void ConversationStore::Impl::settle_job_locked(const std::shared_ptr<ReadJob>& 
         return;
     }
     // A cancelled request reports its terminal status but is never delivered; its descriptor is spent.
-    free_job_prep_locked(job);
+    if (job->speculation_revoked && !job->released)
+        release_job_preparation_locked(job);
+    else
+        free_job_prep_locked(job);
     trace_job_locked(trace, *job, "settled", job->trace_retire_reason);
     cv_ready.notify_all();
 }
@@ -2843,6 +2962,7 @@ void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& 
                                                 ConversationStoreReadStatus status, const std::string& detail,
                                                 StoreReadTraceBatch& trace, const char* why) {
     if (job->handed) return;                       // already the caller's image: release_read() is its way out
+    if (!job->speculation_revoked) job->budget_deferred = false;
     if (read_timing && !job->cancelled) job->trace_retire_reason = why;
     if (read_timing && job->trace_ready && !job->trace_ready_end) job->trace_ready_end = store_timing_ns();
     job->cancelled = true;
@@ -2863,13 +2983,14 @@ void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& 
     release_reservation_locked(job);
     release_lease_locked(job);
     release_slot_locked(job);
-    release_head_lease_locked(job);
+    if (!job->speculation_revoked || job->released) release_head_lease_locked(job);
     job->image.reset();
     // A job that already holds a *refusal* keeps its own verdict; a queued or ready completion takes the authority's
     // terminal status, because a completion that can no longer be handed out must never keep reporting `ready`.
     if (job->status != ConversationStoreReadStatus::none &&
         job->status != ConversationStoreReadStatus::ready) {
-        free_job_prep_locked(job);
+        if (job->speculation_revoked && !job->released) release_job_preparation_locked(job);
+        else free_job_prep_locked(job);
         trace_job_locked(trace, *job, "retire", why);
         return;
     }
@@ -2880,13 +3001,17 @@ void ConversationStore::Impl::retire_job_locked(const std::shared_ptr<ReadJob>& 
         case ConversationStoreReadStatus::cancelled: counters.reads_cancelled++; break;
         default: break;
     }
-    free_job_prep_locked(job);
+    if (job->speculation_revoked && !job->released) release_job_preparation_locked(job);
+    else free_job_prep_locked(job);
     trace_job_locked(trace, *job, "retire", why);
 }
 
 void ConversationStore::Impl::retire_reads_locked(ConversationStoreReadStatus status, const std::string& detail,
                                                   StoreReadTraceBatch& trace, const char* why) {
-    for (const auto& job : jobs) retire_job_locked(job, status, detail, trace, why);
+    for (const auto& job : jobs) {
+        job->speculation_revoked = false;
+        retire_job_locked(job, status, detail, trace, why);
+    }
     cv_ready.notify_all();
 }
 
@@ -2907,17 +3032,34 @@ void ConversationStore::Impl::revoke_speculation_locked(StoreReadTraceBatch& tra
     cv_work.notify_all();
 }
 
+void ConversationStore::Impl::expire_reads_locked(StoreReadTraceBatch& trace) {
+    uint64_t now = 0;
+    for (const auto& job : jobs) {
+        if (!job->query.deadline_ns || job->released || job->handed ||
+            (job->cancelled && !job->speculation_revoked)) continue;
+        if (!now) now = store_timing_ns();
+        if (now < job->query.deadline_ns) continue;
+        job->speculation_revoked = false;
+        retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the request deadline expired", trace, "deadline");
+    }
+}
+
 // Reuse the descriptor and its original authorized query/deadline. An active reader reaches this only after its
 // allocation frame has unwound, so replacing its image never overlaps a second materialization or refunds live bytes.
 bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job, StoreReadTraceBatch& trace) {
     if (job->active || job->cancelled || job->released || job->handed || job->epoch_at_admission != epoch) return false;
+    if (job->status != ConversationStoreReadStatus::none && job->status != ConversationStoreReadStatus::ready &&
+        job->status != ConversationStoreReadStatus::missing && job->status != ConversationStoreReadStatus::refused_budget)
+        return false; // integrity/resource failures are terminal, not speculative refresh candidates
     std::vector<ConversationStoreMatch> found;
     try {
         collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images, found);
     } catch (const std::bad_alloc&) {
         return false; // keep useful prepared work when optional revalidation cannot allocate
     }
-    if (found.empty() || uint64_t(found.front().tokens) <= job->tokens) return false;
+    if (found.empty() || uint64_t(found.front().tokens) < job->tokens ||
+        (uint64_t(found.front().tokens) == job->tokens &&
+         (found.front().published_order <= job->published_order || job->image))) return false;
     const ConversationStoreMatch& best = found.front();
     // A ready shorter cut is still useful if the longer image cannot fit. Check the replacement's own peak and
     // preparation before discarding anything; its decode replaces this descriptor's old decode, not its query.
@@ -2946,6 +3088,8 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
             ready.erase(it);
             break;
         }
+    // Acquire the new immutable authority before dropping the old one, including an equal-cut covered successor.
+    head_leases[best.head_id] += 1;
     job->image.reset();
     release_reservation_locked(job);
     release_lease_locked(job);
@@ -2954,16 +3098,16 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     release_job_preparation_locked(job);
     job->status = ConversationStoreReadStatus::none;
     job->detail.clear();
+    job->budget_deferred = false;
     job->prepared_bytes = decode_workspace;
     read_prep = sat_add(read_prep, decode_workspace);
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
+    job->published_order = best.published_order;
+    head_manifest_locked(best.head_id, job->manifest_id, job->manifest_bytes);
     // The reissue's new selection renews the admission lease: a demand that revalidated to a newer head keeps that
     // head protected for its queued life, exactly like a fresh admission.
-    if (job->head_id) {
-        head_leases[job->head_id] += 1;
-        job->leased = true;
-    }
+    job->leased = true;
     job->live = best.live;
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
@@ -2975,17 +3119,66 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     return true;
 }
 
+// Only the caller's allowance-publication seam retries accepted budget deferrals. The reader's idle poll and
+// catalog sweeps never do: unchanged low capacity cannot manufacture attempts or repeatedly perform I/O.
+void ConversationStore::Impl::retry_budget_deferred_locked(StoreReadTraceBatch& trace) {
+    expire_reads_locked(trace);
+    if (!on || faulted || closing || admission_suspended || !ram_budget || incoming >= options.max_reads) return;
+    for (const auto& job : jobs)
+        if (job->demand && !job->cancelled && !job->released && !job->handed) return;
+    uint64_t slots = options.max_reads - incoming;
+    uint64_t available = ram_budget > resident_locked() ? ram_budget - resident_locked() : 0;
+    for (const auto& job : jobs) {
+        if (!slots || !available) break;
+        if (!job->budget_deferred || job->status != ConversationStoreReadStatus::refused_budget ||
+            job->active || job->demand || job->handed || job->released ||
+            (job->cancelled && !job->speculation_revoked) || job->epoch_at_admission != epoch ||
+            !job->head_id || !job->leased || !digest_nonzero(job->manifest_id) || !job->manifest_bytes) continue;
+        const uint64_t workspace = conversation_store_detail::manifest_read_workspace_bound(
+            manifest_read_cap(job->manifest_bytes, limits));
+        const uint64_t prepared = preparation_locked();
+        if (sat_add(prepared - std::min(prepared, job->prepared_bytes), workspace) > options.metadata_bytes) continue;
+        const uint64_t needed = job->peak_bytes; // already includes the eventual manifest decode workspace
+        if (available <= job->deferred_available || needed > available) continue;
+        // Keep the captured immutable authority, even if a covered publication has retired its catalog head.
+        // Enqueue first so an allocation failure leaves the refusal, leases and accounting intact.
+        try {
+            queue.push_back(job);
+        } catch (const std::bad_alloc&) {
+            continue;
+        }
+        for (auto it = ready.begin(); it != ready.end(); ++it)
+            if (*it == job) {
+                ready.erase(it);
+                break;
+            }
+        release_job_preparation_locked(job);
+        job->prepared_bytes = workspace;
+        read_prep = sat_add(read_prep, workspace);
+        job->cancelled = false;
+        job->speculation_revoked = false;
+        job->budget_deferred = false;
+        job->status = ConversationStoreReadStatus::none;
+        job->detail.clear();
+        trace_begin_locked(*job, job->trace_attempt);
+        trace_job_locked(trace, *job, "reissue", "allowance_recovery");
+        available -= needed;
+        --slots;
+    }
+}
+
 bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why,
-                                                StoreReadTraceBatch& trace) {
+                                                StoreReadTraceBatch& trace, ConversationStoreReadRefusal* refusal) {
     uint64_t previous = 0;
     const char* reissue_reason = "new";
+    std::shared_ptr<ReadJob> previous_job;
+    expire_reads_locked(trace);
     // Dedupe by (request_id, generation); demand revalidates speculation without replacing its request ownership.
     for (auto it = jobs.begin(); it != jobs.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;
         if (job->released) continue; // an old worker may still own a retired descriptor with this identity
         if (job->query.request_id != query.request_id || job->query.generation != query.generation) continue;
-        const bool retryable = job->speculation_revoked ||
-            (!job->cancelled && !job->demand && job->status == ConversationStoreReadStatus::refused_budget);
+        const bool retryable = job->speculation_revoked || job->budget_deferred;
         if (demand && retryable && !job->handed && !job->released) {
             // Keep active retired workers inside the descriptor/byte/slot bounds until they settle.
             // Retirement removes any queued result before the fresh query can reuse this identity.
@@ -2993,10 +3186,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
                 previous = job->trace_attempt;
                 reissue_reason = job->speculation_revoked ? "revoked_demand" : "refused_budget";
             }
-            retire_job_locked(job, ConversationStoreReadStatus::cancelled, "reissued as demand", trace, "reissue");
-            job->released = true;
-            if (!job->active) erase_job_locked(job);
-            break; // Rebuild the descriptor and revalidate the catalog under the current allowance.
+            previous_job = job; // keep the bounded descriptor, query and selected immutable authority
+            break;
         }
         if (job->cancelled) {
             why = "that request was cancelled";
@@ -3027,6 +3218,74 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         }
         return true;
     }
+    // Reuse a settled revoked descriptor even at max_read_requests. Its query and selected-head hold survived the
+    // RAM revocation, but its future decode must still fit beside all other preparation.
+    if (previous_job && !previous_job->active) {
+        if (!previous_job->head_id) {
+            // A revoked miss has no manifest to price. Re-select using its original authorized query before
+            // manifest_read_cap(0) can turn a bounded miss into a maximum-sized decode reservation.
+            previous_job->cancelled = false;
+            previous_job->speculation_revoked = false;
+            previous_job->demand = true;
+            if (refresh_read_locked(previous_job, trace)) {
+                revoke_speculation_locked(trace);
+                return true;
+            }
+            std::vector<ConversationStoreMatch> found;
+            collect_matches(previous_job->query.selector, previous_job->query.tokens.data(),
+                            previous_job->query.tokens.size(), previous_job->query.images, found);
+            if (!found.empty()) {
+                // A real selection exists but did not fit the unchanged preparation/allowance checks.
+                previous_job->cancelled = true;
+                previous_job->speculation_revoked = true;
+                previous_job->demand = false;
+                why = "the newly selected head cannot fit the current read allowance or preparation ceiling";
+                return false;
+            }
+            previous_job->status = ConversationStoreReadStatus::missing;
+            previous_job->detail = "no eligible stored prefix";
+            ready.push_back(previous_job);
+            trace_begin_locked(*previous_job, previous);
+            counters.misses++;
+            trace_job_locked(trace, *previous_job, "reissue", "revoked_miss");
+            trace_job_locked(trace, *previous_job, "settled", "no_io");
+            cv_ready.notify_all();
+            revoke_speculation_locked(trace);
+            return true;
+        }
+        const uint64_t workspace = conversation_store_detail::manifest_read_workspace_bound(
+            manifest_read_cap(previous_job->manifest_bytes, limits));
+        if (sat_add(preparation_locked() - std::min(read_prep, previous_job->prepared_bytes), workspace) >
+            options.metadata_bytes || (ram_budget && previous_job->peak_bytes > ram_budget)) {
+            why = "the retained selection cannot fit the current read allowance or preparation ceiling";
+            return false;
+        }
+        queue.push_front(previous_job); // allocate before changing ownership
+        for (auto it = ready.begin(); it != ready.end(); ++it)
+            if (*it == previous_job) {
+                ready.erase(it);
+                break;
+            }
+        previous_job->cancelled = false;
+        previous_job->speculation_revoked = false;
+        previous_job->budget_deferred = false;
+        previous_job->demand = true;
+        previous_job->status = ConversationStoreReadStatus::none;
+        previous_job->detail.clear();
+        release_job_preparation_locked(previous_job);
+        previous_job->prepared_bytes = workspace;
+        read_prep = sat_add(read_prep, workspace);
+        if (!previous_job->leased && previous_job->head_id) {
+            head_leases[previous_job->head_id] += 1;
+            previous_job->leased = true;
+        }
+        trace_begin_locked(*previous_job, previous);
+        if (!refresh_read_locked(previous_job, trace))
+            trace_job_locked(trace, *previous_job, "reissue", reissue_reason);
+        revoke_speculation_locked(trace);
+        cv_work.notify_all();
+        return true;
+    }
     // Everything is bounded *before* anything is allocated, including a miss and including the caller's own tokens.
     // The request's own prefix chain is charged here too: every image key it carries can become one chain state, and
     // a state is its EVP context as well as its bytes (see kChainBytesPerImageKey).
@@ -3050,6 +3309,20 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     }
     std::vector<ConversationStoreMatch> found;
     collect_matches(query.selector, query.tokens.data(), query.tokens.size(), query.images, found);
+    if (previous_job && previous_job->head_id &&
+        (found.empty() || uint64_t(found.front().tokens) < previous_job->tokens ||
+         (uint64_t(found.front().tokens) == previous_job->tokens &&
+          found.front().published_order <= previous_job->published_order))) {
+        ConversationStoreMatch held;
+        held.head_id = previous_job->head_id;
+        held.tokens = int64_t(previous_job->tokens);
+        held.live = previous_job->live;
+        held.stages = previous_job->stages;
+        held.payload_bytes = previous_job->payload_bytes;
+        held.manifest_bytes = previous_job->manifest_bytes;
+        held.published_order = previous_job->published_order;
+        found.insert(found.begin(), held);
+    }
     if (found.empty()) {
         auto job = std::make_shared<ReadJob>();
         job->query = query;
@@ -3094,6 +3367,10 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     if (ram_budget != 0 && peak > ram_budget) {
         counters.refused_budget++;
         why = "the read's peak does not fit the published RAM allowance";
+        // read_body also holds restore scaffolding beside its decoded manifest.
+        // The existing manifest workspace bound covers that scaffolding too;
+        // quote it separately, without reserving a second decode in the reader.
+        if (refusal) refusal->additional_ram_bytes = sat_add(sat_add(peak, own_prep), decode_workspace);
         trace_refusal_locked(trace, query, demand, ConversationStoreReadStatus::refused_budget, "peak_budget",
                              previous, best.head_id, uint64_t(best.tokens), peak);
         return false;
@@ -3111,6 +3388,11 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     read_prep = sat_add(read_prep, decode_workspace);
     job->head_id = best.head_id;
     job->tokens = uint64_t(best.tokens);
+    job->published_order = best.published_order;
+    if (!head_manifest_locked(best.head_id, job->manifest_id, job->manifest_bytes) && previous_job) {
+        job->manifest_id = previous_job->manifest_id;
+        job->manifest_bytes = previous_job->manifest_bytes;
+    }
     // The selection itself is the protection (#243): a queued read holds the same head lease a started reader
     // would, so ceiling pressure cannot retire the newest cut it just re-validated. The lease follows the job's
     // whole life and is released wherever its slot is; a catalog reissue re-grants it for the new head.
@@ -3118,6 +3400,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         head_leases[job->head_id] += 1;
         job->leased = true;
     }
+    if (previous_job) previous_job->released = true;
     job->live = best.live;
     job->stages = best.stages;
     job->payload_bytes = best.payload_bytes;
@@ -3135,6 +3418,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
 
 bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation,
                                              bool specific, StoreReadTraceBatch& trace) {
+    expire_reads_locked(trace);
     for (auto it = ready.begin(); it != ready.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;   // a copy: the ready entry is erased before the last uses
         if (job->cancelled || job->released) continue;
@@ -3151,6 +3435,7 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
         out.live = job->live;
         out.stages = job->stages;
         out.payload_bytes = job->payload_bytes;
+        out.materialize_ms = job->status == ConversationStoreReadStatus::ready ? job->materialize_ms : 0;
         out.image = job->image;
         out.detail = job->detail;
         job->handed = true;
@@ -3204,12 +3489,15 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
             stop_with(ConversationStoreReadStatus::stale, "the execution domain advanced before this read started");
             return;
         }
-        if (!head_manifest_locked(head_id, manifest_id, manifest_bytes)) {
-            stop_with(ConversationStoreReadStatus::stale, "the head this read selected is no longer retained");
+        if (!job->leased || !digest_nonzero(job->manifest_id)) {
+            stop_with(ConversationStoreReadStatus::stale, "the read no longer owns its selected manifest");
             return;
         }
+        manifest_id = job->manifest_id;
+        manifest_bytes = job->manifest_bytes;
         if (read_timing) job->trace_io_attempted = true;
     }
+    const uint64_t materialize_started = store_timing_ns();
     std::vector<uint8_t> raw;
     std::string why;
     // The same cap the admission counted the read and decode workspace from, so this read can never want more bytes
@@ -3346,18 +3634,16 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
                     return;
                 }
             }
-            const std::string name = sha256_hex(chunk.object);
-            const int shard = open_shard_fd(dirs, name.substr(0, 2), why);
-            if (shard < 0) {
+            ReadObject current;
+            if (!open_read_object(dirs, chunk.object, chunk.length, current, why)) {
                 stop_with(ConversationStoreReadStatus::corrupt, why);
                 return;
             }
             Digest actual{};
             auto hash = conversation_store_detail::object_hasher(identity_scope, id.kind, identity_ordinal,
                                                                 chunk.length);
-            const bool ok = hash_and_copy_object(shard, name, chunk.length, hash, targets[i].write, chunk.offset,
+            const bool ok = hash_and_copy_object(current.fd, chunk.length, hash, targets[i].write, chunk.offset,
                                                  slab, actual, why);
-            ::close(shard);
             if (!ok) {
                 stop_with(ConversationStoreReadStatus::corrupt, why);
                 return;
@@ -3386,6 +3672,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     out.image = std::make_shared<SavedConversation>(std::move(image));
     out.payload_bytes = meta.payload_bytes;
     out.stages = meta.stages;
+    const double materialize_ms = double(store_timing_ns() - materialize_started) / 1e6;
     StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
     if (job->cancelled.load()) {
         out.image.reset();
@@ -3398,6 +3685,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         return;
     }
     out.status = ConversationStoreReadStatus::ready;
+    out.materialize_ms = materialize_ms;
 }
 
 void ConversationStore::Impl::reader_body() {
@@ -3405,6 +3693,7 @@ void ConversationStore::Impl::reader_body() {
     std::unique_lock<std::mutex> lock(mutex);
     while (!stop.load()) {
         trace.flush(lock);
+        expire_reads_locked(trace);
         revoke_speculation_locked(trace);
         trace_waiters_locked(trace);
         for (auto it = queue.begin(); it != queue.end();) {
@@ -3507,6 +3796,7 @@ void ConversationStore::Impl::reader_body() {
             if (outcome.status != ConversationStoreReadStatus::none) {
                 chosen->payload_bytes = outcome.payload_bytes;
                 chosen->stages = outcome.stages;
+                chosen->materialize_ms = outcome.materialize_ms;
                 chosen->image = std::move(outcome.image);
                 settle_job_locked(chosen, outcome.status, std::move(outcome.detail), trace);
             }
@@ -4194,7 +4484,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         }
         if (predecessor != 0 && covered) {
             superseded = predecessor;
-            if (read_timing) plan.replaced_head = predecessor;
+            plan.replaced_head = predecessor;
             for (size_t i = 0; i < plan.candidate.heads.size(); ++i)
                 if (plan.candidate.heads[i].head_id == predecessor) {
                     plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));
@@ -4227,8 +4517,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             // allocated inside an admission that has already decided what it can afford.
             uint64_t estimate = conversation_store_detail::catalog_encoded_size(plan.candidate);
             estimate += uint64_t(objects.size() + plan.new_objects.size()) * kObjectBytesEstimate;
-            for (const auto& entry : head_objects) estimate += uint64_t(entry.second.size()) * sizeof(Digest);
-            estimate += uint64_t(plan.new_objects.size()) * sizeof(Digest);
+            estimate = sat_add(estimate, sat_mul(uint64_t(pending_files.size()), kPendingMetadataBytes));
+            for (const auto& entry : head_objects)
+                estimate = sat_add(estimate, head_hold_metadata_bytes(entry.second.size()));
+            estimate = sat_add(estimate, head_hold_metadata_bytes(plan.new_objects.size()));
             if (estimate > options.metadata_bytes) {
                 plan.candidate.heads.pop_back();
                 plan.retiring.clear();
@@ -4510,7 +4802,9 @@ bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<Conversat
     return true;
 }
 
-bool ConversationStore::demand(const ConversationStoreQuery& query, std::string& why) {
+bool ConversationStore::demand(const ConversationStoreQuery& query, std::string& why,
+                               ConversationStoreReadRefusal* refusal) {
+    if (refusal) *refusal = {};
     StoreReadTraceBatch trace;
     if (impl_->read_timing) trace.call_ns = store_timing_ns();
     std::lock_guard<std::mutex> guard(impl_->mutex);
@@ -4525,7 +4819,7 @@ bool ConversationStore::demand(const ConversationStoreQuery& query, std::string&
         impl_->trace_refusal_locked(trace, query, true, ConversationStoreReadStatus::disabled, "store_fault");
         return false;
     }
-    return impl_->admit_read_locked(query, true, why, trace);
+    return impl_->admit_read_locked(query, true, why, trace, refusal);
 }
 
 bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::string& why) {
@@ -4543,7 +4837,7 @@ bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::strin
         impl_->trace_refusal_locked(trace, query, false, ConversationStoreReadStatus::disabled, "store_fault");
         return false;
     }
-    return impl_->admit_read_locked(query, false, why, trace);
+    return impl_->admit_read_locked(query, false, why, trace, nullptr);
 }
 
 void ConversationStore::cancel_publication(uint64_t request_id, uint64_t generation) {
@@ -4602,6 +4896,7 @@ void ConversationStore::withdraw_prefetch(uint64_t request_id, uint64_t generati
         const std::shared_ptr<Impl::ReadJob> job = entry;
         if (job->released || job->query.request_id != request_id || job->query.generation != generation) continue;
         if (job->demand || job->handed) return; // the demand owner, not the advisory channel, now owns it
+        job->speculation_revoked = false;
         self.retire_job_locked(job, ConversationStoreReadStatus::cancelled, "the advisory prefetch was withdrawn",
                                trace, "withdraw");
         job->released = true;
@@ -4609,6 +4904,26 @@ void ConversationStore::withdraw_prefetch(uint64_t request_id, uint64_t generati
         self.cv_work.notify_all();
         return;
     }
+}
+
+bool ConversationStore::refresh_speculation(uint64_t request_id, uint64_t generation) {
+    Impl& self = *impl_;
+    StoreReadTraceBatch trace;
+    std::unique_lock<std::mutex> lock(self.mutex);
+    self.expire_reads_locked(trace);
+    for (const auto& entry : self.jobs) {
+        const std::shared_ptr<Impl::ReadJob> job = entry;
+        if (job->released || job->cancelled || job->handed || job->demand ||
+            job->query.request_id != request_id || job->query.generation != generation) continue;
+        if (job->active || job->status == ConversationStoreReadStatus::none) return false;
+        // The selection is rebuilt against the catalog as it stands now; the job keeps its descriptor,
+        // its authorized query and its queue identity. Refusals behave like the original admission.
+        if (!self.refresh_read_locked(job, trace)) return false;
+        lock.unlock();
+        self.cv_work.notify_all();
+        return true;
+    }
+    return false;
 }
 
 bool ConversationStore::take_ready(ConversationStoreRead& out) {
@@ -4731,6 +5046,7 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
     Impl& self = *impl_;
     StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
+    self.expire_reads_locked(trace);
     if (!self.on || self.closed) {
         why = self.reason.empty() ? "the store is not enabled" : self.reason;
         return ConversationStorePublishAdmission::refused;
@@ -4914,6 +5230,7 @@ uint64_t ConversationStore::publish_read_allowance(uint64_t bytes) {
     // lease it released after publish(). Do not add that transfer a second time.
     if (impl_->publishing) impl_->publishing->external_credit_bytes = 0;
     impl_->admission_suspended = false;
+    impl_->retry_budget_deferred_locked(trace);
     impl_->trace_waiters_locked(trace);
     impl_->cv_work.notify_all();
     return impl_->ram_budget;
@@ -5193,6 +5510,12 @@ void ConversationStore::set_read_gate_for_test(void (*gate)(void*), void* contex
     std::lock_guard<std::mutex> guard(impl_->mutex);
     impl_->read_gate = gate;
     impl_->read_gate_context = context;
+}
+
+void ConversationStore::set_catalog_gate_for_test(void (*gate)(void*, bool), void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->catalog_gate = gate;
+    impl_->catalog_gate_context = context;
 }
 #endif
 

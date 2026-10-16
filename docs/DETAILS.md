@@ -1643,9 +1643,9 @@ cover it.
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the
 **existing** source enumeration (live session, resident slots, parked RAM, checkpoints) rather than becoming a second
 selector, and the default choice is unchanged: the longest eligible prefix, with resident/RAM preferred at an equal
-cut, so a stored image is only preferred when it cuts strictly longer. Cost selection (`--prefix-selection cost`)
-treats a stored candidate like any other unpriced source - its rate is not invented, and an unpriced longest candidate
-keeps the longest rollback. A required restore is materialized **before any GPU mutation** (the whole host image is
+cut, so a stored image is only preferred when it cuts strictly longer. Its restore cost stays uncalibrated:
+cost selection retains the longest-prefix rollback rather than inventing an SSD rate.
+A required restore is materialized **before any GPU mutation** (the whole host image is
 read, verified and validated first) and then restored exactly like a parked one; a missing, corrupt, stale, refused,
 cancelled or outlasted read is an ordinary miss that falls back to the source the request would have used, so the
 engine still reads the prompt itself. The wait is bounded, honours `STOP`/cancellation, and never runs under the
@@ -1657,6 +1657,9 @@ separate operation. An active retired reader keeps its descriptor, query and all
 Demand also rechecks the current catalog for a cut longer than the prefetched one, using the original authorized
 query and deadline. It reuses the descriptor, waits for an active reader's allocation frame to end, then admits at
 most one replacement read; an unchanged cut or a replacement that cannot fit keeps useful ready work and its lease.
+An accepted speculative descriptor that settles `refused_budget` can re-arm when its allowance recovers
+enough before the original deadline. It keeps the same bounded descriptor and does not poll while idle;
+initially refused offers are not newly admitted by this retry. Withdrawal and expiry still end speculation.
 
 The frontend may prepare the queued frontier early over a **private inherited control socket** (one
 `SOCK_SEQPACKET` endpoint passed as `STRATA_CONVERSATION_OFFER_FD` - never a listening service, never a public
