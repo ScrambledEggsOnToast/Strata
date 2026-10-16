@@ -2075,13 +2075,20 @@ void check_leases_and_budget() {
           "a prefetch without spare allowance is refused");
     check(store.counters().refused_budget > 0, "the budget refusal is counted");
 
-    // A demand waits for the allowance instead of being refused.
-    check(store.demand(query_of(image, 300, 1), why), "a demand is admitted without an allowance");
-    ConversationStoreRead not_yet;
-    check(!store.wait_ready(300, 1, not_yet, 200), "a demand is not admitted without an allowance");
+    // A demand with no published allowance must refuse synchronously. The production owner can then
+    // reclaim a parked history from the refusal's quote; accepting here would leave the only owner
+    // thread waiting for an allowance it cannot republish.
+    const uint64_t before_demand = store.ram_held_bytes();
+    ConversationStoreReadRefusal refusal;
+    check(!store.demand(query_of(image, 300, 1), why, &refusal),
+          "a demand without an allowance is refused");
+    check(refusal.additional_ram_bytes > 0, "the zero-allowance refusal quotes recoverable RAM");
+    check_eq(store.ram_held_bytes(), before_demand,
+             "the refused demand acquires no descriptor or image charge");
     check_eq(store.publish_read_allowance(uint64_t(64) << 20), uint64_t(64) << 20, "the allowance is absolute");
+    check(store.demand(query_of(image, 300, 1), why), "the demand is admitted once the allowance exists");
     ConversationStoreRead read;
-    check(store.wait_ready(300, 1, read, 5000), "the demand is admitted once the allowance exists");
+    check(store.wait_ready(300, 1, read, 5000), "the admitted demand settles");
     check(read.status == ConversationStoreReadStatus::ready, "the demand completes");
     check(store.ram_lease_bytes() > 0, "the handed-out image is leased");
     check(store.ram_held_bytes() >= store.ram_lease_bytes(), "the lease counts inside the held total");

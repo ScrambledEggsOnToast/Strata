@@ -3364,7 +3364,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     }
     const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
                           own_prep + kReadSlabBytes + kReadFixedOverhead;
-    if (ram_budget != 0 && peak > ram_budget) {
+    if ((demand && ram_budget == 0) || (ram_budget != 0 && peak > ram_budget)) {
         counters.refused_budget++;
         why = "the read's peak does not fit the published RAM allowance";
         // read_body also holds restore scaffolding beside its decoded manifest.
