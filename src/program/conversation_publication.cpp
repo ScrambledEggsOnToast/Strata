@@ -15,7 +15,8 @@ void ConversationPublicationOwner::mount(uint64_t head, uint64_t epoch, const st
     if (resume > 0 && (int64_t) whole_live.size() >= resume) {
         lineage.head = head;
         lineage.epoch = epoch;
-        lineage.live.assign(whole_live.begin(), whole_live.begin() + (size_t) resume);
+        // The checkpoint selects execution state, not the extent of the predecessor this lineage may retire.
+        lineage.live = whole_live;
         lineage.scope = scope;
         lineage.cvec = cvec;
         lineage.valid = true;

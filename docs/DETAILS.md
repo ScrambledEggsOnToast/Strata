@@ -1589,8 +1589,8 @@ all. On an **accepted** admission the store owns the image's accounting from tha
 lease there and then, whatever the write later settles as. A restore hands the engine an owned, complete,
 byte-verified image (never a live GPU pointer or a borrowed visitor), and the mounted copy owns its buffers alone.
 
-*Publication.* A publication is bound to a head only when the engine *proves* the outgoing image still covers the cut
-it was captured from - the same authorized scope and the same token prefix, checked by hash - so a divergent sibling
+*Publication.* A publication is bound to a head only when the engine *proves* the predecessor's whole persisted record
+is an exact prefix of the outgoing image in the same authorized scope, so a divergent sibling
 keeps its own head, a one-shot descendant (a `ckpt=0` request) neither consumes nor supersedes its donor, and a stale
 completion cannot overwrite a newer covered descendant. `generation` is assigned at capture ordering, not worker
 completion, and it is the execution domain's chronology rather than one process's own count: a run numbers its
@@ -1611,6 +1611,10 @@ it preserves that cut. Subsequent covering captures remain replaceable: the poli
 not every turn. This internal cut promise does not make the head immune to quota eviction. Replacement completions
 clear retired-head references independently of owner adoption; a queued divergent capture becomes a fresh branch
 rather than claiming a retired predecessor. A completion can attach to an owner only at its original generation.
+
+A checkpoint disk mount records the full persisted live record in owner lineage before shortening the execution
+prefix. Resuming a shorter cut does not authorize retiring the longer donor; re-creating its full prefix can still
+cover it.
 
 *Restore and prefetch.* Lookup is a bounded, metadata-only scan of catalog-authorized manifests: longest exact cut
 first, newest first on ties, with no payload read and no GPU pointer exposed. The stored candidate joins the
