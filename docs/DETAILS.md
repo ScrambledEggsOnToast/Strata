@@ -1397,12 +1397,14 @@ so text after the first difference is never taken from another conversation, and
 namespace with another. Scope metadata is a digest, not a durable session credential: with a persistent store it
 names the same conversation in every process that serves it, and without one it is process-local.
 If the issuer key or complete model/rendering identity is unavailable, the process-local fallback still binds
-the gateway/principal kind, the attested tenant or principal, and the credential fingerprint. Overlapping gateway
-credentials therefore cannot share a fallback scope just because they attest the same tenant; identical
-authorization inputs still reuse within that process. This tightens only fallback scopes: persistent digest
-derivation and existing stored-history identities are unchanged. With no API key configured, a request with no
-credential uses the anonymous principal; untrusted tenant headers remain ignored. A supplied credential still
-partitions the scope by its fingerprint, as in persistent scopes, but does not become an authenticated principal.
+the gateway/principal kind, the attested tenant or principal, and the credential fingerprint. Scope derivation
+uses the canonical configured credential that actually authenticated the request, never the raw header spelling:
+UTF-8 and Latin-1 wire forms of one configured key therefore share one identity, while overlapping configured
+gateway credentials remain separate even when they attest the same tenant. This changes the fallback inputs,
+not the persistent `scc1` digest format. Distinct configured API or tenant credentials whose accepted
+UTF-8/Latin-1 wire encodings collide are refused at startup; a runtime ambiguity also grants no gateway
+authority. With no API key configured, requests use the anonymous principal;
+untrusted tenant and credential headers are ignored and cannot fragment its cache namespace.
 Changed scopes discard the live checkpoint chain; resident and parked searches require an
 exact scope match before token/image matching. Existing snapshot geometry, format and model/config checks remain.
 The oldest checkpoint remains a root **within that conversation**, not a shared system-prompt cache. Other leaves

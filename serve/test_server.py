@@ -949,6 +949,14 @@ class ConfigTenantToken(unittest.TestCase):
             self.assertEqual(self.run_main({"tenant_token": "one,two"}, d)[1], ["one", "two"])
             self.assertEqual(self.run_main({}, d)[1], [])
 
+    def test_ambiguous_api_and_tenant_token_encodings_are_refused_without_echoing_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, token, error = self.run_main({"api_key": ["é"], "tenant_token": ["Ã©"]}, directory)
+            self.assertEqual((code, token), (2, None))
+            self.assertIn("ambiguous UTF-8/Latin-1 credential encodings", error)
+            self.assertNotIn("é", error)
+            self.assertNotIn("Ã©", error)
+
 
 class ApiKeyForms(unittest.TestCase):
     """#725: a key no client could send (spaces or a line end around it), and a key outside ASCII."""
@@ -1681,6 +1689,54 @@ class ConversationScopes(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_http_scope_uses_the_canonical_accepted_key(self):
+        self.svc.api_key = "clé"
+        httpd = serve(self.svc, port=0)
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1,
+                "strata_conversation_id": "A"}
+        try:
+            def request(token):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    json.load(response)
+                return self.engine.last_cache_scope
+
+            latin1 = request("clé")
+            utf8_as_read_by_http_server = "clé".encode().decode("latin-1")
+            self.assertEqual(latin1, request(utf8_as_read_by_http_server))
+            self.assertEqual(latin1, self.svc.cache_scope(body, "clé", credential="clé"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_ambiguous_wire_alias_cannot_gain_gateway_authority(self):
+        self.svc.api_key = ["é"]
+        self.svc.tenant_token = ["Ã©"]
+        httpd = serve(self.svc, port=0)
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1,
+                "strata_conversation_id": "A"}
+        wire = "é".encode().decode("latin-1")
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {wire}",
+                         TENANT_HEADER: "attacker-selected"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                self.assertEqual(response.status, 200)
+                json.load(response)
+            self.assertEqual(self.engine.last_cache_scope,
+                             self.svc.cache_scope(body, "é", credential="é"))
+            self.assertNotEqual(self.engine.last_cache_scope,
+                                self.svc.cache_scope(body, "attacker-selected", gateway=True, credential="Ã©"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
     def test_http_without_api_key_keeps_anonymous_scope_and_ignores_untrusted_tenant(self):
         self.assertFalse(self.svc.api_key)
         self.assertFalse(self.svc.tenant_token)
@@ -1706,10 +1762,9 @@ class ConversationScopes(unittest.TestCase):
             self.assertEqual(anonymous, request(attested="untrusted-tenant"),
                              "an unauthenticated tenant header grants no identity")
             supplied = request("unverified-key", attested="untrusted-tenant")
-            self.assertEqual(supplied, self.svc.cache_scope(body, "", credential="unverified-key"),
-                             "with no API key a supplied credential is not an authenticated principal")
+            self.assertEqual(supplied, anonymous,
+                             "an unverified credential cannot choose an anonymous cache namespace")
             self.assertEqual(supplied, request("unverified-key", attested="another-tenant"))
-            self.assertNotEqual(anonymous, supplied, "the fingerprint still partitions as in persistent scopes")
         finally:
             httpd.shutdown()
             httpd.server_close()

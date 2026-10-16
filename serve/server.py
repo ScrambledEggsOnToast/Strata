@@ -7214,18 +7214,26 @@ def make_handler(svc: Service):
                     auth = self.headers.get("Authorization", "")
                     given = (auth[7:].strip() if auth.lower().startswith("bearer ") else
                              self.headers.get("x-api-key", ""))
-                    principal = given if svc.api_key else ""
+                    accepted = accepted_key(given, svc.api_key) if svc.api_key else None
+                    principal = accepted or ""
+                    credential = principal
                     # A tenant is a key. The label a gateway attests is trusted only from the token
                     # only the gateway holds; a header from anyone else is ignored, not rejected, so
-                    # one request shape serves trusted and direct callers alike.
+                    # one request shape serves trusted and direct callers alike. Cache identity binds
+                    # the canonical configured credential that actually authorized the request,
+                    # never an unauthenticated header or one of its accepted wire encodings.
                     tenant, gateway = principal, False
-                    if svc.tenant_token and key_matches(given, svc.tenant_token):
+                    gateway_credential = accepted_key(given, svc.tenant_token)
+                    gateway_authorized = gateway_credential is not None and (
+                        not svc.api_key or gateway_credential == accepted)
+                    if gateway_authorized:
                         attested = self.headers.get(TENANT_HEADER, "").strip()
                         if attested:
-                            tenant, gateway = attested, True
+                            tenant, gateway, credential = attested, True, gateway_credential
                     # Never trust a client-supplied internal scope or cache grouping key.
                     if path != "/v1/score":        # scores never reuse a conversation prefix
-                        req["_strata_cache_scope"] = svc.cache_scope(req, tenant, gateway=gateway, credential=given)
+                        req["_strata_cache_scope"] = svc.cache_scope(
+                            req, tenant, gateway=gateway, credential=credential)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
@@ -8043,20 +8051,49 @@ def api_key_of(value):
     return key.strip()
 
 
-def key_matches(given: str, key) -> bool:
-    """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
-    arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
-    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213).  #1344: `key` may name several
-    keys (see key_list); the given one must match any, and every key is compared whatever the outcome."""
+def accepted_key(given: str, key) -> str | None:
+    """Return the canonical configured key that authenticated ``given``, or None.
+
+    A header may carry a non-ASCII configured key in either UTF-8 or Latin-1 form. Cache namespaces
+    bind this canonical value rather than the wire spelling. Every configured key is compared even
+    after a match, preserving ``key_matches``' constant-work property across a key list.
+    """
     raw = given.encode("latin-1", "replace")
-    ok = False
-    for k in key_list(key):
-        ok |= hmac.compare_digest(raw, k.encode())
+    matched = None
+    ambiguous = False
+    for configured in key_list(key):
+        same = hmac.compare_digest(raw, configured.encode())
         try:
-            ok |= hmac.compare_digest(raw, k.encode("latin-1"))
+            same |= hmac.compare_digest(raw, configured.encode("latin-1"))
         except UnicodeEncodeError:
             pass
-    return ok
+        if same:
+            if matched is None:
+                matched = configured
+            elif matched != configured:
+                ambiguous = True
+    return None if ambiguous else matched
+
+
+def key_matches(given: str, key) -> bool:
+    """Whether a header value matches any configured key in its accepted wire encodings."""
+    return accepted_key(given, key) is not None
+
+
+def validate_key_encodings(api_key, tenant_tokens) -> None:
+    """Refuse distinct configured credentials that accept the same HTTP header bytes."""
+    seen = {}
+    for configured in [*key_list(api_key), *key_list(tenant_tokens)]:
+        wire_forms = {configured.encode()}
+        try:
+            wire_forms.add(configured.encode("latin-1"))
+        except UnicodeEncodeError:
+            pass
+        for wire in wire_forms:
+            previous = seen.get(wire)
+            if previous is not None and previous != configured:
+                raise ValueError("ambiguous UTF-8/Latin-1 credential encodings")
+            seen[wire] = configured
 
 
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
@@ -8538,6 +8575,11 @@ def main() -> int:
         except OSError as e:
             print(f"[strata] cannot read tenant_token_file {cfg['tenant_token_file']}: {e}", file=sys.stderr)
             return 2
+    try:
+        validate_key_encodings(svc.api_key, svc.tenant_token)
+    except ValueError as e:
+        print(f"[strata] {e}: use credentials with distinct accepted header encodings", file=sys.stderr)
+        return 2
     if svc.tenant_token:
         print(f"[strata] {len(svc.tenant_token)} tenant token(s) configured: a request bearing one may name its tenant "
               f"in {TENANT_HEADER} (the token is the gateway's own key; it does not gate access)", flush=True)
