@@ -388,7 +388,14 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     if (timing) phase = Clock::now();
     // Retire before overwriting, but don't publish a new identity until every
     // consumer is bound. A yielded continuation keeps the existing owner.
-    if (!continuing) retire(slot);
+    if (!continuing) {
+        retire(slot);
+        // #879: the taint belongs to the identity that ran, not to the seat. Its poison described the
+        // retired run's cells, and this bind rebuilds them from the working context, so it must not sit
+        // over the new identity's completion. A continuing rebind is the same identity and run: the
+        // taint stays, and `complete` still refuses that run the cache.
+        state.tainted = false;
+    }
     state.active = state.cached = state.partial = false;
     state.failed = true; // every exception after this point leaves an unavailable target
     state.prefill_split_until = 0;

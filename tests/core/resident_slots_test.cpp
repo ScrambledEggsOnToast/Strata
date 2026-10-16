@@ -67,6 +67,34 @@ int main() {
         completed.failed = false;
         completed.complete(false);
         check(!completed.cached, "prompt-cache zero still disables retention");
+        completed.tainted = true;                   // #879: this run met non-finite logits
+        completed.complete(true);
+        check(!completed.cached && !completed.reusable(completed.input.scope, true),
+              "a tainted completion is neither cached nor reusable");
+    }
+    {
+        // `tainted` belongs to the identity that ran, never to the seat (#879): a fresh (non-continuing)
+        // admission retires the old identity and its stale taint together - bind clears the flag where it
+        // retires, and rebuilds the seat's cells - so the fresh identity completes reusable. A continuing
+        // rebind is the same identity and run: its taint stays, and no completion of it becomes reusable.
+        program::ResidentSlot seat;
+        seat.request = 23;                          // the poisoned run's own identity
+        seat.input.scope.value[0] = 1;
+        seat.input.checkpoint = true;
+        seat.ids = {11, 22};
+        seat.tainted = true;
+        seat.complete(true);
+        check(!seat.cached && !seat.reusable(seat.input.scope, true),
+              "a tainted completion is not cached, so the poisoned prefix is never handed on");
+        seat.tainted = false;                       // retired with the old identity by the fresh admission's bind
+        seat.request = 29;                          // the identity the fresh (non-continuing) bind publishes
+        seat.complete(true);
+        check(seat.cached && seat.reusable(seat.input.scope, true),
+              "a fresh non-continuing admission rebuilds the seat and completes reusable");
+        seat.tainted = true;                        // kept by a continuing rebind of the same identity (29)
+        seat.complete(true);
+        check(!seat.cached && !seat.reusable(seat.input.scope, true),
+              "a continuing tainted rebind stays non-reusable");
     }
     {
         program::ResidentSlot parked;

@@ -6907,7 +6907,11 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "application/json")
             if self.lifecycle is not None:
                 self.send_header("X-Strata-Request-Id", self.lifecycle["id"])
-            if code in (429, 503):
+            # The admission snapshot only fills an absence. A caller that carries its own Retry-After - the
+            # GpuBusy refusals' measured 5 s (batch slots) / 15 s (VRAM or before_load) waits - owns the
+            # hint for its answer, and an HTTP response must not carry two Retry-After values: clients
+            # cannot tell which one to believe.
+            if code in (429, 503) and not any(name.lower() == "retry-after" for name in headers or {}):
                 with svc.status_lock:
                     retry_after = svc._admission_snapshot()["retry_after_s"]
                 self.send_header("Retry-After", str(retry_after))
@@ -7225,7 +7229,12 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
-                    req["_strata_cache_deadline_ns"] = int(self.lifecycle["_deadline"] * 1_000_000_000)
+                    if path != "/v1/score":        # the deadline is generation-only, exactly like the scope above:
+                        # the store ages a prompt out by its own request's deadline, and a score owns no
+                        # conversation prefix - its prepare refuses unknown fields outright (see scoring.prepare),
+                        # so the key here would turn every score request into a 400.  Score keeps its own
+                        # lifecycle deadline (the record above); it just never exports one to the cache.
+                        req["_strata_cache_deadline_ns"] = int(self.lifecycle["_deadline"] * 1_000_000_000)
                     # A client that stops consuming must not hold a resident slot forever in a socket write.
                     self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
                     self._watch_client(self.request_cancel)

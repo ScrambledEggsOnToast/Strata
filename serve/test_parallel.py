@@ -2269,7 +2269,11 @@ class ScoreTransport(unittest.TestCase):
                    ({"selected": [True]}, "int32"), ({"selected": [1.0]}, "int32"),
                    ({"prompt": []}, "prompt_token_ids"), ({"selected": []}, "selected_token_ids"),
                    ({"version": 2}, "version"), ({"temperature": .5}, "unsupported score fields"),
-                   ({"max_tokens": 0}, "unsupported score fields")]
+                   ({"max_tokens": 0}, "unsupported score fields"),
+                   # the frontend's internal cache fields stay server-owned on score too: a client's own
+                   # deadline (or scope) is refused by the closed field set, never honored
+                   ({"_strata_cache_deadline_ns": 1}, "unsupported score fields"),
+                   ({"_strata_cache_scope": "ab" * 32}, "unsupported score fields")]
         for body, reason in invalid:
             with self.subTest(body_keys=list(body)):
                 with self.assertRaises(urllib.error.HTTPError) as refused:

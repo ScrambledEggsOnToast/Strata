@@ -3785,10 +3785,10 @@ class SharingTheGpu(unittest.TestCase):
                                    headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
-                return resp.status, dict(resp.headers), json.loads(resp.read())
+                return resp.status, resp.headers, json.loads(resp.read())
         except urllib.error.HTTPError as e:
             with e:
-                return e.code, dict(e.headers), json.loads(e.read())
+                return e.code, e.headers, json.loads(e.read())
 
     def test_failing_before_load_with_free_vram_still_loads(self):
         """#1997: a peer that is not running makes `curl` exit 7; the card has room, so the model loads."""
@@ -3809,6 +3809,9 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("exited with code 3", body["error"]["message"])
         self.assertTrue(int(headers["Retry-After"]) > 0)
+        # The refusal's own 15 s hint is the only Retry-After on the wire: the default admission hint
+        # must not ride along as a second, conflicting value.
+        self.assertEqual(headers.get_all("Retry-After"), ["15"])
         self.assertFalse(self.engine.alive())
         self.assertEqual(self.engine.starts, 0)
         self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
