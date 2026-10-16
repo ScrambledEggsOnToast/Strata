@@ -21,8 +21,6 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 """
 from __future__ import annotations
 
-from serve.throughput import Throughput
-
 import argparse
 import contextlib
 import collections
@@ -60,6 +58,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
+from serve.throughput import Throughput  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
