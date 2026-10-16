@@ -278,13 +278,13 @@ class ReplicaEngine:
     def throughput(self):
         return self
 
-    def snapshot(self):
+    def snapshot(self, idle=False):
         samples = [getattr(e, "throughput", None) for e in self.engines]
-        snapshots = [s.snapshot() if s is not None and e.alive() else None
+        snapshots = [s.snapshot(idle=idle) if s is not None and e.alive() else None
                      for e, s in zip(self.engines, samples)]
         def total(key):
             return sum(s[key] for s in snapshots) if all(s is not None and s.get(key) is not None for s in snapshots) else None
-        return {"window_s": 5.0, "decode_tok_s": total("decode_tok_s"), "prefill_tok_s": total("prefill_tok_s")}
+        return {"window_s": 2.0 if idle else 5.0, "decode_tok_s": total("decode_tok_s"), "prefill_tok_s": total("prefill_tok_s")}
 
     @property
     def prefill_tok_s_mean(self):

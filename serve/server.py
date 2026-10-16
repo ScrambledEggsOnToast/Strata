@@ -4445,7 +4445,7 @@ class Service:
         else:
             state = "idle"
         throughput = getattr(self.engine, "throughput", None)
-        aggregate = throughput.snapshot() if throughput is not None and self.loaded() else None
+        aggregate = throughput.snapshot(idle=state == "idle" and admission["active"] == 0) if throughput is not None and self.loaded() else None
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,

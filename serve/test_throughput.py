@@ -12,6 +12,20 @@ from serve.server import ByteTokenizer, ChatTemplate, MockEngine, Service, Strat
 
 
 class ThroughputTests(unittest.TestCase):
+    def test_idle_window_does_not_change_active_window(self):
+        now = [0.0]
+        t = Throughput(True, clock=lambda:now[0])
+        t.wire('T 1')
+        self.assertEqual(t.snapshot(idle=True)['window_s'], 2.0)
+        self.assertEqual(t.snapshot(idle=True)['decode_tok_s'], .5)
+        now[0] = 2.1
+        self.assertEqual(t.snapshot(idle=True)['decode_tok_s'], 0)
+        t.wire('T 2')
+        self.assertEqual(t.snapshot()['decode_tok_s'], .4)
+        now[0] = 5.1
+        self.assertEqual(t.snapshot()['decode_tok_s'], .2)
+        self.assertIsNone(Throughput().snapshot(idle=True)['prefill_tok_s'])
+
     def test_concurrent_decode_cached_prefill_and_expiry(self):
         now = [10.0]
         t = Throughput(clock=lambda: now[0])

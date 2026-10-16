@@ -36,3 +36,5 @@ unknown if any constituent's metric is unknown.
 CPU fixture coverage: `python -m unittest serve.test_throughput`, plus the normal
 server and replica suites. Real-engine execution and installation are separate
 qualification steps; this source change does not install a service or model.
+
+Idle services use a two-second window; active services retain five seconds. Reading idle metrics does not mutate the active five-second observation window. Dashboard display smoothing resets on resumption. Missing prefill support remains null.

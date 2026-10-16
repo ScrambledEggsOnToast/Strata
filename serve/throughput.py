@@ -78,9 +78,12 @@ class Throughput:
         while self.buckets and self.buckets[0][0] <= now - self.window_s:
             self.buckets.popleft()
 
-    def snapshot(self):
+    def snapshot(self, idle=False):
         with self.lock:
-            self._expire(self.clock())
-            return {'window_s': self.window_s,
-                    'decode_tok_s': sum(p[1] for p in self.buckets) / self.window_s,
-                    'prefill_tok_s': sum(p[2] for p in self.buckets) / self.window_s if self.prefill_supported else None}
+            now = self.clock()
+            window = 2.0 if idle else self.window_s
+            self._expire(now)
+            selected = [p for p in self.buckets if p[0] > now - window]
+            return {'window_s': window,
+                    'decode_tok_s': sum(p[1] for p in selected) / window,
+                    'prefill_tok_s': sum(p[2] for p in selected) / window if self.prefill_supported else None}
