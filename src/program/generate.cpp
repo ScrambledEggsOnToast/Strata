@@ -15859,17 +15859,8 @@ int main(int argc, char** argv) {
                 // state this session runs requests in, so it also moves the owner's generation: a completion of the
                 // state that was just replaced must never attach itself to the state that replaced it.
                 if (restored_from_store) {
-                    StoreOwner& owner = store_owner(kSessionOwner);
-                    ++owner.generation;
-                    owner.lineage = {};
-                    if (resume > 0 && (int64_t) live.size() >= resume) {
-                        owner.lineage.head = store_demand.head_id;
-                        owner.lineage.epoch = store_demand.epoch;
-                        owner.lineage.live.assign(live.begin(), live.begin() + (size_t) resume);
-                        owner.lineage.scope = req_scope;
-                        owner.lineage.cvec = want_cvec;
-                        owner.lineage.valid = true;
-                    }
+                    store_owner(kSessionOwner).mount(store_demand.head_id, store_demand.epoch, live, resume,
+                                                    req_scope, want_cvec);
                 }
                 if (req_ckpt && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park

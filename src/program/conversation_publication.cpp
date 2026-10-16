@@ -8,6 +8,20 @@
 
 namespace strata::program {
 
+void ConversationPublicationOwner::mount(uint64_t head, uint64_t epoch, const std::vector<int32_t>& whole_live,
+                                         int64_t resume, const strata::core::ConversationScope& scope, bool cvec) {
+    ++generation;
+    lineage = {};
+    if (resume > 0 && (int64_t) whole_live.size() >= resume) {
+        lineage.head = head;
+        lineage.epoch = epoch;
+        lineage.live.assign(whole_live.begin(), whole_live.begin() + (size_t) resume);
+        lineage.scope = scope;
+        lineage.cvec = cvec;
+        lineage.valid = true;
+    }
+}
+
 void ConversationPublicationQueue::report(const ConversationPublicationSink& sink, const char* format, ...) {
     if (!sink.report) return;
     // Bounded by construction: the only variable-length pieces are the store's own short reasons.  A truncation

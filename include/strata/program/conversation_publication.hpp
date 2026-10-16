@@ -44,6 +44,11 @@ struct ConversationPublicationLineage {
 struct ConversationPublicationOwner {
     uint64_t generation = 0;
     ConversationPublicationLineage lineage;
+
+    // Retarget the owner after a disk restore, before execution truncates the mounted record to its resumed cut.
+    // Moving the generation also prevents a completion of the replaced execution state from attaching here.
+    void mount(uint64_t head, uint64_t epoch, const std::vector<int32_t>& whole_live, int64_t resume,
+               const strata::core::ConversationScope& scope, bool cvec);
 };
 
 // A capture the engine already paid for (GPU copies included), waiting for the store's single bounded writer.  The

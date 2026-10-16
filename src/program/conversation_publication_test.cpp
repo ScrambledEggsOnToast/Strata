@@ -265,15 +265,128 @@ uint64_t mount_latest(ConversationStore& store, ConversationPublicationQueue& pu
     ConversationStorePublishResult result;
     check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored,
           "the prior latest head is persisted");
-    auto& owner = publications.owner(0);
-    owner.generation = 1;
-    owner.lineage = {result.head_id, store.epoch(), record.live.ids, record.scope, record.cvec, true};
+    publications.owner(0).mount(result.head_id, store.epoch(), record.live.ids, int64_t(record.live.ids.size()),
+                                record.scope, record.cvec);
     return result.head_id;
+}
+
+// Demand a real checkpoint image, then run the native mount handoff before shortening the execution record.
+std::vector<int32_t> mount_checkpoint(ConversationStore& store, ConversationPublicationQueue& publications,
+                                      const SavedConversation& record, uint64_t request_id) {
+    ConversationStoreQuery query = query_of(record, request_id, 1);
+    query.tokens = record.checkpoints.front().ids;
+    query.tokens.push_back(98765);   // diverges immediately after the stored checkpoint, not after the live cut
+    std::string why;
+    check(store.demand(query, why), "a checkpoint-only prompt is demanded from the real store");
+    ConversationStoreRead read;
+    check(store.wait_ready(request_id, 1, read, 5000) &&
+              read.status == ConversationStoreReadStatus::ready && read.image,
+          "the checkpoint demand returns its complete mounted image");
+    if (!read.image) {
+        store.release_read(request_id, 1);
+        return {};
+    }
+    check(!read.live && read.tokens == int64_t(record.checkpoints.front().ids.size()),
+          "the mount resumes a short checkpoint, not the full live record");
+    check(images_equal(*read.image, record, why), "the short mount still carries the whole persisted record");
+    std::vector<int32_t> live = read.image->live.ids;
+    ConversationPublicationOwner& owner = publications.owner(0);
+    const uint64_t previous_generation = owner.generation;
+    owner.mount(read.head_id, read.epoch, live, read.tokens, query.selector.scope, query.selector.cvec);
+    check_eq(owner.generation, previous_generation + 1, "a disk mount moves the owner generation");
+    check(owner.lineage.valid && owner.lineage.head == read.head_id && owner.lineage.epoch == read.epoch &&
+              owner.lineage.scope.matches(query.selector.scope) && owner.lineage.cvec == query.selector.cvec,
+          "a disk mount preserves its head, epoch, scope and steering");
+    live.resize(size_t(read.tokens));   // the same ordering as the native direct-checkpoint restore
+    read.image.reset();
+    store.release_read(request_id, 1);
+    return live;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // The regressions
 // ---------------------------------------------------------------------------------------------------------------
+
+// A latest head's live cut is deliberately unpinned. Resuming one of its shorter checkpoints and diverging must not
+// make that checkpoint stand in for the whole predecessor in the coverage proof: all its actual pins may still be
+// present in the new branch, so the store cannot recover the missing ancestry check on the native owner's behalf.
+void check_checkpoint_mount_preserves_the_longer_branch() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    if (!store.enabled()) return;
+    Sink sink;
+    ConversationPublicationQueue publications;
+    SavedConversation record = stored_record(141, 64);
+    record.cvec = false;
+    const uint64_t head = mount_latest(store, publications, sink, record);
+    std::vector<int32_t> live = mount_checkpoint(store, publications, record, 201);
+    if (live.empty()) return;
+
+    SavedConversation resumed = record;
+    resumed.live = record.checkpoints.front();
+    resumed.live.ids = std::move(live);
+    resumed.live.pinned = false;
+    for (ConversationKv& kv : resumed.kv) {
+        kv.cells = int64_t(resumed.live.ids.size());
+        kv.k.resize(resumed.live.ids.size() * 16);
+        kv.v.resize(resumed.live.ids.size() * 16);
+    }
+    const SavedConversation divergent = turn_on(resumed, 96, 900);
+    ConversationPublicationOwner& owner = publications.owner(0);
+    ++owner.generation;
+    check(publications.enqueue(capture_of(0, owner.generation, head, true, divergent, store.epoch()), sink.out),
+          "the branch generated after a short disk mount is queued");
+    publications.flush(store, sink.out, 0);
+    const ConversationPublicationPending* pending = pending_of(publications, 0);
+    check(pending && pending->supersedes == 0, "a short-mounted divergence claims no cover of the longer head");
+    settle(publications, store, sink);
+    check_eq(publications.counters().refused, 0, "the short-mounted branch publishes without refusal");
+    check_eq(store.counters().replaced, 0, "the longer predecessor was not retired by the divergent branch");
+    check_eq(store.counters().heads, 2, "the original longer record and the checkpoint branch both persist");
+
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check(reopened.enabled(), "the short-mount branch store reopens");
+    if (!reopened.enabled()) return;
+    check_record_restores(reopened, record, 202);
+    check_record_restores(reopened, divergent, 203, true);
+}
+
+// A short mount is not itself a reason to forbid replacement. If execution re-creates the predecessor's whole live
+// prefix before extending it, the existing full-record/pin predicate must still retire that unpinned latest head.
+void check_checkpoint_mount_allows_a_whole_prefix_replacement() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    if (!store.enabled()) return;
+    Sink sink;
+    ConversationPublicationQueue publications;
+    const SavedConversation record = stored_record(151, 64);
+    const uint64_t head = mount_latest(store, publications, sink, record);
+    std::vector<int32_t> live = mount_checkpoint(store, publications, record, 211);
+    if (live.empty()) return;
+    live.insert(live.end(), record.live.ids.begin() + long(live.size()), record.live.ids.end());
+    check(live == record.live.ids, "execution re-creates the whole predecessor prefix after its short mount");
+    SavedConversation continued = record;
+    continued.live.ids = std::move(live);
+    const SavedConversation covered = turn_on(continued, 96, 151);
+    ConversationPublicationOwner& owner = publications.owner(0);
+    ++owner.generation;
+    check(publications.enqueue(capture_of(0, owner.generation, head, true, covered, store.epoch()), sink.out),
+          "the full-prefix capture after a short disk mount is queued");
+    publications.flush(store, sink.out, 0);
+    const ConversationPublicationPending* pending = pending_of(publications, 0);
+    check(pending && pending->supersedes == head, "the full-prefix capture still covers the mounted head");
+    settle(publications, store, sink);
+    check_eq(publications.counters().refused, 0, "the full-prefix capture publishes without refusal");
+    check_eq(store.counters().replaced, 1, "a valid full-prefix continuation replaces its unpinned latest head");
+    check_eq(store.counters().heads, 1, "a valid replacement does not retain an unnecessary predecessor branch");
+
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check(reopened.enabled(), "the short-mount replacement store reopens");
+    if (!reopened.enabled()) return;
+    check_record_restores(reopened, covered, 212);
+}
 
 // A capture that diverges from the head its owner's state was taken from must be published as the branch it is - and
 // a completion that *replaces* a head must invalidate every reference to it, for every owner and every queued capture,
@@ -545,6 +658,8 @@ int main() {
             return 77;
         }
     }
+    check_checkpoint_mount_preserves_the_longer_branch();
+    check_checkpoint_mount_allows_a_whole_prefix_replacement();
     check_divergent_capture_is_published_as_a_branch();
     check_completion_landing_after_the_harvest();
     check_a_covered_root_keeps_its_record();
