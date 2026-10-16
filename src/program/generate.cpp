@@ -16693,7 +16693,8 @@ int main(int argc, char** argv) {
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
-            // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
+            // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint.  A target the
+            // working history does not hold is ignored and leaves the pin in place (conv_cache::pin_checkpoint)
             int64_t pin_at = -1;
             if (req_pin > 0) {
                 if (o.prompt_cache < 3 || !req_ckpt)
