@@ -282,7 +282,7 @@ class PressureTests(unittest.TestCase):
             sample = self.reader.snapshot()
         cgroup = sample["cgroup"]
         self.assertIsNone(cgroup["reason"])
-        self.assertEqual(cgroup["identity"]["path"], self.member)
+        self.assertEqual(cgroup["identity"]["path"], str(self.scope))
         self.assertEqual(cgroup["cpu"]["some_total_usec"], 101)
         self.assertEqual(cgroup["memory"]["some_total_usec"], 101)
         self.assertEqual(cgroup["io"]["some_total_usec"], 101)
