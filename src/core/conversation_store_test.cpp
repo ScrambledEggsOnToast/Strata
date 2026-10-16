@@ -635,6 +635,12 @@ void check_prefetch_catalog_reuse_and_cancel();
 void check_epoch_and_intent();
 void check_dirty_close();
 void check_ownership_and_close();
+void check_shutdown_admission();
+void check_shutdown_pending();
+void check_shutdown_deadlines();
+void check_shutdown_failures();
+void check_shutdown_late_finalization();
+void check_shutdown_request_policy();
 void check_stale_ready();
 void check_capacity_floor();
 void check_quota_credit();
@@ -670,6 +676,18 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_SHUTDOWN_ONLY")) {
+        check_shutdown_admission();
+        check_shutdown_pending();
+        check_shutdown_deadlines();
+        check_shutdown_failures();
+        check_shutdown_late_finalization();
+        check_shutdown_request_policy();
+        check_dirty_close();
+        check_ownership_and_close();
+        std::printf("conversation_store_test shutdown: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_PROMOTION_ONLY")) {
         check_promotion_burst_coalescing();
         check_promotion_publication_progress();
@@ -755,6 +773,12 @@ int main() {
     check_epoch_and_intent();
     check_dirty_close();
     check_ownership_and_close();
+    check_shutdown_admission();
+    check_shutdown_pending();
+    check_shutdown_deadlines();
+    check_shutdown_failures();
+    check_shutdown_late_finalization();
+    check_shutdown_request_policy();
     check_stale_ready();
     check_capacity_floor();
     check_quota_credit();
@@ -2514,6 +2538,327 @@ bool await_store_progress(Predicate progress) {
         ::usleep(1000);
     }
     return progress();
+}
+
+uint64_t shutdown_now_ms() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void check_shutdown_admission() {
+    TempRoot root;
+    SelectedHoldGate gate;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const auto image = fixture(750, 128);
+    ConversationStorePublishResult head;
+    check(publish_and_wait(store, image, 1, 1, head), "the shutdown fence has a durable history");
+    check(store.shutdown_state() == ConversationStoreShutdownState::none, "an open store has no shutdown request");
+    check(std::strcmp(conversation_store_shutdown_state_name(store.shutdown_state()), "none") == 0,
+          "the initial shutdown state has a stable name");
+
+    std::string why;
+    check(store.demand(query_of(image, 2, 1), why), "the shutdown fence first acquires an image lease");
+    ConversationStoreRead held;
+    check(store.wait_ready(2, 1, held, 5000) && held.image, "the image lease is handed out before shutdown");
+    const uint64_t lease = store.ram_lease_bytes();
+    check(lease > 0, "the handed-out image has a live charge");
+    store.suspend_read_admission();
+    check(store.demand(query_of(image, 3, 1), why), "a demand queues behind the handed-out lease");
+    check(store.request_status(3, 1) == ConversationStoreReadStatus::none, "the second demand has not started");
+
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        if (staged) static_cast<SelectedHoldGate*>(p)->pause();
+    }, &gate);
+    store.confirmed_restore(head.head_id);
+    gate.await(); // the real writer cannot start the publication offered below
+    auto outgoing = std::make_shared<SavedConversation>(fixture(751, 128));
+    ConversationStorePublish publication;
+    publication.request_id = 4;
+    publication.generation = 4;
+    check(store.publish(outgoing, publication, why) == kAccepted, "an unstarted publication owns its image");
+    const std::string catalog_before = file_digest(root.path + "/catalog");
+    store.request_shutdown(UINT64_MAX);
+    check(store.shutdown_state() == ConversationStoreShutdownState::pending, "request_shutdown publishes pending");
+    check(store.describe().find("shutdown: pending") != std::string::npos, "describe exposes the pending state");
+    check(store.run_intent_active(), "request_shutdown cannot speculatively clear the run intent");
+    check(file_digest(root.path + "/catalog") == catalog_before, "request_shutdown performs no catalog transaction");
+    check(store.request_status(3, 1) == ConversationStoreReadStatus::disabled, "shutdown retires the queued demand");
+    ConversationStorePublishResult cancelled;
+    check(store.take_publish(cancelled) && cancelled.request_id == 4 &&
+              cancelled.status == ConversationStorePublishStatus::disabled && cancelled.released,
+          "shutdown settles and releases the unstarted publication");
+    check(!store.writer_busy() && outgoing.use_count() == 1, "an unstarted publication keeps no image alias");
+    check_eq(store.ram_lease_bytes(), lease, "shutdown never refunds a handed-out image lease");
+
+    const auto before = store.counters();
+    const uint64_t ram = store.ram_held_bytes(), disk = store.disk_charged_bytes(), epoch = store.epoch();
+    const uint64_t allowance = store.ram_read_budget();
+    ConversationStoreReadRefusal refusal{123};
+    check(!store.demand(query_of(image, 2, 1), why), "shutdown fences read adoption even for an existing lease");
+    check(!store.demand(query_of(image, 5, 1), why, &refusal) && refusal.additional_ram_bytes == 0,
+          "shutdown fences a fresh demand before admission accounting");
+    check(!store.prefetch(query_of(image, 6, 1), why), "shutdown fences a fresh prefetch");
+    check(!store.prefetch(query_of(fixture(752, 128), 7, 1), why), "shutdown fences even a catalog-miss descriptor");
+    check(!store.refresh_speculation(3, 1), "shutdown cannot refresh speculation");
+    check(!store.invalidate_domain("after shutdown request"), "shutdown fences durable invalidation");
+    check(store.publish(outgoing, publication, why) == kRefused, "shutdown fences new publications");
+    store.confirmed_restore(head.head_id);
+    std::vector<ConversationStoreStreamInfo> streams;
+    check(!store.manifest_streams(head.head_id, streams), "shutdown fences new diagnostic filesystem reads");
+    check(store.matches(selector_of(image), query_of(image, 8, 1).tokens, {}).empty(),
+          "shutdown exposes no new restorable match");
+    check_eq(store.publish_read_allowance(allowance + 4096), allowance, "an allowance update cannot reopen shutdown");
+    const auto after = store.counters();
+    check_eq(after.matches, before.matches, "fenced reads never count a match");
+    check_eq(after.misses, before.misses, "fenced reads never count a miss");
+    check_eq(after.refused_budget, before.refused_budget, "shutdown is not a budget refusal");
+    check_eq(after.refused_limits, before.refused_limits, "shutdown is not a limits refusal");
+    check_eq(after.epoch_advances, before.epoch_advances, "fenced invalidation changes no epoch accounting");
+    check_eq(store.epoch(), epoch, "fenced invalidation changes no epoch");
+    check_eq(store.ram_held_bytes(), ram, "fenced admissions allocate no store-held RAM");
+    check_eq(store.disk_charged_bytes(), disk, "fenced admissions alter no disk charge");
+    check(store.describe().find("promotion pending no") != std::string::npos,
+          "a confirmed restore cannot re-arm policy work during shutdown");
+    ConversationStoreRead blocked;
+    check(!store.wait_ready(blocked, 60000) && !store.wait_ready(3, 1, blocked, 60000),
+          "shutdown wakes both forms of read waiter without waiting for the worker");
+    check(!store.wait_publish(cancelled, 60000), "shutdown wakes publication waiters without waiting for the worker");
+
+    gate.resume();
+    check(store.finish_shutdown() == ConversationStoreShutdownState::durable_clean,
+          "the fenced owner finishes cleanly after the real writer drains");
+    check(!gate.timed_out, "the gated writer was explicitly released");
+    check_eq(store.ram_lease_bytes(), lease, "finishing shutdown still owns the caller's live lease");
+    check(held.image && images_equal(*held.image, image, why), "a previously acquired image stays valid after shutdown");
+    held.image.reset();
+    store.release_read(2, 1);
+    store.release_read(3, 1);
+    check_eq(store.ram_lease_bytes(), 0, "lease release remains legal after terminal shutdown");
+}
+
+void check_shutdown_pending() {
+    TempRoot root;
+    SelectedHoldGate gate;
+    const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    ConversationStore store(options);
+    const auto image = fixture(753, 128);
+    ConversationStorePublishResult head;
+    check(publish_and_wait(store, image, 1, 1, head), "pending observation has a real stored image");
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+    std::string why;
+    check(store.demand(query_of(image, 2, 1), why), "the reader reserves its real materialization");
+    gate.await();
+    const uint64_t epoch = store.epoch(), deadline = shutdown_now_ms() + 1000;
+    store.request_shutdown(deadline);
+    const uint64_t reserved = store.ram_held_bytes();
+    ConversationStoreShutdownState results[2]{}, observed = ConversationStoreShutdownState::none;
+    std::thread first([&] { results[0] = store.finish_shutdown(); });
+    std::thread second([&] { results[1] = store.finish_shutdown(); });
+    std::thread observer([&] { observed = store.shutdown_state(); });
+    observer.join(); // finish must not hold the store mutex while joining the gated reader
+    check(observed == ConversationStoreShutdownState::pending, "another thread can cheaply observe a blocked shutdown");
+    check(store.run_intent_active(), "a blocked worker cannot be reported as a clean exit");
+    check_eq(store.ram_held_bytes(), reserved, "a live reader keeps its reservation until its frame unwinds");
+    {
+        ConversationStore contender(options);
+        check(!contender.enabled(), "pending shutdown keeps the root lock while the reader is live");
+        contender.request_shutdown(UINT64_MAX);
+        check(contender.finish_shutdown() == ConversationStoreShutdownState::quiescent_unclean,
+              "a non-owner never reports a durable-clean shutdown");
+    }
+    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline + 1)));
+    gate.resume();
+    first.join();
+    second.join();
+    check(!gate.timed_out, "pending observation never depended on the worker gate timing out");
+    check(results[0] == ConversationStoreShutdownState::quiescent_unclean && results[1] == results[0],
+          "concurrent finish calls join once and report the same actual terminal state");
+    check(store.shutdown_state() == results[0] && store.finish_shutdown() == results[0],
+          "terminal shutdown observation and repeated finish are idempotent");
+    check(store.describe().find("shutdown: quiescent_unclean") != std::string::npos,
+          "describe distinguishes quiescent unclean from pending");
+    check(store.run_intent_active(), "a deadline that expired while joining leaves the intent armed");
+    check_eq(store.ram_lease_bytes(), 0, "the retired worker delivers and leases no image");
+    store.release_read(2, 1);
+    ConversationStore reopened(options);
+    check(reopened.enabled(), "an expired cooperative drain eventually releases its root lock");
+    check_eq(reopened.epoch(), epoch + 1, "deadline expiry during worker drain forces restart distrust");
+    check(reopened.matches(selector_of(image), query_of(image, 3, 1).tokens, {}).empty(),
+          "the expired worker drain never authorizes reuse on restart");
+    reopened.close();
+}
+
+void check_shutdown_deadlines() {
+    for (int mode = 0; mode != 3; ++mode) {
+        TempRoot root;
+        PromotionCatalogGate gate;
+        gate.release();
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const auto image = fixture(754, 128);
+        ConversationStore store(options);
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, image, 1, 1, head), "deadline shutdown starts with a durable history");
+        const uint64_t epoch = store.epoch();
+        const std::string catalog = file_digest(root.path + "/catalog");
+        store.set_catalog_gate_for_test([](void* p, bool staged) {
+            static_cast<PromotionCatalogGate*>(p)->pause(staged);
+        }, &gate);
+        const uint64_t deadline = mode == 0 ? 0 : (mode == 1 ? shutdown_now_ms() - 1 : shutdown_now_ms() + 60000);
+        store.request_shutdown(deadline);
+        store.request_shutdown(deadline);
+        check(store.shutdown_state() == ConversationStoreShutdownState::pending && store.run_intent_active(),
+              "requesting any deadline is pending, not a durable-clean promise");
+        const auto expected = mode == 2 ? ConversationStoreShutdownState::durable_clean
+                                         : ConversationStoreShutdownState::quiescent_unclean;
+        check(store.finish_shutdown() == expected, "the deadline gates finalization only after drain");
+        check(!store.enabled() && !store.writer_busy(), "a terminal shutdown is quiescent and releases serving authority");
+        check(store.run_intent_active() == (mode != 2), "only a proven clean finalization removes intent");
+        check(std::strcmp(conversation_store_shutdown_state_name(expected),
+                          mode == 2 ? "durable_clean" : "quiescent_unclean") == 0,
+              "terminal shutdown names are stable");
+        gate.check_visits(mode == 2 ? 1 : 0);
+        if (mode != 2)
+            check(file_digest(root.path + "/catalog") == catalog, "a zero or expired deadline starts no final catalog");
+        const std::string after = file_digest(root.path + "/catalog");
+        store.request_shutdown(UINT64_MAX);
+        store.close();
+        check(store.finish_shutdown() == expected && file_digest(root.path + "/catalog") == after,
+              "repeated request, close and finish cannot change a terminal outcome");
+
+        // Reopening while the old object still exists also proves finish released the actual owner lock.
+        ConversationStore reopened(options);
+        check(reopened.enabled(), "terminal shutdown released the root for another owner");
+        if (mode == 2) {
+            check_eq(reopened.epoch(), epoch, "future-deadline durable clean preserves the epoch");
+            std::string why;
+            check(reopened.demand(query_of(image, 2, 1), why), "the cleanly finalized history remains selectable");
+            ConversationStoreRead read;
+            check(reopened.wait_ready(2, 1, read, 5000) && read.image && images_equal(*read.image, image, why),
+                  "future-deadline finalization preserves the exact stored image on restart");
+            read.image.reset();
+            reopened.release_read(2, 1);
+        } else {
+            check_eq(reopened.epoch(), epoch + 1, "zero or expired deadline forces restart distrust");
+            const auto query = query_of(image, 2, 1);
+            check(reopened.matches(query.selector, query.tokens, query.images).empty(),
+                  "a quiescent unclean history cannot be reused after restart");
+        }
+        reopened.close();
+    }
+}
+
+void check_shutdown_failures() {
+    for (const char* step : {"catalog-rename", "catalog-sync", "catalog-apply",
+                             "intent-unlink-sync", "intent-rearm-sync"}) {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const auto image = fixture(755, 128);
+        ConversationStore store(options);
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, image, 1, 1, head), "failed finalization starts with a durable history");
+        const uint64_t epoch = store.epoch();
+        if (std::strcmp(step, "intent-rearm-sync") == 0) store.set_publish_fault_for_test("intent-unlink-sync");
+        store.set_publish_fault_for_test(step);
+        store.request_shutdown(shutdown_now_ms() + 60000);
+        check(store.finish_shutdown() == ConversationStoreShutdownState::quiescent_unclean,
+              "catalog or intent failure is never reported as durable clean");
+        check(store.run_intent_active(), "unproven catalog or intent durability keeps intent armed");
+        store.close();
+        check(store.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean,
+              "close cannot retry a failed finalization into a clean result");
+        ConversationStore reopened(options);
+        check(reopened.enabled(), "a failed finalization still releases its drained root lock");
+        check_eq(reopened.epoch(), epoch + 1, "failed finalization causes restart distrust");
+        const auto query = query_of(image, 2, 1);
+        check(reopened.matches(query.selector, query.tokens, query.images).empty(),
+              "a failed finalization authorizes no reuse on restart");
+        reopened.close();
+    }
+}
+
+void check_shutdown_late_finalization() {
+    for (bool fail : {false, true}) {
+        TempRoot root;
+        PromotionCatalogGate gate;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const auto image = fixture(756, 128);
+        ConversationStore store(options);
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, image, 1, 1, head), "late finalization has a durable history");
+        const uint64_t epoch = store.epoch();
+        store.set_catalog_gate_for_test([](void* p, bool staged) {
+            static_cast<PromotionCatalogGate*>(p)->pause(staged);
+        }, &gate);
+        const uint64_t deadline = shutdown_now_ms() + 1000;
+        store.request_shutdown(deadline);
+        ConversationStoreShutdownState result = ConversationStoreShutdownState::none;
+        std::thread finisher([&] { result = store.finish_shutdown(); });
+        gate.await(false, 1);
+        check(shutdown_now_ms() < deadline, "real finalization began before its deadline");
+        check(store.shutdown_state() == ConversationStoreShutdownState::pending && store.run_intent_active(),
+              "starting finalization proves neither durability nor intent removal");
+        store.request_shutdown(0); // cannot interrupt a finalization already inside the real transaction
+        gate.resume(false, 1);
+        gate.await(true, 1);
+        std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline + 1)));
+        check(shutdown_now_ms() > deadline, "the real final transaction is held until after its deadline");
+        check(store.shutdown_state() == ConversationStoreShutdownState::pending && store.run_intent_active(),
+              "passing the deadline cannot fabricate a terminal result or clear intent");
+        if (fail) store.set_publish_fault_for_test("catalog-sync");
+        gate.release();
+        finisher.join();
+        const auto expected = fail ? ConversationStoreShutdownState::quiescent_unclean
+                                   : ConversationStoreShutdownState::durable_clean;
+        check(result == expected && store.shutdown_state() == expected,
+              "finalization completed after its deadline reports its actual durable outcome");
+        check(store.run_intent_active() == fail, "late success alone proves durable intent removal");
+        gate.check_visits(1);
+        ConversationStore reopened(options);
+        check(reopened.enabled(), "late finalization eventually releases the root lock");
+        check_eq(reopened.epoch(), epoch + (fail ? 1 : 0), "restart trusts only the real late finalization outcome");
+        const auto query = query_of(image, 2, 1);
+        check(reopened.matches(query.selector, query.tokens, query.images).empty() == fail,
+              "a deadline crossing does not substitute for the final transaction's result");
+        reopened.close();
+    }
+}
+
+void check_shutdown_request_policy() {
+    TempRoot root;
+    const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    const auto image = fixture(757, 128);
+    uint64_t epoch = 0;
+    {
+        ConversationStore store(options);
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, image, 1, 1, head), "deadline tightening has a durable history");
+        epoch = store.epoch();
+        store.request_shutdown(shutdown_now_ms() + 60000);
+        store.request_shutdown(shutdown_now_ms() - 1);
+        store.request_shutdown(UINT64_MAX);
+        store.close();
+        check(store.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean && store.run_intent_active(),
+              "a later request or legacy close cannot extend a stricter deadline");
+    }
+    {
+        ConversationStore store(options);
+        check_eq(store.epoch(), epoch + 1, "a tightened shutdown deadline leaves restart distrust intact");
+        ConversationStorePublishResult head;
+        check(publish_and_wait(store, image, 2, 2, head), "destructor policy has a newly durable history");
+        epoch = store.epoch();
+        store.request_shutdown(shutdown_now_ms() + 60000);
+        // No finish: the destructor must tighten this request to zero, not silently finalize it cleanly.
+    }
+    {
+        ConversationStore store(options);
+        check_eq(store.epoch(), epoch + 1, "destruction never upgrades a pending future-deadline request into clean");
+        check_eq(store.counters().heads, 0, "destruction leaves previously published histories distrusted");
+        store.request_shutdown(0);
+        store.request_shutdown(UINT64_MAX);
+        store.close();
+        check(store.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean && store.run_intent_active(),
+              "zero is the strictest deadline and legacy close cannot regain permission to finalize");
+    }
 }
 
 SavedConversation promotion_fixture(uint64_t seed, int64_t tokens = 128) {
@@ -4838,6 +5183,8 @@ void check_dirty_close() {
         check(!store.healthy(), "an observed fault latches");
         store.close();                              // ... and then closes
         check(store.run_intent_active(), "a faulted close leaves the run intent armed");
+        check(store.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean,
+              "legacy close truthfully reports a faulted owner as quiescent unclean");
         check(!store.healthy(), "a closed store is not healthy");
     }
     {
@@ -4876,11 +5223,18 @@ void check_ownership_and_close() {
     check(second.matches(selector_of(image), query_of(image, 9, 9).tokens, {}).empty(),
           "a refused owner matches nothing");
     second.close();   // must not clear the owner's marker or write its own catalog
+    check(second.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean,
+          "legacy close never calls a refused non-owner durable clean");
     check(file_digest(root.path + "/catalog") == catalog_before, "the refused owner wrote no catalog");
     check(first.enabled() && first.healthy(), "the owner keeps serving");
     check(first.run_intent_active(), "the refused owner did not clear the run intent");
     check_eq(first.counters().heads, heads, "the refused owner retired nothing");
     first.close();
+    check(first.shutdown_state() == ConversationStoreShutdownState::durable_clean && !first.run_intent_active(),
+          "legacy close without an earlier deadline preserves healthy durable-clean behavior");
+    first.close();
+    check(first.finish_shutdown() == ConversationStoreShutdownState::durable_clean,
+          "legacy close remains idempotent after proven success");
 }
 
 void check_stale_ready() {

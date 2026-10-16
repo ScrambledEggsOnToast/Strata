@@ -157,6 +157,7 @@ struct StoreReadTraceBatch {
     size_t count = 0;
     uint64_t dropped = 0;
     uint64_t call_ns = 0, call_lock_wait_ns = 0; // this API call only; workers have no caller lock interval
+    bool io_allowed = true; // request_shutdown may retire work but must not perform diagnostic writes
 
     void add(const StoreReadTrace& record) {
         if (count < sizeof records / sizeof records[0]) {
@@ -167,7 +168,7 @@ struct StoreReadTraceBatch {
         } else ++dropped;
     }
     void emit() {
-        if (!count && !dropped) return; // disabled: no clocks, formatting, allocations or I/O
+        if (!io_allowed || (!count && !dropped)) return; // disabled: no clocks, formatting, allocations or I/O
         const int saved_errno = errno;
         for (size_t i = 0; i < count; ++i) {
             const auto& r = records[i];
@@ -784,6 +785,7 @@ struct ConversationStore::Impl {
     std::condition_variable cv_publish;
     std::condition_variable cv_work;
     std::condition_variable cv_durable;
+    std::condition_variable cv_shutdown;
     std::array<uint8_t, 32> issuer_key{};
     Catalog catalog;
     uint64_t catalog_charge = 0;
@@ -792,8 +794,9 @@ struct ConversationStore::Impl {
     uint32_t domain_index = 0;
     bool intent_active = false;
     bool on = false;
-    bool closing = false;
-    bool closed = false;
+    ConversationStoreShutdownState shutdown = ConversationStoreShutdownState::none;
+    uint64_t finalize_before_ms = 0;    // steady-clock epoch; repeated requests only tighten, 0 forbids finalization
+    bool finishing = false;            // exactly one caller owns worker joins and finalization
     bool faulted = false;              // latched for the life of this instance
     bool initialized = false;          // the open sequence completed and the authority is trustworthy
     bool lock_owned = false;           // this instance holds the exclusive root lock
@@ -936,6 +939,7 @@ struct ConversationStore::Impl {
         uint64_t new_head = 0;                    // publish only
         const char* eviction_reason = "space";
         uint64_t replaced_head = 0;               // diagnostics: distinguish a covered replacement from head pressure
+        bool defer_reclaim = false;               // final catalog: reclaim only after proven intent removal
         std::vector<Digest> new_objects;          // publish only: everything the new manifest references
         std::map<Digest, uint64_t> new_object_charges;   // the ones this publication created (already charged)
         uint64_t new_manifest_bytes = 0;
@@ -2062,6 +2066,10 @@ bool ConversationStore::Impl::reserve_writer_workspace(const std::shared_ptr<Pub
 // read's whole peak, a writer's donor figures), so this is only ever a path that holds no reservation of its own.
 bool ConversationStore::Impl::reserve_decode_locked(uint64_t workspace, std::string& why) {
     std::lock_guard<std::mutex> guard(mutex);
+    if (shutdown != ConversationStoreShutdownState::none) {
+        why = "the store is shutting down";
+        return false;
+    }
     if (!workspace) return true;
     if (workspace > options.metadata_bytes || preparation_locked() > options.metadata_bytes - workspace) {
         why = "the workspace a manifest read and decode needs does not fit the store's preparation ceiling";
@@ -2079,6 +2087,7 @@ bool ConversationStore::Impl::reserve_decode_locked(uint64_t workspace, std::str
 void ConversationStore::Impl::release_decode_locked(uint64_t workspace) {
     std::lock_guard<std::mutex> guard(mutex);
     decode -= std::min(decode, workspace);
+    cv_shutdown.notify_all();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2590,6 +2599,7 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         return CommitOutcome::uncertain;
     }
     trace.emit(); // only a confirmed durable apply emits retired
+    if (plan.defer_reclaim) return CommitOutcome::durable_applied;
     // Deletions happen here: the authority that named these files is already durable, and the mutex is released.
     // The transaction is committed at this point, so a reclamation that cannot allocate its own batch must never be
     // reported as a transaction failure: the caller would then treat the manifest and the objects this commit just
@@ -2694,7 +2704,7 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
                                              size_t count, const std::vector<ConversationImageKey>& images,
                                              std::vector<ConversationStoreMatch>& out) const {
     out.clear();
-    if (!on || faulted) return;
+    if (!on || faulted || shutdown != ConversationStoreShutdownState::none) return;
     const Digest bucket = conversation_store_detail::store_bucket_digest(options, selector);
     conversation_store_detail::PrefixChain chain(bucket, ids, count, images);
     for (const auto& head : catalog.heads) {
@@ -3081,6 +3091,7 @@ void ConversationStore::Impl::expire_reads_locked(StoreReadTraceBatch& trace) {
 // Reuse the descriptor and its original authorized query/deadline. An active reader reaches this only after its
 // allocation frame has unwound, so replacing its image never overlaps a second materialization or refunds live bytes.
 bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>& job, StoreReadTraceBatch& trace) {
+    if (shutdown != ConversationStoreShutdownState::none) return false;
     if (job->active || job->cancelled || job->released || job->handed || job->epoch_at_admission != epoch) return false;
     if (job->status != ConversationStoreReadStatus::none && job->status != ConversationStoreReadStatus::ready &&
         job->status != ConversationStoreReadStatus::missing && job->status != ConversationStoreReadStatus::refused_budget)
@@ -3157,7 +3168,8 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
 // catalog sweeps never do: unchanged low capacity cannot manufacture attempts or repeatedly perform I/O.
 void ConversationStore::Impl::retry_budget_deferred_locked(StoreReadTraceBatch& trace) {
     expire_reads_locked(trace);
-    if (!on || faulted || closing || admission_suspended || !ram_budget || incoming >= options.max_reads) return;
+    if (!on || faulted || shutdown != ConversationStoreShutdownState::none ||
+        admission_suspended || !ram_budget || incoming >= options.max_reads) return;
     for (const auto& job : jobs)
         if (job->demand && !job->cancelled && !job->released && !job->handed) return;
     uint64_t slots = options.max_reads - incoming;
@@ -3459,6 +3471,7 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
 
 bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_t request_id, uint64_t generation,
                                              bool specific, StoreReadTraceBatch& trace) {
+    if (shutdown != ConversationStoreShutdownState::none) return false;
     expire_reads_locked(trace);
     for (auto it = ready.begin(); it != ready.end(); ++it) {
         const std::shared_ptr<ReadJob> job = *it;   // a copy: the ready entry is erased before the last uses
@@ -3517,7 +3530,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (read_timing) job->trace_start = started;
         trace_job_locked(trace, *job, "read_start", "materialization");
-        if (!on || closing) {
+        if (!on || shutdown != ConversationStoreShutdownState::none) {
             stop_with(ConversationStoreReadStatus::disabled,
                       reason.empty() ? std::string("the store stopped serving") : reason);
             return;
@@ -3983,7 +3996,7 @@ void ConversationStore::Impl::writer_body() {
             continue;
         }
         if (stop.load()) break;
-        if (promote_pending && !closing && !faulted) {
+        if (promote_pending && shutdown == ConversationStoreShutdownState::none && !faulted) {
             // Policy persistence uses only an idle seam. The transaction consumes the hint with its catalog copy,
             // not on completion, so any later restore re-arms work that this snapshot cannot make durable.
             CommitPlan plan;
@@ -4028,7 +4041,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     uint64_t epoch_now = 0;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        if (!on || closing || faulted) {
+        if (!on || shutdown != ConversationStoreShutdownState::none || faulted) {
             fail(ConversationStorePublishStatus::disabled,
                  faulted ? fault_reason : (reason.empty() ? std::string("the store is not enabled") : reason));
             return;
@@ -4377,7 +4390,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     uint64_t published_order = 0;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        if (!on || closing || faulted) {
+        if (!on || shutdown != ConversationStoreShutdownState::none || faulted) {
             fail(ConversationStorePublishStatus::disabled, "the store stopped serving while the image was written");
             return;
         }
@@ -4714,24 +4727,9 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
 }
 
 ConversationStore::~ConversationStore() {
-    Impl& self = *impl_;
-    // The destructor deliberately abandons the run intent: an exit that never called close() must not look healthy.
-    self.stop.store(true);
-    self.cv_work.notify_all();
-    self.cv_ready.notify_all();
-    self.cv_publish.notify_all();
-    self.cv_durable.notify_all();
-    if (self.writer.joinable()) self.writer.join();
-    for (auto& thread : self.readers)
-        if (thread.joinable()) thread.join();
-    self.readers.clear();
-    std::lock_guard<std::mutex> guard(self.mutex);
-    if (self.lock_fd >= 0) {
-        ::flock(self.lock_fd, LOCK_UN);
-        ::close(self.lock_fd);
-        self.lock_fd = -1;
-    }
-    self.on = false;
+    // Never upgrade an unfinished request into a clean exit merely because its owner is being destroyed.
+    request_shutdown(0);
+    finish_shutdown();
 }
 
 bool ConversationStore::enabled() const {
@@ -4838,7 +4836,8 @@ bool ConversationStore::manifest_streams(uint64_t head_id, std::vector<Conversat
     uint64_t bytes = 0;
     {
         std::lock_guard<std::mutex> guard(self.mutex);
-        if (!self.on || !self.head_manifest_locked(head_id, manifest_id, bytes)) return false;
+        if (!self.on || self.shutdown != ConversationStoreShutdownState::none ||
+            !self.head_manifest_locked(head_id, manifest_id, bytes)) return false;
     }
     // This diagnostic holds no reservation of its own, so its read and decode are charged before either allocates:
     // the retention figures this decodes under are wider than this run's admitted ones, and the decoded metadata and
@@ -4866,6 +4865,11 @@ bool ConversationStore::demand(const ConversationStoreQuery& query, std::string&
     if (impl_->read_timing) trace.call_ns = store_timing_ns();
     std::lock_guard<std::mutex> guard(impl_->mutex);
     if (impl_->read_timing) trace.call_lock_wait_ns = store_timing_ns() - trace.call_ns;
+    if (impl_->shutdown != ConversationStoreShutdownState::none) {
+        why = "the store is shutting down";
+        impl_->trace_refusal_locked(trace, query, true, ConversationStoreReadStatus::disabled, "shutdown");
+        return false;
+    }
     if (!impl_->on) {
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
         impl_->trace_refusal_locked(trace, query, true, ConversationStoreReadStatus::disabled, "disabled");
@@ -4884,6 +4888,11 @@ bool ConversationStore::prefetch(const ConversationStoreQuery& query, std::strin
     if (impl_->read_timing) trace.call_ns = store_timing_ns();
     std::lock_guard<std::mutex> guard(impl_->mutex);
     if (impl_->read_timing) trace.call_lock_wait_ns = store_timing_ns() - trace.call_ns;
+    if (impl_->shutdown != ConversationStoreShutdownState::none) {
+        why = "the store is shutting down";
+        impl_->trace_refusal_locked(trace, query, false, ConversationStoreReadStatus::disabled, "shutdown");
+        return false;
+    }
     if (!impl_->on) {
         why = impl_->reason.empty() ? "the store is not enabled" : impl_->reason;
         impl_->trace_refusal_locked(trace, query, false, ConversationStoreReadStatus::disabled, "disabled");
@@ -4967,6 +4976,7 @@ bool ConversationStore::refresh_speculation(uint64_t request_id, uint64_t genera
     Impl& self = *impl_;
     StoreReadTraceBatch trace;
     std::unique_lock<std::mutex> lock(self.mutex);
+    if (self.shutdown != ConversationStoreShutdownState::none) return false;
     self.expire_reads_locked(trace);
     for (const auto& entry : self.jobs) {
         const std::shared_ptr<Impl::ReadJob> job = entry;
@@ -5001,7 +5011,8 @@ bool ConversationStore::wait_ready(ConversationStoreRead& out, uint64_t timeout_
     if (impl_->deliver_locked(out, 0, 0, false, trace)) return true;
     if (timeout_ms == 0) return false;
     impl_->cv_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                             [&] { return !impl_->ready.empty() || impl_->closed; });
+                             [&] { return !impl_->ready.empty() ||
+                                          impl_->shutdown != ConversationStoreShutdownState::none; });
     return impl_->deliver_locked(out, 0, 0, false, trace);
 }
 
@@ -5011,6 +5022,7 @@ bool ConversationStore::wait_ready(uint64_t request_id, uint64_t generation, Con
     StoreReadTraceBatch trace;
     std::unique_lock<std::mutex> lock(self.mutex);
     const auto settled = [&]() {
+        if (self.shutdown != ConversationStoreShutdownState::none) return true;
         for (const auto& job : self.jobs)
             if (!job->released && job->query.request_id == request_id && job->query.generation == generation)
                 return job->handed ||
@@ -5076,7 +5088,8 @@ ConversationStoreReadStatus ConversationStore::request_status(uint64_t request_i
 void ConversationStore::confirmed_restore(uint64_t head_id) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
-    if (!self.on || self.faulted || !self.initialized || self.closing || self.closed || self.stop.load()) return;
+    if (!self.on || self.faulted || !self.initialized ||
+        self.shutdown != ConversationStoreShutdownState::none || self.stop.load()) return;
     bool found = false;
     for (auto& head : self.catalog.heads) {
         if (head.head_id != head_id) continue;
@@ -5101,17 +5114,17 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
     Impl& self = *impl_;
     StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(self.mutex);
+    if (self.shutdown != ConversationStoreShutdownState::none) {
+        why = "the store is shutting down";
+        return ConversationStorePublishAdmission::refused;
+    }
     self.expire_reads_locked(trace);
-    if (!self.on || self.closed) {
+    if (!self.on) {
         why = self.reason.empty() ? "the store is not enabled" : self.reason;
         return ConversationStorePublishAdmission::refused;
     }
     if (self.faulted) {
         why = self.fault_reason;
-        return ConversationStorePublishAdmission::refused;
-    }
-    if (self.closing) {
-        why = "the store is closing";
         return ConversationStorePublishAdmission::refused;
     }
     if (!image) {
@@ -5236,7 +5249,8 @@ bool ConversationStore::wait_publish(ConversationStorePublishResult& out, uint64
     std::unique_lock<std::mutex> lock(impl_->mutex);
     if (impl_->publish_done.empty() && timeout_ms)
         impl_->cv_publish.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                                   [&] { return !impl_->publish_done.empty() || impl_->closed; });
+                                   [&] { return !impl_->publish_done.empty() ||
+                                                impl_->shutdown != ConversationStoreShutdownState::none; });
     if (impl_->publish_done.empty()) return false;
     out = impl_->publish_done.front();
     impl_->publish_done.pop_front();
@@ -5279,6 +5293,7 @@ void ConversationStore::suspend_read_admission() {
 uint64_t ConversationStore::publish_read_allowance(uint64_t bytes) {
     StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);
+    if (impl_->shutdown != ConversationStoreShutdownState::none) return impl_->ram_budget;
     // Absolute, and never retroactive: a lower bound admits no new work but revokes nothing already admitted.
     impl_->ram_budget = bytes;
     // The caller has now published a complete absolute envelope, including any
@@ -5320,7 +5335,7 @@ bool ConversationStore::invalidate_domain(const char* reason) {
     {
         StoreReadTraceBatch trace;
         std::lock_guard<std::mutex> guard(self.mutex);
-        if (!self.on || !self.initialized) return false;
+        if (!self.on || !self.initialized || self.shutdown != ConversationStoreShutdownState::none) return false;
         if (self.faulted) return false;
         self.epoch += 1;
         if (self.domain_index < self.catalog.domains.size())
@@ -5360,33 +5375,27 @@ bool ConversationStore::invalidate_domain(const char* reason) {
     return true;
 }
 
-void ConversationStore::close() {
+void ConversationStore::request_shutdown(uint64_t finalize_before_ms) {
     Impl& self = *impl_;
+    // This entry point must never emit tracing I/O, even with STRATA_STORE_TIMING enabled.
+    StoreReadTraceBatch trace;
+    trace.io_allowed = false;
     {
-        StoreReadTraceBatch trace;
         std::lock_guard<std::mutex> guard(self.mutex);
-        if (self.closed) return;
-        self.closed = true;
-        if (!self.initialized || !self.lock_owned) {
-            // This instance never owned the store's authority (a rejected second owner, or a root that could not be
-            // opened): it must not write the catalog, retire anything, or touch the run-intent marker.
-            self.on = false;
-            if (self.lock_fd >= 0) {
-                ::flock(self.lock_fd, LOCK_UN);
-                ::close(self.lock_fd);
-                self.lock_fd = -1;
-            }
-            self.lock_owned = false;
+        if (self.shutdown != ConversationStoreShutdownState::none) {
+            if (self.shutdown == ConversationStoreShutdownState::pending)
+                self.finalize_before_ms = std::min(self.finalize_before_ms, finalize_before_ms);
             return;
         }
-        self.closing = true;
-        self.promote_pending = false; // the existing final promote transaction persists the latest live policy
+        self.finalize_before_ms = finalize_before_ms;
+        self.shutdown = ConversationStoreShutdownState::pending;
+        self.promote_pending = false; // the final catalog, if allowed, persists the latest live policy
         self.admission_suspended = true;
         self.retire_reads_locked(ConversationStoreReadStatus::disabled, "the store closed before this read completed",
                                  trace, "closed");
         self.queue.clear();
         if (self.publishing && !self.publishing->started) {
-            // A publication the writer never began is settled here, with its alias and its charge released.
+            // Unstarted work owns no worker frame: its alias and charge can be released immediately.
             const std::shared_ptr<Impl::PublishJob>& job = self.publishing;
             job->cancelled = true;
             if (job->ram_bytes) {
@@ -5410,11 +5419,33 @@ void ConversationStore::close() {
             self.publishing.reset();
         }
     }
-    self.stop.store(true);
     self.cv_work.notify_all();
     self.cv_ready.notify_all();
     self.cv_publish.notify_all();
     self.cv_durable.notify_all();
+}
+
+ConversationStoreShutdownState ConversationStore::shutdown_state() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->shutdown;
+}
+
+ConversationStoreShutdownState ConversationStore::finish_shutdown() {
+    Impl& self = *impl_;
+    if (shutdown_state() == ConversationStoreShutdownState::none) request_shutdown(0);
+    {
+        std::unique_lock<std::mutex> lock(self.mutex);
+        self.cv_shutdown.wait(lock, [&] { return !self.finishing; });
+        if (self.shutdown != ConversationStoreShutdownState::pending) return self.shutdown;
+        self.finishing = true;
+        self.stop.store(true);
+    }
+    self.cv_work.notify_all();
+    self.cv_ready.notify_all();
+    self.cv_publish.notify_all();
+    self.cv_durable.notify_all();
+    // A blocked filesystem call cannot be interrupted by this deadline. Keep all live ownership and the root lock
+    // until every worker really exits; concurrent finish callers wait without holding the catalog mutex.
     if (self.writer.joinable()) self.writer.join();
     for (auto& thread : self.readers)
         if (thread.joinable()) thread.join();
@@ -5422,7 +5453,10 @@ void ConversationStore::close() {
 
     bool commit_final = false;
     {
-        std::lock_guard<std::mutex> guard(self.mutex);
+        std::unique_lock<std::mutex> lock(self.mutex);
+        // A diagnostic decode admitted before the fence is caller-thread I/O, not a worker. It too must drain
+        // before another owner can acquire this root, while handed-out in-memory images stay releasable afterwards.
+        self.cv_shutdown.wait(lock, [&] { return self.decode == 0; });
         for (const auto& job : self.jobs) {
             if (job->status != ConversationStoreReadStatus::none || job->active) continue;
             job->status = ConversationStoreReadStatus::disabled;
@@ -5435,53 +5469,84 @@ void ConversationStore::close() {
             self.free_job_prep_locked(job);
         }
         self.queue.clear();
-        // A faulted store never presents itself as a clean close: the marker stays armed so the next start distrusts
-        // this domain, and no catalog write is attempted on authority already known to be untrustworthy.
-        commit_final = self.initialized && self.lock_owned && !self.faulted;
+        const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+        // This mutex scope is the finalization start decision. Once begun, its real result is reported even if
+        // filesystem I/O crosses the deadline or a later request tightens it. A faulted/non-owning store never starts.
+        commit_final = self.initialized && self.lock_owned && !self.faulted &&
+                       self.finalize_before_ms != 0 && now_ms < self.finalize_before_ms;
     }
-    if (commit_final) {
-        Impl::CommitPlan plan;
-        plan.kind = Impl::CommitPlan::Kind::promote;   // commit the live catalog durably, first
-        std::string why;
-        const CommitOutcome outcome = self.commit_plan(plan, why);
-        if (outcome == CommitOutcome::durable_applied) {
-            // Only now may this run be called clean: the catalog is durable, so the marker can go.
-            std::string intent_why;
-            const bool cleared = self.write_intent(false, intent_why);
-            std::lock_guard<std::mutex> guard(self.mutex);
-            self.intent_active = !cleared;
-            // A close that could not prove the marker gone is not a clean close, and the reason is reported as the
-            // fault it is rather than as a successful drain.
-            if (!cleared) self.latch_fault_locked("the run-intent marker could not be cleared: " + intent_why);
-        } else {
-            // The final commit either changed nothing durable (its own copy could not be admitted, so the previously
-            // committed catalog is still the authority) or its durability is uncertain.  Neither is a clean close:
-            // the marker stays armed so the next start distrusts this domain.  Uncertainty already latched a fault;
-            // an ordinary refusal is not a fault, it just is not a promise.
-            std::lock_guard<std::mutex> guard(self.mutex);
-            self.intent_active = true;
-            if (outcome == CommitOutcome::uncertain)
-                self.latch_fault_locked(why.empty() ? "the final catalog commit is not confirmed" : why);
+    bool durable_clean = false;
+    try {
+        if (commit_final) {
+            Impl::CommitPlan plan;
+            plan.kind = Impl::CommitPlan::Kind::promote;
+            plan.defer_reclaim = true; // drain -> durable catalog -> proven intent removal -> reclaim -> lock release
+            std::string why;
+            const CommitOutcome outcome = self.commit_plan(plan, why);
+            if (outcome == CommitOutcome::durable_applied) {
+                std::string intent_why;
+                const bool cleared = self.write_intent(false, intent_why);
+                std::lock_guard<std::mutex> guard(self.mutex);
+                self.intent_active = !cleared;
+                durable_clean = cleared;
+                if (!cleared) self.latch_fault_locked("the run-intent marker could not be cleared: " + intent_why);
+            } else {
+                // A refusal or uncertain final commit is never a clean exit; intent remains armed for restart distrust.
+                std::lock_guard<std::mutex> guard(self.mutex);
+                self.intent_active = true;
+                if (outcome == CommitOutcome::uncertain)
+                    self.latch_fault_locked(why.empty() ? "the final catalog commit is not confirmed" : why);
+            }
         }
+    } catch (...) {
+        // No escaped finalization may strand concurrent finish callers or turn missing durability proof into clean.
+        std::lock_guard<std::mutex> guard(self.mutex);
+        self.intent_active = true;
+        self.latch_fault_locked("the shutdown finalization could not be confirmed");
     }
+    bool reclaim = false;
     {
         std::lock_guard<std::mutex> guard(self.mutex);
-        if (!self.faulted) {
-            // No reader exists any more, so retired files can be removed and credited regardless of past leases.
+        reclaim = durable_clean && self.initialized && self.lock_owned && !self.faulted;
+        if (reclaim) {
+            // No storage reader remains. A handed-out image owns RAM only, not a filesystem operation.
             for (auto& file : self.pending_files) file.head_id = 0;
         }
     }
-    if (!self.faulted) self.reclaim_pending();
+    if (reclaim) {
+        try {
+            self.reclaim_pending();
+        } catch (...) {
+            // Reclamation is optional: unreclaimed files stay charged, and cannot undo already proven durability.
+        }
+    }
+    int lock_fd = -1;
     {
         std::lock_guard<std::mutex> guard(self.mutex);
-        if (self.lock_fd >= 0) {
-            ::flock(self.lock_fd, LOCK_UN);
-            ::close(self.lock_fd);
-            self.lock_fd = -1;
-        }
+        lock_fd = self.lock_fd;
+        self.lock_fd = -1;
+    }
+    // Even lock-release syscalls stay outside the mutex so another thread can keep observing pending.
+    if (lock_fd >= 0) {
+        ::flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+    }
+    {
+        std::lock_guard<std::mutex> guard(self.mutex);
         self.lock_owned = false;
         self.on = false;
+        self.shutdown = durable_clean ? ConversationStoreShutdownState::durable_clean
+                                      : ConversationStoreShutdownState::quiescent_unclean;
+        self.finishing = false;
     }
+    self.cv_shutdown.notify_all();
+    return shutdown_state();
+}
+
+void ConversationStore::close() {
+    request_shutdown(UINT64_MAX);
+    finish_shutdown();
 }
 
 ConversationStoreCounters ConversationStore::counters() const {
@@ -5518,6 +5583,7 @@ std::string ConversationStore::describe() const {
             (impl_->reason.empty() ? "" : " (" + impl_->reason + ")") + "\n";
     text += std::string("healthy: ") + ((impl_->on && !impl_->faulted) ? "yes" : "no") +
             (impl_->fault_reason.empty() ? "" : " (" + impl_->fault_reason + ")") + "\n";
+    text += std::string("shutdown: ") + conversation_store_shutdown_state_name(impl_->shutdown) + "\n";
     text += "owner lock: " + std::string(impl_->lock_owned ? "held" : "not held") + "\n";
     text += "issuer key digest: " +
             sha256_hex(sha256(impl_->issuer_key.data(), impl_->issuer_key.size())).substr(0, 16) + "\n";
@@ -5579,6 +5645,16 @@ void ConversationStore::set_catalog_gate_for_test(void (*gate)(void*, bool), voi
     impl_->catalog_gate_context = context;
 }
 #endif
+
+const char* conversation_store_shutdown_state_name(ConversationStoreShutdownState state) {
+    switch (state) {
+        case ConversationStoreShutdownState::none: return "none";
+        case ConversationStoreShutdownState::pending: return "pending";
+        case ConversationStoreShutdownState::quiescent_unclean: return "quiescent_unclean";
+        case ConversationStoreShutdownState::durable_clean: return "durable_clean";
+    }
+    return "unknown";
+}
 
 const char* conversation_store_read_status_name(ConversationStoreReadStatus status) {
     switch (status) {

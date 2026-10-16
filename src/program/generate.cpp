@@ -18218,25 +18218,23 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
-        // ---- clean shutdown ---------------------------------------------------
-        // QUIT (or the server closing stdin) has no later request to park the last completed conversation, so the
-        // final owners are captured here: the serial session this engine is holding, and every resident owner a batch
-        // slot completed.  Two things are ordered deliberately.  The offer channel is stopped FIRST: its callback must
-        // never reach a store that is being drained or destroyed, and no offer may add work while the drain runs.  The
-        // deadline starts BEFORE the captures, so capturing every final owner cannot extend the shutdown past it.
-        // Then each owner is captured and drained one at a time: a busy writer delays the next owner rather than making
-        // it skip its own publication, and only the remaining deadline can end the drain.  Finally the store is closed:
-        // only a clean close durably clears this domain's run intent, which is what lets eligible completed
-        // publications survive a restart.  A GPU fault, the poison path or a killed process deliberately leaves the
-        // intent armed (the destructor does exactly that), so a run that stopped short never looks healthy.
+        // ---- cooperative shutdown --------------------------------------------
+        // QUIT (or the server closing stdin) has no later request to park the last completed conversation, so capture
+        // the final serial and resident owners here. Stop the offer channel FIRST: its callback must never reach a
+        // draining or destroyed store. The deadline starts before capture admission and the bounded publication
+        // waits, but cannot interrupt a capture, filesystem call or worker. Request store shutdown only AFTER the
+        // final captures/drain: the fence intentionally refuses new publication. finish_shutdown() then joins real
+        // workers and may wait indefinitely; the frontend's separate terminate/kill escalation remains in charge of
+        // a stuck process. Only durable_clean proves catalog durability and intent removal. A GPU fault, poison or
+        // killed process leaves intent armed, so a run that stopped short never looks healthy.
         if (offer_channel) offer_channel->stop();
         if (store_on && !store_faulted) {
             const auto now_ms = [] {
                 return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now().time_since_epoch()).count();
             };
-            // Bounded: the frontend's QUIT grace is 15 s inside the host's 20 s, and the lifetime already reserves
-            // its own window, so storage work that has not finished by then is abandoned rather than waited out.
+            // Admission/wait budget only, not a claim that storage workers can be interrupted after eight seconds.
+            // The frontend's independent 15-second QUIT escalation is unchanged.
             const uint64_t shutdown_started = now_ms();
             const uint64_t deadline = shutdown_started + 8000;
             store_allowance();
@@ -18307,7 +18305,7 @@ int main(int argc, char** argv) {
             if (!any)
                 std::fprintf(stderr, "strata serve: conversation store: nothing to park at shutdown (a one-shot, a "
                                      "pinned sibling or an incomplete session)\n");
-            std::fprintf(stderr, "strata serve: conversation store: shutdown completed in %llu ms; %zu owner "
+            std::fprintf(stderr, "strata serve: conversation store: capture/drain phase ended in %llu ms; %zu owner "
                                  "captures skipped, %zu queued and %zu outstanding publications left\n",
                          (unsigned long long) (now_ms() - shutdown_started), skipped_owners,
                          publications.queued().size(), publications.pending().size());
@@ -18325,6 +18323,15 @@ int main(int argc, char** argv) {
                                      "token_bytes=%llu\n", (unsigned long long) s.accepted,
                              (unsigned long long) s.cancelled, (unsigned long long) s.rejected,
                              (unsigned long long) s.accepted_token_bytes);
+            }
+            if (!store_faulted) {
+                // Only completed durable publications can survive; the abandoned-work reports above promise no tail.
+                // This deadline decides whether finalization may start AFTER workers drain, never bounds their join.
+                conversation_store->request_shutdown(deadline);
+                const auto state = conversation_store->finish_shutdown();
+                std::fprintf(stderr, "strata serve: conversation store: shutdown state=%s after %llu ms\n",
+                             strata::core::conversation_store_shutdown_state_name(state),
+                             (unsigned long long) (now_ms() - shutdown_started));
             }
             const strata::core::ConversationStoreCounters c = conversation_store->counters();
             std::fprintf(stderr, "strata serve: conversation store at shutdown: enabled=%d healthy=%d run_intent=%d "
@@ -18357,10 +18364,6 @@ int main(int argc, char** argv) {
                              (unsigned long long) publications.counters().coalesced,
                              (unsigned long long) store_cancelled,
                              (unsigned long long) publications.counters().dropped);
-            // A healthy close preserves only completed durable publications; the explicit
-            // abandoned-work reports above are not a promise that every conversation was saved.
-            // GPU faults and poison leave the run intent armed instead.
-            if (!store_faulted) conversation_store->close();
         }
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {
             std::fprintf(stderr, "strata cross-help capture REFUSED: the requested request/window was not "

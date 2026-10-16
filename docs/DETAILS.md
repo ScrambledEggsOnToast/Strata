@@ -1700,13 +1700,28 @@ the request arrives.
 
 *Restart, poison and shutdown.* An execution domain's run intent is durably marked active before persistent reuse is
 enabled, and every lookup, capture and publication ticket carries its epoch. Non-finite logits invalidate the domain
-(an epoch advance, the same moment RAM drops its parked state), so a restart cannot resurrect state the engine
-deliberately discarded. Only a **clean** exit - `QUIT`, or the server closing stdin - parks the final completed
-serial and resident owners, drains outstanding publications with a bounded wait, stops the offer channel and then
-closes the store, which is what durably clears the run intent. A killed process, a GPU fault or an error exit leaves
-the intent armed, so the next start conservatively invalidates that domain instead of reusing it. Recovery after a
-clean switch (same profile, or pair → three-GPU → pair) covers only compatible, catalog-authorized state; the newest
-uncommitted response tail is never promised.
+(an epoch advance, the same moment RAM drops its parked state), so a restart cannot resurrect discarded state.
+On `QUIT` or stdin close, native serving stops offers, captures final completed owners and drains publications within
+its existing admission/wait budget. Only **after** those captures does it request store shutdown with that same
+steady-clock millisecond deadline: the request fences new reads, speculation, invalidation and publication, retires
+unhanded work and reports `pending`, without filesystem or diagnostic I/O. Existing image leases remain valid until
+their owners release them.
+
+`finish_shutdown()` is a **potentially unbounded cooperative drain**, not a timed join. It keeps the live owner and
+root lock until filesystem-blocked workers and already-admitted diagnostic reads really return; it never detaches
+them. After draining, a healthy owner may *begin* finalization only before a nonzero deadline. It then preserves the
+order: durable final catalog, proven durable intent removal, reclamation, lock release. Once finalization begins,
+crossing the deadline cannot cancel it or substitute a guessed result. The observable/printed terminal state is
+`durable_clean` only after both durable proofs; otherwise it is `quiescent_unclean`, with intent left armed.
+`none` means shutdown has not been requested. The frontend's separate 15-second terminate/kill escalation is unchanged;
+the store does not promise that a process stuck in filesystem I/O can exit within that window.
+
+Repeated `request_shutdown()` calls can only tighten the deadline; `0` forbids starting finalization and cannot be
+upgraded. Legacy `close()` requests an unlimited deadline and finishes, preserving healthy clean-close behavior when
+there was no prior stricter request. The destructor requests `0` and finishes, deliberately unclean even after an
+unfinished future-deadline request. Fault/poison exits keep intent armed; a killed process cannot prove a clean result.
+The next start distrusts that domain instead of reusing it. Only compatible, catalog-authorized completed publications
+are preserved by a durable-clean switch (same profile, or pair → three-GPU → pair); no uncommitted response tail is promised.
 
 *Known limits of this first implementation.* Retained-K/V reuse intervals are offered only for a capture that kept a
 donor's own K/V head (`conversation_store_reuse_intervals`), and the store re-validates every one of them: the donor

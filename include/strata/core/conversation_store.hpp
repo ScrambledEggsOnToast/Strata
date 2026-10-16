@@ -18,12 +18,11 @@
 // at.  Bytes are reused across turns only through explicit, caller-proven unchanged byte intervals, so an
 // immutable chunk that already exists is never re-read or re-hashed.
 //
-// Threading: one admitted writer thread and a bounded read pipeline (Options::max_reads incoming images).  Nothing in
-// this module blocks under a caller's admission lock: a caller that wants a restore at its own safe seam calls
-// wait_ready(), and every other entry point returns immediately - including confirmed_restore() and
-// invalidate_domain(), whose durable catalog commits are handed to the storage thread (invalidate_domain then waits
-// for that commit without holding the catalog mutex).  No storage wait ever runs while the module holds its own
-// catalog mutex, and no filesystem call is ever made on a path component the module has not opened itself.
+// Threading: one admitted writer thread and a bounded read pipeline (Options::max_reads incoming images). Callers
+// perform explicit waits only on their own thread, without holding an admission lock: wait_ready(), wait_publish(),
+// invalidate_domain() and finish_shutdown() may wait. request_shutdown() performs no I/O; finish_shutdown() may wait
+// indefinitely for filesystem-blocked work and must not be mistaken for a deadline-bounded join. No storage wait
+// runs while the module holds its catalog mutex, and filesystem access is descriptor-relative to validated paths.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -464,6 +463,17 @@ struct ConversationStoreManifestInfo {
 // The store
 // ---------------------------------------------------------------------------------------------------------------
 
+// pending means admission is fenced, not that workers have stopped. Both terminal states prove quiescence and lock
+// release; only durable_clean also proves the final catalog durable and this run's intent durably removed.
+enum class ConversationStoreShutdownState : uint8_t {
+    none = 0,
+    pending,
+    quiescent_unclean,
+    durable_clean,
+};
+
+const char* conversation_store_shutdown_state_name(ConversationStoreShutdownState state);
+
 class ConversationStore {
 public:
     explicit ConversationStore(ConversationStoreOptions options, ConversationStoreLimits limits = {});
@@ -666,15 +676,27 @@ public:
     // when that commit succeeded.  A failure - including one this call could not confirm in time - latches the store
     // faulted and leaves the run intent armed: the next start must not reuse anything.
     bool invalidate_domain(const char* reason);
-    // Healthy drain: finishes or cancels storage work, durably commits a final catalog, and only then clears and
-    // flushes this domain's run-intent marker - in that order, so a close that cannot finish its commit never removes
-    // the marker that tells the next start to distrust this domain.  Only a healthy close promises that eligible
-    // completed publications survive a restart; a faulted close, and the destructor, deliberately abandon the intent
-    // (an unclean exit must not look healthy).  An instance that does not own the root lock performs no authority
-    // write and removes no marker at all.
+    // Immediate, no I/O: fence new work, retire unhanded reads and cancel unstarted publication. Existing handed-out
+    // leases remain valid and release_read() stays legal. finalize_before_ms uses steady_clock milliseconds since
+    // its epoch, as the native serving loop does. 0 forbids starting optional finalization; UINT64_MAX is unlimited.
+    // Repeated requests only tighten this deadline (0 is strictest), never reopen admission or regain permission.
+    // Once finalization has begun, a later request cannot interrupt it or change the eventual durable verdict.
+    void request_shutdown(uint64_t finalize_before_ms);
+    // Cheap mutex-guarded observation, including while finish_shutdown() is blocked on worker or filesystem I/O.
+    ConversationStoreShutdownState shutdown_state() const;
+    // Potentially UNBOUNDED: cooperatively stop/join workers, settle ownership, then optionally finalize. The
+    // deadline governs only whether finalization may BEGIN after draining; it cannot interrupt filesystem calls,
+    // joins or a finalization already begun. Always keeps the live owner and root lock until quiescence is proven.
+    // An absent request implies request_shutdown(0). Concurrent/repeated finish calls share one terminal result.
+    // durable_clean requires a durable final catalog followed by proven durable intent removal; every other
+    // terminal result is quiescent_unclean, with intent left armed. Non-owners never write authority or remove intent.
+    ConversationStoreShutdownState finish_shutdown();
+    // Legacy healthy drain: request an unlimited deadline and finish. A prior stricter shutdown request is honored,
+    // not upgraded. A faulted owner, or the destructor (request deadline 0 + finish), deliberately leaves intent
+    // armed. Completed publications survive restart only after durable_clean; no promise covers an uncommitted tail.
     void close();
     ConversationStoreCounters counters() const;
-    // Diagnostics for qualification evidence: one bounded line per stage of the open sequence.
+    // Diagnostics include shutdown state and one bounded line per stage of the open sequence.
     std::string describe() const;
 
     // Test-only seams (documented, deterministic): arm a named publication/transaction step to fail, and count the
