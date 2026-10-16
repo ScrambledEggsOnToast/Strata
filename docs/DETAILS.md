@@ -297,13 +297,37 @@ Its `hit_rate` is the VRAM share of the experts looked up while answering: exper
 beside the hit rate.
 
 **Where a decode window's time goes (profiling, #610):** start the server with `STRATA_DECODE_TIMING=1` (and
-`STRATA_VERIFY_PROFILE=1` for the GPU's side) in the environment. After each request the engine log then has one
-`strata decode timing:` line - windows, tokens per window, and per window the verify time split into the wait for the
-GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft - and one
-`strata decode GPU stages (ms/window):` line with the GPU time of each stage (GDN and QSA layers, the VRAM expert
-hits, the router, the head, ...). The GPU profile times every stage with events, so it slows the decode a little:
-use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of
-per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
+`STRATA_VERIFY_PROFILE=1` for the GPU's side) in the environment. The instrumented per-request serve decode path
+prints `strata decode timing:` - windows, tokens per window, and per window the verify time split into the wait
+for the GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft - and
+`strata decode GPU stages (ms/window):` with the GPU time of each stage (GDN and QSA layers, the VRAM expert hits,
+the router, the head, ...). These lines do **not** cover the whole batched/pipelined decode loop; do not treat them
+as a complete batch wall-time breakdown. The GPU profile times stages with events, so use it to compare, not to
+measure headline speed. `--gpu-stages` (a one-token replay of per-layer graphs) refuses a native (IQ) pack,
+which has no such graphs.
+
+`STRATA_COMMIT_TIMING=1` separately prints `strata commit timing:` for instrumented batch stage/group owners.
+These are cumulative owner-lifetime window counts and commit milliseconds (`scope=cumulative`), not independent
+per-request samples; do not sum repeated reports. `STRATA_PREFILL_TIMING=1` prints `strata prefill timing:`
+GPU phase and host staging/setup/wait summaries for prefill. It enables GPU event timing and host accounting,
+not a cache-read or whole-response timer. Unset all these switches for uninstrumented comparisons.
+
+**Queued cache restoration (opt-in diagnostics):** set `STRATA_STORE_TIMING=1` in both the frontend and engine
+environment. The frontend emits metadata-only `[strata] store_offer:` lifecycle diagnostics and adds `cache_offer`
+to the logged `response_attribution` record, not to HTTP responses or the lifecycle API. Join its frontend
+`request_id` to the native `store_read` identity using `offer_id` and `generation`: the native offer id is **not**
+the HTTP request id. `offer_sent` means a successful local channel send, not native acceptance; there is no offer
+ACK, so `native_acceptance` remains `unknown`. `demand_bound` means the frontend attached the offer keys to a
+prepared demand, not that native accepted or restored it. Consumption and withdrawal keep this correlation after
+the prepared prompt is freed; `cancel_sent` describes delivery of the cancellation, not an ACK. One fixed-size
+snapshot of the latest preparation is retained per request; `offer_sequence` distinguishes reoffers, whose
+earlier mappings remain in the lifecycle diagnostic log. Unsent preparations have no native offer id.
+
+Use native attempt identities, event timestamps and outcomes to separate queue residence from materialization,
+including refusals that do no I/O and attempts that are later reissued. Materialization is a host operation
+envelope that may include file reads, page-cache service, validation and copies; it is not physical-device I/O
+latency or proof of SSD traffic. Queue time is not device service time either. These store diagnostics add no GPU
+synchronization and dump no prompts, token arrays, scopes or credentials. Keep them off for headline measurements.
 
 **Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
 `PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one

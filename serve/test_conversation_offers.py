@@ -708,6 +708,167 @@ class QueuedFrontier(ChannelTestCase):
         self.join(first)
 
 
+class OfferDiagnosticCase(ChannelTestCase):
+    timing = "1"
+
+    def setUp(self):
+        capture = mock.patch.object(server, "print", create=True)
+        self.printed = capture.start()
+        self.addCleanup(capture.stop)
+        with mock.patch.dict(os.environ, {"STRATA_STORE_TIMING": self.timing}):
+            super().setUp()
+        self.addCleanup(self.engine.release.set)
+
+    def diagnostic_records(self, kind):
+        prefix = f"[strata] {kind}: "
+        return [json.loads(call.args[0][len(prefix):]) for call in self.printed.call_args_list
+                if call.args and isinstance(call.args[0], str) and call.args[0].startswith(prefix)]
+
+    def wait_attributions(self, count):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            records = self.diagnostic_records("response_attribution")
+            if len(records) >= count:
+                return records
+            time.sleep(.01)
+        self.fail(f"never saw {count} completed response attributions")
+
+
+class StoreOfferTiming(OfferDiagnosticCase):
+    def test_consumed_offer_survives_withdrawal_and_never_aliases_the_next_request(self):
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request("second")
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered)
+        self.engine.release.set()
+        self.join(first, second)
+        self.wait_attributions(2)
+        third = self.start_request("third")
+        self.join(third)
+        attributions = self.wait_attributions(3)
+        self.assertEqual([outcome.get("status") for _, outcome in (first, second, third)], [200, 200, 200])
+        mapped, = [r for r in attributions if "cache_offer" in r]
+        correlation = mapped["cache_offer"]
+        self.assertEqual((correlation["offer_id"], correlation["generation"]),
+                         (offered["request_id"], offered["generation"]))
+        self.assertEqual(correlation["native_acceptance"], "unknown")
+        for field in ("sent", "prepared_consumed", "prepared_reusable", "demand_bound", "withdrawn", "cancel_sent"):
+            self.assertTrue(correlation[field], field)
+        events = [r for r in self.diagnostic_records("store_offer") if r["request_id"] == mapped["request_id"]]
+        self.assertEqual([r["last_event"] for r in events],
+                         ["offer_sent", "prepared_consumed", "demand_bound", "offer_withdrawn"])
+        self.assertEqual([r["last_event_monotonic_ns"] for r in events],
+                         sorted(r["last_event_monotonic_ns"] for r in events))
+        self.assertTrue(all(r["native_acceptance"] == "unknown" for r in events))
+        record = next(r for r in self.svc.lifecycles if r["id"] == mapped["request_id"])
+        self.assertNotIn("_prepared", record)
+        public = self.svc.lifecycle_records(mapped["request_id"])
+        self.assertNotIn("_store_offer", public)
+        self.assertNotIn("cache_offer", public["attribution"], "diagnostics must not extend the lifecycle API")
+        for _, outcome in (first, second, third):
+            self.assertNotIn("cache_offer", json.loads(outcome["body"]), "no new response API fields")
+
+    def test_cancelled_queued_offer_retains_its_identity_without_claiming_native_acceptance(self):
+        first = self.start_request("first")
+        self.assertTrue(self.engine.entered.wait(5))
+        second = self.start_request("cancel this")
+        offered = self.peer.next_offer(5)
+        self.assertIsNotNone(offered)
+        queued, = [r for r in self.svc.lifecycle_records() if r["state"] == "queued"]
+        self.assertTrue(self.svc.cancel_request(queued["id"]))
+        self.join(second)
+        cancelled, = self.wait_attributions(1)
+        self.assertEqual(second[1].get("status"), 409)
+        self.assertEqual(cancelled["request_id"], queued["id"])
+        self.assertEqual(cancelled["outcome"], "cancelled")
+        correlation = cancelled["cache_offer"]
+        self.assertEqual((correlation["offer_id"], correlation["generation"]),
+                         (offered["request_id"], offered["generation"]))
+        self.assertFalse(correlation["prepared_consumed"])
+        self.assertFalse(correlation["demand_bound"])
+        self.assertTrue(correlation["withdrawn"])
+        self.assertTrue(correlation["cancel_sent"])
+        self.assertEqual(correlation["native_acceptance"], "unknown")
+        self.engine.release.set()
+        self.join(first)
+        first_record, = [r for r in self.wait_attributions(2) if r["request_id"] != queued["id"]]
+        self.assertNotIn("cache_offer", first_record)
+
+    def test_prompt_mismatch_and_reoffer_keep_distinct_bounded_correlations(self):
+        request = {"messages": [{"role": "user", "content": "prepare this"}],
+                   "_strata_cache_scope": "ab" * 32, "max_tokens": 4}
+        record = self.svc.register_lifecycle(request, threading.Event())
+        self.svc.prefetch_offer(record, "/v1/chat/completions", request)
+        first = self.peer.next_offer(5)
+        self.assertIsNotNone(first)
+        self.assertIsNone(self.svc.take_prepared(record, [], None, {}, 4, None))
+        self.assertNotIn("_prepared", record)
+        self.svc.prefetch_offer(record, "/v1/chat/completions", request)
+        second = self.peer.next_offer(5)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        self.svc.withdraw_offer(record)
+        self.svc.finish_lifecycle(record)
+        attribution = server._response_attribution(record, "/v1/chat/completions")
+        correlation = attribution["cache_offer"]
+        self.assertEqual(correlation["offer_sequence"], 2)
+        self.assertEqual(correlation["offer_id"], second["request_id"])
+        self.assertFalse(correlation["prepared_consumed"], "a prior offer's consumption must not leak")
+        self.assertFalse(correlation["demand_bound"])
+        self.assertNotIn("_prepared", record)
+        events = self.diagnostic_records("store_offer")
+        first_events = [r for r in events if r["offer_id"] == first["request_id"]]
+        self.assertEqual([r["last_event"] for r in first_events],
+                         ["offer_sent", "prepared_consumed", "offer_withdrawn"])
+        self.assertFalse(first_events[1]["prepared_reusable"])
+        self.assertTrue(all(r["offer_sequence"] == 1 for r in first_events))
+        self.assertTrue(all(r["request_id"] == record["id"] for r in events))
+        self.assertIsInstance(record["_store_offer"], dict)   # one snapshot, not an accumulating trace
+
+    def test_unsent_preparation_never_claims_a_native_offer(self):
+        record = self.svc.register_lifecycle({}, threading.Event())
+        prepared = conversation_offers.PreparedGeneration(ids=(1, 2), thinking=False, max_new=4,
+                                                          digest="", ctx=self.svc.context_size())
+        self.svc.offer_prepared(record, self.link, prepared, {})  # no scope: tokens stay local
+        request = {}
+        self.svc.bind_offer(request, prepared, record=record)
+        self.svc.withdraw_offer(record)
+        self.svc.finish_lifecycle(record)
+        correlation = server._response_attribution(record, "/v1/chat/completions")["cache_offer"]
+        self.assertIsNone(correlation["offer_id"])
+        self.assertFalse(correlation["sent"])
+        self.assertEqual(correlation["native_acceptance"], "not_sent")
+        self.assertFalse(correlation["demand_bound"])
+        self.assertFalse(correlation["cancel_sent"])
+        self.assertNotIn("_strata_cache_offer", request)
+        self.assertEqual(self.peer.offers, [])
+
+
+class StoreOfferTimingDisabled(OfferDiagnosticCase):
+    timing = "0"
+
+    def test_disabled_mode_keeps_normal_response_and_attribution_without_diagnostic_work(self):
+        self.assertFalse(self.svc.store_timing)
+        with mock.patch.object(self.svc, "_store_offer_event") as diagnostic:
+            first = self.start_request("first")
+            self.assertTrue(self.engine.entered.wait(5))
+            second = self.start_request("second")
+            self.assertIsNotNone(self.peer.next_offer(5))
+            self.engine.release.set()
+            self.join(first, second)
+            attributions = self.wait_attributions(2)
+        diagnostic.assert_not_called()
+        self.assertEqual(self.diagnostic_records("store_offer"), [])
+        self.assertTrue(all("cache_offer" not in r for r in attributions))
+        self.assertTrue(all("_store_offer" not in r for r in self.svc.lifecycles))
+        self.assertEqual([outcome.get("status") for _, outcome in (first, second)], [200, 200])
+        for _, outcome in (first, second):
+            body = json.loads(outcome["body"])
+            self.assertEqual(body["choices"][0]["message"]["content"], "ok")
+            self.assertNotIn("cache_offer", body)
+
+
 class WiderFrontier(ChannelTestCase):
     """The wider engine (two pipeline groups) prepares two queued candidates."""
 

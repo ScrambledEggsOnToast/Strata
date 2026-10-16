@@ -3707,6 +3707,7 @@ class Service:
         self.lifecycle_api = False
         self.lifecycles = collections.deque(maxlen=500)
         self.lifecycle_local = threading.local()
+        self.store_timing = os.environ.get("STRATA_STORE_TIMING") == "1"
         self.preparation = conversation_offers.PreparationBudget()   # the queued frontier's own preparation bytes
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -5144,11 +5145,31 @@ class Service:
             on = {**self.sampling_defaults, **self.shared}.get("experimental_speed_projection")
         return on is not False or not self.cvec_loaded()
 
-    def offer_prepared(self, record, link, prepared, req: dict) -> None:
-        """Tell the store about a prepared queued request and keep its answer on the request.
+    def _store_offer_event(self, record, prepared, event, **values) -> None:
+        """Keep one scalar snapshot per request; earlier offer incarnations live only in the opt-in log."""
+        if not self.store_timing or record is None:
+            return
+        previous = record.get("_store_offer")
+        if event in ("offer_sent", "offer_not_sent"):
+            snapshot = {"offer_id": int(prepared.offer_id) or None, "generation": int(prepared.generation),
+                        "offer_sequence": previous["offer_sequence"] + 1 if previous else 1,
+                        "sent": prepared.offered, "native_acceptance": "unknown" if prepared.offered else "not_sent",
+                        "prepared_consumed": False, "demand_bound": False, "withdrawn": False, "cancel_sent": False}
+        else:
+            if previous is None or (previous["offer_id"], previous["generation"]) != (
+                    int(prepared.offer_id) or None, int(prepared.generation)):
+                return
+            snapshot = dict(previous)
+        snapshot.update(values, last_event=event, last_event_monotonic_ns=time.monotonic_ns())
+        record["_store_offer"] = snapshot
+        print("[strata] store_offer: " + json.dumps({"request_id": record["id"], **snapshot},
+                                                   separators=(",", ":")), flush=True)
 
-        The offer is advisory: when the store cannot take it (no scope, too long, its byte budget is spent, or the
-        write fails) the prepared tokens are kept for the request itself and no generation key is bound later.
+    def offer_prepared(self, record, link, prepared, req: dict) -> None:
+        """Send an advisory offer and keep the prepared tokens on their own request.
+
+        A successful send is not native acceptance: the protocol has no offer ACK. If this side cannot send
+        (no scope, too long, its byte budget is spent, or a write failure), no generation key is bound later.
         """
         scope = (req or {}).get("_strata_cache_scope")
         ctx = self.context_size()
@@ -5163,6 +5184,8 @@ class Service:
         prepared.generation = link.epoch()
         prepared.offer_id = request_id
         record["_prepared"] = prepared
+        if self.store_timing:
+            self._store_offer_event(record, prepared, "offer_sent" if prepared.offered else "offer_not_sent")
 
     def take_prepared(self, record, messages, tools, kwargs, max_new, force, req=None):
         """The prepared result `record` may consume once, or None (nothing prepared, or it is not this prompt).
@@ -5192,18 +5215,21 @@ class Service:
             reusable = False               # the steering changed while it waited: the demand renders and prices its own
         prepared.consumed = True            # a prepared result is consumed once, whether or not it matches
         self.release_preparation(record)
+        if self.store_timing:
+            self._store_offer_event(record, prepared, "prepared_consumed", prepared_consumed=True,
+                                    prepared_reusable=reusable)
         if not reusable:
             self.withdraw_offer(record)
             return None
         return prepared
 
-    def bind_offer(self, req: dict, prepared) -> None:
-        """Bind this generation to the offer the store already validated (or clear any client's fields of that name).
+    def bind_offer(self, req: dict, prepared, *, record=None) -> None:
+        """Bind this generation to its sent offer (or clear any client's fields of that name).
 
         These keys are internal: they are put here from the request's own prepared result, in the incarnation that
-        really offered it, and never from a client - exactly like the conversation scope.  The owner is the link
-        whose store validated the tokens: a replica layer dispatches the demand after this point and needs it to
-        keep an offer from reaching a replica that never offered it (see serve/replicas.py).
+        really offered it, and never from a client - exactly like the conversation scope. The owner is the link
+        that sent the offer, not proof of native acceptance: a replica layer dispatches the demand after this point
+        and needs it to keep an offer from reaching a replica that never offered it (see serve/replicas.py).
         """
         req.pop("_strata_cache_offer", None)
         req.pop("_strata_cache_generation", None)
@@ -5216,6 +5242,8 @@ class Service:
         req["_strata_cache_offer"] = int(prepared.offer_id)
         req["_strata_cache_generation"] = int(prepared.generation)
         req["_strata_cache_offer_owner"] = link
+        if self.store_timing:
+            self._store_offer_event(record, prepared, "demand_bound", demand_bound=True)
 
     def withdraw_offer(self, record) -> None:
         """Retire a prepared offer this request will not (or no longer does) need: its deadline, its client or its
@@ -5229,8 +5257,9 @@ class Service:
             return
         prepared.withdrawn = True
         link = prepared.link
-        if link is not None:
-            link.cancel(prepared.offer_id, prepared.generation)
+        cancel_sent = link.cancel(prepared.offer_id, prepared.generation) if link is not None else False
+        if self.store_timing:
+            self._store_offer_event(record, prepared, "offer_withdrawn", withdrawn=True, cancel_sent=cancel_sent)
 
     # -- the endpoints' own resolution, shared by the queued frontier and the run that consumes it ----------------
 
@@ -5351,7 +5380,7 @@ class Service:
             self.embeddings.path = None       # a prepared request is text-only (see resolve_for_offer)
             ids, thinking, wanted = list(prepared.ids), prepared.thinking, prepared.max_new
             if req is not None:
-                self.bind_offer(req, prepared)
+                self.bind_offer(req, prepared, record=record)
                 prepared.apply_to(req)        # the pin boundary the store was offered, not a second resolution
             prepared.release()                # the demand owns the tokens now: the request keeps only the offer
             return ids, thinking, wanted
@@ -6170,7 +6199,7 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
     """One HTTP response's work, including continuations/MCP rounds; bind by the existing request-id header."""
     work = lifecycle.pop("_response_work", [])
     figures = request_stats(work)
-    return {"request_id": lifecycle["id"], "path": path, "outcome": lifecycle["state"],
+    attribution = {"request_id": lifecycle["id"], "path": path, "outcome": lifecycle["state"],
             "finish": figures.get("finish"),
             "committed_tokens": figures.get("generated"),
             "output_tokens": sum(part["output_tokens"] for part in work),
@@ -6182,6 +6211,9 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
             "first_token_s": lifecycle.get("first_token_s"),
             "drafts_accepted": figures.get("drafts_accepted"), "drafts_offered": figures.get("drafts_offered"),
             "legs": figures.get("legs", [])}
+    if "_store_offer" in lifecycle:
+        attribution["cache_offer"] = dict(lifecycle["_store_offer"])
+    return attribution
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -7265,7 +7297,9 @@ def make_handler(svc: Service):
                     svc.finish_lifecycle(self.lifecycle)
                     attribution = _response_attribution(self.lifecycle, path)
                     with svc.status_lock:
-                        self.lifecycle["attribution"] = attribution
+                        # Offer correlation is diagnostic-only, not a lifecycle HTTP API extension.
+                        self.lifecycle["attribution"] = ({k: v for k, v in attribution.items() if k != "cache_offer"}
+                                                         if "cache_offer" in attribution else attribution)
                     print("[strata] response_attribution: " + json.dumps(attribution, separators=(",", ":")),
                           flush=True)
                 record = self.record
