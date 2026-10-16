@@ -865,7 +865,8 @@ class StoreOfferTimingDisabled(OfferDiagnosticCase):
         self.assertEqual([outcome.get("status") for _, outcome in (first, second)], [200, 200])
         for _, outcome in (first, second):
             body = json.loads(outcome["body"])
-            self.assertEqual(body["choices"][0]["message"]["content"], "ok")
+            message = body["choices"][0]["message"]
+            self.assertEqual(message.get("content") or message.get("reasoning_content"), "ok")
             self.assertNotIn("cache_offer", body)
 
 

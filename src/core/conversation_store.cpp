@@ -145,6 +145,9 @@ struct StoreReadTrace {
     uint64_t peak_bytes, reserved_bytes, lease_bytes, resident_bytes, budget_bytes, prepared_bytes;
     uint64_t preparation_bytes, metadata_limit, incoming, max_reads, queued, descriptors, wait_mask;
     uint64_t demand, active, holds_slot, cancelled, io_attempted, bytes_read;
+    bool head_event;
+    uint64_t plan_version, catalog_version, replacement_head, head_leases, pinned, protected_seg, recency;
+    uint64_t charged_bytes, free_bytes, quota_bytes, floor_bytes;
 };
 
 struct StoreReadTraceBatch {
@@ -168,6 +171,20 @@ struct StoreReadTraceBatch {
         const int saved_errno = errno;
         for (size_t i = 0; i < count; ++i) {
             const auto& r = records[i];
+            if (r.head_event) {
+                char line[1024];
+                const int length = std::snprintf(line, sizeof line,
+                    "store_head event=%s reason=%s state_ns=%" PRIu64 " applied_ns=%" PRIu64
+                    " head=%" PRIu64 " cut=%" PRIu64 " epoch=%" PRIu64
+                    " plan_version=%" PRIu64 " catalog_version=%" PRIu64 " replacement_head=%" PRIu64
+                    " head_leases=%" PRIu64 " pinned=%" PRIu64 " protected=%" PRIu64 " recency=%" PRIu64
+                    " charged_bytes=%" PRIu64 " free_bytes=%" PRIu64 " quota_bytes=%" PRIu64 " floor_bytes=%" PRIu64 "\n",
+                    r.event, r.reason, r.ts_ns, r.finish_ns, r.head, r.cut, r.epoch,
+                    r.plan_version, r.catalog_version, r.replacement_head, r.head_leases, r.pinned, r.protected_seg,
+                    r.recency, r.charged_bytes, r.free_bytes, r.quota_bytes, r.floor_bytes);
+                if (length > 0 && size_t(length) < sizeof line) write_line(line, size_t(length));
+                continue;
+            }
             const uint64_t queue_ns = r.admit_ns ? r.admit_ns - r.enqueue_ns : 0;
             const uint64_t dispatch_ns = r.admit_ns && (r.start_ns || r.finish_ns)
                 ? (r.start_ns ? r.start_ns : r.finish_ns) - r.admit_ns : 0;
@@ -884,6 +901,8 @@ struct ConversationStore::Impl {
         uint64_t version = 0;                     // the catalog version an exact candidate was planned against
         std::vector<uint64_t> retiring;           // heads the applied catalog drops
         uint64_t new_head = 0;                    // publish only
+        const char* eviction_reason = "space";
+        uint64_t replaced_head = 0;               // diagnostics: distinguish a covered replacement from head pressure
         std::vector<Digest> new_objects;          // publish only: everything the new manifest references
         std::map<Digest, uint64_t> new_object_charges;   // the ones this publication created (already charged)
         uint64_t new_manifest_bytes = 0;
@@ -983,7 +1002,7 @@ struct ConversationStore::Impl {
     void reclaim_pending();
     void queue_orphans(std::vector<PendingFile>& files);
     CommitOutcome commit_plan(CommitPlan& plan, std::string& why);
-    bool evict_head_durably(uint64_t head_id, std::string& why);
+    bool evict_head_durably(uint64_t head_id, std::string& why, const char* retirement_reason);
     bool make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why);
     CommitOutcome write_catalog_or_refuse(CommitPlan& plan, std::string& why);
     bool take_fault(const char* step);
@@ -1009,6 +1028,7 @@ struct ConversationStore::Impl {
     bool stage_apply_locked(CommitPlan& plan, std::string& why);
     void unstage_apply_locked(CommitPlan& plan);
     void apply_staged_locked(CommitPlan& plan);   // allocation-free: the staged nodes are moved, never built
+    void trace_retirement_locked(StoreReadTraceBatch& trace, const CommitPlan& plan, const char* event) const;
 
     // Lookup: catalog metadata only, under the mutex, no payload read and no GPU pointer exposed.
     void collect_matches(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
@@ -2258,7 +2278,40 @@ void ConversationStore::Impl::apply_staged_locked(CommitPlan& plan) {
     counters.manifests = uint64_t(head_manifest_bytes.size());
 }
 
+void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace, const CommitPlan& plan,
+                                                      const char* event) const {
+    if (!read_timing) return;
+    for (uint64_t victim : plan.retiring) {
+        auto record = trace_state_locked(event, "head_limit", ConversationStoreReadStatus::none);
+        record.head_event = true;
+        record.head = victim;
+        record.plan_version = plan.version;
+        record.catalog_version = catalog_version;
+        record.replacement_head = plan.new_head;
+        if (plan.kind == CommitPlan::Kind::eviction) record.reason = plan.eviction_reason;
+        else if (plan.kind == CommitPlan::Kind::invalidate) record.reason = "domain_invalidated";
+        else if (victim == plan.replaced_head) record.reason = "covered_replacement";
+        const auto lease = head_leases.find(victim);
+        record.head_leases = lease == head_leases.end() ? 0 : lease->second;
+        record.charged_bytes = charged;
+        record.free_bytes = free_sample;
+        record.quota_bytes = options.quota_bytes;
+        record.floor_bytes = options.min_free_bytes;
+        for (const auto& head : catalog.heads) {
+            if (head.head_id != victim) continue;
+            record.epoch = head.epoch;
+            record.pinned = head.pinned;
+            record.protected_seg = head.protected_seg;
+            record.recency = recency_of_locked(head);
+            for (const auto& cut : head.cuts) record.cut = std::max(record.cut, uint64_t(cut.tokens));
+            break;
+        }
+        trace.add(record);
+    }
+}
+
 CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
+    StoreReadTraceBatch trace;
     std::vector<uint8_t> encoded;
     // ---- plan, count, admit and stage, under the lock, before any durable byte changes.  Every failure below
     // leaves the previously committed catalog as the authority ----
@@ -2307,6 +2360,7 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
             return CommitOutcome::unchanged;
         if (!stage_apply_locked(plan, why)) return CommitOutcome::unchanged;
         charged += plan.new_catalog_charge;
+        trace_retirement_locked(trace, plan, "planned");
     } catch (const std::exception& error) {
         why = std::string("the catalog transaction could not be prepared: ") + error.what();
         return CommitOutcome::unchanged;
@@ -2314,6 +2368,7 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         why = "the catalog transaction could not be prepared";
         return CommitOutcome::unchanged;
     }
+    trace.emit(); // planned is not retired; logging never holds the catalog mutex
 
     std::string temp = temp_name();
     bool written = false;
@@ -2383,20 +2438,30 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         // fault exists so that path is exercised rather than merely reachable.
         if (take_fault("catalog-apply")) throw std::bad_alloc();
         std::lock_guard<std::mutex> guard(mutex);
+        trace_retirement_locked(trace, plan, "retired");
         apply_staged_locked(plan);
+        if (trace.count) {
+            const uint64_t applied = store_timing_ns();
+            for (size_t i = 0; i < trace.count; ++i) trace.records[i].finish_ns = applied;
+        }
     } catch (const std::exception& error) {
+        trace.count = 0;
+        trace.dropped = 0; // an uncertain apply must not emit a confirmed retirement
         const std::string detail = std::string("the catalog apply failed after the rename: ") + error.what();
         std::lock_guard<std::mutex> guard(mutex);
         latch_fault_locked(detail);
         why = detail;
         return CommitOutcome::uncertain;
     } catch (...) {
+        trace.count = 0;
+        trace.dropped = 0;
         const std::string detail = "the catalog apply failed after the rename";
         std::lock_guard<std::mutex> guard(mutex);
         latch_fault_locked(detail);
         why = detail;
         return CommitOutcome::uncertain;
     }
+    trace.emit(); // only a confirmed durable apply emits retired
     // Deletions happen here: the authority that named these files is already durable, and the mutex is released.
     // The transaction is committed at this point, so a reclamation that cannot allocate its own batch must never be
     // reported as a transaction failure: the caller would then treat the manifest and the objects this commit just
@@ -2416,9 +2481,11 @@ CommitOutcome ConversationStore::Impl::commit_plan(CommitPlan& plan, std::string
     return write_catalog_or_refuse(plan, why);
 }
 
-bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& why) {
+bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& why,
+                                                const char* retirement_reason) {
     CommitPlan plan;
     plan.kind = CommitPlan::Kind::eviction;
+    plan.eviction_reason = retirement_reason;
     {
         std::lock_guard<std::mutex> guard(mutex);
         plan.version = catalog_version;
@@ -2447,6 +2514,7 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
     floor_limited = false;
     for (;;) {
         uint64_t victim = 0;
+        const char* retirement_reason = "space";
         {
             std::lock_guard<std::mutex> guard(mutex);
             sample_free_locked();
@@ -2467,6 +2535,8 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
                 free_sample - incoming_bytes < options.min_free_bytes;
             floor_limited = over_floor;
             if (!over_quota && !over_floor) return true;
+            if (read_timing)
+                retirement_reason = over_quota ? (over_floor ? "quota_and_floor" : "byte_quota") : "free_space_floor";
             std::set<uint64_t> blocked = eviction_excluded;
             victim = choose_victim_locked(catalog, blocked, false);
             if (victim == 0) victim = choose_victim_locked(catalog, blocked, true);
@@ -2484,7 +2554,7 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
         }
         // An eviction that itself cannot be committed - a quota or a floor that even a catalog copy cannot be paid
         // from - is a refusal: it deletes nothing, so it never turns a promise of space into an admitted byte.
-        if (!evict_head_durably(victim, why)) return false;
+        if (!evict_head_durably(victim, why, retirement_reason)) return false;
     }
 }
 
@@ -4111,6 +4181,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         }
         if (predecessor != 0 && covered) {
             superseded = predecessor;
+            if (read_timing) plan.replaced_head = predecessor;
             for (size_t i = 0; i < plan.candidate.heads.size(); ++i)
                 if (plan.candidate.heads[i].head_id == predecessor) {
                     plan.candidate.heads.erase(plan.candidate.heads.begin() + std::ptrdiff_t(i));

@@ -152,14 +152,14 @@ struct StoreReadTraceCapture {
         }
     }
 
-    std::vector<StoreReadTraceRecord> records() const {
+    std::vector<StoreReadTraceRecord> records(const std::string& channel = "store_read ") const {
         std::vector<StoreReadTraceRecord> result;
         std::istringstream lines(contents());
         std::string line;
         while (std::getline(lines, line)) {
-            if (line.compare(0, 11, "store_read ") != 0) continue;
+            if (line.compare(0, channel.size(), channel) != 0) continue;
             StoreReadTraceRecord record;
-            std::istringstream fields(line.substr(11));
+            std::istringstream fields(line.substr(channel.size()));
             std::string field;
             while (fields >> field) {
                 const size_t equals = field.find('=');
@@ -181,7 +181,8 @@ struct StoreReadTraceCapture {
         std::istringstream lines(contents());
         std::string line;
         while (std::getline(lines, line))
-            if (line.compare(0, 11, "store_read ") != 0) std::fprintf(stderr, "%s\n", line.c_str());
+            if (line.compare(0, 11, "store_read ") != 0 && line.compare(0, 11, "store_head ") != 0)
+                std::fprintf(stderr, "%s\n", line.c_str());
         if (file) std::fclose(file);
         if (had_environment)
             ::setenv("STRATA_STORE_TIMING", old_environment.c_str(), 1);
@@ -2462,7 +2463,7 @@ void check_read_timing() {
                   published.status == ConversationStorePublishStatus::stored, "the timed-read fixture is stored");
         std::string why;
         auto missing = query_of(image, 7001, 8);
-        missing.selector.scope = bytes_from("private:never-log-this-scope");
+        missing.selector.scope = ConversationScope{bytes_from("private:never-log-this-scope")};
         check(store.demand(missing, why), "a timed miss is admitted without materialization");
         ConversationStoreRead miss;
         check(store.wait_ready(7001, 8, miss, 5000) && miss.status == ConversationStoreReadStatus::missing,
@@ -2593,7 +2594,9 @@ void check_read_timing() {
         check(!read_trace(records, "trace_overflow", 0), "the bounded native trace did not lose ownership records");
         check(trace.contents().find(root.path) == std::string::npos &&
                   trace.contents().find("private:never-log-this-scope") == std::string::npos &&
-                  trace.contents().find(sha256_hex(missing.selector.scope)) == std::string::npos,
+                  trace.contents().find(sha256_hex(conversation_store_detail::sha256(
+                      missing.selector.scope.value.data(), missing.selector.scope.value.size()))) ==
+                      std::string::npos,
               "read diagnostics contain neither paths nor private scope material");
     }
 }
@@ -3661,6 +3664,7 @@ void check_commit_outcomes() {
     // (1) A rename that never happened is an ordinary refusal: the previous authority is intact, the store keeps
     // serving, and the bytes this attempt wrote come back out of the ledger once they are confirmed gone.
     {
+        StoreReadTraceCapture trace;
         TempRoot root;
         const std::string path = root.path + "/unchanged";
         ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
@@ -3694,6 +3698,12 @@ void check_commit_outcomes() {
         check(file_digest(path + "/catalog") == catalog_before, "a refused commit left the durable catalog alone");
         check_eq(store.disk_charged_bytes(), charged_before,
                  "a refused commit credits back everything its attempt wrote");
+        const auto refused_records = trace.records("store_head ");
+        const auto* planned = read_trace(refused_records, "planned", 0, "covered_replacement");
+        check(planned && planned->number("head") == head.head_id && planned->number("pinned"),
+              "a planned replacement records its predecessor and pin without claiming retirement");
+        check_eq(read_trace_count(refused_records, "retired", 0), 0,
+                 "a failed catalog rename must not report a committed head retirement");
         // The store is still a working store: the same publication succeeds once the fault is gone.
         ConversationStorePublishResult retry;
         auto retry_image = std::make_shared<SavedConversation>(head_image);
@@ -3701,6 +3711,14 @@ void check_commit_outcomes() {
         check(store.wait_publish(retry, 5000), "the retry settles");
         check(retry.status == ConversationStorePublishStatus::replaced, "the retry replaces the predecessor");
         store.close();
+        const auto committed_records = trace.records("store_head ");
+        const auto* retired = read_trace(committed_records, "retired", 0, "covered_replacement");
+        check_eq(read_trace_count(committed_records, "retired", 0), 1,
+                 "only the successful retry emits a confirmed retirement");
+        check(retired && retired->number("head") == head.head_id &&
+                  retired->number("replacement_head") == retry.head_id &&
+                  retired->number("applied_ns") >= retired->number("state_ns"),
+              "the committed record binds the real replacement after its durable apply");
     }
 
     // (2) A rename whose durability cannot be confirmed is uncertainty: every file this attempt wrote is retained,
@@ -4463,6 +4481,7 @@ void check_failed_write_charges_once() {
 // its own batch.  The publication has to learn `stored`, the manifest and every object it authorized have to survive,
 // and the files the reclamation never reached have to stay queued and charged rather than be credited or deleted.
 void check_postcommit_reclamation_cannot_undo_commit() {
+    StoreReadTraceCapture trace;
     TempRoot root;
     const std::string path = root.path + "/commit";
     SavedConversation first_image = fixture(295, 2048);
@@ -4497,6 +4516,12 @@ void check_postcommit_reclamation_cannot_undo_commit() {
         check_eq(store.counters().heads, 1, "the ceiling retired the first branch and kept the second");
         check(store.counters().reclaimed_objects > 0,
               "the retired branch's objects were still reclaimed, on the pass that follows the commit");
+        const auto retired_records = trace.records("store_head ");
+        const auto* retired = read_trace(retired_records, "retired", 0, "head_limit");
+        check(retired && retired->number("head") == first.head_id &&
+                  !retired->number("pinned") && !retired->number("head_leases") &&
+                  retired->number("replacement_head") == second_head,
+              "a committed head-ceiling eviction records its actual victim and protection state");
         // The same record must still be servable in this very instance: what the commit authorized may not have been
         // handed to the reclaimer as an orphan.
         const SavedConversation second_image = fixture(296, 2048);
