@@ -648,7 +648,6 @@ struct ConversationStore::Impl {
     // keeps a file this publication will name from being deleted and credited before it commits.
     struct ObjectLease {
         uint64_t charge = 0;    // the object's own recorded charge, credited only once the file is confirmed gone
-        uint32_t users = 0;     // publications still referencing it
     };
     std::map<Digest, ObjectLease> object_leases;
     std::map<uint64_t, uint64_t> head_manifest_bytes;       // head id -> its manifest's allocated charge
@@ -1474,15 +1473,12 @@ uint64_t ConversationStore::Impl::pending_object_charge_locked(const Digest& obj
 
 void ConversationStore::Impl::lease_object_locked(const std::shared_ptr<PublishJob>& job, const Digest& object,
                                                  uint64_t charge) {
-    auto entry = object_leases.find(object);
-    if (entry == object_leases.end()) {
-        ObjectLease lease;
-        lease.charge = charge;
-        entry = object_leases.emplace(object, lease).first;
-        job->leased_objects.push_back(object);
-    }
-    if (entry->second.charge == 0) entry->second.charge = charge;
-    entry->second.users += 1;
+    // There is one writer. Repeated chunks in its image need one lease, not one unreleasable count per use.
+    if (object_leases.count(object)) return;
+    job->leased_objects.push_back(object);
+    ObjectLease lease;
+    lease.charge = charge;
+    object_leases.emplace(object, lease);
 }
 
 // The attempt's leases end here, after the transaction has settled.  Every object it referenced without creating is
@@ -1493,10 +1489,6 @@ void ConversationStore::Impl::release_object_leases(const std::shared_ptr<Publis
     for (const Digest& object : job->leased_objects) {
         const auto lease = object_leases.find(object);
         if (lease == object_leases.end()) continue;
-        if (lease->second.users > 1) {
-            lease->second.users -= 1;
-            continue;
-        }
         const uint64_t charge = lease->second.charge;
         object_leases.erase(lease);
         // A faulted or uncertain store may not delete or credit anything: the catalog that would say which file is
@@ -1514,8 +1506,8 @@ void ConversationStore::Impl::release_object_leases(const std::shared_ptr<Publis
             file.shard = sha256_hex(object).substr(0, 2);
             file.name = sha256_hex(object);
             file.charge = state != objects.end() ? state->second.bytes : charge;
-            reclaimable += file.charge;
             pending_files.push_back(std::move(file));
+            reclaimable += pending_files.back().charge;
         } catch (...) {
             continue;
         }
@@ -1898,6 +1890,7 @@ void ConversationStore::Impl::queue_orphans(std::vector<PendingFile>& files) {
 
 void ConversationStore::Impl::reclaim_pending() {
     std::vector<PendingFile> batch;
+    std::vector<PendingFile> retry;
     {
         std::lock_guard<std::mutex> guard(mutex);
         // After an uncertain catalog transaction this process cannot know which catalog is durable, so neither
@@ -1909,6 +1902,7 @@ void ConversationStore::Impl::reclaim_pending() {
         // Every move below stays inside the room reserved here, so a failed allocation can neither lose a pending
         // record between the queue and the batch nor leave the two lists describing the same file twice.
         batch.reserve(std::min<size_t>(pending_files.size(), kMaxReclaimPerPass));
+        retry.reserve(batch.capacity());
         for (auto& file : pending_files) {
             // A file whose head still has an open hold or a handed-out image is not deleted yet: a reader's
             // descriptors may still name it, and its bytes are still in use.
@@ -1924,8 +1918,6 @@ void ConversationStore::Impl::reclaim_pending() {
         }
         pending_files = std::move(keep);
     }
-    std::vector<PendingFile> retry;
-    retry.reserve(batch.size());
     for (PendingFile& file : batch) {
         if (file.where == Where::objects) {
             bool referenced = false;
@@ -1941,12 +1933,18 @@ void ConversationStore::Impl::reclaim_pending() {
             if (referenced) {
                 // Referenced again: the file is needed, so the pending record goes away and its charge stays.
                 std::lock_guard<std::mutex> guard(mutex);
-                revive_object_locked(file.object);
+                reclaimable -= std::min(reclaimable, file.charge);
                 continue;
             }
         }
-        std::string why;
-        if (remove_pending_file(file, why)) {
+        bool removed = false;
+        try {
+            std::string why;
+            removed = remove_pending_file(file, why);
+        } catch (const std::bad_alloc&) {
+            // Even constructing the failure detail may allocate. Keep the preallocated retry record.
+        }
+        if (removed) {
             std::lock_guard<std::mutex> guard(mutex);
             charged -= std::min(charged, file.charge);
             reclaimable -= std::min(reclaimable, file.charge);

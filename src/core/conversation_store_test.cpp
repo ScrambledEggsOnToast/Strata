@@ -3874,14 +3874,18 @@ void check_failed_write_charges_once() {
         check(store.healthy(), "a failed object write is an ordinary failure, not a fault");
         check_eq(store.counters().reclaimed_objects, reclaimed,
                  "an object that was never written is never counted as reclaimed");
-        check(store.disk_charged_bytes() >= charged,
-              "a file that was never created is never credited, even when its removal reports exactly that");
-        check(store.counters().pending_delete_bytes > 0,
-              "the one file this attempt may have left stays charged until it is confirmed gone");
-        check(::chmod((path + "/tmp").c_str(), 0700) == 0, "the temporary directory is made writable again");
-        store.close();
         check_eq(store.disk_charged_bytes(), charged,
-                 "the single charge this attempt took is credited exactly once, when its one file is confirmed gone");
+                 "a failed object creation refunds only its reservation, not existing files");
+        check(::chmod((path + "/tmp").c_str(), 0700) == 0, "the temporary directory is made writable again");
+        ConversationStoreRead restored;
+        const auto prior = fixture(291, 2048);
+        check(store.demand(query_of(prior, 90, 1), why) &&
+                  store.wait_ready(90, 1, restored, 5000) && restored.image &&
+                  images_equal(*restored.image, prior, why),
+              "existing history remains readable after an ordinary object write failure");
+        restored.image.reset();
+        store.release_read(90, 1);
+        store.close();
         check_eq(store.counters().pending_delete_bytes, 0, "the failed write leaves nothing queued for deletion");
     }
 
@@ -3910,15 +3914,21 @@ void check_failed_write_charges_once() {
         check(failed.status == ConversationStorePublishStatus::failed,
               "a refused manifest rename fails the publication");
         check(store.healthy(), "a failed manifest rename is an ordinary failure, not a fault");
-        check(store.disk_charged_bytes() >= charged,
-              "the manifest's one charge is never credited twice");
+        check_eq(store.disk_charged_bytes(), charged,
+                 "the manifest's one charge is credited exactly once");
         check_eq(store.counters().pending_delete_bytes, 0,
                  "one file, one removal: the name the manifest never reached is not left queued for deletion");
         check(::chmod((path + "/manifests").c_str(), 0700) == 0,
               "the manifest directory is made writable again");
+        ConversationStoreRead restored;
+        const auto prior = fixture(293, 2048);
+        check(store.demand(query_of(prior, 91, 1), why) &&
+                  store.wait_ready(91, 1, restored, 5000) && restored.image &&
+                  images_equal(*restored.image, prior, why),
+              "existing history remains readable after an ordinary manifest write failure");
+        restored.image.reset();
+        store.release_read(91, 1);
         store.close();
-        check_eq(store.disk_charged_bytes(), charged,
-                 "the manifest's one charge is credited exactly once, when its one file is confirmed gone");
         check_eq(store.counters().pending_delete_bytes, 0, "the failed manifest write leaves nothing queued");
     }
 }
