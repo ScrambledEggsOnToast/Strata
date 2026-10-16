@@ -1,4 +1,5 @@
 """CPU-only wire and HTTP proof; no model, native process or GPU is started."""
+from unittest.mock import patch
 import json
 import queue
 import threading
@@ -107,6 +108,61 @@ class ThroughputTests(unittest.TestCase):
         self.assertEqual(e.slot_q[0].get(),'BT 0 7\n')
         self.assertEqual([e.lines.get() for _ in range(5)],wire[:3]+wire[4:])
 
+    def test_request_activity_bound_does_not_limit_active_records(self):
+        tok=ByteTokenizer(); engine=MockEngine(tok,'answer',max_context=4096)
+        svc=Service(engine,tok,ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        with svc.status_lock:
+            svc.admission_active={str(i):{'id':format(i,'032x'),'state':'generating','_executing':True} for i in range(200)}
+            snapshot=svc._request_activity()
+            self.assertEqual(len(snapshot['records']),128)
+            self.assertTrue(snapshot['truncated'])
+            self.assertEqual(len(svc.admission_active),200)
+
+    def test_partial_handler_failures_are_not_completed(self):
+        tok=ByteTokenizer(); engine=MockEngine(tok,'answer',max_context=4096)
+        svc=Service(engine,tok,ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0)
+        httpd.handle_error=lambda *args:None
+        try:
+            for exception in (TypeError,RuntimeError):
+                def broken(handler, request):
+                    handler.answer_started=True
+                    raise exception('fixture failure')
+                with patch.object(httpd.RequestHandlerClass,'_openai',broken):
+                    request=urllib.request.Request('http://127.0.0.1:%s/v1/chat/completions'%httpd.server_address[1],
+                        data=b'{"messages":[{"role":"user","content":"fixture"}]}',headers={'Content-Type':'application/json'})
+                    with self.assertRaises(Exception):
+                        urllib.request.urlopen(request).read()
+                with svc.status_lock:
+                    self.assertEqual(svc._request_activity()['records'][-1]['state'],'failed')
+        finally:
+            httpd.shutdown();httpd.server_close()
+
+    def test_request_activity_is_content_free_and_tracks_outcomes(self):
+        tok=ByteTokenizer(); engine=MockEngine(tok,'answer',max_context=4096)
+        svc=Service(engine,tok,ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        record=svc.register_lifecycle({},threading.Event())
+        with svc.status_lock:
+            self.assertEqual(svc._request_activity()['records'][0]['state'],'queued')
+        svc.acquire_request(record)
+        svc.lifecycle_note(record,'prefill',_executing=True,prompt='must not escape',error_detail='private')
+        with svc.status_lock:
+            summary=svc._request_activity()
+        self.assertEqual(summary['records'],[{'id':record['id'],'state':'processing'}])
+        svc.finish_lifecycle(record)
+        with svc.status_lock:
+            self.assertEqual(svc._request_activity()['records'][0]['state'],'completed')
+        for reason,expected in [('cancelled','cancelled'),('timeout','cancelled'),('error','failed')]:
+            record=svc.register_lifecycle({},threading.Event())
+            if reason=='error': record['error']='private failure'
+            else: record['cancel_reason']=reason
+            svc.finish_lifecycle(record)
+            with svc.status_lock:
+                item=next(r for r in svc._request_activity()['records'] if r['id']==record['id'])
+            self.assertEqual(item['state'],expected)
+        self.assertEqual(set(summary),{'boot_id','truncated','records'})
+
+    @patch.dict("os.environ", {"STRATA_THROUGHPUT":"1"})
     def test_http_during_newer_prefill_reports_both_rates(self):
         tok=ByteTokenizer();engine=MockEngine(tok,'answer',max_context=4096)
         engine.throughput=Throughput(True)
@@ -119,6 +175,7 @@ class ThroughputTests(unittest.TestCase):
         try:
             with urllib.request.urlopen('http://127.0.0.1:%s/metrics'%httpd.server_address[1]) as r:
                 body=json.load(r)
+            self.assertEqual(body['request_activity']['records'],[])
             self.assertEqual(body['live']['state'],'reading')
             self.assertIsNone(body['live']['tok_s']) # legacy field stays compatible
             self.assertEqual(body['throughput']['decode_tok_s'],.2)

@@ -3709,6 +3709,7 @@ class Service:
         self.request_context_tokens = None
         self.lifecycle_api = False
         self.lifecycles = collections.deque(maxlen=500)
+        self.lifecycle_boot = uuid.uuid4().hex
         self.lifecycle_local = threading.local()
         self.store_timing = os.environ.get("STRATA_STORE_TIMING") == "1"
         self.preparation = conversation_offers.PreparationBudget()   # the queued frontier's own preparation bytes
@@ -4004,6 +4005,27 @@ class Service:
             public = [{k: list(v) if k == "events" else v for k, v in r.items() if not k.startswith("_")}
                       for r in records if request_id is None or r["id"] == request_id]
             return public if request_id is None else (public[0] if public else None)
+
+    def _request_activity(self):
+        """Content-free bounded monitor snapshot; caller holds status_lock.
+
+        Active identities take precedence over recent terminal records. The bound
+        is display telemetry only and never limits admission or execution.
+        """
+        active = list(self.admission_active.values()) + list(self.admission_waiters)
+        ids = {r["id"] for r in active}
+        done = [r for r in self.lifecycles if r["id"] not in ids and
+                r["state"] in ("completed", "error", "rejected", "cancelled", "timeout", "disconnected", "shutting down")]
+        remaining = max(0, 128 - len(active))
+        chosen = active[:128] + (done[-remaining:] if remaining else [])
+        def item(r):
+            terminal = r["id"] not in ids
+            state = ("completed" if r["state"] == "completed" else
+                     "failed" if r["state"] in ("error", "rejected") else "cancelled") if terminal else (
+                     "processing" if r.get("_executing") else "queued")
+            return {"id": r["id"], "state": state}
+        return {"boot_id": self.lifecycle_boot, "truncated": len(active) + len(done) > len(chosen),
+                "records": [item(r) for r in chosen]}
 
     def cancel_request(self, request_id):
         with self.admission_cv:
@@ -4430,6 +4452,7 @@ class Service:
         with self.status_lock:
             s = dict(self.status)
             admission = self._admission_snapshot()
+            request_activity = self._request_activity()
             if self.live_reqs:                          # parallel requests: the newest one's status
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
@@ -4475,7 +4498,7 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
+        return {**({"request_activity": request_activity} if os.environ.get("STRATA_THROUGHPUT") == "1" else {}), "throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -7264,6 +7287,7 @@ def make_handler(svc: Service):
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
                 # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
                 if getattr(self, "answer_started", False):
+                    self._note(error={"type": "stream_error"})
                     raise
                 import traceback
                 print(f"[strata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
@@ -7284,6 +7308,10 @@ def make_handler(svc: Service):
                 if self.request_cancel is not None:
                     self.request_cancel.set()
                 raise                                        # as before #332: the server's own handling
+            except Exception:
+                # Unhandled handler failures must not become successful telemetry.
+                self._note(error={"type": "internal_error"})
+                raise
             finally:
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
