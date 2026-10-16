@@ -4366,11 +4366,14 @@ class Service:
         return req
 
     def start_telemetry(self):
-        """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
+        """The one-second hardware sampler behind GET /metrics, including tok/s and service-scope Linux pressure."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
+            from serve.psi import PressureReader
+            pressure = PressureReader(self.lifecycle_boot)
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "pressure": pressure.snapshot()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
