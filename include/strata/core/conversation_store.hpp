@@ -440,6 +440,9 @@ struct ConversationStoreCounters {
     uint64_t refusals_stale = 0, refusals_busy = 0, refusals_floor = 0, refusals_quota = 0;
     uint64_t deferred_publishes = 0;   // admissions held back by occupied resources (see publish())
     uint64_t lock_conflicts = 0, aborted_publications = 0, recovered_orphans = 0;
+    // Idle policy transactions that committed/refused; restore calls sharing a pending hint; pending hints consumed
+    // by publish/evict/invalidate candidate copies (absorption counts the attempt, not its durable outcome).
+    uint64_t promotions_applied = 0, promotions_coalesced = 0, promotions_absorbed = 0, promotions_refused = 0;
 };
 
 // Cheap catalog metadata of one retained head (for diagnostics and for planning a reuse interval).
@@ -585,9 +588,10 @@ public:
     ConversationStoreReadStatus request_status(uint64_t request_id, uint64_t generation) const;
     // Recency promotion after a *confirmed* restore (never on prefetch or on a mere append): moves the head into the
     // protected segment so eviction reclaims other histories first, demoting the oldest protected head when the
-    // segment is at its three-quarter ceiling.  The durable catalog write is handed to this module's storage thread,
-    // so this call performs no storage wait; the promotion is a policy hint, and a failed commit leaves it pending for
-    // the next one rather than risking the authority.
+    // segment is at its three-quarter ceiling. This call allocates no work item and performs no storage wait: one
+    // mutex-protected hint coalesces restores until a catalog candidate absorbs them. Urgent invalidations and runnable
+    // publications precede an idle policy transaction; a restore after a candidate copy re-arms the next hint. An
+    // ordinary refusal leaves the live policy for the next transaction, without retrying it in a busy loop.
     void confirmed_restore(uint64_t head_id);
 
     // --- publication --------------------------------------------------------------------------------------

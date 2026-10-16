@@ -931,6 +931,7 @@ struct ConversationStore::Impl {
         Kind kind = Kind::promote;
         Catalog candidate;                        // exact for publish/eviction; re-derived at commit otherwise
         uint64_t version = 0;                     // the catalog version an exact candidate was planned against
+        uint64_t recency_at_copy = 0;             // preserves policy hints newer than this immutable snapshot
         std::vector<uint64_t> retiring;           // heads the applied catalog drops
         uint64_t new_head = 0;                    // publish only
         const char* eviction_reason = "space";
@@ -959,7 +960,8 @@ struct ConversationStore::Impl {
     // ---- workers ----
     std::thread writer;
     std::vector<std::thread> readers;
-    std::deque<std::shared_ptr<DurableWork>> durable;
+    std::deque<std::shared_ptr<DurableWork>> durable; // urgent invalidations only; never coalesced
+    bool promote_pending = false;                 // optional policy hint, guarded by mutex; no per-restore allocation
     std::atomic<bool> stop{false};
 
     // ---- counters and test seams ----
@@ -1033,6 +1035,7 @@ struct ConversationStore::Impl {
     void discard_files(std::vector<PendingFile>&& files);
     void reclaim_pending();
     void queue_orphans(std::vector<PendingFile>& files);
+    void copy_catalog_locked(CommitPlan& plan);
     CommitOutcome commit_plan(CommitPlan& plan, std::string& why);
     bool evict_head_durably(uint64_t head_id, std::string& why, const char* retirement_reason);
     bool make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why);
@@ -1175,6 +1178,7 @@ void ConversationStore::Impl::latch_fault_locked(const std::string& why) {
         faulted = true;
         fault_reason = why;
     }
+    promote_pending = false; // uncertain authority can never schedule a policy retry
     cv_ready.notify_all();
     cv_publish.notify_all();
     cv_work.notify_all();
@@ -1800,7 +1804,10 @@ uint64_t ConversationStore::Impl::retire_head_locked(uint64_t head_id) {
     return freed;
 }
 
-void ConversationStore::Impl::touch_recency_locked(uint64_t head_id) { head_recency[head_id] = ++recency_counter; }
+void ConversationStore::Impl::touch_recency_locked(uint64_t head_id) {
+    // Recovery and publication prepare this retained head's node; a confirmed restore must never allocate one.
+    head_recency.at(head_id) = ++recency_counter;
+}
 
 uint64_t ConversationStore::Impl::recency_of_locked(const CatalogHead& head) const {
     const auto found = head_recency.find(head.head_id);
@@ -2321,6 +2328,7 @@ void ConversationStore::Impl::unstage_apply_locked(CommitPlan& plan) {
 // The apply after the rename: node merges, moves and erases only.  Nothing here allocates, so nothing here can fail
 // after the point of no return; the exception guard around it exists to keep even a bug from deleting files.
 void ConversationStore::Impl::apply_staged_locked(CommitPlan& plan) {
+    const bool newer_policy = recency_counter != plan.recency_at_copy;
     charged -= std::min(charged, catalog_charge);   // the previous catalog file is gone
     catalog_charge = plan.new_catalog_charge;
     if (plan.new_head) {
@@ -2340,6 +2348,21 @@ void ConversationStore::Impl::apply_staged_locked(CommitPlan& plan) {
         head_manifest_bytes[plan.new_head] = plan.new_manifest_bytes;
         head_recency[plan.new_head] = ++recency_counter;
         plan.staged_head_objects = plan.staged_head_manifest = plan.staged_head_recency = false;
+    }
+    if (newer_policy) {
+        // The encoded candidate stays immutable. Only RAM policy is carried forward: a restore after the copy has
+        // already re-armed promote_pending (or close deferred it to its final transaction), and must not be lost when
+        // this older authority snapshot applies. Covered successors inherit their predecessor's latest policy.
+        for (auto& head : plan.candidate.heads) {
+            const uint64_t source = head.head_id == plan.new_head && plan.replaced_head
+                ? plan.replaced_head : head.head_id;
+            for (const auto& live : catalog.heads)
+                if (live.head_id == source) {
+                    head.protected_seg = live.protected_seg;
+                    break;
+                }
+        }
+        cap_protected_locked(plan.candidate);
     }
     for (uint64_t victim : plan.retiring) retire_head_locked(victim);
     catalog = std::move(plan.candidate);
@@ -2382,6 +2405,17 @@ void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace
     }
 }
 
+void ConversationStore::Impl::copy_catalog_locked(CommitPlan& plan) {
+    // Consumption and the copy share one mutex scope. Clear even if allocation refuses the copy: the live policy
+    // remains available to the next real transaction, but an optional failure must not schedule its own retry.
+    if (promote_pending) {
+        promote_pending = false;
+        if (plan.kind != CommitPlan::Kind::promote) counters.promotions_absorbed++;
+    }
+    plan.recency_at_copy = recency_counter;
+    plan.candidate = catalog;
+}
+
 CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan, std::string& why) {
     StoreReadTraceBatch trace;
     std::vector<uint8_t> encoded;
@@ -2412,7 +2446,7 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         switch (plan.kind) {
             case CommitPlan::Kind::invalidate: {
                 // Re-derived at commit time, so an intervening commit can never be overwritten by a stale snapshot.
-                plan.candidate = catalog;
+                copy_catalog_locked(plan);
                 if (plan.domain_index < plan.candidate.domains.size())
                     plan.candidate.domains[plan.domain_index].epoch = plan.epoch;
                 std::vector<CatalogHead> keep;
@@ -2427,7 +2461,7 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
             }
             case CommitPlan::Kind::promote:
                 // "Write the live catalog durably": a promotion is already reflected in its policy flags.
-                plan.candidate = catalog;
+                copy_catalog_locked(plan);
                 break;
             default:
                 if (plan.version != catalog_version) {
@@ -2583,7 +2617,7 @@ bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& 
     {
         std::lock_guard<std::mutex> guard(mutex);
         plan.version = catalog_version;
-        plan.candidate = catalog;
+        copy_catalog_locked(plan);
         bool found = false;
         for (size_t i = 0; i < plan.candidate.heads.size(); ++i) {
             if (plan.candidate.heads[i].head_id != head_id) continue;
@@ -3853,7 +3887,7 @@ void ConversationStore::Impl::writer_body() {
     std::unique_lock<std::mutex> lock(mutex);
     for (;;) {
         if (!durable.empty()) {
-            // Safety work first: an invalidation or a promotion outranks starting another publication.
+            // Urgent invalidations always outrank starting a publication or optional policy work.
             const std::shared_ptr<DurableWork> work = durable.front();
             durable.pop_front();
             lock.unlock();
@@ -3949,6 +3983,19 @@ void ConversationStore::Impl::writer_body() {
             continue;
         }
         if (stop.load()) break;
+        if (promote_pending && !closing && !faulted) {
+            // Policy persistence uses only an idle seam. The transaction consumes the hint with its catalog copy,
+            // not on completion, so any later restore re-arms work that this snapshot cannot make durable.
+            CommitPlan plan;
+            plan.kind = CommitPlan::Kind::promote;
+            lock.unlock();
+            std::string why;
+            const CommitOutcome outcome = commit_plan(plan, why);
+            lock.lock();
+            if (outcome == CommitOutcome::durable_applied) counters.promotions_applied++;
+            else counters.promotions_refused++;
+            continue;
+        }
         cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs));
     }
 }
@@ -4438,7 +4485,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         std::lock_guard<std::mutex> guard(mutex);
         plan.kind = CommitPlan::Kind::publish;
         plan.version = catalog_version;
-        plan.candidate = catalog;
+        copy_catalog_locked(plan);
         CatalogHead head;
         head.head_id = head_id;
         head.manifest_id = meta.manifest_id;
@@ -5029,7 +5076,7 @@ ConversationStoreReadStatus ConversationStore::request_status(uint64_t request_i
 void ConversationStore::confirmed_restore(uint64_t head_id) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
-    if (!self.on || self.faulted || !self.initialized) return;
+    if (!self.on || self.faulted || !self.initialized || self.closing || self.closed || self.stop.load()) return;
     bool found = false;
     for (auto& head : self.catalog.heads) {
         if (head.head_id != head_id) continue;
@@ -5042,11 +5089,9 @@ void ConversationStore::confirmed_restore(uint64_t head_id) {
         break;
     }
     if (!found) return;
-    // The durable write is the storage thread's job: this call performs no storage wait, and a failure is persisted
-    // by the next commit (a promotion is a policy hint, never authority).
-    auto work = std::make_shared<Impl::DurableWork>();
-    work->plan.kind = Impl::CommitPlan::Kind::promote;
-    self.durable.push_back(std::move(work));
+    // No per-restore allocation or durable queue entry: every hint before a candidate copy shares this one bit.
+    if (self.promote_pending) self.counters.promotions_coalesced++;
+    self.promote_pending = true;
     self.cv_work.notify_all();
 }
 
@@ -5335,6 +5380,7 @@ void ConversationStore::close() {
             return;
         }
         self.closing = true;
+        self.promote_pending = false; // the existing final promote transaction persists the latest live policy
         self.admission_suspended = true;
         self.retire_reads_locked(ConversationStoreReadStatus::disabled, "the store closed before this read completed",
                                  trace, "closed");
@@ -5498,7 +5544,12 @@ std::string ConversationStore::describe() const {
             std::to_string(impl_->incoming) + " of " + std::to_string(impl_->options.max_reads) + ", ready " +
             std::to_string(impl_->ready.size()) + ", held descriptors " + std::to_string(impl_->jobs.size()) + "\n";
     text += std::string("writer: ") + (impl_->publishing ? "busy" : "idle") + ", durable queue " +
-            std::to_string(impl_->durable.size()) + "\n";
+            std::to_string(impl_->durable.size()) + ", promotion pending " +
+            (impl_->promote_pending ? "yes" : "no") + "\n";
+    text += "promotions: applied " + std::to_string(impl_->counters.promotions_applied) + ", coalesced " +
+            std::to_string(impl_->counters.promotions_coalesced) + ", absorbed " +
+            std::to_string(impl_->counters.promotions_absorbed) + ", refused " +
+            std::to_string(impl_->counters.promotions_refused) + "\n";
     return text;
 }
 

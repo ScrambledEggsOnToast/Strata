@@ -649,6 +649,14 @@ void check_active_reader_defers_publication();
 void check_permanent_admission_boundaries();
 void check_catalog_headroom();
 void check_commit_outcomes();
+void check_promotion_burst_coalescing();
+void check_promotion_publication_progress();
+void check_promotion_invalidation_order();
+void check_promotion_rearm();
+void check_promotion_eviction_absorption();
+void check_promotion_commit_faults();
+void check_promotion_clean_close();
+void check_promotion_recency_eviction();
 void check_bootstrap_and_intent();
 void check_inflight_object_lease();
 void check_failed_write_charges_once();
@@ -662,6 +670,18 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_PROMOTION_ONLY")) {
+        check_promotion_burst_coalescing();
+        check_promotion_publication_progress();
+        check_promotion_invalidation_order();
+        check_promotion_rearm();
+        check_promotion_eviction_absorption();
+        check_promotion_commit_faults();
+        check_promotion_clean_close();
+        check_promotion_recency_eviction();
+        std::printf("conversation_store_test promotion: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_REVIEW_ONLY")) {
         check_selected_retirement_allocation_retry();
         check_selected_equal_cut_order();
@@ -751,6 +771,14 @@ int main() {
     check_permanent_admission_boundaries();
     check_catalog_headroom();
     check_commit_outcomes();
+    check_promotion_burst_coalescing();
+    check_promotion_publication_progress();
+    check_promotion_invalidation_order();
+    check_promotion_rearm();
+    check_promotion_eviction_absorption();
+    check_promotion_commit_faults();
+    check_promotion_clean_close();
+    check_promotion_recency_eviction();
     check_bootstrap_and_intent();
     check_inflight_object_lease();
     check_failed_write_charges_once();
@@ -2438,6 +2466,575 @@ struct SelectedHoldGate {
         cv.notify_all();
     }
 };
+
+// Each permit releases one real transaction seam. A timeout is only a deadlock guard; assertions below observe
+// reached seams, committed results and joined workers, never the absence of progress during a guessed delay.
+struct PromotionCatalogGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t before = 0, staged = 0, permit_before = 0, permit_staged = 0;
+    bool open = false, timed_out = false;
+
+    void pause(bool after) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const uint64_t visit = after ? ++staged : ++before;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(5), [&] {
+                return open || (after ? permit_staged : permit_before) >= visit;
+            }))
+            timed_out = true;
+    }
+    void await(bool after, uint64_t visit) {
+        std::unique_lock<std::mutex> lock(mutex);
+        check(cv.wait_for(lock, std::chrono::seconds(5), [&] { return (after ? staged : before) >= visit; }),
+              "the promotion regression reaches its real catalog seam");
+    }
+    void resume(bool after, uint64_t visit) {
+        std::lock_guard<std::mutex> guard(mutex);
+        (after ? permit_staged : permit_before) = visit;
+        cv.notify_all();
+    }
+    void release() {
+        std::lock_guard<std::mutex> guard(mutex);
+        open = true;
+        cv.notify_all();
+    }
+    void check_visits(uint64_t expected) {
+        std::lock_guard<std::mutex> guard(mutex);
+        check(!timed_out, "every promotion catalog seam was explicitly released");
+        check_eq(before, expected, "only the expected catalog transactions started");
+        check_eq(staged, expected, "only the expected catalog transactions were staged");
+    }
+};
+
+template <class Predicate>
+bool await_store_progress(Predicate progress) {
+    for (int waited = 0; waited < 5000; ++waited) {
+        if (progress()) return true;
+        ::usleep(1000);
+    }
+    return progress();
+}
+
+SavedConversation promotion_fixture(uint64_t seed, int64_t tokens = 128) {
+    auto image = fixture(seed, tokens);
+    for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+    return image;
+}
+
+void check_promotion_burst_coalescing() {
+    TempRoot root;
+    PromotionCatalogGate gate;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    ConversationStorePublishResult head;
+    check(publish_and_wait(store, promotion_fixture(701), 1, 1, head), "the promotion burst has a retained head");
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        static_cast<PromotionCatalogGate*>(p)->pause(staged);
+    }, &gate);
+    store.confirmed_restore(head.head_id);
+    gate.await(false, 1);
+    constexpr uint64_t restores = 512;
+    for (uint64_t i = 1; i < restores; ++i) store.confirmed_restore(head.head_id);
+    check_eq(store.counters().promotions_coalesced, restores - 1, "a restore burst shares one pending policy hint");
+    check_eq(store.counters().promotions_applied, 0, "no promotion is reported applied before its durable transaction");
+    check(store.describe().find("durable queue 0") != std::string::npos,
+          "confirmed restores allocate no durable work descriptors");
+    gate.resume(false, 1);
+    gate.await(true, 1);
+    check(store.describe().find("promotion pending no") != std::string::npos,
+          "copying the policy candidate consumes its pending hint atomically");
+    gate.release();
+    store.close();
+    check_eq(store.counters().promotions_applied, 1, "one idle transaction applies the whole restore burst");
+    check_eq(store.counters().promotions_absorbed, 0, "a pure burst needed no authority transaction absorption");
+    check_eq(store.counters().promotions_refused, 0, "the coalesced promotion succeeds");
+    check(!store.run_intent_active(), "the burst still closes only after its final durable catalog");
+    gate.check_visits(2); // one idle promotion and the existing final close transaction
+}
+
+void check_promotion_publication_progress() {
+    TempRoot root;
+    PromotionCatalogGate gate;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    ConversationStorePublishResult head;
+    check(publish_and_wait(store, promotion_fixture(702), 1, 1, head), "publication progress has an existing history");
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        static_cast<PromotionCatalogGate*>(p)->pause(staged);
+    }, &gate);
+    store.confirmed_restore(head.head_id);
+    gate.await(false, 1);
+    gate.resume(false, 1);
+    gate.await(true, 1);
+    constexpr uint64_t restores = 512;
+    for (uint64_t i = 0; i < restores; ++i) store.confirmed_restore(head.head_id);
+    const uint64_t source_before = store.source_bytes_read_for_test();
+    ConversationStorePublish request;
+    request.request_id = 2;
+    request.generation = 2;
+    std::string why;
+    check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(703)), request, why) == kAccepted,
+          "a publication is runnable while a promotion has another pending burst");
+    gate.resume(true, 1);
+    gate.await(false, 2);
+    check(store.source_bytes_read_for_test() > source_before, "the next transaction belongs to the real publication");
+    check_eq(store.counters().promotions_applied, 1, "a pending promotion cannot jump ahead of a runnable publication");
+    check_eq(store.counters().promotions_absorbed, 1, "the publication snapshot absorbs the earlier pending burst");
+    check_eq(store.counters().promotions_coalesced, restores - 1, "the waiting burst still uses just one hint");
+    check(store.describe().find("promotion pending no") != std::string::npos,
+          "the publication consumes only the hints preceding its own candidate copy");
+    gate.release();
+    ConversationStorePublishResult stored;
+    check(store.wait_publish(stored, 5000) && stored.status == ConversationStorePublishStatus::stored,
+          "publication completes without draining one transaction per confirmed restore");
+    store.close();
+    check_eq(store.counters().promotions_applied, 1, "an absorbed burst schedules no redundant idle transaction");
+    gate.check_visits(3); // in-flight promotion, publication, final close
+}
+
+void check_promotion_invalidation_order() {
+    TempRoot root;
+    PromotionCatalogGate gate;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    ConversationStorePublishResult head;
+    check(publish_and_wait(store, promotion_fixture(704), 1, 1, head), "invalidation ordering has an existing history");
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        static_cast<PromotionCatalogGate*>(p)->pause(staged);
+    }, &gate);
+    store.confirmed_restore(head.head_id);
+    gate.await(false, 1);
+    gate.resume(false, 1);
+    gate.await(true, 1);
+    store.confirmed_restore(head.head_id);
+    const uint64_t epoch = store.epoch();
+    bool first_ok = false, second_ok = false;
+    std::thread first([&] { first_ok = store.invalidate_domain("first urgent invalidation"); });
+    check(await_store_progress([&] { return store.epoch() == epoch + 1; }),
+          "the first invalidation is enqueued while catalog I/O is gated");
+    std::thread second([&] { second_ok = store.invalidate_domain("second urgent invalidation"); });
+    check(await_store_progress([&] { return store.epoch() == epoch + 2; }),
+          "the second invalidation owns its distinct advanced epoch");
+    check(store.describe().find("durable queue 2") != std::string::npos,
+          "urgent invalidations remain distinct durable work items");
+    const uint64_t source_before = store.source_bytes_read_for_test();
+    ConversationStorePublish request;
+    request.request_id = 2;
+    request.generation = 2;
+    request.epoch = epoch + 2;
+    std::string why;
+    check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(705)), request, why) == kAccepted,
+          "a current-epoch publication waits behind both urgent invalidations");
+    gate.resume(true, 1);
+    gate.await(false, 2);
+    check_eq(store.source_bytes_read_for_test(), source_before, "the first urgent transaction precedes publication");
+    check(store.describe().find("durable queue 1") != std::string::npos,
+          "taking one invalidation leaves the other queued");
+    gate.resume(false, 2);
+    gate.await(true, 2);
+    check_eq(store.counters().promotions_absorbed, 1, "an invalidation snapshot absorbs the older promotion hint");
+    store.confirmed_restore(head.head_id); // after the copy: the next invalidation must consume a fresh hint
+    gate.resume(true, 2);
+    gate.await(false, 3);
+    check_eq(store.source_bytes_read_for_test(), source_before, "the second urgent transaction also precedes publication");
+    check_eq(store.counters().heads, 0, "the first invalidation durably retired the old-epoch history");
+    gate.resume(false, 3);
+    gate.await(true, 3);
+    check_eq(store.counters().promotions_absorbed, 2, "a restore after the first copy re-arms a separate absorption");
+    gate.resume(true, 3);
+    gate.await(false, 4);
+    check(store.source_bytes_read_for_test() > source_before, "publication starts only after both invalidations apply");
+    check_eq(store.counters().promotions_applied, 1, "policy work cannot interpose between urgent work and publication");
+    gate.release();
+    first.join();
+    second.join();
+    check(first_ok && second_ok, "each urgent invalidation receives its own durable success");
+    ConversationStorePublishResult stored;
+    check(store.wait_publish(stored, 5000) && stored.status == ConversationStorePublishStatus::stored &&
+              stored.epoch == epoch + 2,
+          "the runnable publication commits in the twice-advanced epoch");
+    store.close();
+    check(!store.run_intent_active(), "ordered invalidations preserve a clean final close");
+    gate.check_visits(5); // promotion, two invalidations, publication, final close
+}
+
+void check_promotion_rearm() {
+    for (bool publication : {false, true}) {
+        TempRoot root;
+        PromotionCatalogGate gate;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 2; // only one protected head: losing the later hint changes the next real victim
+        ConversationStore store(options);
+        const auto older_image = promotion_fixture(706);
+        ConversationStorePublishResult older, later;
+        check(publish_and_wait(store, older_image, 1, 1, older) &&
+                  publish_and_wait(store, promotion_fixture(707), 2, 2, later),
+              "the re-arm race has two unpinned histories");
+        store.set_catalog_gate_for_test([](void* p, bool staged) {
+            static_cast<PromotionCatalogGate*>(p)->pause(staged);
+        }, &gate);
+        if (publication) {
+            ConversationStorePublish cover;
+            cover.request_id = 3;
+            cover.generation = 3;
+            cover.supersedes = older.head_id;
+            cover.cover = true;
+            std::string why;
+            check(store.publish(std::make_shared<SavedConversation>(older_image), cover, why) == kAccepted,
+                  "a covered publication provides the older immutable snapshot");
+        } else {
+            store.confirmed_restore(older.head_id);
+        }
+        gate.await(false, 1);
+        gate.resume(false, 1);
+        gate.await(true, 1);
+        store.confirmed_restore(later.head_id);
+        check(store.describe().find("promotion pending yes") != std::string::npos,
+              "a restore after a staged candidate copy re-arms policy persistence");
+        gate.resume(true, 1);
+        gate.await(false, 2);
+        check_eq(store.counters().promotions_applied, publication ? 0 : 1,
+                 "the older transaction settles before the re-armed policy transaction");
+        check_eq(store.counters().promotions_absorbed, 0, "a late hint is not incorrectly absorbed by the older copy");
+        uint64_t replaced = older.head_id;
+        if (publication) {
+            ConversationStorePublishResult cover;
+            check(store.wait_publish(cover, 5000) && cover.status == ConversationStorePublishStatus::replaced,
+                  "the older covering publication still succeeds with exact predecessor authority");
+            replaced = cover.head_id;
+        }
+        gate.resume(false, 2);
+        gate.await(true, 2);
+        check(store.describe().find("promotion pending no") != std::string::npos,
+              "the follow-up snapshot consumes the re-armed hint");
+        ConversationStorePublish pressure;
+        pressure.request_id = 4;
+        pressure.generation = 4;
+        std::string why;
+        check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(708)), pressure, why) == kAccepted,
+              "real head pressure waits for the staged follow-up");
+        gate.release();
+        ConversationStorePublishResult stored;
+        check(store.wait_publish(stored, 5000) && stored.status == ConversationStorePublishStatus::stored,
+              "head pressure commits after the follow-up");
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(later.head_id, info) && !store.manifest_info(replaced, info),
+              "the late restore survives the older apply and protects its own history from eviction");
+        store.close();
+        check_eq(store.counters().promotions_applied, publication ? 1 : 2,
+                 "a post-copy restore causes exactly one follow-up policy transaction");
+        gate.check_visits(4);
+    }
+}
+
+void check_promotion_eviction_absorption() {
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 3;
+    const auto large = promotion_fixture(710, 4096);
+    const auto middle = promotion_fixture(711);
+    const auto newest = promotion_fixture(712);
+    ConversationStorePublishResult oldest_head, middle_head, newest_head, incoming;
+    uint64_t charged = 0;
+    {
+        ConversationStore store(options);
+        check(publish_and_wait(store, large, 1, 1, oldest_head) &&
+                  publish_and_wait(store, middle, 2, 2, middle_head) &&
+                  publish_and_wait(store, newest, 3, 3, newest_head),
+              "quota pressure has one large and two small unpinned histories");
+        charged = store.disk_charged_bytes();
+        store.close();
+    }
+    {
+        PromotionCatalogGate gate;
+        options.quota_bytes = charged + catalog_copy_headroom(root.path);
+        ConversationStore store(options);
+        check(store.enabled(), "the eviction absorption store opens with its real catalog-copy headroom");
+        store.set_catalog_gate_for_test([](void* p, bool staged) {
+            static_cast<PromotionCatalogGate*>(p)->pause(staged);
+        }, &gate);
+        store.confirmed_restore(newest_head.head_id);
+        gate.await(false, 1);
+        gate.resume(false, 1);
+        gate.await(true, 1);
+        store.confirmed_restore(newest_head.head_id);
+        ConversationStorePublish request;
+        request.request_id = 4;
+        request.generation = 4;
+        std::string why;
+        check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(713, 4096)), request, why) == kAccepted,
+              "the next runnable publication must evict real bytes before writing its replacement");
+        gate.resume(true, 1);
+        gate.await(false, 2);
+        check_eq(store.counters().evictions, 1, "the second candidate is an actual quota eviction");
+        check_eq(store.counters().promotions_absorbed, 1, "the eviction candidate absorbs the earlier pending hint");
+        store.confirmed_restore(middle_head.head_id);
+        check(store.describe().find("promotion pending yes") != std::string::npos,
+              "a restore after the eviction copy re-arms policy work");
+        gate.resume(false, 2);
+        gate.await(true, 2);
+        gate.resume(true, 2);
+        gate.await(false, 3);
+        check_eq(store.counters().evictions, 1, "one large victim is sufficient; no extra reclamation was promised");
+        check_eq(store.counters().promotions_absorbed, 2, "the publication absorbs the post-eviction-copy hint");
+        check_eq(store.counters().promotions_applied, 1, "publication and eviction avoid redundant policy transactions");
+        gate.release();
+        check(store.wait_publish(incoming, 5000) && incoming.status == ConversationStorePublishStatus::stored,
+              "the quota eviction and following publication both commit");
+        ConversationStoreManifestInfo info;
+        check(!store.manifest_info(oldest_head.head_id, info) && store.manifest_info(middle_head.head_id, info) &&
+                  store.manifest_info(newest_head.head_id, info),
+              "only the oldest unprotected history was retired for physical space");
+        check(store.disk_charged_bytes() <= store.disk_quota_bytes(), "promotion absorption cannot spend quota headroom");
+        store.close();
+        gate.check_visits(4); // idle promotion, quota eviction, publication, final close
+    }
+    {
+        options.quota_bytes = uint64_t(1) << 30;
+        ConversationStore store(options);
+        std::string why;
+        check(store.demand(query_of(middle, 5, 1), why), "the post-copy restored history remains selectable after restart");
+        ConversationStoreRead read;
+        check(store.wait_ready(5, 1, read, 5000) && read.image && images_equal(*read.image, middle, why),
+              "absorbed policy changes never alter the restored model state");
+        read.image.reset();
+        store.release_read(5, 1);
+        ConversationStorePublishResult pressure;
+        check(publish_and_wait(store, promotion_fixture(714), 6, 6, pressure), "a later head pressure publication commits");
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(middle_head.head_id, info) && store.manifest_info(newest_head.head_id, info) &&
+                  !store.manifest_info(incoming.head_id, info),
+              "the post-eviction-copy protection survived apply, absorption and clean restart");
+        store.close();
+    }
+}
+
+void check_promotion_recency_eviction() {
+    TempRoot root;
+    PromotionCatalogGate gate;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 4;
+    ConversationStore store(options);
+    ConversationStorePublishResult heads[4];
+    for (uint64_t i = 0; i < 4; ++i)
+        check(publish_and_wait(store, promotion_fixture(720 + i), i + 1, i + 1, heads[i]),
+              "the recency policy starts with four unpinned histories");
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        static_cast<PromotionCatalogGate*>(p)->pause(staged);
+    }, &gate);
+    store.confirmed_restore(heads[0].head_id);
+    gate.await(false, 1);
+    for (uint64_t i : {1, 2, 3, 0, 2}) store.confirmed_restore(heads[i].head_id);
+    check_eq(store.counters().promotions_coalesced, 5, "coalescing preserves every restore's immediate recency touch");
+    gate.resume(false, 1);
+    gate.await(true, 1);
+    ConversationStorePublish request;
+    request.request_id = 5;
+    request.generation = 5;
+    std::string why;
+    check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(724)), request, why) == kAccepted,
+          "head pressure is admitted after the coalesced recency sequence");
+    gate.release();
+    ConversationStorePublishResult stored;
+    check(store.wait_publish(stored, 5000) && stored.status == ConversationStorePublishStatus::stored,
+          "head pressure commits under the unchanged protected-segment policy");
+    ConversationStoreManifestInfo info;
+    check(!store.manifest_info(heads[1].head_id, info), "the oldest demoted protected head is the eviction victim");
+    for (uint64_t i : {0, 2, 3})
+        check(store.manifest_info(heads[i].head_id, info), "the newest three confirmed histories retain protection");
+    check_eq(store.counters().heads, 4, "coalesced policy persistence preserves the head ceiling");
+    store.close();
+    check_eq(store.counters().promotions_applied, 1, "unchanged recency decisions need only one policy transaction");
+    gate.check_visits(3);
+}
+
+void check_promotion_commit_faults() {
+    for (const char* step : {"catalog-rename", "catalog-sync", "catalog-apply"}) {
+        TempRoot root;
+        const auto options = [&] {
+            auto out = options_for(root.path, uint64_t(1) << 30, 0);
+            out.head_limit = 2;
+            return out;
+        }();
+        const bool uncertain = std::strcmp(step, "catalog-rename") != 0;
+        ConversationStorePublishResult older, later;
+        uint64_t epoch = 0;
+        {
+            PromotionCatalogGate gate;
+            ConversationStore store(options);
+            check(publish_and_wait(store, promotion_fixture(730), 1, 1, older) &&
+                      publish_and_wait(store, promotion_fixture(731), 2, 2, later),
+                  "promotion fault injection starts with two durable unpinned histories");
+            epoch = store.epoch();
+            const uint64_t charged = store.disk_charged_bytes();
+            const std::string before = file_digest(root.path + "/catalog");
+            const auto files = file_inventory(root.path);
+            store.set_catalog_gate_for_test([](void* p, bool staged) {
+                static_cast<PromotionCatalogGate*>(p)->pause(staged);
+            }, &gate);
+            store.confirmed_restore(older.head_id);
+            gate.await(false, 1);
+            gate.resume(false, 1);
+            gate.await(true, 1);
+            if (uncertain) store.confirmed_restore(later.head_id); // an uncertainty must discard even a re-armed hint
+            store.set_publish_fault_for_test(step);
+            gate.release();
+            check(await_store_progress([&] { return store.counters().promotions_refused == 1; }),
+                  "the injected idle promotion reaches its refused outcome");
+            check_eq(store.counters().promotions_applied, 0, "a refused or uncertain promotion is never counted applied");
+            check(store.describe().find("promotion pending no") != std::string::npos,
+                  "a refused promotion cannot reschedule itself in a busy loop");
+            const std::string after = file_digest(root.path + "/catalog");
+            if (!uncertain) {
+                check(store.healthy(), "a pre-rename promotion refusal leaves the committed authority usable");
+                check(after == before, "a failed promotion rename changes no durable catalog bytes");
+                check_eq(store.disk_charged_bytes(), charged, "a pre-rename promotion refusal refunds only its removed copy");
+                check(file_inventory(root.path) == files, "a pre-rename refusal retains every authorized file");
+                store.close();
+                check(!store.run_intent_active(), "the ordinary refusal can still finish its existing final close");
+                check(file_digest(root.path + "/catalog") != before,
+                      "the final transaction persists live policy left by the refused hint");
+                gate.check_visits(2); // refused idle transaction and final close, never a self-retry
+            } else {
+                check(!store.healthy(), "post-rename promotion uncertainty latches the store fault");
+                check(after != before, "an uncertain promotion records that its catalog rename really happened");
+                check(store.disk_charged_bytes() >= charged, "uncertain policy persistence credits no unconfirmed bytes");
+                const auto retained = file_inventory(root.path);
+                store.confirmed_restore(older.head_id);
+                check(!store.invalidate_domain("after uncertain promotion"), "invalidation cannot write uncertain authority");
+                std::string why;
+                ConversationStorePublish blocked;
+                blocked.request_id = 3;
+                blocked.generation = 3;
+                check(store.publish(std::make_shared<SavedConversation>(promotion_fixture(732)), blocked, why) == kRefused,
+                      "an uncertain promotion refuses further publication");
+                const auto query = query_of(promotion_fixture(730), 4, 1);
+                check(store.matches(query.selector, query.tokens, query.images).empty(),
+                      "an uncertain promotion prevents reuse");
+                store.close();
+                check(store.run_intent_active(), "an uncertain promotion leaves the run intent armed");
+                check(file_digest(root.path + "/catalog") == after && file_inventory(root.path) == retained,
+                      "joined workers and close write and reclaim nothing after promotion uncertainty");
+                gate.check_visits(1);
+            }
+            check_eq(store.counters().promotions_refused, 1, "the refused promotion is attempted only once");
+        }
+        ConversationStore reopened(options);
+        check(reopened.enabled(), "the promotion-fault root can be re-opened from its real authority");
+        if (uncertain) {
+            check_eq(reopened.epoch(), epoch + 1, "an uncertain promotion's armed intent forces a new epoch");
+            check_eq(reopened.counters().heads, 0, "no history from the uncertain run is reused");
+        } else {
+            ConversationStorePublishResult pressure;
+            check(publish_and_wait(reopened, promotion_fixture(733), 5, 5, pressure),
+                  "publication remains usable after a refused promotion and clean close");
+            ConversationStoreManifestInfo info;
+            check(reopened.manifest_info(older.head_id, info) && !reopened.manifest_info(later.head_id, info),
+                  "the refused hint's live protection was retained by the final durable transaction");
+        }
+        reopened.close();
+    }
+}
+
+void check_promotion_clean_close() {
+    // The direct restore/close seam has no delay: either the writer already owns one attempt or the final
+    // transaction owns the hint. In both schedules close is the drain barrier, not a timing assertion.
+    {
+        TempRoot root;
+        const auto image = promotion_fixture(740);
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        PromotionCatalogGate gate;
+        gate.release();
+        {
+            ConversationStore store(options);
+            ConversationStorePublishResult head;
+            check(publish_and_wait(store, image, 1, 1, head), "immediate close starts with a durable history");
+            store.set_catalog_gate_for_test([](void* p, bool staged) {
+                static_cast<PromotionCatalogGate*>(p)->pause(staged);
+            }, &gate);
+            store.confirmed_restore(head.head_id);
+            store.close();
+            const auto counters = store.counters();
+            check(counters.promotions_applied <= 1 && counters.promotions_refused == 0,
+                  "immediate close never drains a per-restore policy queue");
+            check(!store.run_intent_active(), "immediate close clears intent only after its final catalog");
+            store.confirmed_restore(head.head_id);
+            check(store.describe().find("promotion pending no") != std::string::npos,
+                  "confirmed_restore cannot re-arm work after close");
+            gate.check_visits(counters.promotions_applied + 1);
+        }
+        ConversationStore reopened(options);
+        std::string why;
+        check(reopened.demand(query_of(image, 2, 1), why), "an immediately closed restore remains selectable");
+        ConversationStoreRead read;
+        check(reopened.wait_ready(2, 1, read, 5000) && read.image && images_equal(*read.image, image, why),
+              "immediate close preserves exact model-state bytes");
+        read.image.reset();
+        reopened.release_read(2, 1);
+        reopened.close();
+    }
+    for (const char* final_fault : {"", "catalog-rename", "catalog-sync", "catalog-apply"}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 2;
+        ConversationStorePublishResult older, later;
+        uint64_t epoch = 0;
+        {
+            PromotionCatalogGate gate;
+            ConversationStore store(options);
+            check(publish_and_wait(store, promotion_fixture(741), 1, 1, older) &&
+                      publish_and_wait(store, promotion_fixture(742), 2, 2, later),
+                  "the close race has an older snapshot and a distinct late-restored history");
+            epoch = store.epoch();
+            store.set_catalog_gate_for_test([](void* p, bool staged) {
+                static_cast<PromotionCatalogGate*>(p)->pause(staged);
+            }, &gate);
+            store.confirmed_restore(older.head_id);
+            gate.await(false, 1);
+            gate.resume(false, 1);
+            gate.await(true, 1);
+            store.confirmed_restore(later.head_id);
+            std::thread closer([&] { store.close(); });
+            check(await_store_progress([&] {
+                return store.describe().find("(admission suspended)") != std::string::npos;
+            }), "close enters its drain while the older catalog I/O is gated");
+            check(store.describe().find("promotion pending no") != std::string::npos,
+                  "close defers the re-armed hint to its existing final transaction");
+            store.confirmed_restore(older.head_id);
+            gate.resume(true, 1);
+            gate.await(false, 2);
+            check(store.run_intent_active(), "the final transaction still owns an armed intent before staging");
+            gate.resume(false, 2);
+            gate.await(true, 2);
+            check(store.run_intent_active(), "staging the final catalog cannot clear intent before durable success");
+            const std::string before_final = file_digest(root.path + "/catalog");
+            if (*final_fault) store.set_publish_fault_for_test(final_fault);
+            gate.release();
+            closer.join();
+            check(store.run_intent_active() == bool(*final_fault),
+                  "only a durably successful final catalog clears the deferred promotion's intent");
+            if (std::strcmp(final_fault, "catalog-rename") == 0)
+                check(file_digest(root.path + "/catalog") == before_final,
+                      "a refused final rename leaves the earlier durable authority untouched");
+            else
+                check(file_digest(root.path + "/catalog") != before_final,
+                      "a successful or uncertain final rename records the late policy snapshot");
+            check_eq(store.counters().promotions_applied, 1, "close runs no extra policy attempt for the deferred flag");
+            gate.check_visits(2);
+        }
+        ConversationStore reopened(options);
+        if (*final_fault) {
+            check_eq(reopened.epoch(), epoch + 1, "a failed final promotion leaves intent armed for the next epoch");
+            check_eq(reopened.counters().heads, 0, "a refused or uncertain final transaction promises no reusable history");
+        } else {
+            ConversationStorePublishResult pressure;
+            check(publish_and_wait(reopened, promotion_fixture(743), 3, 3, pressure),
+                  "the clean-close race retains usable publication authority");
+            ConversationStoreManifestInfo info;
+            check(reopened.manifest_info(later.head_id, info) && !reopened.manifest_info(older.head_id, info),
+                  "the final close preserved a late policy update even after dropping its scheduling flag");
+        }
+        reopened.close();
+    }
+}
 
 void check_selected_retirement_allocation_retry() {
     TempRoot root;
