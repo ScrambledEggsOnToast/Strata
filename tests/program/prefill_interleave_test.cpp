@@ -53,6 +53,7 @@ struct Result {
     std::vector<std::pair<int64_t, int64_t>> reads;
     std::vector<int64_t> decode_positions;
     int64_t interleave_boundaries = 0;
+    std::vector<int64_t> store_positions;
     int64_t parked_at = -1;
     double estimate_ms = 0;
     bool okay = false, fatal = false;
@@ -70,14 +71,16 @@ struct Prefill {
     int64_t position = 0;
     bool pipelined = false;
     std::deque<std::string>* incoming = nullptr;
+    std::atomic<bool>* cancel_after_run = nullptr;
     int64_t chunk() const { return 2048; }
     bool run(const int64_t* data, int64_t count, int64_t pos, std::string& e) {
         if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
         result.reads.emplace_back(pos, count);
         position += count;
         const int64_t chunks = count / chunk() + (count % chunk() != 0);
-        Clock::ms += 250 * chunks - (pipelined ? 150 * (chunks - 1) : 0);
+        Clock::ms += count == 1024 ? 125 : 250 * chunks - (pipelined ? 150 * (chunks - 1) : 0);
         if (incoming) { incoming->push_back("BYIELD 0"); incoming = nullptr; }
+        if (cancel_after_run) cancel_after_run->store(true);
         return true;
     }
     bool run_retained(const int64_t* data, int64_t count, int64_t pos, std::string& e,
@@ -93,9 +96,20 @@ inline Progress& progress() { static Progress p; return p; }
 inline void progress_at(const char*) {}
 }
 
+static void split_setting(const char* value) {
+    constexpr const char* name = "STRATA_PREFILL_SPLIT_OVER_BUDGET";
+#if defined(_WIN32)
+    if (_putenv_s(name, value ? value : "") != 0) throw std::runtime_error("cannot set split gate");
+#else
+    if ((value ? setenv(name, value, 1) : unsetenv(name)) != 0) throw std::runtime_error("cannot set split gate");
+#endif
+}
+
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
                           const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
-                          double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1) {
+                          double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1,
+                          bool empty_decode_credit = false, bool cancel_first_launch = false,
+                          int64_t prior_chunk_tokens = 2048) {
     Clock::ms = 0;
     Result result;
     const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
@@ -105,7 +119,10 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     struct Stage { strata::prefill::Prefill sp; };
     std::vector<std::unique_ptr<Stage>> stages(split ? 2 : 0);
     strata::program::TimeBudget time_budget(budget_ms, 0.25);
-    if (prior_chunk_ms > 0) time_budget.prefilled(prior_chunk_ms, 1, 2048);
+    if (prior_chunk_ms > 0) time_budget.prefilled(prior_chunk_ms, 1, prior_chunk_tokens);
+    // Seed the historical 2048-token cost without letting old credit pay for
+    // the midpoint decode: the first half must earn that credit itself.
+    if (empty_decode_credit) while (time_budget.decode_allowed(0)) time_budget.decoded(5);
     auto last_decode = Clock::now();
     double credited_prefill_ms = 0, resident_round_ms = 0;
     std::atomic<bool> stop_req{false};
@@ -114,6 +131,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const auto batch_on = [&] { return active; };
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
     sp.pipelined = piped;
+    if (cancel_first_launch) sp.cancel_after_run = &stop_req;
     const bool retained_prefill = retained_error != nullptr, retained_layer_yields = true;
     int retained_blocked_stage = -1;
     std::vector<int> stage_group(3, -1);
@@ -166,7 +184,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const std::vector<Slot> bs(4);
 
     // Disk publication is exercised by the real-engine persistence qualification, not this scheduling fixture.
-    const auto store_seam = [] {};
+    const auto store_seam = [&] { result.store_positions.push_back(sp.position); };
 
     // CMake extracts this verbatim from generate.cpp and regenerates it whenever that source changes.
 #include "prefill_read_part.inc"
@@ -175,7 +193,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.okay = read_part(0, n, e);
     result.fatal = batch_fatal;
     result.error = e;
-    if (!retained_prefill && !expects_yield &&
+    if (!retained_prefill && !expects_yield && !cancel_first_launch &&
         (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
         throw std::runtime_error("read_part did not finish: " + e);
     result.interleave_boundaries = il_parts;
@@ -188,6 +206,7 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
 int main() {
+    split_setting(nullptr); // Ambient experiment settings must not change the legacy regressions.
     // Piped groups return piece=0 in the unchanged upstream helper, even beside decoding slots.
     CHECK(strata::program::batch_read_piece(true, true, true, true, 2048, 8) == 0);
     const std::vector<std::pair<int64_t, int64_t>> whole{{0, 10000}};
@@ -261,6 +280,77 @@ int main() {
     CHECK(!failed_drain.okay && failed_drain.fatal && failed_drain.error == "descendant drain failed" && failed_drain.drains == 1);
     const auto retained = read_prompt(0, true, true, true, 4, "");
     CHECK(retained.okay && !retained.fatal && retained.error.empty() && retained.drains == 1 && retained.reads == chunks);
-    if (fails == 0) std::printf("prefill_interleave_test: ok (positive piped: prefill/decode/prefill; zero: legacy)\n");
+    // A measured over-budget C is still allocated as C=2048, but the opt-in
+    // launch reaches the same drained midpoint on ordinary and grouped reads.
+    split_setting("1024");
+    const std::vector<std::pair<int64_t, int64_t>> split_tail{
+        {0, 1024}, {1024, 1024}, {2048, 1024}, {3072, 1024}, {4096, 1}};
+    for (bool piped : {false, true}) {
+        const auto divided = read_prompt(1000, piped, piped, true, 4, nullptr, true, 4097, 1200, false, -1, true);
+        CHECK(divided.okay && divided.reads == split_tail);
+        CHECK(!divided.decode_positions.empty() && divided.decode_positions.front() == 1024);
+        CHECK((divided.store_positions == std::vector<int64_t>{1024, 2048, 3072, 4096, 4097}));
+        CHECK(divided.estimate_ms == 1200); // Half launches and the original tail cannot cheapen C.
+    }
+    // Complete each selected C as two halves even when only its second half
+    // remains; leave the original final tail intact, including tails below 1024.
+    for (int64_t n : {2047, 2048, 2049, 3071, 3072, 4095, 4096, 4097, 10000}) {
+        const auto divided = read_prompt(1000, true, true, true, 4, nullptr, true, n, 1200);
+        int64_t frontier = 0;
+        for (const auto& read : divided.reads) {
+            CHECK(read.first == frontier && read.second > 0);
+            const int64_t expected = frontier < n - n % 2048 ? 1024 : n % 2048;
+            CHECK(read.second == expected);
+            frontier += read.second;
+        }
+        CHECK(frontier == n && divided.estimate_ms == 1200);
+    }
+    // The midpoint re-enters the existing store/control/cancellation seam,
+    // rather than a private second-half loop that hides arrivals.
+    const auto midpoint_yield = read_prompt(1000, true, true, true, 4, nullptr, true, 4097, 1200, true);
+    CHECK(!midpoint_yield.okay && !midpoint_yield.fatal && midpoint_yield.error == "yield");
+    CHECK(midpoint_yield.parked_at == 1024 && midpoint_yield.reads.size() == 1);
+    CHECK((midpoint_yield.store_positions == std::vector<int64_t>{1024}));
+    const auto midpoint_cancel = read_prompt(1000, true, true, true, 4, nullptr, true, 4097, 1200,
+                                            false, -1, false, true);
+    CHECK(!midpoint_cancel.okay && !midpoint_cancel.fatal && midpoint_cancel.error == "cancelled");
+    CHECK(midpoint_cancel.reads.size() == 1 && midpoint_cancel.reads.front().second == 1024);
+    CHECK((midpoint_cancel.store_positions == std::vector<int64_t>{1024}));
+    const std::vector<std::pair<int64_t, int64_t>> unsplit_tail{{0, 2048}, {2048, 2048}, {4096, 1}};
+    for (bool piped : {false, true}) {
+        for (double estimate : {900.0, 1000.0}) {
+            const auto within = read_prompt(1000, piped, true, true, 4, nullptr, true, 4097, estimate);
+            CHECK(within.reads == unsplit_tail);
+        }
+        const auto idle = read_prompt(1000, piped, true, false, 4, nullptr, true, 2048, 1200);
+        CHECK((idle.reads == std::vector<std::pair<int64_t, int64_t>>{{0, 2048}}));
+        CHECK(idle.decode_positions.empty());
+    }
+    const auto idle_fill = read_prompt(1000, true, true, false, 4, nullptr, true, 4096, 1200);
+    CHECK((idle_fill.reads == std::vector<std::pair<int64_t, int64_t>>{{0, 4096}}));
+    CHECK(idle_fill.estimate_ms == 1200 && idle_fill.decode_positions.empty());
+    const auto cold = read_prompt(1000, true, true, true, 4, nullptr, true, 4097);
+    CHECK(cold.reads.front().second == 2048);
+    // A cost learned for another allocation geometry is not a measured C:
+    // execute the cold whole 2048 first and learn its actual cost normally.
+    for (bool piped : {false, true}) {
+        for (int64_t prior_geometry : {1024, 4096}) {
+            const auto mismatched = read_prompt(1000, piped, piped, true, 4, nullptr, true, 4097, 1200,
+                                                false, -1, false, false, prior_geometry);
+            CHECK(mismatched.reads == unsplit_tail && mismatched.estimate_ms == 250);
+        }
+    }
+    CHECK(read_prompt(0, true, true, true).reads == legacy_piped.reads);
+    CHECK(read_prompt(0, false, true, true).reads == legacy_chunked.reads);
+    // Only the exact supported value can partition a launch. Positive
+    // unsupported values are also refused by the engine's startup validation.
+    const char* const disabled_settings[] = {nullptr, "0", "1", "512", "2048", "4096", "01024", "1024junk"};
+    for (const char* value : disabled_settings) {
+        split_setting(value);
+        const auto unchanged = read_prompt(1000, true, true, true, 4, nullptr, true, 4097, 1200);
+        CHECK(unchanged.reads == unsplit_tail);
+    }
+    split_setting(nullptr);
+    if (fails == 0) std::printf("prefill_interleave_test: ok (budget interleave, opt-in split, legacy)\n");
     return fails == 0 ? 0 : 1;
 }
