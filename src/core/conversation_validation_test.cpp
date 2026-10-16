@@ -1,6 +1,7 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/resident_memory.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cstdint>
@@ -366,11 +367,104 @@ void ring_refusal(int format) {
     }
 }
 #endif
+
+// The conversation cache's host price is every saving stage's part, not one whole-model state:
+// conversation_checkpoint_save runs on the primary session and on each split stage's session, so every
+// stage allocates its own GDN rows and indexer layers, while the whole PLE history (session.cpp
+// allocates it in every session) and the checkpoint's token-ID vector are written once per stage.  No
+// checkpoint carries draft/MTP state, so the cache prices none.  The carve and the per-session extents
+// come from the production helpers (session_layer_counts, conversation_session_sizes); the
+// wrapped-transfer arm also captures a real checkpoint per stage and measures what that allocated.
+void checkpoint_payload_stages() {
+    ModelGeometry g;
+    g.n_layers = 8; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    std::string error;
+    const int64_t cells = 96;   // the fixture's max_cells: the token bound one checkpoint can reach
+    const uint64_t ids = (uint64_t) cells * sizeof(int32_t);
+    ConversationStateSizes whole;
+    check(conversation_state_sizes(g, whole, error), "whole-model running-state sizes");
+    const uint64_t per_layer = whole.tail + whole.dead + whole.block_pos;
+    const uint64_t whole_model_one = whole.gdn + whole.ple + (uint64_t) g.n_qsa_layers() * per_layer + ids;
+    strata::plan::ResidentCheckpointPayload price;
+    check(strata::core::conversation_checkpoint_payload(g, cells, 1, nullptr, price) && price.stages == 1 &&
+          price.bytes == whole_model_one, "one stage keeps the whole-model price exactly");
+    // The carve session.cpp leaves the session owning [lo, hi): its own GDN rows and QSA ordinals.
+    auto stage_bytes = [&](int64_t lo, int64_t hi) -> uint64_t {
+        const auto layers = strata::plan::session_layer_counts(g.n_layers, g.qsa_interval, lo, hi);
+        SessionState stage;
+        stage.layer_lo = lo; stage.layer_hi = hi; stage.max_cells = cells;
+        stage.gdn_ord0 = lo - lo / g.qsa_interval; stage.gdn_alloc = layers.gdn;
+        stage.qsa_ord0 = std::min(lo / g.qsa_interval, g.n_qsa_layers() - 1); stage.qsa_alloc = layers.qsa;
+        ConversationStateSizes z;
+        check(conversation_session_sizes(g, stage, z, error), "a real stage carve has session sizes");
+        return z.gdn + z.ple + (uint64_t) layers.qsa * (z.tail + z.dead + z.block_pos) + ids;
+    };
+    const int64_t two_stages[1] = {4};   // the primary session owns [0,4), the split stage [4,8)
+    check(strata::core::conversation_checkpoint_payload(g, cells, 2, two_stages, price) && price.stages == 2 &&
+          price.bytes == stage_bytes(0, 4) + stage_bytes(4, 8),
+          "two stages price every saving stage's carve, PLE history and token IDs");
+    check(price.bytes - whole_model_one == whole.ple + per_layer + ids,
+          "the whole-model price missed one stage's PLE history, indexer layers and token IDs");
+    const int64_t three_stages[2] = {2, 6};   // [0,2) owns no attention layer of its own
+    check(strata::core::conversation_checkpoint_payload(g, cells, 3, three_stages, price) && price.stages == 3 &&
+          price.bytes == stage_bytes(0, 2) + stage_bytes(2, 6) + stage_bytes(6, 8),
+          "three stages price every saving stage, including an attention-free one");
+    check(price.stage_peak == stage_bytes(2, 6) && price.bytes > whole_model_one,
+          "the largest stage sets the peak and the whole-model price is insufficient");
+    const int64_t descending[2] = {6, 2};
+    check(!strata::core::conversation_checkpoint_payload(g, cells, 3, descending, price) && !price.stages,
+          "a non-ascending split is refused");
+    const int64_t past_last[1] = {g.n_layers + 1};
+    check(!strata::core::conversation_checkpoint_payload(g, cells, 2, past_last, price) && !price.stages,
+          "a boundary past the last layer is refused");
+    const int64_t empty_stage[1] = {0};
+    check(!strata::core::conversation_checkpoint_payload(g, cells, 2, empty_stage, price) && !price.stages,
+          "an empty stage is refused");
+    check(!strata::core::conversation_checkpoint_payload(g, cells, 0, nullptr, price) && !price.stages &&
+          !strata::core::conversation_checkpoint_payload(g, (uint64_t) g.n_layers + 1, nullptr, price) &&
+          !price.stages, "no stage, or more stages than layers, is refused");
+    check(!strata::core::conversation_checkpoint_payload(g, 0, 2, two_stages, price) && !price.stages &&
+          !strata::core::conversation_checkpoint_payload(g, (int64_t) INT32_MAX + 1, 2, two_stages, price) &&
+          !price.stages, "a zero or over-int32 cell count is refused");
+    auto overflow = g;
+    overflow.ssm_state_size = std::numeric_limits<int64_t>::max();
+    check(!strata::core::conversation_checkpoint_payload(overflow, cells, 2, two_stages, price) && !price.stages,
+          "checkpoint payload arithmetic overflow is refused");
+#if defined(CONVERSATION_TEST_TRANSFERS)
+    copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
+    auto saved_bytes = [&](int64_t lo, int64_t hi) -> uint64_t {
+        const auto layers = strata::plan::session_layer_counts(g.n_layers, g.qsa_interval, lo, hi);
+        SessionState stage;
+        stage.layer_lo = lo; stage.layer_hi = hi; stage.max_cells = cells;
+        stage.gdn_ord0 = lo - lo / g.qsa_interval; stage.gdn_alloc = layers.gdn;
+        stage.qsa_ord0 = std::min(lo / g.qsa_interval, g.n_qsa_layers() - 1); stage.qsa_alloc = layers.qsa;
+        ConversationStateSizes z;
+        check(conversation_session_sizes(g, stage, z, error), "a real stage carve has session sizes");
+        Pools pool(g, 0);
+        std::array<QsaState, 2> owned{pool.st, pool.st};   // global ordinals: qsa_states[ord0 + j]
+        std::vector<uint8_t> gdn(z.gdn, 0xa5), history(z.ple, 0xa5);
+        stage.gdn_state = (float*) gdn.data();
+        stage.ple_hist = (float*) history.data();
+        stage.qsa_states = owned.data();
+        ConversationCheckpoint part;
+        part.ids.assign((size_t) cells, 1);
+        check(conversation_checkpoint_save(part, stage, g, error),
+              "a stage checkpoint captures on the host transfer backend");
+        return (uint64_t) part.ids.size() * sizeof(int32_t) + part.gdn.size() + part.ple.size() +
+               part.tails.size() + part.dead.size() + part.block_pos.size();
+    };
+    check(saved_bytes(0, 2) == stage_bytes(0, 2) && saved_bytes(2, 6) == stage_bytes(2, 6) &&
+          saved_bytes(6, 8) == stage_bytes(6, 8),
+          "a real three-stage capture allocates exactly the priced stage payloads");
+#endif
+}
 }
 
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    checkpoint_payload_stages();
 #if defined(CONVERSATION_TEST_TRANSFERS)
     for (int format : {0,1,2}) ring_refusal(format);
 #endif
