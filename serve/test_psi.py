@@ -257,6 +257,39 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(sample["host"]["memory"]["some_total_usec"], 31)
         self.assertNotIn("must-not-leak", json.dumps(sample))
 
+    def test_search_only_ancestor_does_not_hide_service_counters(self):
+        # Model an unprivileged caller facing an execute/search-only ancestor
+        # (mode 0711) whose leaf directory and counter files stay readable.
+        # A read-open of the ancestor must fail while O_PATH traversal still
+        # yields the service-cgroup counters. The seam denies directory opens
+        # lacking O_PATH whenever the mode withholds group/other read
+        # permission, so it stays deterministic even when this test process
+        # owns the fixture or runs as root.
+        ancestor = self.mount
+        ancestor.chmod(0o711)
+        self.addCleanup(ancestor.chmod, 0o755)
+        self.assertEqual(ancestor.stat().st_mode & 0o0777, 0o711)
+        real_open = os.open
+
+        def open_directory(path, flags, *args, **kwargs):
+            if flags & os.O_DIRECTORY and not flags & os.O_PATH:
+                st = os.stat(path, **kwargs)
+                if not st.st_mode & 0o0044:  # group/other lack read: search-only
+                    raise PermissionError(errno.EACCES, "must-not-leak-raw-error", str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(psi.os, "open", side_effect=open_directory):
+            sample = self.reader.snapshot()
+        cgroup = sample["cgroup"]
+        self.assertIsNone(cgroup["reason"])
+        self.assertEqual(cgroup["identity"]["path"], self.member)
+        self.assertEqual(cgroup["cpu"]["some_total_usec"], 101)
+        self.assertEqual(cgroup["memory"]["some_total_usec"], 101)
+        self.assertEqual(cgroup["io"]["some_total_usec"], 101)
+        self.assertEqual(cgroup["memory_events"]["oom_kill"], 2)
+        self.assertEqual(cgroup["cpu_stat"]["usage_usec"], 987654321)
+        self.assertNotIn("must-not-leak", json.dumps(sample))
+
     def test_absent_or_malformed_scope_keeps_host_metrics(self):
         for membership, mountinfo, reason in (
                 ("9:memory:/legacy\n", self.mount_line(), "cgroup_v2_absent"),

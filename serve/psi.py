@@ -194,7 +194,11 @@ def _mount_reason(proc_root, fd, expected):
 
 
 def _open_mapped_directory(proc_root, mountpoint, relative, mount_id):
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    # O_PATH performs search-only opens: an ancestor with execute but not
+    # read permission (for example mode 0711) must not suppress traversal.
+    # O_DIRECTORY and O_NOFOLLOW keep rejecting files and symlinks, and the
+    # fd remains valid for dir_fd opens, fstat, and fdinfo mount-ID checks.
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     fd = None
     try:
         # Walk even the mountpoint's parents without symlinks. Opening only the
