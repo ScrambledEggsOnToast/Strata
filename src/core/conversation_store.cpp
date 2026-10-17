@@ -827,6 +827,7 @@ struct ConversationStore::Impl {
     uint64_t recency_counter = 0;
     std::set<uint64_t> eviction_excluded;                   // heads protected by the in-flight publication
     std::vector<PendingFile> pending_files;                 // orphans and retired files awaiting confirmed deletion
+    bool reclaim_pending_work = false;                     // mutex-guarded idle writer hint, not another work queue
     uint64_t charged = 0;         // allocated bytes of every file this module owns that still exists
     uint64_t reclaimable = 0;     // the part of `charged` no longer referenced but still on disk
     uint64_t free_sample = 0;     // last sampled filesystem space under the root
@@ -2145,6 +2146,8 @@ void ConversationStore::Impl::reclaim_pending() {
         // catalog's files may be deleted: every pending file is retained, stays charged, and awaits a restart that
         // re-reads the authority.
         if (faulted) return;
+        // Keep the hint armed if preparing the pass throws; only a prepared batch consumes this snapshot of work.
+        reclaim_pending_work = true;
         // A final-lease release may have lacked room for its retire queue. Retry before reclaiming files.
         for (auto it = head_objects.begin(); it != head_objects.end();) {
             const uint64_t head = it->first;
@@ -2160,6 +2163,7 @@ void ConversationStore::Impl::reclaim_pending() {
         // record between the queue and the batch nor leave the two lists describing the same file twice.
         batch.reserve(std::min<size_t>(pending_files.size(), kMaxReclaimPerPass));
         retry.reserve(batch.capacity());
+        bool more = false;
         for (auto& file : pending_files) {
             // A file whose head still has an open hold or a handed-out image is not deleted yet: a reader's
             // descriptors may still name it, and its bytes are still in use.
@@ -2168,12 +2172,15 @@ void ConversationStore::Impl::reclaim_pending() {
                 continue;
             }
             if (batch.size() >= kMaxReclaimPerPass) {
+                more = true;
                 keep.push_back(std::move(file));
                 continue;
             }
             batch.push_back(std::move(file));
         }
         pending_files = std::move(keep);
+        // Leased files wait for their final release, not an idle retry loop. Only a truncated eligible batch re-arms.
+        reclaim_pending_work = more;
     }
     for (PendingFile& file : batch) {
         if (file.where == Where::objects) {
@@ -2220,6 +2227,7 @@ void ConversationStore::Impl::reclaim_pending() {
     {
         std::lock_guard<std::mutex> guard(mutex);
         for (auto& file : retry) pending_files.push_back(std::move(file));
+        if (!retry.empty()) reclaim_pending_work = true;
         recount_metadata_locked();
     }
 }
@@ -2880,6 +2888,8 @@ void ConversationStore::Impl::release_head_lease_locked(const std::shared_ptr<Re
         Digest manifest{};
         uint64_t bytes = 0;
         if (head_manifest_bytes.count(job->head_id) && !head_manifest_locked(job->head_id, manifest, bytes)) {
+            reclaim_pending_work = true;
+            cv_work.notify_all();
             try {
                 retire_head_locked(job->head_id);
                 recount_metadata_locked();
@@ -4007,6 +4017,21 @@ void ConversationStore::Impl::writer_body() {
             lock.lock();
             if (outcome == CommitOutcome::durable_applied) counters.promotions_applied++;
             else counters.promotions_refused++;
+            continue;
+        }
+        if (reclaim_pending_work && !closing && !faulted) {
+            // Final reader releases schedule storage work, never filesystem I/O on the releasing thread.
+            // Reclamation consumes the hint under the mutex and re-arms it for truncated passes or failed unlinks.
+            lock.unlock();
+            try {
+                reclaim_pending();
+            } catch (const std::bad_alloc&) {
+                // The pass leaves its hint armed and retains every file it could not prepare.
+            }
+            lock.lock();
+            // Pace retries (including persistent unlink failures), while urgent work and shutdown wake immediately.
+            cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs),
+                             [&] { return stop.load() || !durable.empty() || publishing; });
             continue;
         }
         cv_work.wait_for(lock, std::chrono::milliseconds(kIdlePollMs));

@@ -650,6 +650,7 @@ void check_shutdown_failures();
 void check_shutdown_late_finalization();
 void check_shutdown_request_policy();
 void check_stale_ready();
+void check_idle_final_lease_reclaim();
 void check_capacity_floor();
 void check_quota_credit();
 void check_stream_identity();
@@ -773,6 +774,7 @@ int main() {
     check_selected_hold_commit_interleaving();
     check_selected_hold_terminal_release();
     check_selected_retirement_allocation_retry();
+    check_idle_final_lease_reclaim();
     check_selected_equal_cut_order();
     check_budget_deferred_prefetch();
     check_budget_deferred_expanded_peak();
@@ -5403,6 +5405,62 @@ void check_stale_ready() {
     store.release_read(32, 1);
     check(store.ram_held_bytes() <= store.ram_read_budget(), "no charge survives the invalidation");
     store.close();
+}
+
+// A retired head's final reader must wake the idle writer: no later publication or close may be needed to return
+// its physical charge. Two handed-out images distinguish the last lease from an earlier release of the same head.
+void check_idle_final_lease_reclaim() {
+    for (bool fail_retire : {false, true}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_reads = 2;
+        ConversationStore store(options);
+        const SavedConversation image = fixture(193, 256);
+        ConversationStorePublishResult published;
+        check(publish_and_wait(store, image, 1, 1, published) &&
+                  published.status == ConversationStorePublishStatus::stored,
+              "the idle-reclaim branch is stored");
+        std::string why;
+        ConversationStoreRead first, last;
+        check(store.demand(query_of(image, 41, 1), why) && store.wait_ready(41, 1, first, 5000) && first.image,
+              "the first reader holds a handed-out image");
+        check(store.demand(query_of(image, 42, 1), why) && store.wait_ready(42, 1, last, 5000) && last.image,
+              "the final reader holds a second image of the same head");
+        check(store.invalidate_domain("idle reclaim regression"), "the leased head is retired durably");
+        check_eq(store.counters().heads, 0, "the retired head is no longer authorized");
+        const auto held = store.counters();
+        const uint64_t charged = store.disk_charged_bytes();
+        const uint64_t available = store.disk_available_bytes();
+        check(held.pending_delete_bytes > 0, "the leased retired manifest awaits confirmed deletion");
+        first.image.reset();
+        store.release_read(41, 1);
+        ::usleep(50000);
+        check_eq(store.disk_charged_bytes(), charged, "an earlier lease release cannot credit files still held");
+        check_eq(store.counters().pending_delete_bytes, held.pending_delete_bytes,
+                 "the manifest remains pending until the last reader releases it");
+        if (fail_retire) store.set_publish_fault_for_test("retire-object-prepare");
+        last.image.reset();
+        store.release_read(42, 1);
+        // Read-only observation only: deliberately no publication, promotion or close to trigger another pass.
+        bool reclaimed = false;
+        for (int waited = 0; waited < 5000; ++waited) {
+            const auto remaining = store.counters();
+            if (remaining.pending_delete_bytes == 0 && remaining.orphan_bytes == 0 &&
+                store.disk_charged_bytes() < charged) {
+                reclaimed = true;
+                break;
+            }
+            ::usleep(1000);
+        }
+        check(reclaimed, "the idle writer reclaims the final lease, including a failed retire-queue retry");
+        check_eq(store.counters().pending_delete_bytes, 0, "no pending-delete charge survives the idle release");
+        check_eq(store.counters().orphan_bytes, 0, "no reclaimable charge survives the idle release");
+        check(store.disk_available_bytes() > available, "idle deletion returns quota headroom without a publication");
+        check(store.counters().reclaimed_bytes > held.reclaimed_bytes, "idle deletion is confirmed and counted");
+        check(store.healthy() && store.run_intent_active(), "idle reclamation leaves the live store healthy");
+        store.close();
+        check(store.healthy() && !store.run_intent_active(), "the subsequent shutdown still closes cleanly");
+    }
 }
 
 void check_quota_credit() {

@@ -594,6 +594,8 @@ public:
     // delivered or completed afterwards.  Safe and counted for unknown or already-released identifiers; a release
     // that never fires leaves the bytes charged, which is a caller bug the module cannot detect - and charging is the
     // fail-safe direction, never a silent refund of live bytes.
+    // A final lease on a retired head also wakes the existing writer to delete its files in bounded idle passes;
+    // confirmed deletion returns their physical charge without waiting for another publication or close.
     void release_read(uint64_t request_id, uint64_t generation);
     ConversationStoreReadStatus request_status(uint64_t request_id, uint64_t generation) const;
     // Recency promotion after a *confirmed* restore (never on prefetch or on a mere append): moves the head into the
