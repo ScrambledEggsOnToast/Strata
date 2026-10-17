@@ -3332,17 +3332,21 @@ multi-owner arithmetic: require an actual pack with `owners>1`, matching per-sta
 then the corresponding final drain and first-token receipts.
 
 The existing native behavioral vehicle is
-`python tools/batch_interleave_test.py --exe <candidate> --config <copied-config> --packed-prefill --max-new 4`.
+`python tools/batch_interleave_test.py --exe <candidate> --config <copied-config> --packed-prefill`.
 Use an already admitted static, batch-MTP configuration with prompt caching and enough context for `--long`
 (5,000 tokens by default). It uses a disposable store for its intentional EOF-fragment failure and checks
-four owners, early ACKs, late arrivals, owner-local cancellation, one-cell/zero-remaining/short-suffix
-first-token transitions, request reuse and atomic refusal. A second isolated engine uses the observed
+four owners, early ACKs, late arrivals, cancellation before issue, one-cell/zero-remaining transitions,
+and a simultaneous three-owner suffix frame with exact 1/63/64 segmented rows and unequal restored
+frontiers. It also checks request reuse and atomic refusal. A second isolated engine uses the observed
 single-row greedy token as `--eos-ids` to exercise first-token EOS with `max_new=4`; both native logs are
 retained separately. It does not use exact token equality against a different arithmetic partition as a
 qualification gate. The CPU/frontend transport checks are
 `python -m unittest serve.test_parallel.PackedTransport serve.test_throughput.ThroughputTests`.
-These are test entrypoints, not measured acceptance or a performance claim; protected runtime evidence is
-required before promotion.
+The packed cases use fixed output budgets of one, two or four tokens; `--max-new` affects only the
+legacy cases. Late-arrival ACK/completion ordering is not by itself a descendant-drain or concurrent-decode
+proof; inspect actual native stage/drain receipts for those claims. The intentional EOF refusal is not a
+normal durable-clean store shutdown. These are test entrypoints, not measured acceptance or a performance
+claim; monitored real-runtime evidence is required before promotion.
 
 
 Run-config budgets (all bounded per request, not replacements for native byte-level memory admission):

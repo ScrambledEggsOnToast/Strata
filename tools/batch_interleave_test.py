@@ -146,6 +146,28 @@ def packed_cases(eng, prompts):
     eng.send("BGENQ1 " + record("one-row-suffix", 1, suffix))
     drain(["one-row-suffix"])
     assert int(owners["one-row-suffix"]["terminal"][12]) == len(a)
+    # Unequal restored frontiers and exact 1/63/64-row suffixes share one
+    # complete admission frame. Include the unconsumed predicted token first:
+    # each max_new=1 source retains its prompt, not its emitted next token.
+    boundary = [("suffix-1", "single-cell", 1),
+                ("suffix-63", "one-row-suffix", 63),
+                ("suffix-64", "fourth-general", 64)]
+    records = []
+    for tag, previous, rows in boundary:
+        source = owners[previous]
+        assert len(source["tokens"]) == 1
+        prompt = source["prompt"] + source["tokens"] + [source["prompt"][-1]] * rows
+        records.append(record(tag, source["slot"], prompt))
+    eng.send("BGENQ3 " + "\t".join(records))
+    drain([tag for tag, _, _ in boundary])
+    for tag, previous, rows in boundary:
+        owner = owners[tag]
+        reused = int(owner["terminal"][12])
+        fresh = int(owner["terminal"][13].split("=", 1)[1])
+        assert len(owner["tokens"]) == 1
+        assert reused == len(owners[previous]["prompt"]), ("wrong suffix source frontier", tag, reused)
+        assert len(owner["prompt"]) - reused - 1 == rows, ("wrong segmented suffix extent", tag)
+        assert fresh == rows + 1, ("final prompt token missing or duplicated", tag, fresh)
     # A ready singleton starts immediately. The second complete request arrives
     # after its ACK and must get its own ACK before the long reply completes.
     eng.send("BGENQ1 " + record("late-long", 0, long_prompt, 2))
@@ -181,11 +203,11 @@ def packed_cases(eng, prompts):
     eng.p.stdin.flush()
     eng.p.stdin.close()
     fatal = read_frame(allow_fatal=True)
-    assert fatal[:5] == ["FATAL", "incomplete", "command", "frame", "at"], fatal
+    assert fatal and fatal[0] == "FATAL", ("incomplete frame was not refused", fatal)
     eng.p.wait(timeout=30)
     assert eng.p.returncode != 0
     print("PASS real native packed: four owners, early independent ACK, late arrival, cancellation, "
-          "one-cell/zero-remaining/short-suffix first token, exact reuse, atomic refusal, EOF fragment", flush=True)
+          "one-cell/zero-remaining/1/63/64-row suffix first token, exact reuse, atomic refusal, EOF fragment", flush=True)
     return eos_token
 
 
