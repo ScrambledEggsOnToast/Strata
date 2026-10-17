@@ -3062,8 +3062,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
-    const bool ple_on = (segmented ? session_of(segments[0].owner).ple.ready() : ss.ple.ready()) &&
-                        LB <= 1 && 1 < LE;
+    // Slots own history, not another copy of the arena's immutable PLE artifact.
+    const auto& ple = ss.ple;
+    const bool ple_on = ple.ready() && LB <= 1 && 1 < LE;
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
     // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
     static const bool ple_batch_env = [] {
@@ -3071,10 +3072,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
-                           (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
+                           (ple.w.key_bf16 != nullptr || ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, &session_of, tokens, n, prev0, segments, segment_count](int64_t c0, int buf, std::string& e) -> bool {
+    auto ple_gather = [&m, &ss, &ple, &session_of, tokens, n, prev0, segments, segment_count](int64_t c0, int buf, std::string& e) -> bool {
         OwnerSegment singleton;
         singleton.owner.tokens = tokens + c0;
         singleton.owner.rows = std::min(m.T, n - c0);
@@ -3088,11 +3089,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              segment_count ? owner.ple_prev[1] : at(c0 + 1)};
             for (int64_t t = 0; t < segment.owner.rows; ++t) {
                 const int32_t tok = (int32_t) segment.owner.tokens[t];
-                strata::kernels::ngram_rows(&tok, pv, 1, owner.ple.consts,
+                strata::kernels::ngram_rows(&tok, pv, 1, ple.consts,
                     m.ple_rows[buf].data() + (segment.row + t) * strata::kernels::PLE_N_HEADS);
                 pv[0] = pv[1]; pv[1] = tok;
             }
-            if (!owner.ple.table->gather_batch(
+            if (!ple.table->gather_batch(
                     m.ple_rows[buf].data() + segment.row * strata::kernels::PLE_N_HEADS,
                     (size_t) segment.owner.rows, m.ple_emb_host[buf] + segment.row * N, e)) return false;
         }
@@ -3555,7 +3556,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // files), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
                 pt.mark(kPfPle, cs);
                 const auto tp = Clock::now();
-                const strata::kernels::PleWeights& pw = ss.ple.w;
+                const strata::kernels::PleWeights& pw = ple.w;
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
@@ -3583,7 +3584,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple_hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
@@ -3596,10 +3597,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     po.normalized = m.ple_norm;
                     po.result = m.R + t * D;
                     try {
-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
-                                                   ss.ple.scratch, m.cs);
+                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple_hist, ple.w, po,
+                                                   ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    strata::kernels::ple_history_advance(ss.ple_hist, m.ple_norm, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -5704,7 +5705,7 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
                 state->qsa_ord0 != arena.ss->qsa_ord0 || input.position > state->max_cells ||
                 input.rows > state->max_cells - input.position || !state->gdn_state || !state->qsa_states ||
                 state->max_cells / strata::kernels::qsa_real_shapes().idx_block + 2 > arena.max_blocks ||
-                state->ple.ready() != arena.ss->ple.ready()) {
+                (arena.ss->ple.ready() && !state->ple_hist)) {
                 err = "prefill: segmented owner identity/stage/extent mismatch"; return result;
             }
             for (int j = 0; j < i; ++j)

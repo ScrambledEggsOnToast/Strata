@@ -3254,6 +3254,11 @@ support without executing this path. Unsupported compositions refuse before `REA
 unset, or setting it to anything other than exactly `1`, retains the existing GEN/BGEN path.
 The unset pipeline-window option remains automatic and resolves to off for resident slots; it is not an
 enabled pipeline composition. Explicit positive `--pipeline-windows` remains incompatible.
+The existing stage arena supplies PLE table/weights and ordered execution scratch.
+Each destination supplies its own PLE history and predecessor tokens; a resident
+slot need not duplicate the working session's complete `PleRun` bindings.
+Both batched and tokenwise PLE use that destination's history, never the arena's
+working-request history.
 
 An eligible engine announces `INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4`.
 The frontend then submits each ready request immediately as `BGENQ1`: it never waits to fill a cohort.
