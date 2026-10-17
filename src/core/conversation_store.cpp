@@ -105,10 +105,6 @@ std::array<uint8_t, kIssuerEnvelopeBytes> issuer_envelope(const std::array<uint8
     return out;
 }
 
-bool supported_manifest_tag(const uint8_t* bytes, size_t size) {
-    return size < 8 || std::memcmp(bytes, "STCSMAN1", 8) == 0 || std::memcmp(bytes, "STCSMAN2", 8) == 0;
-}
-
 uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 uint64_t sat_mul(uint64_t a, uint64_t b) { return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
 
@@ -1658,10 +1654,10 @@ static bool manifest_versions_supported(int directory, const Catalog& catalog, b
         std::array<char, 8> tag{};
         const ssize_t got = ::pread(fd, tag.data(), tag.size(), 0);
         ::close(fd);
-        if (got < 0 || (got == ssize_t(tag.size()) &&
-            (!supported_manifest_tag(reinterpret_cast<const uint8_t*>(tag.data()), tag.size()) ||
-             (tag[7] == '2' && !floor)))) {
-            why = "a manifest requires an unsupported or unestablished minimum reader";
+        // Only the ordering invariant is decided here: a certified record must never be reachable through legacy
+        // authority, because the legacy reader would reclaim it. A damaged tag stays an ordinary corrupt record.
+        if (got == ssize_t(tag.size()) && std::memcmp(tag.data(), "STCSMAN2", 8) == 0 && !floor) {
+            why = "a certified record exists without the established minimum reader";
             return false;
         }
     }
@@ -2179,10 +2175,6 @@ ConversationStore::Impl::ManifestRead ConversationStore::Impl::load_manifest_of(
     {
         std::lock_guard<std::mutex> guard(mutex);
         counters.bytes_read += raw.size();
-    }
-    if (!supported_manifest_tag(raw.data(), raw.size())) {
-        why = "the manifest requires an unsupported reader version";
-        return ManifestRead::unreadable;
     }
     // Decoded under the *retention* figures rather than this run's admitted ones: this is where the soundness of a
     // record this run did not write is decided - for recovery, for the shared physical ledger and for the publication
@@ -3987,10 +3979,6 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         if (read_timing) job->trace_bytes_read += raw.size();
     }
     conversation_store_detail::ManifestMeta meta;
-    if (!supported_manifest_tag(raw.data(), raw.size())) {
-        stop_with(ConversationStoreReadStatus::failed, "the manifest requires an unsupported reader version");
-        return;
-    }
     // One decode, under the *retention* figures: they are the widest set that still describes what a sound record is
     // (the manifest ceiling is this run's configured one and every count is still bounded by the bytes the file really
     // holds), so this decides whether the record exists at all.  A record another profile captured is not corrupt
