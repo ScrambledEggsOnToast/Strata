@@ -284,6 +284,30 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         foreign.stages[0] = &b;
         require(!owner.prefilled(foreign, 2, error), "swapped physical owner cannot publish a frontier");
         const int32_t first = row(0, 33, 2);
+        // Acquire the exact row while this verifier still owns final_R, before
+        // executing the peer. No destination token at position 3 is captured.
+        core::ConversationBuffer boundary_row;
+        boundary_row.resize(size_t(geometry.hc * geometry.n_embd) * sizeof(float));
+        require(boundary_row.visit(0, boundary_row.size(), [&](uint8_t* dst, size_t n, size_t at) {
+                    return cudaMemcpy(dst, reinterpret_cast<const uint8_t*>(verifier.final_R(0)) + at,
+                                      n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                }), "capture owned final main residual before another verifier row");
+        boundary_row.freeze();
+        const std::vector<int32_t> shared_ids{11, 22, 33};
+        const std::vector<core::ConversationImageKey> shared_images;
+        const std::vector<core::ConversationCheckpoint> shared_checks;
+        core::ConversationView shared_view{shared_ids, shared_images, shared_checks, true, true};
+        draft.certify_view(shared_view, 0);
+        shared_view.draft_boundary_residual = &boundary_row; shared_view.draft_boundary_position = 2;
+        shared_view.draft_boundary_owner = leases[0].request;
+        core::SavedConversation shared;
+        require(core::conversation_snapshot_save(shared, shared_view, a, geometry, *draft.slot_state(0), error) &&
+                shared.draft_cells == 2 && shared.draft_next_token == -1 &&
+                shared.draft_boundary_residual == boundary_row,
+                "production capture preserves actual N-1 coverage and position-bound R without tokenN");
+        shared.scope = request_a.scope;
+        shared.freeze();
+        const auto immutable_shared = shared.frozen_alias();
         owner.cancel(0); // cancellation after issue still owes mandatory draft catchup
         require(!owner.abort_preparation(leases[0], error) && owner.slots()[0].preparing,
                 "final verifier commitment cannot be aborted before draft catchup");
@@ -304,10 +328,12 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         const std::vector<core::ConversationImageKey> images;
         core::SavedConversation image;
         const auto& completed = owner.slots()[0];
-        require(core::conversation_snapshot_save(image, {completed.ids, images, completed.checks, completed.cvec},
-                                                 a, geometry, *draft.slot_state(0), error),
-                "capture real source snapshot for post-ACK direct restore");
-        const int64_t saved_draft_begin = draft.slot_begin(0), saved_draft_cells = draft.slot_cells(0);
+        core::ConversationView source_view{completed.ids, images, completed.checks, completed.cvec};
+        draft.certify_view(source_view, 0);
+        require(core::conversation_snapshot_save(image, source_view, a, geometry, *draft.slot_state(0), error) &&
+                image.draft_cells == draft.slot_cells(0) && image.draft_begin == draft.slot_begin(0) &&
+                image.draft_next_token == draft.slot_next_token(0),
+                "production private capture propagates actual source certification without manual receipt repair");
         const int32_t saved_draft_next = draft.slot_next_token(0);
         image.scope = request_a.scope;
         image.freeze();
@@ -341,16 +367,13 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
                 same(before_refusal, fingerprint(a, *draft.slot_state(0), 2)),
                 "whole-source preflight refusal writes no physical destination");
         image.cvec = true;
-        require(!owner.prepare(restored, &image, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
+        auto unknown = image.frozen_alias();
+        unknown.draft_begin = unknown.draft_cells = -1; unknown.draft_next_token = -1;
+        require(!owner.prepare(restored, &unknown, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
                 error.find("resident preparation: source draft reuse refused:") == 0 &&
                 owner.slots()[0].p == 0 && owner.slots()[0].preparing && !owner.slots()[0].failed &&
                 same(before_refusal, fingerprint(a, *draft.slot_state(0), 2)),
                 "uncertified external draft source is an explicit pre-write refusal, not qualified cold reuse");
-        // These are receipts from this fixture's actual capture, not invented
-        // interval bounds. Persistent propagation is owned by the store vehicle.
-        image.draft_begin = saved_draft_begin;
-        image.draft_cells = saved_draft_cells;
-        image.draft_next_token = saved_draft_next;
         require(owner.prepare(restored, &image, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
                 owner.slots()[0].p == 2 && draft.slot_cells(0) == 2 &&
                 a.ple_prev[0] == 11 && a.ple_prev[1] == 22,
@@ -375,8 +398,30 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
                 !owner.completed_snapshot_source(0, error),
                 "partial destination rewind failure leaves only that physical seat unavailable");
         require(same(peer, fingerprint(b, *draft.slot_state(1), 2)) &&
-                same(ambient, fingerprint(main, draft.kv_state(), 2)) && owner.release_resources(error),
-                "failed destination neither changes peer/ambient state nor strands drained resource release");
+                same(ambient, fingerprint(main, draft.kv_state(), 2)),
+                "failed destination changes neither peer nor ambient payload");
+        // The same immutable N-token image resumes twice at full live N. Each
+        // destination must supply its own tokenN to exactly one missing KV cell.
+        for (const int32_t token_n : {88, 89}) {
+            const std::vector<int64_t> suffix{11, 22, 33, token_n};
+            const program::ResidentPrepareInput shared_input{1, &suffix, request_a};
+            program::ResidentPreparation mounted;
+            require(owner.reserve(&shared_input, 1, &mounted, error) &&
+                    owner.prepare(mounted, &shared, nullptr, core::ConversationSnapshotExpectation::exact_cut, error) &&
+                    owner.slots()[1].p == 3 && draft.slot_cells(1) == 3 &&
+                    draft.slot_next_token(1) == token_n,
+                    "full-live shared mount completes exactly its destination-owned missing cell");
+            require(same_snapshot(shared, immutable_shared) &&
+                    shared.draft_next_token == -1 && shared.live.ids.size() == 3 &&
+                    shared.draft_boundary_residual == boundary_row,
+                    "mount and advance never modify shared source or persist either private tokenN");
+            const int32_t next = row(1, token_n, 3);
+            require(owner.first_token(mounted, next, verifier.final_R(0), error) &&
+                    draft.slot_cells(1) == 4 && owner.finish(1, error),
+                    "catchup-completed source continues normal verifier/first-token lifecycle");
+        }
+        require(same(ambient, fingerprint(main, draft.kv_state(), 2)) && owner.release_resources(error),
+                "shared catchup preserves ambient owner and releases all drained resources");
         std::printf("PACKED_RESIDENT_CHECKS checks=%d actual_verifier=1 direct_prepare=1 short_mtp=1 "
                     "rewind=1 max_new1=1 cancel_after_issue=1 partial_write=1 external_store_qualified=0 failures=0\n", checks);
         return 0;

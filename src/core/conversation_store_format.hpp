@@ -22,6 +22,8 @@
 
 namespace strata::core::conversation_store_detail {
 
+inline constexpr uint16_t kDraftBoundaryKind = uint16_t(ConversationStoreStreamKind::draft_boundary_residual);
+
 // Reads `count` bytes of one stream at `offset` into `dst`; false with a reason when the range is outside the stream
 // or the source itself fails.  Never allocates and never mutates the image.
 using StreamRead = std::function<bool(uint64_t offset, uint8_t* dst, size_t count, std::string& why)>;
@@ -73,6 +75,10 @@ struct ContainerMeta {
     bool cvec = true;
     std::vector<RecordMeta> checkpoints;
     std::vector<KvMeta> kv;
+    // MAN2 only: observed populated interval, never rounded K/V allocation coverage.
+    int64_t draft_begin = -1, draft_cells = -1;
+    int32_t draft_next_token = -1;
+    uint64_t draft_boundary_bytes = 0;
 };
 
 // One restorable token/image prefix of a whole image tree, with the exact prefix-chain digest that proves a query's
@@ -156,6 +162,7 @@ struct ImageShape {
     uint64_t payload_bytes = 0;
     uint64_t max_stream_bytes = 0;     // the longest single stream: the largest chunk one read can produce
     uint64_t max_record_images = 0;    // the largest image-key list in one record: the PrefixChain's own scratch
+    bool certified = false;           // MAN2 adds explicit metadata to every container
 };
 
 // Counts what image_layout() would build, and refuses exactly what it would refuse (an unrepresentable stage depth,
@@ -218,6 +225,7 @@ struct ManifestShape {
     uint64_t chunks = 0;
     uint64_t objects = 0;
     uint64_t cuts = 0;
+    bool certified = false;
 };
 uint64_t manifest_encoded_size_of(const ManifestShape& shape);
 ManifestShape manifest_shape(const ManifestMeta& meta);

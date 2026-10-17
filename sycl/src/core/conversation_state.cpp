@@ -212,8 +212,12 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
-    bytes = sizeof(ConversationScope);
+    bytes = sizeof(ConversationScope) + SavedConversation::draft_metadata_bytes;
     if (!view_validate(view, ss, g, error)) return false;
+    if (view.exact_cut || view.draft_begin != -1 || view.draft_tokens != -1 ||
+        view.draft_next_token != -1 || view.draft_boundary_residual ||
+        view.draft_boundary_position != -1 || view.draft_boundary_owner || view.draft_owner)
+        return fail(error, "certified draft capture is unsupported on this backend");
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     size_t ids = 0, images = 0, checkpoints = 0, layers = 0, tails = 0, dead = 0, positions = 0;
@@ -351,6 +355,9 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    if (image.draft_begin != -1 || image.draft_cells != -1 || image.draft_next_token != -1 ||
+        !image.draft_boundary_residual.empty())
+        return fail(error, "certified draft restore is unsupported on this backend");
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");

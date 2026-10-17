@@ -5187,6 +5187,10 @@ int main(int argc, char** argv) {
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
+        if (packed_prefill)
+            ram("draft_boundary_capture_host",
+                strata::core::ConversationBuffer(true).allocation_peak(size_t(g.hc * g.n_embd) * sizeof(float)),
+                "one opt-in packed/shared immutable source row; no device arena or default row allocation");
         if (packed_prefill) {
             ram("packed_prefill_owner_canaries_host",
                 byte_mul(stage_count, 4 * strata::core::kOperationCanaryHostBytes),
@@ -11041,7 +11045,7 @@ int main(int argc, char** argv) {
         // here (a checkpoint, a park, the next request and the serial paths all find both stages and the drafter idle).
         // Every window in flight is served to its end (its picks discarded), then both stages and the drafter idle.
         // (--adapt-async: the decode loop then settles the asynchronous tier's round, a_pl_settle, see its end.)
-        auto pl_drain = [&]() {
+        auto pl_drain = [&]() -> bool {
             std::string e2;
             for (int round = 0; round < 10000000; ++round) {
                 bool any = false;
@@ -11050,18 +11054,23 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = stage_ver_p(st, par);
                         if (!v.in_flight()) continue;
                         any = true;
-                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return;
+                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) {
+                            mtp.invalidate_coverage(); err = e2; return false;
+                        }
                         if (v.done(e2)) v.pl_finish(nullptr, e2);
-                        else if (!e2.empty()) return;
+                        if (!e2.empty()) { mtp.invalidate_coverage(); err = e2; return false; }
                     }
                 if (!any) break;
             }
             for (int st = 0; st < n_stages && pipe; ++st) {
                 const strata::core::OnDevice on(stage_ver_p(st, 0).device());
-                cudaStreamSynchronize(stage_ver_p(st, 0).stream());
+                if (cudaStreamSynchronize(stage_ver_p(st, 0).stream()) != cudaSuccess) {
+                    mtp.invalidate_coverage(); err = "pipeline: verifier drain failed"; return false;
+                }
             }
             const strata::core::OnDevice on(mtp.device());
-            cudaStreamSynchronize(mtp.stream());
+            if (!mtp.idle(e2)) { err = e2; return false; }
+            return true;
         };
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
@@ -12160,8 +12169,6 @@ int main(int argc, char** argv) {
             uint64_t owner = kSessionOwner;
             bool continues = true;
             bool shared_prefix = false;
-            int64_t draft_begin = 0;
-            int64_t draft_read_from = 0;
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
@@ -12227,6 +12234,24 @@ int main(int argc, char** argv) {
             const auto* draft_state = source.resident ? source.resident->draft : use_mtp ? &mtp.kv_state() : nullptr;
             const strata::core::QsaState* draft0 = n_st > 0 ? nullptr : draft_state;
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? draft_state : nullptr; };
+            auto certify_capture = [&](strata::core::ConversationView& v, bool owns_draft) {
+                if (!owns_draft || (!packed_prefill && !source.shared_prefix)) return;
+                if (source.resident) {
+                    const auto& retained = *source.resident;
+                    if (retained.draft_begin >= 0 && retained.draft_cells >= retained.draft_begin) {
+                        v.draft_begin = retained.draft_begin; v.draft_tokens = retained.draft_cells;
+                        v.draft_owner = retained.owner.request;
+                        v.draft_next_token = retained.draft_cells == int64_t(v.ids.size())
+                            ? retained.draft_next_token : -1;
+                    }
+                } else mtp.certify_view(v);
+                if (!packed_prefill) {
+                    // Legacy feature-off shared cuts retain only their observed
+                    // sanitizing extent, not new persisted certification/payloads.
+                    v.draft_owner = 0; v.draft_boundary_residual = nullptr;
+                    v.draft_boundary_position = -1; v.draft_boundary_owner = 0;
+                }
+            };
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st,
                 strata::core::ConversationCheckpointRetention::parked_history); // allocation failure leaves checks whole
@@ -12234,10 +12259,9 @@ int main(int argc, char** argv) {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
-                source.shared_prefix, source.shared_prefix && draft0 ? int64_t(live.size()) - 1 : -1,
-                source.shared_prefix && draft0 ? source.draft_begin : 0,
-                source.shared_prefix && draft0 ? source.draft_read_from : 0};
+            strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
+                                                source.shared_prefix};
+            certify_capture(view, draft0 != nullptr);
             auto reuse = source.resident || source.shared_prefix
                 ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
@@ -12248,10 +12272,8 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
-                    source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
-                    source.shared_prefix && draft_of(k) ? source.draft_begin : 0,
-                    source.shared_prefix && draft_of(k) ? source.draft_read_from : 0};
+                strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached, source.shared_prefix};
+                certify_capture(view_k, draft_of(k) != nullptr);
                 size_t b = 0;
                 if (!strata::core::conversation_snapshot_bytes(view_k, session_at(k + 1), g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
@@ -12270,7 +12292,11 @@ int main(int argc, char** argv) {
                         err.clear();
                     }
                 }
-                stage_estimate += b;
+                const size_t inline_stage = sizeof(strata::core::ConversationScope) +
+                    strata::core::SavedConversation::draft_metadata_bytes;
+                const size_t stage_bytes = b - inline_stage + sizeof(strata::core::SavedConversation);
+                if (stage_bytes > SIZE_MAX - stage_estimate) return true;
+                stage_estimate += stage_bytes;
             }
             size_t estimate = 0;
             if (!strata::core::conversation_snapshot_bytes(view, session_at(0), g, draft0, estimate, err)) {
@@ -12285,6 +12311,7 @@ int main(int argc, char** argv) {
                 estimate = fresh_estimate;
                 err.clear();
             }
+            if (stage_estimate > SIZE_MAX - estimate) return true;
             estimate += stage_estimate;
             // Bounded unique-allocation diagnostic scratch coexists with the
             // captured image. Both the cache budget and physical reserve price it.
@@ -12348,14 +12375,13 @@ int main(int argc, char** argv) {
                 std::vector<strata::core::ConversationRetainedPrefix> retained_prefixes;
                 if (!strata::core::conversation_snapshot_save(image, view, session_at(0), g, draft0, err,
                         std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr)) return false;
+                image.stage_images.reserve(n_st);
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
-                        source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
-                        source.shared_prefix && draft_of(k) ? source.draft_begin : 0,
-                        source.shared_prefix && draft_of(k) ? source.draft_read_from : 0};
+                    strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached, source.shared_prefix};
+                    certify_capture(view_k, draft_of(k) != nullptr);
                     strata::core::SavedConversation part;
                     std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
@@ -16383,6 +16409,7 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
+                    if (use_mtp) mtp.restored_snapshot(image, int64_t(image.live.ids.size()));
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
@@ -17227,6 +17254,10 @@ int main(int argc, char** argv) {
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { phase_error("ERR stage sync\n"); return 1; }
                 }
+                if (use_mtp) {
+                    const auto& owner = stages.empty() ? *incoming : incoming->stage_images.back();
+                    mtp.restored_snapshot(owner, direct_cut ? parked.tokens : int64_t(incoming->live.ids.size()));
+                }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
                     const auto& draft_kv = stages.empty() ? incoming->kv.back() : incoming->stage_images.back().kv.back();
@@ -17421,12 +17452,15 @@ int main(int argc, char** argv) {
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
-            if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+            if (use_mtp) mtp.kv_restore(reread_to > 0 ? 0 : resume,
+                                      int32_t(cur[size_t(reread_to > 0 ? 0 : resume)]));
             tr("request", n, geni ? 1 : 0);
             // A shared cut's draft state must be reusable with any suffix. Do not
             // skip prefix rows based on this request's longer private suffix.
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && read_from < req_pin ? req_pin + 1 : n);
+            if (use_mtp) mtp.set_boundary_capture(packed_prefill && req_shared_scope.valid() && read_from < req_pin
+                                                   ? req_pin - 1 : -1);
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -17512,7 +17546,7 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 auto fail = [&](std::string why) -> bool {
-                    pl_drain();
+                    (void) pl_drain();
                     e = why.empty() ? std::string("a pipelined prompt window failed") : why;
                     return false;
                 };
@@ -17566,7 +17600,7 @@ int main(int argc, char** argv) {
                     }
                     if (drive.d.failed) return fail(drive.d.fail ? drive.d.fail : "the expert pool failed");
                 }
-                pl_drain();   // nothing in flight: both stages' commits and the drafter's rows have landed
+                if (!pl_drain()) { e = err; return false; } // validates and commits detached MTP writes
                 pl_mtp_live[0] = pl_mtp_live[1] = false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 if (report_throughput) {
@@ -18364,14 +18398,10 @@ int main(int argc, char** argv) {
                     strata::core::ConversationStoreSelector selector = store_selector_base;
                     selector.scope = req_shared_scope;
                     selector.cvec = want_cvec;
-                    const int64_t draft_begin = use_mtp
-                        ? std::clamp(mtp.first_needed(), int64_t(0), pin_at - 1) : 0;
-                    if (!strata::program::ConversationPublicationQueue::shared_capture_recomputed(
-                            use_mtp, read_from, draft_begin)) {
+                    const auto certified = mtp.completed_coverage();
+                    if (use_mtp && (!certified.known() || certified.cells < pin_at - 1)) {
                         std::fprintf(stderr, "strata serve: conversation store: skip shared prefix publication "
-                                             "(pin=%lld read_from=%lld retained_draft_begin=%lld; "
-                                             "retained draft rows were not recomputed by this request)\n",
-                                     (long long) pin_at, (long long) read_from, (long long) draft_begin);
+                                             "(pin=%lld; no completed contiguous draft interval)\n", (long long) pin_at);
                     } else if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
                             *conversation_store, selector, store_prompt, pin_at, uint32_t(stages.size() + 1))) {
                         std::vector<int32_t> prefix = std::move(store_prompt);
@@ -18385,7 +18415,7 @@ int main(int argc, char** argv) {
                         // Only this drained two-part read seam authorizes shared
                         // capture. Never derive a recurrent cut from later state.
                         if (!park_source({prefix, no_park_images, no_checks, req_shared_scope,
-                                want_cvec, true, nullptr, kSessionOwner, false, true, draft_begin, read_from},
+                                want_cvec, true, nullptr, kSessionOwner, false, true},
                                 0, nullptr, 0)) {
                             phase_error("ERR saving the exact shared prefix: %s\n", err.c_str());
                             return 1;
@@ -19111,7 +19141,7 @@ int main(int argc, char** argv) {
                     if (!last && ajob && !adapt_tick(false)) return die("an adaptive refill failed");
                     if (last) ending = true;
                 }
-                pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
+                if (!pl_drain()) return die(err);
                 strata::core::diag_pipeline_fn().store(nullptr);
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
                 adapt_fence = nullptr;
@@ -19505,6 +19535,15 @@ int main(int argc, char** argv) {
                 live_ok = true;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
+            }
+            if (packed_prefill && use_mtp && live_ok && !cancelled && last_committed_residual) {
+                strata::core::ConversationView tail{live, live_imgs, checks, cvec_cached};
+                mtp.certify_view(tail);
+                if (tail.draft_tokens == int64_t(live.size()) - 1 &&
+                    !mtp.capture_boundary(last_committed_residual, int64_t(live.size()) - 1,
+                                          resident.working().request, err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {

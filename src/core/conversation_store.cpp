@@ -63,6 +63,7 @@ using conversation_store_detail::Digest;
 using conversation_store_detail::digest_nonzero;
 using conversation_store_detail::digest_u64;
 using conversation_store_detail::kAllocSlackBytes;
+using conversation_store_detail::kDraftBoundaryKind;
 using conversation_store_detail::kMapNodeBytes;
 using conversation_store_detail::ManifestMeta;
 using conversation_store_detail::sha256;
@@ -84,6 +85,29 @@ constexpr uint64_t kMaxReclaimPerPass = 65536;
 constexpr uint64_t kTempNameAttempts = 32;
 constexpr uint32_t kDurableWaitMs = 30000;
 constexpr uint64_t kIdlePollMs = 20;
+constexpr char kIssuerEnvelopeTag[8] = {'S', 'T', 'C', 'S', 'K', 'E', 'Y', '2'};
+constexpr size_t kIssuerEnvelopeBytes = 64;
+constexpr uint64_t kDraftCertificationBytes = SavedConversation::draft_metadata_bytes;
+// Envelope/checksum preparation, its temporary bookkeeping, and the SHA provider's existing conservative bound.
+constexpr uint64_t kReaderFloorWorkspace = kIssuerEnvelopeBytes + 2 * kAllocSlackBytes +
+                                           conversation_store_detail::kChainBytesPerImageKey + 1024;
+
+// Existing authority, not a second catalog: legacy readers require exactly 32 bytes and stop in open_root().
+// Original key bytes and all derived authorization identities remain unchanged.
+std::array<uint8_t, kIssuerEnvelopeBytes> issuer_envelope(const std::array<uint8_t, 32>& key) {
+    std::array<uint8_t, kIssuerEnvelopeBytes> out{};
+    std::memcpy(out.data(), kIssuerEnvelopeTag, 8);
+    out[8] = 2;  // little-endian envelope version
+    out[12] = 2; // little-endian minimum reader
+    std::memcpy(out.data() + 16, key.data(), key.size());
+    const auto checksum = sha256(out.data(), 48);
+    std::memcpy(out.data() + 48, checksum.data(), 16);
+    return out;
+}
+
+bool supported_manifest_tag(const uint8_t* bytes, size_t size) {
+    return size < 8 || std::memcmp(bytes, "STCSMAN1", 8) == 0 || std::memcmp(bytes, "STCSMAN2", 8) == 0;
+}
 
 uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 uint64_t sat_mul(uint64_t a, uint64_t b) { return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
@@ -775,6 +799,7 @@ struct ConversationStore::Impl {
     std::condition_variable cv_durable;
     std::condition_variable cv_shutdown;
     std::array<uint8_t, 32> issuer_key{};
+    bool certified_reader_floor = false; // sticky existing issuer authority, never reset by catalog transactions
     Catalog catalog;
     uint64_t catalog_charge = 0;
     uint64_t epoch = 0;
@@ -1135,6 +1160,7 @@ struct ConversationStore::Impl {
     // Reads and decodes the durable catalog and decides this domain's epoch.  It may not write anything: the first
     // catalog transaction happens only once the whole physical ledger has been accounted (see reconcile()).
     bool read_catalog(std::string& why);
+    bool ensure_certified_reader_floor(std::string& why);
     bool reconcile(std::string& why);
     bool write_intent(bool present, std::string& why);
 };
@@ -1356,11 +1382,21 @@ bool ConversationStore::Impl::open_root(std::string& why) {
     if (::fstatat(dirs.root, "issuer.key", &info, AT_SYMLINK_NOFOLLOW) == 0) {
         std::vector<uint8_t> key;
         if (!read_file(dirs.root, "issuer.key", 64, key, why)) return false;
-        if (key.size() != 32) {
-            why = "the issuer key file is not 32 bytes";
-            return false;
+        if (key.size() == issuer_key.size()) {
+            std::memcpy(issuer_key.data(), key.data(), issuer_key.size());
+        } else {
+            std::array<uint8_t, 32> original{};
+            if (key.size() == kIssuerEnvelopeBytes)
+                std::memcpy(original.data(), key.data() + 16, original.size());
+            const auto recognized = issuer_envelope(original);
+            if (key.size() != recognized.size() ||
+                std::memcmp(key.data(), recognized.data(), recognized.size()) != 0) {
+                why = "unsupported or malformed issuer-key minimum-reader envelope";
+                return false;
+            }
+            issuer_key = original;
+            certified_reader_floor = true;
         }
-        std::memcpy(issuer_key.data(), key.data(), key.size());
         return true;
     }
     if (errno != ENOENT) {
@@ -1380,6 +1416,119 @@ bool ConversationStore::Impl::open_root(std::string& why) {
     if (!write_new_file(dirs.root, "issuer.key", fresh, sizeof fresh, why)) return false;
     if (!fsync_dir(dirs.root, "the store root", why)) return false;
     std::memcpy(issuer_key.data(), fresh, sizeof fresh);
+    return true;
+}
+
+bool ConversationStore::Impl::ensure_certified_reader_floor(std::string& why) {
+    // Everything that can allocate is prepared before the reservation is taken: a failure here must not leave the
+    // ledger charged for a temporary that was never created.
+    const auto envelope = issuer_envelope(issuer_key);
+    std::string temp = temp_name();
+    uint64_t reservation = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (certified_reader_floor) return true;
+        if (faulted || !lock_owned) {
+            why = "the minimum-reader floor cannot change without healthy authority ownership";
+            return false;
+        }
+        // A floor transition never evicts histories to pay for itself. Include two future catalog copies.
+        sample_free_locked();
+        const uint64_t copy = allocated_charge(kIssuerEnvelopeBytes);
+        const uint64_t reserve = sat_mul(catalog_next_bound_locked(catalog), 2);
+        if (sat_add(charged, sat_add(copy, reserve)) > options.quota_bytes ||
+            copy > free_sample || free_sample - copy < options.min_free_bytes) {
+            why = "the issuer minimum-reader envelope does not fit the shared quota or filesystem floor";
+            return false;
+        }
+        charged = sat_add(charged, copy);
+        reservation = copy;
+    }
+    bool written = false;
+    bool own_temp = false;
+    bool renamed = false;
+    bool reservation_held = true;
+    // Releases the temporary's charge exactly once, whichever pre-rename path ends the attempt.
+    const auto release_reservation = [&] {
+        if (!reservation_held) return;
+        reservation_held = false;
+        std::lock_guard<std::mutex> guard(mutex);
+        charged -= std::min(charged, reservation);
+    };
+    try {
+        for (uint32_t attempt = 0; attempt < kTempNameAttempts; ++attempt) {
+            if (take_fault("reader-floor-write")) { why = "injected reader-floor write failure"; break; }
+            if (write_new_file(dirs.tmp, temp, envelope.data(), envelope.size(), why)) {
+                written = own_temp = true;
+                break;
+            }
+            if (errno != EEXIST) { own_temp = true; break; }
+            temp = temp_name();
+        }
+        if (written && !take_fault("reader-floor-rename")) {
+            if (::renameat(dirs.tmp, temp.c_str(), dirs.root, "issuer.key") == 0) renamed = true;
+            else why = std::string("cannot replace the issuer authority: ") + std::strerror(errno);
+        }
+        if (!renamed) {
+            if (why.empty()) why = "the issuer minimum-reader envelope was not renamed";
+            if (!own_temp) {
+                release_reservation();
+                return false;
+            }
+            PendingFile orphan;
+            orphan.where = Where::tmp;
+            orphan.name = std::move(temp);
+            orphan.charge = reservation;
+            std::vector<PendingFile> files;
+            files.push_back(std::move(orphan));
+            // The queue owns both the charge and the name from here; discard_files() credits what it removes.
+            own_temp = false;
+            reservation_held = false;
+            discard_files(std::move(files));
+            return false;
+        }
+    } catch (...) {
+        // A failed allocation before the rename leaves a temporary behind: remove it by design, so the ledger
+        // never keeps a charge for bytes this attempt no longer owns.
+        if (own_temp) {
+            own_temp = false;
+            if (::unlinkat(dirs.tmp, temp.c_str(), 0) == 0 || errno == ENOENT) release_reservation();
+        } else {
+            release_reservation();
+        }
+        throw;
+    }
+    // The renamed file is now the authority: its charge is real, not a reservation for a temporary.
+    reservation_held = false;
+    // Set the non-allocating safety latch before constructing diagnostics. Even an exception from fsync's
+    // error formatting must stop writer_body() from treating this renamed authority as an ordinary failed job.
+    const auto uncertain = [&] {
+        std::lock_guard<std::mutex> guard(mutex);
+        faulted = true;
+        promote_pending = false;
+        cv_ready.notify_all();
+        cv_publish.notify_all();
+        cv_work.notify_all();
+    };
+    try {
+        if (take_fault("reader-floor-allocate")) throw std::bad_alloc();
+        // Mandatory regardless of object-directory fsync batching. No MAN2 payload has been staged yet.
+        if (take_fault("reader-floor-sync") || !fsync_dir(dirs.root, "the issuer authority root", why) ||
+            take_fault("reader-floor-tmp-sync") || !fsync_dir(dirs.tmp, "the issuer authority temporary directory", why)) {
+            uncertain(); // no deletion, publication, or credit until restart
+            why = "the issuer minimum-reader floor rename has uncertain durability";
+            std::lock_guard<std::mutex> guard(mutex);
+            fault_reason = why;
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        certified_reader_floor = true;
+        // Only now is the old key's replaced inode durably gone.
+        charged -= std::min(charged, allocated_charge(issuer_key.size()));
+    } catch (...) {
+        uncertain();
+        throw;
+    }
     return true;
 }
 
@@ -1442,6 +1591,15 @@ bool ConversationStore::Impl::read_catalog(std::string& why) {
         catalog_charge = allocated_charge(uint64_t(catalog_info.st_size > 0 ? catalog_info.st_size : 0));
         charged += catalog_charge;
         std::vector<uint8_t> bytes;
+        // Unknown versions must stop before reconcile() can delete a single file.
+        std::array<char, 8> tag{};
+        const int fd = ::openat(dirs.root, "catalog", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        const ssize_t got = fd >= 0 ? ::pread(fd, tag.data(), tag.size(), 0) : -1;
+        if (fd >= 0) ::close(fd);
+        if (got < 0 || (got == ssize_t(tag.size()) && std::memcmp(tag.data(), "STCSCAT1", 8) != 0)) {
+            why = "the catalog requires an unsupported reader version";
+            return false;
+        }
         if (!read_file(dirs.root, "catalog", limits.max_manifest_bytes, bytes, detail) ||
             !conversation_store_detail::catalog_decode(bytes.data(), bytes.size(), loaded, detail) ||
             !(loaded.issuer_key_digest == sha256(issuer_key.data(), issuer_key.size()))) {
@@ -1486,8 +1644,33 @@ bool ConversationStore::Impl::read_catalog(std::string& why) {
     return true;
 }
 
+// Read only the bounded schema header before recovery performs any cleanup.
+// Unsupported manifests are not corrupt histories and may belong to a different profile.
+static bool manifest_versions_supported(int directory, const Catalog& catalog, bool floor, std::string& why) {
+    for (const auto& head : catalog.heads) {
+        const std::string name = sha256_hex(head.manifest_id);
+        const int fd = ::openat(directory, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;
+            why = "cannot inspect a manifest's reader version";
+            return false;
+        }
+        std::array<char, 8> tag{};
+        const ssize_t got = ::pread(fd, tag.data(), tag.size(), 0);
+        ::close(fd);
+        if (got < 0 || (got == ssize_t(tag.size()) &&
+            (!supported_manifest_tag(reinterpret_cast<const uint8_t*>(tag.data()), tag.size()) ||
+             (tag[7] == '2' && !floor)))) {
+            why = "a manifest requires an unsupported or unestablished minimum reader";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ConversationStore::Impl::reconcile(std::string& why) {
     StoreReadTraceBatch recovery_trace;
+    if (!manifest_versions_supported(dirs.manifests, catalog, certified_reader_floor, why)) return false;
     recovery_trace.io_allowed = false; // snapshots are not removals until the startup catalog commits
     const auto retiring_trace = [&](const CatalogHead& head, const char* reason) {
         if (read_timing) recovery_trace.add(trace_head_locked(head, "retired", reason));
@@ -1997,6 +2180,10 @@ ConversationStore::Impl::ManifestRead ConversationStore::Impl::load_manifest_of(
         std::lock_guard<std::mutex> guard(mutex);
         counters.bytes_read += raw.size();
     }
+    if (!supported_manifest_tag(raw.data(), raw.size())) {
+        why = "the manifest requires an unsupported reader version";
+        return ManifestRead::unreadable;
+    }
     // Decoded under the *retention* figures rather than this run's admitted ones: this is where the soundness of a
     // record this run did not write is decided - for recovery, for the shared physical ledger and for the publication
     // planner - and a record another profile captured is not corrupt merely because this run could not have created
@@ -2036,7 +2223,7 @@ DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePubl
             prep.decoded = sat_add(prep.decoded, conversation_store_detail::manifest_read_workspace_bound(raw));
         bool donor_counted = false;
         for (const auto& entry : request.reuse) {
-            if (entry.head_id != head.head_id) continue;
+            if (entry.stream.kind == kDraftBoundaryKind || entry.head_id != head.head_id) continue;
             donor_counted = true;
             break;
         }
@@ -2051,7 +2238,7 @@ DonorPrep ConversationStore::Impl::donor_prep_locked(const ConversationStorePubl
         uint64_t heaviest = 0;
         for (size_t i = 0; i < request.reuse.size(); ++i) {
             const auto& entry = request.reuse[i];
-            if (entry.head_id != head.head_id) continue;
+            if (entry.stream.kind == kDraftBoundaryKind || entry.head_id != head.head_id) continue;
             uint64_t named = 1;
             for (size_t j = 0; j < i; ++j) {
                 const auto& earlier = request.reuse[j];
@@ -2075,6 +2262,7 @@ WriterWorkspace ConversationStore::Impl::writer_workspace_locked(const Conversat
     work.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
                                 kJobFixedOverhead);
     work.layout = conversation_store_detail::image_layout_workspace(shape);
+    if (shape.certified) work.layout = sat_add(work.layout, kReaderFloorWorkspace);
     const DonorPrep prep = donor_prep_locked(request);
     work.donor_decoded = prep.decoded;
     const uint64_t chunk_limit = std::max<uint64_t>(4096, options.chunk_bytes);
@@ -2088,7 +2276,7 @@ WriterWorkspace ConversationStore::Impl::writer_workspace_locked(const Conversat
     work.buffer = std::min(chunk_limit, shape.max_stream_bytes);
     const auto manifest_shape = conversation_store_detail::ManifestShape{
         shape.containers, shape.records - shape.containers, shape.kv_layers, shape.streams,
-        chunks, chunks, shape.cuts};
+        chunks, chunks, shape.cuts, shape.certified};
     work.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_shape);
     work.catalog_apply = catalog_apply_bytes_locked(chunks);
     return work;
@@ -3330,7 +3518,8 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
     if (sat_add(prepared - std::min(prepared, job->prepared_bytes), decode_workspace) > options.metadata_bytes)
         return false;
     const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
-                          job->prep_bytes + kReadSlabBytes + kReadFixedOverhead;
+                          job->prep_bytes + kReadSlabBytes + kReadFixedOverhead +
+                          uint64_t(best.stages) * kDraftCertificationBytes;
     if ((ram_budget != 0 && peak > ram_budget) || (ram_budget == 0 && job->image)) return false;
     // Secure the replacement's queue position before releasing the old image or its leases.
     // Reordering an existing descriptor needs no allocation; a failed new slot leaves it ready.
@@ -3631,7 +3820,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         return false;
     }
     const uint64_t peak = uint64_t(best.payload_bytes) + uint64_t(best.payload_bytes) / 4 + decode_workspace +
-                          own_prep + kReadSlabBytes + kReadFixedOverhead;
+                          own_prep + kReadSlabBytes + kReadFixedOverhead +
+                          uint64_t(best.stages) * kDraftCertificationBytes;
     if ((demand && ram_budget == 0) || (ram_budget != 0 && peak > ram_budget)) {
         counters.refused_budget++;
         why = "the read's peak does not fit the published RAM allowance";
@@ -3797,6 +3987,10 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         if (read_timing) job->trace_bytes_read += raw.size();
     }
     conversation_store_detail::ManifestMeta meta;
+    if (!supported_manifest_tag(raw.data(), raw.size())) {
+        stop_with(ConversationStoreReadStatus::failed, "the manifest requires an unsupported reader version");
+        return;
+    }
     // One decode, under the *retention* figures: they are the widest set that still describes what a sound record is
     // (the manifest ceiling is this run's configured one and every count is still bounded by the bytes the file really
     // holds), so this decides whether the record exists at all.  A record another profile captured is not corrupt
@@ -3866,7 +4060,8 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     const uint64_t scaffolding = uint64_t(meta.streams.size()) *
                                      (sizeof(conversation_store_detail::RestoreTarget) + 64) +
                                  uint64_t(meta.containers.size()) * sizeof(ContainerMeta) +
-                                 uint64_t(meta.objects.size()) * kObjectBytesEstimate;
+                                 uint64_t(meta.objects.size()) * kObjectBytesEstimate +
+                                 uint64_t(meta.stages) * kDraftCertificationBytes;
     const uint64_t needed = uint64_t(meta.payload_bytes) + uint64_t(meta.payload_bytes) / 4 + job->prepared_bytes +
                             job->prep_bytes + kReadSlabBytes + kReadFixedOverhead + scaffolding;
     {
@@ -4329,7 +4524,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         // (including this publication's own quota evictions) until it has committed.
         if (request.supersedes) eviction_excluded.insert(request.supersedes);
         for (const auto& entry : request.reuse)
-            if (entry.head_id) eviction_excluded.insert(entry.head_id);
+            if (entry.stream.kind != kDraftBoundaryKind && entry.head_id) eviction_excluded.insert(entry.head_id);
     }
     if (take_fault("layout")) {
         fail(ConversationStorePublishStatus::failed, "injected fault: layout");
@@ -4339,6 +4534,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     std::string why;
     if (!conversation_store_detail::image_layout(image, bucket, limits, layout, why)) {
         fail(ConversationStorePublishStatus::refused_limits, why);
+        return;
+    }
+    if (job->shape.certified && !ensure_certified_reader_floor(why)) {
+        fail(ConversationStorePublishStatus::failed, why);
         return;
     }
     // The predecessor (for the replacement predicate) and each reuse donor are read from their own manifests, and a
@@ -4354,7 +4553,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     }
     std::map<uint64_t, conversation_store_detail::ManifestMeta> donors;
     for (const auto& entry : request.reuse) {
-        if (!entry.head_id || donors.count(entry.head_id)) continue;
+        if (entry.stream.kind == kDraftBoundaryKind || !entry.head_id || donors.count(entry.head_id)) continue;
         conversation_store_detail::ManifestMeta donor;
         std::string detail;
         if (load_manifest_of(entry.head_id, epoch_now, donor, detail) == ManifestRead::loaded &&
@@ -4382,7 +4581,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         // The grid this stream chunks into, plus every chunk a decoded donor's own interval could contribute.
         uint64_t count = conversation_store_detail::stream_chunk_count(bytes, element, chunk_limit);
         for (const auto& entry : request.reuse) {
-            if (!(entry.stream == id)) continue;
+            if (id.kind == kDraftBoundaryKind || !(entry.stream == id)) continue;
             const auto donor = donors.find(entry.head_id);
             if (donor == donors.end()) continue;
             for (const auto& candidate : donor->second.streams)
@@ -4412,12 +4611,13 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     actual.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
                                   kJobFixedOverhead);
     actual.layout = conversation_store_detail::image_layout_workspace(job->shape);
+    if (job->shape.certified) actual.layout = sat_add(actual.layout, kReaderFloorWorkspace);
     actual.donor_decoded = retained_donors;
     actual.chunks = peak_chunks;
     actual.buffer = chunk_buffer;
     const auto manifest_counts = conversation_store_detail::ManifestShape{
         job->shape.containers, job->shape.records - job->shape.containers, job->shape.kv_layers,
-        job->shape.streams, peak_chunks, peak_chunks, job->shape.cuts};
+        job->shape.streams, peak_chunks, peak_chunks, job->shape.cuts, job->shape.certified};
     actual.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_counts);
     actual.catalog_apply = job->catalog_apply_bytes;
     if (!reserve_writer_workspace(job, actual.peak(), why)) {
@@ -4574,7 +4774,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         // Reuse intervals, placed by their own offset; every byte they do not cover is a gap that is chunked.
         std::vector<const ConversationStoreReuse*> intervals;
         for (const auto& entry : request.reuse)
-            if (entry.stream == id) intervals.push_back(&entry);
+            if (id.kind != kDraftBoundaryKind && entry.stream == id) intervals.push_back(&entry);
         std::stable_sort(intervals.begin(), intervals.end(),
                          [](const ConversationStoreReuse* a, const ConversationStoreReuse* b) {
                              return a->offset < b->offset;

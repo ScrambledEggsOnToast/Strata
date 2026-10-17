@@ -600,6 +600,9 @@ void check_layout();
 void check_identity();
 void check_manifest();
 void check_round_trip();
+void check_draft_certification_codec();
+void check_draft_certification_store();
+void check_draft_reader_floor_failures();
 void check_profile_recovery();
 void check_full_catalog_profile_restart();
 void check_profile_switch_retention_disposition();
@@ -697,6 +700,13 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_DRAFT_CERTIFICATION_ONLY")) {
+        check_draft_certification_codec();
+        check_draft_certification_store();
+        check_draft_reader_floor_failures();
+        std::printf("conversation_store_test draft certification: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_RETENTION_ONLY")) {
         check_profile_switch_retention_disposition();
         check_retirement_receipts();
@@ -768,6 +778,9 @@ int main() {
     check_identity();
     check_manifest();
     check_round_trip();
+    check_draft_certification_codec();
+    check_draft_certification_store();
+    check_draft_reader_floor_failures();
     check_profile_recovery();
     check_full_catalog_profile_restart();
     check_profile_switch_retention_disposition();
@@ -8331,6 +8344,486 @@ void check_bounded_candidate_rejections() {
           "the receipt truthfully counts the rest of the twenty-four rejected cuts");
     check(read_trace(records, "settled", 120, "no_io") && read_trace(records, "adopt", 120) &&
               !read_trace(records, "trace_overflow", 0), "candidate fanout cannot displace ownership or settlement records");
+}
+
+// The dimensions are intentionally small; these are storage/authority proofs, not inference proofs.
+SavedConversation certified_fixture(bool shared, bool split = false) {
+    auto image = split ? split_fixture(991, 64, 2) : fixture(991, 64, 1);
+    image.geometry[0] = 8;
+    image.geometry[14] = 2;
+    for (auto& stage : image.stage_images) stage.geometry = image.geometry;
+    auto& owner = split ? image.stage_images.back() : image;
+    if (split) owner.kv.push_back(owner.kv.back());
+    owner.draft_begin = 3;
+    owner.draft_cells = shared ? 63 : 64;
+    owner.draft_next_token = shared ? -1 : 731;
+    if (shared) owner.draft_boundary_residual.resize(64, 0x5a);
+    if (shared) {
+        image.scope = ConversationScope{bytes_from("certified-shared-prefix")};
+        for (auto& stage : image.stage_images) stage.scope = image.scope;
+    }
+    return image;
+}
+
+std::vector<uint8_t> fixture_file_bytes(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { check(false, "the fixture authority can be read"); return {}; }
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || info.st_size < 0) { ::close(fd); return {}; }
+    std::vector<uint8_t> bytes(size_t(info.st_size), 0);
+    size_t at = 0;
+    while (at < bytes.size()) {
+        const ssize_t n = ::read(fd, bytes.data() + at, bytes.size() - at);
+        if (n <= 0) break;
+        at += size_t(n);
+    }
+    ::close(fd);
+    check_eq(at, bytes.size(), "the fixture reads every authority byte");
+    return bytes;
+}
+
+bool fixture_replace_file(const std::string& path, const std::vector<uint8_t>& bytes) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    if (fd < 0) return false;
+    size_t at = 0;
+    while (at < bytes.size()) {
+        const ssize_t n = ::write(fd, bytes.data() + at, bytes.size() - at);
+        if (n <= 0) break;
+        at += size_t(n);
+    }
+    const bool flushed = ::fsync(fd) == 0;
+    const bool closed = ::close(fd) == 0;
+    return at == bytes.size() && flushed && closed;
+}
+
+std::map<std::string, std::string> fixture_contents(const std::string& root) {
+    std::map<std::string, std::string> out;
+    for (const auto& path : file_inventory(root)) out.emplace(path, file_digest(root + path));
+    return out;
+}
+
+conversation_store_detail::ManifestMeta fixture_manifest(
+    const conversation_store_detail::ImageLayout& layout) {
+    conversation_store_detail::ManifestMeta meta;
+    meta.stages = layout.stages;
+    meta.containers = layout.containers;
+    meta.payload_bytes = layout.payload_bytes;
+    meta.cuts = layout.cuts;
+    std::map<Digest, uint64_t> objects;
+    for (const auto& source : layout.streams) {
+        conversation_store_detail::StreamRecord stream;
+        stream.id = source.info.id;
+        stream.bytes = source.info.bytes;
+        if (stream.bytes) {
+            std::vector<uint8_t> bytes(size_t(stream.bytes));
+            std::string why;
+            check(source.read(0, bytes.data(), bytes.size(), why), "the real codec fixture stream reads");
+            const auto object = sha256(bytes.data(), bytes.size());
+            stream.chunks.push_back({0, uint32_t(bytes.size()), object});
+            objects.emplace(object, bytes.size());
+        }
+        meta.streams.push_back(std::move(stream));
+    }
+    meta.objects.assign(objects.begin(), objects.end());
+    return meta;
+}
+
+void check_draft_certification_codec() {
+    using namespace conversation_store_detail;
+    const auto limits = unconstrained_limits();
+    std::string why;
+    for (int variant = 0; variant < 4; ++variant) {
+        const auto image = variant == 0 ? fixture(991, 64, 1) :
+                           certified_fixture(variant >= 2, variant == 3);
+        ImageLayout layout;
+        ImageShape shape;
+        check(image_shape(image, limits, shape, why) && image_layout(image, Digest{}, limits, layout, why),
+              "legacy, private, shared and split certified images have real layouts");
+        check_eq(shape.payload_bytes, layout.payload_bytes, "allocation-free admission counts every residual byte");
+        check_eq(shape.streams, layout.streams.size(), "allocation-free admission counts the explicit residual stream");
+        auto meta = fixture_manifest(layout);
+        const auto encoded = manifest_encode(meta);
+        check_eq(encoded.size(), manifest_encoded_size(meta), "MAN1 and MAN2 exact manifest charges agree");
+        check(encoded.size() >= 8 && encoded[7] == (variant == 0 ? '1' : '2'),
+              "uncertified captures retain MAN1; certification uses explicit MAN2");
+        ManifestMeta decoded;
+        check(manifest_decode(encoded.data(), encoded.size(), limits, decoded, why), "certification metadata decodes");
+        SavedConversation restored;
+        std::vector<RestoreTarget> targets;
+        check(restore_prepare(decoded, limits, restored, targets, why), "certified restore binds real final buffers");
+        if (targets.size() != layout.streams.size()) { check(false, "every restore target exists"); continue; }
+        for (size_t i = 0; i < targets.size(); ++i) {
+            std::vector<uint8_t> bytes(size_t(layout.streams[i].info.bytes));
+            if (!bytes.empty())
+                check(layout.streams[i].read(0, bytes.data(), bytes.size(), why) &&
+                          targets[i].write(0, bytes.data(), bytes.size(), why),
+                      "certified codec roundtrip transfers actual payload bytes");
+        }
+        restore_finish(restored);
+        check(images_equal(image, restored, why), "the exact interval, private token and residual bytes survive");
+        if (variant == 0)
+            check(restored.draft_begin == -1 && restored.draft_cells == -1 && restored.draft_next_token == -1,
+                  "legacy draft allocation never becomes inferred certification");
+        if (variant != 2) continue;
+        ConversationStoreReadProgress progress;
+        check(restore_progress_totals(decoded, encoded.size(), progress, why),
+              "certified progress includes the validated residual stream");
+        const auto& draft = image.kv.back();
+        const uint64_t draft_bytes = image.draft_boundary_residual.size() + draft.k.size() + draft.v.size() +
+                                     draft.k_scale.size() + draft.v_scale.size() + draft.pooled.size();
+        check_eq(progress.components[size_t(ConversationStoreReadComponent::draft)].total, draft_bytes,
+                 "the boundary is charged to draft, not main K/V or metadata");
+        check(!conversation_store_kv_kind(uint16_t(ConversationStoreStreamKind::draft_boundary_residual)),
+              "the residual identity cannot be misclassified as a K/V donor kind");
+        for (int damage = 0; damage < 12; ++damage) {
+            auto bad = meta;
+            auto& c = bad.containers.front();
+            switch (damage) {
+                case 0: c.draft_begin = -1; break;
+                case 1: c.draft_cells = -2; break;
+                case 2: c.draft_begin = c.draft_cells + 1; break;
+                case 3: c.draft_cells = 65; break;
+                case 4: c.draft_next_token = 12; break;
+                case 5: c.draft_cells = 64; c.draft_boundary_bytes = 0; break;
+                case 6: c.kv.back().cells = 62; break;
+                case 7: ++c.draft_boundary_bytes; break;
+                case 8: c.geometry[0] = INT64_MAX; c.geometry[14] = INT64_MAX; break;
+                case 9: c.kv.pop_back(); break;
+                case 10: c.layer_hi = 4; break;
+                default: bad.streams.push_back(bad.streams[7]); break;
+            }
+            const auto malformed = manifest_encode(bad);
+            check(!manifest_decode(malformed.data(), malformed.size(), limits, decoded, why),
+                  "checksummed malformed certification is rejected before payload transfer");
+            SavedConversation untouched;
+            untouched.live.ids.push_back(777);
+            std::vector<RestoreTarget> unbound(1);
+            unbound[0].bytes = 123;
+            check(!restore_prepare(bad, limits, untouched, unbound, why) &&
+                      untouched.live.ids == std::vector<int32_t>{777} && unbound.size() == 1 && unbound[0].bytes == 123,
+                  "malformed certification cannot replace the destination or bind transfer targets");
+        }
+    }
+    auto boundary = certified_fixture(true);
+    boundary.geometry[0] = 512;
+    boundary.draft_boundary_residual.resize(4096, 0x5a);
+    ImageShape counted;
+    check(image_shape(boundary, limits, counted, why), "a boundary larger than every other stream is representable");
+    auto bounded = limits;
+    bounded.max_image_bytes = counted.payload_bytes;
+    bounded.max_state_bytes = bounded.max_stream_bytes = 4096;
+    check(image_shape(boundary, bounded, counted, why), "the exact payload and residual budgets admit");
+    --bounded.max_image_bytes;
+    check(!image_shape(boundary, bounded, counted, why), "one payload byte below the boundary refuses");
+    bounded = limits;
+    bounded.max_stream_bytes = 4095;
+    check(!image_shape(boundary, bounded, counted, why), "the residual spends the stream ceiling");
+    bounded = limits;
+    bounded.max_state_bytes = 4095;
+    check(!image_shape(boundary, bounded, counted, why), "the residual spends the state ceiling");
+    auto invalid = boundary;
+    invalid.draft_begin = -1;
+    check(!image_shape(invalid, limits, counted, why), "malformed certification refuses allocation-free admission");
+    ImageLayout boundary_layout;
+    check(image_layout(boundary, Digest{}, limits, boundary_layout, why), "the bounded image has a canonical layout");
+    const auto boundary_meta = fixture_manifest(boundary_layout);
+    const auto encoded = manifest_encode(boundary_meta);
+    auto manifest_limit = limits;
+    manifest_limit.max_manifest_bytes = encoded.size();
+    ManifestMeta decoded;
+    check(manifest_decode(encoded.data(), encoded.size(), manifest_limit, decoded, why),
+          "the exact MAN2 metadata ceiling admits");
+    --manifest_limit.max_manifest_bytes;
+    check(!manifest_decode(encoded.data(), encoded.size(), manifest_limit, decoded, why),
+          "one manifest byte below refuses before payload binding");
+    check(manifest_decode(encoded.data(), encoded.size(), retention_limits(bounded), decoded, why) &&
+              !manifest_within_limits(decoded, bounded, why),
+          "a residual too large for this profile is retained as capacity refusal, not corruption");
+    const auto fresh = [](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = request.generation = 1;
+        return request;
+    };
+    const auto options = options_for("", uint64_t(1) << 30, 0);
+    const uint64_t floor = publication_admission_floor(options, boundary, fresh, uint64_t(16) << 20);
+    check(publication_is_admitted(options, boundary, fresh, floor) &&
+              !publication_is_admitted(options, boundary, fresh, floor - 1),
+          "real certified publication agrees at its one-byte RAM admission boundary");
+    auto no_boundary = boundary;
+    no_boundary.draft_boundary_residual = ConversationBuffer{};
+    const uint64_t smaller = publication_admission_floor(options, no_boundary, fresh, uint64_t(16) << 20);
+    check(floor > smaller, "residual payload, stream, objects and manifest/workspace are not free at admission");
+}
+
+void check_draft_certification_store() {
+    for (bool split : {false, true}) {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        auto legacy = fixture(993, 64, 1);
+        auto image = certified_fixture(true, split);
+        auto changed = image;
+        std::array<uint8_t, 32> secret{};
+        uint64_t charged = 0;
+        {
+            ConversationStore store(options);
+            secret = store.issuer_key();
+            ConversationStorePublishResult old, certified;
+            check(publish_and_wait(store, legacy, 1, 1, old), "legacy history is durably retained before activation");
+            check_eq(fixture_file_bytes(root.path + "/issuer.key").size(), 32,
+                     "default-off capture does not activate a reader floor");
+            const uint64_t prior_epoch = store.epoch();
+            const auto prior_catalog_bytes = fixture_file_bytes(root.path + "/catalog");
+            conversation_store_detail::Catalog prior_catalog;
+            std::string identity_why;
+            check(conversation_store_detail::catalog_decode(prior_catalog_bytes.data(), prior_catalog_bytes.size(),
+                                                             prior_catalog, identity_why),
+                  "the pre-activation catalog authority decodes");
+            check(publish_and_wait(store, image, 2, 2, certified) &&
+                      certified.status == ConversationStorePublishStatus::stored,
+                  "certified publication establishes the existing authority floor and commits MAN2");
+            const auto envelope = fixture_file_bytes(root.path + "/issuer.key");
+            check_eq(envelope.size(), 64, "activation versions the existing issuer authority");
+            check(store.issuer_key() == secret && envelope.size() == 64 &&
+                      std::equal(secret.begin(), secret.end(), envelope.begin() + 16),
+                  "the original secret and every frontend authorization identity are preserved");
+            check_eq(store.counters().heads, 2, "activation preserves the legacy history beside the certified one");
+            const auto activated_catalog_bytes = fixture_file_bytes(root.path + "/catalog");
+            conversation_store_detail::Catalog activated_catalog;
+            check(conversation_store_detail::catalog_decode(activated_catalog_bytes.data(), activated_catalog_bytes.size(),
+                                                             activated_catalog, identity_why) &&
+                      activated_catalog.issuer_key_digest == prior_catalog.issuer_key_digest &&
+                      activated_catalog.issuer_key_digest == sha256(secret.data(), secret.size()) &&
+                      store.epoch() == prior_epoch,
+                  "activation preserves catalog issuer digest and the domain epoch");
+            for (const auto& head : activated_catalog.heads)
+                if (head.head_id == old.head_id)
+                    check(head.generation == 1 && head.epoch == prior_epoch,
+                          "activation preserves the existing history's generation and epoch");
+            // A caller cannot turn a residual into a K/V donor interval, even with a valid donor head.
+            auto& owner = split ? changed.stage_images.back() : changed;
+            owner.draft_boundary_residual.resize(64, 0x6b);
+            owner.draft_boundary_residual.visit(0, 64, [](uint8_t* p, size_t n, size_t) {
+                std::memset(p, 0x6b, n); return true;
+            });
+            ConversationStorePublish request;
+            request.request_id = 3;
+            request.generation = 3;
+            ConversationStoreReuse reuse;
+            reuse.head_id = certified.head_id;
+            reuse.stream = {uint32_t(split ? 1 : 0), uint16_t(ConversationStoreStreamKind::draft_boundary_residual), 0, 0};
+            reuse.bytes = 64;
+            request.reuse.push_back(reuse);
+            std::string why;
+            check(store.publish(std::make_shared<SavedConversation>(changed), request, why) == kAccepted,
+                  "the residual donor challenge is admitted");
+            ConversationStorePublishResult result;
+            check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored &&
+                      result.reused_bytes == 0, "residual bytes cannot be adopted from an explicit donor interval");
+            store.publish_read_allowance(1);
+            const uint64_t read_before = store.counters().bytes_read;
+            check(!store.demand(query_of(changed, 40, 1), why) && store.counters().bytes_read == read_before,
+                  "an insufficient readpeak refuses before manifest or residual transfer");
+            store.publish_read_allowance(uint64_t(64) << 20);
+            check(store.demand(query_of(changed, 41, 1), why), "the charged certified demand admits");
+            ConversationStoreRead read;
+            check(store.wait_ready(41, 1, read, 5000) && read.status == ConversationStoreReadStatus::ready &&
+                      read.image && images_equal(*read.image, changed, why),
+                  "the destination reads its own changed residual, never the donor's row");
+            check(!read.image || store.ram_lease_bytes() >= read.image->bytes(),
+                  "the handed-out certified image and residual remain fully charged until release");
+            read.image.reset();
+            store.release_read(41, 1);
+            store.close();
+            charged = store.disk_charged_bytes();
+        }
+        const auto floor = fixture_file_bytes(root.path + "/issuer.key");
+        {
+            ConversationStore store(options); // no producer feature flag is needed to read or roll back safely
+            check(store.enabled() && store.issuer_key() == secret, "a compatible feature-off reader reopens the pool");
+            check_eq(store.disk_charged_bytes(), charged + 8192, "reopen charges only its real run-intent marker");
+            check(!store.matches(selector_of(legacy), query_of(legacy, 50, 1).tokens, {}).empty(),
+                  "the old history remains matchable after activation and reopen");
+            uint64_t request_id = 51;
+            for (const SavedConversation* expected : {&legacy, &changed}) {
+                std::string why;
+                check(store.demand(query_of(*expected, request_id, 1), why),
+                      "a compatible feature-off reader admits both legacy and certified histories");
+                ConversationStoreRead read;
+                check(store.wait_ready(request_id, 1, read, 5000) &&
+                          read.status == ConversationStoreReadStatus::ready && read.image &&
+                          images_equal(*read.image, *expected, why),
+                      "both legacy and exact certified residual bytes roundtrip after reopen");
+                read.image.reset();
+                store.release_read(request_id++, 1);
+            }
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, legacy, 4, 4, result), "feature-off legacy publication still works after activation");
+            store.close();
+        }
+        check(fixture_file_bytes(root.path + "/issuer.key") == floor,
+              "feature-off publication and clean close never downgrade the floor");
+        for (int malformed = 0; malformed < 5; ++malformed) {
+            auto bytes = floor;
+            if (malformed == 0) bytes[12] = 3; // a validly checksummed future minimum reader
+            if (malformed == 1) bytes[8] = 3;  // a future envelope version
+            if (malformed < 2) {
+                const auto digest = sha256(bytes.data(), 48);
+                std::copy_n(digest.begin(), 16, bytes.begin() + 48);
+            } else if (malformed == 2) bytes.back() ^= 1;
+            else if (malformed == 3) bytes.resize(63);
+            else bytes.resize(65);
+            check(fixture_replace_file(root.path + "/issuer.key", bytes), "the envelope refusal fixture is durable");
+            const auto before = fixture_contents(root.path);
+            { ConversationStore store(options); check(!store.enabled(), "unsupported or malformed authority refuses open"); }
+            check(fixture_contents(root.path) == before, "authority refusal preserves every history and file byte");
+            check(fixture_replace_file(root.path + "/issuer.key", floor), "the exact recognized authority is restored");
+        }
+        for (bool catalog : {true, false}) {
+            const auto names = directory_names(root.path + "/manifests");
+            if (!catalog && names.empty()) { check(false, "the unsupported-manifest fixture has a real manifest"); continue; }
+            const std::string path = root.path + (catalog ? "/catalog" : "/manifests/" + names.front());
+            const auto original = fixture_file_bytes(path);
+            auto future = original;
+            future[7] = '9';
+            check(fixture_replace_file(path, future), "the unsupported schema fixture is written");
+            const auto before = fixture_contents(root.path);
+            { ConversationStore store(options); check(!store.enabled(), "unsupported schemas refuse before recovery"); }
+            check(fixture_contents(root.path) == before, "unsupported schema refusal cannot reconcile or delete histories");
+            check(fixture_replace_file(path, original), "the original schema bytes are restored");
+        }
+    }
+}
+
+void check_draft_reader_floor_failures() {
+    const char* prior_batch = ::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    const bool had_batch = prior_batch != nullptr;
+    const std::string saved_batch = prior_batch ? prior_batch : "";
+    for (bool batching : {false, true}) {
+        ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", batching ? "1" : "0", 1);
+    for (const char* step : {"reader-floor-write", "reader-floor-rename", "reader-floor-sync", "reader-floor-allocate",
+                             "reader-floor-tmp-sync",
+                             "objects", "manifest", "catalog", "catalog-rename", "catalog-sync", "catalog-apply"}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        auto foreign = options;
+        foreign.domain = bytes_from("other-profile-retained-domain");
+        const auto history = fixture(995, 64);
+        {
+            ConversationStore store(foreign);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, history, 1, 1, result), "the foreign history predates the floor transaction");
+            store.close();
+        }
+        const auto secret = fixture_file_bytes(root.path + "/issuer.key");
+        const auto old_files = fixture_contents(root.path);
+        const bool before_rename = std::strcmp(step, "reader-floor-write") == 0 ||
+                                   std::strcmp(step, "reader-floor-rename") == 0;
+        const bool uncertain = std::strcmp(step, "reader-floor-sync") == 0 ||
+                               std::strcmp(step, "reader-floor-allocate") == 0 ||
+                               std::strcmp(step, "reader-floor-tmp-sync") == 0 ||
+                               std::strcmp(step, "catalog-sync") == 0 || std::strcmp(step, "catalog-apply") == 0;
+        {
+            ConversationStore store(options);
+            const uint64_t charged = store.disk_charged_bytes();
+            store.set_publish_fault_for_test(step);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, certified_fixture(true), 2, 2, result) &&
+                      result.status != ConversationStorePublishStatus::stored &&
+                      result.status != ConversationStorePublishStatus::replaced,
+                  "the injected transition/publication failure never claims a committed head");
+            check(store.healthy() != uncertain, "only actual authority uncertainty latches the store fault");
+            const auto after = fixture_file_bytes(root.path + "/issuer.key");
+            check(after.size() == (before_rename ? 32 : 64),
+                  "no new-format write precedes the floor; every later failure keeps the sticky floor");
+            if (before_rename)
+                check(after == secret && store.disk_charged_bytes() == charged,
+                      "pre-rename failure preserves the key and refunds only confirmed absent scratch");
+            if (uncertain) {
+                const auto retained = fixture_contents(root.path);
+                check(store.disk_charged_bytes() >= charged, "uncertain authority credits no replaced inode");
+                std::string why;
+                ConversationStorePublish request;
+                request.request_id = 3;
+                request.generation = 3;
+                check(store.publish(std::make_shared<SavedConversation>(history), request, why) == kRefused,
+                      "authority uncertainty also refuses subsequent publication work");
+                store.close();
+                check(fixture_contents(root.path) == retained, "faulted close neither downgrades nor reclaims");
+            } else store.close();
+        }
+        {
+            ConversationStore store(options);
+            check(store.enabled(), "reopen recovers the real authority after every transition failure");
+            check(store.matches(selector_of(history), query_of(history, 9, 1).tokens, {}).empty(),
+                  "foreign-domain histories are not served by the current domain");
+            store.close();
+        }
+        {
+            ConversationStore store(foreign);
+            check(store.enabled() && !store.matches(selector_of(history), query_of(history, 10, 1).tokens, {}).empty(),
+                  "the original profile still reads its preserved history after failure/reopen");
+            store.close();
+        }
+        const auto after = fixture_contents(root.path);
+        for (const auto& entry : old_files)
+            if (entry.first != "/catalog" && entry.first != "/issuer.key")
+                check(after.count(entry.first) && after.at(entry.first) == entry.second,
+                      "every pre-existing history object and manifest survives the floor failure");
+    }
+    }
+    for (bool floor_limited : {false, true}) {
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        auto legacy = certified_fixture(false);
+        legacy.draft_begin = legacy.draft_cells = legacy.draft_next_token = -1;
+        for (auto& checkpoint : legacy.checkpoints) checkpoint.pinned = false;
+        uint64_t baseline = 0;
+        {
+            ConversationStore store(options);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, legacy, 1, 1, result), "the non-evicting floor admission has a real history");
+            store.close();
+            baseline = store.disk_charged_bytes();
+        }
+        if (floor_limited) options.min_free_bytes = uint64_t(1) << 62;
+        else options.quota_bytes = baseline + 8192; // only the mandatory run-intent fits; no replacement headroom
+        ConversationStore store(options);
+        check(store.enabled(), "the retained history opens before an unaffordable activation");
+        const auto before = fixture_contents(root.path);
+        const uint64_t charge = store.disk_charged_bytes();
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, certified_fixture(false), 2, 2, result) &&
+                  result.status != ConversationStorePublishStatus::stored,
+              "insufficient replacement headroom refuses activation even with evictable histories");
+        check(store.disk_charged_bytes() == charge && store.counters().evictions == 0 &&
+                  fixture_contents(root.path) == before && fixture_file_bytes(root.path + "/issuer.key").size() == 32,
+              "quota/floor refusal neither evicts nor rewrites any authority or history file");
+        store.close();
+    }
+    for (bool batching : {false, true}) {
+        ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", batching ? "1" : "0", 1);
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        auto legacy = certified_fixture(false);
+        legacy.draft_begin = legacy.draft_cells = legacy.draft_next_token = -1;
+        ConversationStore store(options);
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, legacy, 1, 1, result), "the all-deduplicated activation has real donor objects");
+        const auto objects = fixture_contents(root.path + "/objects");
+        const auto manifests = fixture_contents(root.path + "/manifests");
+        const uint64_t written = store.counters().bytes_written;
+        store.set_publish_fault_for_test("reader-floor-sync");
+        check(publish_and_wait(store, certified_fixture(false), 2, 2, result) &&
+                  result.status != ConversationStorePublishStatus::stored && !store.healthy(),
+              "an all-deduplicated publication still waits for the mandatory floor barrier in both batching modes");
+        check(store.counters().bytes_written == written &&
+                  fixture_contents(root.path + "/objects") == objects &&
+                  fixture_contents(root.path + "/manifests") == manifests,
+              "failed floor durability stages neither objects nor a MAN2 manifest, even with zero dirty shards");
+        store.close();
+    }
+    if (had_batch) ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved_batch.c_str(), 1);
+    else ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");
 }
 
 } // namespace

@@ -449,8 +449,11 @@ bool ResidentSlots::validate_source(const core::SavedConversation& image, const 
         const int64_t cells = (int64_t) candidate.ids.size();
         const int64_t needed = mtp && draft_.window_ > 0 ?
             std::max<int64_t>(0, (int64_t) tokens.size() - draft_.window_) : 0;
-        if (!preparation_prefix(candidate, tokens, selected_limit) || cells > draft_limit ||
+        const bool catchup = mtp && cells == live && draft_limit == live - 1 &&
+                             !last.draft_boundary_residual.empty();
+        if (!preparation_prefix(candidate, tokens, selected_limit) || (cells > draft_limit && !catchup) ||
             (mtp && std::min(draft_begin, cells) > needed)) return false;
+        if (catchup) return true; // destination tokenN is consumed only after its one-row catchup
         if (!mtp || draft_begin >= cells) return true; // an empty interval owes no boundary token
         const int32_t boundary = cells < live ? image.live.ids[(size_t) cells] : last.draft_next_token;
         return boundary >= 0 && boundary == tokens[(size_t) cells];
@@ -698,13 +701,21 @@ bool ResidentSlots::prepare(const ResidentPreparation& lease, const core::SavedC
                 const core::OnDevice on(draft_.device());
                 if (!operation->finish(error)) return fail(lease.slot);
                 auto& target = draft_.slots_[(size_t) lease.slot];
-                target.cells = position;
                 const auto& last = preparation_stage(*source.image, stages_.size() - 1);
-                target.begin = std::min(position, last.draft_begin);
+                target.cells = std::min(position, last.draft_cells);
+                target.completed_cells = target.cells;
+                target.begin = std::min(target.cells, last.draft_begin);
                 target.certified = true;
-                target.tail_token = position > target.begin ? state.prompt[(size_t) position] : -1;
+                target.tail_token = target.cells == position && position > target.begin
+                    ? state.prompt[size_t(position)] : -1; // token identity was proven by source preflight
                 target.prompt_len = (int64_t) state.prompt.size();
                 target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
+                // The immutable prefix never stores tokenN. Advance exactly its
+                // missing cell with this destination's tokenN, using the existing
+                // Rin_ arena and KV-only front, before advertising full coverage.
+                if (target.cells != position &&
+                    !draft_.catchup_slot(lease.slot, last.draft_boundary_residual,
+                        state.prompt[size_t(position)], position - 1, error)) return fail(lease.slot);
             }
         } else {
             for (size_t stage = 0; stage < stages_.size(); ++stage) {
@@ -1041,7 +1052,7 @@ std::optional<ResidentSnapshotSource> ResidentSlots::completed_snapshot_source(i
         error = "resident snapshot: missing draft state"; return std::nullopt;
     }
     return ResidentSnapshotSource{source, stages_, draft, slot, draft ? draft_.slot_begin(slot) : 0,
-        draft ? draft_.slot_cells(slot) : 0, draft ? draft_.slot_next_token(slot) : -1};
+        draft ? draft_.slots_[size_t(slot)].completed_cells : 0, draft ? draft_.slot_next_token(slot) : -1};
 }
 
 bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
@@ -1129,6 +1140,9 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
         return fail(slot);
     }
     working_failed_ = false;
+    if (draft_.coverage_.known() && draft_.coverage_.cells == cells && cells > draft_.coverage_.begin &&
+        working_prompt_ && cells < int64_t(working_prompt_->size()))
+        draft_.coverage_.next_token = (*working_prompt_)[size_t(cells)]; // resume_work proved this source boundary
     residency("resume", slot);
     slots_[(size_t) slot].restored(working_, slot, checkpoint == nullptr);
     return true;

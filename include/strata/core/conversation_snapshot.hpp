@@ -125,12 +125,18 @@ struct ConversationView {
     // draft must claim exactly N-1 cells. Skipped rows before draft_begin and
     // every inactive/page-padding byte are cleared before publication.
     bool exact_cut = false;
+    // Actual completed interval (unknown: -1/-1/-1), never prompt arithmetic.
     int64_t draft_tokens = -1;
-    int64_t draft_begin = 0;
-    // Actual current-request prefill start, not its resumed checkpoint's token
-    // count when a diagnostic reread started at zero. Exact capture refuses to
-    // retain a draft row this request did not recompute.
-    int64_t draft_read_from = 0;
+    int64_t draft_begin = -1;
+    int32_t draft_next_token = -1;
+    // Nonzero producer request owning the certification. Zero permits only a
+    // legacy shared-cut sanitizing extent; it exports no persistent witness.
+    uint64_t draft_owner = 0;
+    // Immutable host row, explicitly position/owner bound by the producer after
+    // its source operation drains. A bare device pointer cannot certify a row.
+    const ConversationBuffer* draft_boundary_residual = nullptr;
+    int64_t draft_boundary_position = -1;
+    uint64_t draft_boundary_owner = 0;
 };
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);

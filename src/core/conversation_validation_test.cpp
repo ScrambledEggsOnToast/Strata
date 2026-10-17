@@ -14,6 +14,7 @@
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 #include "strata/core/native_head.hpp"
+#include "strata/core/mtp.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include <memory>
 
@@ -27,22 +28,27 @@ struct DraftRows {
     int token_calls = 0;
     strata::core::QsaState state;
     std::function<void(int64_t, int64_t)> write;
+    strata::core::ConversationDraftCoverage coverage;
+    int64_t boundary_position = -1;
+    void set_boundary_capture(int64_t position) { boundary_position = position; }
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
-    int64_t first_needed() const {
+    int64_t first_needed(int = 8) const {
 #include "shared_draft_first_needed.inc"
         return first_needed;
     }
     const strata::core::QsaState& kv_state() const { return state; }
-    bool prefill(const float*, const int32_t*, int64_t n, int64_t cell0, std::string&) {
+    bool prefill(const float*, const int32_t* tokens, int64_t n, int64_t cell0, std::string&) {
         ++token_calls;
         const int64_t first_needed = this->first_needed();
         if (per_group_sync) {
 #include "shared_draft_sync_range.inc"
             write(cell0 + c, T);
+            coverage.completed(cell0 + c, cell0 + c + T, tokens[c + T - 1]);
             }
         } else {
 #include "shared_draft_async_range.inc"
             write(cell0 + c, T);
+            coverage.completed(cell0 + c, cell0 + c + T, tokens[c + T - 1]);
             }
         }
         return true;
@@ -58,12 +64,14 @@ public:
     bool accept_batched = false;
     int batched_calls = 0;
     std::function<bool(const float*, int64_t, int64_t, std::string&)> on_chunk;
-    bool draft_kv(DraftRows& mtp, const float*, const int32_t*, int64_t n, int64_t cell0,
+    bool draft_kv(DraftRows& mtp, const float*, const int32_t* tokens, int64_t n, int64_t cell0,
                   std::string&, const char**) {
         ++batched_calls;
         if (!accept_batched) return false;
+        constexpr int slot = 8;
 #include "shared_draft_batched_range.inc"
         mtp.write(cell0 + r0, n - r0);
+        mtp.coverage.completed(cell0 + r0, cell0 + n, r0 < n ? tokens[n - 1] : -1);
         return true;
     }
 };
@@ -80,6 +88,7 @@ namespace {
 int copy_calls = 0, sync_calls = 0, stream_sync_calls = 0, fail_copy = 0, fail_sync = 0;
 int residency_sync_calls = 0;
 bool defer_residency_copies = false, fail_residency_sync = false;
+bool fail_mtp_stream = false;
 struct PendingCopy { void* dst; const void* src; size_t bytes; };
 std::vector<PendingCopy> pending_residency_copies;
 size_t copied_bytes = 0;
@@ -106,6 +115,7 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t
 }
 extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
     ++stream_sync_calls;
+    if (stream == reinterpret_cast<cudaStream_t>(uintptr_t(2)) && fail_mtp_stream) return cudaErrorUnknown;
     if (!stream) {
         ++residency_sync_calls;
         if (fail_residency_sync) return cudaErrorUnknown;
@@ -118,6 +128,69 @@ extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
 extern "C" cudaError_t __wrap_cudaGetLastError() { return cudaSuccess; }
+#endif
+
+#if defined(CONVERSATION_TEST_TRANSFERS)
+namespace strata::core {
+// Host-transfer backend: exercise the real Operation/detach/idle state machine,
+// without model arithmetic, a CUDA context, or claims of device fault recovery.
+struct MtpDrafterCertificationFixture {
+    static void run(void (*check)(bool, const char*)) {
+        MtpDrafter draft;
+        std::string error;
+        draft.cs_ = reinterpret_cast<cudaStream_t>(uintptr_t(2));
+        draft.working_request_ = 17;
+        {
+            MtpDrafter::Operation operation(draft, error);
+            check(bool(operation), "acquire actual draft operation in host backend");
+            operation.writes(4, 8, 11);
+            check(!draft.completed_coverage().known(), "submitted writes are not completed certification");
+            operation.detach();
+        }
+        check(!draft.completed_coverage().known(), "detached async prefill cannot certify on return");
+        check(draft.idle(error) && draft.completed_coverage().begin == 4 &&
+              draft.completed_coverage().cells == 8,
+              "logical drain certifies detached writes before any subsequent operation/capture");
+        {
+            MtpDrafter::Operation operation(draft, error);
+            check(bool(operation), "reacquire drained async scratch");
+            operation.writes(12, 16, 23);
+            operation.detach();
+        }
+        check(draft.idle(error) && draft.completed_coverage().begin == 12 &&
+              draft.completed_coverage().cells == 16, "async completion never unions a hole");
+        draft.kv_restore(16, 23);
+        check(draft.completed_coverage().cells == 16, "matching private boundary keeps actual completed tail");
+        draft.kv_restore(16, 24);
+        check(draft.completed_coverage().cells == 15 && draft.completed_coverage().next_token == -1,
+              "mismatching private boundary drops dependent tail instead of pretending full reuse");
+        SavedConversation unknown;
+        draft.restored_snapshot(unknown, 16);
+        check(!draft.completed_coverage().known(), "unknown restored image replaces old ambient certification");
+        {
+            MtpDrafter::Operation operation(draft, error);
+            operation.writes(0, 4, 19);
+            operation.detach();
+        }
+        fail_mtp_stream = true;
+        check(!draft.idle(error) && !draft.completed_coverage().known() && !draft.context_idle(error),
+              "failed async drain clears evidence and retains poisoned ownership");
+        fail_mtp_stream = false;
+        draft.cs_ = nullptr; // a host fake stream is never passed to CUDA destruction
+        MtpDrafter cancelled;
+        cancelled.cs_ = reinterpret_cast<cudaStream_t>(uintptr_t(2));
+        cancelled.coverage_ = {0, 8, 11};
+        {
+            MtpDrafter::Operation operation(cancelled, error);
+            operation.writes(4, 6, 13);
+            // Early return/cancellation without finish is the actual failure path.
+        }
+        check(!cancelled.completed_coverage().known() && !cancelled.context_idle(error),
+              "abandoned operation drains but cannot retain stale prior certification");
+        cancelled.cs_ = nullptr;
+    }
+};
+}
 #endif
 
 using namespace strata::core;
@@ -226,6 +299,15 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     reject([](auto& s){s.geometry[16] = 128;}, "different expert geometry rejected");
     reject([](auto& s){s.live.stage_parts.emplace_back();}, "layer-split live state rejected before writes");
     reject([](auto& s){s.checkpoints[0].stage_parts.emplace_back();}, "layer-split checkpoint rejected before writes");
+    reject([](auto& s){s.draft_cells = 0;}, "partially unknown certification is rejected");
+    reject([](auto& s){s.draft_begin = 4; s.draft_cells = 3;}, "inverted completed interval is rejected");
+    reject([](auto& s){s.draft_begin = 0; s.draft_cells = 10;}, "coverage beyond live main extent is rejected");
+    reject([](auto& s){s.draft_begin = 0; s.draft_cells = 9;},
+           "full private extent without its actual next token is rejected");
+    reject([](auto& s){s.draft_begin = 0; s.draft_cells = 8; s.draft_next_token = 11;},
+           "partial interval cannot persist a private boundary token");
+    reject([](auto& s){s.draft_boundary_residual.resize(4);},
+           "an unknown image cannot attach an arbitrary residual");
     reject([](auto& s){s.kv.pop_back();}, "missing KV layer rejected");
     reject([](auto& s){s.live.gdn.pop_back();}, "bad live recurrence rejected");
     reject([](auto& s){s.checkpoints.back().gdn.pop_back();}, "bad retained checkpoint rejected");
@@ -722,7 +804,7 @@ void resident_transfer_envelopes() {
 namespace shared_draft_fixture {
 int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
                       int64_t req_pin = 8192, int64_t n = 65536) {
-    const bool use_mtp = true;
+    const bool use_mtp = true, packed_prefill = true;
     const ConversationScope req_shared_scope = shared ? ConversationScope{{1}} : ConversationScope{};
 #include "shared_draft_horizon.inc"
     return read_from;
@@ -786,8 +868,13 @@ void diagnostic_shared_draft(bool batched, bool per_group_sync, int64_t window) 
     const std::vector<int32_t> ids(size_t(pin), 11);
     const std::vector<ConversationImageKey> no_images;
     const std::vector<ConversationCheckpoint> no_checks;
-    const int64_t draft_begin = std::clamp(mtp.first_needed(), int64_t(0), pin - 1);
-    const ConversationView exact{ids, no_images, no_checks, true, true, pin - 1, draft_begin, read_from};
+    ConversationBuffer boundary;
+    boundary.resize(size_t(g.n_embd * g.hc) * sizeof(float), 0x3d);
+    boundary.freeze();
+    check(mtp.coverage.known() && mtp.coverage.cells == pin,
+          "host writers expose their actually completed contiguous interval");
+    const ConversationView exact{ids, no_images, no_checks, true, true, pin - 1, mtp.coverage.begin,
+                                  -1, 17, &boundary, pin - 1, 17};
     SavedConversation image;
     copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
     check(conversation_snapshot_save(image, exact, ss, g, &draft.st, error) &&
@@ -831,6 +918,11 @@ void exact_shared_cut(int format, int64_t cut) {
     const std::vector<ConversationCheckpoint> no_checks;
     const int64_t begin = cut == 80 ? 9 : std::min<int64_t>(1, cut - 1);
     ConversationView exact{ids, no_images, no_checks, true, true, cut - 1, begin};
+    ConversationBuffer boundary;
+    boundary.resize(size_t(g.n_embd * g.hc) * sizeof(float), 0x3d);
+    boundary.freeze();
+    exact.draft_owner = 17; exact.draft_boundary_owner = 17;
+    exact.draft_boundary_position = cut - 1; exact.draft_boundary_residual = &boundary;
     size_t estimate = 0;
     copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
     const ConversationView invalid_beyond{ids, no_images, no_checks, true, true, cut + 1, begin};
@@ -844,11 +936,20 @@ void exact_shared_cut(int format, int64_t cut) {
         check(!conversation_snapshot_bytes(invalid_short, ss, g, &draft.st, estimate, error),
               "an exact capture must own all N-1 draft rows, not an arbitrary shorter extent");
     }
-    const ConversationView invalid_read{ids, no_images, no_checks, true, true, cut - 1, begin, begin + 1};
+    auto invalid_read = exact;
+    invalid_read.draft_boundary_position = cut;
     SavedConversation refused;
     check(!conversation_snapshot_save(refused, invalid_read, ss, g, &draft.st, error) &&
           refused.live.ids.empty() && refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
-          "a private resume past the retained draft start produces no shared image or device access");
+          "wrong-position residual produces no shared image or device access");
+    invalid_read = exact; invalid_read.draft_boundary_owner = 18;
+    check(!conversation_snapshot_save(refused, invalid_read, ss, g, &draft.st, error) &&
+          refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
+          "a residual from a different request generation is rejected before writes");
+    invalid_read = exact; invalid_read.draft_boundary_residual = nullptr;
+    invalid_read.draft_boundary_owner = 0; invalid_read.draft_boundary_position = -1;
+    check(!conversation_snapshot_bytes(invalid_read, ss, g, &draft.st, estimate, error),
+          "completed KV without the final residual cannot claim a catchup-capable exact image");
     SavedConversation unsafe_meta;
     std::vector<SessionKvSource> unsafe_sources;
     check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, draft.st, error) &&
@@ -859,6 +960,18 @@ void exact_shared_cut(int format, int64_t cut) {
     check(first.live.ids == ids && first.checkpoints.empty() && first.kv.back().cells == cut - 1 &&
           first.live.gdn == gdn && first.live.ple == ple,
           "exact capture keeps recurrent/PLE state at N and explicitly records draft extent N-1");
+    auto legacy_view = exact;
+    legacy_view.draft_owner = 0; legacy_view.draft_boundary_residual = nullptr;
+    legacy_view.draft_boundary_owner = 0; legacy_view.draft_boundary_position = -1;
+    SavedConversation legacy;
+    check(conversation_snapshot_save(legacy, legacy_view, ss, g, &draft.st, error) &&
+          legacy.draft_begin == -1 && legacy.draft_cells == -1 && legacy.draft_next_token == -1 &&
+          legacy.draft_boundary_residual.empty() &&
+          conversation_snapshot_validate(legacy, ss, g, &draft.st, ConversationSnapshotExpectation::exact_cut, error),
+          "feature-off shared capture preserves legacy unknown metadata without a new residual allocation/export");
+    check(first.draft_begin == begin && first.draft_cells == cut - 1 && first.draft_next_token == -1 &&
+          first.draft_boundary_residual == boundary,
+          "certified exact capture carries only actual interval and immutable final main residual");
     const int64_t rounded = (cut + 3) / 4 * 4;
     const auto rows_equal = [&](const ConversationKv& kv, int64_t lo, int64_t hi) {
         for (const auto* part : {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale}) {
@@ -1001,13 +1114,13 @@ void exact_shared_cut(int format, int64_t cut) {
                 }
         }
         auto resumed_view = exact;
-        resumed_view.draft_read_from = read_from;
+        resumed_view.draft_boundary_residual = nullptr;
+        resumed_view.draft_boundary_owner = 0; resumed_view.draft_boundary_position = -1;
         SavedConversation suppressed;
         copy_calls = sync_calls = 0;
         check(!conversation_snapshot_save(suppressed, resumed_view, ss, g, &draft.st, error) &&
               suppressed.live.ids.empty() && suppressed.kv.empty() && !copy_calls && !sync_calls,
-              cut == 9 ? "divergent private resume produces no shared record from inherited row R-1" :
-                          "stale long-window private resume produces no shared record from retained earlier rows");
+              "legacy partial resume without a captured final residual cannot emit a certified exact cut");
         const ConversationView private_continuation{ids, no_images, no_checks, true};
         check(conversation_snapshot_save(ordinary, private_continuation, ss, g, &draft.st, error),
               "suppressing shared export does not suppress ordinary private capture or serving state");
@@ -1054,11 +1167,38 @@ void exact_shared_cut(int format, int64_t cut) {
 }
 
 int main() {
+    ConversationDraftCoverage coverage;
+    check(!coverage.known(), "fresh draft coverage is unknown");
+    coverage.completed(4, 8, 11);
+    coverage.completed(8, 12, 13);
+    check(coverage.begin == 4 && coverage.cells == 12 && coverage.next_token == 13,
+          "adjacent completed batches form one real interval");
+    coverage.completed(16, 20, 17);
+    check(coverage.begin == 16 && coverage.cells == 20,
+          "completed writes after a gap never union the missing cells");
+    coverage.completed(18, 19, 23);
+    check(coverage.begin == 16 && coverage.cells == 19 && coverage.next_token == 23,
+          "rewriting an accepted prefix abandons old speculative tail coverage");
+    coverage.rewind(17);
+    check(coverage.begin == 16 && coverage.cells == 17 && coverage.next_token == -1,
+          "rewind keeps actual prefix but cannot invent its boundary token");
+    coverage.rewind(15);
+    check(!coverage.known(), "rewind before completed interval loses certification");
+    SavedConversation owned;
+    owned.draft_boundary_residual = {1, 2, 3, 4};
+    owned.freeze();
+    const auto alias = owned.frozen_alias();
+    check(owned.draft_boundary_residual.visit(0, 4, [](uint8_t* row, size_t n, size_t) {
+              std::fill(row, row + n, 9); return true;
+          }) && alias.draft_boundary_residual == ConversationBuffer({1, 2, 3, 4}) &&
+          owned.draft_boundary_residual != alias.draft_boundary_residual,
+          "replacement of a held boundary row cannot mutate a frozen publication alias");
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
     checkpoint_payload_stages();
     resident_transfer_envelopes();
 #if defined(CONVERSATION_TEST_TRANSFERS)
+    strata::core::MtpDrafterCertificationFixture::run(check);
     for (int format : {0,1,2}) ring_refusal(format);
     for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9,80}) exact_shared_cut(format, cut);
     for (bool batched : {false, true}) for (bool sync : {false, true})

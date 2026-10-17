@@ -1701,15 +1701,15 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     auto publish = [&] {
         if (slot == 8) return;
         auto& destination = mtp.slots_[(size_t) slot];
-        destination.cells = cell0 + n;
-        if (r0 > 0) destination.begin = std::max(destination.begin, cell0 + r0);
-        if (n > 0) destination.tail_token = r0 < n ? next_tokens[n - 1] : -1;
         destination.proposal = destination.proposal_token = -1;
         destination.proposal_cell = -1;
     };
     if (r0 >= n) {
         core::MtpDrafter::Operation operation(mtp, err, slot, m.cs);
-        if (!operation || !operation.finish(err)) return false;
+        if (!operation) return false;
+        operation.writes(cell0 + n, cell0 + n, -1);
+        if (!operation.boundary(R_rows, cell0, n, err)) return false;
+        if (!operation.finish(err)) return false;
         publish();
         return true;
     }
@@ -1864,6 +1864,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
                      "the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0, (long long) (cell0 + r0),
                      (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
+    operation.writes(cell0 + r0, cell0 + n, next_tokens[n - 1]);
+    if (!operation.boundary(R_rows, cell0, n, err)) return false;
     if (!operation.finish(err)) return false;
     publish();
     return true;

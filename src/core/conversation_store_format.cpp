@@ -3,8 +3,8 @@
 // turns a manifest back into a complete image.  No file I/O, no threads, no GPU, no global state: every entry point
 // either produces the exact metadata the caller then writes, or refuses with a reason before allocating.
 //
-// Encoding rules (schema tag "STCS*1", little-endian throughout; the build asserts a little-endian host, so the raw
-// bytes of the engine's own int32/image-key vectors are the on-disk encoding):
+// Encoding rules (STCSMAN1 for legacy captures, STCSMAN2 for explicit draft certification, STCSCAT1 catalog;
+// little-endian throughout; raw int32/image-key vectors use the asserted little-endian host encoding):
 //   integers        8 bytes for u64/i64, 4 for u32, 2 for u16, 1 for u8/bool
 //   byte strings    u64 length then the bytes
 //   digests         32 raw bytes
@@ -39,6 +39,7 @@ namespace {
 // ---------------------------------------------------------------------------------------------------------------
 
 constexpr char kManifestTag[8] = {'S', 'T', 'C', 'S', 'M', 'A', 'N', '1'};
+constexpr char kCertifiedManifestTag[8] = {'S', 'T', 'C', 'S', 'M', 'A', 'N', '2'};
 constexpr char kCatalogTag[8] = {'S', 'T', 'C', 'S', 'C', 'A', 'T', '1'};
 constexpr char kBucketTag[10] = {'S', 'T', 'C', 'S', 'B', 'U', 'C', 'K', 'E', 'T'};
 constexpr char kObjectTag[8] = {'S', 'T', 'C', 'S', 'O', 'B', 'J', '1'};
@@ -157,9 +158,9 @@ private:
 // Canonical stream order
 //
 // For every container, in container order: the container's own record (its token ids, its image keys, then its five
-// running-state arrays), then its checkpoints in retention order, then its K/V layers in layer order.  A container is
-// either a whole image (kinds live_*/cp_*) or one record's stage part (kinds part_*).  `owner` is the record a stream
-// belongs to: 0 for a container's own live record, 1 + checkpoint index for a checkpoint, and the owning record's key
+// running-state arrays), its optional boundary residual, then its checkpoints in retention order, then its K/V layers
+// in layer order. A container is either a whole image (kinds live_*/cp_*) or one record's stage part (kinds part_*).
+// `owner` names the record: 0 for a container's live record, 1 + checkpoint index for a checkpoint, and the owner's key
 // for every stream of a part container; `ordinal` is the K/V layer index for kv_* and 0 otherwise.
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -171,6 +172,7 @@ enum class Buffer {
     tails,
     dead,
     block_pos,
+    draft_boundary,
     kv_k,
     kv_v,
     kv_k_scale,
@@ -257,6 +259,8 @@ bool walk_streams(const std::vector<ContainerMeta>& containers, Visitor&& visit,
             }
             continue;
         }
+        if (c.draft_boundary_bytes &&
+            !visit(slot(kDraftBoundaryKind, 0, 0, Buffer::draft_boundary, 0, 0), c, why)) return false;
         for (uint32_t j = 0; j < c.checkpoints.size(); ++j) {
             const uint64_t key = uint64_t(j) + 1;
             if (!visit(slot(kImageCheckpoint.ids, key, 0, Buffer::ids, 0, key), c, why)) return false;
@@ -280,6 +284,7 @@ struct TreeContainer {
     const ConversationCheckpoint* own = nullptr;             // the live record, or the part's own record
     std::vector<const ConversationCheckpoint*> checkpoints;  // image containers only
     std::vector<const ConversationKv*> kv;                   // image containers only
+    const ConversationBuffer* boundary = nullptr;
 };
 
 RecordMeta record_meta(const ConversationCheckpoint& record) {
@@ -308,6 +313,52 @@ KvMeta kv_meta(const ConversationKv& layer) {
     return meta;
 }
 
+// Scalar-only: admission and decode share this before allocating any payload.
+template<class Kv>
+bool check_draft(const std::array<int64_t, 18>& g, int64_t lo, int64_t hi, uint64_t tokens,
+                 int64_t begin, int64_t cells, int32_t next, uint64_t boundary,
+                 const Kv* kv, size_t count, std::string& why) {
+    if (begin == -1 && cells == -1 && next == -1 && boundary == 0) return true;
+    if (begin < 0 || cells < begin || uint64_t(cells) > tokens ||
+        (uint64_t(cells) == tokens ? next < 0 : next != -1)) {
+        why = "incoherent draft certification interval or tail token";
+        return false;
+    }
+    if (g[1] <= 0 || g[2] <= 0 || lo < 0 || hi < lo || hi != g[1]) {
+        why = "draft certification is not on a draft-owning stage";
+        return false;
+    }
+    const int64_t main = std::max<int64_t>(hi / g[2] - lo / g[2], g[1] / g[2] ? 1 : 0);
+    if (uint64_t(main) >= count || count - size_t(main) != 1 || kv[count - 1].cells < cells) {
+        why = "draft certification exceeds the serialized draft extent";
+        return false;
+    }
+    if (boundary && (tokens == 0 || uint64_t(cells) != tokens - 1 || next != -1 ||
+        g[0] <= 0 || g[14] <= 0 || uint64_t(g[0]) > UINT64_MAX / uint64_t(g[14]) ||
+        uint64_t(g[0]) * uint64_t(g[14]) > UINT64_MAX / sizeof(float) ||
+        boundary != uint64_t(g[0]) * uint64_t(g[14]) * sizeof(float))) {
+        why = "draft boundary residual has invalid position or row length";
+        return false;
+    }
+    return true;
+}
+
+bool check_image_draft(const SavedConversation& image, uint32_t stage, uint32_t stages,
+                       const ConversationStoreLimits& limits, std::string& why) {
+    if (image.draft_begin >= 0 && stage + 1 != stages) {
+        why = "draft certification belongs only to the final stage";
+        return false;
+    }
+    const uint64_t boundary = image.draft_boundary_residual.size();
+    if (boundary > limits.max_state_bytes || boundary > limits.max_stream_bytes) {
+        why = "draft boundary residual exceeds the state/stream budget";
+        return false;
+    }
+    return check_draft(image.geometry, image.layer_lo, image.layer_hi, image.live.ids.size(),
+                       image.draft_begin, image.draft_cells, image.draft_next_token, boundary,
+                       image.kv.data(), image.kv.size(), why);
+}
+
 bool image_container(const SavedConversation& image, uint32_t stage, const ConversationStoreLimits& limits,
                      TreeContainer& out, std::string& why) {
     if (!image.scope.valid()) {
@@ -325,6 +376,11 @@ bool image_container(const SavedConversation& image, uint32_t stage, const Conve
     meta.layer_lo = image.layer_lo;
     meta.layer_hi = image.layer_hi;
     meta.cvec = image.cvec;
+    meta.draft_begin = image.draft_begin;
+    meta.draft_cells = image.draft_cells;
+    meta.draft_next_token = image.draft_next_token;
+    meta.draft_boundary_bytes = image.draft_boundary_residual.size();
+    out.boundary = &image.draft_boundary_residual;
     meta.record = record_meta(image.live);
     if (meta.record.tokens > limits.max_tokens) {
         why = "an image record holds more tokens than ConversationStoreLimits::max_tokens";
@@ -403,6 +459,10 @@ bool build_tree(const SavedConversation& image, const ConversationStoreLimits& l
         return false;
     }
     const uint32_t stages = uint32_t(image.stage_images.size()) + 1;
+    // Check every certification before reserving even the metadata skeleton, not only before transferring payload.
+    if (!check_image_draft(image, 0, stages, limits, why)) return false;
+    for (uint32_t i = 0; i + 1 < stages; ++i)
+        if (!check_image_draft(image.stage_images[i], i + 1, stages, limits, why)) return false;
     out.clear();
     out.reserve(stages);
     if (!image_container(image, 0, limits, out.emplace_back(), why)) return false;
@@ -509,6 +569,18 @@ bool check_containers(const ManifestMeta& meta, const ConversationStoreLimits& l
     }
     for (uint32_t i = 0; i < meta.containers.size(); ++i) {
         const ContainerMeta& c = meta.containers[i];
+        if (!c.is_image && (c.draft_begin != -1 || c.draft_cells != -1 ||
+                            c.draft_next_token != -1 || c.draft_boundary_bytes)) {
+            why = "a checkpoint stage part carries draft certification";
+            return false;
+        }
+        if (!check_draft(c.geometry, c.layer_lo, c.layer_hi, c.record.tokens, c.draft_begin, c.draft_cells,
+                         c.draft_next_token, c.draft_boundary_bytes, c.kv.data(), c.kv.size(), why))
+            return false;
+        if (c.draft_begin >= 0 && c.stage + 1 != meta.stages) {
+            why = "draft certification belongs only to the final stage";
+            return false;
+        }
         if (!c.scope.valid()) {
             why = "a container has no valid authorized scope";
             return false;
@@ -699,6 +771,11 @@ bool check_streams(const ManifestMeta& meta, const ConversationStoreLimits& limi
         // run's admitted capacity, so the retention decode can classify the record as capacity it lacks instead.
         if (slot.buffer >= Buffer::gdn && meta.streams[index].bytes > limits.max_state_bytes) {
             reason = "a state stream is larger than ConversationStoreLimits::max_state_bytes";
+            return false;
+        }
+        if (slot.buffer == Buffer::draft_boundary &&
+            meta.streams[index].bytes != meta.containers[slot.container].draft_boundary_bytes) {
+            reason = "draft boundary stream disagrees with its declared row length";
             return false;
         }
         ++index;
@@ -906,6 +983,9 @@ bool bind_streams(const ManifestMeta& meta, const ConversationStoreLimits& limit
     for (uint32_t s = 0; s < stages; ++s) {
         const ContainerMeta& c = meta.containers[s];
         SavedConversation& image = s == 0 ? out : out.stage_images[s - 1];
+        image.draft_begin = c.draft_begin;
+        image.draft_cells = c.draft_cells;
+        image.draft_next_token = c.draft_next_token;
         image.live.stage_parts.resize(c.record.parts);
         for (uint32_t j = 0; j < c.checkpoints.size(); ++j)
             image.checkpoints[j].stage_parts.resize(c.checkpoints[j].parts);
@@ -987,6 +1067,12 @@ bool bind_streams(const ManifestMeta& meta, const ConversationStoreLimits& limit
                 targets.push_back(target_for(record->imgs));
                 return true;
             }
+            case Buffer::draft_boundary: {
+                SavedConversation& image = slot.container == 0 ? out : out.stage_images[slot.container - 1];
+                image.draft_boundary_residual.resize(size_t(stream.bytes));
+                targets.push_back(target_for(image.draft_boundary_residual, "draft boundary residual"));
+                return true;
+            }
             case Buffer::kv_k:
             case Buffer::kv_v:
             case Buffer::kv_k_scale:
@@ -1050,6 +1136,9 @@ bool container_meta_equal(const ContainerMeta& a, const ContainerMeta& b) {
     if (!(a.scope == b.scope) || !same_record(a.record, b.record) || a.geometry != b.geometry ||
         a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec)
         return false;
+    if (a.draft_begin != b.draft_begin || a.draft_cells != b.draft_cells ||
+        a.draft_next_token != b.draft_next_token || a.draft_boundary_bytes != b.draft_boundary_bytes)
+        return false;
     if (a.checkpoints.size() != b.checkpoints.size()) return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_record(a.checkpoints[i], b.checkpoints[i])) return false;
@@ -1083,6 +1172,7 @@ bool stream_bytes_equal(const StreamSource& a, const StreamSource& b, std::strin
 void seal_record(ConversationCheckpoint& record) { record.seal(); }
 
 void seal_tree(SavedConversation& image) {
+    image.draft_boundary_residual.freeze();
     seal_record(image.live);
     for (auto& checkpoint : image.checkpoints) seal_record(checkpoint);
     for (auto& stage : image.stage_images) seal_tree(stage);
@@ -1184,6 +1274,18 @@ bool image_layout(const SavedConversation& image, const Digest& seed, const Conv
                                       std::memcpy(dst, reinterpret_cast<const uint8_t*>(imgs->data()) + offset, n);
                                       return true;
                                   });
+            }
+            case Buffer::draft_boundary: {
+                const ConversationBuffer* buffer = container.boundary;
+                const uint64_t bytes = buffer->size();
+                return add_stream(slot, bytes, 1,
+                    [buffer, bytes](uint64_t offset, uint8_t* dst, size_t n, std::string& why) {
+                        if (offset > bytes || n > bytes - offset || !buffer->read(dst, size_t(offset), n)) {
+                            why = "a draft boundary residual read failed";
+                            return false;
+                        }
+                        return true;
+                    });
             }
             case Buffer::kv_k:
             case Buffer::kv_v:
@@ -1405,7 +1507,8 @@ uint64_t image_layout_workspace(const ImageShape& shape) {
     uint64_t bytes = 0;
     // build_tree() holds its own roster (a ContainerMeta and two pointer vectors per container) while the layout
     // copies those metadata out, so both exist at once.
-    bytes = sat_add(bytes, sat_mul(shape.containers, 2 * sizeof(ContainerMeta) + 3 * kAllocSlackBytes));
+    bytes = sat_add(bytes, sat_mul(shape.containers, sizeof(TreeContainer) + sizeof(ContainerMeta) +
+                                                   2 * kAllocSlackBytes));
     bytes = sat_add(bytes, sat_mul(shape.records, sizeof(RecordMeta) + kAllocSlackBytes));
     bytes = sat_add(bytes, sat_mul(shape.kv_layers, sizeof(KvMeta) + kAllocSlackBytes));
     // One StreamSource per stream, and one heap block for the closure each source's StreamRead holds.
@@ -1431,7 +1534,17 @@ bool image_shape(const SavedConversation& image, const ConversationStoreLimits& 
         return false;
     }
     // The whole images, in build_tree()'s order: the top image, then every later stage's own image.
+    uint32_t stage_index = 0;
     const auto count_image = [&](const SavedConversation& container) -> bool {
+        if (!check_image_draft(container, stage_index++, uint32_t(image.stage_images.size()) + 1, limits, why))
+            return false;
+        const uint64_t boundary = container.draft_boundary_residual.size();
+        out.certified = out.certified || container.draft_begin != -1;
+        if (boundary) {
+            out.streams = sat_add(out.streams, 1);
+            out.payload_bytes = sat_add(out.payload_bytes, boundary);
+            out.max_stream_bytes = std::max(out.max_stream_bytes, boundary);
+        }
         if (!container.scope.valid()) {
             why = "an image has no valid authorized scope";
             return false;
@@ -1534,6 +1647,7 @@ uint64_t manifest_encoded_size_of(const ManifestShape& shape) {
     uint64_t bytes = 116;
     bytes = sat_add(bytes, 4);                                        // the container count
     bytes = sat_add(bytes, sat_mul(shape.containers, 244));           // 236 fixed + the checkpoint and K/V counts
+    if (shape.certified) bytes = sat_add(bytes, sat_mul(shape.containers, 28));
     bytes = sat_add(bytes, sat_mul(shape.container_records, 21));
     bytes = sat_add(bytes, sat_mul(shape.kv_layers, 96));
     bytes = sat_add(bytes, 4);                                        // the stream count
@@ -1555,15 +1669,18 @@ ManifestShape manifest_shape(const ManifestMeta& meta) {
     for (const auto& stream : meta.streams) shape.chunks = sat_add(shape.chunks, uint64_t(stream.chunks.size()));
     shape.objects = uint64_t(meta.objects.size());
     shape.cuts = uint64_t(meta.cuts.size());
+    for (const auto& c : meta.containers)
+        if (c.draft_begin != -1 || c.draft_cells != -1 || c.draft_next_token != -1 || c.draft_boundary_bytes)
+            shape.certified = true;
     return shape;
 }
 
 uint64_t manifest_encoded_size(const ManifestMeta& meta) { return manifest_encoded_size_of(manifest_shape(meta)); }
 
 uint64_t manifest_workspace_bound(uint64_t encoded_bytes) {
-    // Every decoded element is at most about 1.5x the bytes that encode it (ContainerMeta 300/244, StreamRecord
-    // 48/34, ChunkRecord 48/44, CutRecord 48/42) and each of its vectors carries one allocator header, at most one
-    // per 21 decoded bytes in the manifest's densest section.  Twice the encoding plus a quarter covers both.
+    // Every decoded element, including explicit certification on a legacy-sized container, is less than twice
+    // its encoded bytes. Each vector carries one allocator header, at most one per 21 encoded bytes in the
+    // densest section. Twice the encoding plus a quarter covers both, including legacy 244-byte containers.
     //
     // This is an upper bound for *any* limits set, not only the configured one: every count the decoder accepts is
     // bounded by Reader::count against the bytes left for that section's smallest encoded entry (kContainerEncodedMin
@@ -1588,8 +1705,10 @@ uint64_t manifest_read_workspace_bound(uint64_t encoded_bytes) {
 
 std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
     Writer w;
-    w.reserve(size_t(manifest_encoded_size(meta)));
-    w.raw(kManifestTag, sizeof kManifestTag);
+    const auto shape = manifest_shape(meta);
+    w.reserve(size_t(manifest_encoded_size_of(shape)));
+    const bool certified = shape.certified;
+    w.raw(certified ? kCertifiedManifestTag : kManifestTag, sizeof kManifestTag);
     w.u64(meta.payload_bytes);
     w.u64(meta.epoch);
     w.u64(meta.generation);
@@ -1615,6 +1734,12 @@ std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
         w.i64(c.layer_lo);
         w.i64(c.layer_hi);
         w.u8(c.cvec ? 1 : 0);
+        if (certified) {
+            w.i64(c.draft_begin);
+            w.i64(c.draft_cells);
+            w.u32(uint32_t(c.draft_next_token));
+            w.u64(c.draft_boundary_bytes);
+        }
         w.u32(uint32_t(c.checkpoints.size()));
         for (const auto& checkpoint : c.checkpoints) {
             w.u64(checkpoint.tokens);
@@ -1678,7 +1803,8 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         why = "the manifest is larger than ConversationStoreLimits::max_manifest_bytes";
         return false;
     }
-    if (std::memcmp(bytes, kManifestTag, sizeof kManifestTag) != 0) {
+    const bool certified = std::memcmp(bytes, kCertifiedManifestTag, sizeof kCertifiedManifestTag) == 0;
+    if (!certified && std::memcmp(bytes, kManifestTag, sizeof kManifestTag) != 0) {
         why = "the manifest does not start with the store's schema tag";
         return false;
     }
@@ -1695,7 +1821,7 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         why = "the manifest's header is truncated";
         return false;
     }
-    if (!r.count(count, limits.max_images, kContainerEncodedMin)) {
+    if (!r.count(count, limits.max_images, kContainerEncodedMin + (certified ? 28 : 0))) {
         why = "the manifest's container count is invalid";
         return false;
     }
@@ -1730,6 +1856,15 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
             return false;
         }
         c.cvec = flag != 0;
+        if (certified) {
+            uint32_t token = 0;
+            if (!r.i64(c.draft_begin) || !r.i64(c.draft_cells) || !r.u32(token) ||
+                !r.u64(c.draft_boundary_bytes)) {
+                why = "a manifest's draft certification is truncated";
+                return false;
+            }
+            c.draft_next_token = int32_t(token);
+        }
         uint32_t checkpoints = 0;
         if (!r.count(checkpoints, limits.max_checkpoints, kCheckpointEncodedMin)) {
             why = "a manifest container's checkpoint count is invalid";
@@ -2177,6 +2312,7 @@ bool stream_object_identity(const std::vector<ContainerMeta>& containers, const 
 }
 
 ConversationStoreReadComponent stream_read_component(uint16_t kind, uint64_t object_ordinal) {
+    if (kind == kDraftBoundaryKind) return ConversationStoreReadComponent::draft;
     if (conversation_store_kv_kind(kind) && object_ordinal == (uint64_t{1} << 63))
         return ConversationStoreReadComponent::draft;
     switch (ConversationStoreStreamKind(kind)) {

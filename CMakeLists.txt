@@ -716,8 +716,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         "        sp.on_chunk = " "            // progress for the server window:"
         shared_draft_callback)
       shared_draft_fixture_piece(src/prefill/prefill.cpp
-        "    const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);"
-        "    // per row: emb/e2" shared_draft_batched_range)
+        "    const int64_t r0 = std::min(n, std::max<int64_t>(0, mtp.first_needed(slot) - cell0));"
+        "    auto publish = " shared_draft_batched_range)
       shared_draft_fixture_piece(src/core/mtp.cpp
         "    const int64_t first_needed = " "    // E-4:" shared_draft_first_needed)
       shared_draft_fixture_piece(src/core/mtp.cpp

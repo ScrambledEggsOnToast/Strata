@@ -24,6 +24,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/operation_canary.hpp"
+#include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -106,9 +107,10 @@ public:
     const QsaState& kv_state() const { return st_; }
     /// The same, mutable: the prompt path's batched K/V appends (E-9) write its ring page table and host copy.
     QsaState& kv_state_rw() { return st_; }
-    /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
-    /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
-    void kv_restore(int64_t upto);
+    /// Refill the drafter's resident ring from its authoritative host copy and
+    /// clip certification to the resumed owner. Its last cell consumes the
+    /// destination's token at `upto`; an unknown/mismatching token drops that cell.
+    void kv_restore(int64_t upto, int32_t next_token = -1);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
@@ -216,6 +218,17 @@ public:
     bool slot_covers(int slot, int64_t cells, int64_t prompt_length = 0) const;
     bool advance_slot(int slot, const float* residual, int32_t next_token,
                       int64_t cell, std::string& err);
+    // Drained producer certification; unknown state is never inferred from length.
+    void certify_view(ConversationView& view, int slot = 8) const;
+    void restored_snapshot(const SavedConversation& image, int64_t cells);
+    void invalidate_coverage();
+    // Opt-in seam capture: source rows are copied during their owning operation,
+    // before another verifier/prefill can replace them. -1 disables capture.
+    void set_boundary_capture(int64_t position);
+    bool capture_boundary(const float* residual, int64_t position, uint64_t request, std::string& err);
+    ConversationDraftCoverage completed_coverage() const {
+        return async_owned_ ? ConversationDraftCoverage{} : coverage_;
+    }
     void set_batch_drafting(bool on) { batch_drafting_ = on; }
     bool propose_slot(int slot, const float* residual, int32_t next_token, int64_t cell,
                       int32_t& proposal, std::string& err);
@@ -224,6 +237,7 @@ public:
 private:
     friend class strata::prefill::Prefill;
     friend class strata::program::ResidentSlots;
+    friend struct MtpDrafterCertificationFixture;
     // One host submitter; a failed operation poisons the lease until teardown.
     // A successful operation releases it only after the device stream drains.
     class Operation {
@@ -233,6 +247,8 @@ private:
         ~Operation();
         explicit operator bool() const { return acquired_; }
         bool finish(std::string& err);
+        void writes(int64_t begin, int64_t end, int32_t next_token);
+        bool boundary(const float* rows, int64_t begin, int64_t count, std::string& err);
         void detach() { finished_ = true; owner_.async_owned_ = true; }
     private:
         MtpDrafter& owner_;
@@ -245,6 +261,8 @@ private:
     bool draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                     float* probs, float min_p, int* n_drafts);
     bool restore_ring(int64_t upto, std::string& err);
+    bool catchup_slot(int slot, const ConversationBuffer& residual, int32_t next_token,
+                      int64_t cell, std::string& err);
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err,
                         const QsaState* state = nullptr);
     bool prepare_slots(std::string& err);
@@ -335,6 +353,9 @@ private:
         void* arena = nullptr;
         cudaGraphExec_t advance = nullptr;
         int64_t cells = 0;
+        // Logical main progress may be one cell ahead at ambient admission;
+        // only this independently completed extent can certify draft reuse.
+        int64_t completed_cells = -1;
         int64_t begin = 0, prompt_len = 0;
         bool certified = false;
         int32_t tail_token = -1;
@@ -349,6 +370,14 @@ private:
     std::vector<SlotState> slots_;
     bool batch_drafting_ = false;
     bool async_owned_ = false;
+    ConversationDraftCoverage coverage_, pending_coverage_;
+    uint64_t working_request_ = 0, coverage_owner_ = 0;
+    int pending_slot_ = 8;
+    bool pending_writes_ = false, pending_boundary_ = false;
+    int64_t boundary_capture_ = -1, boundary_position_ = -1;
+    uint64_t boundary_owner_ = 0;
+    ConversationBuffer boundary_residual_;
+    void complete_writes();
     void* arena_ = nullptr;
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,

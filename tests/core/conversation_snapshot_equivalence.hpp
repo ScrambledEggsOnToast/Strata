@@ -15,7 +15,9 @@ inline bool equal(const core::ConversationKv& a, const core::ConversationKv& b) 
 inline bool same_snapshot(const core::SavedConversation& a, const core::SavedConversation& b) {
     if (a.live.ids != b.live.ids || a.live.gdn != b.live.gdn || a.live.ple != b.live.ple ||
         a.live.tails != b.live.tails || a.live.dead != b.live.dead ||
-        a.live.block_pos != b.live.block_pos || a.kv.size() != b.kv.size()) return false;
+        a.live.block_pos != b.live.block_pos || a.kv.size() != b.kv.size() ||
+        a.draft_begin != b.draft_begin || a.draft_cells != b.draft_cells ||
+        a.draft_next_token != b.draft_next_token || a.draft_boundary_residual != b.draft_boundary_residual) return false;
     for (std::size_t i = 0; i < a.kv.size(); ++i)
         if (!equal(a.kv[i], b.kv[i])) return false;
     return true;

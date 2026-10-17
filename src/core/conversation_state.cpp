@@ -257,16 +257,41 @@ bool conversation_session_copy(const SessionState& from, SessionState& to, const
     return sync(error);
 }
 
+namespace {
+bool draft_view_validate(const ConversationView& view, const ModelGeometry& g, bool owns,
+                         size_t& boundary_bytes, std::string& error) {
+    boundary_bytes = 0;
+    const int64_t live = int64_t(view.ids.size());
+    const bool unknown = view.draft_begin == -1 && view.draft_tokens == -1 && view.draft_next_token == -1;
+    if (!unknown && (!owns || view.draft_begin < 0 || view.draft_tokens < view.draft_begin ||
+        view.draft_tokens > live || (view.draft_tokens == live ? view.draft_next_token < 0 :
+                                                                view.draft_next_token != -1)))
+        return fail(error, "incoherent completed draft interval");
+    if (view.draft_boundary_residual) {
+        if (!owns || unknown || view.draft_tokens != live - 1 || !view.draft_owner ||
+            view.draft_boundary_owner != view.draft_owner || view.draft_boundary_position != live - 1 ||
+            !product(boundary_bytes, {uint64_t(g.n_embd), uint64_t(g.hc), sizeof(float)}) ||
+            !boundary_bytes || view.draft_boundary_residual->size() != boundary_bytes ||
+            !view.draft_boundary_residual->frozen())
+            return fail(error, "unowned or wrong-position boundary residual");
+    } else if (view.draft_boundary_position != -1 || view.draft_boundary_owner)
+        return fail(error, "boundary ownership without a residual");
+    if (view.exact_cut && (!view.images.empty() || !view.checkpoints.empty() ||
+        (owns && (unknown || view.draft_tokens != live - 1 ||
+                  (view.draft_owner && !view.draft_boundary_residual)))))
+        return fail(error, "exact cut requires completed N-1 draft cells and its owned boundary residual");
+    return true;
+}
+}
+
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
-    bytes = sizeof(ConversationScope);
+    bytes = sizeof(ConversationScope) + SavedConversation::draft_metadata_bytes;
     if (!view_validate(view, ss, g, error)) return false;
-    if (view.exact_cut && (!view.images.empty() || !view.checkpoints.empty() ||
-        (draft && (view.draft_tokens != int64_t(view.ids.size()) - 1 ||
-                   view.draft_begin < 0 || view.draft_begin > view.draft_tokens ||
-                   view.draft_read_from < 0 || view.draft_read_from > view.draft_begin)) ||
-        (!draft && (view.draft_tokens != -1 || view.draft_begin != 0 || view.draft_read_from != 0))))
-        return fail(error, "exact cut requires N-1 draft cells recomputed from/before its retained start");
+    size_t boundary_bytes = 0;
+    if (!draft_view_validate(view, g, draft != nullptr, boundary_bytes, error)) return false;
+    if (view.draft_boundary_residual && !add(bytes, view.draft_boundary_residual->bytes()))
+        return fail(error, "boundary residual byte count overflow");
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     size_t ids = 0, images = 0, checkpoints = 0, layers = 0, tails = 0, dead = 0, positions = 0;
@@ -337,6 +362,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    if (draft && view.draft_owner) {
+        captured.draft_begin = view.draft_begin; captured.draft_cells = view.draft_tokens;
+        captured.draft_next_token = view.draft_next_token;
+        if (view.draft_boundary_residual)
+            captured.draft_boundary_residual = view.draft_boundary_residual->frozen_alias();
+    }
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     const size_t layers = owned_qsa(ss);
     // The donor's own part lengths, read before the capture resizes those buffers in place: an offered reuse interval
@@ -500,9 +531,22 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
+    size_t boundary_bytes = 0;
+    const bool unknown = image.draft_begin == -1 && image.draft_cells == -1 && image.draft_next_token == -1;
+    if (!unknown && (!draft || image.draft_begin < 0 || image.draft_cells < image.draft_begin ||
+        image.draft_cells > upto || image.draft_cells > image.kv.back().cells ||
+        (image.draft_cells == upto ? image.draft_next_token < 0 : image.draft_next_token != -1)))
+        return fail(error, "incoherent saved draft interval");
+    if (!image.draft_boundary_residual.empty() && (!draft || unknown || image.draft_cells != upto - 1 ||
+        !product(boundary_bytes, {uint64_t(g.n_embd), uint64_t(g.hc), sizeof(float)}) ||
+        !boundary_bytes || image.draft_boundary_residual.size() != boundary_bytes))
+        return fail(error, "invalid saved boundary residual");
     const bool exact = expectation == ConversationSnapshotExpectation::exact_cut;
     if (exact && (!image.live.imgs.empty() || !image.checkpoints.empty()))
         return fail(error, "shared exact cut contains private image/checkpoint metadata");
+    if (exact && draft && !unknown && (image.draft_cells != upto - 1 ||
+                          image.draft_next_token != -1 || image.draft_boundary_residual.empty()))
+        return fail(error, "shared exact cut lacks certified draft coverage/boundary");
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, expectation, error)) return false;
     if (draft && !conversation_kv_validate(image.kv.back(), *draft, g, upto, false, expectation, error)) return false;

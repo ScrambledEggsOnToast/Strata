@@ -82,6 +82,8 @@ enum class ConversationStoreStreamKind : uint16_t {
     kv_k_scale = 24,
     kv_v_scale = 25,
     kv_pooled = 26,
+    // MAN2 only: one position-bound main residual on the draft-owning stage; never a K/V donor.
+    draft_boundary_residual = 27,
 };
 
 inline bool conversation_store_state_kind(uint16_t kind) {
@@ -573,9 +575,10 @@ public:
     void set_unhealthy(const char* reason);      // the owner observed a failure that must stop reuse (e.g. a safety fault)
 
     // The execution domain's current epoch, the issuer key the frontend derives authorized scopes from, and the
-    // durable run-intent marker this owner holds.  The key is 32 bytes of cryptographic entropy and is immutable
-    // after a successful open: an existing store whose key cannot be read or is not exactly 32 bytes stays disabled
-    // rather than minting a new authorization identity.
+    // durable run-intent marker this owner holds. The secret remains exactly 32 bytes of cryptographic entropy,
+    // immutable after successful open. Its existing disk authority accepts a legacy raw secret or a recognized
+    // minimum-reader envelope containing that same secret. Unreadable/unsupported/malformed authority disables
+    // persistence rather than minting a new authorization identity or reconciling histories.
     uint64_t epoch() const;
     const std::array<uint8_t, 32>& issuer_key() const;
     bool run_intent_active() const;

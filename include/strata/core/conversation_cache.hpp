@@ -247,7 +247,31 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+// A single contiguous interval of completed writes. Rewrites abandon the old
+// suffix; a gap starts a new interval, never a min/max union over missing cells.
+struct ConversationDraftCoverage {
+    int64_t begin = -1, cells = -1;
+    int32_t next_token = -1;
+    bool known() const { return begin >= 0 && cells >= begin; }
+    void clear() { begin = cells = -1; next_token = -1; }
+    void completed(int64_t first, int64_t end, int32_t token) {
+        if (first < 0 || end < first) { clear(); return; }
+        if (!known() || first < begin || first > cells) begin = first;
+        cells = end;
+        next_token = end > begin ? token : -1;
+    }
+    void rewind(int64_t end) {
+        if (!known() || end < begin || end > cells) { clear(); return; }
+        if (end != cells) next_token = -1;
+        cells = end;
+    }
+};
+
 struct SavedConversation {
+    // Incremental inline metadata charge for this certification extension.
+    // Embedded stage objects already pay it through their directory capacity.
+    static constexpr size_t draft_metadata_bytes =
+        sizeof(int64_t) * 2 + sizeof(int32_t) + sizeof(ConversationBuffer);
     // RAM-only namespace; session files keep their existing model/config schema.
     ConversationScope scope;
     // Transient sole publication owner; never serialized or propagated to an alias.
@@ -265,6 +289,9 @@ struct SavedConversation {
     int64_t draft_begin = -1, draft_cells = -1;
     // The token consumed with the last retained main residual when draft_cells == live length.
     int32_t draft_next_token = -1;
+    // Immutable R_(live length-1), never the destination's private next token.
+    // Only the draft-owning stage may carry it, with cells == live length-1.
+    ConversationBuffer draft_boundary_residual;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -275,6 +302,7 @@ struct SavedConversation {
         live.freeze();
         for (auto& c : checkpoints) c.freeze();
         for (auto& layer : kv) layer.freeze();
+        draft_boundary_residual.freeze();
         for (auto& stage : stage_images) stage.freeze();
     }
     /// Cheap alias: metadata is copied, every payload is shared with this image
@@ -291,6 +319,7 @@ struct SavedConversation {
         out.cvec = cvec;
         out.draft_begin = draft_begin; out.draft_cells = draft_cells;
         out.draft_next_token = draft_next_token;
+        out.draft_boundary_residual = draft_boundary_residual.frozen_alias();
         out.stage_images.reserve(stage_images.size());
         for (const auto& stage : stage_images) out.stage_images.push_back(stage.frozen_alias());
         return out;
@@ -303,11 +332,12 @@ struct SavedConversation {
     }
 
     size_t bytes() const {
-        size_t n = sizeof(scope) + live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv) +
+        size_t n = sizeof(scope) + draft_metadata_bytes + draft_boundary_residual.bytes() + live.bytes() +
+                   checkpoints.capacity() * sizeof(ConversationCheckpoint) + kv.capacity() * sizeof(ConversationKv) +
                    stage_images.capacity() * sizeof(SavedConversation);
-        // Each directory slot already owns its stage's inline scope.
-        for (const auto& s : stage_images) n += s.bytes() - sizeof(s.scope);
+        // Each directory slot already owns its stage's inline metadata/buffer.
+        for (const auto& s : stage_images)
+            n += s.bytes() - sizeof(s.scope) - draft_metadata_bytes;
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
         return n;
