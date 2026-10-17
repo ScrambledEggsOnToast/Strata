@@ -1758,6 +1758,32 @@ and the exact token/image prefixes it was captured at. Publication order is file
 are superseded roots and unreferenced objects reclaimed. Bytes deduplicate by payload digest, so two separately
 validated manifests can share an identical object.
 
+*Certified manifests and the minimum reader (`STCSMAN2`).* A stored image can now carry the draft layer's **actual
+completed interval** instead of leaving it unknown. An exact shared cut retains cells `[draft_begin, tokens-1)` and one
+immutable main-residual row at position `tokens-1` (stream kind 27, exactly `n_embd * hc * 4` bytes, on the draft-owning
+stage); a private capture may additionally name its own final token. Row `q` consumes `R_q` and token `q+1`, so the
+excluded cell is the first private suffix token: a shared image never persists it, and a full-`N` resume supplies its
+own token and completes exactly one K/V-only cell before advertising `N`. Uncatalogued images and every feature-off
+capture stay `STCSMAN1` with an unknown interval, which the resident source gate refuses at pre-parse time rather than
+treating a cold retry as reuse.
+
+Manifest tags are not a version negotiation. The existing reader classifies an unrecognized manifest tag as *that
+record's* defect and retires it, and it treats an undecodable catalog as an empty catalog while continuing; both
+behaviours delete files. The floor therefore lives in the **existing issuer authority**: `issuer.key` may hold the
+legacy 32-byte secret or a recognized 64-byte `STCSKEY2` envelope that carries the same secret plus a minimum-reader
+value. The secret, the derived scopes and the catalog's issuer digest are unchanged. A legacy reader reads the envelope
+as "not 32 bytes" and refuses in `open_root`, before `read_catalog` and `reconcile`, so it cannot retire a certified
+history. Activation writes that envelope first (charged in full, non-evicting, atomically renamed, with the root and
+`tmp` directories flushed independently of object batching), and only then stages certified bytes; any failure after
+the rename latches a fault and stops publication, deletion and credit until a restart. A certified record that appears
+without the established floor is refused at open.
+
+Activation is an operational cutover, not a runtime detection: before the first certified byte enters a root that any
+legacy binary can open, every binary able to open it must be upgraded, and after that write no legacy binary may be
+pointed at the root again. Rollback uses a compatible reader with the feature off. Applying the catalog gate
+(`scripts/`, deployment) and qualifying a real root are deployment steps; the CPU fixtures here prove classification,
+refusal ordering and byte-exact round trips, not serving behaviour.
+
 Object directory durability is a correctness requirement, not a batching optimization. New objects keep the ordinary
 per-object file/rename/shard-flush path. The writer also flushes `objects/` for an existing shard: a prior `mkdir`
 may have succeeded while its parent flush failed, so directory existence is not proof of durability. An accounted
@@ -1977,6 +2003,7 @@ assertions specify these boundaries rather than matching diagnostic wording:
 | Opt-in retained-orphan revalidation | `check_object_directory_batch`: permission-denied deletion retains newly renamed objects across shard/parent refusal. Retrying must repeat the boundary, retain stable orphan charges and inodes, and succeed with `new_bytes == 0`; clean reopen restores the history byte for byte. Permission-denial cases require an unprivileged account. |
 | Opt-in admission, duplicate, donor and partial drain | The same fixture checks the fixed workspace admission floor, constructs distinct objects sharing a shard and repeats a chunk. A partial-drain fault stays armed on a one-shard batch and fires on a later multi-shard publication; authorized donor/dedup reuse leaves a shard fault armed. |
 | Opt-in selected reader, cancellation and intent distrust | A selected predecessor restores unchanged while its successor is paused before the drain, with no successor manifest or authority. Cancelling that already-started publication leaves its writer active and does not prevent storage after the drain. Orderly destruction without clean close after a refused batch advances the epoch on reopen; this is not abrupt process/power-loss coverage or retained-orphan crash recovery. |
+| Reader-floor activation | `check_draft_reader_floor_failures`: `reader-floor-write`/`-rename` refuse before any certified byte with the legacy key and every history intact; `reader-floor-sync`, `-tmp-sync` and `-allocate` (with and without object flush batching) latch an uncertain pre-rename or post-rename state, publish nothing, delete nothing and refund only a confirmed absent temporary. `check_draft_reader_floor` refuses a malformed, truncated, oversize or future envelope with every file byte unchanged, and proves a compatible feature-off reader still round-trips legacy and certified histories after activation. |
 | Catalog rename and post-rename uncertainty | `check_commit_outcomes`: `catalog-rename` leaves old authority intact; `catalog-sync` and `catalog-apply` retain both catalogs' possible payloads, stop reuse and leave the run intent active while releasing the publication's RAM lease. Restart distrusts both records and reclaims payloads and interrupted scratch writes. |
 | Intent clearing and re-arm | `check_bootstrap_and_intent`: `intent-unlink-sync`, with and without `intent-rearm-sync`, checks the actual marker, its single charge and idempotent close; restart retires the distrusted record and a healthy close removes the marker. Dirty-bootstrap quota refusal is covered separately in the same test. |
 
