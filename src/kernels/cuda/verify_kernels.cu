@@ -74,8 +74,10 @@ __global__ void operation_inputs_check_kernel(core::OperationInputs* expected, c
         const int offset = draft_step < 0 ? t : expected->accepted + draft_step;
         const int cell = expected->position + offset;
         const int token = draft_step > 0 ? *previous : expected->tokens[draft_step < 0 ? t : expected->accepted];
+        const int width = expected->prompt_cap && cell + 1 > (int) expected->prompt_cap
+            ? (int) expected->prompt_cap : cell + 1;
         if (tokens[t] != token || steps[t * 4] != cell || steps[t * 4 + 1] != cell + 1 ||
-            steps[t * 4 + 2] != (cell + 1) / 4 || steps[t * 4 + 3] != cell + 1)
+            steps[t * 4 + 2] != (cell + 1) / 4 || steps[t * 4 + 3] != width)
             scratch->errors |= 256u;
         for (int h = 0; h < heads; ++h)
             if (positions[t * heads + h] != cell) scratch->errors |= 512u;

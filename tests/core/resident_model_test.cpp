@@ -179,6 +179,213 @@ int prefill_split_owner_checks(strata::program::ResidentSlots& owner, strata::co
         return 1;
     }
 }
+
+// Opt-in lifecycle vehicle over the real resident allocation and verifier rows.
+// Prefix rows use the verifier only to supply genuine final residuals to the
+// uncaptured destination MTP front; packed arithmetic is exercised by BGENQ.
+int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
+        const strata::core::ModelGeometry& geometry, strata::core::SessionState& main,
+        strata::core::SessionState& a, strata::core::SessionState& b, strata::core::MtpDrafter& draft,
+        strata::core::Verifier& verifier, strata::core::PoolMultiFn pool, void* pool_user) {
+    using namespace strata;
+    std::string error;
+    int checks = 0;
+    auto require = [&](bool ok, const char* message) {
+        ++checks;
+        if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
+    };
+    auto fingerprint = [&](core::SessionState& session, const core::QsaState& kv, int64_t cells) {
+        program::SessionFingerprint result;
+        require(program::session_fingerprint(session, kv, geometry, cells, result, error),
+                "read actual owner payload");
+        return result;
+    };
+    const auto same = [](const auto& left, const auto& right) {
+        return left.gdn == right.gdn && left.ple == right.ple && left.kv == right.kv && left.draft == right.draft;
+    };
+    try {
+        const char* enabled = std::getenv("STRATA_PACKED_PREFILL");
+        require(enabled && std::strcmp(enabled, "1") == 0 && owner.slots().size() >= 2 &&
+                owner.available(0) && owner.available(1) && draft.slot_state(0) && draft.slot_state(1),
+                "direct preparation fixture needs exact packed opt-in and initialized real owners");
+        const auto ambient = fingerprint(main, draft.kv_state(), 2);
+        const auto untouched_a = fingerprint(a, *draft.slot_state(0), 2);
+        const auto untouched_b = fingerprint(b, *draft.slot_state(1), 2);
+        const auto working_request = owner.working().request;
+        const auto ambient_request = dispatch.request_generation;
+        const std::vector<int64_t> tokens_a{11, 22, 33}, tokens_b{44};
+        program::ResidentRequest request_a, request_b;
+        request_a.max_new = 1; request_a.scope.value[0] = 91; request_a.pin = 1;
+        request_b.max_new = 2; request_b.scope.value[0] = 92;
+        request_a.sampling.greedy = request_b.sampling.greedy = true;
+        request_a.sampling.temperature = request_b.sampling.temperature = 0;
+        const program::ResidentPrepareInput inputs[]{{0, &tokens_a, request_a}, {1, &tokens_b, request_b}};
+        program::ResidentPreparation leases[2];
+        const program::ResidentPrepareInput duplicate[]{{0, &tokens_a, request_a}, {0, &tokens_b, request_b}};
+        require(!owner.reserve(duplicate, 2, leases, error) && !owner.slots()[0].request &&
+                !owner.slots()[1].request, "duplicate atomic reservation leaves both owners unpublished");
+        const core::ExpertOperation operation{71, 0, 0, 1, 1};
+        auto& ledger = dispatch.completion.at(0);
+        require(ledger.begin(operation, 0) && ledger.retain_submission(operation), "retain actual operation lease");
+        require(!owner.reserve(inputs, 2, leases, error), "reservation refuses launched consumers");
+        ledger.cancel();
+        require(!owner.reserve(inputs, 2, leases, error) && !owner.slots()[0].request,
+                "cancelling a consumer is not a reservation drain");
+        require(ledger.drain_submission(operation) && ledger.release(operation), "drain and release actual consumer");
+        require(owner.reserve(inputs, 2, leases, error), "atomically reserve two independent physical owners");
+        require(leases[0].request != leases[1].request && leases[0].incarnation && leases[1].incarnation &&
+                leases[0].endpoint == 2 && leases[1].endpoint == 0 && owner.active() &&
+                !owner.available(0) && !owner.available(1) && !owner.slots()[0].active &&
+                !owner.completed_snapshot_source(0, error) && !owner.release_resources(error),
+                "reserved owners exclude ordinary admission, snapshots and resource release");
+        require(same(untouched_a, fingerprint(a, *draft.slot_state(0), 2)) &&
+                same(untouched_b, fingerprint(b, *draft.slot_state(1), 2)),
+                "CPU reservations perform no destination writes before independent ACK publication");
+        require(owner.prepare(leases[0], error) && owner.prepare(leases[1], error),
+                "bind identities and directly reset each physical owner");
+        require(draft.slot_cells(0) == 0 && draft.slot_begin(0) == 0 && draft.slot_prompt_len(0) == 3 &&
+                draft.slot_cells(1) == 0 && a.ple_prev[0] == -1 && a.ple_prev[1] == -1 &&
+                b.ple_prev[0] == -1 && b.ple_prev[1] == -1,
+                "destination reset includes owner-specific draft interval and PLE history");
+        const auto quiet_b = fingerprint(b, *draft.slot_state(1), 2);
+        const auto row = [&](int slot, int32_t token, int64_t position) {
+            int32_t picked = -1;
+            require(verifier.run_slot_rows(&slot, 1, &token, &position, pool, pool_user, &picked, error) &&
+                    verifier.commit_slots(error) && verifier.context_idle(error) && !dispatch.failed,
+                    "execute and commit an actual physical verifier row");
+            return picked;
+        };
+        core::ConversationCheckpoint first_cut;
+        const auto prefix = [&](const program::ResidentPreparation& lease, int64_t position) {
+            const auto& state = owner.slots()[(size_t) lease.slot];
+            const int32_t token = state.prompt[(size_t) position];
+            const int32_t next = state.prompt[(size_t) position + 1];
+            (void) row(lease.slot, token, position);
+            require(draft.prefill_slot(lease.slot, verifier.final_R(0), &next, 1, position, error) &&
+                    owner.prefilled(lease, position + 1, error),
+                    "uncaptured short-span draft front certifies only its actual destination interval");
+            core::ConversationCheckpoint cut;
+            cut.ids = owner.slots()[(size_t) lease.slot].ids;
+            auto& session = lease.slot ? b : a;
+            require(core::conversation_checkpoint_save(cut, session, geometry, error) &&
+                    owner.checkpoint(lease, cut, error), "retain bounded checkpoint from actual committed prefix");
+            if (!position) first_cut = cut.frozen_alias();
+        };
+        require(owner.prefilled(leases[0], 0, error) && owner.prefilled(leases[1], 0, error),
+                "empty prefixes certify the n-1 endpoint of a one-token prompt");
+        prefix(leases[0], 0);
+        prefix(leases[0], 1);
+        require(same(quiet_b, fingerprint(b, *draft.slot_state(1), 2)),
+                "one owner's real prefix and MTP writes do not touch its peer");
+        auto stale = leases[0];
+        ++stale.incarnation;
+        require(!owner.prefilled(stale, 2, error), "stale physical incarnation cannot publish a frontier");
+        auto foreign = leases[0];
+        foreign.stages[0] = &b;
+        require(!owner.prefilled(foreign, 2, error), "swapped physical owner cannot publish a frontier");
+        const int32_t first = row(0, 33, 2);
+        owner.cancel(0); // cancellation after issue still owes mandatory draft catchup
+        require(!owner.abort_preparation(leases[0], error) && owner.slots()[0].preparing,
+                "final verifier commitment cannot be aborted before draft catchup");
+        require(owner.first_token(leases[0], first, verifier.final_R(0), error) &&
+                draft.slot_cells(0) == 3 && owner.slots()[0].p == 3 && owner.slots()[0].produced == 1 &&
+                owner.slots()[0].stop && owner.slots()[0].ids == std::vector<int32_t>({11, 22, 33}),
+                "max_new1 and cancellation publish only after final prompt and draft advance exactly once");
+        require(!owner.first_token(leases[0], first, verifier.final_R(0), error) && owner.finish(0, error),
+                "first-token lease is consumed once and its coherent cancelled state may finish");
+        const int32_t second = row(1, 44, 0);
+        require(owner.first_token(leases[1], second, verifier.final_R(0), error) && draft.slot_cells(1) == 1,
+                "one-token prompt includes its mandatory first-token draft cell");
+        const int32_t third = row(1, second, 1);
+        require(owner.committed(1, third, verifier.final_R(0), error) && draft.slot_cells(1) == 2 &&
+                owner.slots()[1].p == 2 && owner.slots()[1].produced == 2 && owner.finish(1, error),
+                "ordinary post-first-token commitment continues the same actual physical state");
+        const auto peer = fingerprint(b, *draft.slot_state(1), 2);
+        const std::vector<core::ConversationImageKey> images;
+        core::SavedConversation image;
+        const auto& completed = owner.slots()[0];
+        require(core::conversation_snapshot_save(image, {completed.ids, images, completed.checks, completed.cvec},
+                                                 a, geometry, *draft.slot_state(0), error),
+                "capture real source snapshot for post-ACK direct restore");
+        const int64_t saved_draft_begin = draft.slot_begin(0), saved_draft_cells = draft.slot_cells(0);
+        const int32_t saved_draft_next = draft.slot_next_token(0);
+        image.scope = request_a.scope;
+        image.freeze();
+        const std::vector<int64_t> branch{11, 22, 77};
+        program::ResidentPreparation rewind;
+        require(owner.prepare(0, branch, request_a, rewind, error) && rewind.position == 1 &&
+                owner.slots()[0].p == 1 && draft.slot_cells(0) == 1 && draft.slot_begin(0) == 0 &&
+                a.ple_prev[0] == -1 && a.ple_prev[1] == 11,
+                "retained divergent suffix rewinds recurrent state, draft cells and PLE into its own destination");
+        core::ConversationCheckpoint rewound;
+        rewound.ids = {11};
+        require(core::conversation_checkpoint_save(rewound, a, geometry, error) &&
+                rewound.gdn == first_cut.gdn && rewound.ple == first_cut.ple &&
+                rewound.tails == first_cut.tails && rewound.dead == first_cut.dead &&
+                rewound.block_pos == first_cut.block_pos,
+                "direct retained rewind restores the original real checkpoint payloads");
+        owner.cancel(0);
+        require(owner.abort_preparation(rewind, error) && owner.available(0) &&
+                !owner.prefilled(rewind, 1, error) && !owner.completed_snapshot_source(0, error),
+                "drained cancellation discards unpublished owner and invalidates its old lease");
+        const int32_t boundary = saved_draft_next == 88 ? 89 : 88;
+        const std::vector<int64_t> extension{11, 22, 33, boundary};
+        const program::ResidentPrepareInput restore_input{0, &extension, request_a};
+        program::ResidentPreparation restored;
+        require(owner.reserve(&restore_input, 1, &restored, error) && restored.position == 0,
+                "reserve and ACK a cold seat before materializing its store source");
+        image.cvec = false;
+        const auto before_refusal = fingerprint(a, *draft.slot_state(0), 2);
+        require(!owner.prepare(restored, &image, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
+                owner.slots()[0].preparing && !owner.slots()[0].failed &&
+                same(before_refusal, fingerprint(a, *draft.slot_state(0), 2)),
+                "whole-source preflight refusal writes no physical destination");
+        image.cvec = true;
+        require(!owner.prepare(restored, &image, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
+                error.find("resident preparation: source draft reuse refused:") == 0 &&
+                owner.slots()[0].p == 0 && owner.slots()[0].preparing && !owner.slots()[0].failed &&
+                same(before_refusal, fingerprint(a, *draft.slot_state(0), 2)),
+                "uncertified external draft source is an explicit pre-write refusal, not qualified cold reuse");
+        // These are receipts from this fixture's actual capture, not invented
+        // interval bounds. Persistent propagation is owned by the store vehicle.
+        image.draft_begin = saved_draft_begin;
+        image.draft_cells = saved_draft_cells;
+        image.draft_next_token = saved_draft_next;
+        require(owner.prepare(restored, &image, nullptr, core::ConversationSnapshotExpectation::ordinary, error) &&
+                owner.slots()[0].p == 2 && draft.slot_cells(0) == 2 &&
+                a.ple_prev[0] == 11 && a.ple_prev[1] == 22,
+                "post-ACK source override restores its actual coherent cut, not the reserved start or live endpoint");
+        prefix(restored, 2);
+        const int32_t last = row(0, boundary, 3);
+        require(owner.first_token(restored, last, verifier.final_R(0), error) &&
+                draft.slot_cells(0) == 4 && owner.finish(0, error),
+                "restored suffix reaches a coherent first token through the production lifecycle");
+        require(same(peer, fingerprint(b, *draft.slot_state(1), 2)) &&
+                same(ambient, fingerprint(main, draft.kv_state(), 2)) &&
+                owner.working().request == working_request && dispatch.request_generation == ambient_request,
+                "direct prep, suffix rewind and restore preserve peer and ambient ownership and payloads");
+        program::ResidentPreparation failed;
+        const program::ResidentPrepareInput failure_input{0, &branch, request_a};
+        require(owner.reserve(&failure_input, 1, &failed, error) && failed.position == 1 && a.ple_hist,
+                "select real retained checkpoint for terminal partial-write refusal");
+        transfer_failed = false;
+        fail_destination = a.ple_hist;
+        require(!owner.prepare(failed, error) && transfer_failed && owner.slots()[0].failed &&
+                !owner.available(0) && !owner.slots()[0].preparing &&
+                !owner.completed_snapshot_source(0, error),
+                "partial destination rewind failure leaves only that physical seat unavailable");
+        require(same(peer, fingerprint(b, *draft.slot_state(1), 2)) &&
+                same(ambient, fingerprint(main, draft.kv_state(), 2)) && owner.release_resources(error),
+                "failed destination neither changes peer/ambient state nor strands drained resource release");
+        std::printf("PACKED_RESIDENT_CHECKS checks=%d actual_verifier=1 direct_prepare=1 short_mtp=1 "
+                    "rewind=1 max_new1=1 cancel_after_issue=1 partial_write=1 external_store_qualified=0 failures=0\n", checks);
+        return 0;
+    } catch (const std::exception& exception) {
+        fail_destination = nullptr;
+        std::fprintf(stderr, "PACKED_RESIDENT_CHECKS checks=%d failures=1 error=%s\n", checks, exception.what());
+        return 1;
+    }
+}
 } // namespace
 
 int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::ExpertDispatch& dispatch,
@@ -195,6 +402,8 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
     };
     try {
         if (std::getenv("STRATA_TEST_PREFILL_SPLIT_OWNER")) return prefill_split_owner_checks(owner, main);
+        if (std::getenv("STRATA_TEST_PACKED_RESIDENT"))
+            return packed_resident_checks(owner, dispatch, geometry, main, a, b, draft, verifier, pool, pool_user);
         if (std::getenv("STRATA_TEST_MIXED_RESIDENCY")) {
             // Exercise the production Verifier, not a single-sequence parity
             // kernel or a hand-written imitation of its row compaction.
@@ -365,6 +574,7 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
             for (auto* part : {&marker.k,&marker.v,&marker.k_scale,&marker.v_scale})
                 require(part->visit(0,part->size(),[](uint8_t* p,size_t n,size_t){std::memset(p,0x3c,n);return true;}),
                         "mark each real draft payload run");
+            require(draft.bind_request(0, 1000, error), "bind standalone draft transfer fixture destination");
             require(core::conversation_kv_restore(marker,draft.kv_state(),geometry,2,false,error) &&
                     draft.save_slot(0,2,error),"save marked working draft into host-backed slot ring");
             uint64_t hash=0;

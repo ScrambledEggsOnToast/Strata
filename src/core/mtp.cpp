@@ -175,11 +175,24 @@ bool MtpDrafter::idle(std::string& err) {
 bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
     const OnDevice on(device_);
     if (!g_) return true;
+    if (!request || (slot != 8 && !slot_state(slot))) {
+        err = "mtp: invalid request destination"; return false;
+    }
     if (scratch_owned_.test_and_set(std::memory_order_acquire)) {
         err = "mtp: owner rebind while scratch is in flight or poisoned"; return false;
     }
     const bool ok = canary_.bind(slot, request, err);
-    if (ok) scratch_owned_.clear(std::memory_order_release);
+    if (ok) {
+        if (slot != 8) {
+            auto& target = slots_[(size_t) slot];
+            if (target.request != request) {
+                target.proposal = target.proposal_token = -1;
+                target.proposal_cell = -1;
+            }
+            target.request = request;
+        }
+        scratch_owned_.clear(std::memory_order_release);
+    }
     return ok;
 }
 
@@ -1155,6 +1168,7 @@ bool MtpDrafter::init_slots(const std::vector<SessionState*>& sessions, std::str
     slots_.resize(sessions.size());
     for (size_t i = 0; i < sessions.size(); ++i) {
         auto& slot = slots_[i];
+        slot.session = sessions[i];
         if (!sessions[i] || sessions[i]->max_cells != st_.max_cells ||
             cudaMalloc(&slot.arena, bytes) != cudaSuccess) {
             err = "mtp: resident request K/V allocation failed"; return false;
@@ -1199,8 +1213,120 @@ const QsaState* MtpDrafter::slot_state(int slot) const {
     return slot >= 0 && (size_t) slot < slots_.size() ? &slots_[(size_t) slot].state : nullptr;
 }
 
+int64_t MtpDrafter::first_needed(int slot) const {
+    const int64_t length = slot == 8 ? prompt_len_ : slot_prompt_len(slot);
+    return window_ > 0 && length > 0 ? std::max<int64_t>(0, length - window_ - 64) : 0;
+}
+
+int64_t MtpDrafter::slot_cells(int slot) const {
+    return slot_state(slot) ? slots_[(size_t) slot].cells : -1;
+}
+
+int64_t MtpDrafter::slot_begin(int slot) const {
+    return slot_state(slot) ? slots_[(size_t) slot].begin : -1;
+}
+
+int64_t MtpDrafter::slot_prompt_len(int slot) const {
+    return slot_state(slot) ? slots_[(size_t) slot].prompt_len : -1;
+}
+
+int32_t MtpDrafter::slot_next_token(int slot) const {
+    return slot_state(slot) ? slots_[(size_t) slot].tail_token : -1;
+}
+
+bool MtpDrafter::slot_covers(int slot, int64_t cells, int64_t prompt_length) const {
+    if (!slot_state(slot)) return false;
+    const auto& target = slots_[(size_t) slot];
+    if (cells < 0 || cells > target.cells || prompt_length < 0 ||
+        prompt_length > target.state.max_cells || (prompt_length && cells >= prompt_length)) return false;
+    const int64_t end = prompt_length ? prompt_length : cells + 1;
+    const int64_t needed = window_ > 0 ? std::max<int64_t>(0, end - window_) : 0;
+    return target.request && target.certified && target.begin >= 0 && target.begin <= std::min(cells, needed);
+}
+
+bool MtpDrafter::prepare_slot(int slot, uint64_t request, int64_t prompt_length,
+                             int64_t cells, bool reset, std::string& err) {
+    if (!slot_state(slot) || !request || slots_[(size_t) slot].request != request ||
+        prompt_length < 1 || prompt_length > slots_[(size_t) slot].state.max_cells ||
+        cells < 0 || cells >= prompt_length || (reset ? cells != 0 : !slot_covers(slot, cells, prompt_length))) {
+        err = "mtp: invalid direct destination preparation or retained interval"; return false;
+    }
+    const OnDevice on(device_);
+    Operation operation(*this, err, slot);
+    if (!operation) return false;
+    auto& target = slots_[(size_t) slot];
+    if (reset) qsa_state_zero(target.state, *g_, cs_);
+    else if (target.state.kv_mode == 2 && cells > 0) {
+        const auto shapes = shapes_of(*g_);
+        const int64_t end = (cells + shapes.page_size - 1) / shapes.page_size;
+        const int64_t begin = std::max<int64_t>(0, end - target.state.n_slots);
+        if (!strata::kernels::kv_ring_restore(qsa_attn_pools(target.state), target.state.host,
+                qsa_kv_format(target.state), begin, end, target.state.n_slots, shapes, cs_, err)) return false;
+    }
+    if (!operation.finish(err)) return false;
+    target.cells = cells;
+    target.prompt_len = prompt_length;
+    if (reset) target.begin = 0;
+    target.certified = true;
+    target.tail_token = -1;
+    target.proposal = target.proposal_token = -1;
+    target.proposal_cell = -1;
+    return true;
+}
+
+bool MtpDrafter::prefill_slot(int slot, const float* residuals, const int32_t* next_tokens,
+                             int64_t rows, int64_t position, std::string& err) {
+    if (!g_ || !wt_ || !slot_state(slot) || !slots_[(size_t) slot].request || !slots_[(size_t) slot].certified ||
+        !residuals || !next_tokens || rows < 0 || position < 0 ||
+        position != slots_[(size_t) slot].cells ||
+        position > slots_[(size_t) slot].prompt_len - 1 ||
+        rows > slots_[(size_t) slot].prompt_len - 1 - position || max_t_ < 1) {
+        err = "mtp: invalid direct prompt interval"; return false;
+    }
+    const OnDevice on(device_);
+    Operation operation(*this, err, slot);
+    if (!operation) return false;
+    const auto start = Clock::now();
+    auto& target = slots_[(size_t) slot];
+    const int64_t skipped = std::min(rows, std::max<int64_t>(0, first_needed(slot) - position));
+    canary_.expect_inputs((uint32_t) ((rows - skipped + max_t_ - 1) / max_t_));
+    const int64_t HCN = g_->hc * g_->n_embd;
+    for (int64_t offset = skipped; offset < rows; offset += max_t_) {
+        const int count = (int) std::min<int64_t>(max_t_, rows - offset);
+        for (int row = 0; row < count; ++row) {
+            const int32_t cell = (int32_t) (position + offset + row);
+            h_tok_[row] = next_tokens[offset + row];
+            h_step_[4 * row] = cell; h_step_[4 * row + 1] = cell + 1;
+            h_step_[4 * row + 2] = (cell + 1) / 4; h_step_[4 * row + 3] = cell + 1;
+            for (int64_t head = 0; head < g_->n_head; ++head)
+                h_pos_[row * g_->n_head + head] = cell;
+        }
+        canary_.stage_inputs(next_tokens + offset, count, (int32_t) (position + offset), 0, cs_);
+        strata::kernels::copy_i32_from_mapped(tok_, m_tok_, count, cs_);
+        strata::kernels::copy_i32_from_mapped(step_, m_step_, count * 4, cs_);
+        strata::kernels::copy_i32_from_mapped(pos_, m_pos_, count * g_->n_head, cs_);
+        canary_.check_inputs(tok_, step_, pos_, count, (int) g_->n_head, cs_);
+        if (cudaMemcpyAsync(Rin_, residuals + offset * HCN, (size_t) count * HCN * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+            !record_front(count, 0, cs_, err, &target.state) || !idle(err)) {
+            if (err.empty()) err = "mtp: direct prompt front failed";
+            return false;
+        }
+        // The fixed mapped input rows are reused only after their own stream
+        // drains. No capture, allocation, ambient K/V or global fence is needed.
+    }
+    if (!operation.finish(err)) return false;
+    target.cells = position + rows;
+    if (skipped) target.begin = std::max(target.begin, position + skipped);
+    if (rows > 0) target.tail_token = skipped < rows ? next_tokens[rows - 1] : -1;
+    target.proposal = target.proposal_token = -1;
+    target.proposal_cell = -1;
+    ms_prefill += ms_since(start);
+    return true;
+}
+
 bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
-    if (!slot_state(slot) || cells < 0 || cells > st_.max_cells) {
+    if (!slot_state(slot) || !slots_[(size_t) slot].request || cells < 0 || cells > st_.max_cells) {
         err = "mtp: invalid slot save"; return false;
     }
     const OnDevice on_device(device_);
@@ -1221,9 +1347,20 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
             !conversation_kv_restore(image, target, *g_, cells, false, err)) return false;
     }
-    slots_[(size_t) slot].cells = cells;
-    slots_[(size_t) slot].proposal = -1;
     const bool ok = operation.finish(err);
+    if (ok) {
+        auto& target = slots_[(size_t) slot];
+        target.cells = cells;
+        // The ambient path has no certified logical interval yet. Preserve its
+        // existing execution behavior, but never advertise guessed skipped rows
+        // as a direct-preparation source.
+        target.begin = -1;
+        target.certified = false;
+        target.tail_token = -1;
+        target.prompt_len = prompt_len_;
+        target.proposal = target.proposal_token = -1;
+        target.proposal_cell = -1;
+    }
     if (ok) observed.complete();
     if (timing && ok)
         std::fprintf(stderr, "strata admission timing: slot=%d component=draft_kv_transfer device=%d items=%lld "
@@ -1233,7 +1370,8 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
 }
 
 bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
-    if (!slot_state(slot) || cells < 0 || cells > slots_[(size_t) slot].cells) {
+    if (!slot_state(slot) || !slots_[(size_t) slot].request || cells < slots_[(size_t) slot].begin ||
+        cells < 0 || cells > slots_[(size_t) slot].cells) {
         err = "mtp: invalid slot resume extent"; return false;
     }
     const OnDevice on_device(device_);
@@ -1257,7 +1395,10 @@ bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
 bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_token,
                               int64_t cell, std::string& err) {
     if (!slot_state(slot) || !slots_[(size_t) slot].advance || !residual ||
-        cell != slots_[(size_t) slot].cells || cell >= st_.max_cells) {
+        next_token < 0 || next_token >= n_vocab_ || cell < 0 ||
+        cell != slots_[(size_t) slot].cells ||
+        (slots_[(size_t) slot].certified && !slot_covers(slot, cell)) ||
+        cell >= slots_[(size_t) slot].state.max_cells) {
         err = "mtp: resident slot position or graph mismatch"; return false;
     }
     const OnDevice on_device(device_);
@@ -1274,18 +1415,35 @@ bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_toke
         if (err.empty()) err = "mtp: resident slot advance failed";
         return false;
     }
-    ++slots_[(size_t) slot].cells;
-    if (batch_drafting_) slots_[(size_t) slot].proposal = h_out_[0];
-    return operation.finish(err);
+    if (batch_drafting_ && (h_out_[0] < 0 || h_out_[0] >= n_vocab_)) {
+        err = "mtp: resident graph returned an invalid proposal"; return false;
+    }
+    if (!operation.finish(err)) return false;
+    auto& target = slots_[(size_t) slot];
+    ++target.cells;
+    target.tail_token = next_token;
+    target.proposal = batch_drafting_ ? h_out_[0] : -1;
+    target.proposal_cell = batch_drafting_ ? cell : -1;
+    target.proposal_token = batch_drafting_ ? next_token : -1;
+    return true;
 }
 
 bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_token, int64_t cell,
                               int32_t& proposal, std::string& err) {
     if (!batch_drafting_ || !slot_state(slot) || !slots_[(size_t) slot].advance || !residual ||
-        cell < 0 || cell != slots_[(size_t) slot].cells - 1) {
+        next_token < 0 || next_token >= n_vocab_ ||
+        cell < 0 || cell != slots_[(size_t) slot].cells - 1 ||
+        (slots_[(size_t) slot].certified && !slot_covers(slot, cell))) {
         err = "mtp: resident proposal position or prepared graph mismatch"; return false;
     }
-    if (slots_[(size_t) slot].proposal >= 0) { proposal = slots_[(size_t) slot].proposal; return true; }
+    if (!context_idle(err)) return false;
+    auto& target = slots_[(size_t) slot];
+    if (target.proposal >= 0 && target.proposal < n_vocab_ &&
+        target.proposal_cell == cell && target.proposal_token == next_token) {
+        proposal = target.proposal; return true;
+    }
+    target.proposal = target.proposal_token = -1;
+    target.proposal_cell = -1;
     const OnDevice on_device(device_);
     Operation operation(*this, err, slot, nullptr, next_token, (int32_t) cell);
     if (!operation) return false;
@@ -1299,8 +1457,14 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
         if (err.empty()) err = "mtp: resident proposal failed";
         return false;
     }
+    if (h_out_[0] < 0 || h_out_[0] >= n_vocab_) {
+        err = "mtp: resident graph returned an invalid proposal"; return false;
+    }
     proposal = h_out_[0];
-    slots_[(size_t) slot].proposal = proposal;
+    target.tail_token = next_token;
+    target.proposal = proposal;
+    target.proposal_cell = cell;
+    target.proposal_token = next_token;
     return true;
 }
 

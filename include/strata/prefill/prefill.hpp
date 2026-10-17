@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/segments.hpp"
 
 #include <cstdint>
 #include <atomic>
@@ -113,9 +114,12 @@ public:
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
     /// device, too little scratch; STRATA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not bit-identical to
     /// that pass (FP16 GEMMs instead of Q8_1 activations): the drafts may differ, never the target's tokens' logits.
+    /// A resident destination requires its active on_segment lease: residual and next-token pointers, slot,
+    /// interval and prompt length must match that owner. A harmless decline uses MtpDrafter::prefill_slot,
+    /// never the ambient working draft state. Slot 8 retains the scalar on_chunk interface.
     /// `why` (optional): on a decline (false, `err` empty) the reason, a static string.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                  std::string& err, const char** why = nullptr);
+                  std::string& err, const char** why = nullptr, int slot = 8, int64_t prompt_length = 0);
     Prefill();
     ~Prefill();
     Prefill(const Prefill&) = delete;
@@ -267,6 +271,19 @@ public:
     bool run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
                     const std::function<bool(Prefill*, std::string&)>& step);
 
+    /// Same arithmetic as run(), with disjoint owner intervals in one union-row chunk. The command predicate
+    /// is checked only before stage 0 issues a pack; pending commands drain the issued chain and return
+    /// certified owner frontiers, not cancellation. No callback or descriptor outlives this call.
+    /// Owner request/incarnation/physical session mappings must have been registered by bind_owner before
+    /// preparation writes. Each owner's next_tokens certifies the residual/position+1-token pair for MTP.
+    SegmentedResult run_segments(const OwnerSpan* owners, int count, std::string& err,
+                                 const std::function<bool()>& command_pending);
+    bool bind_owner(int slot, uint64_t request, uint64_t incarnation,
+                    const std::array<core::SessionState*, 4>& sessions, std::string& err);
+    std::function<bool(const OwnerSpan&, size_t stage, uint64_t execution, int64_t frontier,
+                       std::string& err)> on_segment_stage;
+    std::function<bool(Prefill&, const OwnerSpan&, const float* residual, std::string& err)> on_segment;
+
     /// One arithmetic chunk, with the live stack/arena retained at layer boundaries.
     /// step runs on the caller thread before each stage and after each layer's
     /// compute/copy completion. It must return with that device's decode work
@@ -375,13 +392,18 @@ private:
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
-    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                  const OwnerSegment* segments = nullptr, int segment_count = 0, uint64_t execution = 0);
     bool drain_pipeline(std::string& err);
     const std::function<bool(Prefill*, int64_t, std::string&)>* retained_step_ = nullptr;
     bool retained_layer_yields_ = true;
     bool retained_boundary(int64_t next_layer, std::string& err, bool bulk_complete = true);
     bool local_idle(std::string& err) const;
     std::atomic<bool> public_running_{false};
+    Prefill* segment_root_ = nullptr;
+    SegmentedResult* segment_result_ = nullptr;
+    const OwnerSpan* segment_inputs_ = nullptr;
+    int segment_input_count_ = 0;
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;

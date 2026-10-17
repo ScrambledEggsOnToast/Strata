@@ -982,6 +982,7 @@ class StrataEngine:
         if "score_waiters" not in self.__dict__:
             self.score_waiters = 0
         self.score_q = {}
+        self.packed_q = {}               # immutable tags, scoped to this native incarnation
         self.score_control = {"id": None}
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
@@ -1173,6 +1174,68 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _route_packed(self, line, owners):
+        if not line.startswith(("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ")):
+            return False
+        fields = line.split()
+        if len(line) > 8192 or len(fields) < 4:
+            raise ValueError("malformed packed generation frame")
+        kind, tag = fields[:2]
+        with self.slot_cv:
+            owner = owners.get(tag)
+            if owner is None or owner["terminal"] or int(fields[2]) != owner["slot"]:
+                raise ValueError("unknown, retired or mismatched packed generation owner")
+            if kind == "BQREJECT":
+                if owner["identity"] is not None:
+                    raise ValueError("packed refusal after reservation")
+                owner["terminal"] = True
+            else:
+                if len(fields) < 5:
+                    raise ValueError("missing packed generation identity")
+                identity = (int(fields[3]), int(fields[4]))
+                if min(identity) <= 0:
+                    raise ValueError("invalid packed generation identity")
+                if kind == "BACK":
+                    if owner["identity"] is not None or len(fields) != 5:
+                        raise ValueError("duplicate or malformed packed reservation")
+                    owner["identity"] = identity
+                elif owner["identity"] != identity:
+                    raise ValueError("packed reply crossed a request incarnation")
+                if kind == "BQDONE":
+                    if len(fields) != 14 or not fields[13].startswith("prompt_read="):
+                        raise ValueError("incomplete packed terminal")
+                    generated, prompt = int(fields[5]), int(fields[6])
+                    accepted, offered, reused = map(int, fields[10:13])
+                    fresh = int(fields[13].split("=", 1)[1])
+                    times = tuple(map(float, fields[7:9]))
+                    if (generated != owner["committed"] or not 0 <= generated <= owner["max_new"] or
+                            prompt != owner["prompt_tokens"] or not 0 <= accepted <= offered or
+                            not 0 <= reused < prompt or not owner["fresh"] <= fresh <= prompt - reused or
+                            (generated and fresh + reused != prompt) or
+                            fields[9] not in ("stop", "length", "cancel", "nonfinite") or
+                            any(not math.isfinite(value) or value < 0 for value in times)):
+                        raise ValueError("packed terminal exceeded or crossed its request boundary")
+                    owner["terminal"] = True
+                elif kind == "BQT":
+                    if len(fields) != 6 or not fields[5].isdigit():
+                        raise ValueError("malformed packed token")
+                    owner["committed"] += 1
+                    if owner["committed"] > owner["max_new"]:
+                        raise ValueError("packed owner exceeded its generated-token budget")
+                elif kind == "BQPP":
+                    if len(fields) != 8 or not all(f.isdigit() for f in fields[5:]):
+                        raise ValueError("malformed packed progress")
+                    position, prompt, fresh = map(int, fields[5:8])
+                    if (prompt != owner["prompt_tokens"] or not 0 <= position < prompt or
+                            not owner["fresh"] <= fresh <= position):
+                        raise ValueError("packed progress crossed its request boundary")
+                    owner["fresh"] = fresh
+            try:
+                owner["queue"].put_nowait(line)
+            except queue.Full:
+                raise ValueError("packed owner exceeded its admitted reply bound") from None
+        return True
+
     def _route_score(self, line, queues):
         if not line.startswith(("SADMIT ", "SDONE ")):
             return False
@@ -1316,6 +1379,7 @@ class StrataEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         score_q = getattr(self, "score_q", {})
+        packed_q = getattr(self, "packed_q", {})
         score_control = getattr(self, "score_control", {"id": None})
         policy = getattr(self, "speculation_policy", None)  # this process's cost state, never a restarted successor's
         line = None
@@ -1338,6 +1402,8 @@ class StrataEngine:
             if policy is not None:
                 policy.wire(line)
             try:
+                if self._route_packed(line, packed_q):
+                    continue
                 if self._route_score(line, score_q):
                     continue
                 if score_control["id"] is not None:
@@ -1353,7 +1419,9 @@ class StrataEngine:
                         raise ValueError("wrong score terminal/control line: " + line.strip()[:80])
             except ValueError as error:
                 if self.proc is proc:
-                    self.silent_note = "Score protocol failure: " + str(error)
+                    prefix = ("Packed protocol failure: " if line.startswith(
+                        ("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ")) else "Score protocol failure: ")
+                    self.silent_note = prefix + str(error)
                     self.ended = True
                 try:
                     proc.terminate()
@@ -1376,6 +1444,11 @@ class StrataEngine:
             q.put(None)
         with self.slot_cv:
             for owner in score_q.values():
+                try:
+                    owner["queue"].put_nowait(None)
+                except queue.Full:
+                    pass
+            for owner in packed_q.values():
                 try:
                     owner["queue"].put_nowait(None)
                 except queue.Full:
@@ -1991,7 +2064,9 @@ class StrataEngine:
                     if cancel.is_set():
                         return False
                     # Exclusive reason precedence: selector/deadline, physical slot, occupied control.
-                    ready = turn and (not getattr(self, "foreground_budget_s", 0) or slot_ready is None or slot_ready())
+                    slot_gate = (getattr(self, "foreground_budget_s", 0) or
+                                 (getattr(self, "info", {}) or {}).get("packed_prefill") == 1)
+                    ready = turn and (not slot_gate or slot_ready is None or slot_ready())
                     if ready and self.ctl.acquire(blocking=False):
                         if self.alive():
                             break
@@ -2060,6 +2135,147 @@ class StrataEngine:
             finally:
                 local.native_work = previous
 
+    def _generate_packed(self, ids, max_new, sampling, cancel):
+        """Reserve one tagged native owner, then release admission control at BACK, before prefill."""
+        sampling = sampling or {}
+        priority = sampling.get("strata_priority", "foreground")
+        if priority not in ("foreground", "background"):
+            raise ValueError("strata_priority must be foreground or background")
+        scope = sampling.get("_strata_cache_scope", "")
+        on_phase = sampling.get("_strata_frontend_phase")
+        ready = lambda: self.pick_slot(ids, scope) is not None
+        acquired = yield from self._take_control(
+            cancel, len(ids), sampling.get("_strata_control_ready"), sampling.get("_strata_native_waiting"),
+            priority, slot_ready=ready, foreground_pending=sampling.get("_strata_foreground_pending"),
+            on_phase=on_phase)
+        if not acquired:
+            return
+        holding, sent, done, stopped = True, False, False, False
+        born, owners = self.gen, self.packed_q
+        busy, claims, held = self.slot_busy, self.slot_claims, self.slot_held
+        live_slots, used, scopes = self.slot_live, self.slot_used, self.slot_scope
+        tag, slot, owner, output = uuid.uuid4().hex, None, None, []
+        heard = time.monotonic()
+        allow = min(float(self.silence_s or 1800), 1800.0)
+        def cancel_owner():
+            nonlocal stopped
+            if sent and not stopped and self.gen == born and self.alive():
+                identity = owner["identity"] or (0, 0)
+                self._send(f"BQCANCEL {tag} {slot} {identity[0]} {identity[1]}")
+                stopped = True
+        def terminal(line):
+            nonlocal done
+            fields = line.split()
+            done = True
+            if fields[0] == "BQREJECT":
+                held[slot] = []
+                raise ValueError(" ".join(fields[3:]))
+            self._parse_done("DONE " + " ".join(fields[5:13]), slot=slot)
+            self.last["prompt_read"] = int(fields[13].split("=", 1)[1])
+            self.last["legs"] = [_native_leg("packed", self.last, slot)]
+            work = getattr(getattr(self, "_tl", None), "native_work", None)
+            if work is not None:
+                work.batch_done(self.last)
+            held[slot] = list(ids) + output[:-1] if output else []
+            if self.last.get("finish") == "nonfinite":
+                held[slot] = []
+                raise EngineNonFinite("the engine's logits became non-finite (#879)")
+        try:
+            with self.slot_cv:
+                slot = self.pick_slot(ids, scope)
+                if slot is None:
+                    raise EngineDied("packed reservation lost its physical slot")
+                busy[slot] = True
+                claims.add(slot)
+                owner = {"slot": slot, "identity": None, "terminal": False, "committed": 0, "fresh": 0,
+                         "prompt_tokens": len(ids), "max_new": int(max_new),
+                         "queue": queue.Queue(maxsize=self.max_context + 8)}
+                owners[tag] = owner
+                live = {"slot": slot, "state": "reserving", "prompt_tokens": len(ids), "generated": 0,
+                        "started": time.time(), "first_token": None, "request_id": sampling.get("_strata_request_id")}
+                live_slots[slot] = live
+                scopes[slot] = scope
+            on_slot = sampling.get("_strata_slot")
+            if callable(on_slot):
+                on_slot(slot)
+            keys = self.sampling_keys(sampling) + self._phase_keys(sampling, slot)
+            self._send(f"BGENQ1 {tag} {slot} {int(max_new)} priority={priority}{keys} "
+                       + ",".join(str(int(token)) for token in ids))
+            sent = True
+            on_submit = sampling.get("_strata_submitted")
+            if callable(on_submit):
+                on_submit(slot)
+            while not done:
+                if self.gen != born:
+                    raise EngineDied("the engine restarted during packed generation")
+                if cancel.is_set():
+                    cancel_owner()
+                try:
+                    line = owner["queue"].get(timeout=0.5)
+                except queue.Empty:
+                    if not self.alive():
+                        raise EngineDied("the engine stopped during packed generation")
+                    if time.monotonic() - heard >= allow:
+                        raise self._silent("packed owner did not produce its next reply")
+                    yield None
+                    continue
+                if line is None:
+                    raise EngineDied("the engine closed a packed generation owner")
+                heard = time.monotonic()
+                fields = line.split()
+                if fields[0] == "BACK":
+                    live["state"] = "reading"
+                    self._release_control()
+                    holding = False
+                elif fields[0] == "BQT":
+                    token = int(fields[5])
+                    output.append(token)
+                    live.update(state="decoding", generated=len(output))
+                    if live["first_token"] is None:
+                        live["first_token"] = time.time()
+                    if not cancel.is_set():
+                        yield token
+                elif fields[0] == "BQPP":
+                    live["prompt_read"] = int(fields[5])
+                    yield None
+                else:
+                    terminal(line)
+        finally:
+            if callable(on_phase):
+                on_phase("cleanup")
+            if holding:
+                self._release_control()
+            # A consumer may stop at EOS without advancing to BQDONE. Its exact
+            # tagged terminal, never another slot's control line, retires the claim.
+            try:
+                if sent and not done and self.gen == born and self.alive():
+                    cancel_owner()
+                    until = time.monotonic() + min(allow, 300.0)
+                    while not done and self.gen == born and self.alive():
+                        left = until - time.monotonic()
+                        if left <= 0:
+                            raise self._silent("packed cancellation did not drain its tagged terminal")
+                        try:
+                            line = owner["queue"].get(timeout=min(left, 0.5))
+                        except queue.Empty:
+                            continue
+                        if line is None:
+                            break
+                        fields = line.split()
+                        if fields[0] == "BQT":
+                            output.append(int(fields[5]))
+                        elif fields[0] in ("BQDONE", "BQREJECT"):
+                            terminal(line)
+            finally:
+                with self.slot_cv:
+                    owners.pop(tag, None)
+                    if slot is not None:
+                        busy[slot] = False
+                        claims.discard(slot)
+                        live_slots[slot] = None
+                        used[slot] = time.time()
+                    self.slot_cv.notify_all()
+
     def _generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
@@ -2071,6 +2287,10 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if ((self.info or {}).get("packed_prefill") == 1 and
+                (self.info or {}).get("packed_prefill_version") == 1 and not embeddings):
+            yield from self._generate_packed(ids, max_new, sampling, cancel)
+            return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         priority = (sampling or {}).get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):

@@ -3,6 +3,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/program/prefix_selection.hpp"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -56,9 +57,10 @@ void apply_request_sampling(const ResidentWorking& owner, Verifier& verifier, Ve
 // Read-only to the scheduler. The vector objects and graph-referenced sessions
 // never move while bound. Token storage is reserved once per admitted slot.
 struct ResidentSlot {
-    bool active = false, stop = false, foreground = true;
+    bool active = false, preparing = false, stop = false, foreground = true;
     kernels::SamplerParams sampling;
     uint64_t request = 0;
+    uint64_t incarnation = 0;
     int32_t x = 0;
     int32_t draft = -1;
     int64_t p = 0, produced = 0, max_new = 0;
@@ -78,7 +80,7 @@ struct ResidentSlot {
 
     // Called only after the operation owner certifies this row's drain.
     void complete(bool cache_enabled) {
-        active = false;
+        active = preparing = false;
         prefill_split_until = 0;
         cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed && !tainted;
     }
@@ -91,7 +93,7 @@ struct ResidentSlot {
         partial = false;
     }
     bool reusable(const core::ConversationScope& scope, bool steering) const {
-        return !active && !failed && cached && request && cvec == steering && input.scope.matches(scope);
+        return !active && !preparing && !failed && cached && request && cvec == steering && input.scope.matches(scope);
     }
 };
 
@@ -102,6 +104,8 @@ public:
     const ResidentSlot& owner;
     std::vector<core::ConversationCheckpoint>& checkpoints;
     const core::QsaState* draft;
+    const int64_t draft_begin, draft_cells;
+    const int32_t draft_next_token;
 
     const core::SessionState& session(size_t stage) const {
         return *stages_[stage].slots[(size_t) slot_];
@@ -109,8 +113,9 @@ public:
 private:
     friend class ResidentSlots;
     ResidentSnapshotSource(ResidentSlot& owner, const std::vector<ResidentStage>& stages,
-                           const core::QsaState* draft, int slot)
-        : owner(owner), checkpoints(owner.checks), draft(draft), stages_(stages), slot_(slot) {}
+                           const core::QsaState* draft, int slot, int64_t begin, int64_t cells, int32_t next)
+        : owner(owner), checkpoints(owner.checks), draft(draft), draft_begin(begin), draft_cells(cells),
+          draft_next_token(next), stages_(stages), slot_(slot) {}
     const std::vector<ResidentStage>& stages_;
     int slot_;
 };
@@ -126,6 +131,27 @@ struct ResidentAdmission {
     int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
     int64_t prefill_split_until = 0; // park only; zero once the selected interval has finished
 };
+
+// A physical seat incarnation, not an ambient working-session handle. Tokens
+// and stage destinations remain stable until first_token or abort_preparation.
+struct ResidentPreparation {
+    int slot = -1;
+    uint64_t request = 0, incarnation = 0;
+    int64_t position = 0, endpoint = 0;
+    std::array<core::SessionState*, 4> stages{};
+};
+
+struct ResidentPrepareInput {
+    int slot = -1;
+    const std::vector<int64_t>* tokens = nullptr;
+    ResidentRequest request;
+    const core::SavedConversation* snapshot = nullptr;
+    const core::ConversationCheckpoint* cut = nullptr;
+    core::ConversationSnapshotExpectation expectation = core::ConversationSnapshotExpectation::ordinary;
+};
+
+// Only these pre-write source refusals permit retrying the original reservation.
+enum class ResidentSourceRefusal { none, uncertified_interval, incoherent_boundary };
 
 // One host submitter, the same as Verifier. Scheduling and protocol emission
 // remain outside; callers never rebind identity/history/dispatch/MTP separately.
@@ -164,6 +190,21 @@ public:
     bool init_resources(std::string& error);
     bool release_resources(std::string& error);
     bool admit(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request, std::string& error);
+    // CPU-only, all-or-none reservation of distinct seats. Publish protocol ACKs
+    // after reserve, before prepare performs any destination write.
+    bool reserve(const ResidentPrepareInput* inputs, int count, ResidentPreparation* leases, std::string& error);
+    bool prepare(const ResidentPreparation& lease, std::string& error);
+    bool prepare(const ResidentPreparation& lease, const core::SavedConversation* snapshot,
+                 const core::ConversationCheckpoint* cut, core::ConversationSnapshotExpectation expectation,
+                 std::string& error, ResidentSourceRefusal* refusal = nullptr);
+    bool prepare(int slot, const std::vector<int64_t>& tokens, const ResidentRequest& request,
+                 ResidentPreparation& lease, std::string& error);
+    // Drained segmented work publishes only its certified prefix. The final
+    // prompt token belongs to a separate verifier row, followed by first_token.
+    bool prefilled(const ResidentPreparation& lease, int64_t frontier, std::string& error);
+    bool checkpoint(const ResidentPreparation& lease, core::ConversationCheckpoint& cut, std::string& error);
+    bool first_token(const ResidentPreparation& lease, int32_t next, const float* residual, std::string& error);
+    bool abort_preparation(const ResidentPreparation& lease, std::string& error);
     bool park(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request,
               bool from_start, std::string& error);
     // No transfers, synchronization or owner mutation. Prices the selected
@@ -183,6 +224,26 @@ public:
     bool finish(int slot, std::string& error, bool diagnostic = true);
 private:
     enum class Resources { released, ready, failed };
+    struct PreparationSource {
+        const core::SavedConversation* image = nullptr;
+        const core::ConversationCheckpoint* cut = nullptr;
+        core::ConversationSnapshotExpectation expectation = core::ConversationSnapshotExpectation::ordinary;
+        int rewind = -1;
+        int32_t tail_token = -1;
+        bool retained = false, ready = false, mutated = false;
+    };
+    bool preparation_valid(const ResidentPreparation& lease, std::string& error) const;
+    bool validate_checkpoint(const core::ConversationCheckpoint& cut, int slot, std::string& error) const;
+    template<class Token>
+    bool select_checkpoints(const std::vector<core::ConversationCheckpoint>& cuts,
+                            const std::vector<Token>& tokens, int64_t limit, int slot,
+                            std::vector<core::ConversationCheckpoint>& selected, std::string& error) const;
+    template<class Token>
+    bool validate_source(const core::SavedConversation& image, const core::ConversationCheckpoint*& cut,
+                         core::ConversationSnapshotExpectation expectation, int slot,
+                         const std::vector<Token>& tokens, const ResidentRequest& request,
+                         std::vector<core::ConversationCheckpoint>& selected, int64_t& position,
+                         std::string& error, ResidentSourceRefusal* refusal = nullptr) const;
     bool idle(std::string& error);
     bool slot_idle(int slot, std::string& error);
     bool retained(int slot) const;
@@ -201,6 +262,7 @@ private:
     core::ExpertDispatch& dispatch_;
     std::vector<ResidentSlot> slots_;
     int64_t context_;
+    std::vector<PreparationSource> preparations_;
     int64_t checkpoint_chain_limit_;
     uint64_t checkpoint_byte_limit_;
     ResidentWorking working_;

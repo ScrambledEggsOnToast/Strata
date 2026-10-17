@@ -14,6 +14,7 @@ class Throughput:
         self.buckets = collections.deque()
         self.prefill_supported = prefill_supported
         self.fresh = None
+        self.packed_fresh = {}
 
     def wire(self, line):
         fields = line.split()
@@ -50,6 +51,32 @@ class Throughput:
                 elif fields[0] == 'DONE':
                     # Legacy DONE totals use cache-resume accounting, not actual re-read work.
                     self.fresh = None
+                elif fields[0] == 'BACK' and len(fields) == 5:
+                    if len(self.packed_fresh) >= 4 or fields[1] in self.packed_fresh:
+                        self.prefill_supported = False
+                        return
+                    self.packed_fresh[fields[1]] = (tuple(fields[2:5]), 0)
+                elif fields[0] in ('BQPP', 'BQDONE'):
+                    identity, previous = self.packed_fresh.get(fields[1], (None, None))
+                    if identity != tuple(fields[2:5]):
+                        self.prefill_supported = False
+                        return
+                    fresh = int(fields[7] if fields[0] == 'BQPP' else fields[13].removeprefix("prompt_read="))
+                    if fresh < previous:
+                        self.prefill_supported = False
+                        return
+                    prefill = fresh - previous
+                    if fields[0] == 'BQDONE':
+                        self.packed_fresh.pop(fields[1])
+                    else:
+                        self.packed_fresh[fields[1]] = (identity, fresh)
+                elif fields[0] == 'BQT' and len(fields) == 6:
+                    identity, _ = self.packed_fresh.get(fields[1], (None, None))
+                    if identity != tuple(fields[2:5]):
+                        self.prefill_supported = False
+                        return
+                    if int(fields[5]) >= 0:
+                        decode = 1
                 elif fields[0] == 'T' and len(fields) == 2:
                     if int(fields[1]) >= 0:
                         decode = 1
@@ -59,7 +86,7 @@ class Throughput:
                 else:
                     return
             except (ValueError, IndexError):
-                if fields[0] in ('RESUME', 'PP') or (fields[0] == 'INFO' and 'fresh_prompt_tokens=' in line):
+                if fields[0] in ('RESUME', 'PP', 'BACK', 'BQPP', 'BQDONE', 'BQT') or (fields[0] == 'INFO' and 'fresh_prompt_tokens=' in line):
                     self.prefill_supported = False
                     self.fresh = None
                 return

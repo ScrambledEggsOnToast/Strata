@@ -66,6 +66,24 @@ class ThroughputTests(unittest.TestCase):
         t.wire('DONE 1 2001 1 1 stop 0 0 2000 0 0 0 0 0 1')
         self.assertEqual(t.snapshot()['prefill_tok_s'],30.2)
 
+    def test_tagged_owners_count_fresh_rows_and_final_prompt_token_independently(self):
+        counter = Throughput(True)
+        counter.wire("BACK first 0 11 1")
+        counter.wire("BACK second 1 22 1")
+        counter.wire("BQPP first 0 11 1 1020 1100 20")
+        counter.wire("BQPP second 1 22 1 5 6 5")
+        counter.wire("BQPP first 0 11 1 1020 1100 20")
+        counter.wire("BQT second 1 22 1 9")
+        counter.wire("BQDONE second 1 22 1 1 6 1 1 length 0 0 0 prompt_read=6")
+        counter.wire("BQDONE first 0 11 1 0 1100 1 0 cancel 0 0 1000 prompt_read=20")
+        self.assertAlmostEqual(counter.snapshot()["prefill_tok_s"], 26 / 5)
+        self.assertAlmostEqual(counter.snapshot()["decode_tok_s"], 1 / 5)
+        self.assertEqual(counter.packed_fresh, {})
+        counter.wire("BACK successor 0 33 2")
+        counter.wire("BQT successor 0 11 1 9")
+        self.assertAlmostEqual(counter.snapshot()["decode_tok_s"], 1 / 5)
+        self.assertIsNone(counter.snapshot()["prefill_tok_s"])
+
     def test_reread_ignores_legacy_done_total(self):
         t=Throughput(True)
         t.wire('RESUME 1000')

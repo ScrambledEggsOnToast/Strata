@@ -51,11 +51,13 @@ def reader():
             lines.put(l)
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
-print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
+print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 or ("--packed" in args and fit == 1) else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 if "--says-multiplex" in args:
     print("INFO resident_multiplex=1", flush=True)
 print("INFO score=1 score_version=1 score_max_prompt=4096 score_max_selected=256 score_max_pending=8", flush=True)
+if "--packed" in args:
+    print("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4", flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
 if "--says-spec" in args:
@@ -79,7 +81,31 @@ stopped = set()      # BSTOPped slots: they end "cancel"
 # #879: a prompt with NFSOLO / NFADMIT ends its first GEN / BGEN with DONE ... nonfinite (nothing emitted); one with
 # NFSLOT ends its slot with BDONE ... nonfinite after its second token
 fired, nf_slots = set(), set()
+packed, packed_cache, packed_serial = {}, {}, 0
+def packed_window():
+    for b, owner in list(packed.items()):
+        tag, request, incarnation, ids, limit, tokens, generated, cancelled, scope, reuse = owner
+        if not cancelled and hold and os.path.exists(hold):
+            continue
+        prefix = f"{tag} {b} {request} {incarnation}"
+        if cancelled:
+            finish = "cancel"
+        else:
+            token = tokens.pop(0) if tokens else 257
+            generated.append(token)
+            wire_request = request + 1 if "--packed-wrong-id" in args else request
+            print(f"BQT {tag} {b} {wire_request} {incarnation} {token}", flush=True)
+            finish = "stop" if token == 257 else "length" if len(generated) >= limit else None
+        if finish:
+            read = len(ids) - reuse if generated else 0
+            print(f"BQDONE {prefix} {len(generated)} {len(ids)} 5 1 {finish} 0 0 {reuse} prompt_read={read}", flush=True)
+            if generated:
+                packed_cache[b] = (scope, list(map(int, ids)) + generated[:-1])
+            if log:
+                log.write(f"BQDONE {tag} {b} {finish}\n"); log.flush()
+            del packed[b]
 def window():        # one batch window: every active slot one token
+    packed_window()
     if hold and os.path.exists(hold):
         return
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
@@ -116,7 +142,7 @@ def score_done(request_id, status, result):
 parked = {}
 while True:
     try:
-        line = lines.get(timeout=STEP if active else None)
+        line = lines.get(timeout=STEP if active or packed else None)
     except queue.Empty:
         line = ""
     if line is None or line == "QUIT":
@@ -131,6 +157,33 @@ while True:
         if b in active:
             active[b][1] = 0
             stopped.add(b)
+        continue
+    if line.startswith("BQCANCEL "):
+        fields = line.split()
+        tag, slot, request, incarnation = fields[1], int(fields[2]), int(fields[3]), int(fields[4])
+        owner = packed.get(slot)
+        if owner and owner[0] == tag and ((request, incarnation) == (0, 0) or (request, incarnation) == tuple(owner[1:3])):
+            owner[7] = True
+        continue
+    if line.startswith("BGENQ1 "):
+        fields = line.split()
+        tag, slot, max_new, ids = fields[1], int(fields[2]), int(fields[3]), fields[-1].split(",")
+        if slot in packed:
+            print(f"BQREJECT {tag} {slot} physical slot is not free", flush=True)
+            continue
+        packed_serial += 1
+        scope = next((f[6:] for f in fields[4:-1] if f.startswith("scope=")), "")
+        old_scope, cached = packed_cache.get(slot, ("", []))
+        reuse = 0
+        if scope and scope == old_scope:
+            while reuse < min(len(ids) - 1, len(cached)) and int(ids[reuse]) == cached[reuse]:
+                reuse += 1
+        packed[slot] = [tag, packed_serial, packed_serial, ids, max_new, reply(ids), [], False, scope, reuse]
+        if log:
+            log.write(f"BGENQ {tag} {slot} {len(ids)}\n"); log.flush()
+        print(f"BACK {tag} {slot} {packed_serial} {packed_serial}", flush=True)
+        if "--packed-duplicate-ack" in args:
+            print(f"BACK {tag} {slot} {packed_serial} {packed_serial}", flush=True)
         continue
     if line.startswith("SCORE "):
         _, request_id, payload = line.split(" ", 2)
@@ -2088,6 +2141,122 @@ class ParallelService(unittest.TestCase):
         t.join(60)
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["live"]["queued"], 0)
+
+
+class PackedTransport(unittest.TestCase):
+    """Real HTTP/frontend transport coverage; arithmetic is exercised by the native interleave vehicle."""
+    start = ParallelService.start
+    tearDown = ParallelService.tearDown
+    chat = ParallelService.chat
+    get = ParallelService.get
+
+    def wait_until(self, predicate, seconds=5):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            if predicate():
+                return
+            time.sleep(.005)
+        self.fail("packed transport did not reach its bounded condition")
+
+    def test_one_effective_slot_still_uses_the_tagged_native_path(self):
+        self.start(1, more=("--packed",))
+        self.assertEqual(self.engine.batch, 1)
+        reply = self.chat("one general slot", max_tokens=1)
+        self.assertEqual(reply["usage"]["completion_tokens"], 1)
+        self.assertIn("BGENQ ", self.log.read_text())
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertFalse(self.engine.packed_q)
+
+    def test_reservation_ack_releases_control_before_prefill_with_four_general_slots(self):
+        with tempfile.TemporaryDirectory() as root:
+            hold = Path(root) / "prefill-held"
+            hold.touch()
+            self.start(4, more=("--packed", "--hold-replies", str(hold), "--says-budget"))
+            replies, errors = {}, []
+            def request(index):
+                try:
+                    replies[index] = self.chat(f"owner-{index} " + "different prompt " * (index + 1),
+                                               max_tokens=1, priority="background" if index == 3 else "foreground")
+                except Exception as error:
+                    errors.append(error)
+            threads = [threading.Thread(target=request, args=(index,)) for index in range(4)]
+            try:
+                for thread in threads:
+                    thread.start()
+                self.wait_until(lambda: self.log.exists() and self.log.read_text().count("BGENQ ") == 4)
+                self.wait_until(lambda: not self.engine.ctl.locked())
+                self.assertEqual(sum(self.engine.slot_busy), 4)
+                self.assertEqual(replies, {}, "ACK must not pretend the prompt or first token completed")
+                self.assertEqual(len(self.engine.packed_q), 4)
+                self.assertTrue(all(owner["identity"] is not None for owner in self.engine.packed_q.values()))
+            finally:
+                hold.unlink(missing_ok=True)
+                for thread in threads:
+                    thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(replies), 4)
+            self.assertTrue(all(reply["usage"]["completion_tokens"] == 1 for reply in replies.values()))
+            self.assertFalse(any(self.engine.slot_busy))
+            self.assertFalse(self.engine.packed_q)
+
+    def test_cancel_during_prefill_is_owner_local_and_request_reuse_gets_a_new_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            hold = Path(root) / "prefill-held"
+            hold.touch()
+            self.start(2, more=("--packed", "--hold-replies", str(hold), "--slotcache"))
+            cancels = [threading.Event(), threading.Event()]
+            results, errors = {}, []
+            def request(index):
+                try:
+                    tokens = list(self.engine.generate_batched(
+                        [20 + index, 40 + index, 60 + index], 1,
+                        {"_strata_cache_scope": ("a" if index == 0 else "b") * 64}, cancels[index]))
+                    results[index] = ([token for token in tokens if token is not None], dict(self.engine.last))
+                except Exception as error:
+                    errors.append(error)
+            threads = [threading.Thread(target=request, args=(index,)) for index in range(2)]
+            try:
+                for thread in threads:
+                    thread.start()
+                self.wait_until(lambda: len(self.engine.packed_q) == 2 and
+                                all(owner["identity"] is not None for owner in self.engine.packed_q.values()))
+                old = set(self.engine.packed_q)
+                cancels[0].set()
+                self.wait_until(lambda: 0 in results)
+                self.assertEqual(results[0][0], [])
+                self.assertEqual(results[0][1]["finish"], "cancel")
+                self.assertNotIn(1, results)
+            finally:
+                hold.unlink(missing_ok=True)
+                for thread in threads:
+                    thread.join(10)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results[1][0]), 1)
+            replacement = list(self.engine.generate_batched(
+                [21, 41, 61, 70], 1, {"_strata_cache_scope": "b" * 64}, threading.Event()))
+            self.assertEqual(len([token for token in replacement if token is not None]), 1)
+            tags = {line.split()[1] for line in self.log.read_text().splitlines() if line.startswith("BGENQ ")}
+            self.assertEqual(len(tags), 3)
+            self.assertEqual(len(tags - old), 1)
+            self.assertGreater(self.engine.last["reused"], 0)
+            self.assertFalse(any(self.engine.slot_busy))
+            self.assertFalse(self.engine.ctl.locked())
+
+    def test_mismatched_identity_and_duplicate_ack_fail_closed(self):
+        for flag in ("--packed-wrong-id", "--packed-duplicate-ack"):
+            with self.subTest(flag=flag):
+                self.start(2, more=("--packed", flag))
+                try:
+                    with self.assertRaises(urllib.error.HTTPError) as failed:
+                        self.chat("must keep exact correlation", max_tokens=1)
+                    with failed.exception as response:
+                        self.assertEqual(response.code, 503)
+                    self.assertFalse(self.engine.alive())
+                    self.assertFalse(any(self.engine.slot_busy))
+                finally:
+                    self.tearDown()
+                    self.httpd = self.engine = self.tmp = None
 
 
 class ScoreTransport(unittest.TestCase):

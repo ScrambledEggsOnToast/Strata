@@ -2991,6 +2991,7 @@ Verifier::ScratchGuard::~ScratchGuard() {
 bool Verifier::fail_operation(std::string& err) {
     if (!released_.load()) err += released_note(release_gpu_waits(5000));
     scratch_.poison();
+    for (auto& row : committed_slot_row_) row = {};
     b_running_ = false;
     return false;
 }
@@ -3044,6 +3045,7 @@ bool Verifier::set_slot_context(int slot, uint64_t request_id, const strata::ker
         }
     if (next_ && !next_->set_slot_context(slot, request_id, sp, history, steering, err)) return false;
     validated_slot_id_[slot] = 0;
+    committed_slot_row_[slot] = {};
     slot_sp_[(size_t) slot] = sp;
     slot_history_[slot] = history;
     slot_steering_[slot] = steering ? 1 : 0;
@@ -3133,6 +3135,18 @@ bool Verifier::check_canaries(bool commit, std::string& err) {
             std::fprintf(stderr, "STATE_CANARY request=%llu identity=%s slot=%d row=%d rows=%d epoch=%llu phase=%s checked=1\n",
                 (unsigned long long) expected.request_id, expected.request_id ? "bound" : "unbound", expected.slot, t, last_t_,
                 (unsigned long long) expected.epoch, commit ? "commit" : "window");
+    }
+    // Commit canaries also cover rejected speculative suffix rows. Publish only
+    // accepted rows, after every canary has passed; solo commits have no batch mask.
+    if (commit && last_batch_) {
+        const int64_t stride = 2 + max_t_;
+        int first = 0;
+        for (int t = 0; t < last_t_; ++t) {
+            const auto& expected = expected_canary_[t];
+            if (t == 0 || expected.slot != expected_canary_[t - 1].slot) first = t;
+            if (t - first < h_commitb_[(size_t) expected.slot * stride])
+                committed_slot_row_[expected.slot] = expected;
+        }
     }
     return true;
 }
@@ -3827,6 +3841,7 @@ bool Verifier::release_batch_resources(std::string& err) {
     std::vector<strata::kernels::SamplerParams>().swap(slot_sp_);
     for (int i = 0; i < 8; ++i) {
         slot_request_id_[i] = validated_slot_id_[i] = 0;
+        committed_slot_row_[i] = {};
         slot_history_[i] = nullptr;
     }
     last_batch_ = false; last_t_ = 0;

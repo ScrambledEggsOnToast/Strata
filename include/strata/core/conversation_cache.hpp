@@ -260,6 +260,11 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    // Certified populated draft interval, not the rounded allocation extent.
+    // Unknown coverage must refuse direct source reuse before any destination write.
+    int64_t draft_begin = -1, draft_cells = -1;
+    // The token consumed with the last retained main residual when draft_cells == live length.
+    int32_t draft_next_token = -1;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -284,6 +289,8 @@ struct SavedConversation {
         out.kv.reserve(kv.size());
         for (const auto& layer : kv) out.kv.push_back(layer.frozen_alias());
         out.cvec = cvec;
+        out.draft_begin = draft_begin; out.draft_cells = draft_cells;
+        out.draft_next_token = draft_next_token;
         out.stage_images.reserve(stage_images.size());
         for (const auto& stage : stage_images) out.stage_images.push_back(stage.frozen_alias());
         return out;

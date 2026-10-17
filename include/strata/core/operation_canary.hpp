@@ -57,6 +57,7 @@ public:
     }
     void begin(int slot, cudaStream_t stream, int32_t token = 0, int32_t position = 0) {
         if (!scratch_) return;
+        expected_checks_ = -1;
         expected_ = {ids_[slot], ++epoch_, slot, token, position, 0};
         *host_ = expected_;
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -73,11 +74,14 @@ public:
                                       nullptr, scratch_, nullptr, output(mapped_), 1, stream);
         cudaMemcpyAsync(input_checks(host_), &inputs()->checks, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
     }
-    void stage_inputs(const int32_t* tokens, int rows, int32_t position, int accepted, cudaStream_t stream) {
+    void expect_inputs(int checks) { expected_checks_ = checks; }
+    void stage_inputs(const int32_t* tokens, int rows, int32_t position, int accepted, cudaStream_t stream,
+                      uint32_t prompt_cap = 0) {
         if (!scratch_) return;
         OperationInputs value;
         value.request_id = expected_.request_id; value.epoch = expected_.epoch;
         value.position = position; value.accepted = accepted;
+        value.prompt_cap = prompt_cap;
         for (int t = 0; t < rows; ++t) value.tokens[t] = tokens[t];
         kernels::operation_inputs_stage(value, inputs(), stream);
     }
@@ -89,7 +93,8 @@ public:
     }
     bool validate(const char* resource, std::string& err) const {
         if (!scratch_) return true;
-        if (!verify_canary_matches(*output(host_), expected_, 1)) {
+        if (!verify_canary_matches(*output(host_), expected_, 1) ||
+            (expected_checks_ >= 0 && *input_checks(host_) != (uint32_t) expected_checks_)) {
             err = std::string(resource) + ": shared operation canary mismatch"; return false;
         }
         if (std::getenv("STRATA_STATE_HASH"))
@@ -106,6 +111,7 @@ private:
     OperationInputs* inputs() const { return reinterpret_cast<OperationInputs*>(owners() + 9); }
     static uint32_t* input_checks(VerifyCanaryInput* p) { return reinterpret_cast<uint32_t*>(output(p) + 1); }
     int device_ = -1;
+    int expected_checks_ = -1;
     uint64_t ids_[9] = {}, epoch_ = 0;
     VerifyCanaryInput expected_;
     VerifyCanaryInput *host_ = nullptr, *mapped_ = nullptr;

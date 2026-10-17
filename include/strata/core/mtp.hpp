@@ -34,6 +34,7 @@
 #include <vector>
 
 namespace strata::prefill { class Prefill; }
+namespace strata::program { class ResidentSlots; }
 
 namespace strata::core {
 
@@ -190,7 +191,7 @@ public:
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
     bool bind_request(int slot, uint64_t request, std::string& err);
-    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    int64_t first_needed(int slot = 8) const;
     int device() const { return device_; }
     bool idle(std::string& err);
     /// Lifecycle preflight: unlike idle(), also rejects an owned/poisoned lease.
@@ -202,6 +203,17 @@ public:
                     const strata::plan::QsaPlacement* placement = nullptr);
     bool save_slot(int slot, int64_t cells, std::string& err);
     bool restore_slot(int slot, int64_t cells, std::string& err);
+    // Direct destination preparation never passes through the working state.
+    // A retained rewind must remain inside the actually materialized interval.
+    bool prepare_slot(int slot, uint64_t request, int64_t prompt_length, int64_t cells,
+                      bool reset, std::string& err);
+    bool prefill_slot(int slot, const float* residuals, const int32_t* next_tokens,
+                      int64_t rows, int64_t position, std::string& err);
+    int64_t slot_cells(int slot) const;
+    int64_t slot_begin(int slot) const;
+    int64_t slot_prompt_len(int slot) const;
+    int32_t slot_next_token(int slot) const;
+    bool slot_covers(int slot, int64_t cells, int64_t prompt_length = 0) const;
     bool advance_slot(int slot, const float* residual, int32_t next_token,
                       int64_t cell, std::string& err);
     void set_batch_drafting(bool on) { batch_drafting_ = on; }
@@ -211,6 +223,7 @@ public:
 
 private:
     friend class strata::prefill::Prefill;
+    friend class strata::program::ResidentSlots;
     // One host submitter; a failed operation poisons the lease until teardown.
     // A successful operation releases it only after the device stream drains.
     class Operation {
@@ -322,8 +335,15 @@ private:
         void* arena = nullptr;
         cudaGraphExec_t advance = nullptr;
         int64_t cells = 0;
+        int64_t begin = 0, prompt_len = 0;
+        bool certified = false;
+        int32_t tail_token = -1;
+        uint64_t request = 0;
+        SessionState* session = nullptr;
         uint64_t arena_bytes = 0;
         int32_t proposal = -1;
+        int64_t proposal_cell = -1;
+        int32_t proposal_token = -1;
     };
     static_assert(sizeof(SlotState) <= 4096, "resident.hpp slot owner envelope");
     std::vector<SlotState> slots_;

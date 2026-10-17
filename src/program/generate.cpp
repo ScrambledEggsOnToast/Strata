@@ -1343,6 +1343,31 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
+bool parse_i64_list(std::string_view text, std::vector<int64_t>& out, std::string& err, size_t bound) {
+    out.clear();
+    const auto separator = [](char c) {
+        return c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    };
+    size_t at = 0;
+    while (at < text.size()) {
+        while (at < text.size() && separator(text[at])) ++at;
+        if (at == text.size()) break;
+        const size_t begin = at;
+        while (at < text.size() && !separator(text[at])) ++at;
+        int32_t id = 0;
+        const auto parsed = std::from_chars(text.data() + begin, text.data() + at, id);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + at || id < 0 || out.size() == bound) {
+            err = out.size() == bound ? "token list exceeds the request context" :
+                                       "invalid token id: expected an integer in [0, 2147483647]";
+            out.clear();
+            return false;
+        }
+        out.push_back(id);
+    }
+    if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
 /// Verified 32-byte release identity from its HEX64 spelling (the conversation cache's persistent store keys its
 /// records on these, so a typo must not silently select a different domain). Not `conversation_scope_parse`: an
 /// identity is not required to be nonzero here - a zero identity is refused later, by name, as missing release data.
@@ -2892,12 +2917,29 @@ int main(int argc, char** argv) {
     if (!o.conversation_cache_dir.empty() && !persistence_configured)
         std::fprintf(stderr, "strata serve: persistent conversation caching stays off: %s\n",
                      persistence_disabled_reason.c_str());
+    const bool packed_prefill = strata::prefill::packed_prefill_enabled();
     if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
-        (o.foreground_budget_ms > 0 && (!o.serve || o.batch < 2 || o.prompt_cache <= 0))) {
+        (o.foreground_budget_ms > 0 && (!o.serve || o.batch < (packed_prefill ? 1 : 2) || o.prompt_cache <= 0))) {
         std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
                              "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
         return 2;
     }
+    constexpr size_t kPackedQueuedFrames = 8;
+    if (packed_prefill && (o.max_context < 1 || o.max_context > INT32_MAX)) {
+        std::fprintf(stderr, "strata packed prefill: requires a fixed positive int32 context bound\n");
+        return 2;
+    }
+    const size_t packed_frame_bytes = packed_prefill
+        ? size_t(4) * (size_t(std::max<int64_t>(o.max_context, 1)) * 11 + 4096) + 16 : 0;
+    if (packed_prefill && (!o.serve || o.batch < 1 || o.batch > 4 || o.mtp.empty() ||
+        o.spec < 2 || o.prefill_chunk != 2048 || o.prefill_auto || o.vision || o.kv_grow ||
+        o.vram_elastic || o.pipeline_windows || o.judge_context || o.adapt_async ||
+        o.adapt_swaps != 0 || o.peer_device >= 0 || o.prefill_helpers || o.spec_split)) {
+        std::fprintf(stderr, "strata packed prefill: requires --serve, 1..4 resident slots, MTP/spec, "
+                             "fixed 2048 scratch and static text-only owners; no elastic/adaptive/helper/judge composition\n");
+        return 2;
+    }
+    if (packed_prefill) o.no_prefill_borrow = true; // priced before any cache grant or stage arena layout
     const char* prefill_split_setting = std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET");
     if (prefill_split_setting && std::strcmp(prefill_split_setting, "0") != 0 &&
         std::strcmp(prefill_split_setting, "1024") != 0) {
@@ -4529,6 +4571,9 @@ int main(int argc, char** argv) {
             v0.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "shared verifier ownership records and device owner table");
         v0.add("operation_canary_device", 2 * strata::core::kOperationCanaryDeviceBytes,
                "one prefill and one MTP serialized scratch owner table per device; conservative for inactive paths");
+        if (packed_prefill)
+            v0.add("packed_prefill_owner_canaries", 4 * strata::core::kOperationCanaryDeviceBytes,
+                   "four independent destination prefill witnesses beside the scalar owner");
         v0.add("decode_parts", byte_mul(byte_mul((uint64_t) K, (uint64_t) g.n_embd), sizeof(float)),
                "cudaMalloc d_parts: K*n_embd FP32 partials");
         v0.add("embedding_row", byte_mul((uint64_t) g.n_embd, sizeof(float)), "cudaMalloc d_emb FP32 row");
@@ -4728,6 +4773,9 @@ int main(int argc, char** argv) {
                     ds.vram.add("verifier_canary_device", strata::core::kVerifyCanaryDeviceBytes, "per-stage verifier ownership records");
                 ds.vram.add("operation_canary_device", 2 * strata::core::kOperationCanaryDeviceBytes,
                             "bounded prefill/MTP scratch owner tables, conservatively per stage");
+                if (packed_prefill)
+                    ds.vram.add("packed_prefill_owner_canaries", 4 * strata::core::kOperationCanaryDeviceBytes,
+                                "four destination witnesses on each actual prefill stage");
                 if (o.spec > 0) {
                     const uint64_t windows = strata::core::Verifier::planned_device_bytes(
                         g, o.max_context, n_vocab, grouped_draft ? grouped_rows : std::max(o.spec, o.batch));
@@ -5139,6 +5187,20 @@ int main(int argc, char** argv) {
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
+        if (packed_prefill) {
+            ram("packed_prefill_owner_canaries_host",
+                byte_mul(stage_count, 4 * strata::core::kOperationCanaryHostBytes),
+                "per-stage bounded owner witness staging/readback");
+            ram("packed_prefill_command_queue", byte_mul(kPackedQueuedFrames + 4, packed_frame_bytes + 4096),
+                "eight queued frames, reader/current-command/parse staging and descriptor-read slack");
+            ram("packed_prefill_request_tokens", byte_mul(4, byte_mul(o.max_context, sizeof(int64_t))),
+                "four immutable native prompt vectors; resident int32 histories are charged separately");
+            ram("packed_prefill_handoff_metadata", byte_mul(stage_count,
+                2 * (2048 * sizeof(int64_t) + 4 * sizeof(strata::prefill::OwnerSegment))),
+                "two fixed host handoff token arrays and four owner descriptors; existing device tokens stay 8192 B");
+            ram("packed_prefill_checkpoint_staging", byte_mul(4, admitted_checkpoint_bytes),
+                "one bounded direct-stage checkpoint assembly per prepared owner, outside retained chains");
+        }
         if (requested_slots) {
             ram("resident_slot_main_pinned", slot_host_pinned,
                 "requested slot QSA staging and full logical streamed KV backing; explicit split sums actual layer ranges");
@@ -7129,7 +7191,7 @@ int main(int argc, char** argv) {
     const bool batch_mtp_pipeline = split_batch_mtp && o.batch_mtp_pipeline;
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
-        const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
+        const char* why = o.batch < (packed_prefill ? 1 : 2) ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
                         : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
                         ? "it needs each layer-split stage on its own GPU" : !o.serve ? "it needs --serve" : nullptr;
         // Multiple resolved groups refuse synchronous MTP rather than silently dropping the feature.
@@ -7151,9 +7213,10 @@ int main(int argc, char** argv) {
         }
     }
     const bool synchronous_batch_mtp = split_batch_mtp && !batch_mtp_pipeline;
+    const int min_batch_slots = packed_prefill ? 1 : 2;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        const char* off = !o.serve ? "it needs --serve" : o.batch < min_batch_slots ? "too few resident slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
@@ -7244,9 +7307,10 @@ int main(int argc, char** argv) {
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
-                                 "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
+        if (fit < min_batch_slots) {
+            std::fprintf(stderr, "strata generate: WARNING: --batch is off: not %d slot sessions fit (a smaller "
+                                 "--max-context or KV streaming, --kv-resident, makes them smaller)\n",
+                         min_batch_slots);
             bslot_ss.clear();
             o.batch = 0;
         } else {
@@ -10786,6 +10850,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: --batch: %s\n", err.c_str());
             return 1;
         }
+        if (packed_prefill && (!batch_mtp || o.batch < 1 || o.batch > 4 || any_loan || sp.chunk() != 2048 ||
+            stages.size() > 3 || !std::all_of(stages.begin(), stages.end(),
+                [](const auto& stage) { return stage->sp.chunk() == 2048; }) ||
+            !std::all_of(host_res.begin(), host_res.end(), [](int32_t slot) { return slot >= 0; }))) {
+            std::fprintf(stderr, "strata packed prefill: requires effective batch MTP, complete local residency "
+                                 "and owned 2048 scratch on every stage\n");
+            return 2;
+        }
 #ifdef STRATA_RESIDENT_MODEL_TEST
         if (o.host_native) {
             if (test_resident_stages.size() != 3 || o.batch != 4 || !batch_mtp_pipeline) {
@@ -11672,6 +11744,7 @@ int main(int argc, char** argv) {
             bool mounted = false;      // the engine took an alias: the read is transferred and must be released
             uint64_t request_id = 0, generation = 0;
         };
+        std::function<bool()> packed_wait_commands;
         auto store_demand_restore = [&](const std::vector<int32_t>& prompt,
                                         const std::vector<ImgKey>& imgs,
                                         const strata::core::ConversationScope& scope, bool want_cvec,
@@ -11844,6 +11917,11 @@ int main(int argc, char** argv) {
             };
             (void) observe_restore();
             for (;;) {
+                if (packed_wait_commands && !packed_wait_commands()) {
+                    conversation_store->cancel_read(query.request_id, query.generation);
+                    out.status = strata::core::ConversationStoreReadStatus::failed;
+                    return out;
+                }
                 if (cancelled()) {
                     conversation_store->cancel_read(query.request_id, query.generation);
                     ++store_cancelled;
@@ -13419,6 +13497,7 @@ int main(int argc, char** argv) {
         std::condition_variable in_cv;
         std::deque<std::string> in_lines;
         bool in_eof = false;
+        std::atomic<uint64_t> command_epoch{0};
         strata::program::score::Pending score_pending;
         auto score_write = [&](const std::string& reply) {
             std::printf("%s", reply.c_str());       // one stdio call: never interleave terminal bytes
@@ -13444,6 +13523,11 @@ int main(int argc, char** argv) {
                 for (;;) {
                     const size_t nlpos = buf.find('\n');
                     if (nlpos != std::string::npos) {
+                        if (packed_prefill && nlpos > packed_frame_bytes) {
+                            std::fprintf(stdout, "FATAL packed command exceeds the admitted frame bound\n");
+                            std::fflush(stdout);
+                            std::_Exit(1);
+                        }
                         if (oversized_score) {
                             out = "SCORE " + oversized_id + " oversized";
                             oversized_score = false;
@@ -13451,7 +13535,12 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
-                    // Generation's long prompts retain their existing framing. SCORE alone has a 64 KiB line cap.
+                    // Packed admission publishes only complete, bounded records.
+                    if (packed_prefill && buf.size() > packed_frame_bytes) {
+                        std::fprintf(stdout, "FATAL packed command exceeds the admitted frame bound\n");
+                        std::fflush(stdout);
+                        std::_Exit(1);
+                    }
                     if (oversized_score) buf.clear();
                     else if (buf.size() > strata::program::score::max_wire_bytes && buf.rfind("SCORE ", 0) == 0) {
                         oversized_id = strata::program::score::request_id(std::string_view(buf).substr(0, 72));
@@ -13465,6 +13554,11 @@ int main(int argc, char** argv) {
                     if (n < 0 && errno == EINTR) continue;
 #endif
                     if (n <= 0) {
+                        if (packed_prefill && (!buf.empty() || oversized_score)) {
+                            std::fprintf(stdout, "FATAL incomplete command frame at EOF\n");
+                            std::fflush(stdout);
+                            std::_Exit(1);
+                        }
                         if (oversized_score) {
                             out = "SCORE " + oversized_id + " oversized";
                             oversized_score = false;
@@ -13481,7 +13575,9 @@ int main(int argc, char** argv) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
-                std::lock_guard<std::mutex> lk(in_mu);
+                std::unique_lock<std::mutex> lk(in_mu);
+                while (packed_prefill && in_lines.size() >= kPackedQueuedFrames)
+                    in_cv.wait_for(lk, std::chrono::milliseconds(100));
                 if (l.rfind("SCANCEL ", 0) == 0) {
                     const std::string_view id(l.data() + 8, l.size() - 8);
                     if (strata::program::score::valid_id(id)) score_pending.cancel(id);
@@ -13503,11 +13599,25 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
+                if (packed_prefill) {
+                    if (command_epoch.load() == UINT64_MAX) {
+                        score_write("FATAL command epoch exhausted\n");
+                        std::_Exit(1);
+                    }
+                    command_epoch.fetch_add(1);
+                }
                 in_lines.push_back(std::move(l));
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
             in_eof = true;
+            if (packed_prefill) {
+                if (command_epoch.load() == UINT64_MAX) {
+                    score_write("FATAL command epoch exhausted at EOF\n");
+                    std::_Exit(1);
+                }
+                command_epoch.fetch_add(1);
+            }
             in_cv.notify_one();
         }).detach();
         // Wake for commands immediately; poll completed publications only while storage work remains.
@@ -13534,6 +13644,7 @@ int main(int argc, char** argv) {
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            if (packed_prefill) in_cv.notify_all();
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
@@ -13742,6 +13853,7 @@ int main(int argc, char** argv) {
         }
         // Advertise before readiness, including replicas that have not received work yet.
         if (report_throughput) std::printf("INFO throughput_progress=1\n");
+        if (packed_prefill) std::printf("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4\n");
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -13888,6 +14000,69 @@ int main(int argc, char** argv) {
         // this loop retains only scheduling policy and protocol emission.
         using BSlot = strata::program::ResidentSlot;
         const auto& bs = resident.slots();
+        struct PackedOwner {
+            std::string tag;
+            std::vector<int64_t> tokens;
+            strata::program::ResidentRequest input;
+            strata::program::ResidentPreparation lease;
+            uint64_t cache_offer = 0, cache_generation = 0, deadline_ns = 0;
+            bool pending = false, prepared = false, first = false;
+            bool checkpoint_due = false;
+            const char* terminal_reason = nullptr;
+            int64_t draft_accepted = 0, draft_offered = 0;
+            int64_t resume = 0, frontier = 0, boundary = 0, periodic = 0;
+            std::array<int64_t, 3> seams{};
+            std::array<ConvCheckpoint, 4> parts;
+            std::array<bool, 4> parts_ready{};
+            double prompt_ms = 0;
+            Clock::time_point started;
+            phase::Input phase_input;
+            std::optional<phase::Leg> phase_leg;
+        };
+        std::array<PackedOwner, 4> packed_owners;
+        std::atomic<bool> packed_first_ready{false};
+        auto packed_done = [&](int slot, const char* reason) {
+            if (!packed_prefill || slot < 0 || size_t(slot) >= packed_owners.size()) return false;
+            auto& owner = packed_owners[size_t(slot)];
+            if (owner.tag.empty()) return false;
+            const auto& state = bs[size_t(slot)];
+            if (state.active) {
+                // Existing decode paths name the finish before finish() drains
+                // diagnostics/consumers. Never publish a tagged terminal early.
+                owner.terminal_reason = reason;
+                return true;
+            }
+            const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+            const int64_t read = std::max<int64_t>(0, owner.frontier - owner.resume);
+            if (owner.phase_leg && !owner.phase_leg->terminal) {
+                phase_receipts->request(*owner.phase_leg,
+                    std::strcmp(reason, "cancel") == 0 ? "cancelled" :
+                    std::strcmp(reason, "nonfinite") == 0 || std::strcmp(reason, "error") == 0 ? "error" : "completed");
+                std::fflush(stderr);
+            }
+            std::fprintf(stderr, "PACKED_PREFILL event=terminal tag=%s slot=%d request=%llu incarnation=%llu "
+                                 "produced=%lld frontier=%lld fresh=%lld reason=%s\n",
+                         owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
+                         (unsigned long long)owner.lease.incarnation,
+                         (long long)(owner.first ? state.produced : 0), (long long)owner.frontier,
+                         (long long)read, reason);
+            std::printf("BQDONE %s %d %llu %llu %lld %zu %.1f %.1f %s %lld %lld %lld prompt_read=%lld\n",
+                        owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
+                        (unsigned long long)owner.lease.incarnation, (long long)(owner.first ? state.produced : 0),
+                        owner.tokens.size(), owner.prompt_ms, std::max(0.0, elapsed - owner.prompt_ms), reason,
+                        (long long)owner.draft_accepted, (long long)owner.draft_offered,
+                        (long long)owner.resume, (long long)read);
+            std::fflush(stdout);
+            owner = {};
+            return true;
+        };
+        auto packed_flush = [&] {
+            for (size_t slot = 0; slot < packed_owners.size() && slot < bs.size(); ++slot) {
+                auto& owner = packed_owners[slot];
+                if (!owner.tag.empty() && owner.terminal_reason && !bs[slot].active && !owner.pending)
+                    packed_done(int(slot), owner.terminal_reason);
+            }
+        };
         struct PhaseResident {
             phase::Identity identity;
             uint64_t request = 0, started_ns = 0;
@@ -13959,6 +14134,11 @@ int main(int argc, char** argv) {
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
             ++counts.offered;
             counts.accepted += keep - 1;
+            if (packed_prefill && size_t(b) < packed_owners.size() &&
+                packed_owners[size_t(b)].lease.request == sl.request) {
+                ++packed_owners[size_t(b)].draft_offered;
+                packed_owners[size_t(b)].draft_accepted += keep - 1;
+            }
             if (batch_mtp_trace)
                 std::fprintf(stderr, "strata batch MTP: request=%llu slot=%d position=%lld "
                                      "proposal=%d target=%d keep=%d\n",
@@ -13971,9 +14151,10 @@ int main(int argc, char** argv) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
             if (judge_lane) judge_lane->observe_generation();
             phase_resident_done(b, reason);
-            std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
-                        b, (long long) sl.produced, reason, ms,
-                        (long long) counts.accepted, (long long) counts.offered);
+            if (!packed_done(b, reason))
+                std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
+                            b, (long long) sl.produced, reason, ms,
+                            (long long) counts.accepted, (long long) counts.offered);
         };
         size_t resident_cursor = 0;
         unsigned resident_credit = 0;
@@ -13991,7 +14172,13 @@ int main(int argc, char** argv) {
                 const auto& state = bs[(size_t)slot];
                 judge_commits->add(slot, state.request, state.p, state.produced);
             }
-            std::printf("BT %d %d\n", slot, (int)token);
+            if (packed_prefill && slot >= 0 && size_t(slot) < packed_owners.size() &&
+                !packed_owners[size_t(slot)].tag.empty()) {
+                const auto& owner = packed_owners[size_t(slot)];
+                std::printf("BQT %s %d %llu %llu %d\n", owner.tag.c_str(), slot,
+                            (unsigned long long)owner.lease.request,
+                            (unsigned long long)owner.lease.incarnation, (int)token);
+            } else std::printf("BT %d %d\n", slot, (int)token);
             if (o.foreground_budget_ms > 0) ++batch_commit_epoch;
         };
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
@@ -14013,6 +14200,7 @@ int main(int argc, char** argv) {
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            if (packed_prefill) in_cv.notify_all();
             return true;
         };
 
@@ -14037,7 +14225,8 @@ int main(int argc, char** argv) {
                 if (split_batch_mtp)
                     print_mtp_done(b, "cancel");
                 else
-                    std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
+                    if (!packed_done(b, "cancel"))
+                        std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
             }
             std::fflush(stdout);
             if (o.resident_multiplex) {
@@ -14154,7 +14343,8 @@ int main(int argc, char** argv) {
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[b] = batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                if (split_batch_mtp && i + 1 < S && rows[i + 1] == b)
+                if ((split_batch_mtp || packed_prefill) && i + 1 < S && rows[i + 1] == b &&
+                    (!packed_prefill || !ver.nonfinite_in(i, 2)))
                     record_batch_proposal(b, tok[i + 1], outb[i], keep[b]);
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
@@ -14184,7 +14374,8 @@ int main(int argc, char** argv) {
                     else {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(b, "nonfinite");
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                        if (!packed_done(b, "nonfinite"))
+                            std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     }
                     resident.taint(b);
                     if (!resident.finish(b, err, false)) {
@@ -14208,12 +14399,13 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(b, fin);
-                        if (split_batch_mtp)
-                            std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
-                                        b, (long long) sl.produced, fin, ms,
-                                        (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
-                        else
-                            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        if (!packed_done(b, fin)) {
+                            if (split_batch_mtp)
+                                std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
+                                            b, (long long) sl.produced, fin, ms,
+                                            (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
+                            else std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        }
                         if (!resident.finish(b, err)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
@@ -14390,7 +14582,8 @@ int main(int argc, char** argv) {
                                      G.rows[t], (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(G.rows[t], "nonfinite");
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", G.rows[t], (long long) sl.produced, ms);
+                        if (!packed_done(G.rows[t], "nonfinite"))
+                            std::printf("BDONE %d %lld nonfinite %.1f\n", G.rows[t], (long long) sl.produced, ms);
                         resident.taint(G.rows[t]);
                         if (!resident.finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
@@ -14411,7 +14604,8 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(G.rows[t], fin);
-                        std::printf("BDONE %d %lld %s %.1f\n", G.rows[t], (long long) sl.produced, fin, ms);
+                        if (!packed_done(G.rows[t], fin))
+                            std::printf("BDONE %d %lld %s %.1f\n", G.rows[t], (long long) sl.produced, fin, ms);
                         if (!resident.finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
@@ -14523,7 +14717,8 @@ int main(int argc, char** argv) {
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out[first]) != o.eos_ids.end();
                     keep[b] = t - first == 2 && out[first] == G.tok[first + 1] && !eos && !sl.stop &&
                               sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                    if (t - first == 2) record_batch_proposal(b, G.tok[first + 1], out[first], keep[b]);
+                    if (t - first == 2 && (!packed_prefill || !head.nonfinite_in(first, 2)))
+                        record_batch_proposal(b, G.tok[first + 1], out[first], keep[b]);
                 }
                 if (!group_verifier(0, gi).commit_slot_prefixes(keep, err)) {
                     phase_error("ERR %s\n", err.c_str()); return false;
@@ -14803,6 +14998,7 @@ int main(int argc, char** argv) {
                 {
                     std::lock_guard<std::mutex> lock(in_mu);
                     if (!strata::program::pop_control_prefix(in_lines, control, consume_yield)) break;
+                    if (packed_prefill) in_cv.notify_all();
                 }
                 resident_control(control);
             }
@@ -14823,8 +15019,9 @@ int main(int argc, char** argv) {
                 if (!resident.finish(b, err, batch_mtp_trace)) return false;
                 phase_resident_done(b, "cancel");
                 if (split_batch_mtp || batch_mtp_pipeline) print_mtp_done(b, "cancel");
-                else std::printf("BDONE %d %lld cancel %.1f\n", b, (long long)sl.produced,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+                else if (!packed_done(b, "cancel"))
+                    std::printf("BDONE %d %lld cancel %.1f\n", b, (long long)sl.produced,
+                                std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
             }
             std::fflush(stdout);
             return true;
@@ -14942,8 +15139,650 @@ int main(int argc, char** argv) {
         }
         strata::program::score::Request score_request; // retain bounded host staging across scoring requests
         std::vector<float> score_values;
+        auto packed_control = [&](const std::string& command) {
+            const bool cancel = command.rfind("BQCANCEL ", 0) == 0;
+            const bool priority = command.rfind("BQPRIORITY ", 0) == 0;
+            if (!cancel && !priority) return false;
+            size_t at = cancel ? 9 : 11;
+            auto field = [&]() {
+                while (at < command.size() && command[at] == ' ') ++at;
+                const size_t begin = at;
+                while (at < command.size() && command[at] != ' ') ++at;
+                return std::string_view(command).substr(begin, at - begin);
+            };
+            const auto tag = field(), seat = field(), request = field(), incarnation = field();
+            uint64_t req = 0, inc = 0;
+            const bool identity = (request == "0" && incarnation == "0") ||
+                (phase::positive_u64(request, req) && phase::positive_u64(incarnation, inc));
+            if (!phase::valid_request(tag) || seat.size() != 1 || seat[0] < '0' ||
+                seat[0] >= '0' + int(bs.size()) || !identity) {
+                std::printf("FATAL malformed packed owner control\n"); std::fflush(stdout); std::_Exit(1);
+            }
+            const int slot = seat[0] - '0';
+            auto& owner = packed_owners[size_t(slot)];
+            const bool matches = owner.tag == tag && (!req ||
+                (req == owner.lease.request && inc == owner.lease.incarnation));
+            if (cancel) {
+                if (!field().empty()) {
+                    std::printf("FATAL trailing packed cancellation fields\n"); std::fflush(stdout); std::_Exit(1);
+                }
+                if (matches) resident.cancel(slot);
+            } else {
+                const auto value = field();
+                if ((value != "foreground" && value != "background") || !field().empty()) {
+                    std::printf("FATAL malformed packed priority\n"); std::fflush(stdout); std::_Exit(1);
+                }
+                if (matches) resident.priority(slot, value == "foreground");
+            }
+            return true;
+        };
+        auto packed_poison_reset = [&] {
+            if (!nan_flush) return;
+            nan_flush = false;
+            live_ok = false;
+            checks.clear();
+            tail_ckpt_len = -1;
+            conversations.clear();
+            if (store_on) conversation_store->invalidate_domain("non-finite logits");
+            drop_store_publications("the execution domain advanced after the capture");
+            resident.invalidate_after_nonfinite(); // active and preparing owners stay tainted, never reusable
+            if (store_on) publish_ram_view();
+        };
+        auto packed_admit_frame = [&](const std::string& frame) -> bool {
+            packed_poison_reset();
+            std::array<PackedOwner, 4> parsed;
+            std::array<int, 4> seats{};
+            std::array<strata::program::ResidentPrepareInput, 4> inputs;
+            std::array<strata::program::ResidentPreparation, 4> leases;
+            const int count = frame.size() > 7 && frame[5] >= '1' && frame[5] <= '4' && frame[6] == ' '
+                ? frame[5] - '0' : 0;
+            if (!count) {
+                std::printf("FATAL expected BGENQ1 through BGENQ4 complete frame\n");
+                std::fflush(stdout); return false;
+            }
+            size_t start = 7;
+            std::string why;
+            for (int index = 0; index < count; ++index) {
+                const size_t tab = frame.find('\t', start);
+                const size_t end = tab == std::string::npos ? frame.size() : tab;
+                const std::string_view record(frame.data() + start, end - start);
+                size_t at = 0;
+                auto field = [&]() {
+                    while (at < record.size() && record[at] == ' ') ++at;
+                    const size_t begin = at;
+                    while (at < record.size() && record[at] != ' ') ++at;
+                    return record.substr(begin, at - begin);
+                };
+                auto& owner = parsed[size_t(index)];
+                const auto tag = field(), seat = field(), budget = field();
+                if (!phase::valid_request(tag) || seat.size() != 1 || seat[0] < '0' ||
+                    seat[0] >= '0' + int(bs.size())) {
+                    std::printf("FATAL packed record lacks a routeable tag and slot\n");
+                    std::fflush(stdout); return false;
+                }
+                owner.tag.assign(tag);
+                const int slot = seats[size_t(index)] = seat[0] - '0';
+                uint64_t max_new = 0;
+                if (!phase::positive_u64(budget, max_new) || max_new > INT64_MAX)
+                    why = "invalid generated-token budget";
+                owner.input.max_new = int64_t(std::min<uint64_t>(max_new, INT64_MAX));
+                owner.input.pcie_fraction = o.pcie_frac;
+                owner.input.spec_min_probability = o.spec_min_p;
+                owner.input.sampling.greedy = true;
+                owner.input.sampling.top_p = 1;
+                owner.input.sampling.top_k = 20;
+                owner.input.sampling.penalty_repeat = 1;
+                bool steering = true, foreground = true;
+                size_t token_begin = record.size();
+                for (;;) {
+                    const auto item = field();
+                    if (item.empty()) break;
+                    const size_t eq = item.find('=');
+                    if (eq == std::string_view::npos) { token_begin = at - item.size(); break; }
+                    const auto key = item.substr(0, eq), value = item.substr(eq + 1);
+                    owner.phase_input.key(key, value);
+                    const float number = std::strtof(value.data(), nullptr);
+                    auto& policy = owner.input.sampling;
+                    if (key == "scope") {
+                        if (!strata::core::conversation_scope_parse(value, owner.input.scope)) why = "invalid private scope";
+                    } else if (key == "sscope") {
+                        if (!strata::core::conversation_shared_scope_parse(value, owner.input.shared_scope))
+                            why = "invalid shared scope";
+                    } else if (key == "priority") {
+                        if (value != "foreground" && value != "background") why = "invalid priority";
+                        foreground = value == "foreground";
+                    } else if (key == "cvec") steering = std::atoi(value.data()) != 0;
+                    else if (key == "ckpt") owner.input.checkpoint = std::atoi(value.data()) != 0;
+                    else if (key == "pin") owner.input.pin = std::max<int64_t>(0, std::atoll(value.data()));
+                    else if (key == "cache_offer") owner.cache_offer = std::strtoull(value.data(), nullptr, 10);
+                    else if (key == "cache_generation") owner.cache_generation = std::strtoull(value.data(), nullptr, 10);
+                    else if (key == "cache_deadline_ns") owner.deadline_ns = std::strtoull(value.data(), nullptr, 10);
+                    else if (key == "temperature") { policy.temperature = number; policy.greedy = number <= 0; }
+                    else if (key == "top_p") policy.top_p = number;
+                    else if (key == "top_k") policy.top_k = std::atoi(value.data());
+                    else if (key == "min_p") policy.min_p = std::clamp(number, 0.0f, 1.0f);
+                    else if (key == "seed") policy.seed = std::strtoull(value.data(), nullptr, 10);
+                    else if (key == "penalty_last_n") policy.penalty_last_n = std::max(0, std::atoi(value.data()));
+                    else if (key == "penalty_repeat") policy.penalty_repeat = number;
+                    else if (key == "penalty_freq") policy.penalty_freq = number;
+                    else if (key == "penalty_present") policy.penalty_present = number;
+                    else if (key == "pcie_frac") owner.input.pcie_fraction = std::clamp(double(number), 0.0, 1.0);
+                    else if (key == "spec_min_p") owner.input.spec_min_probability = std::clamp(double(number), 0.0, 1.0);
+                    else if (key == "logit_bias") why = "logit_bias is not supported with resident slots";
+                }
+                owner.phase_input.finish();
+                owner.input.steering = !strata::kernels::cvec().loaded() || steering;
+                owner.tokens.reserve(size_t(o.max_context));
+                std::string token_error;
+                if (token_begin == record.size() || !parse_i64_list(
+                    record.substr(token_begin), owner.tokens, token_error, size_t(o.max_context)))
+                    why = "invalid or over-context prompt";
+                for (int64_t token : owner.tokens)
+                    if (token < 0 || token >= n_vocab) why = "token outside vocabulary";
+                strata::plan::RequestDemand demand;
+                demand.prompt_tokens = int64_t(owner.tokens.size());
+                demand.max_new_tokens = owner.input.max_new;
+                demand.state_bytes_per_sequence = resident_capacity;
+                const auto admission = strata::plan::admit_request(demand, o.max_context);
+                if (!admission.admitted) why = admission.reason;
+                if (!resident.available(slot) || !packed_owners[size_t(slot)].tag.empty()) why = "physical slot is not free";
+                for (const auto& active : packed_owners)
+                    if (!active.tag.empty() && active.tag == owner.tag) {
+                        std::printf("FATAL duplicate packed request tag\n"); std::fflush(stdout); return false;
+                    }
+                for (int prior = 0; prior < index; ++prior)
+                    if (seats[size_t(prior)] == slot || parsed[size_t(prior)].tag == owner.tag) {
+                        std::printf("FATAL duplicate packed frame destination or tag\n"); std::fflush(stdout); return false;
+                    }
+                owner.lease.slot = slot;
+                owner.pending = true;
+                owner.started = Clock::now();
+                owner.seams[0] = foreground ? 1 : 0;
+                if ((index + 1 < count) != (tab != std::string::npos)) {
+                    std::printf("FATAL packed frame record count mismatch\n"); std::fflush(stdout); return false;
+                }
+                start = end + 1;
+            }
+            auto reject = [&] {
+                for (int index = 0; index < count; ++index)
+                    std::printf("BQREJECT %s %d %s\n", parsed[size_t(index)].tag.c_str(),
+                                seats[size_t(index)], why.c_str());
+                std::fflush(stdout);
+            };
+            if (!why.empty()) { reject(); return true; }
+            for (int index = 0; index < count; ++index) {
+                const int slot = seats[size_t(index)];
+                const auto& old = bs[size_t(slot)];
+                const auto& next = parsed[size_t(index)];
+                const bool retains = old.reusable(next.input.scope, next.input.steering) &&
+                    old.ids.size() < next.tokens.size() &&
+                    std::equal(old.ids.begin(), old.ids.end(), next.tokens.begin());
+                if (!retains && !park_completed(slot, 0, nullptr)) return false;
+            }
+            for (int index = 0; index < count; ++index) {
+                const int slot = seats[size_t(index)];
+                packed_owners[size_t(slot)] = std::move(parsed[size_t(index)]);
+                auto& owner = packed_owners[size_t(slot)];
+                inputs[size_t(index)].slot = slot;
+                inputs[size_t(index)].tokens = &owner.tokens;
+                inputs[size_t(index)].request = owner.input;
+            }
+            if (!resident.reserve(inputs.data(), count, leases.data(), why)) {
+                for (int index = 0; index < count; ++index) {
+                    const int slot = seats[size_t(index)];
+                    std::printf("BQREJECT %s %d %s\n", packed_owners[size_t(slot)].tag.c_str(), slot, why.c_str());
+                    packed_owners[size_t(slot)] = {};
+                }
+                std::fflush(stdout); return true;
+            }
+            for (int index = 0; index < count; ++index) {
+                auto& owner = packed_owners[size_t(seats[size_t(index)])];
+                const bool foreground = owner.seams[0] != 0;
+                owner.seams = {};
+                owner.lease = leases[size_t(index)];
+                if (phase_receipts) {
+                    uint64_t sequence = 0;
+                    (void)phase::next_sequence(phase_sequence, sequence);
+                    owner.phase_leg.emplace(owner.phase_input, sequence, phase::now_ns());
+                    owner.phase_leg->slot = owner.lease.slot;
+                }
+                resident.priority(owner.lease.slot, foreground);
+                std::printf("BACK %s %d %llu %llu\n", owner.tag.c_str(), owner.lease.slot,
+                            (unsigned long long)owner.lease.request, (unsigned long long)owner.lease.incarnation);
+                std::fprintf(stderr, "PACKED_PREFILL event=reserved tag=%s slot=%d request=%llu incarnation=%llu "
+                                     "prompt=%zu endpoint=%lld phase_request=%s\n",
+                             owner.tag.c_str(), owner.lease.slot, (unsigned long long)owner.lease.request,
+                             (unsigned long long)owner.lease.incarnation, owner.tokens.size(),
+                             (long long)owner.lease.endpoint, owner.phase_input.identity.request);
+            }
+            std::fflush(stdout);
+            return true;
+        };
+        auto packed_collect = [&]() -> bool {
+            packed_flush();
+            for (;;) {
+                std::string command;
+                {
+                    std::lock_guard<std::mutex> lock(in_mu);
+                    if (in_lines.empty()) return true;
+                    const auto& front = in_lines.front();
+                    if (front.rfind("BGENQ", 0) != 0 && front.rfind("BQCANCEL ", 0) != 0 &&
+                        front.rfind("BQPRIORITY ", 0) != 0) return true;
+                    command = std::move(in_lines.front());
+                    in_lines.pop_front();
+                    in_cv.notify_all();
+                }
+                if (!packed_control(command) && !packed_admit_frame(command)) return false;
+                if (!retire_stopped()) return false;
+                packed_flush();
+            }
+        };
+        if (packed_prefill) packed_wait_commands = [&packed_collect] { return packed_collect(); };
+        auto packed_pending = [&] {
+            return std::any_of(packed_owners.begin(), packed_owners.end(),
+                               [](const auto& owner) { return owner.pending; });
+        };
+        auto packed_cancelled = [&](int slot) {
+            std::lock_guard<std::mutex> lock(in_mu);
+            return in_eof || bs[size_t(slot)].stop;
+        };
+        auto packed_prepare = [&](PackedOwner& owner) -> bool {
+            const int slot = owner.lease.slot;
+            // Restore offers and the RAM cache keep their existing authority:
+            // demand consumes the exact frontend offer, then direct preparation
+            // validates and writes only the reserved physical destination.
+            struct Lease {
+                strata::core::ConversationStore* store = nullptr;
+                uint64_t request = 0, generation = 0;
+                ~Lease() { if (store && request) store->release_read(request, generation); }
+            } lease;
+            std::optional<strata::core::SavedConversation> incoming;
+            const auto cancelled = [&] { return packed_cancelled(slot); };
+            const auto* previous_phase = phase_current;
+            phase_current = owner.phase_leg ? &*owner.phase_leg : nullptr;
+            struct PhaseRestore {
+                phase::Leg*& current;
+                const phase::Leg* previous;
+                ~PhaseRestore() { current = const_cast<phase::Leg*>(previous); }
+            } phase_restore{phase_current, previous_phase};
+            const auto& prompt = bs[size_t(slot)].prompt;
+            const int64_t retained = owner.lease.position;
+            int64_t ram_tokens = retained;
+            std::optional<strata::core::ConversationCache::Match> ram;
+            conversations.for_each_match(owner.tokens, no_park_images, owner.input.steering, owner.input.scope,
+                [&](auto match, const strata::core::SavedConversation&, const ConvCheckpoint&) {
+                    if (match.tokens > ram_tokens) { ram = match; ram_tokens = match.tokens; }
+                });
+            StoreDemandResult mounted;
+            bool shared_mount = false;
+            auto from_store = [&](const strata::core::ConversationScope& scope, bool shared) {
+                if (!store_on || !scope.valid() || cancelled()) return false;
+                auto selector = store_selector_base;
+                selector.scope = scope;
+                selector.cvec = owner.input.steering;
+                bool candidate = false;
+                conversation_store->for_each_match(selector, prompt, no_park_images,
+                    [&](const strata::core::ConversationStoreMatch& match) {
+                        if (match.stages == stages.size() + 1 && match.tokens > ram_tokens &&
+                            (!shared || (match.live && match.tokens == owner.input.pin))) candidate = true;
+                    });
+                if (!candidate) return false;
+                mounted = store_demand_restore(prompt, no_park_images, scope, owner.input.steering,
+                    shared ? 0 : owner.cache_offer, shared ? 0 : owner.cache_generation,
+                    owner.deadline_ns, cancelled, ram ? &ram->index : nullptr, incoming);
+                if (mounted.mounted) {
+                    lease.store = conversation_store.get();
+                    lease.request = mounted.request_id;
+                    lease.generation = mounted.generation;
+                }
+                if (mounted.status != strata::core::ConversationStoreReadStatus::ready || !incoming ||
+                    mounted.stages != stages.size() + 1 || mounted.tokens <= ram_tokens ||
+                    (shared && (!mounted.live || mounted.tokens != owner.input.pin ||
+                        incoming->live.ids.size() != size_t(owner.input.pin) ||
+                        !incoming->checkpoints.empty() || !incoming->live.imgs.empty()))) {
+                    incoming.reset();
+                    if (lease.store) lease.store->release_read(lease.request, lease.generation);
+                    lease = {};
+                    return false;
+                }
+                shared_mount = shared;
+                return true;
+            };
+            // Private ties win. A shared miss never consumes the private offer.
+            bool disk = from_store(owner.input.scope, false);
+            if (!disk && owner.input.shared_scope.valid())
+                disk = from_store(owner.input.shared_scope, true);
+            const ConvCheckpoint* cut = nullptr;
+            const strata::core::SavedConversation* source = incoming ? &*incoming : nullptr;
+            if (disk && incoming && !mounted.live) {
+                for (const auto& checkpoint : incoming->checkpoints)
+                    if (int64_t(checkpoint.ids.size()) == mounted.tokens &&
+                        strata::core::conversation_prefix(checkpoint, owner.tokens, no_park_images) == mounted.tokens) {
+                        cut = &checkpoint; break;
+                    }
+                if (!cut) { incoming.reset(); source = nullptr; disk = false; }
+            }
+            if (!disk && ram && !cancelled()) {
+                // Borrow the authoritative RAM image through synchronous
+                // preparation. A preflight refusal must not consume a valid
+                // history merely because this path cannot prove its draft tail.
+                conversations.for_each_match(owner.tokens, no_park_images, owner.input.steering, owner.input.scope,
+                    [&](auto match, const strata::core::SavedConversation& image, const ConvCheckpoint& checkpoint) {
+                        if (match.index == ram->index && match.tokens == ram->tokens && match.live == ram->live) {
+                            source = &image;
+                            cut = match.live ? nullptr : &checkpoint;
+                        }
+                    });
+            }
+            if (cancelled()) return true; // reservation is retired by the caller before any write
+            const auto expectation = shared_mount ? strata::core::ConversationSnapshotExpectation::exact_cut :
+                                                   strata::core::ConversationSnapshotExpectation::ordinary;
+            {
+                phase::Span phase_span(phase_current, phase::Stage::gpu_mount);
+                auto refusal = strata::program::ResidentSourceRefusal::none;
+                if (!resident.prepare(owner.lease, source, cut, expectation, err, &refusal)) {
+                    if (!source || refusal == strata::program::ResidentSourceRefusal::none) return false;
+                    std::fprintf(stderr, "PACKED_PREFILL event=source_refused tag=%s slot=%d request=%llu "
+                                         "incarnation=%llu outcome=original_reservation reason=%s\n",
+                                 owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
+                                 (unsigned long long)owner.lease.incarnation, err.c_str());
+                    incoming.reset();
+                    source = nullptr;
+                    cut = nullptr;
+                    if (lease.store) lease.store->release_read(lease.request, lease.generation);
+                    lease = {};
+                    disk = false;
+                    shared_mount = false;
+                    err.clear();
+                    if (!resident.prepare(owner.lease, err)) return false;
+                }
+            }
+            owner.prepared = true;
+            owner.resume = owner.frontier = bs[size_t(slot)].p;
+            if (disk && incoming && owner.resume > 0) {
+                auto& publication = store_owner(kResidentOwnerFirst + uint64_t(slot));
+                if (shared_mount) publication.borrow();
+                else publication.mount(mounted.head_id, mounted.epoch, incoming->live.ids, owner.resume,
+                                       owner.input.scope, owner.input.steering);
+                conversation_store->confirmed_restore(mounted.head_id);
+                if (store_restore_trace)
+                    std::fprintf(stderr, "store_restore event=confirmed request_id=%llu generation=%llu "
+                                         "attempt_id=%llu head=%llu cut=%lld epoch=%llu origin=%s\n",
+                                 (unsigned long long)mounted.request_id, (unsigned long long)mounted.generation,
+                                 (unsigned long long)mounted.attempt_id, (unsigned long long)mounted.head_id,
+                                 (long long)owner.resume, (unsigned long long)mounted.epoch,
+                                 mounted.prefetched ? "prefetch" : "demand");
+                ++store_restored;
+            }
+            if (owner.phase_leg)
+                store_owner(kResidentOwnerFirst + uint64_t(slot)).phase_producer = owner.phase_leg->input.identity;
+            const int64_t endpoint = int64_t(owner.tokens.size()) - 1;
+            int64_t first_turn = -1, previous_turn = -1, last_turn = -1;
+            for (int64_t p = 1; p <= endpoint; ++p) if (owner.tokens[size_t(p)] == o.turn_token) {
+                if (first_turn < 0) first_turn = p;
+                previous_turn = last_turn;
+                last_turn = p;
+            }
+            if (previous_turn > owner.resume && o.tail_role_token >= 0 &&
+                owner.tokens[size_t(previous_turn + 1)] == o.tail_role_token) last_turn = previous_turn;
+            owner.seams = {first_turn >= o.prompt_cache_root && o.prompt_cache_root > 0 ? first_turn : 0,
+                           last_turn, owner.input.pin > 0 && owner.input.pin < endpoint ? owner.input.pin : 0};
+            owner.periodic = o.prompt_cache_every > 0 ? owner.resume + o.prompt_cache_every : INT64_MAX;
+            publish_ram_view();
+            return true;
+        };
+        if (packed_prefill) {
+            sp.on_segment_stage = [&](const strata::prefill::OwnerSpan& span, size_t stage,
+                                      uint64_t, int64_t frontier, std::string& why) {
+                if (span.slot < 0 || size_t(span.slot) >= packed_owners.size() || stage > stages.size()) {
+                    why = "packed checkpoint stage outside owner lease"; return false;
+                }
+                auto& owner = packed_owners[size_t(span.slot)];
+                if (owner.lease.request != span.request || owner.lease.incarnation != span.incarnation) {
+                    why = "packed checkpoint crossed an owner incarnation"; return false;
+                }
+                if (!owner.checkpoint_due || frontier != owner.boundary) return true;
+                auto& part = owner.parts[stage];
+                part = {};
+                part.ids.assign(owner.tokens.begin(), owner.tokens.begin() + frontier);
+                if (!checkpoint_save(part, *span.stages[stage], g)) {
+                    why = "packed destination checkpoint capture failed"; return false;
+                }
+                owner.parts_ready[stage] = true;
+                return true;
+            };
+            sp.on_segment = [&](strata::prefill::Prefill& arithmetic, const strata::prefill::OwnerSpan& span,
+                                const float* residual, std::string& why) {
+                const char* decline = nullptr;
+                const bool batched = arithmetic.draft_kv(mtp, residual, span.next_tokens, span.rows,
+                    span.position, why, &decline, span.slot,
+                    int64_t(packed_owners[size_t(span.slot)].tokens.size()));
+                if (!batched && !why.empty()) return false;
+                const bool drained = batched ||
+                    mtp.prefill_slot(span.slot, residual, span.next_tokens, span.rows, span.position, why);
+                if (drained && span.position + span.rows == packed_owners[size_t(span.slot)].lease.endpoint)
+                    packed_first_ready.store(true, std::memory_order_release);
+                return drained;
+            };
+        }
+        auto packed_step = [&]() -> bool {
+            if (!packed_collect()) return false;
+            packed_poison_reset();
+            for (auto& owner : packed_owners) if (owner.pending && !owner.prepared) {
+                if (!packed_cancelled(owner.lease.slot) && !packed_prepare(owner)) return false;
+                if (!packed_collect()) return false;
+            }
+            for (auto& owner : packed_owners) if (owner.pending && packed_cancelled(owner.lease.slot)) {
+                const int slot = owner.lease.slot;
+                owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                if (!resident.abort_preparation(owner.lease, err)) return false;
+                packed_done(slot, "cancel");
+            }
+            std::array<strata::prefill::OwnerSpan, 4> spans;
+            std::array<int, 4> span_slots{};
+            int count = 0;
+            bool final_ready = false;
+            for (auto& owner : packed_owners) if (owner.pending && owner.prepared) {
+                const int slot = owner.lease.slot;
+                const int64_t begin = bs[size_t(slot)].p, endpoint = owner.lease.endpoint;
+                if (begin >= endpoint) { final_ready = true; continue; }
+                owner.boundary = endpoint;
+                if (owner.input.checkpoint && o.prompt_cache > 0) {
+                    for (int64_t seam : owner.seams)
+                        if (seam > begin) owner.boundary = std::min(owner.boundary, seam);
+                    if (owner.periodic > begin) owner.boundary = std::min(owner.boundary, owner.periodic);
+                }
+                owner.checkpoint_due = owner.input.checkpoint && o.prompt_cache > 0 && owner.boundary > 0;
+                owner.parts_ready = {};
+                auto& span = spans[size_t(count)];
+                span.request = owner.lease.request;
+                span.incarnation = owner.lease.incarnation;
+                span.slot = slot;
+                span.position = begin;
+                span.rows = owner.boundary - begin;
+                span.tokens = owner.tokens.data() + begin;
+                span.next_tokens = bs[size_t(slot)].prompt.data() + begin + 1;
+                span.stages = owner.lease.stages;
+                span.steering = owner.input.steering;
+                span_slots[size_t(count++)] = slot;
+            }
+            if (count && !final_ready) {
+                packed_first_ready.store(false, std::memory_order_release);
+                const uint64_t epoch = command_epoch.load();
+                const auto begin = Clock::now();
+                unsigned probes = 0;
+                const auto pending = [&] {
+                    if (command_epoch.load() != epoch || packed_first_ready.load(std::memory_order_acquire)) return true;
+                    // Uncontended prefill retains its full three-stage pipeline.
+                    // A live decoder may request an existing budget seam only
+                    // after stage zero has had one real issuance opportunity.
+                    return ++probes > 1 && batch_on() && time_budget.enabled() &&
+                        std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count() >= o.foreground_budget_ms;
+                };
+                const auto result = sp.run_segments(spans.data(), count, err, pending);
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+                int64_t issued_rows = 0;
+                for (int index = 0; index < count; ++index)
+                    issued_rows += std::max<int64_t>(0, result.frontier[size_t(index)] - spans[size_t(index)].position);
+                std::fprintf(stderr, "PACKED_PREFILL event=%s execution=%llu owners=%d touched=%u rows=%lld "
+                                     "completion=%s trigger=%s host_ms=%.3f\n",
+                             result.completion == strata::prefill::PrefillCompletion::failed ? "failed" : "drained",
+                             (unsigned long long)result.execution, count, result.touched, (long long)issued_rows,
+                             result.completion == strata::prefill::PrefillCompletion::complete ? "complete" :
+                             result.completion == strata::prefill::PrefillCompletion::pending_command ? "pending_command" : "failed",
+                             result.completion != strata::prefill::PrefillCompletion::pending_command ? "none" :
+                             packed_first_ready.load(std::memory_order_acquire) ? "owner_ready" :
+                             command_epoch.load() != epoch ? "command" : "budget", wall);
+                for (int index = 0; index < count; ++index) {
+                    const auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
+                    std::fprintf(stderr, "PACKED_PREFILL event=frontier execution=%llu tag=%s slot=%d request=%llu "
+                                         "incarnation=%llu from=%lld to=%lld touched=%d\n",
+                                 (unsigned long long)result.execution, owner.tag.c_str(), owner.lease.slot,
+                                 (unsigned long long)owner.lease.request, (unsigned long long)owner.lease.incarnation,
+                                 (long long)spans[size_t(index)].position, (long long)result.frontier[size_t(index)],
+                                 (result.touched & (1u << index)) ? 1 : 0);
+                }
+                time_budget.background_work(wall);
+                if (result.completion == strata::prefill::PrefillCompletion::failed) {
+                    for (int index = 0; index < count; ++index)
+                        if (result.touched & (1u << index)) resident.taint(span_slots[size_t(index)]);
+                    return false;
+                }
+                for (int index = 0; index < count; ++index) {
+                    if (!(result.touched & (1u << index))) continue;
+                    auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
+                    if (!resident.prefilled(owner.lease, result.frontier[size_t(index)], err)) return false;
+                    owner.frontier = result.frontier[size_t(index)];
+                    owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                    if (owner.phase_leg) owner.phase_leg->add(phase::Stage::prefill_run, wall);
+                    if (owner.checkpoint_due && owner.frontier == owner.boundary) {
+                        for (size_t stage = 0; stage <= stages.size(); ++stage)
+                            if (!owner.parts_ready[stage]) { err = "packed checkpoint lacks a drained stage"; return false; }
+                        ConvCheckpoint cut = std::move(owner.parts[0]);
+                        for (size_t stage = 1; stage <= stages.size(); ++stage)
+                            cut.stage_parts.push_back(std::move(owner.parts[stage]));
+                        cut.used = ++check_clock;
+                        cut.pinned = owner.boundary == owner.input.pin && o.prompt_cache >= 3;
+                        if (!resident.checkpoint(owner.lease, cut, err)) return false;
+                        if (owner.frontier >= owner.periodic && o.prompt_cache_every > 0)
+                            owner.periodic = owner.frontier + o.prompt_cache_every;
+                    }
+                    std::printf("BQPP %s %d %llu %llu %lld %zu %lld\n", owner.tag.c_str(), owner.lease.slot,
+                                (unsigned long long)owner.lease.request,
+                                (unsigned long long)owner.lease.incarnation,
+                                (long long)owner.frontier, owner.tokens.size(),
+                                (long long)(owner.frontier - owner.resume));
+                }
+                std::fflush(stdout);
+                if (!packed_collect()) return false; // certified frontiers are public before reselection
+                if (batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
+                    time_budget.decode_due(std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count(), 2048))
+                    if (!decode_round(true)) return false;
+            }
+            // Cancellation before issuance discards the reservation. Once final
+            // verifier rows issue, every owner must complete its MTP catch-up.
+            if (!packed_collect()) return false;
+            std::array<strata::core::BatchRow, 4> final_rows;
+            std::array<int, 4> final_slots{};
+            int final_count = 0;
+            const uint64_t final_epoch = command_epoch.load();
+            for (auto& owner : packed_owners) if (owner.pending && owner.prepared) {
+                const int slot = owner.lease.slot;
+                if (packed_cancelled(slot)) {
+                    if (!resident.abort_preparation(owner.lease, err)) return false;
+                    packed_done(slot, "cancel");
+                    continue;
+                }
+                if (bs[size_t(slot)].p != owner.lease.endpoint) continue;
+                auto& row = final_rows[size_t(final_count)];
+                row.request_id = row.cancellation_generation = owner.lease.request;
+                row.state = owner.lease.stages[0];
+                row.slot = slot;
+                row.token = int32_t(owner.tokens[size_t(owner.lease.endpoint)]);
+                row.position = owner.lease.endpoint;
+                row.sequence_begin = 0;
+                row.sequence_end = row.position + 1;
+                row.output_offset = final_count;
+                row.mask = strata::core::BatchRowMask::active;
+                final_slots[size_t(final_count++)] = slot;
+            }
+            if (!final_count || command_epoch.load() != final_epoch) return true;
+            int32_t output[4] = {};
+            drive.d.failed = false;
+            if (!ver.run_slot_rows(final_rows.data(), final_count, win_pool_fn, win_pool_user, output, err) ||
+                !ver.commit_slots(err) || !ver.wait_commit(err)) {
+                for (int index = 0; index < final_count; ++index) resident.taint(final_slots[size_t(index)]);
+                return false;
+            }
+            if (!packed_collect()) return false;
+            auto& head = stage_verifier(n_pipe - 1);
+            for (int index = 0; index < final_count; ++index) {
+                const int slot = final_slots[size_t(index)];
+                auto& owner = packed_owners[size_t(slot)];
+                if (head.nonfinite_in(index)) {
+                    for (int touched = 0; touched < final_count; ++touched)
+                        resident.taint(final_slots[size_t(touched)]);
+                    nan_flush = true;
+                    poison_store();
+                    // No valid next token exists for mandatory MTP catch-up.
+                    // This issued verifier transaction cannot be aborted into a
+                    // reusable reservation or published as a completed owner.
+                    err = "packed final-token verification produced non-finite logits";
+                    return false;
+                }
+                const float* residual = head.final_R(index);
+                if (!resident.first_token(owner.lease, output[index], residual, err)) return false;
+                std::fprintf(stderr, "PACKED_PREFILL event=first_token tag=%s slot=%d request=%llu incarnation=%llu "
+                                     "final_position=%lld frontier=%lld mtp_cells=%lld\n",
+                             owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
+                             (unsigned long long)owner.lease.incarnation, (long long)owner.lease.endpoint,
+                             (long long)bs[size_t(slot)].p, (long long)mtp.slot_cells(slot));
+                owner.first = true;
+                owner.pending = false;
+                owner.frontier = int64_t(owner.tokens.size());
+                owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                emit_batch_token(slot, output[index]);
+                std::fflush(stdout);
+                const auto& state = bs[size_t(slot)];
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), int64_t(output[index])) != o.eos_ids.end();
+                const char* finish = eos ? "stop" : state.stop ? "cancel" :
+                    state.produced >= state.max_new || state.p + 1 > o.max_context ? "length" : nullptr;
+                if (finish) {
+                    if (!resident.finish(slot, err, batch_mtp_trace)) return false;
+                    packed_done(slot, finish);
+                } else {
+                    if (!resident.propose(slot, residual, err)) return false;
+                    if (owner.phase_leg) {
+                        phase_receipts->request(*owner.phase_leg, "completed", "resident");
+                        auto& receipt = (*phase_residents)[size_t(slot)];
+                        receipt.identity = owner.phase_leg->input.identity;
+                        receipt.request = owner.lease.request;
+                        receipt.started_ns = phase::now_ns();
+                        receipt.pending = true;
+                    }
+                }
+            }
+            std::fflush(stdout);
+            publish_ram_view();
+            return true;
+        };
+        auto packed_front = [&] {
+            std::lock_guard<std::mutex> lock(in_mu);
+            return !in_lines.empty() && (in_lines.front().rfind("BGENQ", 0) == 0 ||
+                in_lines.front().rfind("BQCANCEL ", 0) == 0 || in_lines.front().rfind("BQPRIORITY ", 0) == 0);
+        };
         bool reference_pending = !o.score_reference.empty();
         for (;;) {
+            if (packed_prefill) packed_flush();
+            if (packed_prefill && (packed_pending() || packed_front())) {
+                if (!pipe_drain() || !packed_collect() || (packed_pending() && !packed_step())) {
+                    std::printf("FATAL packed admission failed: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+                store_seam();
+                continue;
+            }
             if (time_budget.enabled()) {
                 score_controls();
                 if (!retire_stopped()) return 1;
@@ -14989,6 +15828,14 @@ int main(int argc, char** argv) {
                 drain_pipe_for_command = piped && line.rfind("BSTOP ", 0) != 0;
             } else if (!next_line(line)) {
                 break;
+            }
+            if (packed_prefill && (line.rfind("BGENQ", 0) == 0 || line.rfind("BQCANCEL ", 0) == 0 ||
+                line.rfind("BQPRIORITY ", 0) == 0)) {
+                if (!pipe_drain() || (!packed_control(line) && !packed_admit_frame(line)) || !retire_stopped()) {
+                    std::printf("FATAL packed admission failed: %s\n", err.c_str());
+                    std::fflush(stdout); return 1;
+                }
+                continue;
             }
             std::optional<phase::Leg> phase_leg;
             if (phase_receipts && phase::generation_command(line)) {

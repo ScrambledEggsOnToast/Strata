@@ -3217,6 +3217,96 @@ The server cannot infer native quanta or pauses from HTTP token arrival times. P
 FIFO, with yielded chunk reads rejoining behind current waiters; native safe boundaries remain responsible
 for interleaving prefill and decode. No per-token state swapping is introduced by the service.
 
+#### Experimental segmented packed prefill
+
+`STRATA_PACKED_PREFILL=1` is an exact, default-off native switch. It requires serving with one to four
+effective resident slots, batch MTP, a fixed 2,048-row prefill arena, static complete expert residency and
+text-only requests. Startup prices and owns each stage's existing arena before granting the expert cache;
+there is no borrowed-arena rebind, second prefill arena, working-session copy or fallback that advertises
+support without executing this path. Unsupported compositions refuse before `READY`. Leaving the variable
+unset, or setting it to anything other than exactly `1`, retains the existing GEN/BGEN path.
+
+An eligible engine announces `INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4`.
+The frontend then submits each ready request immediately as `BGENQ1`: it never waits to fill a cohort.
+All effective slots remain general-purpose; the existing FIFO-within-class, three-foreground-to-one-background
+HTTP admission rule is unchanged. Native reservation `BACK`, not completion of prefill, releases the frontend's
+exclusive submission control. Each request continues on its own tagged reply queue.
+
+Trusted native clients may send `BGENQ1` through `BGENQ4`. One newline terminates the entire frame.
+The suffix is the exact number of owner records, separated by a single TAB:
+
+```
+BGENQ2 tag-a 0 1 scope=<scope-a> <ids-a><TAB>tag-b 1 4 priority=background scope=<scope-b> <ids-b>
+```
+
+Each record is `<tag> <slot> <max_new> [existing sampling/cache/phase keys] <comma-separated ids>`.
+A tag has 1..96 ASCII letters, digits, underscores or hyphens and belongs to one submission.
+Every destination is prevalidated before the all-or-none CPU reservation. A frame has at most four owners;
+the complete-input queue holds at most eight frames, each bounded by the configured context and four records.
+An unterminated EOF fragment is an error, never a final runnable request. There is no wait-to-fill timer.
+
+Replies are independent:
+
+- `BACK <tag> <slot> <native-request> <slot-incarnation>` reserves the destination, before device preparation.
+- `BQT <tag> <slot> <native-request> <slot-incarnation> <token>` publishes one committed target token.
+- `BQPP <tag> <slot> <native-request> <slot-incarnation> <frontier> <prompt-tokens> <fresh-rows>` publishes
+  a certified prefill frontier. Fresh rows exclude restored prefixes.
+- `BQDONE <tag> <slot> <native-request> <slot-incarnation> <produced> <prompt> <prompt-ms> <decode-ms>
+  <finish> <draft-accepted> <draft-offered> <reused> prompt_read=<fresh-rows>` closes only this owner.
+  Unattributable expert/cache/I/O counters are omitted, not reported as zero.
+- `BQREJECT <tag> <slot> <reason>` refuses an unreserved record; every record of a refused frame gets its
+  own terminal and no destination is reserved.
+
+`BQCANCEL <tag> <slot> <native-request> <slot-incarnation>` cancels exactly that owner.
+Before receiving `BACK`, the client may use `0 0` for the native identity because the unique tag already
+identifies the submission. `BQPRIORITY` carries the same identity followed by `foreground|background`.
+Stale native identities cannot cancel a reused physical slot. A frontend consumer that leaves early still
+drains its own `BQDONE` before freeing the slot; malformed, mismatched or missing boundaries fail closed.
+
+Ready cold and retained-suffix owners write directly to their reserved sessions. A complete late command
+changes the command epoch: stage zero stops issuing more packs, launched descendants and side consumers
+drain, and the caller publishes certified frontiers before processing commands and selecting owners again.
+This is not cancellation. The union arithmetic uses at most four owner segments and 2,048 rows; recurrent,
+attention, indexer, PLE and MTP state remain owner-local. The final prompt token is excluded from segmented
+prefill and runs once in a separate physical-slot verifier operation. MTP catch-up must finish even for
+`max_new=1`, EOS or cancellation before the first token or a successful terminal can be published.
+An owner reaching its endpoint requests the same drained scheduling seam, so its separate first-token
+operation and terminal do not wait for an unrelated long request to finish. The final drain receipt
+distinguishes `trigger=owner_ready`, `command` and `budget`.
+
+Prepared store offers still use the existing `cache_offer`, `cache_generation` and request-deadline keys.
+The store owns lookup/materialization and its read lease; preparation validates any mounted image and
+restores it directly into the physical destination. Only a successful nonzero physical restore emits
+`store_restore event=confirmed`, using the actual restored cut. An explicit **pre-write** draft-coverage
+refusal emits `PACKED_PREFILL event=source_refused`, releases the read image/lease, then uses the original
+cold or retained-slot reservation. It emits no confirmed restore or source-lineage mount. All other
+preparation errors remain fatal. Such a miss is not evidence of a successful stored-history suffix mount:
+private/shared source-suffix qualification requires exact captured draft coverage and boundary state.
+The current persistent format does not yet carry that certification. Stored private/shared sources therefore
+remain unqualified on this experimental path; the initial runtime check covers cold and resident-retained
+owners only. Persisted interval and boundary-state propagation is required before suffix qualification.
+
+Feature-on runtime evidence is content-free: `PACKED_PREFILL event=reserved`, `event=pack` and
+`event=segment` identify actual locally drained arithmetic, `event=drained` certifies the complete
+transaction, and `event=first_token` reports the separate final position and coherent MTP cell count.
+`event=terminal` identifies the released request/incarnation. A flag or `BACK` alone is not evidence of
+multi-owner arithmetic: require an actual pack with `owners>1`, matching per-stage segment identities,
+then the corresponding final drain and first-token receipts.
+
+The existing native behavioral vehicle is
+`python tools/batch_interleave_test.py --exe <candidate> --config <copied-config> --packed-prefill --max-new 4`.
+Use an already admitted static, batch-MTP configuration with prompt caching and enough context for `--long`
+(5,000 tokens by default). It uses a disposable store for its intentional EOF-fragment failure and checks
+four owners, early ACKs, late arrivals, owner-local cancellation, one-cell/zero-remaining/short-suffix
+first-token transitions, request reuse and atomic refusal. A second isolated engine uses the observed
+single-row greedy token as `--eos-ids` to exercise first-token EOS with `max_new=4`; both native logs are
+retained separately. It does not use exact token equality against a different arithmetic partition as a
+qualification gate. The CPU/frontend transport checks are
+`python -m unittest serve.test_parallel.PackedTransport serve.test_throughput.ThroughputTests`.
+These are test entrypoints, not measured acceptance or a performance claim; protected runtime evidence is
+required before promotion.
+
+
 Run-config budgets (all bounded per request, not replacements for native byte-level memory admission):
 
 | Key | Default | Meaning |

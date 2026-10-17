@@ -20,7 +20,7 @@ Exact comparisons need the same settings as batch_test.py (this script sets STRA
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
 borrowed (those experts run on the CPU, which rounds differently): A's and B's text may then drift from solo.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, queue, sys, tempfile, threading, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +48,182 @@ def run(eng, out, line, slot=None):
     raise SystemExit(f"the engine ended during: {line[:40]} (see {eng.log_path})")
 
 
+def packed_cases(eng, prompts):
+    """Exercise the real segmented caller and lifecycle, not greedy parity against a different arithmetic partition."""
+    incoming = queue.Queue(maxsize=64)
+    def reader():
+        try:
+            for line in eng.lines():
+                incoming.put(line)
+        finally:
+            incoming.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+    deadline = time.monotonic() + 300
+    owners, events = {}, []
+    def record(tag, slot, prompt, maximum=1, scope=None):
+        owners[tag] = {"slot": slot, "prompt": list(prompt), "maximum": maximum, "identity": None,
+                       "tokens": [], "terminal": None, "progress": 0}
+        scope = scope or format(slot + 1, "x") * 64
+        return f"{tag} {slot} {maximum} scope={scope} " + ",".join(map(str, prompt))
+    def read_frame(allow_fatal=False):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AssertionError("native packed fixture exceeded 300 seconds")
+        try:
+            line = incoming.get(timeout=left)
+        except queue.Empty:
+            raise AssertionError("native packed fixture missed its bounded reply") from None
+        if line is None:
+            raise AssertionError("native engine ended before the tagged terminal")
+        fields = line.split()
+        events.append(fields)
+        if line.startswith(("FATAL", "ERR")):
+            if allow_fatal:
+                return fields
+            raise AssertionError(line)
+        if not fields or fields[0] not in ("BACK", "BQPP", "BQT", "BQDONE", "BQREJECT"):
+            return fields
+        tag = fields[1]
+        assert tag in owners, ("reply for unknown request", line)
+        owner = owners[tag]
+        assert int(fields[2]) == owner["slot"], ("cross-slot reply", line)
+        assert owner["terminal"] is None, ("duplicate terminal or late reply", line)
+        if fields[0] == "BQREJECT":
+            assert owner["identity"] is None, ("refusal after reservation", line)
+            owner["terminal"] = fields
+            return fields
+        identity = tuple(map(int, fields[3:5]))
+        assert min(identity) > 0, line
+        if fields[0] == "BACK":
+            assert owner["identity"] is None, ("duplicate ACK", line)
+            owner["identity"] = identity
+        else:
+            assert owner["identity"] == identity, ("request incarnation crossed", line)
+            if fields[0] == "BQT":
+                owner["tokens"].append(int(fields[5]))
+                assert len(owner["tokens"]) <= owner["maximum"], line
+            elif fields[0] == "BQPP":
+                position, total, fresh = map(int, fields[5:8])
+                assert owner["progress"] <= position <= total - 1, line
+                assert total == len(owner["prompt"]) and 0 <= fresh <= position, line
+                owner["progress"] = position
+            else:
+                assert int(fields[5]) == len(owner["tokens"]), ("terminal token accounting", line)
+                assert int(fields[6]) == len(owner["prompt"]), line
+                assert len(fields) == 14 and fields[13].startswith("prompt_read="), line
+                reused, fresh = int(fields[12]), int(fields[13].split("=", 1)[1])
+                assert 0 <= reused <= len(owner["prompt"]) - 1, line
+                assert 0 <= fresh <= len(owner["prompt"]) - reused, line
+                if owner["tokens"]:
+                    assert reused + fresh == len(owner["prompt"]), ("last prompt token missing or duplicated", line)
+                owner["terminal"] = fields
+        return fields
+    def drain(tags):
+        while any(owners[tag]["terminal"] is None for tag in tags):
+            read_frame()
+    a, b, long_prompt, short = prompts
+    initial = ["single-cell", "max-new-one", "cancel-cold", "fourth-general"]
+    records = [record(initial[0], 0, a[-1:]), record(initial[1], 1, a),
+               record(initial[2], 2, long_prompt, 4), record(initial[3], 3, b)]
+    eng.send("BGENQ4 " + "\t".join(records))
+    eng.send("BQCANCEL cancel-cold 2 0 0")
+    drain(initial)
+    first_token = next(i for i, event in enumerate(events) if event[0] == "BQT")
+    assert all(any(event[:2] == ["BACK", tag] for event in events[:first_token]) for tag in initial)
+    assert len(owners["single-cell"]["tokens"]) == len(owners["max-new-one"]["tokens"]) == 1
+    assert owners["single-cell"]["terminal"][13] == "prompt_read=1"
+    ready_done = next(i for i, event in enumerate(events) if event[:2] == ["BQDONE", "single-cell"])
+    assert not any(event[0] == "BQPP" for event in events[:ready_done]), \
+        "an endpoint-ready owner waited for unrelated prefill"
+    assert owners["cancel-cold"]["terminal"][9] == "cancel"
+    assert not owners["cancel-cold"]["tokens"]
+    # Exact resend has zero segmented rows; only the independent final-token
+    # verifier operation runs. Its prior max_new=1 draft state must be coherent.
+    eng.send("BGENQ1 " + record("zero-remaining", 1, a))
+    drain(["zero-remaining"])
+    assert int(owners["zero-remaining"]["terminal"][12]) == len(a) - 1
+    suffix = a + owners["zero-remaining"]["tokens"] + [a[-1]]
+    eng.send("BGENQ1 " + record("one-row-suffix", 1, suffix))
+    drain(["one-row-suffix"])
+    assert int(owners["one-row-suffix"]["terminal"][12]) == len(a)
+    # A ready singleton starts immediately. The second complete request arrives
+    # after its ACK and must get its own ACK before the long reply completes.
+    eng.send("BGENQ1 " + record("late-long", 0, long_prompt, 2))
+    while owners["late-long"]["identity"] is None:
+        read_frame()
+    eng.send("BGENQ1 " + record("late-short", 2, short))
+    old_request, old_incarnation = owners["single-cell"]["identity"]
+    eng.send(f"BQCANCEL single-cell 0 {old_request} {old_incarnation}")
+    drain(["late-long", "late-short"])
+    late_ack = next(i for i, event in enumerate(events) if event[:2] == ["BACK", "late-short"])
+    long_done = next(i for i, event in enumerate(events) if event[:2] == ["BQDONE", "late-long"])
+    assert late_ack < long_done, "late ready owner waited for the entire first prefill"
+    short_done = next(i for i, event in enumerate(events) if event[:2] == ["BQDONE", "late-short"])
+    assert short_done < long_done, "a completed short owner waited for an unrelated generation terminal"
+    assert owners["late-long"]["terminal"][9] != "cancel", "stale control reached a reused physical slot"
+    # One invalid reservation rejects the entire complete two-owner frame. The
+    # free destination remains usable by an unrelated subsequent request.
+    eng.send("BGENQ1 " + record("atomic-held", 0, long_prompt, 2, scope="e" * 64))
+    while owners["atomic-held"]["identity"] is None:
+        read_frame()
+    eng.send("BGENQ2 " + "\t".join([record("atomic-busy", 0, a), record("atomic-free", 3, b)]))
+    while any(owners[tag]["terminal"] is None for tag in ("atomic-busy", "atomic-free")):
+        read_frame()
+    assert all(owners[tag]["terminal"][0] == "BQREJECT" for tag in ("atomic-busy", "atomic-free"))
+    eng.send("BGENQ1 " + record("after-atomic", 3, short))
+    drain(["atomic-held", "after-atomic"])
+    eng.send("BGENQ1 " + record("eos-probe", 1, a[-1:], scope="f" * 64))
+    drain(["eos-probe"])
+    eos_token = owners["eos-probe"]["tokens"][0]
+    # A fragment is never a runnable owner. EOF rejects it rather than treating
+    # it as one final complete admission. The caller supplies a disposable store.
+    eng.p.stdin.write("BGENQ1 fragment 0 1 1,2")
+    eng.p.stdin.flush()
+    eng.p.stdin.close()
+    fatal = read_frame(allow_fatal=True)
+    assert fatal[:5] == ["FATAL", "incomplete", "command", "frame", "at"], fatal
+    eng.p.wait(timeout=30)
+    assert eng.p.returncode != 0
+    print("PASS real native packed: four owners, early independent ACK, late arrival, cancellation, "
+          "one-cell/zero-remaining/short-suffix first token, exact reuse, atomic refusal, EOF fragment", flush=True)
+    return eos_token
+
+
+def packed_eos_case(eng, prompt):
+    """The observed one-row greedy probe is now an explicit EOS, with unchanged arithmetic."""
+    frames = queue.Queue(maxsize=16)
+    def reader():
+        try:
+            for line in eng.lines():
+                frames.put(line)
+        finally:
+            frames.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+    eng.send("BGENQ1 eos-first 1 4 scope=" + "f" * 64 + " " + ",".join(map(str, prompt)))
+    identity, tokens = None, []
+    until = time.monotonic() + 60
+    while True:
+        left = until - time.monotonic()
+        if left <= 0:
+            raise AssertionError("native EOS first-token case exceeded 60 seconds")
+        line = frames.get(timeout=left)
+        assert line is not None and not line.startswith(("ERR", "FATAL")), line
+        fields = line.split()
+        if fields[:2] == ["BACK", "eos-first"]:
+            identity = fields[2:5]
+        elif fields[:2] == ["BQT", "eos-first"]:
+            assert fields[2:5] == identity, line
+            tokens.append(int(fields[5]))
+        elif fields[:2] == ["BQDONE", "eos-first"]:
+            assert fields[2:5] == identity and fields[9] == "stop", line
+            assert len(tokens) == int(fields[5]) == 1, line
+            eng.send("QUIT")
+            eng.p.wait(timeout=30)
+            assert eng.p.returncode == 0
+            print("PASS real native packed: first-token EOS with max_new=4 and mandatory MTP catch-up", flush=True)
+            return
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
@@ -55,6 +231,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=200)
     ap.add_argument("--long", type=int, default=5000, help="tokens of the long prompt C (several prompt chunks)")
     ap.add_argument("--extra", default="")
+    ap.add_argument("--packed-prefill", action="store_true",
+                    help="real tagged packed-prefill behavioral cases; no exact-token parity gate")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
@@ -69,6 +247,42 @@ def main():
     D = chat(body + "\nWhat are the three most important ideas in the text above?")
     E = chat("Describe the life cycle of a star like the Sun.")
     print(f"prompts: A {len(A)}, B {len(B)}, C {len(C)} tokens", flush=True)
+    if a.packed_prefill:
+        with tempfile.TemporaryDirectory(prefix="strata-packed-fixture-") as cache:
+            eng = Engine(a.exe, cfg, 4, {"STRATA_PACKED_PREFILL": "1"},
+                         a.extra.split() + ["--conversation-cache-dir", cache])
+            try:
+                eos_token = packed_cases(eng, [A, B, C, E])
+            finally:
+                if eng.p.poll() is None:
+                    eng.send("QUIT")
+                    eng.p.wait(timeout=30)
+            eng.log.close()
+            # Preserve the first native log; do not truncate its retained pack,
+            # cancellation and EOF receipts when starting the EOS-only case.
+            previous_log = os.environ.get("BATCH_TEST_LOG")
+            descriptor, eos_log = tempfile.mkstemp(prefix="batch-packed-eos-", suffix=".log",
+                                                   dir=str(Path(eng.log_path).parent))
+            os.close(descriptor)
+            os.environ["BATCH_TEST_LOG"] = eos_log
+            try:
+                eos = Engine(a.exe, cfg, 4, {"STRATA_PACKED_PREFILL": "1"},
+                             a.extra.split() + ["--conversation-cache-dir", str(Path(cache) / "eos"),
+                                               "--eos-ids", str(eos_token)])
+                try:
+                    packed_eos_case(eos, A[-1:])
+                finally:
+                    if eos.p.poll() is None:
+                        eos.send("QUIT")
+                        eos.p.wait(timeout=30)
+                    eos.log.close()
+                print(f"native logs: {eng.log_path}; {eos_log}", flush=True)
+            finally:
+                if previous_log is None:
+                    os.environ.pop("BATCH_TEST_LOG", None)
+                else:
+                    os.environ["BATCH_TEST_LOG"] = previous_log
+            return 0
     eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, a.extra.split())
     eng.pending = []
     out = eng.lines()

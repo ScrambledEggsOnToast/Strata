@@ -809,12 +809,23 @@ struct Prefill::Impl {
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     core::OperationCanary canary;
+    std::array<core::OperationCanary, kPrefillOwners> owner_canary;
+    std::array<uint64_t, kPrefillOwners> owner_requests{};
+    std::array<uint64_t, kPrefillOwners> owner_incarnations{};
+    std::array<core::SessionState*, kPrefillOwners> owner_sessions{};
+    uint64_t execution = 0;
+    uint64_t segment_pack = 0;
+    struct Handoff {
+        std::array<int64_t, kPrefillRows> tokens{};
+        std::array<OwnerSegment, kPrefillOwners> segments{};
+    } owner_handoff[2];
     uint64_t bound_request = 0;
     std::atomic<bool> running{false};
     bool poisoned = false;
     const std::function<bool()>* retained_stop = nullptr;
     bool retained_cancel_requested = false, retained_cancelled = false;
     std::thread::id callback_thread;
+    const OwnerSegment* callback_segment = nullptr;
     std::thread::id release_thread;
     uint64_t generation_request = 0;
     bool draft_active = false;
@@ -950,6 +961,28 @@ struct Prefill::Impl {
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
+    // A view, not another arena or state owner. Only row-addressed QSA values are offset;
+    // selection/attention scratch and the streamed layer pool remain serialized on cs.
+    struct AttentionRows {
+        float *Kc, *Vc, *Qf, *q, *idx_raw, *q_idx, *attn;
+        int32_t *steps_dev, *sel_ids;
+        const int32_t* steps_host;
+        float *sel_scores, *attn_scratch;
+        int64_t sel_batch, max_blocks, attn_batch, cap, T;
+        cudaStream_t cs;
+        cudaEvent_t kv_ready;
+        strata::kernels::KvHostPools& stage;
+        int32_t* ident_table;
+        AttentionRows(Impl& arena, int64_t row)
+            : Kc(arena.Kc + row * 512), Vc(arena.Vc + row * 512), Qf(arena.Qf + row * 12288),
+              q(arena.q + row * ZV), idx_raw(arena.idx_raw + row * 128), q_idx(arena.q_idx + row * 512),
+              attn(arena.attn + row * ZV), steps_dev(arena.steps_dev + row * strata::kernels::kStepCount),
+              sel_ids(arena.sel_ids + row * arena.cap),
+              steps_host(arena.steps_host.data() + row * strata::kernels::kStepCount),
+              sel_scores(arena.sel_scores), attn_scratch(arena.attn_scratch), sel_batch(arena.sel_batch),
+              max_blocks(arena.max_blocks), attn_batch(arena.attn_batch), cap(arena.cap), T(arena.T),
+              cs(arena.cs), kv_ready(arena.kv_ready), stage(arena.stage), ident_table(arena.ident_table) {}
+    };
 };
 
 namespace {
@@ -1319,6 +1352,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     m.initialized = m.canary.init(err);
+    if (m.initialized && packed_prefill_enabled())
+        for (auto& witness : m.owner_canary)
+            if (!witness.init(err)) { m.initialized = false; break; }
     return m.initialized;
 }
 
@@ -1603,10 +1639,13 @@ bool Prefill::rebind_session(core::SessionState& ss, void* stream, uint64_t requ
 }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                       std::string& err, const char** why) {
+                       std::string& err, const char** why, int slot, int64_t prompt_length) {
     Impl& m = *impl_;
     if (!m.running.load() || m.callback_thread != std::this_thread::get_id() || m.draft_active || m.poisoned) {
         err = "prefill: draft K/V requires the drained on_chunk lease"; return false;
+    }
+    if (m.callback_segment && slot == 8) {
+        err = "prefill: a segmented callback requires its explicit destination draft owner"; return false;
     }
     const core::OnDevice on_device(m.device);   // the stage's own GPU current (a layer split's drafter: the last stage)
     auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
@@ -1616,7 +1655,20 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // still reach (r0 below), which the ring holds, so no two of them share a slot.  STRATA_MTP_BATCH_RING=0: the
     // drafter's own pass for a ring (the A/B).
     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
-    core::QsaState& st = mtp.kv_state_rw();
+    if (slot != 8 && (!mtp.slot_state(slot) || !mtp.slots_[(size_t) slot].request ||
+                     !mtp.slots_[(size_t) slot].certified ||
+                     cell0 != mtp.slots_[(size_t) slot].cells || prompt_length != mtp.slots_[(size_t) slot].prompt_len ||
+                     cell0 < 0 || n < 0 || n > mtp.slots_[(size_t) slot].state.max_cells - cell0)) {
+        err = "prefill: destination draft owner or interval mismatch"; return false;
+    }
+    if (slot != 8 && (!m.callback_segment || m.callback_segment->owner.slot != slot ||
+        m.callback_segment->owner.request != mtp.slots_[(size_t) slot].request ||
+        m.callback_segment->owner.position != cell0 || m.callback_segment->owner.rows != n ||
+        !next_tokens || m.callback_segment->owner.next_tokens != next_tokens ||
+        R_rows != m.R + m.callback_segment->row * m.g->hc * m.g->n_embd)) {
+        err = "prefill: draft residual/next-token pair is not the current owner callback"; return false;
+    }
+    core::QsaState& st = slot == 8 ? mtp.kv_state_rw() : mtp.slots_[(size_t) slot].state;
     if (off) return decline("STRATA_MTP_BATCH=0");
     if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
     if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
@@ -1645,8 +1697,22 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                   (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
         return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
-    const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
-    if (r0 >= n) return true;
+    const int64_t r0 = std::min(n, std::max<int64_t>(0, mtp.first_needed(slot) - cell0));
+    auto publish = [&] {
+        if (slot == 8) return;
+        auto& destination = mtp.slots_[(size_t) slot];
+        destination.cells = cell0 + n;
+        if (r0 > 0) destination.begin = std::max(destination.begin, cell0 + r0);
+        if (n > 0) destination.tail_token = r0 < n ? next_tokens[n - 1] : -1;
+        destination.proposal = destination.proposal_token = -1;
+        destination.proposal_cell = -1;
+    };
+    if (r0 >= n) {
+        core::MtpDrafter::Operation operation(mtp, err, slot, m.cs);
+        if (!operation || !operation.finish(err)) return false;
+        publish();
+        return true;
+    }
     // per row: emb/e2 (N), en16 (N half), hn/h2/Rm/gated (HCN), hn16/xn16 (HCN half), lo (LR) + lo16, grs, mixed (N) +
     // mixed_h, K and V (KV each), the token id
     // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
@@ -1655,7 +1721,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);   // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
-    int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+    const int64_t requested = slot == 8 && !packed_prefill_enabled() ? n - r0 : std::max<int64_t>(n - r0, 64);
+    int64_t B = std::min<int64_t>(requested, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
     if (B < 64) return decline("too little scratch for a 64-row batch");
@@ -1687,8 +1754,14 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         explicit DraftScope(Impl& state) : m(state) { m.draft_active = true; }
         ~DraftScope() { m.draft_active = false; }
     } draft_scope{m};
-    core::MtpDrafter::Operation operation(mtp, err, 8, m.cs);
+    core::MtpDrafter::Operation operation(mtp, err, slot, m.cs,
+                                          next_tokens[0], (int32_t) cell0);
     if (!operation) return false;
+    const int64_t residual_offset = (R_rows - m.R) / HCN;
+    if (R_rows != m.R + residual_offset * HCN || residual_offset < 0 || n > m.T - residual_offset) {
+        err = "prefill: draft residual rows are not the active owner interval"; return false;
+    }
+    if (slot != 8) mtp.canary_.expect_inputs((int) ((n - r0 + 7) / 8));
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) cudaStreamSynchronize(m.cs);
     const auto ti0 = Clock::now();
@@ -1726,6 +1799,15 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         if (m.up_ring.h2d(tok, tk.data(), (size_t) nb * 4, m.cs) != cudaSuccess) {
             err = "prefill: the draft tokens' upload failed";
             return false;
+        }
+        // Packed destination witnesses check the exact retained owner inputs. The
+        // legacy ambient path retains its existing operation canary without these launches.
+        if (slot != 8) for (int64_t t = 0; t < nb; t += 8) {
+            const int count = (int) std::min<int64_t>(8, nb - t);
+            mtp.canary_.stage_inputs(next_tokens + b0 + t, count, (int32_t) (c0 + t), 0, m.cs, (uint32_t) m.cap);
+            mtp.canary_.check_inputs(tok + t,
+                m.steps_dev + (residual_offset + b0 + t) * strata::kernels::kStepCount,
+                nullptr, count, 0, m.cs);
         }
         // the input branches: the next token's embedding, and this cell's final residual rows
         if (nemb) {
@@ -1782,7 +1864,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
                      "the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0, (long long) (cell0 + r0),
                      (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
-    return operation.finish(err);
+    if (!operation.finish(err)) return false;
+    publish();
+    return true;
 }
 namespace {
 // Layer split: STRATA_PREFILL_HELP=1 lends the idle stage's GPU (opt-in: the helped rows are computed in another MMQ
@@ -2753,15 +2837,18 @@ struct PeTimer {
 };
 }  // namespace
 
-bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                      const OwnerSegment* segments, int segment_count, uint64_t execution) {
     err.clear();
     Impl& m = *impl_;
+    const bool segmented = segment_count > 0;
     if (prefill_attribution_requested() && (stage_lb_ < 0 || stage_le_ > 48 || stage_lb_ >= stage_le_)) {
         err = "prefill attribution: stage layer bounds must lie within [0,48]";
         return false;
     }
     const core::OnDevice on_device(m.device);
     if (m.running.exchange(true)) { err = "prefill: scratch already in flight"; return false; }
+    const uint64_t pack = segmented ? ++m.segment_pack : 0;
     m.retained_cancel_requested = m.retained_cancelled = false;
     struct RunLease {
         Impl& m;
@@ -2806,6 +2893,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!cancelled) m.poisoned = true;
             }
             m.callback_thread = {};
+            m.callback_segment = nullptr;
             m.running.store(false);
         }
     } lease{m, err};
@@ -2816,10 +2904,42 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         helper->bytes_act = helper->bytes_meta = helper->bytes_out = helper->bytes_staged = 0;
     }
     if (retained_step_ && !retained_boundary(stage_lb_, err, false)) return false;
-    m.canary.begin(8, m.cs, n > 0 ? (int32_t) tokens[0] : 0, (int32_t) pos0);
-    lease.canary_started = true;
+    if (!segmented) {
+        m.canary.begin(8, m.cs, n > 0 ? (int32_t) tokens[0] : 0, (int32_t) pos0);
+        lease.canary_started = true;
+    }
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    auto session_of = [&](const OwnerSpan& owner) -> core::SessionState& {
+        for (auto* state : owner.stages)
+            if (state && state->layer_lo == stage_lb_ && state->layer_hi == stage_le_) return *state;
+        std::terminate(); // preflight validated every stage before any issue
+    };
+    auto stage_of = [&](const OwnerSpan& owner) -> size_t {
+        for (size_t i = 0; i < owner.stages.size(); ++i)
+            if (owner.stages[i] == &session_of(owner)) return i;
+        std::terminate();
+    };
+    auto stage_complete = [&]() -> bool {
+        if (!segmented) return true;
+        for (int i = 0; i < segment_count; ++i) {
+            const auto& owner = segments[i].owner;
+            auto& state = session_of(owner);
+            for (int64_t t = 0; t < owner.rows; ++t) {
+                state.ple_prev[0] = state.ple_prev[1];
+                state.ple_prev[1] = (int32_t) owner.tokens[t];
+            }
+            m.owner_canary[owner.slot].check(owner.slot, m.cs);
+        }
+        if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = "prefill: owner witnesses failed to drain"; return false; }
+        for (int i = 0; i < segment_count; ++i) {
+            const auto& owner = segments[i].owner;
+            if (!m.owner_canary[owner.slot].validate("prefill_segment", err)) return false;
+            if (segment_root_->on_segment_stage && !segment_root_->on_segment_stage(
+                    owner, stage_of(owner), execution, owner.position + owner.rows, err)) return false;
+        }
+        return true;
+    };
     int wmma_cc = 0;
 #if !defined(STRATA_USE_HIP)
     if (detail::iq_wmma_requested()) {
@@ -2845,7 +2965,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const char* e = std::getenv("STRATA_KV_PREFETCH");
         return e ? std::atoi(e) != 0 : false;
     }();
-    const bool kv_prefetch = kv_prefetch_on;
+    const bool kv_prefetch = kv_prefetch_on && !segmented;
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
@@ -2867,7 +2987,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // this one reads; it streams and computes a share of this stage's experts then (set_stage_helper), in the
     // place of a --peer-device peer, and gives the stage back its own buffers when the run ends
     const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
-    const bool helped = single_chunk && bind_stage_helper(n);
+    const bool helped = !segmented && single_chunk && bind_stage_helper(n);
     if (helped) m.pp = m.help_pp.get();
     struct HelpScope {
         Impl& m;
@@ -2940,7 +3060,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
-    const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
+    const bool ple_on = (segmented ? session_of(segments[0].owner).ple.ready() : ss.ple.ready()) &&
+                        LB <= 1 && 1 < LE;
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
     // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
     static const bool ple_batch_env = [] {
@@ -2951,30 +3072,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
-        auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
-        int32_t pv[2] = {at(c0), at(c0 + 1)};
-        for (int64_t t = 0; t < T; ++t) {
-            const int32_t tok = (int32_t) tokens[c0 + t];
-            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
-                                        m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
-            pv[0] = pv[1];
-            pv[1] = tok;
+    auto ple_gather = [&m, &ss, &session_of, tokens, n, prev0, segments, segment_count](int64_t c0, int buf, std::string& e) -> bool {
+        OwnerSegment singleton;
+        singleton.owner.tokens = tokens + c0;
+        singleton.owner.rows = std::min(m.T, n - c0);
+        const auto* owners = segment_count ? segments : &singleton;
+        const int count = segment_count ? segment_count : 1;
+        auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };
+        for (int i = 0; i < count; ++i) {
+            const auto& segment = owners[i];
+            auto& owner = segment_count ? session_of(segment.owner) : ss;
+            int32_t pv[2] = {segment_count ? owner.ple_prev[0] : at(c0),
+                             segment_count ? owner.ple_prev[1] : at(c0 + 1)};
+            for (int64_t t = 0; t < segment.owner.rows; ++t) {
+                const int32_t tok = (int32_t) segment.owner.tokens[t];
+                strata::kernels::ngram_rows(&tok, pv, 1, owner.ple.consts,
+                    m.ple_rows[buf].data() + (segment.row + t) * strata::kernels::PLE_N_HEADS);
+                pv[0] = pv[1]; pv[1] = tok;
+            }
+            if (!owner.ple.table->gather_batch(
+                    m.ple_rows[buf].data() + segment.row * strata::kernels::PLE_N_HEADS,
+                    (size_t) segment.owner.rows, m.ple_emb_host[buf] + segment.row * N, e)) return false;
         }
-        return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        return true;
     };
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
-    // A future destructor waits but discards failure. On a retained stop its
-    // result is part of the reuse proof, even if layer 1 never consumed it.
+    // A future destructor waits but discards failure. Every issued gather is
+    // part of the drain proof, even if an error precedes its layer-1 consumer.
     struct RetainedPleJoin {
         Impl& m;
         std::future<bool>& pending;
         std::string& why;
         std::string& err;
         ~RetainedPleJoin() {
-            if (!m.retained_stop || !pending.valid()) return;
+            if (!pending.valid()) return;
             try {
                 if (pending.get()) return;
                 err = why.empty() ? "prefill: retained PLE gather failed" : why;
@@ -2988,7 +3120,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int ple_buf = 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
-        if (should_stop && should_stop()) {
+        if (!segmented && should_stop && should_stop()) {
             if (retained_step_) {
                 m.retained_cancel_requested = true;
                 err = "cancelled";
@@ -3000,7 +3132,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
-        m.gemm.native_profile_context(m.bound_request, p0);
+        m.gemm.native_profile_context(segmented ? execution : m.bound_request, p0);
         pt.begin_chunk(m.device, LB, LE, p0, T, m.borrowed, cs);
         if (pt.attribution) {
             pt.attribution->streamed = stats_.experts_streamed;
@@ -3022,7 +3154,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+        bool batched = (hand_in_ == nullptr || segmented) && m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
         if (batched && nemb == nullptr &&
@@ -3039,6 +3171,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = "prefill: the token id upload failed";
                 return false;
             }
+            if (hand_in_ == nullptr) {
             if (nemb) {
                 nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
             } else {
@@ -3050,6 +3183,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                       wemb->code_bits, wemb->code_bias, wemb->group_elems,
                                                       (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+            }
             }
         }
         for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
@@ -3123,16 +3257,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_ple += ms_since(tp);
             return true;
         };
-        for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-        // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        std::array<OwnerSegment, kPrefillOwners> local_segments;
+        if (!segmented) {
+            local_segments[0].owner.tokens = tokens + c0;
+            local_segments[0].owner.position = p0;
+            local_segments[0].owner.rows = T;
+            local_segments[0].owner.stages[0] = &ss;
+            for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
+        }
+        const auto* chunk_segments = segmented ? segments : local_segments.data();
+        const int chunk_owners = segmented ? segment_count : 1;
+        // All downstream stateful operations slice these same immutable intervals.
+        for (int i = 0; i < chunk_owners; ++i) {
+            const auto& segment = chunk_segments[i];
+            for (int64_t t = 0; t < segment.owner.rows; ++t)
+                strata::kernels::qsa_step_fill(m.steps_host.data() +
+                    (segment.row + t) * strata::kernels::kStepCount, segment.owner.position + t, s);
+        }
         if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
             err = "prefill: the QSA step records' upload failed";
             return false;
         }
         // The first chunk's actual embedding IDs and QSA positions must belong to
         // this operation, not just agree with a second copy of its canary metadata.
-        if (c0 == 0) m.canary.check(8, m.cs, batched ? m.tok_dev : nullptr, m.steps_dev);
+        if (!segmented && c0 == 0) m.canary.check(8, m.cs, batched ? m.tok_dev : nullptr, m.steps_dev);
+        if (segmented) for (int i = 0; i < segment_count; ++i) {
+            const auto& segment = segments[i];
+            const auto& owner = segment.owner;
+            auto& witness = m.owner_canary[owner.slot];
+            witness.begin(owner.slot, m.cs, (int32_t) owner.tokens[0], (int32_t) owner.position);
+            witness.expect_inputs((int) ((owner.rows + 7) / 8));
+            for (int64_t t = 0; t < owner.rows; t += 8) {
+                const int count = (int) std::min<int64_t>(8, owner.rows - t);
+                int32_t expected[8];
+                for (int j = 0; j < count; ++j) expected[j] = (int32_t) owner.tokens[t + j];
+                witness.stage_inputs(expected, count, (int32_t) (owner.position + t), 0, m.cs, (uint32_t) m.cap);
+                witness.check_inputs(m.tok_dev + segment.row + t,
+                    m.steps_dev + (segment.row + t) * strata::kernels::kStepCount, nullptr, count, 0, m.cs);
+            }
+        }
 
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
@@ -3379,6 +3542,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             m.pp = helper_for_layer(l);
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
+            for (int owner_index = 0; owner_index < chunk_owners; ++owner_index) {
+                const auto& segment = chunk_segments[owner_index];
+                auto& ss = segmented ? session_of(segment.owner) : *m.ss;
+                const int64_t first_row = segment.row, last_row = first_row + segment.owner.rows;
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -3390,8 +3557,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                for (int64_t s0 = 0; s0 < T; s0 += SB) {
-                    const int64_t nb = std::min(SB, T - s0);
+                for (int64_t s0 = first_row; s0 < last_row; s0 += SB) {
+                    const int64_t nb = std::min(SB, last_row - s0);
                     uint8_t* q = m.region;
                     auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
@@ -3422,7 +3589,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             } else if (l == 1 && ple_on) {
                 pt.mark(kPfPle, cs);
                 const auto tp = Clock::now();
-                for (int64_t t = 0; t < T; ++t) {
+                for (int64_t t = first_row; t < last_row; ++t) {
                     strata::kernels::PleOut po;
                     po.normalized = m.ple_norm;
                     po.result = m.R + t * D;
@@ -3433,6 +3600,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
+            }
             }
             for (int half = 0; half < 2; ++half) {
                 // ---- the hyper-connection read of this half
@@ -3512,25 +3680,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
-                    float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
-                    pt.mark(kPfGdnRec, cs);
-                    const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                    for (int owner_index = 0; owner_index < chunk_owners; ++owner_index) {
+                        const auto& segment = chunk_segments[owner_index];
+                        auto& owner = segmented ? session_of(segment.owner) : ss;
+                        const int64_t row = segment.row, count = segment.owner.rows;
+                        float* state = owner.gdn_state + (size_t) (gdn_index - owner.gdn_ord0) * gdn_floats;
+                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        gdn_conv(conv, m.qkv + row * C, (const float*) wc->data, m.hbuf + row * C, count, EPS, m.cs);
+                        pt.mark(kPfGdnRec, cs);
+                        gdn_recurrence(state, m.hbuf + row * C, m.gate + row * HV, m.beta + row * HV,
+                            m.z + row * ZV, (const float*) wnm->data, EPS, m.y + row * ZV,
+                            m.y_h + row * (ld_y ? ld_y : ZV), count, m.cs, ld_y);
+                    }
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
-                    const core::QsaState& st = ss.qsa_states[qsa_index];
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
                                           *wik = need(v, "indexer.k_proj.weight", err),
@@ -3546,6 +3719,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
+                    for (int owner_index = 0; owner_index < chunk_owners; ++owner_index) {
+                    const auto& segment = chunk_segments[owner_index];
+                    const auto& owner = segmented ? session_of(segment.owner) : ss;
+                    const auto& st = owner.qsa_states[qsa_index];
+                    Impl::AttentionRows rows(m, segment.row);
+                    auto& m = rows;
+                    const int64_t T = segment.owner.rows, p0 = segment.owner.position;
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
@@ -3753,6 +3933,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    }
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
@@ -5076,7 +5257,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const bool steered = half == 1 && strata::kernels::cvec().covers(l);
                 const float *cv_dir = nullptr, *cv_s = nullptr;
                 const int* cv_on = nullptr;
-                const bool cv_fused = steered && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
+                const bool cv_fused = !segmented && steered && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
                                       strata::kernels::cvec().n_embd == N && strata::kernels::cvec().hc == HC &&
                                       strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on);
                 const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cv_fused);
@@ -5130,8 +5311,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                 }
-                if (steered && !cv_fused)   // --control-vector-scaled
-                    strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                if (steered && !cv_fused) {  // --control-vector-scaled, with each packed owner's own switch
+                    if (segmented) {
+                        for (int i = 0; i < segment_count; ++i)
+                            if (cudaMemsetAsync(m.src_dev + segments[i].row, segments[i].owner.steering ? 1 : 0,
+                                    (size_t) segments[i].owner.rows * sizeof(int32_t), m.cs) != cudaSuccess) {
+                                err = "prefill: owner steering staging failed"; return false;
+                            }
+                    }
+                    strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs,
+                                                segmented ? m.src_dev : nullptr);
+                }
             }
             // Do not manufacture a shorter layer range: normed, grs, xn16 and
             // xn16_lo are the fused NEXT layer's inputs and remain in this arena.
@@ -5171,10 +5361,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pt.fold();   // the existing hand-off sync completed every mark; no new synchronization
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (segmented ? !stage_complete() : (on_stage_chunk && !on_stage_chunk(p0 + T, err))) return false;
             if (pt.attribution) pt.attribution->successor_begin = prefill_host_ns();
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             if (pt.attribution) pt.attribution->successor_end = prefill_host_ns();
+            auto& handoff = m.owner_handoff[hand_buf_];
+            if (segmented) {
+                std::copy_n(tokens + c0, T, handoff.tokens.data());
+                std::copy_n(segments, segment_count, handoff.segments.data());
+            }
             next_err_.clear();
             next_->hand_in_ = h;
             next_->single_chunk_ = single_chunk;
@@ -5193,7 +5388,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // Descendant callbacks may have leased this device to decode.
                 // Reacquire it before the parent's canary/checkpoint epilogue.
                 if (!retained_boundary(LE, err, false)) return false;
-            } else next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+            } else if (segmented) next_run_ = std::async(std::launch::async,
+                    [this, &handoff, T, p0, segment_count, execution] {
+                strata::aux_cpus::pin_current_thread();
+                return next_->run_impl(handoff.tokens.data(), T, p0, next_err_,
+                                       handoff.segments.data(), segment_count, execution);
+            });
+            else next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
                 strata::aux_cpus::pin_current_thread();
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
@@ -5236,7 +5437,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (segmented || on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
             if (pt.attribution) pt.attribution->finish_sync_begin = prefill_host_ns();
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -5248,13 +5449,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const auto toc2 = Clock::now();
             if (pt.attribution) pt.attribution->finish_sync_end = prefill_host_ns();
             pt.fold();   // use the chunk's existing completion join, including timing-only observation
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (on_chunk) {
-                m.callback_thread = std::this_thread::get_id();
-                const bool ok = on_chunk(m.R, T, p0, err);
-                m.callback_thread = {};
-                if (!ok) return false;
-            }
+            if (segmented ? !stage_complete() : (on_stage_chunk && !on_stage_chunk(p0 + T, err))) return false;
+            m.callback_thread = std::this_thread::get_id();
+            if (segmented) {
+                for (int i = 0; i < segment_count; ++i) {
+                    const auto& segment = segments[i];
+                    m.callback_segment = &segment;
+                    if (segment_root_->on_segment &&
+                        !segment_root_->on_segment(*this, segment.owner, m.R + segment.row * D, err)) return false;
+                    m.callback_segment = nullptr;
+                    for (int j = 0; j < segment_root_->segment_input_count_; ++j) {
+                        const auto& input = segment_root_->segment_inputs_[j];
+                        if (input.request == segment.owner.request && input.incarnation == segment.owner.incarnation &&
+                            input.slot == segment.owner.slot)
+                            segment_root_->segment_result_->frontier[j] = segment.owner.position + segment.owner.rows;
+                    }
+                }
+            } else if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            m.callback_thread = {};
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
@@ -5265,9 +5477,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
-    ss.ple_prev[0] = prev[0];
-    ss.ple_prev[1] = prev[1];
-    if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
+    if (!segmented) {
+        ss.ple_prev[0] = prev[0];
+        ss.ple_prev[1] = prev[1];
+    }
+    if (!segmented && std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
             std::vector<float> h((size_t) n);
@@ -5285,7 +5499,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
-    m.canary.check(8, m.cs);
+    if (!segmented) m.canary.check(8, m.cs);
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -5295,7 +5509,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
-    if (!m.canary.validate("prefill", err)) return false;
+    if (!segmented && !m.canary.validate("prefill", err)) return false;
     if (!m.gemm.collect_native_profile(err)) return false;
     if (!collect_device_groups()) return false;
     if (m.native_expert_ptrs)
@@ -5310,6 +5524,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                      (long long) kv_prefetches);
     }
     lease.complete = true;
+    if (segmented) {
+        const size_t stage = stage_of(segments[0].owner);
+        // This is the actual union arithmetic completion, not a scheduler selection.
+        // Descendants may still run; the caller's final drain receipt certifies the chain.
+        std::fprintf(stderr, "PACKED_PREFILL event=pack execution=%llu pack=%llu stage=%zu "
+                             "layer_begin=%lld layer_end=%lld owners=%d rows=%lld phase=local_drained\n",
+            (unsigned long long) execution, (unsigned long long) pack, stage,
+            (long long) LB, (long long) LE, segment_count, (long long) n);
+        for (int i = 0; i < segment_count; ++i) {
+            const auto& segment = segments[i];
+            const auto& owner = segment.owner;
+            std::fprintf(stderr, "PACKED_PREFILL event=segment execution=%llu pack=%llu stage=%zu "
+                                 "request=%llu incarnation=%llu slot=%d row=%lld position=%lld rows=%lld "
+                                 "frontier=%lld input_groups=%lld phase=local_drained\n",
+                (unsigned long long) execution, (unsigned long long) pack, stage,
+                (unsigned long long) owner.request, (unsigned long long) owner.incarnation, owner.slot,
+                (long long) segment.row, (long long) owner.position, (long long) owner.rows,
+                (long long) (owner.position + owner.rows), (long long) ((owner.rows + 7) / 8));
+        }
+    }
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();
@@ -5355,7 +5589,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (helped && m.help_pp) one(*m.help_pp);
         for (const auto& h : m.pps) one(*h);
     }
-    if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
+    if (!segmented && std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: scalar working-owner state
         cudaStreamSynchronize(m.cs);
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;
@@ -5404,6 +5638,160 @@ bool Prefill::drain_pipeline(std::string& err) {
     }
 
     return ok;
+}
+
+bool Prefill::bind_owner(int slot, uint64_t request, uint64_t incarnation,
+                        const std::array<core::SessionState*, 4>& sessions, std::string& err) {
+    if (!packed_prefill_enabled() || slot < 0 || slot >= kPrefillOwners || !request || !incarnation ||
+        !context_idle(err)) {
+        if (err.empty()) err = "prefill: packed owner bind requires an idle initialized owner";
+        return false;
+    }
+    size_t index = 0;
+    for (Prefill* stage = this; stage; stage = stage->next_, ++index) {
+        const auto& arena = *stage->impl_;
+        const auto* state = index < sessions.size() ? sessions[index] : nullptr;
+        if (!arena.initialized || arena.borrowed || !state || state == arena.original_ss ||
+            state->allocation_device != arena.device || !state->allocation_id ||
+            state->layer_lo != stage->stage_lb_ || state->layer_hi != stage->stage_le_) {
+            err = "prefill: packed owners require independently owned destination stages and arenas"; return false;
+        }
+        for (int i = 0; i < kPrefillOwners; ++i)
+            if (i != slot && arena.owner_sessions[i] == state) {
+                err = "prefill: physical destination is registered to another slot"; return false;
+            }
+    }
+    index = 0;
+    for (Prefill* stage = this; stage; stage = stage->next_, ++index) {
+        if (!stage->impl_->owner_canary[slot].bind(slot, request, err)) return false;
+        stage->impl_->owner_requests[slot] = request;
+        stage->impl_->owner_incarnations[slot] = incarnation;
+        stage->impl_->owner_sessions[slot] = sessions[index];
+    }
+    return true;
+}
+
+SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::string& err,
+                                     const std::function<bool()>& command_pending) {
+    SegmentedResult result;
+    err.clear();
+    if (!packed_prefill_enabled() || !owners || count < 1 || count > kPrefillOwners ||
+        !on_segment || !on_segment_stage || !context_idle(err)) {
+        if (err.empty()) err = "prefill: segmented execution requires 1..4 prepared owners and lifecycle callbacks";
+        return result;
+    }
+    int stage_count = 0;
+    int64_t capacity = kPrefillRows;
+    for (Prefill* stage = this; stage; stage = stage->next_, ++stage_count) {
+        const auto& arena = *stage->impl_;
+        if (stage_count >= 4 || !arena.initialized || arena.borrowed || arena.poisoned || stage->embd_rows) {
+            err = "prefill: segmented execution requires owned text-only stage arenas"; return result;
+        }
+        capacity = std::min(capacity, arena.T);
+        for (int i = 0; i < count; ++i) {
+            const auto& input = owners[i];
+            const auto* state = input.stages[stage_count];
+            if (!input.request || !input.incarnation || input.slot < 0 || input.slot >= kPrefillOwners ||
+                input.position < 0 || input.rows < 0 || (input.rows && !input.tokens) ||
+                arena.owner_requests[input.slot] != input.request || !state || state == arena.original_ss ||
+                arena.owner_incarnations[input.slot] != input.incarnation || arena.owner_sessions[input.slot] != state ||
+                !state->allocation_id || state->allocation_device != arena.device ||
+                state->layer_lo != stage->stage_lb_ || state->layer_hi != stage->stage_le_ ||
+                state->k != arena.ss->k || state->gdn_alloc != arena.ss->gdn_alloc ||
+                state->gdn_ord0 != arena.ss->gdn_ord0 || state->qsa_alloc != arena.ss->qsa_alloc ||
+                state->qsa_ord0 != arena.ss->qsa_ord0 || input.position > state->max_cells ||
+                input.rows > state->max_cells - input.position || !state->gdn_state || !state->qsa_states ||
+                state->max_cells / strata::kernels::qsa_real_shapes().idx_block + 2 > arena.max_blocks ||
+                state->ple.ready() != arena.ss->ple.ready()) {
+                err = "prefill: segmented owner identity/stage/extent mismatch"; return result;
+            }
+            for (int j = 0; j < i; ++j)
+                if (owners[j].slot == input.slot || owners[j].request == input.request ||
+                    owners[j].stages[stage_count] == state) {
+                    err = "prefill: segmented owners alias a request, slot or state"; return result;
+                }
+            for (int64_t q = state->qsa_ord0; q < state->qsa_ord0 + state->qsa_alloc; ++q) {
+                const auto& target = state->qsa_states[q];
+                const auto& original = arena.ss->qsa_states[q];
+                if (target.kv_elastic >= 0 || target.kv_mode < 0 || target.kv_mode > 1 ||
+                    target.kv_int8 != original.kv_int8 || target.kv_q4 != original.kv_q4 ||
+                    target.kv_hybrid != original.kv_hybrid || target.kv_rot != original.kv_rot ||
+                    (target.kv_mode == 1 && (!arena.stage.present() || !arena.ident_table))) {
+                    err = "prefill: destination KV placement exceeds the existing stage arena"; return result;
+                }
+            }
+        }
+    }
+    if (capacity < 1 || impl_->execution == UINT64_MAX || public_running_.exchange(true)) {
+        err = "prefill: segmented execution unavailable or identity exhausted"; return result;
+    }
+    result.execution = ++impl_->execution;
+    result.completion = PrefillCompletion::complete;
+    for (int i = 0; i < count; ++i) result.frontier[i] = owners[i].position;
+    struct Lease {
+        Prefill& root;
+        ~Lease() {
+            for (Prefill* stage = &root; stage; stage = stage->next_) stage->segment_root_ = nullptr;
+            root.segment_result_ = nullptr; root.segment_inputs_ = nullptr; root.segment_input_count_ = 0;
+            root.public_running_.store(false);
+        }
+    } lease{*this};
+    segment_result_ = &result; segment_inputs_ = owners; segment_input_count_ = count;
+    for (Prefill* stage = this; stage; stage = stage->next_) {
+        stage->segment_root_ = this;
+        stage->impl_->segment_pack = 0;
+    }
+    std::array<int64_t, kPrefillOwners> issued{}, remaining{};
+    std::array<int64_t, kPrefillRows> packed_tokens;
+    std::array<OwnerSegment, kPrefillOwners> segments;
+    bool okay = true;
+    try {
+        for (;;) {
+            bool ready = false;
+            for (int i = 0; i < count; ++i) {
+                remaining[i] = owners[i].rows - issued[i];
+                ready = ready || remaining[i] > 0;
+            }
+            if (!ready) break;
+            if (command_pending && command_pending()) {
+                result.completion = PrefillCompletion::pending_command;
+                break;
+            }
+            const auto shares = prefill_shares(remaining, count, capacity);
+            int n_segments = 0;
+            int64_t rows = 0;
+            for (int i = 0; i < count; ++i) {
+                if (!shares[i]) continue;
+                auto& segment = segments[n_segments++];
+                segment.owner = owners[i];
+                segment.owner.position += issued[i];
+                segment.owner.tokens += issued[i];
+                if (segment.owner.next_tokens) segment.owner.next_tokens += issued[i];
+                segment.owner.rows = shares[i];
+                segment.row = rows;
+                std::copy_n(segment.owner.tokens, shares[i], packed_tokens.data() + rows);
+                rows += shares[i];
+                result.touched |= uint32_t(1) << i;
+            }
+            if (!run_impl(packed_tokens.data(), rows, segments[0].owner.position, err,
+                          segments.data(), n_segments, result.execution)) { okay = false; break; }
+            for (int i = 0; i < count; ++i) issued[i] += shares[i];
+        }
+    } catch (const std::exception& failure) {
+        err = failure.what(); impl_->poisoned = true; okay = false;
+    } catch (...) {
+        err = "prefill: segmented execution threw"; impl_->poisoned = true; okay = false;
+    }
+    std::string drain_error;
+    if (!drain_pipeline(drain_error)) {
+        if (err.empty()) err = drain_error;
+        impl_->poisoned = true;
+        okay = false;
+    }
+    for (Prefill* stage = this; stage; stage = stage->next_)
+        stage->impl_->gemm.flush_native_profile(okay);
+    if (!okay) result.completion = PrefillCompletion::failed;
+    return result;
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {

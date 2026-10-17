@@ -315,6 +315,13 @@ public:
     uint64_t validated_slot_request_id(int slot) const {
         return !released_.load() && slot >= 0 && slot < (int) slots_.size() ? validated_slot_id_[slot] : 0;
     }
+    /// Last accepted, GPU-committed resident row, never an admission owner check.
+    bool slot_committed_row(int slot, uint64_t request, int64_t position, int32_t token) const {
+        if (released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle ||
+            slot < 0 || slot >= (int) slots_.size() || !request) return false;
+        const auto& row = committed_slot_row_[slot];
+        return row.request_id == request && row.position == position && row.token == token;
+    }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
@@ -481,6 +488,7 @@ private:
     uint64_t request_id_ = 0, canary_epoch_ = 0;
     uint64_t slot_request_id_[8] = {};
     uint64_t validated_slot_id_[8] = {};
+    VerifyCanaryInput committed_slot_row_[8] = {};
     uint64_t batch_device_bytes_ = 0, batch_pinned_bytes_ = 0;
     void report_batch_resources(const char* phase) const;
     VerifyCanaryInput expected_canary_[8] = {};

@@ -58,6 +58,11 @@ int main() {
               completed.p == 3 && completed.sampling.seed == 99 && completed.ids.size() == 3,
               "retention changes neither committed output, identity, RNG nor position");
         check(completed.prefill_split_until == 0, "completion clears any pending prefill partition endpoint");
+        completed.preparing = true;
+        check(!completed.reusable(completed.input.scope, true),
+              "a reserved incarnation cannot expose its previous cache while destination preparation is pending");
+        completed.complete(true);
+        check(!completed.preparing, "drained completion clears the preparation marker");
         completed.input.checkpoint = false;
         completed.complete(true);
         check(!completed.cached, "one-shot completed turns cannot become reusable");
@@ -149,6 +154,28 @@ int main() {
     check(!slots.begin(-1, {11, 22}, config, error) && slots.working().request == 0,
           "uninitialized working verifier cannot publish an identity");
     const std::vector<int32_t> prefix{11, 22};
+    {
+        program::ResidentPreparation lease;
+        lease.slot = 7;
+        lease.request = 91;
+        const std::vector<int64_t> tokens{11, 22};
+        const program::ResidentPrepareInput inputs[]{{0, &tokens, config}, {0, &tokens, config}};
+        check(!slots.reserve(inputs, 0, &lease, error) && lease.slot == 7 && lease.request == 91,
+              "empty reservation cannot replace a caller lease");
+        program::ResidentPreparation leases[2];
+        check(!slots.reserve(inputs, 2, leases, error) && !slots.slots()[0].preparing &&
+              slots.slots()[0].request == 0 && slots.slots()[1].request == 0,
+              "unavailable/duplicate reservation publishes no partial owner or preparation");
+        check(!slots.prepare(lease, error) && !slots.prefilled(lease, 1, error) &&
+              !slots.first_token(lease, 33, nullptr, error) && !slots.abort_preparation(lease, error),
+              "foreign preparation leases refuse every transition before GPU access");
+        check(draft.slot_cells(-1) == -1 && draft.slot_begin(0) == -1 &&
+              draft.slot_prompt_len(0) == -1 && !draft.slot_covers(0, 0),
+              "missing draft destination never advertises a retained interval");
+        check(!draft.prepare_slot(-1, 91, 2, 0, true, error) &&
+              !draft.prefill_slot(0, nullptr, nullptr, 1, 0, error),
+              "invalid direct draft preparation and span refuse before device access");
+    }
     program::ResidentAdmission request;
     request.next_token = 33;
     check(!slots.admit(0, prefix, request, error), "admission before resource initialization refuses");

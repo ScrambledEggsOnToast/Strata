@@ -71,7 +71,8 @@ struct OperationInputs {
     uint64_t request_id = 0, epoch = 0;
     int32_t position = 0, accepted = 0;
     int32_t tokens[8] = {};
-    uint32_t checks = 0, reserved = 0;
+    // Zero: dense draft steps. Nonzero: prompt QSA width=min(position+1,prompt_cap).
+    uint32_t checks = 0, prompt_cap = 0;
 };
 static_assert(sizeof(OperationInputs) == 64);
 
