@@ -1037,6 +1037,7 @@ class StrataEngine:
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
+        self.throughput = Throughput()  # one counter for startup and ongoing frames of this process
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
@@ -1052,6 +1053,7 @@ class StrataEngine:
                 continue
             if line is None:
                 break
+            self.throughput.wire(line)
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -1306,7 +1308,7 @@ class StrataEngine:
                     self._release_control()
 
     def _pump(self):
-        throughput = self.throughput = Throughput()
+        throughput = self.throughput = getattr(self, "throughput", None) or Throughput()
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         score_q = getattr(self, "score_q", {})

@@ -13480,6 +13480,8 @@ int main(int argc, char** argv) {
                              (long long)(std::max_element(row, row + n_vocab) - row));
             }
         }
+        // Advertise before readiness, including replicas that have not received work yet.
+        if (report_throughput) std::printf("INFO throughput_progress=1\n");
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

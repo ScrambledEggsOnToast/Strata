@@ -1,3 +1,5 @@
+import tempfile
+import sys
 """CPU-only wire and HTTP proof; no model, native process or GPU is started."""
 from unittest.mock import patch
 import json
@@ -83,6 +85,47 @@ class ThroughputTests(unittest.TestCase):
         self.assertIsNone(r.snapshot()['prefill_tok_s'])
         r.engines[1].alive=lambda: False
         self.assertIsNone(r.snapshot()['decode_tok_s'])
+
+    def test_startup_capability_reaches_runtime_counter(self):
+        import serve.server as server
+        from unittest.mock import patch
+        peer = "import sys\nprint('INFO throughput_progress=1', flush=True)\nprint('READY 4096 stop', flush=True)\nfor line in sys.stdin:\n if line.strip() == 'QUIT': break\n"
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'peer.py'
+            script.write_text(peer)
+            popen = server.subprocess.Popen
+            with patch.object(server.subprocess, 'Popen', lambda cmd, **kw: popen([sys.executable, str(script)], **kw)):
+                engine = StrataEngine('fixture', [])
+            try:
+                self.assertTrue(engine.alive())
+                self.assertEqual(engine.throughput.snapshot()['prefill_tok_s'], 0)
+            finally:
+                engine.close()
+            # A new process without the announcement must not inherit capability.
+            script.write_text(peer.replace("print('INFO throughput_progress=1', flush=True)\n", ''))
+            with patch.object(server.subprocess, 'Popen', lambda cmd, **kw: popen([sys.executable, str(script)], **kw)):
+                engine.__init__('fixture', [])
+            try:
+                self.assertIsNone(engine.throughput.snapshot()['prefill_tok_s'])
+            finally:
+                engine.close()
+
+    def test_idle_replica_capability_before_first_request(self):
+        busy, unused = Throughput(), Throughput()
+        for counter in (busy, unused):
+            counter.wire('INFO throughput_progress=1')
+            counter.wire('READY 4096 stop')
+        busy.wire('RESUME 0')
+        busy.wire('PP 100 100 100 1000 100')
+        busy.wire('BT 0 42')
+        replicas = ReplicaEngine.__new__(ReplicaEngine)
+        replicas.engines = [SimpleNamespace(throughput=t, alive=lambda: True) for t in (busy, unused)]
+        self.assertEqual(replicas.snapshot()['prefill_tok_s'], 20)
+        self.assertEqual(replicas.snapshot()['decode_tok_s'], .2)
+        # A genuinely uninstrumented member must still leave the total unknown.
+        unused.wire('RESUME 0')
+        unused.wire('PP 10 10 10 1000')
+        self.assertIsNone(replicas.snapshot()['prefill_tok_s'])
 
     def test_unknown_protocol_and_restart(self):
         t=Throughput()

@@ -17,7 +17,7 @@ IDs or token values are retained by the counters. No GPU polling is added.
 
 The native PP line appends cumulative fresh tokens for the current read leg as
 its sixth field. The previous five fields retain their meaning. The native
-reader advertises `INFO throughput_progress=1` before RESUME. Unlike the prompt
+reader advertises `INFO throughput_progress=1` before READY and again before RESUME. This lets unused replicas contribute a known zero instead of making the aggregate unavailable. Unlike the prompt
 position, this count excludes reused prefixes and includes actual re-reading.
 An INFO fresh_prompt_tokens counter reports committed tails at the prompt boundary
 and the final prompt input at the first committed output. DONE's legacy resume-based
