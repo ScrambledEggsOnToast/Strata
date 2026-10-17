@@ -1135,6 +1135,8 @@ void check_shared_head_is_evictable() {
     settle(publications, store, sink);
     check(store.counters().heads == 1 && store.counters().evictions == 1 && publications.owner(0).lineage.valid,
           "real head pressure evicts the shared head rather than pinning capacity forever");
+}
+
 // Keep a real production pending entry unreconciled while other callers finish more publications than the result
 // queue can hold. Backpressure must preserve that first completion, not quietly leave its owner pending forever.
 void check_unreaped_results_preserve_production_pending() {

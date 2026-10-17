@@ -5919,7 +5919,9 @@ void check_idle_final_lease_reclaim() {
         check(store.counters().reclaimed_bytes > held.reclaimed_bytes, "idle deletion is confirmed and counted");
         check(store.healthy() && store.run_intent_active(), "idle reclamation leaves the live store healthy");
         store.close();
-        check(store.healthy() && !store.run_intent_active(), "the subsequent shutdown still closes cleanly");
+        check(store.shutdown_state() == ConversationStoreShutdownState::durable_clean &&
+                  !store.run_intent_active(),
+              "the subsequent shutdown still closes durably and clears the intent");
     }
 }
 

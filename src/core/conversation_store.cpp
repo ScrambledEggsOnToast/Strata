@@ -4054,7 +4054,7 @@ void ConversationStore::Impl::writer_body() {
             else counters.promotions_refused++;
             continue;
         }
-        if (reclaim_pending_work && !closing && !faulted) {
+        if (reclaim_pending_work && shutdown == ConversationStoreShutdownState::none && !faulted) {
             // Final reader releases schedule storage work, never filesystem I/O on the releasing thread.
             // Reclamation consumes the hint under the mutex and re-arms it for truncated passes or failed unlinks.
             lock.unlock();
