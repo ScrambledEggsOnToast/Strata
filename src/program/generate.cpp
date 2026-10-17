@@ -11655,9 +11655,15 @@ int main(int argc, char** argv) {
         // byte-verified.  A missing, corrupt, stale, refused or cancelled record is an ordinary miss: the caller
         // keeps the selection it already had and reads the prompt itself.  Nothing here runs under the request
         // admission or the generation pipe lock, and the wait is bounded and cancellable.
+        const bool store_restore_trace = [] {
+            const char* value = std::getenv("STRATA_STORE_TIMING");
+            return value && std::strcmp(value, "1") == 0;
+        }();
         struct StoreDemandResult {
             strata::core::ConversationStoreReadStatus status = strata::core::ConversationStoreReadStatus::none;
             uint64_t head_id = 0;
+            uint64_t attempt_id = 0;
+            bool prefetched = false;
             uint64_t epoch = 0;        // the execution-domain epoch the mounted image was captured in
             int64_t tokens = 0;
             bool live = false;
@@ -11897,6 +11903,8 @@ int main(int argc, char** argv) {
             }
             out.status = read.status;
             out.head_id = read.head_id;
+            out.attempt_id = read.attempt_id;
+            out.prefetched = read.prefetched;
             out.epoch = read.epoch;
             out.tokens = read.tokens;
             out.live = read.live;
@@ -11910,8 +11918,11 @@ int main(int argc, char** argv) {
             out.request_id = query.request_id;
             out.generation = query.generation;
             std::fprintf(stderr, "strata serve: conversation store: demand ready request=%llu head=%llu tokens=%lld "
+                                 "generation=%llu attempt_id=%llu origin=%s "
                                  "wait_ms=%.1f materialize_ms=%.3f ready_ns=%llu\n", (unsigned long long) query.request_id,
                          (unsigned long long) read.head_id, (long long) read.tokens,
+                         (unsigned long long) read.generation, (unsigned long long) read.attempt_id,
+                         read.prefetched ? "prefetch" : "demand",
                          (double) (now_ns() - wait_started) / 1e6, read.materialize_ms, (unsigned long long) now_ns());
             // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
             // (ram_lease_bytes) until this process reports the read finished.  That report is release_read(), and the
@@ -16537,8 +16548,18 @@ int main(int argc, char** argv) {
                 }
                 incoming.reset();
             }
-            if (restored_from_store) {
+            if (restored_from_store && reread_to < 0) {
                 conversation_store->confirmed_restore(store_demand.head_id);
+                if (store_restore_trace)
+                    std::fprintf(stderr, "store_restore event=confirmed request_id=%llu generation=%llu "
+                                         "attempt_id=%llu head=%llu cut=%lld epoch=%llu origin=%s\n",
+                                 (unsigned long long) store_demand.request_id,
+                                 (unsigned long long) store_demand.generation,
+                                 (unsigned long long) store_demand.attempt_id,
+                                 (unsigned long long) store_demand.head_id,
+                                 (long long) store_demand.tokens,
+                                 (unsigned long long) store_demand.epoch,
+                                 store_demand.prefetched ? "prefetch" : "demand");
                 ++store_restored;
             }
             // Every alias of the mounted image is gone by now - the engine's own image was reset above, and the K/V the

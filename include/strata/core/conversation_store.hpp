@@ -24,6 +24,14 @@
 // indefinitely for filesystem-blocked work and must not be mistaken for a deadline-bounded join. No storage wait
 // runs while the module holds its catalog mutex, and filesystem access is descriptor-relative to validated paths.
 #pragma once
+//
+// STRATA_STORE_TIMING=1 enables bounded, metadata-only store_read/store_head receipts (off by default).
+// `planned` is not removal: only `retired` after durable catalog apply names a committed retirement, with
+// its applied catalog_version and applied_ns. Pin/lease/protected/recency fields describe the victim just
+// before apply; protected is preferential retention, not a pin. Capacity evictions count only committed
+// removals, excluding covered replacements. Candidate rejections are capped at eight per selection;
+// candidate_rejections_omitted reports the remainder without hiding ownership transitions. No tokens,
+// prompt bytes, scopes, credentials, paths or content digests enter these receipts.
 
 #include "strata/core/conversation_cache.hpp"
 
@@ -366,6 +374,10 @@ struct ConversationStoreRead {
     uint64_t request_id = 0;
     uint64_t generation = 0;
     uint64_t head_id = 0;
+    // Receipt identity and origin of the attempt that produced this result. Demand may adopt an existing
+    // prefetch without relabelling it; a demand redo has a new attempt_id and prefetched=false.
+    uint64_t attempt_id = 0;
+    bool prefetched = false;
     // The execution-domain epoch this read was admitted in.  Never relabelled: a completion of an older epoch is
     // retired rather than delivered under the current one.
     uint64_t epoch = 0;

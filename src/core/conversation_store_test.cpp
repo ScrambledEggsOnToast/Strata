@@ -602,6 +602,9 @@ void check_manifest();
 void check_round_trip();
 void check_profile_recovery();
 void check_full_catalog_profile_restart();
+void check_profile_switch_retention_disposition();
+void check_retirement_receipts();
+void check_bounded_candidate_rejections();
 void check_split_pinned_restart();
 void check_dedup_beyond_the_quota();
 void check_dense_manifest_workspace_refusal();
@@ -694,6 +697,15 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_RETENTION_ONLY")) {
+        check_profile_switch_retention_disposition();
+        check_retirement_receipts();
+        check_bounded_candidate_rejections();
+        check_quota_credit();
+        check_selected_hold_commit_interleaving();
+        std::printf("conversation_store_test retention: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_SHUTDOWN_ONLY")) {
         check_shutdown_admission();
         check_shutdown_pending();
@@ -758,6 +770,9 @@ int main() {
     check_round_trip();
     check_profile_recovery();
     check_full_catalog_profile_restart();
+    check_profile_switch_retention_disposition();
+    check_retirement_receipts();
+    check_bounded_candidate_rejections();
     check_split_pinned_restart();
     check_dedup_beyond_the_quota();
     check_dense_manifest_workspace_refusal();
@@ -4406,6 +4421,7 @@ void check_selected_hold_commit_interleaving() {
     // A demand racing victim selection must either win before staging, or retain immutable authority after staging.
     // Also cover a selected predecessor absent from the catalog and a second retirement of shared object bytes.
     for (int scenario = 0; scenario < 4; ++scenario) {
+        StoreReadTraceCapture trace;
         const bool after_staging = scenario != 0;
         const bool cover = scenario >= 2;
         const bool rollback = scenario == 3;
@@ -4442,6 +4458,16 @@ void check_selected_hold_commit_interleaving() {
         ConversationStorePublishResult result;
         check(store.wait_publish(result, 5000), "the racing catalog transaction settles");
         store.set_catalog_gate_for_test(nullptr, nullptr);
+        const auto records = trace.records("store_head ");
+        const auto* retired = read_trace(records, "retired", request.request_id,
+                                          cover ? "covered_replacement" : "head_limit");
+        if (after_staging && !rollback) {
+            check(retired && retired->number("head") == first.head_id && retired->number("head_leases") == 1 &&
+                      retired->number("catalog_version") == result.catalog_version,
+                  "a staged retirement receipt reports the lease actually present at committed removal");
+        } else {
+            check(!retired, "a winning pre-stage lease or failed rename emits no committed removal");
+        }
         if (!after_staging || rollback) {
             ConversationStoreManifestInfo retained;
             check(store.manifest_info(first.head_id, retained), "a pre-stage lease or failed rename preserves authority");
@@ -6015,6 +6041,7 @@ void check_quota_credit() {
     // (2) With an evictable branch present, the store makes room by evicting it *durably* before it charges the new
     // bytes, and never touches the pinned branch.
     {
+        StoreReadTraceCapture trace;
         const std::string path = root.path + "/evict";
         SavedConversation big = fixture(211, 4096);
         for (auto& checkpoint : big.checkpoints) checkpoint.pinned = false;
@@ -6022,12 +6049,14 @@ void check_quota_credit() {
         check(!big.pinned(), "the evictable fixture carries no pin");
         check(small_pinned.pinned(), "the small fixture is pinned");
         uint64_t charged = 0;
+        uint64_t victim_head = 0;
         {
             ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
             ConversationStorePublishResult first, second;
             check(publish_and_wait(store, big, 1, 1, first) &&
                       first.status == ConversationStorePublishStatus::stored,
                   "the evictable branch is stored");
+            victim_head = first.head_id;
             check(publish_and_wait(store, small_pinned, 2, 2, second) &&
                       second.status == ConversationStorePublishStatus::stored,
                   "the pinned branch is stored beside it");
@@ -6058,6 +6087,14 @@ void check_quota_credit() {
         const ConversationStoreQuery kept = query_of(small_pinned, 5, 5);
         check(!store.matches(kept.selector, kept.tokens, kept.images).empty(),
               "the pinned branch survived the eviction");
+        const auto records = trace.records("store_head ");
+        const auto* retired = read_trace(records, "retired", request.request_id, "byte_quota");
+        check(retired && retired->number("head") == victim_head && !retired->number("pinned") &&
+                  !retired->number("head_leases") && !retired->number("protected") &&
+                  retired->number("replacement_head") == 0 && retired->number("applied_ns") &&
+                  retired->number("catalog_version") < stored.catalog_version,
+              "physical byte eviction names the committed victim and requesting publication, not a head-limit event");
+        check_eq(store.counters().evictions, 1, "one committed physical quota victim counts exactly once");
         store.close();
     }
 }
@@ -8086,6 +8123,213 @@ void check_object_directory_batch() {
     }
     if (had) ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved.c_str(), 1);
     else ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");
+}
+
+// Classification fixture for #243, not an assertion about the untraced historical retirement. The same older
+// pinned history/newer unpinned branch crosses two clean domain switches. Only real head pressure may remove
+// the newest branch; persisted protected recency and a selected request lease must each preserve it.
+void check_profile_switch_retention_disposition() {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto pair_options = options_for(root.path, uint64_t(1) << 30, 0);
+        pair_options.domain = bytes_from("domain:pair");
+        pair_options.head_limit = scenario == 0 ? 4 : 3;
+        pair_options.publication_timing = true;
+        auto triple_options = pair_options;
+        triple_options.domain = bytes_from("domain:triple");
+        const auto limits = profile_limits(3, 2, uint64_t(64) << 20);
+        auto older = split_fixture(811, 64, 2);
+        older.checkpoints.front().pinned = true;
+        for (auto& stage : older.stage_images) stage.checkpoints.front().pinned = true;
+        const auto latest = split_fixture(811, 128, 2);
+        check(older.pinned() && !latest.pinned(), "the classification separates a pinned fallback from the latest branch");
+        ConversationStorePublishResult old_head, latest_head, pressure;
+        uint64_t pair_epoch = 0;
+        std::string why;
+        {
+            ConversationStore pair(pair_options, limits);
+            pair_epoch = pair.epoch();
+            check(publish_and_wait(pair, older, 1, 1, old_head) &&
+                      old_head.status == ConversationStorePublishStatus::stored &&
+                      publish_and_wait(pair, latest, 2, 2, latest_head) &&
+                      latest_head.status == ConversationStorePublishStatus::stored,
+                  "the initial pair stores both real histories without pressure");
+            if (scenario == 2) {
+                const auto query = query_of(latest, 20, 1);
+                ConversationStoreRead read;
+                check(pair.demand(query, why) && pair.wait_ready(20, 1, read, 5000) && read.image &&
+                          read.tokens == 128, "a real confirmed use promotes the latest branch before switching");
+                check(read.attempt_id && !read.prefetched, "a fresh demand receipt has its own non-prefetch attempt");
+                if (read.image) pair.confirmed_restore(read.head_id);
+                read.image.reset();
+                pair.release_read(20, 1);
+            }
+            pair.close();
+        }
+        {
+            ConversationStore triple(triple_options, limits);
+            check(triple.enabled() && triple.retains_head(latest_head.head_id),
+                  "changing execution domain alone never retires the pair frontier");
+            check(publish_and_wait(triple, split_fixture(813, 128, 3), 31, 1, pressure) &&
+                      pressure.status == ConversationStorePublishStatus::stored,
+                  "the triple fills the last available head slot");
+            if (scenario != 3)
+                check(publish_and_wait(triple, split_fixture(815, 128, 3), 32, 2, pressure) &&
+                          pressure.status == ConversationStorePublishStatus::stored,
+                      "independent triple publication exercises the actual shared head ceiling");
+            check_eq(triple.counters().evictions, scenario == 0 || scenario == 3 ? 0 : 1,
+                     "only committed capacity removals count as evictions");
+            check_eq(triple.counters().refused_quota, 0, "head pressure is not misreported as byte quota refusal");
+            check_eq(triple.counters().corrupt_records, 0, "ordinary head pressure is not checkpoint corruption");
+            triple.close();
+        }
+        {
+            ConversationStore pair(pair_options, limits);
+            check_eq(pair.epoch(), pair_epoch, "both clean domain switches preserve the original pair epoch");
+            check(pair.retains_head(old_head.head_id), "the independently pinned fallback survives both switches");
+            const bool lost_latest = scenario == 1;
+            check(pair.retains_head(latest_head.head_id) != lost_latest,
+                  "only unprotected head pressure, not profile identity or lifetime, loses the newest head");
+            const auto query = query_of(latest, 40, 3);
+            pair.suspend_read_admission();
+            check(pair.prefetch(query, why), "returning request selects its own retained head before materialization");
+            if (scenario == 3) {
+                check(publish_and_wait(pair, split_fixture(817, 128, 2), 41, 3, pressure) &&
+                          pressure.status == ConversationStorePublishStatus::stored,
+                      "publication beside the queued selected lease still obtains a real head slot");
+                check(pair.retains_head(latest_head.head_id), "a queued lease protects the selected latest head");
+                check_eq(pair.counters().evictions, 1, "leased-head pressure commits exactly one other removal");
+            }
+            pair.publish_read_allowance(uint64_t(64) << 20);
+            check(await_status(pair, 40, 3, ConversationStoreReadStatus::ready), "the returning prefetch materializes");
+            check(pair.demand(query, why), "demand adopts the already-materialized prefetch");
+            ConversationStoreRead read;
+            check(pair.wait_ready(40, 3, read, 5000) && read.image &&
+                      read.head_id == (lost_latest ? old_head.head_id : latest_head.head_id) &&
+                      read.tokens == (lost_latest ? 64 : 128) &&
+                      images_equal(*read.image, lost_latest ? older : latest, why),
+                  "restore distinguishes normal older-head fallback from a retained latest checkpoint");
+            check(read.attempt_id && read.prefetched, "the returned receipt preserves the adopted prefetch's origin");
+            if (read.image) pair.confirmed_restore(read.head_id);
+            const uint64_t attempt = read.attempt_id;
+            read.image.reset();
+            pair.release_read(40, 3);
+            pair.close();
+            const auto reads = trace.records();
+            const auto* adopted = read_trace(reads, "adopt", 40);
+            check(adopted && adopted->number("attempt_id") == attempt && adopted->text("origin") == "prefetch" &&
+                      adopted->number("head") == (lost_latest ? old_head.head_id : latest_head.head_id),
+                  "native restore delivery correlates request, attempt, head, cut and immutable origin");
+        }
+        const auto heads = trace.records("store_head ");
+        const auto* retired = read_trace(heads, "retired", 32, "head_limit");
+        if (scenario == 1 || scenario == 2) {
+            check(retired && retired->number("head") != old_head.head_id &&
+                      (retired->number("head") == latest_head.head_id) == (scenario == 1) &&
+                      !retired->number("pinned") && !retired->number("head_leases") &&
+                      !retired->number("protected") && retired->number("recency") &&
+                      retired->number("catalog_version") == pressure.catalog_version &&
+                      retired->number("applied_ns") == pressure.applied_ns,
+                  "the authoritative receipt distinguishes expected head eviction from protected-history loss");
+        } else {
+            check(!retired, "a switch without that capacity transaction has no invented retirement");
+        }
+    }
+}
+
+void check_retirement_receipts() {
+    for (const char* fault : {"catalog-rename", "catalog-sync", "catalog-apply"}) {
+        StoreReadTraceCapture trace;
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.head_limit = 1;
+        options.publication_timing = true;
+        ConversationStore store(options);
+        auto first = fixture(821, 128);
+        for (auto& checkpoint : first.checkpoints) checkpoint.pinned = false;
+        ConversationStorePublishResult prior, failed, committed;
+        check(publish_and_wait(store, first, 71, 1, prior), "the retirement fault fixture starts with a real head");
+        store.set_publish_fault_for_test(fault);
+        check(publish_and_wait(store, fixture(823, 128), 72, 2, failed) &&
+                  failed.status == ConversationStorePublishStatus::failed,
+              "the injected catalog boundary rejects the capacity publication");
+        check_eq(store.counters().evictions, 0, "planned or uncertain removals never increment committed evictions");
+        const auto refused = trace.records("store_head ");
+        check(read_trace(refused, "planned", 72, "head_limit") &&
+                  !read_trace(refused, "retired", 72),
+              "a planned victim is not reported as an authoritative retirement on failure");
+        if (std::strcmp(fault, "catalog-rename") == 0) {
+            check(store.retains_head(prior.head_id), "failed rename preserves the original authority");
+            check(publish_and_wait(store, fixture(823, 128), 73, 3, committed) &&
+                      committed.status == ConversationStorePublishStatus::stored,
+                  "the same real capacity publication succeeds once the rename fault is gone");
+            check_eq(store.counters().evictions, 1, "successful retry counts one removal, not two attempts");
+            const auto records = trace.records("store_head ");
+            const auto* retired = read_trace(records, "retired", 73, "head_limit");
+            check(retired && retired->number("head") == prior.head_id &&
+                      retired->number("catalog_version") == committed.catalog_version &&
+                      retired->number("plan_version") < retired->number("catalog_version") &&
+                      retired->number("applied_ns") == committed.applied_ns,
+                  "retirement and publication share the actual successful apply version and timestamp");
+        }
+        store.close();
+    }
+    StoreReadTraceCapture trace;
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 2;
+    ConversationStorePublishResult older, newer;
+    {
+        ConversationStore store(options);
+        auto image = fixture(825, 128);
+        for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+        check(publish_and_wait(store, image, 81, 1, older) &&
+                  publish_and_wait(store, fixture(827, 128), 82, 2, newer), "startup pressure has two durable heads");
+        store.close();
+    }
+    options.head_limit = 1;
+    ConversationStore reopened(options);
+    check(reopened.enabled() && !reopened.retains_head(older.head_id) && reopened.retains_head(newer.head_id),
+          "startup head pressure removes the unpinned actual victim");
+    check_eq(reopened.counters().evictions, 1, "recovery also counts only its committed capacity removal");
+    const auto records = trace.records("store_head ");
+    const auto* retired = read_trace(records, "retired", 0, "startup_head_limit");
+    check(retired && retired->number("head") == older.head_id && retired->number("applied_ns") &&
+              retired->number("catalog_version"), "startup retirement has a durable-apply receipt, not silent loss");
+    reopened.close();
+}
+
+void check_bounded_candidate_rejections() {
+    StoreReadTraceCapture trace;
+    TempRoot root;
+    auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    options.head_limit = 16;
+    ConversationStore store(options);
+    for (uint64_t i = 0; i < 12; ++i) {
+        auto image = fixture(841, 128);
+        for (auto& token : image.live.ids) token += int32_t(i);
+        for (auto& checkpoint : image.checkpoints)
+            for (auto& token : checkpoint.ids) token += int32_t(i);
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, image, 100 + i, i + 1, result) &&
+                  result.status == ConversationStorePublishStatus::stored, "rejection fanout stores real candidate heads");
+    }
+    auto query = query_of(fixture(841, 128), 120, 1);
+    query.tokens.front() = -1;
+    std::string why;
+    check(store.prefetch(query, why), "a missing prefix traverses the real candidate selection");
+    ConversationStoreRead read;
+    check(store.wait_ready(120, 1, read, 5000) && read.status == ConversationStoreReadStatus::missing,
+          "bounded diagnostics leave the real no-I/O miss unchanged");
+    store.close();
+    const auto records = trace.records();
+    check_eq(read_trace_count(records, "candidate_rejected", 120), 8, "rejection reasons have a fixed per-selection cap");
+    const auto* omitted = read_trace(records, "candidate_rejections_omitted", 120, "trace_bound");
+    check(omitted && omitted->number("omitted_rejections") == 16 && omitted->text("origin") == "prefetch",
+          "the receipt truthfully counts the rest of the twenty-four rejected cuts");
+    check(read_trace(records, "settled", 120, "no_io") && read_trace(records, "adopt", 120) &&
+              !read_trace(records, "trace_overflow", 0), "candidate fanout cannot displace ownership or settlement records");
 }
 
 } // namespace

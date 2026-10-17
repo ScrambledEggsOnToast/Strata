@@ -146,7 +146,7 @@ struct StoreReadTrace {
     uint64_t body_lock_wait_ns, completion_lock_wait_ns;
     uint64_t peak_bytes, reserved_bytes, lease_bytes, resident_bytes, budget_bytes, prepared_bytes;
     uint64_t preparation_bytes, metadata_limit, incoming, max_reads, queued, descriptors, wait_mask;
-    uint64_t demand, active, holds_slot, cancelled, io_attempted, bytes_read;
+    uint64_t demand, prefetched, active, holds_slot, cancelled, io_attempted, bytes_read, omitted_rejections;
     bool head_event;
     uint64_t plan_version, catalog_version, replacement_head, head_leases, pinned, protected_seg, recency;
     uint64_t charged_bytes, free_bytes, quota_bytes, floor_bytes;
@@ -213,15 +213,16 @@ struct StoreReadTraceBatch {
                 " resident_bytes=%" PRIu64 " budget_bytes=%" PRIu64 " prepared_bytes=%" PRIu64
                 " preparation_bytes=%" PRIu64 " metadata_limit=%" PRIu64 " incoming=%" PRIu64
                 " max_reads=%" PRIu64 " queued=%" PRIu64 " descriptors=%" PRIu64 " wait_mask=%" PRIu64
-                " demand=%" PRIu64 " active=%" PRIu64 " holds_slot=%" PRIu64 " cancelled=%" PRIu64
-                " io_attempted=%" PRIu64 " bytes_read=%" PRIu64 "\n",
+                " demand=%" PRIu64 " origin=%s active=%" PRIu64 " holds_slot=%" PRIu64 " cancelled=%" PRIu64
+                " io_attempted=%" PRIu64 " bytes_read=%" PRIu64 " omitted_rejections=%" PRIu64 "\n",
                 r.event, r.reason, conversation_store_read_status_name(r.status), r.ts_ns,
                 r.request_id, r.generation, r.attempt_id, r.previous_attempt_id, r.head, r.cut, r.epoch,
                 r.call_ns, r.call_lock_wait_ns, r.enqueue_ns, r.admit_ns, r.start_ns, r.finish_ns, r.ready_ns, r.ready_end_ns,
                 queue_ns, dispatch_ns, read_ns, r.body_lock_wait_ns, materialize_ns, r.completion_lock_wait_ns, residence,
                 r.peak_bytes, r.reserved_bytes, r.lease_bytes, r.resident_bytes, r.budget_bytes, r.prepared_bytes,
                 r.preparation_bytes, r.metadata_limit, r.incoming, r.max_reads, r.queued, r.descriptors, r.wait_mask,
-                r.demand, r.active, r.holds_slot, r.cancelled, r.io_attempted, r.bytes_read);
+                r.demand, r.prefetched ? "prefetch" : "demand", r.active, r.holds_slot, r.cancelled,
+                r.io_attempted, r.bytes_read, r.omitted_rejections);
             if (length > 0 && size_t(length) < sizeof line) write_line(line, size_t(length));
         }
         if (dropped) {
@@ -840,6 +841,7 @@ struct ConversationStore::Impl {
         ConversationStoreQuery query;
         ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
         bool demand = false;
+        bool prefetched = false;          // immutable origin of this attempt; demand adoption does not relabel it
         bool refresh_on_completion = false; // one demand-time catalog recheck after an active prefetch unwinds
         bool active = false;              // a reader thread is materializing it right now
         std::atomic<bool> cancelled{false};
@@ -1069,6 +1071,7 @@ struct ConversationStore::Impl {
     bool stage_apply_locked(CommitPlan& plan, std::string& why);
     void unstage_apply_locked(CommitPlan& plan);
     void apply_staged_locked(CommitPlan& plan);   // allocation-free: the staged nodes are moved, never built
+    StoreReadTrace trace_head_locked(const CatalogHead& head, const char* event, const char* reason) const;
     void trace_retirement_locked(StoreReadTraceBatch& trace, const CommitPlan& plan, const char* event) const;
     void trace_publication_locked(StoreReadTraceBatch& trace, const CommitPlan& plan) const;
 
@@ -1484,6 +1487,11 @@ bool ConversationStore::Impl::read_catalog(std::string& why) {
 }
 
 bool ConversationStore::Impl::reconcile(std::string& why) {
+    StoreReadTraceBatch recovery_trace;
+    recovery_trace.io_allowed = false; // snapshots are not removals until the startup catalog commits
+    const auto retiring_trace = [&](const CatalogHead& head, const char* reason) {
+        if (read_timing) recovery_trace.add(trace_head_locked(head, "retired", reason));
+    };
     // Every scratch file is garbage by construction: a durable write completes with a rename out of tmp/.  Anything
     // that is not a regular file this account owns is left in place (and is still accounted for below).
     std::vector<DirEntry> temporaries;
@@ -1588,6 +1596,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         // ledger before the first catalog transaction forgets it.
         if (head.domain == domain_index && (unclean_start || head.epoch != epoch)) {
             dropped.push_back(head.head_id);
+            retiring_trace(head, unclean_start ? "unclean_domain" : "retired_epoch");
             continue;
         }
         const auto manifest = present_manifests.find(head.manifest_id);
@@ -1619,6 +1628,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         if (read == ManifestRead::invalid) {
             counters.corrupt_records++;
             dropped.push_back(head.head_id);
+            retiring_trace(head, "invalid_manifest");
             continue;
         }
         bool complete = true;
@@ -1630,6 +1640,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         if (!complete) {
             counters.corrupt_records++;
             dropped.push_back(head.head_id);
+            retiring_trace(head, "missing_object");
             continue;
         }
         head_manifest_bytes[head.head_id] = manifest->second;
@@ -1687,10 +1698,10 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         for (size_t i = 0; i < catalog.heads.size(); ++i)
             if (catalog.heads[i].head_id == victim) {
                 retiring.push_back(victim);
+                retiring_trace(catalog.heads[i], "startup_head_limit");
                 catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
                 break;
             }
-        counters.evictions++;
     }
     recount_metadata_locked();
     while (metadata > options.metadata_bytes && catalog.heads.size() > 1) {
@@ -1699,6 +1710,7 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         for (size_t i = 0; i < catalog.heads.size(); ++i)
             if (catalog.heads[i].head_id == victim) {
                 retiring.push_back(victim);
+                retiring_trace(catalog.heads[i], "startup_metadata_limit");
                 catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
                 break;
             }
@@ -1725,6 +1737,15 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
     CommitPlan plan;
     plan.kind = CommitPlan::Kind::promote;
     if (commit_plan(plan, why) != CommitOutcome::durable_applied) return false;
+    counters.evictions += retiring.size();
+    if (read_timing && (recovery_trace.count || recovery_trace.dropped)) {
+        const uint64_t applied = plan.applied_ns;
+        for (size_t i = 0; i < recovery_trace.count; ++i) {
+            recovery_trace.records[i].finish_ns = applied;
+            recovery_trace.records[i].catalog_version = catalog_version;
+        }
+        recovery_trace.io_allowed = true;
+    }
     recount_metadata_locked();
     return true;
 }
@@ -1931,7 +1952,6 @@ bool ConversationStore::Impl::obtain_head_slot_locked(Catalog& candidate, uint64
                 candidate.heads.erase(candidate.heads.begin() + std::ptrdiff_t(i));
                 break;
             }
-        counters.evictions++;
     }
     return true;
 }
@@ -2456,41 +2476,48 @@ void ConversationStore::Impl::apply_staged_locked(CommitPlan& plan) {
     counters.manifests = uint64_t(head_manifest_bytes.size());
 }
 
+StoreReadTrace ConversationStore::Impl::trace_head_locked(const CatalogHead& head, const char* event,
+                                                         const char* reason) const {
+    auto record = trace_state_locked(event, reason, ConversationStoreReadStatus::none);
+    record.head_event = true;
+    record.head = head.head_id;
+    record.epoch = head.epoch;
+    record.catalog_version = catalog_version;
+    const auto lease = head_leases.find(head.head_id);
+    record.head_leases = lease == head_leases.end() ? 0 : lease->second;
+    record.pinned = head.pinned;
+    record.protected_seg = head.protected_seg;
+    record.recency = recency_of_locked(head);
+    record.stages = head.stages;
+    record.charged_bytes = charged;
+    record.free_bytes = free_sample;
+    record.quota_bytes = options.quota_bytes;
+    record.floor_bytes = options.min_free_bytes;
+    for (const auto& cut : head.cuts) {
+        record.cut = std::max(record.cut, uint64_t(cut.tokens));
+        if (cut.live) record.live_tokens = std::max(record.live_tokens, uint64_t(cut.tokens));
+    }
+    return record;
+}
+
 void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace, const CommitPlan& plan,
                                                       const char* event) const {
     if (!read_timing) return;
     for (uint64_t victim : plan.retiring) {
-        auto record = trace_state_locked(event, "head_limit", ConversationStoreReadStatus::none);
-        record.head_event = true;
-        record.head = victim;
-        record.request_id = plan.request_id;
-        record.generation = plan.generation;
-        record.plan_version = plan.version;
-        record.catalog_version = catalog_version;
-        record.replacement_head = plan.new_head;
-        if (plan.kind == CommitPlan::Kind::eviction) record.reason = plan.eviction_reason;
-        else if (plan.kind == CommitPlan::Kind::invalidate) record.reason = "domain_invalidated";
-        else if (victim == plan.replaced_head) record.reason = "covered_replacement";
-        const auto lease = head_leases.find(victim);
-        record.head_leases = lease == head_leases.end() ? 0 : lease->second;
-        record.charged_bytes = charged;
-        record.free_bytes = free_sample;
-        record.quota_bytes = options.quota_bytes;
-        record.floor_bytes = options.min_free_bytes;
         for (const auto& head : catalog.heads) {
             if (head.head_id != victim) continue;
-            record.epoch = head.epoch;
-            record.pinned = head.pinned;
-            record.protected_seg = head.protected_seg;
-            record.recency = recency_of_locked(head);
-            record.stages = head.stages;
-            for (const auto& cut : head.cuts) {
-                record.cut = std::max(record.cut, uint64_t(cut.tokens));
-                if (cut.live) record.live_tokens = std::max(record.live_tokens, uint64_t(cut.tokens));
-            }
+            const char* reason = "head_limit";
+            if (plan.kind == CommitPlan::Kind::eviction) reason = plan.eviction_reason;
+            else if (plan.kind == CommitPlan::Kind::invalidate) reason = "domain_invalidated";
+            else if (victim == plan.replaced_head) reason = "covered_replacement";
+            auto record = trace_head_locked(head, event, reason);
+            record.request_id = plan.request_id;
+            record.generation = plan.generation;
+            record.plan_version = plan.version;
+            record.replacement_head = plan.new_head;
+            trace.add(record);
             break;
         }
-        trace.add(record);
     }
 }
 
@@ -2697,9 +2724,16 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         trace_retirement_locked(trace, plan, "retired");
         apply_staged_locked(plan);
         plan.applied_catalog_version = catalog_version;
+        // Count removals only at the same successful authority boundary as the catalog receipt.
+        // A rejected/stale/uncertain plan is not an eviction; a covered replacement is not capacity pressure.
+        if (plan.kind == CommitPlan::Kind::publish || plan.kind == CommitPlan::Kind::eviction)
+            for (uint64_t victim : plan.retiring)
+                if (victim != plan.replaced_head) counters.evictions++;
+        for (size_t i = 0; i < trace.count; ++i)
+            trace.records[i].catalog_version = catalog_version;
         trace_publication_locked(trace, plan);
-        const uint64_t applied = options.publication_timing || trace.count ? store_timing_ns() : 0;
-        if (options.publication_timing) plan.applied_ns = applied;
+        const uint64_t applied = options.publication_timing || read_timing ? store_timing_ns() : 0;
+        if (options.publication_timing || read_timing) plan.applied_ns = applied;
         if (trace.count)
             for (size_t i = 0; i < trace.count; ++i) trace.records[i].finish_ns = applied;
     } catch (const std::exception& error) {
@@ -2748,6 +2782,10 @@ bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& 
     {
         std::lock_guard<std::mutex> guard(mutex);
         plan.version = catalog_version;
+        if (publishing && publishing->started) {
+            plan.request_id = publishing->request.request_id;
+            plan.generation = publishing->request.generation;
+        }
         copy_catalog_locked(plan);
         bool found = false;
         for (size_t i = 0; i < plan.candidate.heads.size(); ++i) {
@@ -2761,7 +2799,6 @@ bool ConversationStore::Impl::evict_head_durably(uint64_t head_id, std::string& 
             return false;
         }
         plan.retiring.push_back(head_id);
-        counters.evictions++;
     }
     return commit_plan(plan, why) == CommitOutcome::durable_applied;
 }
@@ -2829,16 +2866,22 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
     if (!on || faulted || shutdown != ConversationStoreShutdownState::none) return;
     const Digest bucket = conversation_store_detail::store_bucket_digest(options, selector);
     conversation_store_detail::PrefixChain chain(bucket, ids, count, images);
+    size_t rejections = 0;
+    uint64_t omitted = 0;
     auto reject = [&](const CatalogHead& head, const auto& cut, const char* reason) {
         if (!read_timing || !trace || !query) return;
-        if (trace->count == sizeof trace->records / sizeof trace->records[0]) {
-            ++trace->dropped;
+        // Leave room for the selection/adoption ownership records in this fixed batch. Candidate fanout must
+        // not silently displace the very transition the diagnostics are intended to explain.
+        if (rejections == 8 || trace->count >= 48) {
+            ++omitted;
             return;
         }
+        ++rejections;
         auto record = trace_state_locked("candidate_rejected", reason, ConversationStoreReadStatus::none);
         record.request_id = query->request_id;
         record.generation = query->generation;
         record.demand = demand;
+        record.prefetched = !demand;
         record.head = head.head_id;
         record.cut = cut.tokens;
         record.epoch = head.epoch;
@@ -2877,6 +2920,16 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
             match.published_order = head.published_order;
             out.push_back(match);
         }
+    }
+    if (omitted) {
+        auto record = trace_state_locked("candidate_rejections_omitted", "trace_bound",
+                                         ConversationStoreReadStatus::none);
+        record.request_id = query->request_id;
+        record.generation = query->generation;
+        record.demand = demand;
+        record.prefetched = !demand;
+        record.omitted_rejections = omitted;
+        trace->add(record);
     }
     std::stable_sort(out.begin(), out.end(), [](const ConversationStoreMatch& a, const ConversationStoreMatch& b) {
         if (a.tokens != b.tokens) return a.tokens > b.tokens;
@@ -2950,6 +3003,7 @@ void ConversationStore::Impl::trace_job_locked(StoreReadTraceBatch& trace, const
     record.prepared_bytes = job.prepared_bytes;
     record.wait_mask = trace_wait_locked(job);
     record.demand = job.demand;
+    record.prefetched = job.prefetched;
     record.active = job.active;
     record.holds_slot = job.holds_slot;
     record.cancelled = job.cancelled.load();
@@ -2968,6 +3022,7 @@ void ConversationStore::Impl::trace_refusal_locked(StoreReadTraceBatch& trace, c
     record.attempt_id = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
     record.previous_attempt_id = previous;
     record.demand = demand;
+    record.prefetched = !demand;
     record.head = head;
     record.cut = cut;
     record.peak_bytes = peak;
@@ -2978,6 +3033,7 @@ void ConversationStore::Impl::trace_refusal_locked(StoreReadTraceBatch& trace, c
 void ConversationStore::Impl::trace_begin_locked(ReadJob& job, uint64_t previous) {
     const bool prior_unmeasured = job.progress.prior_materialize_unmeasured || job.progress.materialize_started;
     job.progress = {};
+    job.prefetched = !job.demand;
     job.progress.prior_materialize_unmeasured = prior_unmeasured;
     job.progress.attempt_id = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!read_timing) return;
@@ -3649,6 +3705,8 @@ bool ConversationStore::Impl::deliver_locked(ConversationStoreRead& out, uint64_
         out.request_id = job->query.request_id;
         out.generation = job->query.generation;
         out.head_id = job->head_id;
+        out.attempt_id = job->progress.attempt_id;
+        out.prefetched = job->prefetched;
         out.epoch = job->epoch_at_admission;
         out.tokens = int64_t(job->tokens);
         out.live = job->live;
