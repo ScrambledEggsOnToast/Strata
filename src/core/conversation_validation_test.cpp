@@ -68,6 +68,7 @@ public:
                   std::string&, const char**) {
         ++batched_calls;
         if (!accept_batched) return false;
+        constexpr int slot = 8;
 #include "shared_draft_batched_range.inc"
         mtp.write(cell0 + r0, n - r0);
         mtp.coverage.completed(cell0 + r0, cell0 + n, r0 < n ? tokens[n - 1] : -1);
@@ -823,6 +824,7 @@ namespace shared_draft_fixture {
 int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
                       int64_t req_pin = 8192, int64_t n = 65536) {
     const bool use_mtp = true;
+    const bool packed_prefill = true;
     const ConversationScope req_shared_scope = shared ? ConversationScope{{1}} : ConversationScope{};
 #include "shared_draft_horizon.inc"
     return read_from;

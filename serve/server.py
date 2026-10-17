@@ -721,7 +721,7 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
 # finished, #267): the process may stay alive and even print DONE, but it must not take another request.
-FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
+FATAL_PREFIXES = ("FATAL ", "ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
@@ -1392,7 +1392,7 @@ class StrataEngine:
                 # release_gpu_waits invalidates the verifier, even if the native
                 # process stays alive and prints DONE afterwards.
                 if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                    self.silent_note = "Unrecoverable native failure: " + line.partition(" ")[2].strip()
                     self.ended = True
                 try:
                     proc.terminate()

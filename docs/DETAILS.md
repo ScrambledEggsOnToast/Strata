@@ -3260,6 +3260,9 @@ The frontend then submits each ready request immediately as `BGENQ1`: it never w
 All effective slots remain general-purpose; the existing FIFO-within-class, three-foreground-to-one-background
 HTTP admission rule is unchanged. Native reservation `BACK`, not completion of prefill, releases the frontend's
 exclusive submission control. Each request continues on its own tagged reply queue.
+An untagged native `FATAL` invalidates the entire process before reply routing, preserves
+the reported cause, and releases every waiting owner without accepting trailing tokens
+or a successful terminal. It is not an owner-local rejection or permission to reuse state.
 
 Trusted native clients may send `BGENQ1` through `BGENQ4`. One newline terminates the entire frame.
 The suffix is the exact number of owner records, separated by a single TAB:
@@ -3311,9 +3314,10 @@ refusal emits `PACKED_PREFILL event=source_refused`, releases the read image/lea
 cold or retained-slot reservation. It emits no confirmed restore or source-lineage mount. All other
 preparation errors remain fatal. Such a miss is not evidence of a successful stored-history suffix mount:
 private/shared source-suffix qualification requires exact captured draft coverage and boundary state.
-The current persistent format does not yet carry that certification. Stored private/shared sources therefore
-remain unqualified on this experimental path; the initial runtime check covers cold and resident-retained
-owners only. Persisted interval and boundary-state propagation is required before suffix qualification.
+The explicit `STCSMAN2` format can carry certified intervals and the immutable boundary
+residual, guarded by its minimum-reader envelope. Stored private/shared sources still
+require real execution qualification; neither the format tag nor a positive reuse count
+proves a full-live restore or its one-cell catchup.
 
 Feature-on runtime evidence is content-free: `PACKED_PREFILL event=reserved`, `event=pack` and
 `event=segment` identify actual locally drained arithmetic, `event=drained` certifies the complete

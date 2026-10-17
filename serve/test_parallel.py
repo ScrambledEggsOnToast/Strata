@@ -182,6 +182,8 @@ while True:
         if log:
             log.write(f"BGENQ {tag} {slot} {len(ids)}\n"); log.flush()
         print(f"BACK {tag} {slot} {packed_serial} {packed_serial}", flush=True)
+        if "--packed-fatal" in args:
+            print("FATAL packed admission failed: destination lease invalid", flush=True)
         if "--packed-duplicate-ack" in args:
             print(f"BACK {tag} {slot} {packed_serial} {packed_serial}", flush=True)
         continue
@@ -2257,6 +2259,20 @@ class PackedTransport(unittest.TestCase):
                 finally:
                     self.tearDown()
                     self.httpd = self.engine = self.tmp = None
+
+    def test_native_fatal_invalidates_packed_owner_before_trailing_output(self):
+        self.start(2, more=("--packed", "--packed-fatal"))
+        with self.assertRaises(urllib.error.HTTPError) as failed:
+            self.chat("the failed owner cannot emit later tokens", max_tokens=16)
+        with failed.exception as response:
+            self.assertEqual(response.code, 503)
+            request_id = response.headers["X-Strata-Request-Id"]
+        self.assertIsNotNone(request_id)
+        self.assertFalse(self.engine.alive())
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertFalse(self.engine.ctl.locked())
+        record = self.svc.lifecycle_records(request_id)
+        self.assertEqual(record.get("output_tokens", 0), 0)
 
 
 class ScoreTransport(unittest.TestCase):
