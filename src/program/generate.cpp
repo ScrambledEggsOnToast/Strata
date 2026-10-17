@@ -18517,9 +18517,10 @@ int main(int argc, char** argv) {
                              pending.lease_bytes >> 20);
             if (offer_channel) {
                 const strata::program::ConversationOfferStats s = offer_channel->stats();
-                std::fprintf(stderr, "strata serve: conversation offers: accepted=%llu cancelled=%llu rejected=%llu "
-                                     "token_bytes=%llu\n", (unsigned long long) s.accepted,
-                             (unsigned long long) s.cancelled, (unsigned long long) s.rejected,
+                std::fprintf(stderr, "strata serve: conversation offers: accepted=%llu cancelled=%llu "
+                                     "cancel_failed=%llu rejected=%llu token_bytes=%llu\n",
+                             (unsigned long long) s.accepted, (unsigned long long) s.cancelled,
+                             (unsigned long long) s.cancel_failed, (unsigned long long) s.rejected,
                              (unsigned long long) s.accepted_token_bytes);
             }
             if (!store_faulted) {
