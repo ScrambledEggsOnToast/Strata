@@ -212,6 +212,12 @@ public:
         const std::shared_ptr<const strata::core::SavedConversation>& image);
     static std::shared_ptr<const strata::core::SavedConversation> unpinned_shared_cut(
         const std::shared_ptr<const strata::core::SavedConversation>& image);
+    // Retained draft rows must all have been recomputed by this request. A
+    // private resume leaves row read_from-1 dependent on its old suffix, and an
+    // old longer prompt may have skipped earlier rows needed by this shared cut.
+    static bool shared_capture_recomputed(bool draft, int64_t read_from, int64_t draft_begin) noexcept {
+        return !draft || (read_from >= 0 && read_from <= draft_begin);
+    }
     // Metadata-only exact selector lookup. Called before capture and again at
     // handoff, so two queued captures cannot publish the same cut twice.
     static bool shared_prefix_exists(strata::core::ConversationStore& store,

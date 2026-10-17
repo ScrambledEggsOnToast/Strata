@@ -1513,11 +1513,18 @@ Trusted frontend requests may additionally send `sscope=<64 nonzero lowercase he
 still carried only by `pin=N`. This is a separate, explicitly authorized persistent selector: every private source
 (including private disk state) is considered first, and an equal-length private prefix wins. Shared restores borrow
 state without mounting a private lineage or retaining shared donor intervals; the next private publication is a
-fresh one-shot branch. Only a prompt read that actually stops at the pin may publish a shared cut. The capture
-contains no other checkpoints, clears inactive K/V/index bytes, and explicitly records the draft's meaningful extent
-as `N-1` (draft row `N-1` consumes the private token `N`). Shared publication is owner-neutral, unpinned on disk,
-donor-free and suppressed when an equal-or-longer exact record already exists. Existing private capture behavior
-and disk field layout are unchanged; sharing does not make any private scope visible to another conversation.
+fresh one-shot branch. Only a prompt read that actually stops at the pin may publish a shared cut. With a draft,
+the current request must have recomputed every row the shared image retains: its actual prefill start must be at
+or before the retained draft window's start. A later private resume can leave row `R-1` dependent on the old suffix
+and earlier window rows stale, so that request logs and skips shared publication, without disabling private serving
+or shared lookup. A diagnostic reread uses its actual start at zero, not the checkpoint length.
+The capture contains no other checkpoints, clears inactive K/V/index bytes, and records the owning draft's extent
+as exactly `N-1` (draft row `N-1` consumes private token `N`). Native shared validation, every stage restore and draft
+read-back explicitly require that exact-cut contract; rounded-cell metadata cannot disable excluded-byte checks.
+Ordinary private validation and SYCL signatures remain separate; this transport/selection path is native-only.
+Shared publication is owner-neutral, unpinned on disk, donor-free and suppressed when an equal-or-longer exact
+record already exists. Existing private capture behavior and disk field layout are unchanged; sharing does not make
+any private scope visible to another conversation.
 
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
@@ -1708,6 +1715,9 @@ allowance and retries only after positive bytes were released. Active readers,
 accepted or adopted reads, leases and pending publications retain their
 ownership and never authorize this reclamation. The original cancellation and
 deadline remain authoritative, and a refused retry performs no second reclaim.
+A shared demand and any later private-disk attempt protect and rebase the **same** eventual RAM fallback index.
+Shared refusal, invalid exact-cut metadata or read failure selects the separate private-disk candidate when present,
+then that authoritative RAM candidate; cache compaction cannot leave a second stale rollback index behind.
 If manifest decoding discovers a larger restore peak, the deferred descriptor
 retains that peak: a smaller allowance increase cannot repeat the same manifest
 read, while sufficient capacity may re-arm the descriptor before its deadline.

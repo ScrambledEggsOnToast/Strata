@@ -486,7 +486,7 @@ void exact_shared_cut(int format, int64_t cut) {
     std::vector<int32_t> ids(size_t(cut), 11);
     const std::vector<ConversationImageKey> no_images;
     const std::vector<ConversationCheckpoint> no_checks;
-    const int64_t begin = std::min<int64_t>(1, cut - 1);
+    const int64_t begin = cut == 80 ? 9 : std::min<int64_t>(1, cut - 1);
     ConversationView exact{ids, no_images, no_checks, true, true, cut - 1, begin};
     size_t estimate = 0;
     copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
@@ -497,6 +497,18 @@ void exact_shared_cut(int format, int64_t cut) {
     invalid.draft_tokens = cut;
     check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error),
           "the draft row consuming the first private suffix token cannot be claimed");
+    if (cut > 1) {
+        invalid = exact;
+        invalid.draft_tokens = cut - 2;
+        check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error),
+              "an exact capture must own all N-1 draft rows, not an arbitrary shorter extent");
+    }
+    invalid = exact;
+    invalid.draft_read_from = begin + 1;
+    SavedConversation refused;
+    check(!conversation_snapshot_save(refused, invalid, ss, g, &draft.st, error) &&
+          refused.live.ids.empty() && refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
+          "a private resume past the retained draft start produces no shared image or device access");
     SavedConversation unsafe_meta;
     std::vector<SessionKvSource> unsafe_sources;
     check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, draft.st, error) &&
@@ -562,18 +574,108 @@ void exact_shared_cut(int format, int64_t cut) {
                a.v_scale == b.v_scale && a.pooled == b.pooled;
     }
     check(same, "poisoned post-cut storage cannot influence any published shared payload byte");
-    auto corrupt = second;
-    corrupt.kv.back().k.visit(corrupt.kv.back().k.size() - 1, 1,
-        [](uint8_t* p, size_t, size_t) { *p = 0xee; return true; });
+    constexpr auto expectation = ConversationSnapshotExpectation::exact_cut;
+    check(conversation_snapshot_validate(second, ss, g, &draft.st, expectation, error),
+          "the explicit shared expectation accepts the sanitized exact cut");
+    auto rounded_claim = second;
+    rounded_claim.kv.back().cells = rounded;
     copy_calls = sync_calls = 0;
-    check(!conversation_snapshot_validate(corrupt, ss, g, &draft.st, error) &&
-          copy_calls == 0 && sync_calls == 0, "restore rejects a shorter draft claim that conceals nonzero post-cut bytes");
-    for (auto& bytes : draft.data) std::fill(bytes.begin(), bytes.end(), 0xee);
-    check(conversation_snapshot_restore(second, ss, g, &draft.st, error) == ConversationRestore::restored,
-          "restore understands the intentionally shorter draft extent");
     uint64_t fingerprint = 0;
-    check(conversation_kv_verify(second.kv.back(), draft.st, g, cut, false, fingerprint, error),
-          "restore overwrites the excluded draft row and page tail with zeros instead of reviving old suffix state");
+    check(!conversation_snapshot_validate(rounded_claim, ss, g, &draft.st, expectation, error) &&
+          conversation_snapshot_restore(rounded_claim, ss, g, &draft.st, expectation, error) ==
+              ConversationRestore::invalid &&
+          !conversation_kv_restore(rounded_claim.kv.back(), draft.st, g, cut, false, expectation, error) &&
+          !conversation_kv_verify(rounded_claim.kv.back(), draft.st, g, cut, false,
+                                  expectation, fingerprint, error) &&
+          copy_calls == 0 && sync_calls == 0,
+          "ordinary rounded metadata cannot downgrade a shared validate, restore or diagnostic verify");
+    check(conversation_snapshot_validate(rounded_claim, ss, g, &draft.st, error),
+          "ordinary private validation still accepts its rounded-cell contract");
+    check(rounded_claim.kv.back().k.visit(rounded_claim.kv.back().k.size() - 1, 1,
+        [](uint8_t* p, size_t, size_t) { *p = 0xee; return true; }),
+        "a malicious rounded record also carries a nonzero excluded byte");
+    check(conversation_snapshot_validate(rounded_claim, ss, g, &draft.st, error) &&
+          !conversation_snapshot_validate(rounded_claim, ss, g, &draft.st, expectation, error),
+          "shared authorization, not metadata or payload shape, selects the stronger validation contract");
+    if (cut > 1) {
+        auto shorter_claim = second;
+        shorter_claim.kv.back().cells = rounded;
+        check(conversation_kv_clear_inactive(shorter_claim.kv.back(), cut, std::min(begin, cut - 2), cut - 2, error),
+              "zero every row the malicious shorter claim would exclude");
+        shorter_claim.kv.back().cells = cut - 2;
+        check(!conversation_snapshot_validate(shorter_claim, ss, g, &draft.st, expectation, error),
+              "shared restore refuses a shorter-than-N-1 draft claim even when excluded bytes are zero");
+    }
+    // Every excluded row, head and populated part is checked, not just the last
+    // byte or a metadata-selected extent. The N-1 row consumes the private suffix.
+    for (size_t layer = 0; layer < second.kv.size(); ++layer) {
+        const int64_t end = layer + 1 == second.kv.size() ? cut - 1 : cut;
+        for (size_t part = 0; part < 4; ++part) {
+            for (int64_t cell = end; cell < rounded; ++cell) {
+                for (int64_t head = 0; head < g.n_head_kv; ++head) {
+                    auto corrupt = second;
+                    auto& kv = corrupt.kv[layer];
+                    const std::array<ConversationBuffer*, 4> buffers{&kv.k, &kv.v, &kv.k_scale, &kv.v_scale};
+                    if (buffers[part]->empty()) continue;
+                    const size_t width = buffers[part]->size() / size_t(rounded * g.n_head_kv);
+                    const size_t at = size_t((cell / 4 * g.n_head_kv + head) * 4 + cell % 4) * width;
+                    check(buffers[part]->visit(at, 1, [](uint8_t* p, size_t, size_t) {
+                        *p = 0xee; return true;
+                    }), "poison an excluded shared row");
+                    copy_calls = sync_calls = 0;
+                    check(conversation_snapshot_restore(corrupt, ss, g, &draft.st, expectation, error) ==
+                              ConversationRestore::invalid && copy_calls == 0 && sync_calls == 0,
+                          "nonzero excluded main/draft bytes are refused before any device call or write");
+                }
+            }
+        }
+    }
+    if (cut == 9 || cut == 80) {
+        // Execute the actual ordinary private restore -> divergent prefill ->
+        // shared-capture chain with the host transfer backend. Only the model
+        // arithmetic is synthetic: it rewrites rows [R,N-1), never R-1 or the
+        // earlier retained rows skipped by the old longer-window prompt.
+        const int64_t read_from = cut - 2;
+        std::vector<int32_t> old_ids = ids;
+        old_ids.resize(size_t(cut + 16), 31);
+        old_ids[size_t(read_from)] = 37;
+        std::vector<ConversationCheckpoint> old_checks(1);
+        old_checks[0].ids.assign(old_ids.begin(), old_ids.begin() + read_from);
+        check(conversation_checkpoint_save(old_checks[0], ss, g, error),
+              "save a real private resume checkpoint before the divergent suffix");
+        const ConversationView old_view{old_ids, no_images, old_checks, true};
+        SavedConversation old_private;
+        check(conversation_snapshot_save(old_private, old_view, ss, g, &draft.st, error) &&
+              conversation_snapshot_restore(old_private, ss, g, &draft.st, error, &old_private.checkpoints[0]) ==
+                  ConversationRestore::restored,
+              "restore the old longer private snapshot at R without a shared expectation");
+        for (size_t part = 0; part < 4; ++part) {
+            auto& bytes = draft.data[part];
+            if (bytes.empty()) continue;
+            const size_t width = bytes.size() / size_t(96 * g.n_head_kv);
+            for (int64_t cell = read_from; cell < cut - 1; ++cell)
+                for (int64_t head = 0; head < g.n_head_kv; ++head) {
+                    const size_t at = size_t((cell / 4 * g.n_head_kv + head) * 4 + cell % 4) * width;
+                    std::fill(bytes.begin() + at, bytes.begin() + at + width, 0x6a);
+                }
+        }
+        auto resumed_view = exact;
+        resumed_view.draft_read_from = read_from;
+        SavedConversation suppressed;
+        copy_calls = sync_calls = 0;
+        check(!conversation_snapshot_save(suppressed, resumed_view, ss, g, &draft.st, error) &&
+              suppressed.live.ids.empty() && suppressed.kv.empty() && !copy_calls && !sync_calls,
+              cut == 9 ? "divergent private resume produces no shared record from inherited row R-1" :
+                          "stale long-window private resume produces no shared record from retained earlier rows");
+        const ConversationView private_continuation{ids, no_images, no_checks, true};
+        check(conversation_snapshot_save(ordinary, private_continuation, ss, g, &draft.st, error),
+              "suppressing shared export does not suppress ordinary private capture or serving state");
+    }
+    for (auto& bytes : draft.data) std::fill(bytes.begin(), bytes.end(), 0xee);
+    check(conversation_snapshot_restore(second, ss, g, &draft.st, expectation, error) == ConversationRestore::restored,
+          "explicit shared restore understands the required N-1 draft extent");
+    check(conversation_kv_verify(second.kv.back(), draft.st, g, cut, false, expectation, fingerprint, error),
+          "shared verify checks the zeroed excluded draft row and page tail after restore");
     const ConversationView private_view{ids, no_images, no_checks, true};
     check(conversation_snapshot_save(ordinary, private_view, ss, g, &draft.st, error) &&
           ordinary.kv.back().cells == rounded, "post-shared private captures preserve the ordinary rounded-cell contract");
@@ -595,10 +697,14 @@ void exact_shared_cut(int format, int64_t cut) {
         check(zero_buffer(stage.kv.front().k) && zero_buffer(stage.kv.front().v) && zero_buffer(stage.kv.front().pooled) &&
               zeros(stage.live.tails) && zeros(stage.live.dead),
               "inactive primary QSA payload and index state cannot carry bytes from another owner");
+        check(conversation_snapshot_validate(stage, unused, g, nullptr, expectation, error),
+              "an exact stage without the draft owner uses the same explicit shared expectation");
         unused = ss;
         unused.layer_lo = 2; unused.gdn_ord0 = 2; unused.gdn_alloc = 1;
         check(conversation_snapshot_save(stage, cut_view, unused, g, nullptr, error) && zeros(stage.live.ple),
               "PLE history on a stage that never runs the first layer is excluded");
+        check(conversation_snapshot_validate(stage, unused, g, nullptr, expectation, error),
+              "later exact stages validate without inventing a draft owner or PLE history");
     }
 }
 #endif
@@ -611,7 +717,7 @@ int main() {
     checkpoint_payload_stages();
 #if defined(CONVERSATION_TEST_TRANSFERS)
     for (int format : {0,1,2}) ring_refusal(format);
-    for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9}) exact_shared_cut(format, cut);
+    for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9,80}) exact_shared_cut(format, cut);
 #endif
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

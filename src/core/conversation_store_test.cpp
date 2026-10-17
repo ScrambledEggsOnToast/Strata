@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <stdexcept>
 #include <unistd.h>
 #include <thread>
 #include <vector>
@@ -4306,13 +4307,25 @@ void check_demand_reclaim_quote() {
 void check_demand_reclaim_owner() {
     enum class Case { restored, view_allocation, cancel_before, expire_before,
                       cancel_after, expire_after, missing_objects };
+    enum class Selection { private_demand, shared_ram, shared_private_disk };
+    struct Candidate {
+        bool disk = false;
+        uint64_t head = 0;
+        ConversationCache::Match parked{};
+    };
+    for (const auto selection : {Selection::private_demand, Selection::shared_ram, Selection::shared_private_disk})
     for (const auto scenario : {Case::restored, Case::view_allocation, Case::cancel_before,
                                Case::expire_before, Case::cancel_after, Case::expire_after,
                                Case::missing_objects}) {
         TempRoot root;
         ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
-        const SavedConversation disk = fixture(155, 4096);
-        SavedConversation fallback = fixture(157, 32), victim = fixture(159, 16);
+        SavedConversation disk = fixture(155, 4096);
+        SavedConversation fallback = fixture(155, 32), victim = fixture(159, 16), newer = fixture(161, 32);
+        const bool keep_newer = scenario == Case::missing_objects;
+        newer.checkpoints.clear();
+        const SavedConversation private_disk = fixture(155, 256);
+        const bool shared = selection != Selection::private_demand;
+        if (shared) disk.scope.value[0] ^= 0x80;
         fallback.checkpoints.clear();
         victim.checkpoints.clear();
         ConversationStorePublishResult published;
@@ -4320,6 +4333,14 @@ void check_demand_reclaim_owner() {
             published.status != ConversationStorePublishStatus::stored) {
             check(false, "the owner-reclamation image is durable");
             continue;
+        }
+        uint64_t private_head = 0;
+        if (selection == Selection::shared_private_disk) {
+            ConversationStorePublishResult private_published;
+            check(publish_and_wait(store, private_disk, 11, 11, private_published) &&
+                  private_published.status == ConversationStorePublishStatus::stored,
+                  "a separate private disk fallback is durably available behind the shared candidate");
+            private_head = private_published.head_id;
         }
         std::string why;
         auto query = query_of(disk, 2, 2);
@@ -4335,12 +4356,19 @@ void check_demand_reclaim_owner() {
         }
         victim.live.gdn.resize(size_t(quote.additional_ram_bytes + baseline + (1u << 20)), 9);
         const size_t lease = 2048, preparation = 8192, outside = 4096;
-        const size_t envelope = victim.bytes() + fallback.bytes() + lease + preparation + outside + baseline + 1;
-        ConversationCache cache(envelope, 2);
+        const size_t envelope = victim.bytes() + fallback.bytes() + (keep_newer ? newer.bytes() : 0) +
+                                lease + preparation + outside + baseline + 1;
+        const size_t entries = keep_newer ? 3 : 2;
+        ConversationCache cache(envelope, entries);
         check(cache.put(std::move(victim)) && cache.put(SavedConversation(fallback)) &&
-                  cache.try_reserve_lease(lease), "the owner holds an evictable image, fallback and separate lease");
+                  (!keep_newer || cache.put(SavedConversation(newer))) && cache.try_reserve_lease(lease),
+              "the owner holds an older victim, private fallback, optional following owner and separate lease");
         const size_t before = cache.envelope_bytes();
-        size_t protected_index = 1;
+        strata::program::ConversationStoreDemandFallback<Candidate> backups;
+        backups.ram.parked = cache.best(query.tokens, {}, fallback.cvec, fallback.scope);
+        check(backups.ram.parked.index == 1 && backups.ram.parked.tokens == 32,
+              "the authoritative fallback is selected by the private prompt and scope after an older victim");
+        if (private_head) backups.private_disk = Candidate{true, private_head, {}};
         bool cancelled = scenario == Case::cancel_before;
         if (scenario == Case::expire_before) now = query.deadline_ns;
         // This is the optional published coverage, not a stand-in for the store.
@@ -4348,7 +4376,7 @@ void check_demand_reclaim_owner() {
         auto coverage = std::make_shared<size_t>(cache.size());
         bool dirty = false;
         const auto result = strata::program::admit_store_demand(
-            store, cache, query, why, {envelope, preparation, outside}, &protected_index,
+            store, cache, query, why, {envelope, preparation, outside}, &backups.ram.parked.index,
             [&] { return now; }, [&] { return cancelled; },
             [&] {
                 dirty = true;
@@ -4362,12 +4390,13 @@ void check_demand_reclaim_owner() {
             [&]() noexcept { coverage.reset(); dirty = true; });
         const bool early = scenario == Case::cancel_before || scenario == Case::expire_before;
         const bool late = scenario == Case::cancel_after || scenario == Case::expire_after;
+        bool disk_missed = early || late;
         if (early) {
             check(!result.accepted && !result.recovery_attempted && !result.retried &&
-                      cache.envelope_bytes() == before && cache.size() == 2 && protected_index == 1,
+                      cache.envelope_bytes() == before && cache.size() == entries && backups.ram.parked.index == 1,
                   "cancelled or expired work mutates no cache ownership before admission");
         } else {
-            check(result.recovery_attempted && cache.size() == 1 && protected_index == 0 &&
+            check(result.recovery_attempted && cache.size() == entries - 1 && backups.ram.parked.index == 0 &&
                       cache.evictions() == 1 && result.released_bytes == before - cache.envelope_bytes(),
                   "the actual owner reclaims once and rebases its original fallback");
             check(store.ram_read_budget() == envelope - preparation - outside - cache.envelope_bytes(),
@@ -4380,6 +4409,7 @@ void check_demand_reclaim_owner() {
                 ConversationStoreRead read;
                 check(store.wait_ready(2, 2, read, 5000), "the reclaimed demand settles through the real reader");
                 if (scenario == Case::missing_objects) {
+                    disk_missed = true;
                     check(read.status == ConversationStoreReadStatus::corrupt && !read.image,
                           "a real missing-object failure after reclamation delivers no disk image");
                 } else {
@@ -4396,10 +4426,45 @@ void check_demand_reclaim_owner() {
         check(cache.leased_bytes() == lease, "reclamation never refunds a separate live lease");
         if (scenario == Case::view_allocation)
             check(!coverage && dirty, "failed optional view allocation removes stale coverage and leaves it dirty");
-        bool retained = true;
-        auto restored = cache.take(protected_index, retained);
-        check(!retained && images_equal(restored, fallback, why),
-              "the original RAM fallback remains consumable after success, cancellation or real disk failure");
+        Candidate selected = backups.after_failure(shared);
+        if (selection == Selection::shared_private_disk) {
+            check(selected.disk && selected.head == private_head,
+                  "shared failure preserves a separate private disk choice, never a duplicate RAM index");
+            if (disk_missed) {
+                auto private_query = query_of(private_disk, 3, 3);
+                private_query.deadline_ns = query.deadline_ns;
+                const auto private_admission = strata::program::admit_store_demand(
+                    store, cache, private_query, why, {envelope, preparation, outside}, &backups.ram.parked.index,
+                    [&] { return now; }, [&] { return cancelled; }, [] {}, []() noexcept {});
+                if (private_admission.accepted) {
+                    ConversationStoreRead read;
+                    check(store.wait_ready(3, 3, read, 5000) &&
+                          read.status == ConversationStoreReadStatus::corrupt && !read.image,
+                          "the separate private disk attempt also settles its real missing-object failure");
+                    read.image.reset();
+                    store.release_read(3, 3);
+                } else {
+                    check(early || late, "only real cancellation/expiry refuses the private fallback before its read");
+                }
+            }
+            selected = backups.after_failure(false);
+        }
+        check(!selected.disk && selected.parked.index == backups.ram.parked.index,
+              "failure selects exactly the RAM object whose index admission protected and rebased");
+        if (keep_newer) {
+            const auto newer_query = query_of(newer, 5, 5);
+            check(cache.best(newer_query.tokens, {}, newer.cvec, newer.scope).index == 1,
+                  "the obsolete pre-compaction index is in range but names a different private scope");
+        }
+        try {
+            bool retained = true;
+            auto restored = cache.take(selected.parked.index, retained);
+            check(!retained && restored.scope.matches(fallback.scope) &&
+                  (!shared || !restored.scope.matches(disk.scope)) && images_equal(restored, fallback, why),
+                  "after failure/refusal compaction returns the authorized private fallback scope and exact content");
+        } catch (const std::out_of_range&) {
+            check(false, "a shared/private demand chain must not retain an out_of_range pre-compaction RAM index");
+        }
         cache.release_lease(lease);
         store.close();
     }

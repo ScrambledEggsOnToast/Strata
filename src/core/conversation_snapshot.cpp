@@ -319,16 +319,23 @@ bool conversation_kv_clear_inactive(ConversationKv& image, int64_t tokens, int64
 }
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                              int64_t upto, bool index, std::string& error) {
+                              int64_t upto, bool index, ConversationSnapshotExpectation expectation,
+                              std::string& error) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    // The existing cells field carries the exact meaningful extent of a shared
-    // draft cut. Its payload remains rounded to the main cut and must contain
-    // zeros from the excluded next-token row onwards; restore copies those zeros
-    // too, so neither host nor resident ring can revive the outgoing suffix.
+    // An authorized shared mount chooses this expectation, never image.cells.
+    // Its payload is rounded to N but its draft owns exactly [0,N-1): row N-1
+    // consumes the first private suffix token and cannot be part of the record.
+    const bool exact = expectation == ConversationSnapshotExpectation::exact_cut;
+    if (exact && (upto <= 0 || (!index && image.cells != upto - 1))) {
+        error = "conversation snapshot: shared draft extent must equal N-1";
+        return false;
+    }
+    // Keep the ordinary/private interpretation of older shortened draft images
+    // separate; it cannot downgrade an explicit shared expectation.
     const bool exact_draft = !index && image.cells >= 0 && image.cells < upto;
     if (image.format != l.format || (!exact_draft && image.cells != l.cells) || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
@@ -338,13 +345,14 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
-    if (exact_draft && !inactive_rows(image, l.cells, 0, image.cells,
+    const int64_t retained_end = exact ? (index ? upto : upto - 1) : image.cells;
+    if ((exact || exact_draft) && !inactive_rows(image, l.cells, 0, retained_end,
         [](const auto& buffer, size_t offset, size_t bytes) {
             return buffer.visit(offset, bytes, [](const uint8_t* p, size_t n, size_t) {
                 return std::all_of(p, p + n, [](uint8_t b) { return b == 0; });
             });
         })) {
-        error = "conversation snapshot: exact draft cut contains post-cut bytes";
+        error = "conversation snapshot: exact cut contains excluded K/V bytes";
         return false;
     }
     const auto dst = pools(st);
@@ -354,10 +362,11 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 }
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, std::string& error, int64_t captured_tokens) {
+                             int64_t upto, bool index, ConversationSnapshotExpectation expectation,
+                             std::string& error, int64_t captured_tokens) {
     if (captured_tokens < 0) captured_tokens = upto;
     if (upto < 0 || upto > captured_tokens ||
-        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+        !conversation_kv_validate(image, st, g, captured_tokens, index, expectation, error)) return false;
     Layout cut{};
     if (!layout(st, g, upto, index, cut, error) || !valid(st, cut, upto, error)) return false;
     const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
@@ -399,10 +408,11 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error, int64_t captured_tokens) {
+                            int64_t upto, bool index, ConversationSnapshotExpectation expectation,
+                            uint64_t& fingerprint, std::string& error, int64_t captured_tokens) {
     if (captured_tokens < 0) captured_tokens = upto;
     if (upto < 0 || upto > captured_tokens ||
-        !conversation_kv_validate(image, st, g, captured_tokens, index, error)) return false;
+        !conversation_kv_validate(image, st, g, captured_tokens, index, expectation, error)) return false;
     Layout cut{};
     if (!layout(st, g, upto, index, cut, error)) return false;
     const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
@@ -444,6 +454,24 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     }
     fingerprint = hash;
     return true;
+}
+
+// Ordinary/private entry points, also implemented by the other backends. Shared
+// native mounts use the explicit-expectation overloads above, including verify.
+bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                              int64_t upto, bool index, std::string& error) {
+    return conversation_kv_validate(image, st, g, upto, index, ConversationSnapshotExpectation::ordinary, error);
+}
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                             int64_t upto, bool index, std::string& error, int64_t captured_tokens) {
+    return conversation_kv_restore(image, st, g, upto, index, ConversationSnapshotExpectation::ordinary,
+                                   error, captured_tokens);
+}
+bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error,
+                            int64_t captured_tokens) {
+    return conversation_kv_verify(image, st, g, upto, index, ConversationSnapshotExpectation::ordinary,
+                                  fingerprint, error, captured_tokens);
 }
 
 } // namespace strata::core

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <new>
+#include <optional>
 #include <type_traits>
 
 namespace strata::program {
@@ -55,6 +56,19 @@ struct ConversationStoreDemandAdmission {
     uint64_t required_increment_bytes = 0;
     size_t released_bytes = 0;
     uint64_t allowance_bytes = 0;
+};
+
+// One authoritative RAM rollback candidate survives every demand in a shared ->
+// private-disk -> RAM chain. Only a disk candidate belongs in private_disk: a
+// second copy of ram would retain a stale cache index after admission compacts it.
+template<class Candidate>
+struct ConversationStoreDemandFallback {
+    Candidate ram;
+    std::optional<Candidate> private_disk;
+
+    const Candidate& after_failure(bool shared) const noexcept {
+        return shared && private_disk ? *private_disk : ram;
+    }
 };
 
 // The actual owner-side sequence, shared by serving and CPU ownership regressions.

@@ -48,6 +48,20 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& state, const Mo
                           std::array<uint64_t, 5>* retained = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
+// Native shared mounts must select exact_cut explicitly. Record metadata never
+// selects this contract: its owning draft must claim N-1 cells, and all excluded
+// next-token/page-padding bytes must be zero. Ordinary/private APIs below keep
+// their existing validation and backend signatures.
+enum class ConversationSnapshotExpectation { ordinary, exact_cut };
+bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                              int64_t upto, bool include_index, ConversationSnapshotExpectation expectation,
+                              std::string& error);
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                             int64_t upto, bool include_index, ConversationSnapshotExpectation expectation,
+                             std::string& error, int64_t captured_tokens = -1);
+bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                            int64_t upto, bool include_index, ConversationSnapshotExpectation expectation,
+                            uint64_t& fingerprint, std::string& error, int64_t captured_tokens = -1);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
@@ -101,12 +115,16 @@ struct ConversationView {
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;
     // Opt-in export of exactly this token-zero cut. Private captures keep their
-    // existing rounded payloads. A draft row i consumes token i+1, so its claimed
-    // extent must be strictly below the cut; skipped rows before draft_begin and
+    // existing rounded payloads. A draft row i consumes token i+1, so the owning
+    // draft must claim exactly N-1 cells. Skipped rows before draft_begin and
     // every inactive/page-padding byte are cleared before publication.
     bool exact_cut = false;
     int64_t draft_tokens = -1;
     int64_t draft_begin = 0;
+    // Actual current-request prefill start, not its resumed checkpoint's token
+    // count when a diagnostic reread started at zero. Exact capture refuses to
+    // retain a draft row this request did not recompute.
+    int64_t draft_read_from = 0;
 };
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
@@ -159,5 +177,22 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error,
                                                    const ConversationCheckpoint* selected = nullptr);
+
+// Native-only explicit contract for shared cuts. Pass it for every stage, even
+// those without a draft owner, and for subsequent restore/diagnostic read-back.
+// Ordinary private callers deliberately use the signatures above.
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
+                                    const ModelGeometry& g, const QsaState* draft,
+                                    ConversationSnapshotExpectation expectation, std::string& error);
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
+                                    const ModelGeometry& g, const QsaState& draft,
+                                    ConversationSnapshotExpectation expectation, std::string& error);
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
+                                                   const ModelGeometry& g, const QsaState* draft,
+                                                   ConversationSnapshotExpectation expectation, std::string& error,
+                                                   const ConversationCheckpoint* selected = nullptr);
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
+                                                   const ModelGeometry& g, const QsaState& draft,
+                                                   ConversationSnapshotExpectation expectation, std::string& error);
 
 } // namespace strata::core

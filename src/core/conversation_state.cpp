@@ -262,10 +262,11 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     bytes = sizeof(ConversationScope);
     if (!view_validate(view, ss, g, error)) return false;
     if (view.exact_cut && (!view.images.empty() || !view.checkpoints.empty() ||
-        (draft && (view.draft_tokens < 0 || view.draft_tokens >= int64_t(view.ids.size()) ||
-                   view.draft_begin < 0 || view.draft_begin > view.draft_tokens)) ||
-        (!draft && (view.draft_tokens != -1 || view.draft_begin != 0))))
-        return fail(error, "invalid exact cut or draft extent at/past its token boundary");
+        (draft && (view.draft_tokens != int64_t(view.ids.size()) - 1 ||
+                   view.draft_begin < 0 || view.draft_begin > view.draft_tokens ||
+                   view.draft_read_from < 0 || view.draft_read_from > view.draft_begin)) ||
+        (!draft && (view.draft_tokens != -1 || view.draft_begin != 0 || view.draft_read_from != 0))))
+        return fail(error, "exact cut requires N-1 draft cells recomputed from/before its retained start");
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     size_t ids = 0, images = 0, checkpoints = 0, layers = 0, tails = 0, dead = 0, positions = 0;
@@ -299,6 +300,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          const SessionState& ss, const ModelGeometry& g,
                                          const QsaState* draft, size_t& bytes, std::string& error) {
     if (!conversation_snapshot_bytes(view, ss, g, draft, bytes, error)) return false;
+    if (view.exact_cut && !reuse.kv.empty())
+        return fail(error, "an exact shared cut cannot retain bytes from another captured image");
     if (reuse.kv.empty()) return true;
     const size_t layers = owned_qsa(ss) + (draft ? 1 : 0);
     if (reuse.kv.size() != layers || reuse.unchanged_tokens < 0 ||
@@ -484,7 +487,8 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 }
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                    const ModelGeometry& g, const QsaState* draft,
+                                    ConversationSnapshotExpectation expectation, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -496,15 +500,54 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
+    const bool exact = expectation == ConversationSnapshotExpectation::exact_cut;
+    if (exact && (!image.live.imgs.empty() || !image.checkpoints.empty()))
+        return fail(error, "shared exact cut contains private image/checkpoint metadata");
     for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
-    return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, expectation, error)) return false;
+    if (draft && !conversation_kv_validate(image.kv.back(), *draft, g, upto, false, expectation, error)) return false;
+    if (exact) {
+        // Mirror the capture's excluded running-state bytes for every carve.
+        // These checks never depend on a record-controlled K/V extent.
+        const auto zeros = [](const auto& bytes, size_t begin, size_t end) {
+            return begin <= end && end <= bytes.size() &&
+                std::all_of(bytes.begin() + begin, bytes.begin() + end, [](uint8_t byte) { return byte == 0; });
+        };
+        if ((ss.layer_lo > 0 && !zeros(image.live.ple, 0, image.live.ple.size())) ||
+            !zeros(image.live.block_pos, 0, image.live.block_pos.size()))
+            return fail(error, "shared exact cut contains excluded PLE/position bytes");
+        ConversationStateSizes z;
+        if (!conversation_session_sizes(g, ss, z, error)) return false;
+        const size_t active = size_t(upto % strata::kernels::qsa_real_shapes().idx_block) *
+                              size_t(g.idx_key_dim) * sizeof(float);
+        for (size_t j = 0; j < layers; ++j) {
+            const int64_t layer = (ss.qsa_ord0 + int64_t(j) + 1) * g.qsa_interval - 1;
+            const bool active_layer = layer >= ss.layer_lo && layer < ss.layer_hi;
+            if (!zeros(image.live.tails, j * z.tail + (active_layer ? active : 0), (j + 1) * z.tail))
+                return fail(error, "shared exact cut contains excluded index-tail bytes");
+            const auto& kv = image.kv[j];
+            if (!active_layer) {
+                if (!zeros(image.live.dead, j * z.dead, (j + 1) * z.dead))
+                    return fail(error, "shared exact cut contains inactive indexer state");
+                for (const auto* part : {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled})
+                    if (!part->visit(0, part->size(), [](const uint8_t* p, size_t n, size_t) {
+                        return std::all_of(p, p + n, [](uint8_t byte) { return byte == 0; });
+                    })) return fail(error, "shared exact cut contains inactive stage K/V");
+            } else if (!kv.pooled.visit(kv.pooled.size() - z.dead, z.dead,
+                [&](const uint8_t* p, size_t n, size_t at) {
+                    return std::memcmp(p, image.live.dead.data() + j * z.dead +
+                        at - (kv.pooled.size() - z.dead), n) == 0;
+                })) return fail(error, "shared exact cut has a foreign indexer spare");
+        }
+    }
+    return true;
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const ModelGeometry& g, const QsaState* draft,
+                                                   ConversationSnapshotExpectation expectation, std::string& error,
                                                    const ConversationCheckpoint* selected) {
-    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    if (!conversation_snapshot_validate(image, ss, g, draft, expectation, error)) return ConversationRestore::invalid;
     // A cut is an existing sealed checkpoint of this exact image, never an arbitrary token junction.
     if (selected && std::none_of(image.checkpoints.begin(), image.checkpoints.end(),
             [&](const auto& c) { return &c == selected; })) {
@@ -516,9 +559,9 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     const int64_t upto = (int64_t) running.ids.size();
     const int64_t captured = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, captured))
+        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, expectation, error, captured))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, captured)) ||
+    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, expectation, error, captured)) ||
         !conversation_checkpoint_restore(running, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
@@ -538,6 +581,26 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationRetainedPrefix>* retained) {
     return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, retained);
+}
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                                    const QsaState& draft, ConversationSnapshotExpectation expectation,
+                                    std::string& error) {
+    if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
+    return conversation_snapshot_validate(image, ss, g, &draft, expectation, error);
+}
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
+                                                   const ModelGeometry& g, const QsaState& draft,
+                                                   ConversationSnapshotExpectation expectation, std::string& error) {
+    return conversation_snapshot_restore(image, ss, g, &draft, expectation, error);
+}
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                                    const QsaState* draft, std::string& error) {
+    return conversation_snapshot_validate(image, ss, g, draft, ConversationSnapshotExpectation::ordinary, error);
+}
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const ConversationCheckpoint* selected) {
+    return conversation_snapshot_restore(image, ss, g, draft, ConversationSnapshotExpectation::ordinary, error, selected);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {

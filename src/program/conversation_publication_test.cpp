@@ -950,6 +950,65 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
     check_record_restores(reopened, record, 312, true);
 }
 
+void check_private_resume_never_publishes_unrecomputed_shared_rows() {
+    struct Scenario { int64_t cut, read_from, draft_begin; const char* label; };
+    for (const auto scenario : {
+            Scenario{64, 32, 0, "divergent private resume suppresses shared publication"},
+            Scenario{8192, 8064, 7105, "stale long-window private resume suppresses shared publication"}}) {
+        TempRoot root;
+        const auto options = options_for(root.path);
+        ConversationStore store(options);
+        Sink sink(store);
+        ConversationPublicationQueue publications;
+        SavedConversation private_image = stored_record(205, scenario.cut + 128);
+        // The selected private cut is before the shared pin. Its retained draft
+        // row R-1 consumes the old token R; the current prefill [R,N) cannot repair
+        // it. In the long-window case, [draft_begin,R) also includes rows an old
+        // longer prompt was allowed to skip. These are storage fixtures, not a
+        // claim that synthetic bytes model either prompt's arithmetic.
+        private_image.checkpoints.front().ids.assign(private_image.live.ids.begin(),
+            private_image.live.ids.begin() + scenario.read_from);
+        private_image.live.ids[size_t(scenario.read_from)] = 17;
+        check(capture_image(publications, sink, 0, 1, 0, true, private_image, store.epoch()),
+              "the old private suffix is durably retained before the divergent request");
+        settle(publications, store, sink);
+        const uint64_t private_head = publications.owner(0).lineage.head;
+        check(private_head != 0, "the private fallback has a real durable head");
+
+        SavedConversation shared = private_image;
+        shared.scope.value[0] ^= 0x80;
+        shared.live.ids.resize(size_t(scenario.cut));
+        shared.live.ids[size_t(scenario.read_from)] = 19;
+        shared.checkpoints.clear();
+        shared.kv.back().cells = scenario.cut - 1;
+        if (ConversationPublicationQueue::shared_capture_recomputed(
+                true, scenario.read_from, scenario.draft_begin)) {
+            auto entry = capture_of(UINT64_MAX, 1, 0, false, shared, store.epoch(), ++sink.next_ticket);
+            entry.shared_prefix = true;
+            (void) publications.capture(sink.cache, std::move(shared), std::move(entry),
+                                       size_t(store.ram_held_bytes()), 0, sink.out);
+        }
+        settle(publications, store, sink);
+        auto query = query_of(private_image, 1501, 1);
+        query.selector.scope.value[0] ^= 0x80;
+        query.tokens.resize(size_t(scenario.cut) + 1);
+        query.tokens[size_t(scenario.read_from)] = 19;
+        check(store.matches(query.selector, query.tokens, {}).empty() &&
+              store.counters().published == 1 && !publications.holds_work(), scenario.label);
+        check(ConversationPublicationQueue::shared_capture_recomputed(true, 0, scenario.draft_begin) &&
+              ConversationPublicationQueue::shared_capture_recomputed(
+                  true, scenario.draft_begin, scenario.draft_begin) &&
+              ConversationPublicationQueue::shared_capture_recomputed(false, scenario.read_from, 0),
+              "cold reads, complete retained windows and requests without a draft remain publishable");
+        check_record_restores(store, private_image, 1502, true);
+        store.close();
+        ConversationStore reopened(options);
+        check(reopened.matches(query.selector, query.tokens, {}).empty(),
+              "reopening the real store finds no suppressed shared record");
+        check_record_restores(reopened, private_image, 1503, true);
+    }
+}
+
 void check_shared_borrow_and_owner_neutral_publication() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
@@ -1101,6 +1160,7 @@ int main() {
     check_capture_refusal_is_atomic();
     check_optional_retention_failure_preserves_publication();
     check_bounded_capture_persists_the_newest_all_stage_frontier();
+    check_private_resume_never_publishes_unrecomputed_shared_rows();
     check_shared_borrow_and_owner_neutral_publication();
     check_shared_head_is_evictable();
     std::fprintf(stderr, "conversation_publication_test: %d checks, %d failures\n", checks, failures);

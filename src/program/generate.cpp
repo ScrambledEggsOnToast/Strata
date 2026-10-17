@@ -11780,6 +11780,7 @@ int main(int argc, char** argv) {
             bool continues = true;
             bool shared_prefix = false;
             int64_t draft_begin = 0;
+            int64_t draft_read_from = 0;
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
@@ -11854,7 +11855,8 @@ int main(int argc, char** argv) {
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
                 source.shared_prefix, source.shared_prefix && draft0 ? int64_t(live.size()) - 1 : -1,
-                source.shared_prefix && draft0 ? source.draft_begin : 0};
+                source.shared_prefix && draft0 ? source.draft_begin : 0,
+                source.shared_prefix && draft0 ? source.draft_read_from : 0};
             auto reuse = source.resident || source.shared_prefix
                 ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
@@ -11867,7 +11869,8 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(st->dev);
                 const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
                     source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
-                    source.shared_prefix && draft_of(k) ? source.draft_begin : 0};
+                    source.shared_prefix && draft_of(k) ? source.draft_begin : 0,
+                    source.shared_prefix && draft_of(k) ? source.draft_read_from : 0};
                 size_t b = 0;
                 if (!strata::core::conversation_snapshot_bytes(view_k, session_at(k + 1), g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
@@ -11970,7 +11973,8 @@ int main(int argc, char** argv) {
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
                         source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
-                        source.shared_prefix && draft_of(k) ? source.draft_begin : 0};
+                        source.shared_prefix && draft_of(k) ? source.draft_begin : 0,
+                        source.shared_prefix && draft_of(k) ? source.draft_read_from : 0};
                     strata::core::SavedConversation part;
                     std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
@@ -11991,13 +11995,15 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
-                auto valid_image = [&](const auto& candidate) {
+                auto valid_image = [&](const auto& candidate, strata::core::ConversationSnapshotExpectation expectation =
+                                           strata::core::ConversationSnapshotExpectation::ordinary) {
                     std::string why;
                     if (candidate.stage_images.size() != stages.size() ||
-                        !strata::core::conversation_snapshot_validate(candidate, session_at(0), g, draft0, why)) return false;
+                        !strata::core::conversation_snapshot_validate(
+                            candidate, session_at(0), g, draft0, expectation, why)) return false;
                     for (size_t k = 0; k < stages.size(); ++k)
                         if (!strata::core::conversation_snapshot_validate(candidate.stage_images[k],
-                                session_at(k + 1), g, draft_of(k), why)) return false;
+                                session_at(k + 1), g, draft_of(k), expectation, why)) return false;
                     return true;
                 };
                 // Capture is complete: only retained allocations can be saved.
@@ -12055,7 +12061,9 @@ int main(int argc, char** argv) {
                 bool stored = false;
                 bool publication_attempted = false;
                 publication_outside_bytes = image.bytes() <= UINT64_MAX - held ? held + image.bytes() : UINT64_MAX;
-                if (store_on && valid_image(image)) {
+                if (store_on && valid_image(image, source.shared_prefix ?
+                        strata::core::ConversationSnapshotExpectation::exact_cut :
+                        strata::core::ConversationSnapshotExpectation::ordinary)) {
                     store_admission.publish(image.bytes());
                     flush_publishes(0);
                     const StoreOwner* owner = source.shared_prefix ? nullptr : &store_owner(source.owner);
@@ -15642,14 +15650,14 @@ int main(int argc, char** argv) {
             // All private sources, including the private persistent selector,
             // precede the opt-in shared selector. PrefixChoice keeps first-seen
             // equal-length winners, so sharing never displaces a private tie.
-            PrefixCandidate store_candidate_backup, private_candidate_backup;
+            strata::program::ConversationStoreDemandFallback<PrefixCandidate> store_fallback;
             // The store's queries carry exact prompt tokens as int32 (its own prefix confirmation hashes int32 ids);
             // parse_i64_list already bounds every request id, so this narrowing is checked, not truncating.
             std::vector<int32_t> store_prompt;
             if (store_on && yielded_source < 0 && o.prompt_cache > 0 && req_scope.valid() && ids.size() <= (size_t) o.max_context) {
                 store_prompt.reserve(ids.size());
                 for (const int64_t id : ids) store_prompt.push_back((int32_t) id);
-                store_candidate_backup = choice.using_cost() ? cheapest : longest;
+                store_fallback.ram = choice.using_cost() ? cheapest : longest;
                 const auto stored_candidate = [&](const strata::core::ConversationScope& scope, bool shared) {
                     strata::core::ConversationStoreSelector selector = store_selector_base;
                     selector.scope = scope;
@@ -15671,7 +15679,8 @@ int main(int argc, char** argv) {
                         });
                 };
                 stored_candidate(req_scope, false);
-                private_candidate_backup = choice.using_cost() ? cheapest : longest;
+                const auto& private_choice = choice.using_cost() ? cheapest : longest;
+                if (private_choice.source == PrefixSource::disk) store_fallback.private_disk = private_choice;
                 if (req_shared_scope.valid()) stored_candidate(req_shared_scope, true);
             }
             PrefixCandidate selected = choice.using_cost() ? cheapest : longest;
@@ -15709,6 +15718,31 @@ int main(int argc, char** argv) {
                 const auto deadline = offer_book->deadline(req_cache_offer, req_cache_generation);
                 if (deadline) req_cache_deadline_ns = *deadline;
             }
+            // A shared image is rejected while the authoritative RAM fallback
+            // is still protected. Never downgrade it to ordinary validation or
+            // discard it later after the fallback selection has been forgotten.
+            const auto valid_shared_mount = [&] {
+                constexpr auto exact = strata::core::ConversationSnapshotExpectation::exact_cut;
+                std::string why;
+                if (!incoming || incoming->stage_images.size() != stages.size()) return false;
+                if (!strata::core::conversation_snapshot_validate(*incoming, ss, g,
+                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, exact, why)) {
+                    std::fprintf(stderr, "strata serve: conversation store: discard invalid shared snapshot (%s)\n",
+                                 why.c_str());
+                    return false;
+                }
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    const auto& part = incoming->stage_images[i];
+                    if (part.live.ids != incoming->live.ids ||
+                        !strata::core::conversation_snapshot_validate(part, stages[i]->ss, g,
+                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, exact, why)) {
+                        std::fprintf(stderr, "strata serve: conversation store: discard invalid shared stage (%s)\n",
+                                     why.c_str());
+                        return false;
+                    }
+                }
+                return true;
+            };
             while (selected.source == PrefixSource::disk) {
                 const bool shared = selected.shared;
                 store_demand = store_demand_restore(store_prompt, req_imgs,
@@ -15716,8 +15750,8 @@ int main(int argc, char** argv) {
                                                     shared ? 0 : req_cache_offer,
                                                     shared ? 0 : req_cache_generation, req_cache_deadline_ns,
                                                     [&] { return stop_req.load(); },
-                                                    store_candidate_backup.source == PrefixSource::parked ?
-                                                        &store_candidate_backup.parked.index : nullptr, incoming);
+                                                    store_fallback.ram.source == PrefixSource::parked ?
+                                                        &store_fallback.ram.parked.index : nullptr, incoming);
                 if (store_demand.mounted) {   // arm the guard for every path, including a rejected mount
                     store_demand_lease.store = conversation_store.get();
                     store_demand_lease.request_id = store_demand.request_id;
@@ -15727,7 +15761,8 @@ int main(int argc, char** argv) {
                     store_demand.stages == (uint32_t) stages.size() + 1 && store_demand.tokens > 0 &&
                     (!shared || (store_demand.live && store_demand.tokens == req_pin && incoming &&
                                  incoming->live.ids.size() == size_t(req_pin) &&
-                                 incoming->checkpoints.empty() && incoming->live.imgs.empty()))) {
+                                 incoming->checkpoints.empty() && incoming->live.imgs.empty() &&
+                                 valid_shared_mount()))) {
                     restored_from_store = true;
                     selected.tokens = store_demand.tokens;
                     selected.parked = strata::core::ConversationCache::Match{0, store_demand.tokens, store_demand.live};
@@ -15742,7 +15777,7 @@ int main(int argc, char** argv) {
                 } else {
                     incoming.reset();
                     store_demand_lease.release();
-                    selected = shared ? private_candidate_backup : store_candidate_backup;
+                    selected = store_fallback.after_failure(shared);
                     if (selected.source == PrefixSource::disk) continue;
                     std::fprintf(stderr, "strata serve: conversation store: reading the prompt instead (source=%s "
                                          "tokens=%lld)\n",
@@ -15753,6 +15788,9 @@ int main(int argc, char** argv) {
                                  (long long) selected.tokens);
                 }
             }
+            const auto incoming_expectation = selected.shared ?
+                strata::core::ConversationSnapshotExpectation::exact_cut :
+                strata::core::ConversationSnapshotExpectation::ordinary;
             bool incoming_retained_in_cache = false;
             if (selected.source == PrefixSource::parked) {
                 try {
@@ -15788,11 +15826,13 @@ int main(int argc, char** argv) {
                     selected.restore_ms.value_or(-1), selected.prefill_ms.value_or(-1));
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
-            if (incoming && incoming->stage_images.size() != stages.size()) {
+            // Shared mounts already passed the stronger whole-stage check in
+            // the demand loop, while their eventual RAM fallback was protected.
+            if (incoming && !selected.shared && incoming->stage_images.size() != stages.size()) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (stage count)\n");
                 incoming.reset();
             }
-            if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
+            if (incoming && !selected.shared) for (size_t i = 0; i < stages.size(); ++i) {
                 const strata::core::OnDevice on(stages[i]->dev);
                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
                         use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
@@ -15803,7 +15843,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
+            if (incoming && !selected.shared && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
                     use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
@@ -15917,7 +15957,7 @@ int main(int argc, char** argv) {
                 const PrefixWork restore_work = session_work(direct_cut ? parked.tokens : (int64_t) incoming->live.ids.size(), false);
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err,
+                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, incoming_expectation, err,
                         direct_cut ? incoming_cuts[0] : nullptr) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
@@ -15928,7 +15968,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err,
+                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, incoming_expectation, err,
                             direct_cut ? incoming_cuts[i + 1] : nullptr) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
@@ -15942,7 +15982,8 @@ int main(int argc, char** argv) {
                     const auto& draft_kv = stages.empty() ? incoming->kv.back() : incoming->stage_images.back().kv.back();
                     const strata::core::OnDevice on_d(stages.empty() ? 0 : stages.back()->dev);
                     if (!strata::core::conversation_kv_verify(draft_kv, mtp.kv_state(), g,
-                            direct_cut ? parked.tokens : int64_t(incoming->live.ids.size()), false, draft_hash, err,
+                            direct_cut ? parked.tokens : int64_t(incoming->live.ids.size()), false,
+                            incoming_expectation, draft_hash, err,
                             int64_t(incoming->live.ids.size()))) {
                         std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
                         return 1;
@@ -16936,7 +16977,15 @@ int main(int argc, char** argv) {
                     strata::core::ConversationStoreSelector selector = store_selector_base;
                     selector.scope = req_shared_scope;
                     selector.cvec = want_cvec;
-                    if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
+                    const int64_t draft_begin = use_mtp
+                        ? std::clamp(mtp.first_needed(), int64_t(0), pin_at - 1) : 0;
+                    if (!strata::program::ConversationPublicationQueue::shared_capture_recomputed(
+                            use_mtp, read_from, draft_begin)) {
+                        std::fprintf(stderr, "strata serve: conversation store: skip shared prefix publication "
+                                             "(pin=%lld read_from=%lld retained_draft_begin=%lld; "
+                                             "retained draft rows were not recomputed by this request)\n",
+                                     (long long) pin_at, (long long) read_from, (long long) draft_begin);
+                    } else if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
                             *conversation_store, selector, store_prompt, pin_at, uint32_t(stages.size() + 1))) {
                         std::vector<int32_t> prefix = std::move(store_prompt);
                         if (prefix.empty()) {
@@ -16946,12 +16995,10 @@ int main(int argc, char** argv) {
                             prefix.resize(size_t(pin_at));
                         }
                         std::vector<ConvCheckpoint> no_checks;
-                        const int64_t draft_begin = use_mtp
-                            ? std::clamp(mtp.first_needed(), int64_t(0), pin_at - 1) : 0;
                         // Only this drained two-part read seam authorizes shared
                         // capture. Never derive a recurrent cut from later state.
                         if (!park_source({prefix, no_park_images, no_checks, req_shared_scope,
-                                want_cvec, true, nullptr, kSessionOwner, false, true, draft_begin},
+                                want_cvec, true, nullptr, kSessionOwner, false, true, draft_begin, read_from},
                                 0, nullptr, 0)) {
                             std::printf("ERR saving the exact shared prefix: %s\n", err.c_str());
                             return 1;
