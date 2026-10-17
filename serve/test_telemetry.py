@@ -276,7 +276,7 @@ class SampleSequences(unittest.TestCase):
                 sampler._loop()
             self.assertEqual(sampler.snapshot()["now"]["seq"], seqs[-1] + 1)
             previous = sampler.snapshot()["now"]["seq"]
-            with mock.patch.object(telemetry, "gpu_reader", return_value=self.reader()), \
+            with mock.patch.object(telemetry, "gpu_reader", return_value=SamplerOwnership().reader()), \
                     mock.patch.object(threading.Thread, "start"):
                 second = telemetry.Telemetry()
             try:
