@@ -4829,7 +4829,7 @@ class Service:
         """
         prefix = req.get("strata_shared_prefix")
         n = prefix.get("tokens") if isinstance(prefix, dict) and set(prefix) == {"tokens"} else None
-        if (not self.api_key or has_images or fallback or self.template_fallback or score
+        if (has_images or fallback or self.template_fallback or score
                 or isinstance(n, bool) or not isinstance(n, int) or not 0 < n < len(ids) - 1
                 or not isinstance(principal, tuple) or len(principal) != 3):
             return None
@@ -7422,7 +7422,7 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
                     self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
-                    if path != "/v1/score" and accepted:
+                    if path != "/v1/score" and (accepted or (gateway and gateway_credential)):
                         self.lifecycle["_cache_principal"] = (
                             "gateway" if gateway else "principal", tenant, credential_fingerprint(credential))
                     if path != "/v1/score":        # the deadline is generation-only, exactly like the scope above:

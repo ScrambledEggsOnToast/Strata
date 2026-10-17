@@ -2122,15 +2122,22 @@ class CrossConversationPrefix(unittest.TestCase):
                         self.assertIsNone(shared)
                     self.assertGreater(self.engine.last_sampling["_strata_cache_deadline_ns"], 0)
 
-    def test_unauthenticated_http_never_shares_even_with_a_claimed_key_or_gateway_tenant(self):
+    def test_gateway_tenant_token_authorizes_sharing_without_a_general_api_key(self):
         self.svc.api_key = ""
         request = {"messages": SharedPrefix.MSGS, "max_tokens": 4, "strata_shared_prefix": {"tokens": 4},
                    "_strata_cache_shared_scope": "de" * 32}
-        for token in (None, "unverified-key", "gateway-token"):
+        for token in (None, "unverified-key"):
             with self.subTest(token=token):
                 status, response = self.post(request, token=token, tenant="tenant-a")
                 self.assertEqual(status, 200, response)
                 self.assertNotIn("_strata_cache_shared_scope", self.engine.last_sampling)
+        status, response = self.post(request, token="gateway-token", tenant=None)
+        self.assertEqual(status, 200, response)
+        self.assertNotIn("_strata_cache_shared_scope", self.engine.last_sampling,
+                         "the gateway token cannot share without naming its authenticated tenant")
+        status, response = self.post(request, token="gateway-token", tenant="tenant-a")
+        self.assertEqual(status, 200, response)
+        self.assertRegex(self.engine.last_sampling["_strata_cache_shared_scope"], r"^[0-9a-f]{64}$")
 
     def test_images_and_even_omitted_tool_images_cannot_share(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -448,7 +448,8 @@ class StableScope(unittest.TestCase):
             with self.subTest(principal=unauthorized):
                 self.assertIsNone(service.shared_cache_scope(request, unauthorized, ids))
         service.api_key = ""
-        self.assertIsNone(service.shared_cache_scope(request, principal, ids))
+        self.assertIsNotNone(service.shared_cache_scope(request, principal, ids),
+                             "a trusted principal is the authorization; the endpoint need not have a general gate")
         service.api_key = "client-key"
         service.template_fallback = True
         self.assertIsNone(service.shared_cache_scope(request, principal, ids))
