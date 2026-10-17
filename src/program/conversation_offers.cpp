@@ -84,7 +84,7 @@ struct ConversationOfferChannel::Impl {
     std::atomic<bool> stopping{false};
     bool started = false, enabled = false;
     std::thread reader;
-    std::atomic<uint64_t> accepted{0}, cancelled{0}, rejected{0}, token_bytes{0};
+    std::atomic<uint64_t> accepted{0}, cancelled{0}, rejected{0}, token_bytes{0}, cancel_failed{0};
     struct Active { uint64_t id = 0, generation = 0; size_t bytes = 0; };
     std::array<Active, 2> active{};
     size_t outstanding_bytes = 0;
@@ -94,13 +94,18 @@ struct ConversationOfferChannel::Impl {
           offer(std::move(offer_)), cancel(std::move(cancel_)) {}
 
     void cancel_at(size_t i) noexcept {
-        const Active previous = std::exchange(active[i], {});
+        const Active previous = active[i];
         if (!previous.id) return;
+        try {
+            cancel(previous.id, previous.generation);
+        } catch (...) {
+            // Store work may still be live: retain its slot and byte charge.
+            cancel_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        active[i] = {};
         outstanding_bytes -= previous.bytes;
         cancelled.fetch_add(1, std::memory_order_relaxed);
-        // Callback exceptions must not strand the transport thread or descriptor.
-        // The store's own bounded jobs/epochs remain authoritative on failure.
-        try { cancel(previous.id, previous.generation); } catch (...) {}
     }
 
 #if defined(__linux__)
@@ -286,7 +291,8 @@ void ConversationOfferChannel::stop() noexcept {
 ConversationOfferStats ConversationOfferChannel::stats() const noexcept {
     const auto& p = *impl_;
     return {p.accepted.load(std::memory_order_relaxed), p.cancelled.load(std::memory_order_relaxed),
-            p.rejected.load(std::memory_order_relaxed), p.token_bytes.load(std::memory_order_relaxed)};
+            p.rejected.load(std::memory_order_relaxed), p.token_bytes.load(std::memory_order_relaxed),
+            p.cancel_failed.load(std::memory_order_relaxed)};
 }
 
 } // namespace strata::program

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -107,6 +108,8 @@ struct Observed {
     std::condition_variable changed;
     std::vector<ConversationOffer> offers;
     std::vector<std::pair<uint64_t, uint64_t>> cancellations;
+    std::vector<std::pair<uint64_t, uint64_t>> cancel_attempts;
+    size_t cancel_failures = 0;
     bool take(ConversationOffer&& value) {
         std::lock_guard lock(mutex);
         offers.push_back(std::move(value));
@@ -115,13 +118,20 @@ struct Observed {
     }
     void cancel(uint64_t id, uint64_t generation) {
         std::lock_guard lock(mutex);
+        cancel_attempts.emplace_back(id, generation);
+        if (cancel_failures) {
+            --cancel_failures;
+            changed.notify_all();
+            throw std::runtime_error("injected store cancellation failure");
+        }
         cancellations.emplace_back(id, generation);
         changed.notify_all();
     }
-    void await(size_t requests, size_t cancelled) {
+    void await(size_t requests, size_t cancelled, size_t attempts = 0) {
         std::unique_lock lock(mutex);
         check(changed.wait_for(lock, std::chrono::seconds(3), [&] {
-            return offers.size() >= requests && cancellations.size() >= cancelled;
+            return offers.size() >= requests && cancellations.size() >= cancelled &&
+                   cancel_attempts.size() >= attempts;
         }), "bounded receiver reached expected request transition");
     }
 };
@@ -237,6 +247,75 @@ int main() {
         observed.await(2, 1);
         channel.stop();
         observed.await(2, 2);
+        ::close(socket[0]);
+    }
+    {
+        int socket[2];
+        check(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, socket) == 0,
+              "create cancellation-failure channel");
+        Observed observed;
+        observed.cancel_failures = 1;
+        ConversationOfferChannel channel(socket[1], 4096, 2, 16,
+            [&](ConversationOffer&& value) { return observed.take(std::move(value)); },
+            [&](uint64_t id, uint64_t generation) { observed.cancel(id, generation); });
+        std::array<uint8_t, 32> key{};
+        key[0] = 11;
+        std::string why;
+        check(channel.start(key, 2, true, why), "start cancellation-failure channel");
+        hello(socket[0]);
+        offer(socket[0], 1, 7, {1, 2, 3, 4});
+        send_packet(socket[0], packet(3, 1, 6)); // stale cancellation never calls the store
+        send_packet(socket[0], packet(3, 1, 7)); // injected failure must retain all 16 bytes
+        offer(socket[0], 2, 1, {5});            // spare frontier slot, but no byte capacity
+        send_packet(socket[0], packet(3, 1, 7)); // retry retires the still-active generation
+        send_packet(socket[0], packet(3, 1, 7)); // successful retirement is idempotent
+        offer(socket[0], 2, 1, {5});            // successful retry releases byte capacity
+        observed.await(2, 1);
+        ::shutdown(socket[0], SHUT_WR);
+        observed.await(2, 2);
+        channel.stop();
+        const auto stats = channel.stats();
+        check(stats.accepted == 2 && stats.rejected == 1 && stats.cancelled == 2 &&
+              stats.cancel_failed == 1 && stats.accepted_token_bytes == 20,
+              "failed cancellation retains byte accounting until successful retry");
+        {
+            std::lock_guard lock(observed.mutex);
+            check(observed.cancel_attempts == std::vector<std::pair<uint64_t, uint64_t>>({
+                      {1, 7}, {1, 7}, {2, 1}}),
+                  "failed cancellation remains retryable while stale and repeated success stay idempotent");
+        }
+        ::close(socket[0]);
+    }
+    {
+        int socket[2];
+        check(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, socket) == 0,
+              "create EOF cancellation-failure channel");
+        Observed observed;
+        observed.cancel_failures = 1;
+        ConversationOfferChannel channel(socket[1], 4096, 2, 16,
+            [&](ConversationOffer&& value) { return observed.take(std::move(value)); },
+            [&](uint64_t id, uint64_t generation) { observed.cancel(id, generation); });
+        std::array<uint8_t, 32> key{};
+        key[0] = 11;
+        std::string why;
+        check(channel.start(key, 2, true, why), "start EOF cancellation-failure channel");
+        hello(socket[0]);
+        offer(socket[0], 1, 7, {1, 2});
+        offer(socket[0], 2, 8, {3, 4});
+        observed.await(2, 0);
+        ::shutdown(socket[0], SHUT_WR);
+        observed.await(2, 1, 2);
+        channel.stop();
+        channel.stop();
+        const auto stats = channel.stats();
+        check(stats.accepted == 2 && stats.cancelled == 1 && stats.cancel_failed == 1,
+              "EOF cancellation failure is observable and never counted as successful retirement");
+        {
+            std::lock_guard lock(observed.mutex);
+            check(observed.cancel_attempts == std::vector<std::pair<uint64_t, uint64_t>>({{1, 7}, {2, 8}}) &&
+                  observed.cancellations == std::vector<std::pair<uint64_t, uint64_t>>({{2, 8}}),
+                  "EOF tries every active offer once without retrying indefinitely on failure");
+        }
         ::close(socket[0]);
     }
     {

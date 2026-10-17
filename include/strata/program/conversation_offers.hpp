@@ -28,6 +28,7 @@ struct ConversationOfferStats {
     uint64_t cancelled = 0;
     uint64_t rejected = 0;
     uint64_t accepted_token_bytes = 0;
+    uint64_t cancel_failed = 0; // Callback failures, not successful retirements.
 };
 
 // Returns an inherited descriptor >=3, or -1. Consumes the environment variable
@@ -38,7 +39,11 @@ class ConversationOfferChannel {
 public:
     // Callbacks run on the CPU reader thread and must never touch GPU state.
     // offer takes ownership only when it returns true. cancel retires exactly
-    // this request/generation. Both must provide their own storage synchronization.
+    // this request/generation on normal return; it must throw on failure and be
+    // safe to retry. A failed cancellation retains the active offer and its byte
+    // charge until a later CANCEL or final reader cleanup succeeds. Both callbacks
+    // must provide their own storage synchronization; store deadlines/epochs
+    // remain responsible for bounding work if final cleanup fails.
     using Offer = std::function<bool(ConversationOffer&&)>;
     using Cancel = std::function<void(uint64_t, uint64_t)>;
 
@@ -54,6 +59,8 @@ public:
     // store sends no key and accepts no offers. No key/prompt bytes are logged.
     bool start(const std::array<uint8_t, 32>& issuer_key, uint64_t epoch,
                bool enabled, std::string& why);
+    // Reader exit tries each remaining cancellation once; failure is counted,
+    // not retried indefinitely, and remains accounted until channel destruction.
     void stop() noexcept;
     ConversationOfferStats stats() const noexcept;
 
