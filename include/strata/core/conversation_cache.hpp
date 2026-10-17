@@ -51,6 +51,13 @@ inline bool conversation_scope_parse(std::string_view text, ConversationScope& o
     return true;
 }
 
+inline bool conversation_shared_scope_parse(std::string_view text, ConversationScope& out) {
+    if (std::any_of(text.begin(), text.end(), [](char c) {
+            return !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        })) return false;
+    return conversation_scope_parse(text, out);
+}
+
 struct ConversationImageKey {
     int64_t start = 0;
     uint64_t hash = 0;
@@ -106,6 +113,9 @@ struct ConversationCheckpoint {
 // source is the authoritative host pool, NOT the replaceable VRAM slots.
 struct ConversationKv {
     int format = 0;
+    // Private captures use page-rounded cells. An exact shared draft cut uses
+    // cells == live.ids.size()-1: its meaningful extent is explicit in the same
+    // serialized field, while the rounded payload contains zeros afterwards.
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
     void freeze() { k.freeze(); v.freeze(); k_scale.freeze(); v_scale.freeze(); pooled.freeze(); }

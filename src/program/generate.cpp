@@ -11778,6 +11778,8 @@ int main(int argc, char** argv) {
             // it is published as a branch of its own and never becomes the owner's lineage.
             uint64_t owner = kSessionOwner;
             bool continues = true;
+            bool shared_prefix = false;
+            int64_t draft_begin = 0;
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
@@ -11805,7 +11807,7 @@ int main(int argc, char** argv) {
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
             // cache is full, evict the long conversation they were interleaved with (oldest first) - the reuse it
             // wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths below take.
-            if (!conversations.wants((int64_t) live.size())) {
+            if (!source.shared_prefix && !conversations.wants((int64_t) live.size())) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
                                      "minimum; parked=%zu)\n",
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
@@ -11850,8 +11852,11 @@ int main(int argc, char** argv) {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = source.resident ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
+            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
+                source.shared_prefix, source.shared_prefix && draft0 ? int64_t(live.size()) - 1 : -1,
+                source.shared_prefix && draft0 ? source.draft_begin : 0};
+            auto reuse = source.resident || source.shared_prefix
+                ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -11860,7 +11865,9 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
+                    source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
+                    source.shared_prefix && draft_of(k) ? source.draft_begin : 0};
                 size_t b = 0;
                 if (!strata::core::conversation_snapshot_bytes(view_k, session_at(k + 1), g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
@@ -11961,7 +11968,9 @@ int main(int argc, char** argv) {
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached,
+                        source.shared_prefix, source.shared_prefix && draft_of(k) ? int64_t(live.size()) - 1 : -1,
+                        source.shared_prefix && draft_of(k) ? source.draft_begin : 0};
                     strata::core::SavedConversation part;
                     std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
@@ -12049,18 +12058,19 @@ int main(int argc, char** argv) {
                 if (store_on && valid_image(image)) {
                     store_admission.publish(image.bytes());
                     flush_publishes(0);
-                    StoreOwner& owner = store_owner(source.owner);
+                    const StoreOwner* owner = source.shared_prefix ? nullptr : &store_owner(source.owner);
                     QueuedPublish queued;
                     queued.owner = source.owner;
                     queued.capture_epoch = capture_epoch;
-                    queued.continues = source.continues;
-                    queued.supersedes_hint = owner.lineage.valid ? owner.lineage.head : 0;
+                    queued.shared_prefix = source.shared_prefix;
+                    queued.continues = source.continues && !source.shared_prefix && !owner->force_fresh;
+                    queued.supersedes_hint = queued.continues && owner->lineage.valid ? owner->lineage.head : 0;
                     queued.scope = live_scope;
                     queued.cvec = cvec_cached;
                     queued.live.assign(live.begin(), live.end());
                     // Only bytes the capture itself kept from the image it retained may be offered, and only against
                     // the head that image came from - never against a global "current" head.
-                    if (!retained_prefixes.empty() && reuse_donor_head != 0) {
+                    if (!source.shared_prefix && !retained_prefixes.empty() && reuse_donor_head != 0) {
                         const std::vector<strata::core::ConversationStoreStreamInfo> streams =
                             strata::core::conversation_store_streams(image);
                         queued.reuse = strata::core::conversation_store_reuse_intervals(
@@ -15194,6 +15204,8 @@ int main(int argc, char** argv) {
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
             strata::core::ConversationScope req_scope;
+            strata::core::ConversationScope req_shared_scope;
+            bool bad_shared_scope = false;
             bool bad_scope = false;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
@@ -15215,9 +15227,12 @@ int main(int argc, char** argv) {
                     const size_t eq = tok.find('=');
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
-                    const float fv = key == "scope" ? 0.0f : std::strtof(tok.c_str() + eq + 1, nullptr);
+                    const float fv = key == "scope" || key == "sscope" ? 0.0f : std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "scope")
                         bad_scope = bad_scope || !strata::core::conversation_scope_parse(std::string_view(tok).substr(eq + 1), req_scope);
+                    else if (key == "sscope")
+                        bad_shared_scope = bad_shared_scope ||
+                            !strata::core::conversation_shared_scope_parse(std::string_view(tok).substr(eq + 1), req_shared_scope);
                     else if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "cache_offer") req_cache_offer = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
@@ -15255,11 +15270,18 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (bad_scope || max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
-                std::printf("ERR bad request: %s\n", bad_scope ? "scope must be 64 nonzero hex digits" : pe.empty() ? "max_new" : pe.c_str());
+            if (bad_scope || bad_shared_scope || max_new < 1 || endp == nullptr || (geni && emb_path.empty()) ||
+                !parse_i64_list(endp, ids, pe)) {
+                std::printf("ERR bad request: %s\n", bad_shared_scope ? "sscope must be 64 nonzero lowercase hex digits" :
+                            bad_scope ? "scope must be 64 nonzero hex digits" : pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (req_shared_scope.valid() && (!store_on || !req_scope.valid() || geni ||
+                !o.score_reference.empty() || req_pin <= 0 || req_pin >= n - 1 || !req_ckpt || o.prompt_cache < 3)) {
+                std::fprintf(stderr, "strata serve: shared prefix ignored: no usable private scope, store, text pin seam\n");
+                req_shared_scope = {};
+            }
             // BGEN's internal GEN 1 is only the prefill leg, not its output budget.
             // Slots, draft state and workspace were reserved at startup; reachable
             // cells must fit that envelope before uploads, identity binding or work.
@@ -15421,6 +15443,8 @@ int main(int argc, char** argv) {
             input.pcie_fraction = req_pcie_frac;
             input.spec_min_probability = req_spec_min_p;
             input.scope = req_scope;
+            input.shared_scope = req_shared_scope;
+            input.pin = req_pin;
             input.checkpoint = req_ckpt != 0;
             input.sampling.greedy = req_temperature <= 0.0f;
             input.sampling.temperature = req_temperature;
@@ -15488,6 +15512,7 @@ int main(int argc, char** argv) {
                 PrefixTransfer transfer = PrefixTransfer::checkpoint;
                 std::optional<double> total_ms{}, restore_ms{}, prefill_ms{}, park_ms{};
                 uint64_t store_head = 0;   ///< PrefixSource::disk: the stored branch head to materialize
+                bool shared = false;      ///< disk candidate is a borrow from the shared selector
             };
             const int yielded_source = resident.working().resume_slot;
             const uint64_t prefill_route = uint64_t(std::clamp(int(req_pcie_frac * 256.0 + 0.5), 0, 256)) |
@@ -15614,35 +15639,40 @@ int main(int argc, char** argv) {
                               session_work((int64_t) image.live.ids.size(), false), PrefixTransfer::parked},
                              prefix_costs.transfer_ms(PrefixTransfer::checkpoint, rewind));
                 });
-            // Catalog-authorized exact cuts, longest/newest first; equal RAM cuts retain their original tie order.
-            // Disk cost remains unknown, preserving the longest-prefix rollback.
-            // Keep the pre-store selection so a failed demand falls back without consuming or changing that source.
-            PrefixCandidate store_candidate_backup;
+            // All private sources, including the private persistent selector,
+            // precede the opt-in shared selector. PrefixChoice keeps first-seen
+            // equal-length winners, so sharing never displaces a private tie.
+            PrefixCandidate store_candidate_backup, private_candidate_backup;
             // The store's queries carry exact prompt tokens as int32 (its own prefix confirmation hashes int32 ids);
             // parse_i64_list already bounds every request id, so this narrowing is checked, not truncating.
             std::vector<int32_t> store_prompt;
             if (store_on && yielded_source < 0 && o.prompt_cache > 0 && req_scope.valid() && ids.size() <= (size_t) o.max_context) {
                 store_prompt.reserve(ids.size());
                 for (const int64_t id : ids) store_prompt.push_back((int32_t) id);
-                strata::core::ConversationStoreSelector store_selector = store_selector_base;
-                store_selector.scope = req_scope;
-                store_selector.cvec = want_cvec;
                 store_candidate_backup = choice.using_cost() ? cheapest : longest;
-                bool store_seen = false;
-                conversation_store->for_each_match(store_selector, store_prompt, req_imgs,
-                    [&](const strata::core::ConversationStoreMatch& match) {
-                        if (store_seen) return;                    // longest first: the first is the best cut
-                        if (match.stages != (uint32_t) stages.size() + 1) return;   // another layout's image
-                        if (match.tokens <= 0) return;
-                        store_seen = true;
-                        PrefixCandidate candidate;
-                        candidate.source = PrefixSource::disk;
-                        candidate.tokens = match.tokens;
-                        candidate.parked = strata::core::ConversationCache::Match{0, match.tokens, match.live};
-                        candidate.store_head = match.head_id;
-                        candidate.transfer = PrefixTransfer::parked;   // accounting label only: no rate is claimed
-                        consider(std::move(candidate), std::nullopt);
-                    });
+                const auto stored_candidate = [&](const strata::core::ConversationScope& scope, bool shared) {
+                    strata::core::ConversationStoreSelector selector = store_selector_base;
+                    selector.scope = scope;
+                    selector.cvec = want_cvec;
+                    bool seen = false;
+                    conversation_store->for_each_match(selector, store_prompt, req_imgs,
+                        [&](const strata::core::ConversationStoreMatch& match) {
+                            if (seen || match.stages != uint32_t(stages.size() + 1) || match.tokens <= 0 ||
+                                (shared && (!match.live || match.tokens != req_pin))) return;
+                            seen = true;
+                            PrefixCandidate candidate;
+                            candidate.source = PrefixSource::disk;
+                            candidate.tokens = match.tokens;
+                            candidate.parked = strata::core::ConversationCache::Match{0, match.tokens, match.live};
+                            candidate.store_head = match.head_id;
+                            candidate.shared = shared;
+                            candidate.transfer = PrefixTransfer::parked;
+                            consider(std::move(candidate), std::nullopt);
+                        });
+                };
+                stored_candidate(req_scope, false);
+                private_candidate_backup = choice.using_cost() ? cheapest : longest;
+                if (req_shared_scope.valid()) stored_candidate(req_shared_scope, true);
             }
             PrefixCandidate selected = choice.using_cost() ? cheapest : longest;
             if (yielded_source >= 0) {
@@ -15673,9 +15703,18 @@ int main(int argc, char** argv) {
                 }
             } store_demand_lease;
             std::optional<strata::core::SavedConversation> incoming;
-            if (selected.source == PrefixSource::disk) {
-                store_demand = store_demand_restore(store_prompt, req_imgs, req_scope, want_cvec,
-                                                    req_cache_offer, req_cache_generation, req_cache_deadline_ns,
+            // A shared borrow cannot consume the private offer's descriptor. The
+            // demand path mints a fresh request-local ID even without any offer.
+            if (req_cache_deadline_ns == 0 && req_cache_offer != 0) {
+                const auto deadline = offer_book->deadline(req_cache_offer, req_cache_generation);
+                if (deadline) req_cache_deadline_ns = *deadline;
+            }
+            while (selected.source == PrefixSource::disk) {
+                const bool shared = selected.shared;
+                store_demand = store_demand_restore(store_prompt, req_imgs,
+                                                    shared ? req_shared_scope : req_scope, want_cvec,
+                                                    shared ? 0 : req_cache_offer,
+                                                    shared ? 0 : req_cache_generation, req_cache_deadline_ns,
                                                     [&] { return stop_req.load(); },
                                                     store_candidate_backup.source == PrefixSource::parked ?
                                                         &store_candidate_backup.parked.index : nullptr, incoming);
@@ -15685,7 +15724,10 @@ int main(int argc, char** argv) {
                     store_demand_lease.generation = store_demand.generation;
                 }
                 if (store_demand.status == strata::core::ConversationStoreReadStatus::ready &&
-                    store_demand.stages == (uint32_t) stages.size() + 1 && store_demand.tokens > 0) {
+                    store_demand.stages == (uint32_t) stages.size() + 1 && store_demand.tokens > 0 &&
+                    (!shared || (store_demand.live && store_demand.tokens == req_pin && incoming &&
+                                 incoming->live.ids.size() == size_t(req_pin) &&
+                                 incoming->checkpoints.empty() && incoming->live.imgs.empty()))) {
                     restored_from_store = true;
                     selected.tokens = store_demand.tokens;
                     selected.parked = strata::core::ConversationCache::Match{0, store_demand.tokens, store_demand.live};
@@ -15696,9 +15738,12 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation store: demand mounted head %llu (planned "
                                              "%llu)\n", (unsigned long long) store_demand.head_id,
                                      (unsigned long long) selected.store_head);
+                    break;
                 } else {
                     incoming.reset();
-                    selected = store_candidate_backup;
+                    store_demand_lease.release();
+                    selected = shared ? private_candidate_backup : store_candidate_backup;
+                    if (selected.source == PrefixSource::disk) continue;
                     std::fprintf(stderr, "strata serve: conversation store: reading the prompt instead (source=%s "
                                          "tokens=%lld)\n",
                                  selected.source == PrefixSource::live ? "live" :
@@ -15851,6 +15896,8 @@ int main(int argc, char** argv) {
                     resume = slot_tokens;
                     from_live = true;
                     live_scope = req_scope;
+                    if (store_on && store_owner(kResidentOwnerFirst + uint64_t(slot_source)).force_fresh)
+                        store_owner(kSessionOwner).borrow();
                     cvec_cached = want_cvec;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
@@ -15925,7 +15972,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 cvec_cached = incoming->cvec;
-                live_scope = incoming->scope;
+                live_scope = selected.shared ? req_scope : incoming->scope;
                 resume = parked.tokens;
                 from_live = parked.live || direct_cut;
                 // A store-mounted image sets the lineage of the owner whose state it becomes: the head this state now
@@ -15934,10 +15981,15 @@ int main(int argc, char** argv) {
                 // state this session runs requests in, so it also moves the owner's generation: a completion of the
                 // state that was just replaced must never attach itself to the state that replaced it.
                 if (restored_from_store) {
-                    store_owner(kSessionOwner).mount(store_demand.head_id, store_demand.epoch, live, resume,
-                                                    req_scope, want_cvec);
+                    if (selected.shared) {
+                        store_owner(kSessionOwner).borrow();
+                        (void) conversations.take_reuse();
+                    } else {
+                        store_owner(kSessionOwner).mount(store_demand.head_id, store_demand.epoch, live, resume,
+                                                        req_scope, want_cvec);
+                    }
                 }
-                if (req_ckpt && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                if (req_ckpt && !selected.shared && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     // The retained K/V names the head it came from, so a later capture can offer the exact bytes it
@@ -16066,7 +16118,9 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
-            if (use_mtp) mtp.set_prompt_len(n);
+            // A shared cut's draft state must be reusable with any suffix. Do not
+            // skip prefix rows based on this request's longer private suffix.
+            if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && resume < req_pin ? req_pin + 1 : n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
             pp_total = n;
@@ -16609,6 +16663,8 @@ int main(int argc, char** argv) {
                             0, &checks, nullptr, q, q < split_until ? split_until : 0};
                         if (can && !park_replaced(ys)) { batch_fatal = true; e = err; return false; }
                         if (can && resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye)) {
+                            if (store_on && store_owner(kSessionOwner).force_fresh)
+                                store_owner(kResidentOwnerFirst + uint64_t(ys)).borrow();
                             yielded_at = q;
                             yielded_slot = ys;
                             std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d "
@@ -16876,6 +16932,33 @@ int main(int argc, char** argv) {
                 }
                 if (to == pin_at && !strata::program::conv_cache::pin_checkpoint(checks, pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
+                if (to == pin_at && req_shared_scope.valid()) {
+                    strata::core::ConversationStoreSelector selector = store_selector_base;
+                    selector.scope = req_shared_scope;
+                    selector.cvec = want_cvec;
+                    if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
+                            *conversation_store, selector, store_prompt, pin_at, uint32_t(stages.size() + 1))) {
+                        std::vector<int32_t> prefix = std::move(store_prompt);
+                        if (prefix.empty()) {
+                            prefix.reserve(size_t(pin_at));
+                            for (int64_t i = 0; i < pin_at; ++i) prefix.push_back(int32_t(ids[size_t(i)]));
+                        } else {
+                            prefix.resize(size_t(pin_at));
+                        }
+                        std::vector<ConvCheckpoint> no_checks;
+                        const int64_t draft_begin = use_mtp
+                            ? std::clamp(mtp.first_needed(), int64_t(0), pin_at - 1) : 0;
+                        // Only this drained two-part read seam authorizes shared
+                        // capture. Never derive a recurrent cut from later state.
+                        if (!park_source({prefix, no_park_images, no_checks, req_shared_scope,
+                                want_cvec, true, nullptr, kSessionOwner, false, true, draft_begin},
+                                0, nullptr, 0)) {
+                            std::printf("ERR saving the exact shared prefix: %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
+                    if (use_mtp) mtp.set_prompt_len(n);
+                }
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
@@ -18054,6 +18137,8 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str()); return 1;
                     }
+                    if (store_on && store_owner(kSessionOwner).force_fresh)
+                        store_owner(kResidentOwnerFirst + uint64_t(admit_slot)).borrow();
                 }
                 if (cont) {
                     const double admission_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc0).count();

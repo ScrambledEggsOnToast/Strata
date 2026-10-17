@@ -55,7 +55,8 @@ void report_admission_timing(int slot, const char* component, int device, int64_
 bool same_request(const ResidentRequest& a, const ResidentRequest& b) {
     const auto& x = a.sampling;
     const auto& y = b.sampling;
-    return a.scope.matches(b.scope) && a.checkpoint == b.checkpoint &&
+    return a.scope.matches(b.scope) && a.shared_scope.value == b.shared_scope.value && a.pin == b.pin &&
+           a.checkpoint == b.checkpoint &&
            a.max_new == b.max_new && a.steering == b.steering && a.images == b.images &&
            a.pcie_fraction == b.pcie_fraction && a.spec_min_probability == b.spec_min_probability &&
            x.top_k == y.top_k && x.top_p == y.top_p && x.min_p == y.min_p &&

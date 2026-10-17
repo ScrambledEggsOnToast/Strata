@@ -6,11 +6,13 @@
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <utility>
 
 namespace strata::core {
 namespace {
@@ -267,6 +269,55 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     return true;
 }
 
+namespace {
+// Authoritative K/V and scale runs all have the same page/head/cell ordering,
+// but different row widths (including hybrid K8/V4).
+template<class Image, class Fn>
+bool inactive_rows(Image& image, int64_t cells, int64_t begin, int64_t end, Fn fn) {
+    if (cells <= 0 || image.page_size <= 0 || image.heads <= 0 ||
+        cells % image.page_size != 0 || uint64_t(cells) > SIZE_MAX / uint64_t(image.heads)) return false;
+    const size_t rows = size_t(cells) * size_t(image.heads);
+    const std::array<decltype(&image.k), 4> buffers = {&image.k, &image.v, &image.k_scale, &image.v_scale};
+    for (auto* buffer : buffers) {
+        if (buffer->empty()) continue;
+        if (buffer->size() % rows != 0) return false;
+        const size_t width = buffer->size() / rows;
+        const std::array<std::pair<int64_t, int64_t>, 2> inactive{{{0, begin}, {end, cells}}};
+        for (const auto interval : inactive) {
+            if (interval.first == interval.second) continue;
+            for (int64_t page = interval.first / image.page_size;
+                 page <= (interval.second - 1) / image.page_size; ++page) {
+                const int64_t first = std::max(interval.first, page * image.page_size) - page * image.page_size;
+                const int64_t last = std::min(interval.second, (page + 1) * image.page_size) - page * image.page_size;
+                for (int64_t head = 0; head < image.heads; ++head) {
+                    const size_t offset = ((size_t(page) * size_t(image.heads) + size_t(head)) *
+                                           size_t(image.page_size) + size_t(first)) * width;
+                    if (!fn(*buffer, offset, size_t(last - first) * width)) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+}
+
+bool conversation_kv_clear_inactive(ConversationKv& image, int64_t tokens, int64_t begin, int64_t end,
+                                    std::string& error) {
+    if (tokens <= 0 || image.page_size <= 0 || tokens > INT64_MAX - (image.page_size - 1) ||
+        begin < 0 || end < begin || end > tokens ||
+        image.cells != (tokens + image.page_size - 1) / image.page_size * image.page_size ||
+        !inactive_rows(image, image.cells, begin, end, [](auto& buffer, size_t offset, size_t bytes) {
+            return buffer.visit(offset, bytes, [](uint8_t* p, size_t n, size_t) {
+                std::memset(p, 0, n);
+                return true;
+            });
+        })) {
+        error = "conversation snapshot: invalid exact-cut K/V extent";
+        return false;
+    }
+    return true;
+}
+
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
     Layout l{};
@@ -274,7 +325,12 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     if (!valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
+    // The existing cells field carries the exact meaningful extent of a shared
+    // draft cut. Its payload remains rounded to the main cut and must contain
+    // zeros from the excluded next-token row onwards; restore copies those zeros
+    // too, so neither host nor resident ring can revive the outgoing suffix.
+    const bool exact_draft = !index && image.cells >= 0 && image.cells < upto;
+    if (image.format != l.format || (!exact_draft && image.cells != l.cells) || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
         image.idx_dim != g.idx_key_dim) {
         error = "conversation snapshot: incompatible K/V geometry";
@@ -282,6 +338,15 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    if (exact_draft && !inactive_rows(image, l.cells, 0, image.cells,
+        [](const auto& buffer, size_t offset, size_t bytes) {
+            return buffer.visit(offset, bytes, [](const uint8_t* p, size_t n, size_t) {
+                return std::all_of(p, p + n, [](uint8_t b) { return b == 0; });
+            });
+        })) {
+        error = "conversation snapshot: exact draft cut contains post-cut bytes";
+        return false;
+    }
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }

@@ -261,6 +261,11 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
     bytes = sizeof(ConversationScope);
     if (!view_validate(view, ss, g, error)) return false;
+    if (view.exact_cut && (!view.images.empty() || !view.checkpoints.empty() ||
+        (draft && (view.draft_tokens < 0 || view.draft_tokens >= int64_t(view.ids.size()) ||
+                   view.draft_begin < 0 || view.draft_begin > view.draft_tokens)) ||
+        (!draft && (view.draft_tokens != -1 || view.draft_begin != 0))))
+        return fail(error, "invalid exact cut or draft extent at/past its token boundary");
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     size_t ids = 0, images = 0, checkpoints = 0, layers = 0, tails = 0, dead = 0, positions = 0;
@@ -374,6 +379,53 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                   retained ? &kept : nullptr)) return false;
         report((uint32_t) layers, kept);
     }
+    if (view.exact_cut) {
+        // The active recurrence and PLE were captured exactly at this seam. Raw
+        // index tails past the current partial block and block-position scratch
+        // are not state a continuation reads; they may still name an old owner.
+        ConversationStateSizes z;
+        if (!conversation_session_sizes(g, ss, z, error)) return false;
+        // A carved stage can allocate a primary QSA only to lend its RoPE table,
+        // and every stage allocates PLE history although only layer zero uses it.
+        // Neither unused owner's bytes belong to the shared prefix.
+        if (ss.layer_lo > 0) {
+            auto& history = captured.live.ple.write();
+            std::fill(history.begin(), history.end(), 0);
+        }
+        const size_t active = size_t(upto % strata::kernels::qsa_real_shapes().idx_block) *
+                              size_t(g.idx_key_dim) * sizeof(float);
+        auto& tails = captured.live.tails.write();
+        for (size_t j = 0; j < layers; ++j) {
+            const int64_t layer = (ss.qsa_ord0 + int64_t(j) + 1) * g.qsa_interval - 1;
+            const bool active_layer = layer >= ss.layer_lo && layer < ss.layer_hi;
+            if (!active_layer) {
+                std::fill(tails.begin() + j * z.tail, tails.begin() + (j + 1) * z.tail, 0);
+                auto& dead = captured.live.dead.write();
+                std::fill(dead.begin() + j * z.dead, dead.begin() + (j + 1) * z.dead, 0);
+                if (!conversation_kv_clear_inactive(captured.kv[j], upto, 0, 0, error) ||
+                    !captured.kv[j].pooled.visit(0, captured.kv[j].pooled.size(),
+                        [](uint8_t* p, size_t n, size_t) { std::memset(p, 0, n); return true; }))
+                    return fail(error, "invalid inactive stage K/V");
+                continue;
+            }
+            std::fill(tails.begin() + j * z.tail + active, tails.begin() + (j + 1) * z.tail, 0);
+            if (!conversation_kv_clear_inactive(captured.kv[j], upto, 0, upto, error)) return false;
+            // The spare is the prefix's constant dead key, never a stale pooled row.
+            if (!captured.kv[j].pooled.visit(captured.kv[j].pooled.size() - z.dead, z.dead,
+                [&](uint8_t* p, size_t n, size_t at) {
+                    std::memcpy(p, captured.live.dead.data() + j * z.dead +
+                                   at - (captured.kv[j].pooled.size() - z.dead), n);
+                    return true;
+                })) return fail(error, "invalid exact indexer spare");
+        }
+        auto& positions = captured.live.block_pos.write();
+        std::fill(positions.begin(), positions.end(), 0);
+        if (draft) {
+            if (!conversation_kv_clear_inactive(captured.kv.back(), upto, view.draft_begin,
+                                                view.draft_tokens, error)) return false;
+            captured.kv.back().cells = view.draft_tokens;
+        }
+    }
     image = std::move(captured);
     return true;
 }
@@ -381,6 +433,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                    const QsaState& draft, std::string& error) {
+    if (view.exact_cut) return fail(error, "an exact cut requires the sanitizing snapshot capture");
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);

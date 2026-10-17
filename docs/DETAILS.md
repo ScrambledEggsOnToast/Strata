@@ -1509,6 +1509,16 @@ parked histories retain their own pins. This needs `--prompt-cache 3` or more (c
 slots). `tools/research_run.py` runs a document and a question list against a server with and without it.
 The engine's own key is `pin=N` on the `GEN` line.
 
+Trusted frontend requests may additionally send `sscope=<64 nonzero lowercase hex digits>`, with the exact count
+still carried only by `pin=N`. This is a separate, explicitly authorized persistent selector: every private source
+(including private disk state) is considered first, and an equal-length private prefix wins. Shared restores borrow
+state without mounting a private lineage or retaining shared donor intervals; the next private publication is a
+fresh one-shot branch. Only a prompt read that actually stops at the pin may publish a shared cut. The capture
+contains no other checkpoints, clears inactive K/V/index bytes, and explicitly records the draft's meaningful extent
+as `N-1` (draft row `N-1` consumes the private token `N`). Shared publication is owner-neutral, unpinned on disk,
+donor-free and suppressed when an equal-or-longer exact record already exists. Existing private capture behavior
+and disk field layout are unchanged; sharing does not make any private scope visible to another conversation.
+
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when

@@ -44,6 +44,11 @@ struct ConversationPublicationLineage {
 struct ConversationPublicationOwner {
     uint64_t generation = 0;
     ConversationPublicationLineage lineage;
+    bool force_fresh = false;   // a shared restore owes one fresh, one-shot private publication
+
+    // Borrowed shared state never establishes private ancestry, including through
+    // a late completion of the state it replaced.
+    void borrow();
 
     // Retarget the owner after a disk restore, before execution truncates the mounted record to its resumed cut.
     // Moving the generation also prevents a completion of the replaced execution state from attaching here.
@@ -62,6 +67,7 @@ struct ConversationPublicationCapture {
     uint64_t image_ticket = 0;         // unique nonzero capture generation; transient cache ownership, never on disk
     uint64_t supersedes_hint = 0;      // the owner's lineage head at capture (0: this capture starts a branch)
     bool continues = true;             // false: a one-shot borrow; never supersedes and never sets a lineage
+    bool shared_prefix = false;        // owner-neutral, donor-free, unpinned persistent cut
     strata::core::ConversationScope scope;
     bool cvec = true;
     std::vector<int32_t> live;         // the captured record, for the coverage proof and the lineage
@@ -87,6 +93,7 @@ struct ConversationPublicationPending {
     uint64_t owner_generation = 0;
     uint64_t capture_epoch = 0;
     bool continues = true;
+    bool shared_prefix = false;
     strata::core::ConversationScope scope;
     bool cvec = true;
     std::vector<int32_t> live;
@@ -203,6 +210,13 @@ public:
     // caller's image - the entry's own retry image and the export cache's copy - is never mutated for it.
     static std::shared_ptr<const strata::core::SavedConversation> pinned_live_cut(
         const std::shared_ptr<const strata::core::SavedConversation>& image);
+    static std::shared_ptr<const strata::core::SavedConversation> unpinned_shared_cut(
+        const std::shared_ptr<const strata::core::SavedConversation>& image);
+    // Metadata-only exact selector lookup. Called before capture and again at
+    // handoff, so two queued captures cannot publish the same cut twice.
+    static bool shared_prefix_exists(strata::core::ConversationStore& store,
+        const strata::core::ConversationStoreSelector& selector, const std::vector<int32_t>& prompt,
+        int64_t tokens, uint32_t stages);
 
     // Retirement bookkeeping, deliberately independent of the generation-guarded adoption below: a completed
     // *replacement* removed its predecessor from the store's catalog, so every reference to that head - the lineage

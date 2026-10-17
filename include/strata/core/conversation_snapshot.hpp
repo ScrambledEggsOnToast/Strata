@@ -67,6 +67,10 @@ bool conversation_kv_source(SessionKvSource& source, const QsaState& state, cons
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
+// Clear rows outside [begin,end) in a captured, page-rounded cut. No device read
+// or allocation; layout is [page][head][cell][row bytes], including scale runs.
+bool conversation_kv_clear_inactive(ConversationKv& image, int64_t tokens, int64_t begin, int64_t end,
+                                    std::string& error);
 // Disk sessions: the read limits this session can ever restore - its geometry and layer range, at most
 // min(max_tokens, its cells) tokens, `max_checkpoints` checkpoints, the exact running-state sizes and the K/V part
 // sizes at that many tokens - so session_file_read refuses an oversized or foreign file before it allocates.
@@ -96,6 +100,13 @@ struct ConversationView {
     const std::vector<ConversationImageKey>& images;
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;
+    // Opt-in export of exactly this token-zero cut. Private captures keep their
+    // existing rounded payloads. A draft row i consumes token i+1, so its claimed
+    // extent must be strictly below the cut; skipped rows before draft_begin and
+    // every inactive/page-padding byte are cleared before publication.
+    bool exact_cut = false;
+    int64_t draft_tokens = -1;
+    int64_t draft_begin = 0;
 };
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);

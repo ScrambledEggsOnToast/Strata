@@ -652,6 +652,7 @@ void check_stale_ready();
 void check_capacity_floor();
 void check_quota_credit();
 void check_stream_identity();
+void check_shared_scope_payload_separation();
 void check_corruption(bool truncate = false);
 void check_writer_workspace();
 void check_reuse_reservation();
@@ -814,6 +815,7 @@ int main() {
     check_inflight_object_lease();
     check_failed_write_charges_once();
     check_postcommit_reclamation_cannot_undo_commit();
+    check_shared_scope_payload_separation();
     std::printf("conversation_store_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 #endif
@@ -1115,6 +1117,59 @@ bool publish_and_wait(ConversationStore& store, const SavedConversation& image, 
     const bool settled = store.wait_publish(out, 5000);
     if (settled && !out.detail.empty()) std::fprintf(stderr, "Publication result: %s\n", out.detail.c_str());
     return settled;
+}
+
+void check_shared_scope_payload_separation() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    SavedConversation private_image = fixture(431, 64);
+    private_image.checkpoints.clear();
+    SavedConversation shared = private_image;
+    shared.scope = ConversationScope{bytes_from("explicit-shared-prefix")};
+    // Persist the exact-draft extent using the existing cells field, including
+    // after reopening. This fixture does not claim numerical runtime validity.
+    shared.kv.back().cells = int64_t(shared.live.ids.size()) - 1;
+    ConversationStorePublishResult first;
+    check(publish_and_wait(store, private_image, 8801, 1, first) &&
+          first.status == ConversationStorePublishStatus::stored, "a private record is stored before shared export");
+    const auto before = store.counters();
+    std::string why;
+    const ConversationStoreStreamId stream{0, uint16_t(ConversationStoreStreamKind::kv_k), 0, 0};
+    std::pair<Digest, uint64_t> private_identity, shared_identity;
+    check(identity_of(private_image, stream, private_identity, why) &&
+          identity_of(shared, stream, shared_identity, why) && private_identity != shared_identity,
+          "byte-identical private and shared K/V have scope-bound physical identities");
+    ConversationStorePublish request;
+    request.request_id = 8802;
+    request.generation = 2;
+    request.epoch = store.epoch();
+    request.reuse.push_back({first.head_id, stream, 0, 0, private_image.kv.front().k.size()});
+    check(store.publish(std::make_shared<SavedConversation>(shared), request, why) == kAccepted,
+          "a shared-scope export with an unauthorized private donor is admitted without adoption");
+    ConversationStorePublishResult second;
+    check(store.wait_publish(second, 5000) && second.status == ConversationStorePublishStatus::stored &&
+          second.reused_bytes == 0 && store.counters().objects == 2 * before.objects,
+          "cross-scope bytes are written separately rather than adopted or deduplicated");
+    const auto shared_query = query_of(shared, 8803, 3);
+    const auto private_query = query_of(private_image, 8804, 4);
+    const auto shared_matches = store.matches(shared_query.selector, shared_query.tokens, {});
+    const auto private_matches = store.matches(private_query.selector, private_query.tokens, {});
+    check(shared_matches.size() == 1 && shared_matches.front().head_id == second.head_id &&
+          private_matches.size() == 1 && private_matches.front().head_id == first.head_id,
+          "private and shared selectors cannot combine equal token histories");
+    auto foreign = shared_query;
+    foreign.selector.scope.value[0] ^= 0x80;
+    check(store.matches(foreign.selector, foreign.tokens, {}).empty(),
+          "a different credential-bound shared scope cannot discover an equal prefix");
+    store.close();
+    ConversationStore reopened(options_for(root.path, uint64_t(1) << 30, 0));
+    check(reopened.demand(shared_query, why), "the shared record is demandable after a clean restart");
+    ConversationStoreRead read;
+    check(reopened.wait_ready(8803, 3, read, 5000) && read.status == ConversationStoreReadStatus::ready &&
+          read.image && read.image->kv.back().cells == 63 && images_equal(*read.image, shared, why),
+          "the unchanged disk fields preserve the exact shorter draft claim and scoped payload");
+    read.image.reset();
+    reopened.release_read(8803, 3);
 }
 
 void check_read_object_boundaries() {

@@ -32,6 +32,8 @@ struct ResidentRequest {
     bool steering = true, images = false;
     double pcie_fraction = 0, spec_min_probability = 0;
     core::ConversationScope scope;
+    core::ConversationScope shared_scope;
+    int64_t pin = 0;
     bool checkpoint = true;
 };
 

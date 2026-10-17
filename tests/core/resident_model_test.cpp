@@ -340,6 +340,8 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         program::ResidentRequest request;
         request.max_new = 8;
         request.scope.value[0] = 1;
+        request.shared_scope.value[0] = 71;
+        request.pin = 2;
         request.sampling.seed = 0; // chosen seed must survive repeated yields
         request.sampling.penalty_last_n = 2;
         require(!owner.init_resources(error), "repeated init refuses");
@@ -395,6 +397,14 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
         altered_request.sampling.penalty_repeat += 0.1f;
         require(owner.begin(0, prompt, altered_request, error) && owner.working().request != aid &&
                 owner.working().resume_slot == -1, "different settings cannot claim parked identity");
+        altered_request = request;
+        altered_request.shared_scope.value[0] ^= 1;
+        require(owner.begin(0, prompt, altered_request, error) && owner.working().request != aid &&
+                owner.working().resume_slot == -1, "a changed shared authorization cannot claim a yielded identity");
+        altered_request = request;
+        ++altered_request.pin;
+        require(owner.begin(0, prompt, altered_request, error) && owner.working().request != aid &&
+                owner.working().resume_slot == -1, "a changed exact pin cut cannot claim a yielded identity");
         const std::vector<int64_t> other_prompt{11, 22, 33, 45};
         require(owner.begin(0, other_prompt, request, error) && owner.working().request != aid &&
                 owner.working().resume_slot == -1, "different full prompt cannot claim parked identity");

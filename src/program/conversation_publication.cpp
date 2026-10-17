@@ -10,10 +10,17 @@
 
 namespace strata::program {
 
+void ConversationPublicationOwner::borrow() {
+    ++generation;
+    lineage = {};
+    force_fresh = true;
+}
+
 void ConversationPublicationOwner::mount(uint64_t head, uint64_t epoch, const std::vector<int32_t>& whole_live,
                                          int64_t resume, const strata::core::ConversationScope& scope, bool cvec) {
     ++generation;
     lineage = {};
+    force_fresh = false;
     if (resume > 0 && (int64_t) whole_live.size() >= resume) {
         lineage.head = head;
         lineage.epoch = epoch;
@@ -79,7 +86,12 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
     }
     try {
         // Both containers may allocate. Do so before put may move the candidate or retire an old cache entry.
-        owner(entry.owner);
+        if (!entry.shared_prefix) owner(entry.owner);
+        if (entry.shared_prefix || owner(entry.owner).force_fresh) {
+            entry.continues = false;
+            entry.supersedes_hint = 0;
+            entry.reuse.clear();
+        }
         queued_.push_back(std::move(entry));
     } catch (const std::bad_alloc&) {
         refuse("queue metadata allocation failed; the captured image is still owned");
@@ -99,7 +111,11 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
         refuse("the protected image does not fit the bounded cache");
         return ordinary_park();
     }
-    owners_[size_t(queued_.back().owner)].generation = queued_.back().owner_generation;
+    if (!queued_.back().shared_prefix) {
+        auto& target = owners_[size_t(queued_.back().owner)];
+        target.generation = queued_.back().owner_generation;
+        target.force_fresh = false;
+    }
     out.queued = true;
     return out;
 }
@@ -153,7 +169,8 @@ bool ConversationPublicationQueue::covers(const ConversationPublicationCapture& 
     // predecessor as a retained branch whenever that proof does not hold.  A capture whose owner lineage has moved
     // on - or whose own hint was retired with the head it named - makes no claim at all and is published as the
     // branch it is.
-    if (!(entry.continues && owner.generation == entry.owner_generation && lineage.valid &&
+    if (!(entry.continues && !entry.shared_prefix && !owner.force_fresh &&
+          owner.generation == entry.owner_generation && lineage.valid &&
           entry.supersedes_hint != 0 && lineage.head == entry.supersedes_hint &&
           lineage.epoch == entry.capture_epoch && lineage.scope.matches(entry.scope) && lineage.cvec == entry.cvec &&
           lineage.live.size() <= entry.live.size() &&
@@ -191,6 +208,30 @@ std::shared_ptr<const strata::core::SavedConversation> ConversationPublicationQu
     return std::make_shared<strata::core::SavedConversation>(std::move(published));
 }
 
+std::shared_ptr<const strata::core::SavedConversation> ConversationPublicationQueue::unpinned_shared_cut(
+    const std::shared_ptr<const strata::core::SavedConversation>& image) {
+    if (!image) return {};
+    strata::core::SavedConversation published = image->frozen_alias();
+    const auto clear_pins = [](auto& stage) {
+        stage.live.pinned = false;
+        for (auto& cut : stage.checkpoints) cut.pinned = false;
+    };
+    clear_pins(published);
+    for (auto& stage : published.stage_images) clear_pins(stage);
+    return std::make_shared<strata::core::SavedConversation>(std::move(published));
+}
+
+bool ConversationPublicationQueue::shared_prefix_exists(strata::core::ConversationStore& store,
+    const strata::core::ConversationStoreSelector& selector, const std::vector<int32_t>& prompt,
+    int64_t tokens, uint32_t stages) {
+    if (!selector.scope.valid() || tokens <= 0 || tokens >= int64_t(prompt.size())) return false;
+    bool exists = false;
+    store.for_each_match(selector, prompt, {}, [&](const strata::core::ConversationStoreMatch& match) {
+        if (match.stages == stages && match.tokens >= tokens) exists = true;
+    });
+    return exists;
+}
+
 size_t ConversationPublicationQueue::retire(uint64_t retired_head) {
     if (retired_head == 0) return 0;
     size_t references = 0;
@@ -211,8 +252,9 @@ bool ConversationPublicationQueue::adopt(const ConversationPublicationPending& p
                                         const strata::core::ConversationStorePublishResult& result) {
     // A one-shot borrow published as a fresh branch never becomes the owner's lineage, and a completion that arrives
     // after its owner's generation moved on describes a state the owner no longer runs.
+    if (pending.shared_prefix || !pending.continues) return false;
     ConversationPublicationOwner& target = owner(pending.owner);
-    if (!pending.continues || target.generation != pending.owner_generation) return false;
+    if (target.force_fresh || target.generation != pending.owner_generation) return false;
     target.lineage.head = result.head_id;
     target.lineage.epoch = result.epoch;
     target.lineage.live = pending.live;
@@ -316,13 +358,32 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
                 }
                 entry.lease_bytes = entry.image->bytes();
             }
+            if (entry.shared_prefix) {
+                strata::core::ConversationStoreSelector selector;
+                selector.scope = entry.scope;
+                selector.cvec = entry.cvec;
+                selector.geometry = entry.image->geometry;
+                selector.layer_lo = entry.image->layer_lo;
+                selector.layer_hi = entry.image->layer_hi;
+                // The selector requires a cut strictly shorter than the demand.
+                // This sentinel is metadata only, never part of the captured cut.
+                auto prompt = entry.live;
+                prompt.push_back(0);
+                if (shared_prefix_exists(store, selector, prompt, int64_t(entry.live.size()),
+                                         uint32_t(entry.image->stage_images.size() + 1))) {
+                    drop(0, "an equal or longer exact shared prefix is already stored", sink);
+                    continue;
+                }
+            }
             strata::core::ConversationStorePublish publish;
             publish.request_id = publication_id;
             publish.generation = publication_id;
             publish.epoch = entry.capture_epoch;
             publish.external_lease_bytes = entry.lease_bytes;
-            publish.reuse = entry.reuse;
-            covers(entry, owner(entry.owner), publish);
+            if (!entry.shared_prefix) {
+                publish.reuse = entry.reuse;
+                covers(entry, owner(entry.owner), publish);
+            }
             ConversationPublicationPending pending;
             pending.request_id = publish.request_id;
             pending.generation = publish.generation;
@@ -331,6 +392,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             pending.owner_generation = entry.owner_generation;
             pending.capture_epoch = entry.capture_epoch;
             pending.continues = entry.continues;
+            pending.shared_prefix = entry.shared_prefix;
             pending.scope = entry.scope;
             pending.cvec = entry.cvec;
             pending.live = entry.live;
@@ -339,8 +401,9 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             pending_.push_back(std::move(pending));
             // Keep the original head image throughout refusal, deferral and allocation failure. A fresh branch's
             // extra root-cut promise is offered through a metadata alias, never by mutating the retry image.
-            const std::shared_ptr<const strata::core::SavedConversation> offered =
-                pins_live_cut(publish) ? pinned_live_cut(entry.image) : entry.image;
+            const std::shared_ptr<const strata::core::SavedConversation> offered = entry.shared_prefix
+                ? unpinned_shared_cut(entry.image)
+                : pins_live_cut(publish) ? pinned_live_cut(entry.image) : entry.image;
             admission = store.publish(offered, publish, why);
         } catch (const std::bad_alloc&) {
             if (pending_.size() != pending_before) pending_.pop_back();

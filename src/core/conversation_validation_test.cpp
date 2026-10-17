@@ -53,14 +53,21 @@ struct Pools {
     Pools(const ModelGeometry& g, int format) {
         st.max_cells = 96; st.n_pages = st.n_slots = 24; st.idx_pooled_rows = 26;
         st.kv_int8 = format == 1; st.kv_q4 = format == 2;
+        st.kv_hybrid = format == 3;
         const size_t per = format == 2 ? strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                                      : g.head_dim * (format == 1 ? 1 : 2);
-        data[0].resize(96 * g.n_head_kv * per, 0xa5); data[1] = data[0];
-        data[2].resize(format == 1 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5); data[3] = data[2];
+                                      : g.head_dim * (format == 1 || format == 3 ? 1 : 2);
+        data[0].resize(96 * g.n_head_kv * per, 0xa5);
+        data[1].resize(format == 3 ? 96 * g.n_head_kv *
+                       strata::kernels::kv_q4_bytes_per_head((int) g.head_dim) : data[0].size(), 0xa5);
+        data[2].resize(format == 1 || format == 3 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5);
+        if (format == 1) data[3] = data[2];
         data[4].resize(26 * g.idx_key_dim * 4, 0xa5);
         data[5].resize(3 * g.idx_key_dim * 4, 0xa5);
         data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].resize(4, 0xa5);
-        if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
+        if (format == 3) {
+            st.k_q = (int8_t*) data[0].data(); st.v_q4 = data[1].data();
+            st.k_scale = (uint16_t*) data[2].data();
+        } else if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
         else if (format == 1) {
             st.k_q = (int8_t*) data[0].data(); st.v_q = (int8_t*) data[1].data();
             st.k_scale = (uint16_t*) data[2].data(); st.v_scale = (uint16_t*) data[3].data();
@@ -461,6 +468,141 @@ void checkpoint_payload_stages() {
           "a real three-stage capture allocates exactly the priced stage payloads");
 #endif
 }
+#if defined(CONVERSATION_TEST_TRANSFERS)
+void exact_shared_cut(int format, int64_t cut) {
+    ModelGeometry g;
+    g.n_layers = 4; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 2; g.head_dim = 64; g.idx_key_dim = 8;
+    Pools main(g, format), draft(g, format == 3 ? 1 : format);
+    ConversationStateSizes z;
+    std::string error;
+    check(conversation_state_sizes(g, z, error), "exact cut fixture prices running state");
+    std::vector<uint8_t> gdn(z.gdn, 0x45), ple(z.ple, 0x46);
+    SessionState ss;
+    ss.max_cells = 96; ss.layer_hi = g.n_layers; ss.gdn_alloc = g.n_gdn_layers(); ss.qsa_alloc = 1;
+    ss.gdn_state = reinterpret_cast<float*>(gdn.data());
+    ss.ple_hist = reinterpret_cast<float*>(ple.data());
+    ss.qsa_states = &main.st;
+    std::vector<int32_t> ids(size_t(cut), 11);
+    const std::vector<ConversationImageKey> no_images;
+    const std::vector<ConversationCheckpoint> no_checks;
+    const int64_t begin = std::min<int64_t>(1, cut - 1);
+    ConversationView exact{ids, no_images, no_checks, true, true, cut - 1, begin};
+    size_t estimate = 0;
+    copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
+    auto invalid = exact;
+    invalid.draft_tokens = cut + 1;
+    check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error) &&
+          copy_calls == 0 && sync_calls == 0, "draft extent beyond an exact cut is refused before device access");
+    invalid.draft_tokens = cut;
+    check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error),
+          "the draft row consuming the first private suffix token cannot be claimed");
+    SavedConversation unsafe_meta;
+    std::vector<SessionKvSource> unsafe_sources;
+    check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, draft.st, error) &&
+          copy_calls == 0 && sync_calls == 0, "streamed exports cannot bypass exact-cut sanitization");
+    SavedConversation first, second, ordinary;
+    check(conversation_snapshot_save(first, exact, ss, g, &draft.st, error),
+          "capture an exact shared cut with poisoned inactive storage");
+    check(first.live.ids == ids && first.checkpoints.empty() && first.kv.back().cells == cut - 1 &&
+          first.live.gdn == gdn && first.live.ple == ple,
+          "exact capture keeps recurrent/PLE state at N and explicitly records draft extent N-1");
+    const int64_t rounded = (cut + 3) / 4 * 4;
+    const auto rows_equal = [&](const ConversationKv& kv, int64_t lo, int64_t hi) {
+        for (const auto* part : {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale}) {
+            if (part->empty()) continue;
+            const size_t width = part->size() / size_t(rounded * g.n_head_kv);
+            for (int64_t cell = 0; cell < rounded; ++cell) for (int64_t head = 0; head < g.n_head_kv; ++head) {
+                const size_t at = size_t((cell / 4 * g.n_head_kv + head) * 4 + cell % 4) * width;
+                const uint8_t want = cell >= lo && cell < hi ? 0xa5 : 0;
+                bool equal = true;
+                part->visit(at, width, [&](const uint8_t* p, size_t n, size_t) {
+                    equal = std::all_of(p, p + n, [&](uint8_t byte) { return byte == want; });
+                    return true;
+                });
+                if (!equal) return false;
+            }
+        }
+        return true;
+    };
+    check(rows_equal(first.kv.front(), 0, cut) && rows_equal(first.kv.back(), begin, cut - 1),
+          "all heads, formats, scale runs, skipped draft cells and page tails obey the exact cut");
+    const size_t active_tail = size_t(cut % 4) * size_t(g.idx_key_dim) * 4;
+    check(std::all_of(first.live.tails.begin() + active_tail, first.live.tails.end(),
+                      [](uint8_t b) { return b == 0; }) &&
+          std::all_of(first.live.block_pos.begin(), first.live.block_pos.end(), [](uint8_t b) { return b == 0; }),
+          "inactive indexer tails and position scratch cannot retain another conversation");
+
+    const auto poison_rows = [&](Pools& pools, int64_t lo, int64_t hi) {
+        for (size_t part = 0; part < 4; ++part) {
+            auto& bytes = pools.data[part];
+            if (bytes.empty()) continue;
+            const size_t width = bytes.size() / size_t(96 * g.n_head_kv);
+            for (int64_t cell = 0; cell < 96; ++cell) if (cell < lo || cell >= hi)
+                for (int64_t head = 0; head < g.n_head_kv; ++head) {
+                    const size_t at = size_t((cell / 4 * g.n_head_kv + head) * 4 + cell % 4) * width;
+                    std::fill(bytes.begin() + at, bytes.begin() + at + width, 0x9b);
+                }
+        }
+    };
+    poison_rows(main, 0, cut);
+    poison_rows(draft, begin, cut - 1);
+    std::fill(main.data[5].begin() + active_tail, main.data[5].end(), 0x9b);
+    std::fill(main.data[7].begin(), main.data[7].end(), 0x9b);
+    const size_t spare = size_t(cut / 4) * size_t(g.idx_key_dim) * 4;
+    std::fill(main.data[4].begin() + spare, main.data[4].end(), 0x9b);
+    check(conversation_snapshot_save(second, exact, ss, g, &draft.st, error),
+          "recapture the same exact prefix after poisoning private suffix and inactive bytes differently");
+    bool same = first.live.gdn == second.live.gdn && first.live.ple == second.live.ple &&
+                first.live.tails == second.live.tails && first.live.dead == second.live.dead &&
+                first.live.block_pos == second.live.block_pos;
+    for (size_t layer = 0; layer < first.kv.size(); ++layer) {
+        const auto& a = first.kv[layer]; const auto& b = second.kv[layer];
+        same = same && a.k == b.k && a.v == b.v && a.k_scale == b.k_scale &&
+               a.v_scale == b.v_scale && a.pooled == b.pooled;
+    }
+    check(same, "poisoned post-cut storage cannot influence any published shared payload byte");
+    auto corrupt = second;
+    corrupt.kv.back().k.visit(corrupt.kv.back().k.size() - 1, 1,
+        [](uint8_t* p, size_t, size_t) { *p = 0xee; return true; });
+    copy_calls = sync_calls = 0;
+    check(!conversation_snapshot_validate(corrupt, ss, g, &draft.st, error) &&
+          copy_calls == 0 && sync_calls == 0, "restore rejects a shorter draft claim that conceals nonzero post-cut bytes");
+    for (auto& bytes : draft.data) std::fill(bytes.begin(), bytes.end(), 0xee);
+    check(conversation_snapshot_restore(second, ss, g, &draft.st, error) == ConversationRestore::restored,
+          "restore understands the intentionally shorter draft extent");
+    uint64_t fingerprint = 0;
+    check(conversation_kv_verify(second.kv.back(), draft.st, g, cut, false, fingerprint, error),
+          "restore overwrites the excluded draft row and page tail with zeros instead of reviving old suffix state");
+    const ConversationView private_view{ids, no_images, no_checks, true};
+    check(conversation_snapshot_save(ordinary, private_view, ss, g, &draft.st, error) &&
+          ordinary.kv.back().cells == rounded, "post-shared private captures preserve the ordinary rounded-cell contract");
+    if (format == 0 && cut == 5) {
+        auto unused = ss;
+        unused.layer_hi = 2; unused.gdn_alloc = 2; // allocated QSA primary lends only RoPE
+        const ConversationView cut_view{ids, no_images, no_checks, true, true};
+        SavedConversation stage;
+        check(conversation_snapshot_save(stage, cut_view, unused, g, nullptr, error),
+              "capture a carved stage whose primary QSA owns no attention layer");
+        const auto zeros = [](const auto& bytes) {
+            return std::all_of(bytes.begin(), bytes.end(), [](uint8_t b) { return b == 0; });
+        };
+        const auto zero_buffer = [](const ConversationBuffer& bytes) {
+            return bytes.visit(0, bytes.size(), [](const uint8_t* p, size_t n, size_t) {
+                return std::all_of(p, p + n, [](uint8_t b) { return b == 0; });
+            });
+        };
+        check(zero_buffer(stage.kv.front().k) && zero_buffer(stage.kv.front().v) && zero_buffer(stage.kv.front().pooled) &&
+              zeros(stage.live.tails) && zeros(stage.live.dead),
+              "inactive primary QSA payload and index state cannot carry bytes from another owner");
+        unused = ss;
+        unused.layer_lo = 2; unused.gdn_ord0 = 2; unused.gdn_alloc = 1;
+        check(conversation_snapshot_save(stage, cut_view, unused, g, nullptr, error) && zeros(stage.live.ple),
+              "PLE history on a stage that never runs the first layer is excluded");
+    }
+}
+#endif
+
 }
 
 int main() {
@@ -469,6 +611,7 @@ int main() {
     checkpoint_payload_stages();
 #if defined(CONVERSATION_TEST_TRANSFERS)
     for (int format : {0,1,2}) ring_refusal(format);
+    for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9}) exact_shared_cut(format, cut);
 #endif
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

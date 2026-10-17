@@ -1387,6 +1387,34 @@ int main() {
               "a priced stored candidate competes in the existing cost policy like any other source");
     }
     {
+        ConversationScope scope{{7}}, parsed;
+        const std::string lower(64, 'a'), upper(64, 'A'), zero(64, '0');
+        check(conversation_shared_scope_parse(lower, parsed) && parsed.valid(),
+              "native shared scope accepts an exact lowercase authorization digest");
+        const auto prior = parsed;
+        check(!conversation_shared_scope_parse(upper, parsed) &&
+              !conversation_shared_scope_parse(zero, parsed) &&
+              !conversation_shared_scope_parse(lower + "0", parsed) && parsed == prior,
+              "invalid shared scope is refused atomically without changing the accepted scope");
+        for (bool measured : {false, true}) for (size_t private_source = 0; private_source < 5; ++private_source) {
+            strata::program::PrefixChoice choice(measured);
+            // Each private class is enumerated before the shared store candidate:
+            // live, checkpoint, resident, parked and private persistent store.
+            choice.consider(private_source, 512, 7.0);
+            choice.consider(5, 512, std::nullopt);
+            check(choice.selected() == private_source, "every equal-length private source beats the shared store");
+            choice.consider(6, 1024, std::nullopt);
+            check(choice.selected() == 6, "a strictly longer authorized shared cut remains eligible");
+        }
+        ConversationCache cache(1u << 20, 2);
+        auto shared = image({1, 2, 3});
+        shared.scope = scope;
+        check(cache.put(std::move(shared)), "the shared RAM publication owner is retained separately");
+        check(cache.best(std::vector<int32_t>{1,2,3,4}, {}, true, test_scope).tokens == 0 &&
+              cache.best(std::vector<int32_t>{1,2,3,4}, {}, true, scope).tokens == 3,
+              "shared publication payload cannot become an implicit private RAM source");
+    }
+    {
         // The reuse intervals a capture may offer: each one names the donor head the retained bytes came from, ends on
         // that donor's own object grid, and claims nothing the capture did not keep.  The store re-validates all of it;
         // this is the caller-side half of the proof.

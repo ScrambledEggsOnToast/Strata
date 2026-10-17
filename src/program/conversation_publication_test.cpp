@@ -950,6 +950,134 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
     check_record_restores(reopened, record, 312, true);
 }
 
+void check_shared_borrow_and_owner_neutral_publication() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    SavedConversation private_image = stored_record(201, 64);
+    check(capture_image(publications, sink, 0, 1, 0, true, private_image, store.epoch()),
+          "the private predecessor is captured before shared publication");
+    settle(publications, store, sink);
+    const auto private_owner = publications.owner(0);
+    const uint64_t private_head = private_owner.lineage.head;
+    check(private_head != 0, "the private predecessor establishes its own lineage");
+
+    SavedConversation shared = private_image;
+    shared.scope.value[0] ^= 0x80;
+    shared.checkpoints.clear();
+    shared.live.pinned = true; // local retention must not pin the persistent shared head
+    const auto enqueue_shared = [&](uint64_t owner) {
+        SavedConversation image = shared;
+        auto entry = capture_of(owner, 9999, private_head, true, image, store.epoch(), ++sink.next_ticket);
+        entry.shared_prefix = true;
+        entry.reuse.push_back({private_head, {0, uint16_t(ConversationStoreStreamKind::kv_k), 0, 0}, 0, 0, 64});
+        return publications.capture(sink.cache, std::move(image), std::move(entry),
+                                    size_t(store.ram_held_bytes()), 0, sink.out);
+    };
+    check(enqueue_shared(UINT64_MAX).queued, "a shared capture needs no physical owner slot");
+    check(publications.owners().size() == 1 && publications.owner(0).generation == private_owner.generation &&
+          publications.owner(0).lineage.head == private_head,
+          "shared capture neither allocates an owner nor invalidates an unrelated private completion");
+    check(!publications.queued().front().continues && !publications.queued().front().supersedes_hint &&
+          publications.queued().front().reuse.empty(), "shared metadata cannot combine private donor lineage");
+    check(enqueue_shared(0).queued, "a duplicate may wait before the first shared capture has committed");
+    sink.refresh_allowance();
+    settle(publications, store, sink);
+    check(!publications.holds_work() && store.counters().published == 2 && store.counters().heads == 2,
+          "the handoff publishes only one shared head and suppresses the queued duplicate");
+    check(publications.owner(0).generation == private_owner.generation &&
+          publications.owner(0).lineage.head == private_head, "shared completion is owner-neutral too");
+    auto query = query_of(shared, 1001, 17);
+    const auto matches = store.matches(query.selector, query.tokens, {});
+    check(matches.size() == 1 && !matches.front().pinned && matches.front().live,
+          "local checkpoint pinning never pins the persistent shared head");
+    const uint64_t shared_head = matches.empty() ? 0 : matches.front().head_id;
+    check(ConversationPublicationQueue::shared_prefix_exists(store, query.selector, query.tokens, 64, 1),
+          "an exact shared selector suppresses duplicate capture without a payload read");
+    auto changed = query;
+    changed.tokens[5] ^= 1;
+    check(!ConversationPublicationQueue::shared_prefix_exists(store, changed.selector, changed.tokens, 64, 1),
+          "token divergence cannot suppress a different prefix");
+    changed = query;
+    changed.selector.scope.value[1] ^= 0x40;
+    check(!ConversationPublicationQueue::shared_prefix_exists(store, changed.selector, changed.tokens, 64, 1),
+          "another shared authorization cannot observe the stored selector");
+    changed = query;
+    changed.selector = query_of(private_image, 1002, 18).selector;
+    const auto private_matches = store.matches(changed.selector, changed.tokens, {});
+    check(!private_matches.empty() && private_matches.front().head_id == private_head,
+          "the private selector stays independent of the equal shared record");
+
+    std::string why;
+    check(store.demand(query, why), "shared demand is admitted with its own IDs and no preceding offer");
+    ConversationStoreRead read;
+    check(store.wait_ready(1001, 17, read, 5000) && read.status == ConversationStoreReadStatus::ready &&
+          read.image && read.head_id == shared_head, "direct shared demand restores its exact record");
+    check(read.image && !read.image->live.pinned && read.image->checkpoints.empty(),
+          "the restored shared record carries no private checkpoints or pin promise");
+    read.image.reset();
+    store.release_read(1001, 17);
+
+    publications.owner(0).borrow();
+    check(!publications.owner(0).lineage.valid && publications.owner(0).force_fresh,
+          "shared borrowing forgets private ancestry and owes a fresh one-shot publication");
+    ConversationPublicationPending old;
+    old.owner = 0;
+    old.owner_generation = private_owner.generation;
+    old.scope = private_image.scope;
+    old.live = private_image.live.ids;
+    ConversationStorePublishResult old_result;
+    old_result.status = ConversationStorePublishStatus::stored;
+    old_result.head_id = private_head;
+    old_result.epoch = store.epoch();
+    check(!publications.adopt(old, old_result) && !publications.owner(0).lineage.valid,
+          "a pre-borrow completion cannot reattach private lineage");
+    SavedConversation after = turn_on(private_image, 80, 203);
+    auto after_entry = capture_of(0, publications.owner(0).generation + 1, private_head, true,
+                                  after, store.epoch(), ++sink.next_ticket);
+    after_entry.reuse.push_back({private_head, {0, uint16_t(ConversationStoreStreamKind::kv_k), 0, 0}, 0, 0, 64});
+    check(publications.capture(sink.cache, std::move(after), std::move(after_entry),
+                               size_t(store.ram_held_bytes()), 0, sink.out).queued,
+          "the post-shared private state is captured even with a stale private donor hint");
+    sink.refresh_allowance();
+    check(!publications.queued().front().continues && !publications.queued().front().supersedes_hint &&
+          publications.queued().front().reuse.empty(), "the next private publication is fresh, one-shot and donor-free");
+    settle(publications, store, sink);
+    check(!publications.owner(0).lineage.valid && !publications.owner(0).force_fresh,
+          "the one-shot private result never adopts a lineage and settles its fresh-publication obligation");
+    ConversationStoreManifestInfo info;
+    check(store.manifest_info(private_head, info) && store.manifest_info(shared_head, info) &&
+          store.counters().replaced == 0, "post-shared private publication supersedes neither private nor shared donors");
+}
+
+void check_shared_head_is_evictable() {
+    TempRoot root;
+    auto options = options_for(root.path);
+    options.head_limit = 1;
+    ConversationStore store(options);
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    SavedConversation shared = stored_record(211, 64);
+    shared.checkpoints.clear();
+    shared.live.pinned = true;
+    auto entry = capture_of(UINT64_MAX, 1, 0, true, shared, store.epoch(), ++sink.next_ticket);
+    entry.shared_prefix = true;
+    check(publications.capture(sink.cache, std::move(shared), std::move(entry),
+                               size_t(store.ram_held_bytes()), 0, sink.out).queued,
+          "an explicitly locally pinned shared cut is captured at the head ceiling");
+    sink.refresh_allowance();
+    settle(publications, store, sink);
+    check(store.counters().heads == 1 && store.counters().pinned_heads == 0,
+          "shared publication leaves its persistent head unpinned");
+    const SavedConversation private_image = stored_record(213, 64);
+    check(capture_image(publications, sink, 0, 1, 0, true, private_image, store.epoch()),
+          "a private publication is admitted behind the shared head");
+    settle(publications, store, sink);
+    check(store.counters().heads == 1 && store.counters().evictions == 1 && publications.owner(0).lineage.valid,
+          "real head pressure evicts the shared head rather than pinning capacity forever");
+}
+
 } // namespace
 
 int main() {
@@ -973,6 +1101,8 @@ int main() {
     check_capture_refusal_is_atomic();
     check_optional_retention_failure_preserves_publication();
     check_bounded_capture_persists_the_newest_all_stage_frontier();
+    check_shared_borrow_and_owner_neutral_publication();
+    check_shared_head_is_evictable();
     std::fprintf(stderr, "conversation_publication_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
