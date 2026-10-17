@@ -3225,6 +3225,8 @@ text-only requests. Startup prices and owns each stage's existing arena before g
 there is no borrowed-arena rebind, second prefill arena, working-session copy or fallback that advertises
 support without executing this path. Unsupported compositions refuse before `READY`. Leaving the variable
 unset, or setting it to anything other than exactly `1`, retains the existing GEN/BGEN path.
+The unset pipeline-window option remains automatic and resolves to off for resident slots; it is not an
+enabled pipeline composition. Explicit positive `--pipeline-windows` remains incompatible.
 
 An eligible engine announces `INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4`.
 The frontend then submits each ready request immediately as `BGENQ1`: it never waits to fill a cohort.

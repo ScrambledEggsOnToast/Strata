@@ -2933,7 +2933,7 @@ int main(int argc, char** argv) {
         ? size_t(4) * (size_t(std::max<int64_t>(o.max_context, 1)) * 11 + 4096) + 16 : 0;
     if (packed_prefill && (!o.serve || o.batch < 1 || o.batch > 4 || o.mtp.empty() ||
         o.spec < 2 || o.prefill_chunk != 2048 || o.prefill_auto || o.vision || o.kv_grow ||
-        o.vram_elastic || o.pipeline_windows || o.judge_context || o.adapt_async ||
+        o.vram_elastic || o.pipeline_windows > 0 || o.judge_context || o.adapt_async ||
         o.adapt_swaps != 0 || o.peer_device >= 0 || o.prefill_helpers || o.spec_split)) {
         std::fprintf(stderr, "strata packed prefill: requires --serve, 1..4 resident slots, MTP/spec, "
                              "fixed 2048 scratch and static text-only owners; no elastic/adaptive/helper/judge composition\n");
