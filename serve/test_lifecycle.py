@@ -238,6 +238,193 @@ class RequestAdmission(unittest.TestCase):
         tok = ByteTokenizer()
         return Service(MockEngine(tok, "ok"), tok, None)
 
+    def test_frontend_partition_survives_trace_overflow_and_cancelled_reacquisition(self):
+        svc = self.service()
+        clock = [100.0]
+        with mock.patch("serve.server.time.perf_counter", side_effect=lambda: clock[0]):
+            record = svc.register_lifecycle({"strata_priority": "background"}, threading.Event())
+            clock[0] += 2
+            svc.acquire_request(record)
+            self.assertEqual(record["admission_wait_s"], 2)
+            clock[0] += 3
+            for _ in range(140):
+                svc.frontend_phase(record, "control_selector_wait")
+                svc.lifecycle_note(record, "engine_wait")
+                clock[0] += 1
+                svc.frontend_phase(record, "physical_slot_wait")
+                clock[0] += 2
+                svc.frontend_phase(record, "control_occupied_wait")
+                clock[0] += 3
+                svc.native_submitted(record, 0)
+                svc.lifecycle_note(record, "prefill")
+                clock[0] += 4
+            svc.frontend_phase(record, "control_selector_wait")
+            clock[0] += 5
+            record["cancel_reason"] = "cancelled"
+            svc.finish_lifecycle(record)
+        seconds, counts = record["frontend"]["seconds"], record["frontend"]["counts"]
+        self.assertEqual(seconds["admission_wait"], 2)
+        self.assertEqual(seconds["preparation"], 3)
+        self.assertEqual(seconds["control_selector_wait"], 145)
+        self.assertEqual(seconds["physical_slot_wait"], 280)
+        self.assertEqual(seconds["control_occupied_wait"], 420)
+        self.assertEqual(seconds["native_active"], 560)
+        self.assertEqual(counts["control_selector_wait"], 141)
+        self.assertEqual(sum(seconds.values()), record["completion_s"])
+        self.assertEqual(record["finished_monotonic_s"], clock[0])
+        self.assertIsNone(record["_frontend_phase"])
+        self.assertEqual(record["state"], "cancelled")
+        self.assertEqual(len(record["events"]), 128)
+        self.assertGreater(record["events_dropped"], 128)
+        self.assertEqual(len(record["native_submissions"]), 128)
+        self.assertEqual(record["native_submissions_dropped"], 12)
+        self.assertEqual(record["last_native_submission"]["submission_sequence"], 140)
+        totals = svc.frontend_totals["background"]["cancelled"]
+        self.assertEqual(totals["seconds"], seconds)
+        self.assertEqual(totals["requests"], 1)
+        with svc.status_lock:
+            svc._finish_frontend(record, clock[0] + 100)
+        self.assertEqual(totals["requests"], 1)
+
+    def test_cleanup_and_first_observations_are_independent_of_native_timings(self):
+        svc = self.service()
+        clock = [10.0]
+        with mock.patch("serve.server.time.perf_counter", side_effect=lambda: clock[0]):
+            record = svc.register_lifecycle({}, threading.Event())
+            svc.acquire_request(record)
+            clock[0] = 11
+            svc.frontend_phase(record, "native_active")
+            record["first_token_s"], record["first_content_s"] = 1.5, 2.0
+            clock[0] = 14
+            svc.frontend_phase(record, "cleanup")
+            clock[0] = 16
+            svc.finish_lifecycle(record)
+        self.assertEqual(record["frontend"]["seconds"]["cleanup"], 2)
+        self.assertEqual(record["frontend"]["seconds"]["native_active"], 3)
+        self.assertEqual(sum(record["frontend"]["seconds"].values()), 6)
+        totals = svc.frontend_totals["foreground"]["completed"]
+        self.assertEqual((totals["first_token_s"], totals["first_content_s"]), (1.5, 2.0))
+        self.assertEqual((totals["first_token_count"], totals["first_content_count"]), (1, 1))
+
+    def test_registration_refusals_close_after_http_response_and_emit_once(self):
+        import contextlib
+        for shutdown in (False, True):
+            with self.subTest(shutdown=shutdown):
+                tok = ByteTokenizer()
+                svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+                svc.request_queue_limit = 0
+                if not shutdown:
+                    svc.register_lifecycle({}, threading.Event())
+                svc.shutting_down = shutdown
+                http = serve(svc, "127.0.0.1", 0)
+                finished = threading.Event()
+                emit = svc._emit_attribution
+                def finalize(*args):
+                    try:
+                        emit(*args)
+                    finally:
+                        finished.set()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()) as log, \
+                            mock.patch.object(svc, "_emit_attribution", side_effect=finalize):
+                        request = urllib.request.Request(
+                            f"http://127.0.0.1:{http.server_port}/v1/chat/completions",
+                            json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                                        "strata_priority": "background", "max_tokens": 1}).encode(),
+                            {"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as refused:
+                            urllib.request.urlopen(request, timeout=2)
+                        body = refused.exception.read()
+                        refused.exception.close()
+                        self.assertEqual(refused.exception.code, 503 if shutdown else 429, body)
+                        self.assertTrue(finished.wait(2))
+                        rejected = svc.lifecycles[-1]
+                        self.assertEqual(refused.exception.headers["X-Strata-Request-Id"], rejected["id"])
+                        svc._emit_attribution(rejected, "/v1/chat/completions")
+                    records = [json.loads(line.split("response_attribution: ", 1)[1])
+                               for line in log.getvalue().splitlines() if "response_attribution: " in line]
+                    self.assertEqual(len(records), 1)
+                    attribution = records[0]
+                    self.assertEqual(attribution["request_id"], rejected["id"])
+                    self.assertEqual(attribution["priority"], "background")
+                    self.assertEqual(attribution["outcome"], "rejected")
+                    self.assertEqual(attribution["rejection_reason"], "shutdown" if shutdown else "queue_full")
+                    self.assertEqual((attribution["legs"], attribution["native_submission_count"]), ([], 0))
+                    self.assertIsNone(attribution["committed_tokens"])
+                    self.assertAlmostEqual(sum(attribution["frontend"]["seconds"].values()),
+                                           attribution["interval"]["duration_s"])
+                    self.assertEqual(svc.frontend_totals["background"]["rejected"]["requests"], 1)
+                finally:
+                    http.shutdown()
+                    http.server_close()
+
+    def test_real_control_reacquisitions_and_cancelled_wait_close_the_open_phase(self):
+        engine = StrataEngine("missing-executable", [], lazy=True)
+        engine.alive = lambda: True
+        tok = ByteTokenizer()
+        svc = Service(engine, tok, None)
+        clock = [100.0]
+        cancel = threading.Event()
+        def consume(turn):
+            while True:
+                try:
+                    next(turn)
+                except StopIteration as done:
+                    return done.value
+        with mock.patch("serve.server.time.perf_counter", side_effect=lambda: clock[0]):
+            record = svc.register_lifecycle({}, cancel)
+            svc.acquire_request(record)
+            for _ in range(2):
+                self.assertTrue(consume(engine._take_control(cancel, 1,
+                    on_phase=lambda phase: svc.frontend_phase(record, phase))))
+                svc.native_submitted(record)
+                clock[0] += 1
+                engine._release_control()
+            engine.ctl.acquire()
+            def cancel_wait(timeout=None):
+                clock[0] += 4
+                cancel.set()
+            with mock.patch.object(engine.slot_cv, "wait", side_effect=cancel_wait):
+                self.assertFalse(consume(engine._take_control(cancel, 1,
+                    on_phase=lambda phase: svc.frontend_phase(record, phase))))
+            record["cancel_reason"] = "cancelled"
+            svc.finish_lifecycle(record)
+            engine.ctl.release()
+        self.assertEqual(record["frontend"]["seconds"]["native_active"], 2)
+        self.assertEqual(record["frontend"]["seconds"]["control_occupied_wait"], 4)
+        self.assertEqual(record["completion_s"], 6)
+        self.assertIsNone(record["_frontend_phase"])
+        self.assertEqual(engine.waiting, 0)
+
+    def test_drained_foreground_releases_native_deferral_but_not_http_admission(self):
+        engine = StrataEngine("missing-executable", [], lazy=True)
+        engine.alive = lambda: True
+        engine.batch, engine.foreground_budget_s = 4, 1
+        svc = Service(engine, ByteTokenizer(), None)
+        foreground = svc.register_lifecycle({}, threading.Event())
+        svc.acquire_request(foreground)
+        def background_can_take_control():
+            cancel = threading.Event()
+            with mock.patch.object(engine.slot_cv, "wait", side_effect=lambda timeout=None: cancel.set()):
+                turn = engine._take_control(cancel, 1, priority="background",
+                                            background_due=time.monotonic() + 10,
+                                            foreground_pending=lambda: svc._foreground_pending)
+                with self.assertRaises(StopIteration) as finished:
+                    next(turn)
+            if finished.exception.value:
+                engine._release_control()
+            return finished.exception.value
+        try:
+            for state, expected in (("preparing", False), ("drained", True),
+                                    ("preparing", False), ("error", True)):
+                with self.subTest(state=state):
+                    svc.lifecycle_note(foreground, state, _executing=False,
+                                       error="failed" if state == "error" else None)
+                    self.assertEqual(background_can_take_control(), expected)
+                    self.assertIn(foreground["id"], svc.admission_active)
+        finally:
+            svc.finish_lifecycle(foreground)
+
     def test_priority_fairness_bounds_foreground_bypass(self):
         svc = self.service()
         records = []

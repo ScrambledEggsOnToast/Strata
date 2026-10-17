@@ -1099,6 +1099,15 @@ public:
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
     void close();
 
+    /// Terminally release ONLY this instance's owned ring, retaining source files, reader pools, layout,
+    /// model_inputs() and accumulated counters for reporting. Before calling, the owner MUST prove no escaped
+    /// blob pointer has a remaining reader, quiesce all GPU/startup work using it, and exclude future source
+    /// use. The mutex waits for synchronous direct reads, NOT escaped CPU/GPU readers or inherited copies.
+    /// No lazy reallocation or buffered fallback follows: reads fail with error() naming retirement.
+    /// Repeating a successful retirement succeeds; unopened/failed sources refuse without releasing anything.
+    /// Only an explicit open()/close() starts a new lifecycle and clears retirement.
+    bool retire_ring(std::string& err);
+
     bool ready() const { return ring_ != nullptr; }
     int64_t blobs() const { return blobs_; }
 
@@ -1106,12 +1115,12 @@ public:
     /// Resident envelope: the ring's PAYLOAD - the one large allocation this class is responsible for.  The
     /// small layout tables, the per-file `DirectFile` state and the reader threads' stacks are separate
     /// (threads are reported by `reader_threads()`); none of this is process RSS, and none of it says anything
-    /// about the host page cache.  Anonymous heap, allocated once at `open`, never grown.
+    /// about the host page cache. Anonymous heap, allocated once at `open`, never grown; zero after retirement.
     uint64_t residency_bytes() const { return ring_bytes_; }
     uint64_t slot_stride_bytes() const { return slot_stride_; }
     int64_t slots() const { return (int64_t) slot_count_; }
-    /// IO transient: reads land inside their slot, so the only transient is one slot itself.
-    uint64_t io_transient_bytes() const { return slot_stride_; }
+    /// IO transient: reads land inside their slot, so one slot while live, zero after retirement.
+    uint64_t io_transient_bytes() const { return retired_ ? 0 : slot_stride_; }
     /// Sum of the open source files' sizes: report metadata - never mapped for data, never charged as guest
     /// residency by this class.
     uint64_t source_bytes() const;
@@ -1120,7 +1129,7 @@ public:
     int reader_threads() const;
     /// Bytes read from the source files, for the driver's report.
     uint64_t io_bytes() const { return io_bytes_; }
-    /// The first failure's detail; `blob()` returns nullptr from then on, like every source.
+    /// The first failure's detail, or intentional ring retirement; `blob()` returns nullptr thereafter.
     const std::string& error() const { return error_; }
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
@@ -1177,6 +1186,7 @@ private:
     int64_t reads_ = 0;
     uint64_t io_bytes_ = 0;
     bool failed_ = false;
+    bool retired_ = false;                     ///< terminal ring-only retirement, NOT an I/O failure
     std::string error_;
 };
 

@@ -15,8 +15,142 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, request_timings, serve
+from serve.server import (ByteTokenizer, EngineDied, MockEngine, NativePhaseLog, Service, StrataEngine,
+                          request_timings, serve)
 from serve.test_server import ThinkingEngine
+
+
+class NativePhaseAccounting(unittest.TestCase):
+    def test_submission_keys_are_internal_opt_in_and_allocated_before_send(self):
+        engine = StrataEngine("missing-executable", [], lazy=True)
+        correlations = []
+        sampling = {"_strata_request_id": "a" * 32, "strata_priority": "background",
+                    "_strata_submission": correlations.append}
+        with mock.patch.dict("os.environ", {"STRATA_PHASE_TIMING": "1"}):
+            engine.info = {}
+            self.assertEqual(engine._phase_keys(sampling, 0), "")
+            engine.info["phase_timing"] = 1
+            engine.info["phase_timing_version"] = 1
+            keys = engine._phase_keys(sampling, 1)
+        self.assertIn("phase_request=" + "a" * 32, keys)
+        self.assertIn("phase_leg=2", keys)
+        self.assertIn("phase_incarnation=" + engine.phase_incarnation, keys)
+        self.assertIn("phase_priority=background", keys)
+        self.assertEqual([r["submission_sequence"] for r in correlations], [1, 2])
+        self.assertEqual([r["slot"] for r in correlations], [0, 1])
+        self.assertNotIn("phase_", engine.sampling_keys({"phase_request": "client-spoof"}))
+
+    def test_optional_receipts_keep_missing_native_times_unknown_and_reject_bad_identities(self):
+        prefix = "STRATA_PHASE v=1 kind=request request=req leg=1 incarnation=" + "a" * 32
+        receipt = NativePhaseLog.parse(prefix + " status=completed semantics=inclusive_host prefill_run_ms=1.5"
+                                      " prefill_run_count=2 resident_copyin_ms=na future_metric=27 gpu_mount_ms=2.5"
+                                      " demand_request=9223372036854775809 demand_generation=3 demand_attempt=2"
+                                      " demand_head=9 demand_status=restored decode_run_ms=na shared_lookup_ns=10"
+                                      " shared_lookup_catalog_version=0 shared_lookup_matches=0"
+                                      " shared_lookup_eligible=0 shared_lookup_head=na")
+        self.assertEqual(receipt["prefill_run_ms"], 1.5)
+        self.assertIsNone(receipt["resident_copyin_ms"])
+        self.assertEqual(receipt["gpu_mount_ms"], 2.5)
+        self.assertEqual(receipt["demand_request"], 9223372036854775809)
+        self.assertEqual(receipt["demand_status"], "restored")
+        self.assertIsNone(receipt["decode_run_ms"])
+        self.assertEqual(receipt["shared_lookup_catalog_version"], 0)
+        self.assertEqual(receipt["shared_lookup_matches"], 0)
+        self.assertIsNone(receipt["shared_lookup_head"])
+        self.assertNotIn("demand_wait_ms", receipt)
+        self.assertEqual(receipt["unknown_fields"], 1)
+        self.assertTrue(receipt["correlated"])
+        for suffix in (" prefill_run_ms=nan", " leg=2", " demand_wait_count=-1"):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                NativePhaseLog.parse(prefix + suffix)
+        with self.assertRaises(ValueError):
+            NativePhaseLog.parse("STRATA_PHASE v=1 kind=request request=req leg=1")
+        self.assertIsNone(NativePhaseLog.parse("DONE 1 2 stop"))
+
+    def test_receipts_bind_exact_leg_incarnation_and_late_publications_keep_the_producer(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, None)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"STRATA_PHASE_TIMING": "1"}):
+            path = Path(directory) / "native.log"
+            svc.engine.log_path, svc.engine.log_start = str(path), 0
+            svc.engine.info = {"phase_timing": 1, "phase_timing_version": 1}
+            producer = svc.register_lifecycle({}, threading.Event())
+            svc.acquire_request(producer)
+            incarnation = "a" * 32
+            svc.native_submitted(producer, correlation={"incarnation": incarnation, "submission_sequence": 1, "slot": 0})
+            identity = f"request={producer['id']} leg=1 incarnation={incarnation}"
+            request = f"STRATA_PHASE v=1 kind=request {identity} status=completed total_ms=7 prefill_run_ms=3\n"
+            path.write_text(request + request.replace("leg=1", "leg=2") +
+                            request.replace("incarnation=" + incarnation, "incarnation=" + "b" * 32))
+            svc.finish_lifecycle(producer)
+            with contextlib.redirect_stdout(io.StringIO()):
+                svc._emit_attribution(producer, "/v1/chat/completions")
+            attribution = producer["attribution"]
+            self.assertEqual(len(attribution["native_phase"]["receipts"]), 1)
+            self.assertEqual(attribution["native_phase"]["receipts"][0]["total_ms"], 7)
+            partition = dict(attribution["frontend"]["seconds"])
+            successor = svc.register_lifecycle({}, threading.Event())
+            svc.acquire_request(successor)
+            svc.native_submitted(successor, correlation={"incarnation": incarnation, "submission_sequence": 4, "slot": 0})
+            publication = (f"STRATA_PHASE v=1 kind=publication {identity} event=terminal publication=7 status=committed"
+                           " capture_ticket=2 owner=3 owner_generation=4 epoch=5 head=6 attempts=2 observed_ns=100"
+                           " catalog_version=12 since_capture_ms=7 queue_ms=3 admitted_to_observed_ms=4"
+                           " writer_ms=2 durable_ns=95\n")
+            with path.open("a") as log:
+                log.write(publication)
+            view = svc.metrics()["native_phase"]
+            self.assertEqual(view["records"][-1]["request"], producer["id"])
+            self.assertEqual(view["records"][-1]["publication"], 7)
+            self.assertEqual(view["records"][-1]["queue_ms"], 3)
+            self.assertEqual(view["records"][-1]["head"], 6)
+            self.assertEqual(view["records"][-1]["writer_ms"], 2)
+            self.assertEqual(view["records"][-1]["durable_ns"], 95)
+            self.assertEqual(view["records"][-1]["catalog_version"], 12)
+            self.assertEqual(partition, producer["attribution"]["frontend"]["seconds"])
+            svc.finish_lifecycle(successor)
+            with contextlib.redirect_stdout(io.StringIO()):
+                svc._emit_attribution(successor, "/v1/chat/completions")
+            self.assertEqual(successor["attribution"]["native_phase"]["receipts"], [])
+
+    def test_resident_continuation_requires_its_own_terminal_receipt(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, None)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"STRATA_PHASE_TIMING": "1"}):
+            path = Path(directory) / "native.log"
+            svc.engine.log_path, svc.engine.log_start = str(path), 0
+            svc.engine.info = {"phase_timing": 1, "phase_timing_version": 1}
+            record = svc.register_lifecycle({}, threading.Event())
+            svc.acquire_request(record)
+            incarnation = "a" * 32
+            svc.native_submitted(record, correlation={"incarnation": incarnation, "submission_sequence": 1, "slot": 0})
+            path.write_text(f"STRATA_PHASE v=1 kind=request request={record['id']} leg=1 "
+                            f"incarnation={incarnation} status=completed continuation=resident\n")
+            svc.finish_lifecycle(record)
+            with contextlib.redirect_stdout(io.StringIO()):
+                svc._emit_attribution(record, "/v1/chat/completions")
+            self.assertEqual(record["attribution"]["native_phase"]["status"], "partial")
+            self.assertEqual(record["attribution"]["native_phase"]["resident_terminals_missing"], 1)
+
+    def test_log_reader_bounds_records_bytes_and_partial_lines(self):
+        reader = NativePhaseLog()
+        prefix = "STRATA_PHASE v=1 kind=request request=req leg=1 incarnation=" + "a" * 32
+        line = prefix + " status=completed prefill_run_ms=1\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.log"
+            path.write_text(line * (reader.RECORDS_MAX + 8) + prefix)
+            snapshot = reader.poll(str(path), 0)
+            self.assertEqual(len(snapshot["records"]), reader.RECORDS_MAX)
+            self.assertEqual(snapshot["records_dropped"], 8)
+            with path.open("a") as log:
+                log.write(" status=completed total_ms=2\n")
+            snapshot = reader.poll(str(path), 0)
+            self.assertEqual(snapshot["records"][-1]["total_ms"], 2)
+            self.assertEqual(snapshot["records_dropped"], 9)
+            with path.open("a") as log:
+                log.write("x" * (reader.READ_MAX + 100) + "\n" + line)
+            snapshot = reader.poll(str(path), 0)
+            self.assertGreater(snapshot["gaps"], 0)
+            self.assertEqual(snapshot["records"][-1]["prefill_run_ms"], 1)
 
 
 class ClockedThinkingEngine(ThinkingEngine):
@@ -136,6 +270,41 @@ class RequestAccounting(unittest.TestCase):
         self.assert_original_input(response["usage"])
         self.assert_request_work(response["timings"], response["usage"]["completion_tokens"])
 
+    def test_slow_attribution_log_poll_does_not_block_unrelated_admission(self):
+        entered, release, registered = threading.Event(), threading.Event(), threading.Event()
+        errors, records = [], []
+        original = self.svc.phase_log.poll
+        def slow_poll(*args):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release attribution reader")
+            return original(*args)
+        def request():
+            try:
+                self.chat(budget=10000)
+            except BaseException as error:
+                errors.append(error)
+        def register():
+            records.append(self.svc.register_lifecycle({}, threading.Event()))
+            registered.set()
+        client, waiter = threading.Thread(target=request), threading.Thread(target=register)
+        with mock.patch.object(self.svc.phase_log, "poll", side_effect=slow_poll):
+            client.start()
+            try:
+                self.assertTrue(entered.wait(2), "HTTP finalization must reach the native receipt reader")
+                waiter.start()
+                self.assertTrue(registered.wait(.5), "slow telemetry must not retain the admission lock")
+            finally:
+                release.set()
+                client.join(3)
+                if waiter.ident is not None:
+                    waiter.join(3)
+                for record in records:
+                    self.svc.finish_lifecycle(record)
+        self.assertFalse(client.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(errors, [])
+
     def test_continuations_emit_one_response_attribution_record(self):
         prefix = "[strata] response_attribution: "
         with contextlib.redirect_stdout(io.StringIO()) as log:
@@ -148,6 +317,11 @@ class RequestAccounting(unittest.TestCase):
         self.assertEqual(len(records), 1, log.getvalue())
         record = records[0]
         self.assertEqual(record["request_id"], self.svc.lifecycle_records()[0]["id"])
+        self.assertEqual(record["priority"], "foreground")
+        self.assertAlmostEqual(sum(record["frontend"]["seconds"].values()), record["interval"]["duration_s"])
+        self.assertIsNotNone(record["first_content_s"])
+        self.assertGreaterEqual(record["first_content_s"], record["first_token_s"] - 0.000001)
+        self.assertEqual(record["native_phase"]["status"], "unavailable")
         self.assertEqual((record["drafts_accepted"], record["drafts_offered"]), (15, 29))
         self.assertEqual(len(record["legs"]), 2)
         self.assertEqual([leg["drafts_offered"] for leg in record["legs"]], [18, 11])

@@ -10,6 +10,16 @@
 
 namespace strata::program {
 
+namespace {
+void phase_notify(const ConversationPublicationSink& sink, const phase::Publication& publication,
+                  const char* event, const char* status, uint32_t attempts = 0, uint64_t head = 0) {
+    if (!sink.phase_event) return;
+    // Diagnostic failure cannot affect ownership, retirement or reconciliation.
+    try { sink.phase_event({publication, event, status, phase::now_ns(), head, attempts}); }
+    catch (...) {}
+}
+}
+
 void ConversationPublicationOwner::borrow() {
     ++generation;
     lineage = {};
@@ -55,6 +65,14 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
     ConversationPublicationCapture&& entry, size_t held, size_t held_entries,
     const ConversationPublicationSink& sink) {
     ConversationPublicationCaptureResult out;
+    if (sink.phase_event) {
+        entry.phase.capture_ticket = entry.image_ticket;
+        entry.phase.owner = entry.owner;
+        entry.phase.owner_generation = entry.owner_generation;
+        entry.phase.epoch = entry.capture_epoch;
+        entry.phase.shared_prefix_tokens = entry.shared_prefix ? uint64_t(image.live.ids.size()) : 0;
+        if (!entry.phase.captured_ns) entry.phase.captured_ns = phase::now_ns();
+    }
     const auto ordinary_park = [&] {
         image.publication_ticket = 0;
         try {
@@ -67,6 +85,7 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
     const auto refuse = [&](const char* why) {
         ++counters_.refused;
         report(sink, "strata serve: conversation store: capture not queued for persistence (%s)\n", why);
+        phase_notify(sink, entry.phase, "terminal", "capture_refused");
     };
     if (image.publication_ticket != 0) {
         refuse("the candidate already owns a publication ticket");
@@ -117,6 +136,7 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
         target.force_fresh = false;
     }
     out.queued = true;
+    phase_notify(sink, queued_.back().phase, "captured", "queued");
     return out;
 }
 
@@ -132,6 +152,7 @@ void ConversationPublicationQueue::drop(size_t index, const char* why, const Con
                  "%llu) dropped (%s, %zu MiB acquired)\n", (unsigned long long) entry.owner,
            (unsigned long long) entry.capture_epoch, (unsigned long long) entry.image_ticket, why,
            entry.lease_bytes >> 20);
+    phase_notify(sink, entry.phase, "terminal", "dropped", entry.attempts);
     queued_.erase(queued_.begin() + (std::ptrdiff_t) index);
 }
 
@@ -145,6 +166,7 @@ void ConversationPublicationQueue::abandon(const char* why, const ConversationPu
         ++counters_.dropped;
         report(sink, "strata serve: conversation store: queued publication of owner %llu dropped (%s)\n",
                (unsigned long long) entry.owner, why);
+        phase_notify(sink, entry.phase, "terminal", "abandoned", entry.attempts);
     }
     queued_.clear();
     forget_lineages();
@@ -232,16 +254,16 @@ bool ConversationPublicationQueue::shared_prefix_exists(strata::core::Conversati
     return exists;
 }
 
-size_t ConversationPublicationQueue::retire(uint64_t retired_head) {
+size_t ConversationPublicationQueue::retire(uint64_t retired_head, uint64_t epoch) {
     if (retired_head == 0) return 0;
     size_t references = 0;
     for (ConversationPublicationCapture& entry : queued_) {
-        if (entry.supersedes_hint != retired_head) continue;
+        if (entry.supersedes_hint != retired_head || entry.capture_epoch != epoch) continue;
         entry.supersedes_hint = 0;
         ++references;
     }
     for (ConversationPublicationOwner& owner : owners_) {
-        if (!owner.lineage.valid || owner.lineage.head != retired_head) continue;
+        if (!owner.lineage.valid || owner.lineage.head != retired_head || owner.lineage.epoch != epoch) continue;
         owner.lineage = {};
         ++references;
     }
@@ -277,15 +299,26 @@ size_t ConversationPublicationQueue::reconcile(strata::core::ConversationStore& 
         for (size_t i = 0; i < pending_.size(); ++i)
             if (pending_[i].request_id == result.request_id) { at = i; break; }
         if (at == pending_.size()) continue;   // already reaped (or a foreign result)
-        const ConversationPublicationPending pending = pending_[at];
+        ConversationPublicationPending pending = pending_[at];
         pending_.erase(pending_.begin() + (std::ptrdiff_t) at);
+        pending.phase.applied_ns = result.applied_ns;
+        pending.phase.catalog_version = result.catalog_version;
         const bool made = created(result);
         if (made) {
             adopt(pending, result);
             // Independently of the adoption above: a replacement removed the head it superseded from the store's
             // catalog, so every reference to it is now dangling - including the references of owners whose
             // generation guard just refused the adoption.
-            retire(result.superseded);
+            retire(result.superseded, result.epoch);
+        }
+        if (result.status == strata::core::ConversationStorePublishStatus::stale && pending.supersedes != 0 &&
+            result.generation == pending.generation && result.epoch == pending.capture_epoch &&
+            store.healthy() && store.epoch() == pending.capture_epoch) {
+            // Ordinary eviction has no replacement completion. Only a catalog-proven missing predecessor in this
+            // capture's still-current epoch permits forgetting its references: stale generation/cancellation alone
+            // must not turn a retained predecessor into a new branch. No lookup or allocation on successful results.
+            if (!store.retains_head(pending.supersedes) && store.epoch() == pending.capture_epoch)
+                retire(pending.supersedes, pending.capture_epoch);
         }
         if (result.status == strata::core::ConversationStorePublishStatus::coalesced) {
             // A newer capture of the same owner and lineage replaced this one before the writer started it.  The
@@ -309,6 +342,8 @@ size_t ConversationPublicationQueue::reconcile(strata::core::ConversationStore& 
                    (unsigned long long) result.new_bytes, (unsigned long long) result.reused_bytes,
                    int(result.released));
         }
+        phase_notify(sink, pending.phase, "terminal",
+                     strata::core::conversation_store_publish_status_name(result.status), 0, result.head_id);
         if (reaped >= pending_.size() + 4) break;
     }
     return reaped;
@@ -334,8 +369,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
         // The writer queues its result and *then* clears its busy flag, so a completion can land between the harvest
         // above and this observation of idle.  Harvest it here, before the predecessor proof below reads a lineage
         // that completion may have just retired: a completion that arrived in that window and was not reconciled
-        // would leave this capture naming a head the store has already removed, and it would be refused as stale on
-        // every one of its attempts.
+        // would needlessly lose this accepted capture to a terminal stale verdict.
         if (reconcile(store, sink, 0) != 0) continue;
         uint64_t publication_id = 0;
         if (!sink.next_publication_id || !sink.next_publication_id(publication_id)) {
@@ -344,6 +378,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
         }
         ConversationPublicationCapture& entry = queued_.front();
         entry.publication_id = publication_id;
+        if (sink.phase_event) entry.phase.publication = publication_id;
         std::string why;
         strata::core::ConversationStorePublishAdmission admission;
         const size_t pending_before = pending_.size();
@@ -397,6 +432,10 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             pending.cvec = entry.cvec;
             pending.live = entry.live;
             pending.lease_bytes = entry.lease_bytes;
+            if (sink.phase_event) {
+                pending.phase = entry.phase;
+                pending.phase.admitted_ns = phase::now_ns();
+            }
             // Every allocation the queue needs to remember the result precedes the store's destructive handoff.
             pending_.push_back(std::move(pending));
             // Keep the original head image throughout refusal, deferral and allocation failure. A fresh branch's
@@ -416,6 +455,8 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             break;
         }
         if (admission == strata::core::ConversationStorePublishAdmission::accepted) {
+            if (sink.phase_event) entry.phase = pending_.back().phase;
+            phase_notify(sink, entry.phase, "admitted", "accepted", entry.attempts);
             // The store owns its full charge now. Optional RAM retention gets only spare capacity after that exact
             // transfer; failing to retain is not a failed publication and must never undo the admitted result.
             if (sink.release_lease) sink.release_lease(entry.lease_bytes);
@@ -439,6 +480,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             // resource frees (the store counts the verdicts it returned).
             if (!entry.deferred_reported) {
                 entry.deferred_reported = true;
+                phase_notify(sink, entry.phase, "handoff", "deferred", entry.attempts);
                 report(sink, "strata serve: conversation store: publication of owner %llu is deferred (%s); it stays "
                              "queued with its lease and its whole attempt allowance (id %llu)\n",
                        (unsigned long long) entry.owner, why.c_str(),
@@ -447,6 +489,7 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             break;
         }
         ++counters_.refused;
+        phase_notify(sink, entry.phase, "handoff", "refused", entry.attempts);
         if (retry(admission, entry.attempts).exhausted) {
             drop(0, why.empty() ? "the store refused the publication" : why.c_str(), sink);
             continue;

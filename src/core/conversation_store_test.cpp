@@ -681,6 +681,9 @@ void check_promotion_recency_eviction();
 void check_bootstrap_and_intent();
 void check_inflight_object_lease();
 void check_failed_write_charges_once();
+void check_orphan_revival();
+void check_object_directory_retry();
+void check_object_directory_batch();
 void check_postcommit_reclamation_cannot_undo_commit();
 void check_read_object_boundaries();
 
@@ -835,6 +838,9 @@ int main() {
     check_bootstrap_and_intent();
     check_inflight_object_lease();
     check_failed_write_charges_once();
+    check_orphan_revival();
+    check_object_directory_retry();
+    check_object_directory_batch();
     check_postcommit_reclamation_cannot_undo_commit();
     check_shared_scope_payload_separation();
     std::printf("conversation_store_test: %d checks, %d failures\n", checks, failures);
@@ -1367,7 +1373,9 @@ void check_round_trip() {
     const SavedConversation image = fixture(41, 256);
     uint64_t head_id = 0;
     {
-        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.publication_timing = true;
+        ConversationStore store(options);
         check(store.enabled(), "the store opens its root");
         if (!store.enabled()) {
             std::fprintf(stderr, "Store initialization: %s\n", store.disabled_reason());
@@ -1383,6 +1391,8 @@ void check_round_trip() {
         check(result.status == ConversationStorePublishStatus::stored, "a new branch is stored");
         check(result.released, "the store released its publication alias");
         check(result.new_bytes > 0, "the publication wrote object bytes");
+        check(result.applied_ns != 0 && result.catalog_version != 0,
+              "a stored publication reports its exact catalog visibility boundary");
         const ConversationStoreCounters counted = store.counters();
         check(counted.objects > 0 && counted.object_bytes > 0,
               "the counters report the bytes of the objects the store holds");
@@ -1399,6 +1409,14 @@ void check_round_trip() {
         check(store.disk_available_bytes() < store.disk_quota_bytes(), "the charge is against the shared quota");
 
         const ConversationStoreQuery query = query_of(image, 7, 1);
+        ConversationStoreLookupFrontier frontier;
+        std::vector<ConversationStoreMatch> observed;
+        store.for_each_match(query.selector, query.tokens, query.images,
+            [&](const ConversationStoreMatch& match) { observed.push_back(match); }, &frontier);
+        check(frontier.observed_ns >= result.applied_ns && frontier.catalog_version == result.catalog_version,
+              "a later lookup reports the exact catalog version that contains the publication");
+        check(!observed.empty() && observed.front().head_id == result.head_id,
+              "the frontier-bearing lookup returns the published head");
         const std::vector<ConversationStoreMatch> found = store.matches(query.selector, query.tokens, query.images);
         check(!found.empty(), "the published cut is matchable");
         if (found.empty()) return;
@@ -2393,6 +2411,8 @@ void check_capacity_floor() {
     check(publish_and_wait(store, image, 1, 1, result), "the publication is admitted");
     check(result.status == ConversationStorePublishStatus::refused_floor,
           "an impossible filesystem floor refuses the publication");
+    check(result.applied_ns == 0 && result.catalog_version == 0,
+          "a refused publication reports no catalog visibility boundary");
     check_eq(uint64_t(store.counters().heads), 0, "a refused publication authorizes no head");
     check_eq(store.disk_charged_bytes(), charged_before, "a refused publication leaves nothing charged");
     check(store.counters().refusals_floor > 0, "the floor refusal is counted");
@@ -2732,6 +2752,8 @@ void check_read_progress() {
     const auto queued = store.request_progress(2, 1);
     check(queued.state == State::queued && queued.status == ConversationStoreReadStatus::none &&
               queued.attempt_id && !queued.totals_known, "queued ownership is distinct from an unknown request");
+    check(!queued.materialize_started && !queued.prior_materialize_unmeasured,
+          "a queued descriptor is not a materialization observation");
     check(!store.wait_ready(2, 1, read, 1) &&
               !store.request_progress(2, 1).acknowledged_after(queued),
           "a queue timer cannot report delivery or acknowledged progress");
@@ -2745,6 +2767,8 @@ void check_read_progress() {
     check(active.state == State::materializing && active.attempt_id == queued.attempt_id &&
               !active.totals_known && !active.acknowledged_after(queued),
           "a reader reservation is materializing, not acknowledged I/O");
+    check(active.materialize_started && !active.prior_materialize_unmeasured,
+          "reader dispatch records an attempt without claiming acknowledged I/O");
     check(!store.wait_ready(2, 1, read, 1) &&
               !store.request_progress(2, 1).acknowledged_after(active) && !read.image,
           "a no-I/O worker stall stays invisible to the engine's byte-only heartbeat predicate");
@@ -2776,6 +2800,8 @@ void check_read_progress() {
     const auto settled = store.request_progress(2, 1);
     check(settled.state == State::settled && settled.status == ConversationStoreReadStatus::ready,
           "successful settlement precedes whole-image hand-over");
+    check(settled.materialize_started && !settled.prior_materialize_unmeasured,
+          "successful settlement retains the current attempt's diagnostic dispatch bit");
     for (size_t i = 0; i < settled.components.size(); ++i) {
         check(expected[i] != 0, "the fixture exercises every restore component");
         check_eq(settled.components[i].acknowledged, expected[i], "terminal success acknowledges each entire component");
@@ -2840,6 +2866,8 @@ void check_read_progress_failures() {
         const auto failed = store.request_progress(2, 1);
         check(failed.state == State::settled && failed.status == ConversationStoreReadStatus::corrupt,
               "settled is not synonymous with ready");
+        check(failed.materialize_started && !failed.prior_materialize_unmeasured,
+              "even a corrupt manifest records attempted materialization before byte progress exists");
         check(failed.totals_known == (damage != 2), "a corrupt manifest never publishes trusted component totals");
         for (size_t i = 0; i < failed.components.size(); ++i) {
             const uint64_t expected = damage != 2 && i == size_t(Component::metadata) ? uint64_t(info.st_size) : 0;
@@ -2870,6 +2898,8 @@ void check_read_progress_failures() {
     check(!store.wait_ready(2, 1, read, 0) && cancelled.state == State::settled &&
               cancelled.status == ConversationStoreReadStatus::cancelled &&
               !cancelled.acknowledged_after(queued), "false also describes settled undeliverable cancellation");
+    check(!cancelled.materialize_started && !cancelled.prior_materialize_unmeasured,
+          "queued cancellation never invents attempted materialization");
     store.release_read(2, 1);
     SelectedHoldGate gate;
     store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
@@ -2916,6 +2946,8 @@ void check_read_progress_reissue() {
     check(retry.state == ConversationStoreReadState::materializing && retry.attempt_id != previous.attempt_id &&
               retry.head_id == new_head.head_id && !retry.totals_known && !retry.acknowledged_after(previous),
           "a real reissue binds a new attempt/manifest without crediting discarded bytes");
+    check(retry.materialize_started && retry.prior_materialize_unmeasured,
+          "reissuing a completed image preserves the discarded attempt's unavailable duration");
     for (const auto& component : retry.components)
         check(component.total == 0 && component.acknowledged == 0, "reissue resets every component together");
     gate.resume();
@@ -2925,6 +2957,8 @@ void check_read_progress_reissue() {
     const auto ready = store.request_progress(3, 1);
     check(ready.attempt_id == retry.attempt_id && ready.acknowledged_after(retry),
           "the new attempt's verified bytes, not its wakeup, count as progress");
+    check(ready.materialize_started && ready.prior_materialize_unmeasured,
+          "a later ready sample cannot erase prior unsampled materialization");
     for (const auto& component : ready.components)
         check_eq(component.acknowledged, component.total, "the new successful attempt completes all components");
     read.image.reset();
@@ -4103,6 +4137,8 @@ void check_budget_deferred_expanded_peak() {
     check(refused_progress.state == ConversationStoreReadState::settled && refused_progress.totals_known &&
               refused_progress.components[0].acknowledged > 0,
           "a decoded budget refusal keeps its attempt's validated manifest progress, not a successful image");
+    check(refused_progress.materialize_started && !refused_progress.prior_materialize_unmeasured,
+          "a decoded budget refusal is attempted work, unlike an unstarted admission refusal");
     const auto first = trace.records();
     check_eq(read_trace_count(first, "read_start", 935), 1,
              "the first refusal follows one real manifest read");
@@ -4122,6 +4158,8 @@ void check_budget_deferred_expanded_peak() {
     check(retry_progress.attempt_id != refused_progress.attempt_id && !retry_progress.totals_known &&
               !retry_progress.acknowledged_after(refused_progress),
           "a real allowance retry resets its fixed component counters under a new attempt identity");
+    check(retry_progress.materialize_started && retry_progress.prior_materialize_unmeasured,
+          "allowance recovery preserves unknown failed work across the attempt reset");
     for (const auto& component : retry_progress.components)
         check(component.total == 0 && component.acknowledged == 0, "a retried decode starts with no credited bytes");
     retry_gate.resume();
@@ -4134,6 +4172,8 @@ void check_budget_deferred_expanded_peak() {
     check(store.wait_ready(935, 1, restored, 5000) && restored.image &&
               images_equal(*restored.image, image, why),
           "expanded-peak recovery preserves every restored byte");
+    check(store.request_progress(935, 1).prior_materialize_unmeasured,
+          "ready delivery retains the failed attempt's unknown aggregate contribution");
     restored.image.reset();
     store.release_read(935, 1);
     store.close();
@@ -5856,6 +5896,7 @@ void check_stale_ready() {
     check(publish_and_wait(store, second, 2, 2, stored) &&
               stored.status == ConversationStorePublishStatus::stored,
           "a later branch is stored in the new epoch");
+    store.suspend_read_admission(); // Exercise a queued descriptor, not a racing active worker's retirement.
     check(store.demand(query_of(second, 32, 1), why), "a demand is admitted in the new epoch");
     check(store.invalidate_domain("non-finite logits again"), "the domain invalidates a second time");
     ConversationStoreRead queued;
@@ -6575,21 +6616,25 @@ void check_commit_outcomes() {
         check_eq(store.disk_charged_bytes(), charged_before,
                  "a refused commit credits back everything its attempt wrote");
         const auto refused_records = trace.records("store_head ");
-        const auto* planned = read_trace(refused_records, "planned", 0, "covered_replacement");
+        const auto* planned = read_trace(refused_records, "planned", cover.request_id, "covered_replacement");
         check(planned && planned->number("head") == head.head_id && planned->number("pinned"),
               "a planned replacement records its predecessor and pin without claiming retirement");
-        check_eq(read_trace_count(refused_records, "retired", 0), 0,
+        check_eq(read_trace_count(refused_records, "retired", cover.request_id), 0,
                  "a failed catalog rename must not report a committed head retirement");
+        check_eq(read_trace_count(refused_records, "published_cut", cover.request_id), 0,
+                 "a failed catalog rename reports no confirmed reusable cut");
         // The store is still a working store: the same publication succeeds once the fault is gone.
         ConversationStorePublishResult retry;
         auto retry_image = std::make_shared<SavedConversation>(head_image);
         check(store.publish(retry_image, cover, why) == kAccepted, "the retry is admitted");
         check(store.wait_publish(retry, 5000), "the retry settles");
         check(retry.status == ConversationStorePublishStatus::replaced, "the retry replaces the predecessor");
+        check(!store.retains_head(head.head_id) && store.retains_head(retry.head_id),
+              "successful replacement removes only predecessor authority and retains its successor");
         store.close();
         const auto committed_records = trace.records("store_head ");
-        const auto* retired = read_trace(committed_records, "retired", 0, "covered_replacement");
-        check_eq(read_trace_count(committed_records, "retired", 0), 1,
+        const auto* retired = read_trace(committed_records, "retired", cover.request_id, "covered_replacement");
+        check_eq(read_trace_count(committed_records, "retired", cover.request_id), 1,
                  "only the successful retry emits a confirmed retirement");
         check(retired && retired->number("head") == head.head_id &&
                   retired->number("replacement_head") == retry.head_id &&
@@ -7317,6 +7362,160 @@ void check_inflight_object_lease() {
     }
 }
 
+// Only ids are initially authorized; the repeated state adds exactly one unique physical object.
+SavedConversation revival_fixture(size_t copies) {
+    SavedConversation image = fixture(381, 64);
+    image.checkpoints.clear();
+    image.kv.clear();
+    image.live.gdn.assign(copies * 4096, 0x5a);
+    image.live.ple.resize(0);
+    image.live.tails.resize(0);
+    image.live.dead.resize(0);
+    image.live.block_pos.resize(0);
+    return image;
+}
+
+void check_orphan_revival() {
+    if (::geteuid() == 0) return; // Real unlink/rename permission failures require an unprivileged owner.
+    for (size_t copies : {size_t(1), size_t(2)}) {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        check(store.invalidate_domain("empty durable catalog baseline") && store.counters().heads == 0,
+              "establish the same durable empty catalog before and after retirement");
+        const uint64_t empty_charge = store.disk_charged_bytes();
+        const SavedConversation base = revival_fixture(0), image = revival_fixture(copies);
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, base, 1, 1, result) &&
+                  result.status == ConversationStorePublishStatus::stored,
+              "revival starts with only the token object authorized");
+        const uint64_t base_charge = store.disk_charged_bytes();
+        const std::string catalog = file_digest(root.path + "/catalog");
+        const ConversationStoreStreamId gdn{0, uint16_t(ConversationStoreStreamKind::live_gdn), 0, 0};
+        std::pair<Digest, uint64_t> identity;
+        std::string why;
+        check(identity_of(image, gdn, identity, why), "the revival object's physical identity is known");
+        const Digest object = conversation_store_detail::object_digest(
+            identity.first, gdn.kind, identity.second, 4096, image.live.gdn.data());
+        const std::string name = sha256_hex(object);
+        const std::string shard = root.path + "/objects/" + name.substr(0, 2);
+        const std::string file = shard + "/" + name;
+        SelectedHoldGate gate;
+        store.set_catalog_gate_for_test([](void* p, bool staged) {
+            if (staged) static_cast<SelectedHoldGate*>(p)->pause();
+        }, &gate);
+        store.set_publish_fault_for_test("catalog-rename");
+        ConversationStorePublish request;
+        request.request_id = request.generation = 2;
+        check(store.publish(std::make_shared<SavedConversation>(image), request, why) == kAccepted,
+              "the orphan-producing publication is admitted");
+        gate.await();
+        struct stat before {};
+        check(::stat(file.c_str(), &before) == 0, "the orphan's real inode exists before catalog refusal");
+        check(::chmod(shard.c_str(), 0500) == 0, "a real permission failure prevents orphan deletion and rewriting");
+        gate.resume();
+        check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::failed,
+              "catalog refusal leaves the new object without authority");
+        store.set_catalog_gate_for_test(nullptr, nullptr);
+        check(!gate.timed_out, "orphan retention uses the reached catalog seam, not a timeout");
+        const uint64_t retained_charge = store.disk_charged_bytes();
+        check(retained_charge > base_charge, "the undeletable orphan retains its original charge");
+        check_eq(store.counters().orphan_bytes, retained_charge - base_charge,
+                 "the stable orphan ledger accounts for the retained physical file exactly once");
+        check(file_digest(root.path + "/catalog") == catalog, "orphan retention changes no catalog authority");
+        const uint64_t written = store.counters().bytes_written;
+        // A failed revival flush must put the same lease charge back into orphan ownership. Repeat each boundary
+        // so that a retry cannot accidentally treat mere file/directory existence as proof of durability.
+        uint64_t attempt = 3;
+        for (const char* boundary : {"object-shard-sync", "object-parent-sync"}) {
+            for (unsigned retry = 0; retry != 2; ++retry) {
+                store.set_publish_fault_for_test(boundary);
+                check(publish_and_wait(store, image, attempt, attempt, result) &&
+                          result.status == ConversationStorePublishStatus::failed && result.released,
+                      "each revival retry must traverse both real directory durability boundaries");
+                ++attempt;
+                check_eq(store.disk_charged_bytes(), retained_charge, "failed revival neither loses nor doubles its charge");
+                check_eq(store.counters().orphan_bytes, retained_charge - base_charge,
+                         "failed revival returns its charge to the stable orphan ledger");
+                check_eq(store.counters().bytes_written, written, "a failed revival flush rewrites no payload");
+                check_eq(store.counters().heads, 1, "a failed revival adds no catalog authority");
+                check(file_digest(root.path + "/catalog") == catalog &&
+                          directory_names(root.path + "/manifests").size() == 1 &&
+                          directory_names(root.path + "/tmp").empty(),
+                      "revival durability refusal precedes manifest creation and preserves prior authority");
+                check(store.healthy() && !store.writer_busy() && store.ram_lease_bytes() == 0,
+                      "directory refusal settles the publication without poisoning catalog authority");
+            }
+        }
+        check(publish_and_wait(store, image, attempt, attempt, result) &&
+                  result.status == ConversationStorePublishStatus::stored && result.new_bytes == 0,
+              "revival and a duplicate in the same publication reuse the pinned object without rewriting");
+        struct stat after {};
+        check(::stat(file.c_str(), &after) == 0 && after.st_ino == before.st_ino,
+              "revival keeps the original inode");
+        check_eq(store.counters().orphan_bytes, 0, "successful revival transfers ownership out of the orphan ledger");
+        // All ledger transitions must be in this process: reopening reconstructs the ledger and hides a lost charge.
+        ConversationStoreManifestInfo revived_info;
+        check(store.manifest_info(result.head_id, revived_info), "the revived manifest's allocated charge is observable");
+        check_eq(store.disk_charged_bytes(), retained_charge + revived_info.manifest_bytes,
+                 "publication adds one manifest charge, not another charge for the revived object");
+        ConversationStoreRead read;
+        check(store.demand(query_of(image, 91, 1), why) && store.wait_ready(91, 1, read, 5000) &&
+                  read.head_id == result.head_id && read.image && images_equal(*read.image, image, why),
+              "the revived repeated state is restored byte for byte");
+        read.image.reset();
+        store.release_read(91, 1);
+        check(::chmod(shard.c_str(), 0700) == 0, "normal shard permissions are restored before retirement");
+        check(store.invalidate_domain("revival retirement fixture"), "the revived head can be durably retired");
+        check_eq(store.counters().heads, 0, "retirement removes every authority");
+        check_eq(store.disk_charged_bytes(), empty_charge,
+                 "retirement and confirmed deletion refund the revived object's original charge");
+        check(file_inventory(root.path + "/objects").empty(), "retirement deletes all payload objects");
+        check(store.healthy() && store.ram_lease_bytes() == 0, "revival and retirement preserve health and image ownership");
+        store.close();
+    }
+}
+
+void check_object_directory_retry() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    check(store.invalidate_domain("empty durable catalog baseline") && store.counters().heads == 0,
+          "establish the same durable empty catalog before and after retirement");
+    const uint64_t empty_charge = store.disk_charged_bytes();
+    const std::string catalog = file_digest(root.path + "/catalog");
+    const SavedConversation image = revival_fixture(0);
+    ConversationStorePublishResult result;
+    // mkdir succeeds before the flush fault. Default mode refuses before creating an object; batch mode refuses
+    // after renames and reclaims them. In either mode the shard survives, so existence cannot prove parent durability.
+    for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+        store.set_publish_fault_for_test("object-parent-sync");
+        check(publish_and_wait(store, image, attempt, attempt, result) &&
+                  result.status == ConversationStorePublishStatus::failed && result.released,
+              "both newly created and existing shards must retry a failed objects-parent flush");
+        check_eq(directory_names(root.path + "/objects").size(), 1,
+                 "the retry really encounters the shard left by the earlier mkdir");
+        check(file_inventory(root.path + "/objects").empty() &&
+                  directory_names(root.path + "/tmp").empty() && directory_names(root.path + "/manifests").empty(),
+              "parent flush refusal leaves no object or manifest authority after cleanup");
+        check_eq(store.disk_charged_bytes(), empty_charge, "a parent refusal refunds only confirmed absent files");
+        check_eq(store.counters().orphan_bytes, 0, "a parent refusal leaves no physical orphan charge");
+        check(file_digest(root.path + "/catalog") == catalog && store.healthy(),
+              "parent durability refusal preserves catalog authority and health");
+    }
+    store.set_publish_fault_for_test("object-shard-sync");
+    check(publish_and_wait(store, image, 3, 3, result) &&
+              result.status == ConversationStorePublishStatus::failed,
+          "a new object's post-rename shard flush can refuse publication");
+    check(file_inventory(root.path + "/objects").empty() && directory_names(root.path + "/tmp").empty() &&
+              directory_names(root.path + "/manifests").empty(),
+          "ordinary post-rename refusal reclaims the real object without publishing a manifest");
+    check_eq(store.disk_charged_bytes(), empty_charge, "confirmed deletion refunds the failed post-rename write once");
+    check(publish_and_wait(store, image, 4, 4, result) && result.status == ConversationStorePublishStatus::stored,
+          "a fully flushed same-process retry becomes catalog authority");
+    check(store.invalidate_domain("directory retry fixture"), "the retried object can be retired normally");
+    check_eq(store.disk_charged_bytes(), empty_charge, "retirement returns all physical payload charges");
+    store.close();
+}
+
 // One failed write, one charge.  A write that fails before its file reaches its own name leaves bytes only in the
 // temporary, and the store must credit that one file exactly once - never a temporary *and* the name it never
 // reached.  The failure is injected at the operation itself (the directory refuses the write), not ahead of it.
@@ -7324,7 +7523,14 @@ void check_failed_write_charges_once() {
     // The phase hooks are distinct from the operation-level permission failures below: objects refuses before any
     // new file, manifest after object creation, and catalog after both objects and a manifest have been written.
     // Each failure must release the image and its object leases without retiring the covered predecessor.
-    for (const char* step : {"objects", "manifest", "catalog"}) {
+    const char* old_batch = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    const bool had_batch = old_batch != nullptr;
+    const std::string saved_batch = old_batch ? old_batch : "";
+    for (const char* step : {"objects", "batch-shard-open", "batch-shard-sync", "batch-shard-partial",
+                             "batch-parent-sync", "batch-shard-allocate", "manifest", "catalog"}) {
+        // Preserve the caller's mode for legacy phases; only the new fault cases force the candidate on.
+        ::setenv("STRATA_STORE_DIR_FSYNC_BATCH",
+                 std::strncmp(step, "batch-", 6) == 0 ? "1" : (had_batch ? saved_batch.c_str() : "0"), 1);
         TempRoot root;
         const auto options = options_for(root.path, uint64_t(1) << 30, 0);
         const SavedConversation prior = fixture(371, 1024);
@@ -7341,6 +7547,7 @@ void check_failed_write_charges_once() {
             head_id = head.head_id;
             epoch = store.epoch();
             const uint64_t charged = store.disk_charged_bytes();
+            const size_t descriptors = directory_names("/proc/self/fd").size();
             const auto inventory = file_inventory(root.path);
             const std::string catalog = file_digest(root.path + "/catalog");
             const auto markers = intent_names(root.path);
@@ -7368,6 +7575,8 @@ void check_failed_write_charges_once() {
             ConversationStoreManifestInfo info;
             check(store.manifest_info(head_id, info), "a failed phase preserves the predecessor's manifest authority");
             check(file_digest(root.path + "/catalog") == catalog, "a failed phase preserves the durable catalog");
+            check_eq(directory_names("/proc/self/fd").size(), descriptors,
+                     "a failed publication phase leaks no transient descriptor, including exception unwinding");
             check(file_inventory(root.path) == inventory, "a failed phase removes every file its attempt created");
             check(directory_names(root.path + "/tmp").empty(), "a failed phase leaves no scratch file");
             check(intent_names(root.path) == markers && store.run_intent_active(),
@@ -7412,6 +7621,10 @@ void check_failed_write_charges_once() {
             store.close();
         }
     }
+    if (had_batch)
+        ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved_batch.c_str(), 1);
+    else
+        ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");
 
     // (1) The object write: its temporary directory refuses the write, so the shard never receives the object.
     {
@@ -7541,10 +7754,12 @@ void check_postcommit_reclamation_cannot_undo_commit() {
         ConversationStoreManifestInfo info;
         check(store.manifest_info(second_head, info), "the committed head keeps its authority");
         check_eq(store.counters().heads, 1, "the ceiling retired the first branch and kept the second");
+        check(!store.retains_head(first.head_id) && store.retains_head(second_head),
+              "head pressure removes the actual victim while retaining the committed successor");
         check(store.counters().reclaimed_objects > 0,
               "the retired branch's objects were still reclaimed, on the pass that follows the commit");
         const auto retired_records = trace.records("store_head ");
-        const auto* retired = read_trace(retired_records, "retired", 0, "head_limit");
+        const auto* retired = read_trace(retired_records, "retired", request.request_id, "head_limit");
         check(retired && retired->number("head") == first.head_id &&
                   !retired->number("pinned") && !retired->number("head_leases") &&
                   retired->number("replacement_head") == second_head,
@@ -7583,6 +7798,294 @@ void check_postcommit_reclamation_cannot_undo_commit() {
         if (read.image) store.release_read(4, 4);
         store.close();
     }
+}
+
+// The batch pause is only a scheduling seam. Assertions use real files, public authority/restore APIs and charges.
+void check_object_directory_batch() {
+    const char* old = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    const bool had = old != nullptr;
+    const std::string saved = old ? old : "";
+    ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", "1", 1);
+
+    // The same image must need the fixed tracker/name/descriptor workspace at admission, not only at execution.
+    const auto shape = options_for("/unused", uint64_t(1) << 30, 0);
+    const SavedConversation hollow = revival_fixture(0);
+    const auto fresh = [](ConversationStore&) {
+        ConversationStorePublish request;
+        request.request_id = request.generation = 1;
+        return request;
+    };
+    ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", "0", 1);
+    const uint64_t ordinary_floor = publication_admission_floor(shape, hollow, fresh, uint64_t(16) << 20);
+    ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", "1", 1);
+    const uint64_t batch_floor = publication_admission_floor(shape, hollow, fresh, uint64_t(16) << 20);
+    check_eq(batch_floor, ordinary_floor + 4 * sizeof(uint64_t) + 3 * sizeof(char) + sizeof(int),
+             "the enabled tracker, stack shard name and transient descriptor are included in writer admission");
+    check(publication_is_admitted(shape, hollow, fresh, batch_floor) &&
+              !publication_is_admitted(shape, hollow, fresh, batch_floor - 1),
+          "batch publication fits exactly its counted allowance and refuses one byte less");
+
+    // Real unlink permission failures retain renamed objects. Revival must prove directory durability again,
+    // without rewriting or double-charging them. The third attempt succeeds using those very same files.
+    for (const char* boundary : {"batch-shard-sync", "batch-parent-sync"}) {
+        if (::geteuid() == 0) continue; // Retained-orphan assertions require real unlink permission denial.
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const SavedConversation image = fixture(381, 1024);
+        uint64_t epoch = 0, successful_head = 0;
+        {
+            ConversationStore store(options);
+            epoch = store.epoch();
+            const uint64_t base_charge = store.disk_charged_bytes();
+            const std::string catalog = file_digest(root.path + "/catalog");
+            uint64_t written = 0, retained_charge = 0;
+            std::vector<std::string> object_files;
+            std::vector<ino_t> object_inodes;
+            for (unsigned attempt = 0; attempt < 3; ++attempt) {
+                SelectedHoldGate gate;
+                store.set_object_batch_gate_for_test([](void* p) {
+                    static_cast<SelectedHoldGate*>(p)->pause();
+                }, &gate);
+                if (attempt < 2) store.set_publish_fault_for_test(boundary);
+                ConversationStorePublish request;
+                request.request_id = attempt + 1;
+                request.generation = attempt + 1;
+                std::string why;
+                check(store.publish(std::make_shared<SavedConversation>(image), request, why) == kAccepted,
+                      "the orphan/revival publication is admitted");
+                gate.await();
+                check(directory_names(root.path + "/manifests").empty(),
+                      "the batch pause precedes every manifest file creation");
+                const auto query = query_of(image, 90, 1);
+                check(store.matches(query.selector, query.tokens, query.images).empty(),
+                      "renamed objects and a pending batch confer no catalog authority");
+                if (attempt == 0) {
+                    object_files = file_inventory(root.path + "/objects");
+                    check(!object_files.empty(), "the batch really has renamed object files");
+                    for (const auto& file : object_files) {
+                        struct stat info {};
+                        check(::stat((root.path + "/objects" + file).c_str(), &info) == 0,
+                              "the staged object's real inode can be recorded");
+                        object_inodes.push_back(info.st_ino);
+                    }
+                    written = store.counters().bytes_written;
+                    for (const auto& shard : directory_names(root.path + "/objects"))
+                        check(::chmod((root.path + "/objects/" + shard).c_str(), 0500) == 0,
+                              "renamed objects become genuinely undeletable without blocking reads or fsync");
+                } else {
+                    if (attempt == 1)
+                        check_eq(store.counters().bytes_written, written, "failed revival writes no payload a second time");
+                    check(file_inventory(root.path + "/objects") == object_files,
+                          "revival retains the exact same set of physical files");
+                    for (size_t i = 0; i < object_files.size(); ++i) {
+                        struct stat info {};
+                        check(::stat((root.path + "/objects" + object_files[i]).c_str(), &info) == 0 &&
+                                  info.st_ino == object_inodes[i],
+                              "revival reuses the same inode instead of replacing its content-addressed name");
+                    }
+                }
+                if (attempt == 2)
+                    for (const auto& shard : directory_names(root.path + "/objects"))
+                        check(::chmod((root.path + "/objects/" + shard).c_str(), 0700) == 0,
+                              "the successful retry restores normal shard permissions");
+                gate.resume();
+                ConversationStorePublishResult result;
+                check(store.wait_publish(result, 5000), "the batch/revival attempt settles");
+                store.set_object_batch_gate_for_test(nullptr, nullptr);
+                check(!gate.timed_out, "the deterministic batch gate never relies on its timeout");
+                check(result.released && store.ram_lease_bytes() == 0 && !store.writer_busy(),
+                      "every batch/revival outcome releases its image, RAM lease and writer slot");
+                check(store.healthy(), "object durability refusal never latches uncertain catalog authority");
+                if (attempt < 2) {
+                    check(result.status == ConversationStorePublishStatus::failed,
+                          "the revival itself must traverse the armed directory durability boundary");
+                    check_eq(store.counters().heads, 0, "failed batch/revival authorizes no head");
+                    check(file_digest(root.path + "/catalog") == catalog,
+                          "a roomy failed batch/revival leaves the catalog unchanged");
+                    check(directory_names(root.path + "/tmp").empty() &&
+                              directory_names(root.path + "/manifests").empty(),
+                          "an object durability failure creates neither manifest nor lingering scratch");
+                    const uint64_t charge = store.disk_charged_bytes();
+                    check(charge > base_charge, "failed deletion retains a real physical object charge");
+                    check_eq(store.counters().orphan_bytes, charge - base_charge,
+                             "each abandoned physical object retains exactly one stable orphan charge");
+                    if (attempt == 0) retained_charge = charge;
+                    else check_eq(charge, retained_charge, "failed revival adds no second object charge");
+                } else {
+                    check(result.status == ConversationStorePublishStatus::stored && result.new_bytes == 0,
+                          "a fully flushed revival becomes durable authority without rewriting any payload");
+                    successful_head = result.head_id;
+                    for (size_t i = 0; i < object_files.size(); ++i) {
+                        struct stat info {};
+                        check(::stat((root.path + "/objects" + object_files[i]).c_str(), &info) == 0 &&
+                                  info.st_ino == object_inodes[i],
+                              "successful revival leaves the retained payload inode unchanged");
+                    }
+                    check_eq(store.counters().orphan_bytes, 0,
+                             "successful revival transfers the stable orphan ledger into live object ownership");
+                }
+            }
+            store.close();
+            check(!store.run_intent_active(), "successful revival permits durable clean shutdown");
+        }
+        {
+            ConversationStore store(options);
+            check_eq(store.epoch(), epoch, "clean reopening preserves the successfully retried epoch");
+            check_eq(store.counters().heads, 1, "only the successful revival survives reopening");
+            ConversationStoreRead read;
+            std::string why;
+            check(store.demand(query_of(image, 91, 1), why) && store.wait_ready(91, 1, read, 5000) &&
+                      read.head_id == successful_head && read.image && images_equal(*read.image, image, why),
+                  "the revived history restores byte for byte after clean reopening");
+            read.image.reset();
+            store.release_read(91, 1);
+            store.close();
+        }
+    }
+
+    // Two of 257 distinct chunks must share a shard. Authorize ids first, so only the colliding objects (and a
+    // duplicate chunk) need durability in the successor. A partial-batch fault cannot fire on that single shard.
+    {
+        TempRoot root;
+        SavedConversation base = fixture(383, 1024);
+        base.checkpoints.clear();
+        base.kv.clear();
+        base.live.gdn.resize(0);
+        base.live.ple.resize(0);
+        base.live.tails.resize(0);
+        base.live.dead.resize(0);
+        base.live.block_pos.resize(0);
+        SavedConversation shared = base;
+        shared.live.gdn.resize(4096);
+        const ConversationStoreStreamId gdn{0, uint16_t(ConversationStoreStreamKind::live_gdn), 0, 0};
+        std::pair<Digest, uint64_t> identity;
+        std::string why;
+        check(identity_of(shared, gdn, identity, why), "the shared-shard fixture has a valid stream identity");
+        std::array<int, 256> first;
+        first.fill(-1);
+        int left = -1, right = -1;
+        for (int seed = 0; seed <= 256; ++seed) {
+            std::vector<uint8_t> bytes(4096, 0);
+            bytes[0] = uint8_t(seed);
+            bytes[1] = uint8_t(seed >> 8);
+            const auto object = conversation_store_detail::object_digest(identity.first, gdn.kind, identity.second,
+                                                                          bytes.size(), bytes.data());
+            if (first[object[0]] >= 0) {
+                left = first[object[0]];
+                right = seed;
+                break;
+            }
+            first[object[0]] = seed;
+        }
+        check(left >= 0 && right >= 0, "two distinct chunks share a shard by the pigeonhole principle");
+        {
+            auto& bytes = shared.live.gdn.write();
+            bytes.assign(3 * 4096, 0);
+            for (size_t index = 0; index < 3; ++index) {
+                const int seed = index == 1 ? right : left;
+                bytes[index * 4096] = uint8_t(seed);
+                bytes[index * 4096 + 1] = uint8_t(seed >> 8);
+            }
+        }
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        ConversationStorePublishResult prior, result;
+        check(publish_and_wait(store, base, 1, 1, prior), "the single-shard fixture first authorizes its ids");
+        const uint64_t chunks = store.counters().published_chunks;
+        const uint64_t dedup = store.counters().dedup_chunks;
+        store.set_publish_fault_for_test("batch-shard-partial");
+        check(publish_and_wait(store, shared, 2, 2, result) &&
+                  result.status == ConversationStorePublishStatus::stored,
+              "distinct objects in one shard and a repeated chunk need no second shard flush");
+        const uint64_t shared_head = result.head_id;
+        check_eq(store.counters().published_chunks - chunks, 2, "the shared-shard publication creates only two objects");
+        check(store.counters().dedup_chunks > dedup, "the repeated new chunk is deduplicated");
+        check(publish_and_wait(store, fixture(385, 1024), 3, 3, result) &&
+                  result.status == ConversationStorePublishStatus::failed,
+              "the partial fault remains armed until a second touched shard exists");
+
+        // A wholly authorized donor/dedup publication must leave a first-shard fault armed for new objects.
+        store.set_publish_fault_for_test("batch-shard-sync");
+        ConversationStorePublish donor_request;
+        donor_request.request_id = 4;
+        donor_request.generation = 4;
+        donor_request.reuse.push_back({shared_head, gdn, 0, 0, 4096});
+        check(store.publish(std::make_shared<SavedConversation>(shared), donor_request, why) == kAccepted,
+              "the wholly authorized donor/dedup publication is admitted");
+        check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored &&
+                  result.reused_bytes == 4096 && result.new_bytes == 0,
+              "authorized donor and deduplicated objects publish without a directory batch");
+        check(publish_and_wait(store, fixture(387, 1024), 5, 5, result) &&
+                  result.status == ConversationStorePublishStatus::failed,
+              "authorized reuse leaves the durability fault armed for genuinely new objects");
+        store.close();
+    }
+
+    // A selected immutable reader remains usable during the batch; renames alone never authorize the successor.
+    {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const SavedConversation prior = fixture(389, 1024), next = fixture(391, 1024);
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, prior, 1, 1, result), "the concurrent-reader fixture stores its predecessor");
+        SelectedHoldGate read_gate, batch_gate;
+        store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &read_gate);
+        store.set_object_batch_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &batch_gate);
+        std::string why;
+        check(store.demand(query_of(prior, 96, 1), why), "a reader selects the already-authorized predecessor");
+        read_gate.await();
+        ConversationStorePublish request;
+        request.request_id = 2;
+        request.generation = 2;
+        check(store.publish(std::make_shared<SavedConversation>(next), request, why) == kAccepted,
+              "a successor can emit objects beside the selected immutable reader");
+        batch_gate.await();
+        const auto query = query_of(next, 97, 1);
+        check(store.matches(query.selector, query.tokens, query.images).empty(),
+              "the successor is unselectable while its object-directory batch is paused");
+        check_eq(directory_names(root.path + "/manifests").size(), 1,
+                 "the paused successor has not created a manifest");
+        read_gate.resume();
+        ConversationStoreRead read;
+        check(store.wait_ready(96, 1, read, 5000) && read.image && images_equal(*read.image, prior, why),
+              "the selected reader restores unchanged while the writer remains paused at object durability");
+        read.image.reset();
+        store.release_read(96, 1);
+        store.cancel_publication(2, 2);
+        check(store.writer_busy(), "cancelling an already-started batch cannot retire its active writer");
+        batch_gate.resume();
+        check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::stored,
+              "cancelling a started publication is a no-op: the successor stores after its durability drain");
+        check(!store.matches(query.selector, query.tokens, query.images).empty(),
+              "catalog publication, not the pause or renames, makes the successor selectable");
+        check(!read_gate.timed_out && !batch_gate.timed_out, "reader/batch interleaving uses no timeout as evidence");
+        store.set_read_gate_for_test(nullptr, nullptr);
+        store.set_object_batch_gate_for_test(nullptr, nullptr);
+        store.close();
+    }
+
+    // Destruction after refusal, unlike close(), keeps intent armed and preserves existing epoch distrust.
+    {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        uint64_t epoch = 0;
+        {
+            ConversationStore store(options);
+            epoch = store.epoch();
+            store.set_publish_fault_for_test("batch-parent-sync");
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, fixture(393, 1024), 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::failed,
+                  "the interrupted-run fixture fails before authorizing its publication");
+        }
+        ConversationStore reopened(options);
+        check_eq(reopened.epoch(), epoch + 1, "unclean restart after a batch refusal distrusts the previous epoch");
+        check_eq(reopened.counters().heads, 0, "interrupted object publication never resurrects a history");
+        check(directory_names(root.path + "/manifests").empty(),
+              "unclean recovery finds no manifest authority from an interrupted batch");
+        reopened.close();
+    }
+    if (had) ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved.c_str(), 1);
+    else ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");
 }
 
 } // namespace

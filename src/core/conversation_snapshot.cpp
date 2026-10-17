@@ -182,8 +182,13 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
 } // namespace
 
 bool resident_direct_copy_enabled() {
-    const char* value = std::getenv("STRATA_RESIDENT_DIRECT_COPY");
-    return value && std::strcmp(value, "1") == 0;
+    // Freeze once, before admission. Resident/MTP handoffs must never switch to
+    // the allocating snapshot branch after a direct-copy envelope was priced.
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_RESIDENT_DIRECT_COPY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, const ModelGeometry& g,

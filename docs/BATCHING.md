@@ -474,6 +474,18 @@ bounded decode round, then every stage drains before prompt/verifier scratch is 
 The legacy `batch_read_piece` helper still selects one whole run for pipelined groups; only budget `0`
 uses that selection to bypass the quantum loop. A positive budget instead selects quanta with `TimeBudget`.
 
+`STRATA_PREFILL_RETAINED_LAYERS=stage` can separately opt into the
+[retained-stage budget candidate](experiments/retained-prefill-model.md#opt-in-retained-stage-budget-candidate).
+It keeps 2048-token chunks and the existing credit/debt decisions, with a sole
+synchronous pump owner, bounded in-chunk decode and a full idle fence before
+store or parking seams. It requires four fully resident slots, two MTP groups
+and owned scratch on distinct devices; layer mode with a positive budget and
+the optional 1024 split remain incompatible. This combination is not enabled
+by default and has no GPU or performance qualification. It intentionally loses
+the ordinary idle two-chunk fill, so cold/cohort throughput can regress.
+Phase0 prefill receipts remain inclusive host spans; the scheduler's subtraction
+of callback decode service must not be read as an additive diagnostic breakdown.
+
 `STRATA_PREFILL_SPLIT_OVER_BUDGET=1024` separately opts into an execution split, not a smaller allocation.
 It applies only with a positive foreground budget, an admitted 2048-token chunk whose measured cost
 exceeds that budget, a currently served decoder, one selected contended chunk rather than pipeline fill,

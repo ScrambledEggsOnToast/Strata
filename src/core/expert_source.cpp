@@ -5521,10 +5521,37 @@ void WindowedExpertSource::close() {
     close_locked();
 }
 
+bool WindowedExpertSource::retire_ring(std::string& err) {
+    std::lock_guard<std::mutex> lock(mu_);
+    err.clear();
+    if (retired_) return true;
+    // A failed wait need not prove that its queued destination is no longer in use. Fail closed rather
+    // than releasing storage under a possibly pending direct read; keep the original failure for reporting.
+    if (failed_) {
+        err = "WindowedExpertSource: cannot retire a failed source: " + error_;
+        return false;
+    }
+    if (ring_ == nullptr) {
+        err = "WindowedExpertSource: cannot retire a source that is not open";
+        return false;
+    }
+    // ring_ is created only by alloc_aligned in open(), never borrowed. Every successful submit completes
+    // under this same mutex before blob returns, so a healthy source has no pending direct-I/O destination.
+    // Escaped pointer readers are the CALLER'S precondition; the mutex cannot observe or drain them.
+    error_ = "WindowedExpertSource: ring retired; explicitly reopen before reading";
+    strata::platform::DirectFile::free_aligned(ring_);
+    ring_ = nullptr;
+    ring_bytes_ = 0;
+    retired_ = true;
+    return true;
+}
+
 void WindowedExpertSource::close_locked() {
+    // Drain POSIX reader workers before releasing their possible destinations.
+    // Windows completion draining remains a separate DirectFile contract.
+    files_.clear();
     if (ring_ != nullptr) strata::platform::DirectFile::free_aligned(ring_);
     ring_ = nullptr;
-    files_.clear();   // every SourceFile's DirectFile closes its handle and joins its pool
     layer_offsets_.clear();
     layer_blob_bytes_.clear();
     layer_file_.clear();
@@ -5543,6 +5570,7 @@ void WindowedExpertSource::close_locked() {
     reads_ = 0;
     io_bytes_ = 0;
     failed_ = false;
+    retired_ = false;
     error_.clear();
 }
 

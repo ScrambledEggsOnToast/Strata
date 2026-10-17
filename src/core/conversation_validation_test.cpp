@@ -610,6 +610,114 @@ void checkpoint_payload_stages() {
           "a real three-stage capture allocates exactly the priced stage payloads");
 #endif
 }
+
+void resident_transfer_envelopes() {
+    ModelGeometry g;
+    g.n_layers = 8; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    const int64_t split[] = {2, 6};
+    auto shape = strata::kernels::qsa_real_shapes();
+    shape.n_head_kv = g.n_head_kv; shape.head_dim = g.head_dim; shape.idx_dim = g.idx_key_dim;
+    for (int fmt : {0, 1, 2, 3}) for (int64_t cells : {1, 5, 96}) {
+        auto roles = strata::plan::qsa_resolve_roles(shape, cells, fmt, -1, -1, -1, 8);
+        strata::plan::ResidentHostBytes legacy, direct;
+        check(resident_host_payload(g, cells, true, roles, 3, split, false, 1, legacy) &&
+              resident_host_payload(g, cells, true, roles, 3, split, true, 1, direct),
+              "both transfer envelopes price supported formats and partial pages");
+        check(direct.histories == legacy.histories && direct.checkpoints == legacy.checkpoints &&
+              direct.transfer_transient > strata::plan::kResidentCheckpointMetadataBytes &&
+              direct.transfer_transient < legacy.transfer_transient,
+              "direct removes only serial images, retaining checkpoint/repair storage and margin");
+        const auto old_format = roles.working_main.format;
+        roles.working_main.format = 999;
+        for (bool mode : {false, true})
+            check(!resident_host_payload(g, cells, true, roles, 3, split, mode, 1, direct) &&
+                  !direct.histories && !direct.checkpoints && !direct.transfer_transient,
+                  "unknown main format cannot become a zero-image optimistic admission");
+        roles.working_main.format = old_format;
+        roles.working_draft.format = 999;
+        for (bool mode : {false, true})
+            check(!resident_host_payload(g, cells, true, roles, 3, split, mode, 1, direct),
+                  "unknown draft format fails closed in both modes");
+    }
+    const auto roles = strata::plan::qsa_resolve_roles(shape, 96, 0, -1, -1, -1, 8);
+    for (bool mode : {false, true}) {
+        strata::plan::ResidentHostBytes host;
+        check(!resident_host_payload(g, 0, true, roles, 3, split, mode, 1, host) &&
+              !host.transfer_transient, "invalid context has no usable transfer price");
+        const int64_t bad_split[] = {6, 2};
+        check(!resident_host_payload(g, 96, true, roles, 3, bad_split, mode, 1, host),
+              "invalid split cannot shrink the transfer envelope");
+        auto overflow = g;
+        overflow.head_dim = INT64_MAX;
+        check(!resident_host_payload(overflow, 96, true, roles, 3, split, mode, 1, host) &&
+              !host.transfer_transient, "direct still validates image geometry arithmetic before omitting storage");
+        strata::plan::ResidentCheckpointPayload checkpoint{UINT64_MAX, UINT64_MAX, 3};
+        check(!strata::plan::resident_host_bytes(96, checkpoint, 0, 0, 1, host) &&
+              !host.transfer_transient, "checkpoint plus margin overflow fails closed even without images");
+        auto unknown = roles;
+        unknown.slot_main.kv.mode = 999;
+        strata::plan::ResidentBytes bytes;
+        const char* unpriced = nullptr;
+        check(!resident_allocation_bytes(g, 96, 1, 2, true, unknown, mode, 1, bytes, unpriced, 3, split) &&
+              unpriced && !bytes.transfer_transient,
+              "unknown actual-owner placement refuses before either transfer envelope is admitted");
+    }
+    {
+        using namespace strata::plan;
+        ResidentCheckpointPayload checkpoint{64, 64, 3};
+        ResidentHostBytes one, many, legacy;
+        check(resident_host_bytes(96, checkpoint, 0, 0, 1, one) &&
+              resident_host_bytes(96, checkpoint, 0, 0, 7, many),
+              "price independently owned retained chains");
+        check(many.checkpoints == 7 * one.checkpoints && many.histories == one.histories,
+              "every retained root/pin/latest owns a full checkpoint without duplicating seat histories");
+        const uint64_t aliases = 7 * 3 * (96 * sizeof(int32_t) + kResidentCheckpointMetadataBytes);
+        check(many.transfer_transient == aliases + aliases / 8,
+              "bind keeps old owners alive and prices new alias IDs, stage objects and controls");
+        check(resident_host_bytes(96, checkpoint, 1000000, 0, 7, legacy) &&
+              legacy.transfer_transient == 1000064 + 1000064 / 8 + kResidentCheckpointMetadataBytes,
+              "legacy transfer and bind alias peaks compose by maximum, not sum");
+        // Nonintegral eighths and the exact max crossover: these constants
+        // come from a one-stage 65-byte payload, one cell (8 history bytes),
+        // and the independently specified 4096-byte metadata envelope.
+        ResidentCheckpointPayload odd{65, 65, 1};
+        ResidentHostBytes below, tie, above;
+        check(kResidentCheckpointMetadataBytes == 4096 &&
+              resident_host_bytes(1, odd, 393, 0, 1, below) &&
+              resident_host_bytes(1, odd, 394, 0, 1, tie) &&
+              resident_host_bytes(1, odd, 395, 0, 1, above) &&
+              below.checkpoints == 4171 && below.histories == 8 &&
+              below.transfer_transient == 4613 && tie.transfer_transient == 4613 &&
+              above.transfer_transient == 4614,
+              "ceil(73/8)=10 and ceil(4100/8)=513; serial maximum crosses at 459 bytes");
+        for (uint64_t limit : {uint64_t(0), uint64_t(INT32_MAX) + 1, UINT64_MAX})
+            check(!resident_host_bytes(96, checkpoint, 0, 0, limit, many) &&
+                  !many.checkpoints && !many.transfer_transient, "invalid chain limit fails closed");
+        checkpoint.bytes = UINT64_MAX / 2;
+        check(!resident_host_bytes(96, checkpoint, 0, 0, 7, many) && !many.checkpoints,
+              "retained chain multiplication overflow fails closed");
+    }
+    // The production caller resolves this before pricing. Later environment
+    // mutation must not switch ResidentSlots/MTP to an allocating legacy branch.
+    const char* value = std::getenv("STRATA_RESIDENT_DIRECT_COPY");
+    const bool had_value = value != nullptr;
+    const bool expected = value && std::strcmp(value, "1") == 0;
+    const std::string original = value ? value : "";
+    check(resident_direct_copy_enabled() == expected, "only exact one selects direct handoff at process resolution");
+#ifdef _WIN32
+    _putenv_s("STRATA_RESIDENT_DIRECT_COPY", expected ? "0" : "1");
+#else
+    setenv("STRATA_RESIDENT_DIRECT_COPY", expected ? "0" : "1", 1);
+#endif
+    check(resident_direct_copy_enabled() == expected, "pricing and later runtime share one immutable selection");
+#ifdef _WIN32
+    _putenv_s("STRATA_RESIDENT_DIRECT_COPY", original.c_str());
+#else
+    if (had_value) setenv("STRATA_RESIDENT_DIRECT_COPY", original.c_str(), 1);
+    else unsetenv("STRATA_RESIDENT_DIRECT_COPY");
+#endif
+}
 #if defined(CONVERSATION_TEST_TRANSFERS)
 namespace shared_draft_fixture {
 int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
@@ -949,6 +1057,7 @@ int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
     checkpoint_payload_stages();
+    resident_transfer_envelopes();
 #if defined(CONVERSATION_TEST_TRANSFERS)
     for (int format : {0,1,2}) ring_refusal(format);
     for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9,80}) exact_shared_cut(format, cut);

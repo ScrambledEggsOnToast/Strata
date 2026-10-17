@@ -11,7 +11,8 @@
 
 namespace strata::core {
 
-// Native resident handoff experiment. Only the exact value "1" enables it.
+// Process-immutable native resident handoff selection, resolved before admission.
+// Only exact "1" enables it; unsupported layouts fail without a host-image fallback.
 bool resident_direct_copy_enabled();
 // Copy between existing same-device owners, using their authoritative pools (which
 // may already be mapped host pools). No intermediate image or CPU fallback.

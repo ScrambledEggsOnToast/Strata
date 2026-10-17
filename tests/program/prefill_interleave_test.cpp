@@ -3,20 +3,26 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/time_budget.hpp"
 #include "strata/program/serve_controls.hpp"
+#include "strata/program/phase_receipts.hpp"
 
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <thread>
 #include <vector>
+
+namespace phase = strata::program::phase;
 
 struct Clock {
     using time_point = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
@@ -40,6 +46,7 @@ struct NoControlRequests {
     bool allow_park = false;
     int64_t parked_at = -1;
     int64_t prefill_split_until = 0;
+    std::vector<int32_t> parked_prefix;
     int64_t take_prefill_split_until() { return std::exchange(prefill_split_until, 0); }
     void cancel(int) { throw std::logic_error("unexpected BSTOP"); }
     bool available(int slot) {
@@ -50,6 +57,7 @@ struct NoControlRequests {
               bool, std::string&) {
         if (!allow_park || parked_at >= 0) throw std::logic_error("unexpected park");
         parked_at = (int64_t) prefix.size();
+        parked_prefix = prefix;
         prefill_split_until = request.prefill_split_until;
         return true;
     }
@@ -61,10 +69,38 @@ struct Result {
     std::vector<int64_t> store_positions;
     int64_t parked_at = -1;
     int64_t parked_split_until = 0;
+    int64_t final_frontier = 0;
+    std::vector<int32_t> parked_prefix;
     double estimate_ms = 0;
     bool okay = false, fatal = false;
-    int drains = 0;
+    bool drain_observed = false;
     std::string error;
+    std::vector<std::array<int, 2>> retained_starts;
+    std::vector<int64_t> retained_start_clocks;
+    // Stage/group pairs are semantic work receipts, not callback-count checks.
+    std::vector<std::pair<int, int>> completed_stages, drained_stages;
+    std::vector<std::array<int, 3>> completions_under_exclusion;
+    std::vector<int> reacquired_with_peer;
+    std::vector<std::array<int, 2>> seam_rounds;
+    std::array<int, 2> completed_rounds{}, starts_after_cancel{}, peer_completions_after_cancel{};
+    int pump_calls = 0, cancel_controls = 0;
+    int ownership_violations = 0, exclusion_violations = 0, fence_violations = 0, budget_mutations = 0;
+    int final_blocked_stage = -1;
+    bool final_bounded_round = false, final_inflight = false, decode_credit = false;
+    double credited_ms = 0, resident_ms = 0, decode_estimate_ms = 0, decode_age_ms = 0;
+    std::vector<int64_t> checkpoint_positions;
+    bool prefill_phase_observed = false, copyin_phase_observed = false;
+    bool decode_phase_unavailable = false, parked_identity_preserved = false;
+};
+
+struct RetainedSchedule {
+    int64_t stage_ms = 20, pump_ms = 5;
+    int64_t checkpoint_every = 0;
+    int stop_boundary = -1, cancel_boundary = -1, fail_pump_call = -1;
+    bool foreign_callback = false, admission_before_cancel = false;
+    // Each launched stage completes only after its own number of pump polls.
+    std::array<std::array<int, 3>, 2> completion_polls{{{{1, 1, 1}}, {{1, 1, 1}}}};
+    bool reverse_completions = false;
 };
 
 // Inject Prefill's terminal outcome at the existing read_part seam. This
@@ -78,6 +114,16 @@ struct Prefill {
     bool pipelined = false;
     std::deque<std::string>* incoming = nullptr;
     std::atomic<bool>* cancel_after_run = nullptr;
+    const RetainedSchedule* schedule = nullptr;
+    std::vector<Prefill*> owners;
+    const std::vector<int>* stage_group = nullptr;
+    strata::program::TimeBudget* budget = nullptr;
+    std::atomic<bool>* stop = nullptr;
+    std::deque<std::string>* controls = nullptr;
+    bool* retained_running = nullptr;
+    std::function<bool()> consumers_live;
+    std::vector<int64_t>* checkpoint_next = nullptr;
+    int64_t* next_checkpoint = nullptr;
     int64_t chunk() const { return 2048; }
     bool run(const int64_t* data, int64_t count, int64_t pos, std::string& e) {
         if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
@@ -90,9 +136,61 @@ struct Prefill {
         return true;
     }
     bool run_retained(const int64_t* data, int64_t count, int64_t pos, std::string& e,
-                      const std::function<bool(Prefill*, int64_t, std::string&)>&, bool) {
+                      const std::function<bool(Prefill*, int64_t, std::string&)>& step, bool) {
         if (retained_error && *retained_error) { e = retained_error; return false; }
-        return run(data, count, pos, e);
+        if (!schedule) return run(data, count, pos, e);
+        if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
+        struct Exit { bool& running; ~Exit() { running = false; } } exit{*retained_running};
+        *retained_running = true;
+        result.reads.emplace_back(pos, count);
+        result.retained_starts.push_back({});
+        int boundary = 0;
+        const auto invoke = [&](int stage, int64_t layer) {
+            // The production callback must reacquire only this device.
+            if (schedule->stop_boundary == boundary) stop->store(true);
+            if (schedule->cancel_boundary == boundary) {
+                if (schedule->admission_before_cancel) controls->push_back("BGEN queued-admission");
+                controls->push_back("BSTOP 0");
+            }
+            ++boundary;
+            const double chunk_ms = budget->chunk_ms(), decode_ms = budget->decode_ms();
+            const bool credit = budget->decode_allowed(0);
+            bool okay = false;
+            if (schedule->foreign_callback) {
+                std::thread foreign([&] { okay = step(owners[(size_t)stage], layer, e); });
+                foreign.join();
+            } else okay = step(owners[(size_t)stage], layer, e);
+            if (budget->chunk_ms() != chunk_ms || budget->decode_ms() != decode_ms ||
+                budget->decode_allowed(0) != credit) ++result.budget_mutations;
+            if (okay && (*stage_group)[(size_t)stage] >= 0) ++result.exclusion_violations;
+            if (okay && std::any_of(stage_group->begin(), stage_group->end(), [](int group) { return group >= 0; }))
+                result.reacquired_with_peer.push_back(stage);
+            if (!okay) return false;
+            // This fixture injects Prefill's existing validated cancellation
+            // receipt. CUDA cleanup/state validity is not established here.
+            if (stop->load()) { e = "cancelled"; return false; }
+            return true;
+        };
+        for (int stage = 0; stage < (int)owners.size(); ++stage) {
+            if (!invoke(stage, 0)) return false;
+            Clock::ms += schedule->stage_ms;
+            if (!invoke(stage, 1)) return false;
+            if (schedule->checkpoint_every > 0 && pos + count >= (*checkpoint_next)[(size_t)stage]) {
+                if (consumers_live()) ++result.fence_violations;
+                result.checkpoint_positions.push_back(pos + count);
+                (*checkpoint_next)[(size_t)stage] = pos + count + schedule->checkpoint_every;
+            }
+        }
+        for (int stage = (int)owners.size() - 2; stage >= 0; --stage)
+            if (!invoke(stage, 1)) return false;
+        if (schedule->checkpoint_every > 0 && pos + count >= *next_checkpoint) {
+            if (consumers_live()) ++result.fence_violations;
+            *next_checkpoint = pos + count + schedule->checkpoint_every;
+        }
+        position += count;
+        if (incoming) { incoming->push_back("BYIELD 0"); incoming = nullptr; }
+        if (cancel_after_run) cancel_after_run->store(true);
+        return true;
     }
 };
 }
@@ -111,19 +209,42 @@ static void split_setting(const char* value) {
 #endif
 }
 
+struct RetainedOptions {
+    double budget_ms = 100, prior_chunk_ms = 60;
+    int64_t tokens = 2048, begin_at = 0, pending_split_until = 0;
+    bool active = true, yield = false, drain_ok = true;
+};
+
 static Result read_prompt(double budget_ms, bool piped, bool split, bool active, int batch = 4,
                           const char* retained_error = nullptr, bool drain_ok = true, int64_t n = 10000,
                           double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1,
                           bool empty_decode_credit = false, bool cancel_first_launch = false,
-                          int64_t prior_chunk_tokens = 2048, int64_t begin_at = 0, int64_t pending_split_until = 0) {
+                          int64_t prior_chunk_tokens = 2048, int64_t begin_at = 0, int64_t pending_split_until = 0,
+                          const RetainedSchedule* retained_schedule = nullptr) {
+    // Compile Phase0's real diagnostic scopes, not a second fixture-only API.
+    // Their host clock is deliberately independent of the synthetic scheduler.
+    phase::Leg phase_leg(phase::parse_input(
+        "GEN 16 phase_request=retained-fixture phase_leg=1 "
+        "phase_incarnation=0123456789abcdef0123456789abcdef phase_priority=background 1 2"), 1, phase::now_ns());
+    phase::Leg* phase_current = &phase_leg;
+    const bool phase_receipts = true;
     Clock::ms = 0;
     Result result;
     const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
-    struct Options { int batch; int prompt_cache = 6; int64_t short_read = 32; double foreground_budget_ms; };
-    const Options o{batch, 6, 32, budget_ms};
+    struct Options {
+        int batch;
+        int prompt_cache = 6;
+        int64_t short_read = 32;
+        double foreground_budget_ms;
+        int64_t prompt_cache_every = 0;
+    };
+    const Options o{batch, 6, 32, budget_ms, retained_schedule ? retained_schedule->checkpoint_every : 0};
     std::vector<int64_t> ids((size_t) n);
+    for (int64_t i = 0; i < n; ++i) ids[(size_t)i] = i;
     struct Stage { strata::prefill::Prefill sp; };
     std::vector<std::unique_ptr<Stage>> stages(split ? 2 : 0);
+    int64_t pp_next_check = o.prompt_cache_every > 0 ? begin_at + o.prompt_cache_every : INT64_MAX;
+    std::vector<int64_t> part_next(stages.size() + 1, pp_next_check);
     strata::program::TimeBudget time_budget(budget_ms, 0.25);
     if (prior_chunk_ms > 0) time_budget.prefilled(prior_chunk_ms, 1, prior_chunk_tokens);
     // Seed the historical 2048-token cost without letting old credit pay for
@@ -134,36 +255,137 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     std::atomic<bool> stop_req{false};
     const auto credit_service = [] {};
     const auto retire_stopped = [] { return true; };
-    const auto batch_on = [&] { return active; };
+    // One active resident slot per two-slot group; cancelling slot 0 must not
+    // disable slot 2. The real resident authority, not this adapter, owns reuse.
+    std::array<bool, 4> slot_active{{active, false, active, false}};
+    std::array<bool, 2> cancelled_group{};
+    const auto batch_on = [&] {
+        return retained_schedule ? std::any_of(slot_active.begin(), slot_active.end(), [](bool live) { return live; }) : active;
+    };
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
     sp.pipelined = piped;
     sp.position = begin_at;
     if (cancel_first_launch) sp.cancel_after_run = &stop_req;
-    const bool retained_prefill = retained_error != nullptr, retained_layer_yields = true;
+    const bool retained_prefill = retained_error != nullptr, retained_layer_yields = budget_ms <= 0;
+    bool retained_running = false, bounded_round = false;
     int retained_blocked_stage = -1;
     std::vector<int> stage_group(3, -1);
-    struct Group { bool inflight = false; };
+    struct Group { bool inflight = false, round_started = false; int stage = 0; };
     std::vector<Group> pg(2);
+    std::array<int, 3> remaining_polls{};
+    bool draining = false;
+    const auto group_active = [&](int group) {
+        return retained_schedule ? slot_active[(size_t)group * 2] || slot_active[(size_t)group * 2 + 1] : active;
+    };
     const auto pipe_inflight = [&] {
         return std::any_of(pg.begin(), pg.end(), [](const Group& group) { return group.inflight; });
     };
     std::string err;
-    const auto score_controls = [](bool) {};
-    const auto pump_mtp = [](bool) -> bool { throw std::logic_error("unexpected retained callback"); };
+    const auto pump_mtp = [&](bool may_start) -> bool {
+        if (!retained_schedule) throw std::logic_error("unexpected retained callback");
+        ++result.pump_calls;
+        if (result.pump_calls > 4096) throw std::logic_error("synthetic pump failed to converge");
+        Clock::ms += retained_schedule->pump_ms;
+        if (result.pump_calls == retained_schedule->fail_pump_call) {
+            err = "retained pump failed";
+            return false;
+        }
+        for (int order = 0; order < (int)stage_group.size(); ++order) {
+            const int stage = retained_schedule->reverse_completions ? (int)stage_group.size() - 1 - order : order;
+            const int gi = stage_group[(size_t)stage];
+            if (gi < 0 || --remaining_polls[(size_t)stage] > 0) continue;
+            stage_group[(size_t)stage] = -1;
+            pg[(size_t)gi].stage = stage + 1;
+            result.completed_stages.emplace_back(stage, gi);
+            if (draining) result.drained_stages.emplace_back(stage, gi);
+            if (retained_blocked_stage >= 0)
+                result.completions_under_exclusion.push_back({retained_blocked_stage, stage, gi});
+            if (stage + 1 == (int)stage_group.size()) {
+                pg[(size_t)gi].inflight = false;
+                ++result.completed_rounds[(size_t)gi];
+                if (result.cancel_controls > 0 && !cancelled_group[(size_t)gi])
+                    ++result.peer_completions_after_cancel[(size_t)gi];
+            }
+        }
+        for (int stage = (int)stage_group.size() - 1; stage >= 0; --stage) {
+            if (stage == retained_blocked_stage || stage_group[(size_t)stage] >= 0) continue;
+            for (size_t gi = 0; gi < pg.size(); ++gi) {
+                auto& group = pg[gi];
+                if (stage == 0) {
+                    if (!may_start || !group_active((int)gi) || group.inflight || (bounded_round && group.round_started)) continue;
+                    group.inflight = true;
+                    group.round_started = bounded_round;
+                    group.stage = 0;
+                    if (cancelled_group[gi]) ++result.starts_after_cancel[gi];
+                    if (retained_running) {
+                        ++result.retained_starts.back()[gi];
+                        result.retained_start_clocks.push_back(Clock::ms - retained_schedule->pump_ms);
+                    }
+                } else if (!group.inflight || group.stage != stage) continue;
+                stage_group[(size_t)stage] = (int)gi;
+                remaining_polls[(size_t)stage] = retained_schedule->completion_polls[gi][(size_t)stage];
+                break;
+            }
+        }
+        // A consumer already occupying the excluded device may finish there;
+        // only new launches onto that device are forbidden above.
+        return true;
+    };
     const auto pipe_drain = [&] {
-        ++result.drains;
+        result.drain_observed = true;
+        if (retained_running) ++result.ownership_violations;
         err.clear(); // The real caller can share its error string with the peer pipeline.
         if (!drain_ok) err = "descendant drain failed";
-        return drain_ok;
+        if (!drain_ok) return false;
+        draining = true;
+        while (pipe_inflight()) {
+            if (!pump_mtp(false)) { draining = false; return false; }
+        }
+        draining = false;
+        return true;
     };
     std::mutex in_mu;
     std::deque<std::string> in_lines;
+    if (retained_schedule) {
+        sp.schedule = retained_schedule;
+        sp.owners.push_back(&sp);
+        for (auto& stage : stages) {
+            stage = std::make_unique<Stage>(Stage{strata::prefill::Prefill{ids.data(), result}});
+            sp.owners.push_back(&stage->sp);
+        }
+        sp.stage_group = &stage_group;
+        sp.budget = &time_budget;
+        sp.stop = &stop_req;
+        sp.controls = &in_lines;
+        sp.retained_running = &retained_running;
+        sp.consumers_live = pipe_inflight;
+        sp.checkpoint_next = &part_next;
+        sp.next_checkpoint = &pp_next_check;
+    }
     auto decode_round = [&]() -> bool {
+        if (retained_running) ++result.ownership_violations;
         result.decode_positions.push_back(sp.position);
-        Clock::ms += 5;
+        const auto begin = Clock::now();
+        if (retained_schedule) {
+            const auto before = result.completed_rounds;
+            bounded_round = true;
+            for (auto& group : pg) group.round_started = group.inflight;
+            for (;;) {
+                bool pending = pipe_inflight();
+                for (size_t gi = 0; gi < pg.size(); ++gi)
+                    pending = pending || (!pg[gi].round_started && group_active((int)gi));
+                if (!pending) break;
+                if (!pump_mtp(true)) { bounded_round = false; return false; }
+            }
+            bounded_round = false;
+            result.seam_rounds.push_back({result.completed_rounds[0] - before[0],
+                                         result.completed_rounds[1] - before[1]});
+            if (pipe_inflight()) ++result.fence_violations;
+        } else Clock::ms += 5;
         last_decode = Clock::now();
-        time_budget.decoded(5);
-        if (time_budget.enabled()) resident_round_ms += 5;
+        const double wall_ms = std::chrono::duration<double, std::milli>(last_decode - begin).count();
+        time_budget.decoded(wall_ms);
+        if (time_budget.enabled()) resident_round_ms += wall_ms;
         if (yield_on_decode_at >= 0 && sp.position >= yield_on_decode_at) {
             in_lines.push_back("BYIELD 0");
             yield_on_decode_at = -1;
@@ -180,9 +402,32 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     resident.prefill_split_until = pending_split_until;
     if (inject_yield) sp.incoming = &in_lines;
     const auto resident_control = [&](const std::string& command) {
-        if (command.rfind("BSTOP ", 0) == 0) resident.cancel(std::atoi(command.c_str() + 6));
+        if (command.rfind("BSTOP ", 0) == 0) {
+            const int slot = std::atoi(command.c_str() + 6);
+            if (!retained_schedule) {
+                resident.cancel(slot);
+                active = false;
+            } else if (slot >= 0 && slot < (int)slot_active.size()) {
+                slot_active[(size_t)slot] = false;
+                cancelled_group[(size_t)slot / 2] = !group_active(slot / 2);
+            }
+            ++result.cancel_controls;
+        }
     };
-    const auto park_replaced = [](int) { return true; }; // GPU snapshotting is outside this CPU control-flow seam.
+    const auto score_controls = [&](bool consume_yield) {
+        for (;;) {
+            std::string control;
+            {
+                std::lock_guard<std::mutex> lock(in_mu);
+                if (!strata::program::pop_control_prefix(in_lines, control, consume_yield)) break;
+            }
+            resident_control(control);
+        }
+    };
+    const auto park_replaced = [&](int) {
+        if (retained_running || pipe_inflight() || bounded_round) ++result.fence_violations;
+        return true;
+    }; // GPU snapshotting is outside this CPU control-flow seam.
     const int admit_slot = -1;
     const std::vector<int> req_imgs;
     const std::vector<ConvCheckpoint> checks;
@@ -190,9 +435,23 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const bool resumed_from0 = false, trace = false;
     struct Slot { bool failed = false; };
     const std::vector<Slot> bs(4);
+    // The compiled production loop names these store authorities, but this
+    // scheduling fixture never authorizes disk/store ownership changes.
+    const bool store_on = false;
+    constexpr uint64_t kSessionOwner = 0, kResidentOwnerFirst = 1;
+    struct StoreOwner {
+        bool force_fresh = false;
+        phase::Identity phase_producer;
+        void borrow() { throw std::logic_error("unexpected store borrow"); }
+    } no_store;
+    const auto store_owner = [&](uint64_t) -> StoreOwner& { return no_store; };
 
     // Disk publication is exercised by the real-engine persistence qualification, not this scheduling fixture.
-    const auto store_seam = [&] { result.store_positions.push_back(sp.position); };
+    const auto store_seam = [&] {
+        if (retained_prefill && time_budget.enabled() &&
+            (retained_running || pipe_inflight() || bounded_round)) ++result.fence_violations;
+        result.store_positions.push_back(sp.position);
+    };
 
     // CMake extracts this verbatim from generate.cpp and regenerates it whenever that source changes.
 #include "prefill_read_part.inc"
@@ -208,14 +467,205 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.estimate_ms = time_budget.chunk_ms();
     result.parked_at = resident.parked_at;
     result.parked_split_until = resident.prefill_split_until;
+    result.parked_prefix = resident.parked_prefix;
+    result.final_frontier = sp.position;
+    result.final_blocked_stage = retained_blocked_stage;
+    result.final_bounded_round = bounded_round;
+    result.final_inflight = pipe_inflight();
+    result.decode_credit = time_budget.decode_allowed(0);
+    result.credited_ms = credited_prefill_ms;
+    result.resident_ms = resident_round_ms;
+    result.decode_estimate_ms = time_budget.decode_ms();
+    result.prefill_phase_observed = phase_leg.totals[size_t(phase::Stage::prefill_run)].count > 0;
+    result.copyin_phase_observed = phase_leg.totals[size_t(phase::Stage::resident_copyin)].count > 0;
+    result.decode_phase_unavailable = !phase_leg.totals[size_t(phase::Stage::decode_interleave)].known;
+    result.parked_identity_preserved = no_store.phase_producer.valid() &&
+        std::strcmp(no_store.phase_producer.request, phase_leg.input.identity.request) == 0 &&
+        std::strcmp(no_store.phase_producer.incarnation, phase_leg.input.identity.incarnation) == 0 &&
+        no_store.phase_producer.leg == phase_leg.input.identity.leg &&
+        no_store.phase_producer.priority == phase_leg.input.identity.priority;
+    result.decode_age_ms = std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count();
     return result;
+}
+
+static Result read_retained(const RetainedSchedule& schedule, const RetainedOptions& o = {}) {
+    return read_prompt(o.budget_ms, true, true, o.active, 4, "", o.drain_ok, o.tokens, o.prior_chunk_ms,
+                       o.yield, -1, false, false, 2048, o.begin_at, o.pending_split_until, &schedule);
 }
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
+static void test_retained_budget() {
+    // A complete bounded callback quantum is settled once at the idle seam.
+    // Moving this reviewed policy fixture here keeps the change in program scope.
+    strata::program::TimeBudget retained(100, .25);
+    retained.prefilled(60, 1, 2048);
+    retained.decoded(250);
+    CHECK(!retained.decode_allowed(0) && retained.decode_ms() == 250);
+    retained.background_work(40);
+    CHECK(!retained.decode_allowed(0));
+    retained.background_work(10);
+    CHECK(!retained.decode_allowed(0));
+    retained.background_work(1);
+    CHECK(retained.decode_allowed(0) && !retained.decode_allowed(3));
+    retained.decoded(1000, false);
+    CHECK(retained.decode_allowed(0));
+    const auto idle = [](const Result& result) {
+        return result.final_blocked_stage == -1 && !result.final_bounded_round && !result.final_inflight &&
+               result.ownership_violations == 0 && result.exclusion_violations == 0 &&
+               result.fence_violations == 0 && result.budget_mutations == 0;
+    };
+    const RetainedSchedule serial;
+    const auto guarded = read_retained(serial);
+    CHECK(guarded.okay && !guarded.fatal && idle(guarded));
+    CHECK(guarded.prefill_phase_observed && guarded.decode_phase_unavailable);
+    CHECK((guarded.retained_starts == std::vector<std::array<int, 2>>{{1, 1}}));
+    CHECK(!guarded.retained_start_clocks.empty() && guarded.retained_start_clocks.front() == 40);
+    CHECK(guarded.decode_positions.empty() && guarded.seam_rounds.empty());
+    CHECK((guarded.completed_rounds == std::array<int, 2>{1, 1}));
+    CHECK(guarded.estimate_ms == 60 && guarded.credited_ms == 60 && guarded.resident_ms == 30);
+    CHECK(guarded.decode_estimate_ms == 30 && guarded.decode_credit);
+    CHECK((guarded.store_positions == std::vector<int64_t>{2048}));
+    RetainedSchedule long_stage = serial;
+    long_stage.stage_ms = 1000;
+    const auto old_decode = read_retained(long_stage);
+    CHECK(old_decode.okay && idle(old_decode) && old_decode.decode_age_ms == 1000);
+
+    // Cold/idle chunks cannot invent credit or decoders; a retained run never
+    // adopts the ordinary idle 4096 fill. Tails do not train the 2048 estimate.
+    const auto cold = read_retained(serial, {.prior_chunk_ms = 0});
+    CHECK(cold.okay && idle(cold) && cold.completed_stages.empty() && cold.decode_credit && cold.estimate_ms == 60);
+    const auto solo = read_retained(serial, {.prior_chunk_ms = 0, .tokens = 4097, .active = false});
+    CHECK(solo.okay && idle(solo) && solo.completed_stages.empty() && solo.decode_positions.empty());
+    CHECK((solo.reads == std::vector<std::pair<int64_t, int64_t>>{{0, 2048}, {2048, 2048}, {4096, 1}}));
+    CHECK(solo.drain_observed && solo.estimate_ms == 60);
+
+    // Existing checkpoint-part and full-checkpoint callbacks occur inside the
+    // bulk call, so their chunks use global closure instead of stage loans.
+    RetainedSchedule checkpoint = serial;
+    checkpoint.checkpoint_every = 4096;
+    const auto snapshots = read_retained(checkpoint, {.tokens = 4096});
+    CHECK(snapshots.okay && idle(snapshots));
+    CHECK((snapshots.retained_starts == std::vector<std::array<int, 2>>{{1, 1}, {0, 0}}));
+    CHECK((snapshots.checkpoint_positions == std::vector<int64_t>{4096, 4096, 4096}));
+
+    // Independent stage latencies leave peers live at local handoff and at the
+    // final seam. Both completion traversal orders must preserve all work.
+    for (bool reverse : {false, true}) {
+        RetainedSchedule delayed = serial;
+        delayed.completion_polls = {{{{2, 3, 5}}, {{3, 12, 9}}}};
+        delayed.reverse_completions = reverse;
+        const auto result = read_retained(delayed);
+        CHECK(result.okay && idle(result));
+        CHECK((result.completed_rounds == std::array<int, 2>{1, 1}));
+        CHECK((result.retained_starts == std::vector<std::array<int, 2>>{{1, 1}}));
+        CHECK(!result.reacquired_with_peer.empty() && !result.drained_stages.empty());
+        CHECK(std::any_of(result.completions_under_exclusion.begin(), result.completions_under_exclusion.end(),
+                          [](const auto& event) { return event[0] == 1 && event[1] == 0 && event[2] == 1; }));
+        for (int stage = 0; stage < 3; ++stage)
+            for (int group = 0; group < 2; ++group)
+                CHECK(std::count(result.completed_stages.begin(), result.completed_stages.end(),
+                                 std::make_pair(stage, group)) == 1);
+        // These independent consumers become ready on the same poll. Invert
+        // their completion order without changing the set of completed work.
+        const auto peer = std::find(result.completed_stages.begin(), result.completed_stages.end(), std::make_pair(0, 1));
+        const auto local = std::find(result.completed_stages.begin(), result.completed_stages.end(), std::make_pair(1, 0));
+        CHECK((peer < local) == !reverse);
+        CHECK((result.store_positions == std::vector<int64_t>{2048}));
+    }
+
+    // In-chunk service must not replace the ordinary seam's additional complete
+    // rounds. A long bulk-only suffix makes the seam due; each paid round must
+    // finish both groups, rather than merely advance the synthetic clock.
+    const auto seam = read_retained(long_stage, {.tokens = 4096});
+    CHECK(seam.okay && idle(seam) && seam.seam_rounds.size() >= 2);
+    CHECK(std::all_of(seam.seam_rounds.begin(), seam.seam_rounds.end(),
+                      [](const auto& round) { return round == std::array<int, 2>{1, 1}; }));
+    CHECK(!seam.decode_positions.empty() &&
+          std::all_of(seam.decode_positions.begin(), seam.decode_positions.end(), [](int64_t q) { return q == 2048; }));
+
+    // An indivisible slow round carries its entire measured service as debt.
+    // The next chunk must repay it, not restart or miscredit it as prefill.
+    RetainedSchedule slow = serial;
+    slow.pump_ms = 100;
+    const auto debt = read_retained(slow, {.tokens = 4096});
+    CHECK(debt.okay && idle(debt) && !debt.decode_credit && debt.decode_positions.empty() && debt.seam_rounds.empty());
+    CHECK((debt.retained_starts == std::vector<std::array<int, 2>>{{1, 1}, {0, 0}}));
+    CHECK(debt.credited_ms == 120 && debt.resident_ms == 600 && debt.estimate_ms == 60);
+
+    // STOP and contiguous BSTOP make progress at the existing stage callbacks.
+    // A queued admission must still prevent a later slot-number cancellation.
+    RetainedSchedule stopped = serial;
+    stopped.stop_boundary = 3;
+    const auto cancelled = read_retained(stopped);
+    CHECK(!cancelled.okay && !cancelled.fatal && cancelled.error == "cancelled" && idle(cancelled));
+    CHECK(cancelled.store_positions.empty() && cancelled.final_frontier == 0);
+    RetainedSchedule resident_stop = serial;
+    resident_stop.cancel_boundary = 4; // slot 0 already owns a stage; slot 2 is independent
+    const auto stop = read_retained(resident_stop, {.tokens = 4096});
+    CHECK(stop.okay && idle(stop) && stop.cancel_controls > 0);
+    CHECK((stop.starts_after_cancel == std::array<int, 2>{0, 0}));
+    CHECK(stop.retained_starts.size() == 2 && stop.retained_starts[0][0] == 1 && stop.retained_starts[1][0] == 0);
+    CHECK(stop.completed_rounds[0] == 1 && stop.peer_completions_after_cancel[1] > 0);
+    // This proves the caller keeps pumping the peer and does not restart the
+    // cancelled group. Actual slot-generation/output fencing remains GPU-only.
+    resident_stop.admission_before_cancel = true;
+    const auto ordered = read_retained(resident_stop);
+    CHECK(ordered.okay && idle(ordered) && ordered.cancel_controls == 0);
+    CHECK((ordered.completed_rounds == std::array<int, 2>{1, 1}));
+
+    const auto yielded = read_retained(serial, {.tokens = 10000, .yield = true});
+    CHECK(!yielded.okay && !yielded.fatal && yielded.error == "yield" && idle(yielded));
+    CHECK(yielded.parked_at == 2048 && yielded.final_frontier == yielded.parked_at && yielded.parked_split_until == 0);
+    CHECK(yielded.copyin_phase_observed && yielded.parked_identity_preserved);
+    CHECK(yielded.parked_prefix.size() == (size_t)yielded.parked_at);
+    for (size_t i = 0; i < yielded.parked_prefix.size(); ++i) CHECK(yielded.parked_prefix[i] == (int32_t)i);
+    const auto resumed = read_retained(serial, {.tokens = 10000, .begin_at = yielded.parked_at,
+                                               .pending_split_until = yielded.parked_split_until});
+    const auto uninterrupted = read_retained(serial, {.tokens = 10000});
+    CHECK(resumed.okay && idle(resumed) && resumed.final_frontier == 10000 && resumed.parked_split_until == 0);
+    auto joined = yielded.reads;
+    joined.insert(joined.end(), resumed.reads.begin(), resumed.reads.end());
+    CHECK(joined == uninterrupted.reads);
+    int64_t frontier = 0;
+    for (const auto& range : joined) {
+        CHECK(range.first == frontier && range.second > 0);
+        frontier += range.second;
+    }
+    CHECK(frontier == 10000);
+
+    // Failure while the local exclusion is live resets it before the main
+    // owner's full drain. Error-string aliasing must not turn failure into STOP.
+    RetainedSchedule broken = serial;
+    broken.fail_pump_call = 4;
+    const auto failure = read_retained(broken);
+    CHECK(!failure.okay && failure.fatal && failure.error == "retained pump failed" && idle(failure));
+    CHECK(!failure.drained_stages.empty() && failure.store_positions.empty());
+    CHECK((failure.completed_rounds == std::array<int, 2>{1, 1}));
+    const auto drain = read_retained(serial, {.drain_ok = false});
+    CHECK(!drain.okay && drain.fatal && drain.error == "descendant drain failed" && drain.store_positions.empty());
+    CHECK(drain.final_blocked_stage == -1 && !drain.final_bounded_round);
+    RetainedSchedule foreign = serial;
+    foreign.foreign_callback = true;
+    const auto refused_owner = read_retained(foreign);
+    CHECK(!refused_owner.okay && refused_owner.fatal && idle(refused_owner));
+    CHECK(refused_owner.error == "retained prefill: budget pump owner changed" && refused_owner.completed_stages.empty());
+    const auto split = read_retained(serial, {.tokens = 4097, .begin_at = 1024, .pending_split_until = 2048});
+    CHECK(!split.okay && split.reads.empty() && split.error == "retained prefill: cannot resume a split 2048 chunk");
+
+    for (const char* error : {"cancelled", "prefill: retained cancellation cleanup failed", "partial publication failed"}) {
+        const auto terminal = read_prompt(1000, true, true, true, 4, error);
+        CHECK(!terminal.okay && terminal.fatal == (std::strcmp(error, "cancelled") != 0));
+        CHECK(terminal.error == error && terminal.drain_observed && idle(terminal));
+    }
+    const auto legacy = read_retained(serial, {.budget_ms = 0, .prior_chunk_ms = 0, .active = false});
+    CHECK(legacy.okay && legacy.drain_observed && legacy.estimate_ms == 0 && legacy.credited_ms == 0);
+}
+
 int main() {
     split_setting(nullptr); // Ambient experiment settings must not change the legacy regressions.
+    test_retained_budget();
     // Piped groups return piece=0 in the unchanged upstream helper, even beside decoding slots.
     CHECK(strata::program::batch_read_piece(true, true, true, true, 2048, 8) == 0);
     const std::vector<std::pair<int64_t, int64_t>> whole{{0, 10000}};
@@ -280,15 +730,15 @@ int main() {
     const auto no_batch = read_prompt(1000, true, true, false, 0);
     CHECK(no_batch.reads == whole && no_batch.decode_positions.empty() && no_batch.estimate_ms == 0);
     const auto cancelled = read_prompt(0, true, true, true, 4, "cancelled");
-    CHECK(!cancelled.okay && !cancelled.fatal && cancelled.error == "cancelled" && cancelled.drains == 1);
+    CHECK(!cancelled.okay && !cancelled.fatal && cancelled.error == "cancelled" && cancelled.drain_observed);
     for (const char* failure : {"prefill: retained cancellation cleanup failed", "partial publication failed"}) {
         const auto failed = read_prompt(0, true, true, true, 4, failure);
-        CHECK(!failed.okay && failed.fatal && failed.error == failure && failed.drains == 1);
+        CHECK(!failed.okay && failed.fatal && failed.error == failure && failed.drain_observed);
     }
     const auto failed_drain = read_prompt(0, true, true, true, 4, "cancelled", false);
-    CHECK(!failed_drain.okay && failed_drain.fatal && failed_drain.error == "descendant drain failed" && failed_drain.drains == 1);
+    CHECK(!failed_drain.okay && failed_drain.fatal && failed_drain.error == "descendant drain failed" && failed_drain.drain_observed);
     const auto retained = read_prompt(0, true, true, true, 4, "");
-    CHECK(retained.okay && !retained.fatal && retained.error.empty() && retained.drains == 1 && retained.reads == chunks);
+    CHECK(retained.okay && !retained.fatal && retained.error.empty() && retained.drain_observed && retained.reads == chunks);
     // A measured over-budget C is still allocated as C=2048, but the opt-in
     // launch reaches the same drained midpoint on ordinary and grouped reads.
     split_setting("1024");
@@ -379,6 +829,6 @@ int main() {
         CHECK(unchanged.reads == unsplit_tail);
     }
     split_setting(nullptr);
-    if (fails == 0) std::printf("prefill_interleave_test: ok (budget interleave, opt-in split, legacy)\n");
+    if (fails == 0) std::printf("prefill_interleave_test: ok (retained ownership/budget, interleave, opt-in split, legacy)\n");
     return fails == 0 ? 0 : 1;
 }

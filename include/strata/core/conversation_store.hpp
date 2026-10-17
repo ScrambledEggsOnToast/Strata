@@ -171,6 +171,9 @@ struct ConversationStoreOptions {
     // publication must fit it as its image *plus* the writer workspace it needs (see publish()).  There is no
     // admission path that skips the check, and publish_read_allowance() is what makes both absolute.
     uint64_t read_budget_bytes = 0;
+    // Sample successful catalog-apply time for publication receipts. False adds
+    // no clock read; catalog versions remain available without timing.
+    bool publication_timing = false;
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -263,6 +266,13 @@ struct ConversationStoreMatch {
     uint64_t published_order = 0;
 };
 
+// The exact catalog snapshot a lookup examined. Both fields are sampled while
+// holding the catalog mutex; `observed_ns` is steady-clock time in this process.
+struct ConversationStoreLookupFrontier {
+    uint64_t observed_ns = 0;
+    uint64_t catalog_version = 0;
+};
+
 struct ConversationStoreQuery {
     ConversationStoreSelector selector;
     std::vector<int32_t> tokens;                  // the prepared request's exact prompt tokens
@@ -321,6 +331,12 @@ struct ConversationStoreReadProgress {
     uint64_t attempt_id = 0;
     uint64_t head_id = 0;
     bool totals_known = false; // false until manifest validation and authorized-cut checks have succeeded
+    // Diagnostic only. `materialize_started` means this attempt was dispatched
+    // to the reader, not merely queued or refused (and does not acknowledge I/O).
+    // The prior bit survives every reissue of this request/generation: only a
+    // ready result exposes a duration, and replaced attempts have no such sample.
+    bool materialize_started = false;
+    bool prior_materialize_unmeasured = false;
     // Logical bytes, not unique objects or physical disk traffic. Metadata includes the validated encoded manifest,
     // token IDs and image keys; recurrent is GDN; PLE is its history; indexer includes tails/dead/block positions and
     // main-model pooled keys; main_kv is main K/V and scales; draft is every part of the extra draft pool.
@@ -465,6 +481,10 @@ struct ConversationStorePublishResult {
     uint64_t payload_bytes = 0;
     uint64_t new_bytes = 0;      // objects actually written by this publication
     uint64_t reused_bytes = 0;   // immutable chunks taken from `reuse`
+    // The successful apply that made this result visible to catalog lookups.
+    // Both remain zero when no durable catalog apply occurred.
+    uint64_t applied_ns = 0;
+    uint64_t catalog_version = 0;
     bool released = true;        // the store dropped its shared_ptr<const SavedConversation> alias
     std::string detail;
 };
@@ -566,16 +586,20 @@ public:
     // a payload, an image or a GPU pointer.
     void for_each_match(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
                         const ConversationImageKey* images, size_t image_count,
-                        const std::function<void(const ConversationStoreMatch&)>& visit) const;
+                        const std::function<void(const ConversationStoreMatch&)>& visit,
+                        ConversationStoreLookupFrontier* frontier = nullptr) const;
     template<class Visitor>
     void for_each_match(const ConversationStoreSelector& selector, const std::vector<int32_t>& ids,
-                        const std::vector<ConversationImageKey>& images, Visitor&& visit) const {
+                        const std::vector<ConversationImageKey>& images, Visitor&& visit,
+                        ConversationStoreLookupFrontier* frontier = nullptr) const {
         for_each_match(selector, ids.data(), ids.size(), images.data(), images.size(),
-                       std::function<void(const ConversationStoreMatch&)>(std::forward<Visitor>(visit)));
+                       std::function<void(const ConversationStoreMatch&)>(std::forward<Visitor>(visit)), frontier);
     }
     std::vector<ConversationStoreMatch> matches(const ConversationStoreSelector& selector,
                                                const std::vector<int32_t>& ids,
                                                const std::vector<ConversationImageKey>& images) const;
+    // Catalog-only presence, without allocation or I/O; not a lease or promise of future retention.
+    bool retains_head(uint64_t head_id) const;
     bool manifest_info(uint64_t head_id, ConversationStoreManifestInfo& out) const;
     // The stream table of a retained head, read from its manifest (bounded, read-only, no catalog lock held): for
     // planning reuse intervals.  It exposes no payload and authorizes nothing.  Decoded under the store's retention
@@ -764,6 +788,8 @@ public:
     // an empty name disarms every armed step.  Recognised steps:
     //   "layout"          the image's layout is refused before any payload is read
     //   "objects"         the next immutable object write fails
+    //   "object-parent-sync" the objects/ flush fails after mkdir (default), during revival, or at the batch drain
+    //   "object-shard-sync"  the shard flush fails after object rename or during revival, before manifest creation
     //   "manifest"        the manifest write fails
     //   "catalog"         the catalog commit is refused before it plans anything
     //   "catalog-rename"  the catalog rename fails: nothing durable changed
@@ -777,12 +803,24 @@ public:
     void set_publish_fault_for_test(const char* step);
     uint64_t source_bytes_read_for_test() const;
 #ifdef STRATA_STORE_TEST_HOOKS
+    // With STRATA_STORE_DIR_FSYNC_BATCH=1, before any manifest is created (test builds only):
+    //   "batch-shard-open"     fail before opening the next touched shard
+    //   "batch-shard-sync"     fail before flushing the next opened shard
+    //   "batch-shard-partial"  fail before a second touched shard, after at least one was flushed
+    //   "batch-parent-sync"    fail before the final objects-parent flush, including existing shards
+    //   "batch-shard-allocate" throw bad_alloc while owning the opened shard
+    // Arm these through set_publish_fault_for_test(); generic object flush faults work in either mode.
+#endif
+#ifdef STRATA_STORE_TEST_HOOKS
     // Pause the real worker after reservation, outside the store mutex. Absent from production builds.
     void set_read_gate_for_test(void (*gate)(void*), void* context);
     // Pause after publishing validated manifest totals or acknowledging a verified chunk, outside the mutex.
     void set_read_progress_gate_for_test(void (*gate)(void*), void* context);
     // Pause a real catalog transaction outside the mutex, before staging (false) or after staging (true).
     void set_catalog_gate_for_test(void (*gate)(void*, bool staged), void* context);
+    // Pause a nonempty object-directory batch after payload emission/revalidation, before opening any shard.
+    // Outside the mutex; absent from production. Context must outlive the publication using it.
+    void set_object_batch_gate_for_test(void (*gate)(void*), void* context);
 #endif
 
 private:

@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -495,6 +499,67 @@ bool open_windowed(strata::core::WindowedExpertSource& src, const fs::path& dir,
     return opened;
 }
 
+/// Reuse the real direct-I/O fixtures: retirement is not close(), and inherited read entry points must
+/// remain terminal without allocating a replacement ring. All fixture consumers have finished reading.
+void check_windowed_retirement(strata::core::WindowedExpertSource& src, int64_t layer, int64_t expert,
+                               std::string& err) {
+    const uint64_t ring_bytes = src.residency_bytes();
+    const uint64_t stride = src.slot_stride_bytes();
+    const int64_t slots = src.slots();
+    const int64_t blobs = src.blobs();
+    const uint64_t source_bytes = src.source_bytes();
+    const int threads = src.reader_threads();
+    const int64_t reads = src.reads();
+    const uint64_t io_bytes = src.io_bytes();
+    require(src.ready() && ring_bytes > 4096 && source_bytes > 0 && threads > 0 &&
+                slots > 0 && stride > 0 && blobs > 0 && reads > 0 && io_bytes > 0,
+            "retirement fixture needs a used direct ring with positive file/layout/reader metadata");
+    err.reserve(256);
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 33)
+    const auto before = mallinfo2();
+#endif
+#endif
+    const bool retired = src.retire_ring(err);
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 33)
+    const auto after = mallinfo2();
+    // Count live heap + mmap allocations, not RSS (free may retain allocator-owned pages). Allow one page
+    // for the retirement diagnostic's bookkeeping; merely clearing ring_/ring_bytes_ cannot pass this.
+    const uint64_t live_before = (uint64_t) before.uordblks + (uint64_t) before.hblkhd;
+    const uint64_t live_after = (uint64_t) after.uordblks + (uint64_t) after.hblkhd;
+    require(live_before >= live_after && live_before - live_after >= ring_bytes - 4096,
+            "retirement did not actually free the owned ring allocation");
+#endif
+#endif
+    require(retired && err.empty(), "healthy ring retirement failed: " + err);
+    require(!src.ready() && src.residency_bytes() == 0 && src.io_transient_bytes() == 0,
+            "retirement retained current ring residency or I/O transient");
+    require(src.source_bytes() == source_bytes &&
+                src.reader_threads() == threads && src.slots() == slots &&
+                src.slot_stride_bytes() == stride && src.blobs() == blobs,
+            "retirement discarded input, file, reader or layout report metadata");
+    const std::string retirement = src.error();
+    require(retirement.find("retired") != std::string::npos, "retirement was not named");
+    uint8_t untouched = 123;
+    require(src.blob(layer, expert) == nullptr && src.blob_stable(layer, expert) == nullptr &&
+                src.blob_async(layer, expert) == nullptr && !src.copy_blob(layer, expert, &untouched) &&
+                untouched == 123,
+            "retired source served a read or touched a rejected copy destination");
+    const int32_t layers[] = {(int32_t) layer}, experts[] = {(int32_t) expert};
+    uint8_t* dst[] = {&untouched};
+    require(!src.copy_blobs(layers, experts, dst, 1) && untouched == 123,
+            "retired source served a batched copy");
+    src.begin_layer(layer, nullptr, 0);
+    require(src.blob(layer, expert) == nullptr, "a layer boundary revived a retired ring");
+    err = "stale caller error";
+    require(src.retire_ring(err) && err.empty(), "repeated retirement was not explicitly idempotent");
+    require(!src.ready() && src.residency_bytes() == 0 && src.reads() == reads &&
+                src.io_bytes() == io_bytes && src.error() == retirement &&
+                src.source_bytes() == source_bytes && src.reader_threads() == threads,
+            "rejected reads or repeated retirement changed counters, metadata or ring state");
+}
+
 void test_windowed_direct_canonical() {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
@@ -601,6 +666,11 @@ void test_windowed_direct_canonical() {
     require(bad.blob(layers, 0) == nullptr && bad.error().find("geometry") != std::string::npos,
             "an out-of-range lookup was not named");
     require(bad.blob(0, 0) == nullptr, "a failed source kept serving");
+    const std::string failure = bad.error();
+    const uint64_t failed_ring = bad.residency_bytes();
+    require(!bad.retire_ring(err) && err.find("failed source") != std::string::npos &&
+                bad.error() == failure && bad.residency_bytes() == failed_ring && bad.ready(),
+            "failed-source retirement freed unproven storage or overwrote the failure");
 
     WindowedExpertSource::Config one;
     one.slots = 1;
@@ -619,6 +689,26 @@ void test_windowed_direct_canonical() {
     require(tiny.residency_bytes() <= tiny_priced, "the one-slot ring exceeded its price");
     tiny.close();
     require(!tiny.ready() && tiny.residency_bytes() == 0, "close did not release the ring");
+    require(!tiny.retire_ring(err) && err.find("not open") != std::string::npos &&
+                tiny.error().empty() && tiny.residency_bytes() == 0,
+            "closed-source retirement was not refused cleanly");
+
+    check_windowed_retirement(src, 0, 0, err);
+    require(src.open(dir.path.string(), layers, experts, err, cfg), "retired source could not reopen: " + err);
+    require(src.ready() && src.error().empty() && src.reads() == 0 && src.io_bytes() == 0 &&
+                src.residency_bytes() == (uint64_t) src.slots() * src.slot_stride_bytes(),
+            "explicit reopen kept retired state");
+    const uint8_t* reopened = src.blob(0, 1);
+    want_blob(0, 1, want);
+    require(reopened && std::memcmp(reopened, want.data(), want.size()) == 0 &&
+                src.reads() == 1 && src.io_bytes() == (uint64_t) BLOB,
+            "explicit reopen failed to serve exact source bytes");
+    check_windowed_retirement(src, 0, 1, err);
+    src.close();
+    require(src.error().empty() && src.reads() == 0 && src.io_bytes() == 0,
+            "close did not reset retirement and counters");
+    require(!src.retire_ring(err) && err.find("not open") != std::string::npos,
+            "close left an idempotent retired lifecycle");
 
     // A wrong-size pack refuses BY NAME, before any allocation.  Runs last: it corrupts the pack.
     src.close();
@@ -628,6 +718,13 @@ void test_windowed_direct_canonical() {
     require(!short_src.open(dir.path.string(), layers, experts, err, cfg) && !short_src.ready() &&
                 err.find(std::to_string(total - 1)) != std::string::npos,
             "a truncated pack was not refused with its size");
+    require(!short_src.retire_ring(err) && err.find("not open") != std::string::npos &&
+                short_src.residency_bytes() == 0,
+            "a refused open could be retired");
+    WindowedExpertSource unopened;
+    require(!unopened.retire_ring(err) && err.find("not open") != std::string::npos &&
+                unopened.error().empty() && unopened.reads() == 0 && unopened.io_bytes() == 0,
+            "an unopened source could be retired or gained failure/counter state");
 }
 
 #if defined(STRATA_NATIVE_EXPERTS)
@@ -690,6 +787,7 @@ void test_windowed_direct_native_bin() {
             "native layer-1 blobs came back wrong");
     require(src.io_bytes() == 2 * (uint64_t) first_fmt.bytes + 2 * (uint64_t) second_fmt.bytes,
             "the native byte count disagrees with the fetches");
+    check_windowed_retirement(src, 1, 2, err);
     src.close();
 }
 
@@ -778,6 +876,7 @@ void test_windowed_direct_native_gguf() {
     }
     require(src.io_bytes() == 2 * (uint64_t) fmts[0].bytes + 2 * (uint64_t) fmts[1].bytes,
             "the GGUF byte count disagrees with the fetches");
+    check_windowed_retirement(src, 1, 2, err);
     src.close();
     require(!src.ready(), "close did not release the GGUF ring");
 }

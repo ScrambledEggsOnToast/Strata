@@ -162,6 +162,7 @@ class ChannelTestCase(unittest.TestCase):
     """A service with a private channel whose native side this test speaks, and an HTTP server in front of it."""
 
     frontier = 1
+    generation = 41
     metadata_bytes = 1 << 20
     enabled = True
     key = KEY
@@ -172,8 +173,8 @@ class ChannelTestCase(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.link = conversation_offers.ConversationOfferLink()
         self.addCleanup(self.link.close)
-        self.peer = NativePeer(self.link, frontier=self.frontier, metadata_bytes=self.metadata_bytes,
-                               enabled=self.enabled, key=self.key)
+        self.peer = NativePeer(self.link, generation=self.generation, frontier=self.frontier,
+                               metadata_bytes=self.metadata_bytes, enabled=self.enabled, key=self.key)
         self.link.start()
         self.peer.start()
         self.engine = self.engine_for()
@@ -1215,22 +1216,26 @@ class NoStoreFrontier(ChannelTestCase):
     """A store that keeps nothing (a disabled HELLO) offers nothing: the demand path stays exactly as it was."""
 
     enabled = False
+    generation = 0
     key = b"\0" * 32
 
     def test_no_offer_is_ever_published(self):
+        self.assertTrue(self.link.wait_hello(0), "a disabled native store must still complete its handshake")
+        self.assertEqual(self.svc.offer_stats()["malformed"], 0)
         self.assertFalse(self.svc.offers_ready())
         self.assertIsNone(self.svc.scope_key())
         first = self.start_request("first")
         self.assertTrue(self.engine.entered.wait(5))
-        self.start_request("second")
+        second = self.start_request("second")
         self.wait_queued(1)
         self.peer.drain(0.6)
         self.assertEqual(self.peer.offers, [])
         self.assertEqual(self.peer.other, [])
         self.assertEqual(self.svc.offer_stats()["store"], False)
         self.engine.release.set()
-        self.join(first)
-        self.assertEqual(first[1].get("status"), 200)
+        self.join(first, second)
+        for response in (first, second):
+            self.assertEqual(response[1].get("status"), 200, response[1])
 
 
 class FrontierOrder(unittest.TestCase):

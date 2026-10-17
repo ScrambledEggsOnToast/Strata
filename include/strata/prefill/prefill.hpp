@@ -137,6 +137,8 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// Resolved allocation ownership, not permission to borrow. False before successful init.
+    bool owns_work_buffers() const;
     bool bind_request(uint64_t request, std::string& err);
     bool context_idle(std::string& err) const;
 

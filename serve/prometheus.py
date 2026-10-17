@@ -130,11 +130,31 @@ def strata(m: dict, out: list, lab: str):
            live.get("prefill_tok_s_mean") or 0)
     metric("live_prompt_read", "gauge", "Prompt tokens read so far by the running request (live.prompt_read).",
            live.get("prompt_read") or 0)
-    for state in ("idle", "reading", "generating"):
+    for state in ("idle", "reserved", "parked", "reading", "decoding", "releasing"):
         slots = live.get("slots")
         if isinstance(slots, list) and slots:
             metric("live_slots", "gauge", "The batch slots in each state (live.slots).",
                    sum(1 for x in slots if isinstance(x, dict) and x.get("state") == state), f',state="{state}"')
+    # Enumerated dimensions only: correlation identities never become metric labels.
+    for priority in ("foreground", "background"):
+        metric("admission_waiting", "gauge", "HTTP admission waiters by priority.",
+               ((m.get("admission") or {}).get("waiting_by_priority") or {}).get(priority, 0),
+               f',priority="{priority}"')
+        for outcome in ("completed", "error", "rejected", "cancelled", "timeout", "disconnected", "shutting down"):
+            values = ((m.get("frontend") or {}).get(priority) or {}).get(outcome) or {}
+            labels = f',priority="{priority}",outcome="{outcome}"'
+            metric("request_outcomes_total", "counter", "Terminal registered requests.", values.get("requests", 0), labels)
+            for phase in ("admission_wait", "control_selector_wait", "physical_slot_wait", "control_occupied_wait",
+                          "preparation", "native_active", "cleanup", "unattributed"):
+                metric("frontend_phase_seconds_total", "counter", "Exclusive frontend wall time, not native compute.",
+                       (values.get("seconds") or {}).get(phase, 0), labels + f',phase="{phase}"')
+                metric("frontend_phase_entries_total", "counter", "Entries to exclusive frontend phases.",
+                       (values.get("counts") or {}).get(phase, 0), labels + f',phase="{phase}"')
+            for first in ("first_token", "first_content"):
+                metric(f"time_to_{first}_seconds_sum", "counter", "Queue-inclusive first observation seconds.",
+                       values.get(first + "_s", 0), labels)
+                metric(f"time_to_{first}_seconds_count", "counter", "Requests with a first observation.",
+                       values.get(first + "_count", 0), labels)
     metric("engine_max_context", "gauge", "The engine's context (engine.max_context).", eng.get("max_context"))
     metric("totals_prompt_seconds_total", "counter", "Time spent reading prompts (totals.prompt_ms).",
            round((totals.get("prompt_ms") or 0) / 1000, 3))

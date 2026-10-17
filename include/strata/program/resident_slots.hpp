@@ -117,6 +117,10 @@ private:
 
 struct ResidentAdmission {
     int32_t next_token = 0;
+    // Eligible cuts must be flat and stage-shape-valid. Retained array capacity,
+    // copied IDs and owner metadata must fit the preadmitted per-checkpoint bytes;
+    // caller-only vector reserve is not retained. Root/latest/all pins must fit
+    // the admitted chain cap before source freezing or target mutation.
     std::vector<core::ConversationCheckpoint>* checkpoints = nullptr;
     const float* residual = nullptr;
     int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
@@ -131,13 +135,15 @@ class ResidentSlots {
 public:
     ResidentSlots(const core::ModelGeometry& geometry, std::vector<ResidentStage> stages,
                   core::MtpDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
-                  int64_t context, bool cache);
+                  int64_t context, bool cache, int64_t checkpoint_chain_limit, uint64_t checkpoint_byte_limit);
     ~ResidentSlots();
     ResidentSlots(const ResidentSlots&) = delete;
     ResidentSlots& operator=(const ResidentSlots&) = delete;
     ResidentSlots(ResidentSlots&&) = delete;
     ResidentSlots& operator=(ResidentSlots&&) = delete;
     const std::vector<ResidentSlot>& slots() const { return slots_; }
+    int64_t checkpoint_chain_limit() const { return checkpoint_chain_limit_; }
+    uint64_t checkpoint_byte_limit() const { return checkpoint_byte_limit_; }
     // Bind the working verifier, prefill, draft and dispatch together. An exact
     // yielded resend or solo-to-parked-slot promotion retains identity and seed.
     bool begin(int destination, const std::vector<int64_t>& prompt, const ResidentRequest& request,
@@ -195,6 +201,8 @@ private:
     core::ExpertDispatch& dispatch_;
     std::vector<ResidentSlot> slots_;
     int64_t context_;
+    int64_t checkpoint_chain_limit_;
+    uint64_t checkpoint_byte_limit_;
     ResidentWorking working_;
     ResidentRequest input_;
     const std::vector<int64_t>* working_prompt_ = nullptr; // borrowed only through this request's park/admit

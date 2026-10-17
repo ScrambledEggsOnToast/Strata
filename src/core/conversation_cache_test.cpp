@@ -58,6 +58,51 @@ bool same_image(const SavedConversation& a, const SavedConversation& b) {
 
 int main() {
     {
+        auto first = image({11, 12, 13});
+        auto second = image({21, 22, 23});
+        auto third = image({31, 32, 33});
+        first.freeze();
+        second.freeze();
+        third.freeze();
+        const size_t one = first.bytes(), fixed = 3 * one;
+        ConversationCache cache(fixed + 2 * one, 4);
+        check(cache.try_reserve_lease(fixed), "empty cache reserves lifetime resident checkpoint ownership");
+        auto pending = SavedConversation(first);
+        pending.publication_ticket = 91;
+        check(cache.put(std::move(pending)) && cache.put(SavedConversation(second)),
+              "parking uses the remainder after fixed checkpoint ownership");
+        auto publication = cache.take_publication(91);
+        check(publication.has_value() && same_image(*publication, first) &&
+                  cache.leased_bytes() == fixed + publication->bytes(),
+              "ordinary publication transfers its own charge alongside the fixed lease");
+        if (!publication) return 1;
+        const size_t publication_bytes = publication->bytes();
+        publication.reset();
+        cache.release_lease(publication_bytes);
+        check(cache.leased_bytes() == fixed && cache.can_fit(one),
+              "publication refund restores parking room without refunding fixed ownership");
+        check(cache.put(SavedConversation(third)), "refunded publication room accepts another parked image");
+        const size_t before = cache.envelope_bytes();
+        check(!cache.reserve_snapshot(2 * one + 1) && cache.size() == 2 &&
+                  cache.envelope_bytes() == before && cache.evictions() == 0,
+              "impossible reservation cannot spend fixed ownership or destroy parked entries");
+        cache.for_each_image([&](size_t index, const auto& current) {
+            check(same_image(current, index == 0 ? second : third),
+                  "impossible reservation preserves actual parked payloads");
+        });
+        check(cache.reserve_snapshot(one) && cache.size() == 1 && cache.evictions() == 1 &&
+                  cache.leased_bytes() == fixed,
+              "feasible reservation evicts an ordinary image but never the fixed lease");
+        check(cache.best(std::vector<int32_t>{31, 32, 33, 34}, {}, true, test_scope).tokens == 3 &&
+                  cache.best(std::vector<int32_t>{21, 22, 23, 24}, {}, true, test_scope).tokens == 0,
+              "reservation evicts the oldest payload and leaves the newer consumer match");
+        check(cache.clear() == 1 && cache.bytes() == 0 && cache.leased_bytes() == fixed,
+              "poison-style clear removes images without releasing resident checkpoint ownership");
+        check(cache.put(SavedConversation(first)) && cache.put(SavedConversation(second)) &&
+                  !cache.try_reserve_lease(1),
+              "clear leaves exactly the reduced parking envelope available");
+    }
+    {
         auto make = [] {
             auto s = image({1,2,3,4,5,6,7,8,9});
             auto cut = s.live; cut.ids.resize(5); s.checkpoints.push_back(cut);

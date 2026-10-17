@@ -341,9 +341,10 @@ class ModelBusy(RuntimeError):
 class AdmissionError(RuntimeError):
     """A bounded request queue or budget refused work before generation."""
 
-    def __init__(self, message, status=429):
+    def __init__(self, message, status=429, *, lifecycle=None):
         super().__init__(message)
         self.status = status
+        self.lifecycle = lifecycle
 
 
 class EngineSilent(EngineDied):
@@ -1166,6 +1167,7 @@ class StrataEngine:
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        self.phase_incarnation = uuid.uuid4().hex
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.pump = threading.Thread(target=self._pump, daemon=True)
@@ -1245,7 +1247,7 @@ class StrataEngine:
                 raise AdmissionError("score cancelled after matching terminal drained", 409)
             return result
 
-    def score(self, request, cancel, request_id=None, on_wait=None, on_submit=None):
+    def score(self, request, cancel, request_id=None, on_wait=None, on_submit=None, on_phase=None):
         """One bounded score owner on the existing control FIFO and stdout pump.
 
         SCANCEL never releases ownership: only the matching, validated SDONE does.
@@ -1266,7 +1268,7 @@ class StrataEngine:
         born, queues, control = self.gen, self.score_q, self.score_control
         try:
             turn = self._take_control(cancel, len(prompt), on_wait=on_wait,
-                                      priority=request.get("strata_priority", "foreground"))
+                                      priority=request.get("strata_priority", "foreground"), on_phase=on_phase)
             while True:
                 try:
                     next(turn)
@@ -1288,6 +1290,8 @@ class StrataEngine:
                 on_submit()
             return self._read_score(request_id, owner, born, prompt, selected, cancel)
         finally:
+            if callable(on_phase):
+                on_phase("cleanup")
             try:
                 if sent and not owner["drained"] and self.gen == born and self.alive():
                     cancel.set()
@@ -1534,6 +1538,26 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def _phase_keys(self, sampling, slot=None):
+        """One frontend submission identity per actual GEN/BGEN, allocated before the pipe write."""
+        self._submission_sequence = getattr(self, "_submission_sequence", 0) + 1
+        incarnation = getattr(self, "phase_incarnation", None)
+        if incarnation is None:
+            incarnation = self.phase_incarnation = uuid.uuid4().hex
+        correlation = {"engine_incarnation": getattr(self, "gen", None), "incarnation": incarnation,
+                       "submission_sequence": self._submission_sequence, "slot": slot}
+        callback = sampling.get("_strata_submission")
+        if callable(callback):
+            callback(correlation)
+        request = sampling.get("_strata_request_id")
+        if (os.environ.get("STRATA_PHASE_TIMING") != "1" or not (self.info or {}).get("phase_timing") or
+                (self.info or {}).get("phase_timing_version") != 1 or not isinstance(request, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", request)):
+            return ""
+        priority = sampling.get("strata_priority", "foreground")
+        return (f" phase_request={request} phase_leg={self._submission_sequence} phase_incarnation={incarnation}"
+                f" phase_priority={priority if priority in ('foreground', 'background') else 'unknown'}")
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1933,7 +1957,7 @@ class StrataEngine:
 
 
     def _take_control(self, cancel, plen: int, on_control=None, on_wait=None,
-                      priority="foreground", background_due=None, slot_ready=None, foreground_pending=None):
+                      priority="foreground", background_due=None, slot_ready=None, foreground_pending=None, on_phase=None):
         """One control owner; a parked read rejoins without changing request or queue identity."""
         if callable(on_wait):
             on_wait()
@@ -1947,8 +1971,12 @@ class StrataEngine:
             self.slot_cv.notify_all()
         beat = time.monotonic()
         queued_at = time.perf_counter()
+        pending_phase = reported_phase = None
         try:
             while True:
+                if pending_phase != reported_phase and callable(on_phase):
+                    on_phase(pending_phase)
+                    reported_phase = pending_phase
                 if not self.alive() and not getattr(self, "starting", False):
                     # #1012: the engine is gone and nobody is starting it again: this request was not sent, so it
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
@@ -1962,11 +1990,19 @@ class StrataEngine:
                         turn = False   # HTTP reservations are bounded: a foreground waiter may not be native yet.
                     if cancel.is_set():
                         return False
-                    if (turn and (not getattr(self, "foreground_budget_s", 0) or slot_ready is None or slot_ready()) and
-                            self.ctl.acquire(blocking=False)):
+                    # Exclusive reason precedence: selector/deadline, physical slot, occupied control.
+                    ready = turn and (not getattr(self, "foreground_budget_s", 0) or slot_ready is None or slot_ready())
+                    if ready and self.ctl.acquire(blocking=False):
                         if self.alive():
                             break
                         self._release_control()
+                    wait_phase = ("control_selector_wait" if not turn else
+                                  "physical_slot_wait" if not ready else "control_occupied_wait")
+                    if callable(on_phase) and wait_phase != reported_phase:
+                        # Notify without the engine condition held, then recheck every
+                        # predicate before acquiring control or waiting. No wake is lost.
+                        pending_phase = wait_phase
+                        continue
                     left = entry[3] - time.monotonic()
                     wait_s = min(0.5, left) if priority == "background" and left > 0 else 0.5
                     self.slot_cv.wait(timeout=wait_s)
@@ -1984,6 +2020,8 @@ class StrataEngine:
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
+        if callable(on_phase):
+            on_phase("preparation")
         if callable(on_control):
             on_control(time.perf_counter() - queued_at)
         return True
@@ -2046,6 +2084,7 @@ class StrataEngine:
         on_control = (sampling or {}).get("_strata_control_ready")
         on_wait = (sampling or {}).get("_strata_native_waiting")
         on_submit = (sampling or {}).get("_strata_submitted")
+        on_phase = (sampling or {}).get("_strata_frontend_phase")
         foreground_pending = (sampling or {}).get("_strata_foreground_pending")
         background_due = None
         slot = None
@@ -2056,7 +2095,7 @@ class StrataEngine:
                 getattr(self, "foreground_budget_s", 0) and priority == "background" and
                 callable(foreground_pending) and foreground_pending())
         ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority, background_due,
-                                           slot_ready, foreground_pending)
+                                           slot_ready, foreground_pending, on_phase)
         if not ok:
             return
         control_started = time.monotonic()
@@ -2075,7 +2114,7 @@ class StrataEngine:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
                     ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority,
-                                                       background_due, slot_ready, foreground_pending)
+                                                       background_due, slot_ready, foreground_pending, on_phase)
                     if not ok:
                         return
                     holding = True
@@ -2086,7 +2125,8 @@ class StrataEngine:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if (alone and left > 1 and not getattr(self, "resident_multiplex", False) and
                         (policy is None or policy.prefer_solo(len(prompt), left))):
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    leg_keys = keys + self._phase_keys(sampling or {})
+                    head = f"GENI {left}{leg_keys} {embeddings}" if embeddings else f"GEN {left}{leg_keys}"
                     if policy is not None:
                         policy.begin("solo", len(prompt), transition=bool(out))
                     self._last_done = None                  # (#879: this request's DONE decides below)
@@ -2130,6 +2170,9 @@ class StrataEngine:
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
+                        slot_live[slot] = {"slot": slot, "state": "parked", "prompt_tokens": len(prompt),
+                                           "generated": len(out), "started": time.time(), "first_token": None,
+                                           "request_id": (sampling or {}).get("_strata_request_id")}
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
                             slot_busy[reserved] = False
@@ -2167,6 +2210,8 @@ class StrataEngine:
                                     on_wait()
                                 self._release_control()
                                 holding = False
+                            if callable(on_phase):
+                                on_phase("physical_slot_wait")
                             with self.slot_cv:
                                 if self.pick_slot(prompt, scope) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
@@ -2185,7 +2230,7 @@ class StrataEngine:
                                 return
                             if not holding:
                                 ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait,
-                                                                   priority, background_due, slot_ready, foreground_pending)
+                                                                   priority, background_due, slot_ready, foreground_pending, on_phase)
                                 if not ok:
                                     return
                                 # No slot is owned while waiting across a restart. Capture the
@@ -2202,12 +2247,14 @@ class StrataEngine:
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
                         yields += 1
+                        if self.slot_live[slot] is not None:
+                            self.slot_live[slot]["state"] = "parked"
                         if self.foreground_budget_s and priority == "background":
                             background_due = self._background_next(control_started)
                         self._release_control()
                         holding = False
                         ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority,
-                                                           background_due, slot_ready, foreground_pending)
+                                                           background_due, slot_ready, foreground_pending, on_phase)
                         if not ok:
                             return
                         holding = True
@@ -2218,7 +2265,8 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     if getattr(self, "resident_multiplex", False):
                         self._send(f"BPRIORITY {slot} {(sampling or {}).get('strata_priority', 'foreground')}")
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    leg_keys = keys + self._phase_keys(sampling or {}, slot)
+                    head = f"BGENI {slot} {left}{leg_keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{leg_keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     if (sampling or {}).get("_strata_request_id"):
@@ -2349,6 +2397,8 @@ class StrataEngine:
                             break
                         return
         finally:
+            if callable(on_phase):
+                on_phase("cleanup")
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             try:
@@ -2454,10 +2504,12 @@ class StrataEngine:
                          for key in ("kv_mode", "kv_window", "draft_kv_mode", "draft_kv_window")
                          if f"slot_{b}_{key}" in self.info}
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b]), **residency})
+                state = ("releasing" if b in self.slot_releasing else "reserved" if b in self.slot_claims else
+                         "parked" if self.slot_busy[b] else "idle")
+                view.append({"slot": b, "state": state, "held_tokens": len(self.slot_held[b]), **residency})
                 continue
             ft = r.get("first_token")
-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+            view.append({"slot": b, "state": "releasing" if b in self.slot_releasing else r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None, **residency,
                          **({"request_id": r["request_id"]} if r.get("request_id") else {})})
@@ -2481,8 +2533,8 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {}) + self._phase_keys(sampling or {})
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
         on_submit = (sampling or {}).get("_strata_submitted")
         if callable(on_submit):
@@ -3713,6 +3765,147 @@ class ResolvedGeneration:
     mcp_extra: set = dataclasses.field(default_factory=set)
 
 
+class NativePhaseLog:
+    """Opt-in metadata receipts: fixed fields, bounded read bytes/records, no slot-owner inference."""
+    READ_MAX, LINE_MAX, RECORDS_MAX = 262144, 8192, 512
+    STAGES = ("demand_identity", "demand_wait", "demand_materialize", "resident_giveback", "resident_copyin",
+              "prefill_run", "store_seam", "decode_interleave", "park_capture", "decode_residence", "decode_run",
+              "gpu_mount")
+    TEXT_FIELDS = ("kind", "event", "priority", "status", "semantics", "continuation", "identity", "demand_status")
+    ID_FIELDS = ("request", "incarnation", "executor_request", "executor_incarnation")
+    INT_FIELDS = ("leg", "slot", "slot_generation", "sequence", "started_ns", "ended_ns",
+                  "aggregate_overflow", "terminal_overflow", "trace_dropped", "trace_truncated", "capture_ticket", "publication",
+                  "owner", "owner_generation", "epoch", "executor_leg", "head", "attempts", "observed_ns",
+                  "durable_ns", "catalog_version", "demand_request", "demand_generation", "demand_attempt", "demand_head",
+                  "shared_prefix_tokens", "shared_prefix_restored_tokens", "shared_lookup_ns",
+                  "shared_lookup_catalog_version", "shared_lookup_matches", "shared_lookup_eligible", "shared_lookup_head",
+                  "periodic_checkpoint_count", "periodic_checkpoint_last_tokens", "periodic_checkpoint_last_ns")
+    DURATION_FIELDS = ("total_ms", "since_capture_ms", "queue_ms", "admitted_to_observed_ms", "writer_ms")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.key, self.identity, self.pos = None, None, 0
+        self.records = collections.deque(maxlen=self.RECORDS_MAX)
+        self.dropped, self.gaps, self.invalid = 0, 0, 0
+
+    @classmethod
+    def parse(cls, line):
+        if not line.startswith("STRATA_PHASE "):
+            return None
+        if len(line) > cls.LINE_MAX:
+            raise ValueError("phase receipt exceeds line bound")
+        fields = {}
+        for token in line.split()[1:]:
+            key, separator, value = token.partition("=")
+            if not separator or key in fields or len(fields) >= 96:
+                raise ValueError("invalid phase receipt fields")
+            fields[key] = value
+        if fields.get("v") != "1" or fields.get("kind") not in ("request", "resident", "publication"):
+            raise ValueError("unsupported phase receipt")
+        result = {"v": 1}
+        known = {"v", *cls.TEXT_FIELDS, *cls.ID_FIELDS, *cls.INT_FIELDS, *cls.DURATION_FIELDS}
+        for stage in cls.STAGES:
+            known.update((stage + "_ms", stage + "_count"))
+        for key, value in fields.items():
+            if key not in known or key == "v":
+                continue
+            if value == "na":
+                result[key] = None
+            elif key in cls.ID_FIELDS:
+                pattern = r"[0-9a-f]{32}" if key.endswith("incarnation") else r"[A-Za-z0-9_-]{1,96}"
+                if not re.fullmatch(pattern, value):
+                    raise ValueError("invalid phase identity")
+                result[key] = value
+            elif key in cls.INT_FIELDS or key.endswith("_count"):
+                if key == "slot" and value == "-1":
+                    result[key] = -1
+                elif not re.fullmatch(r"0|[1-9][0-9]{0,19}", value) or int(value) >= 1 << 64:
+                    raise ValueError("invalid phase integer")
+                else:
+                    result[key] = int(value)
+            elif key.endswith("_ms"):
+                number = float(value)
+                if not math.isfinite(number) or number < 0:
+                    raise ValueError("invalid phase duration")
+                result[key] = number
+            else:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+                    raise ValueError("invalid phase enum")
+                result[key] = value
+        identity = (result.get("request"), result.get("leg"), result.get("incarnation"))
+        result["correlated"] = all(identity) and result.get("identity") != "invalid"
+        if any(value is not None for value in identity) and not result["correlated"]:
+            raise ValueError("partial phase identity")
+        result["unknown_fields"] = len(fields.keys() - known)
+        return result
+
+    def poll(self, path, start):
+        with self.lock:
+            if path and start is not None:
+                try:
+                    with open(path, "rb") as stream:
+                        stat = os.fstat(stream.fileno())
+                        identity = stat.st_dev, stat.st_ino
+                        if self.key != (path, start):
+                            if self.key is not None:
+                                self.gaps += 1
+                            self.key, self.pos, self.identity = (path, start), start, identity
+                        if self.identity != identity or stat.st_size < self.pos:
+                            self.gaps += 1
+                            self.pos = 0
+                        self.identity = identity
+                        skipped = stat.st_size - self.pos > self.READ_MAX
+                        if skipped:
+                            self.gaps += 1
+                            self.pos = stat.st_size - self.READ_MAX
+                        stream.seek(self.pos)
+                        data = stream.read(self.READ_MAX)
+                    if skipped:
+                        end = data.find(b"\n")
+                        consumed = len(data) if end < 0 else end + 1
+                        self.pos += consumed
+                        data = data[consumed:]
+                    end = data.rfind(b"\n")
+                    if end >= 0:
+                        self.pos += end + 1
+                        for line in data[:end].split(b"\n"):
+                            try:
+                                receipt = self.parse(line.decode("ascii"))
+                            except (ValueError, UnicodeError):
+                                if line.startswith(b"STRATA_PHASE "):
+                                    self.invalid += 1
+                                continue
+                            if receipt is not None:
+                                if len(self.records) == self.RECORDS_MAX:
+                                    self.dropped += 1
+                                self.records.append(receipt)
+                    elif len(data) > self.LINE_MAX:
+                        self.pos += len(data)
+                        self.gaps += 1
+                except OSError:
+                    pass
+            return {"records": [dict(r) for r in self.records], "records_dropped": self.dropped,
+                    "gaps": self.gaps, "invalid": self.invalid, "semantics": "inclusive_host_not_partition"}
+
+
+FRONTEND_PHASES = ("admission_wait", "control_selector_wait", "physical_slot_wait", "control_occupied_wait",
+                   "preparation", "native_active", "cleanup", "unattributed")
+ATTRIBUTION_OUTCOMES = ("completed", "error", "rejected", "cancelled", "timeout", "disconnected", "shutting down")
+
+
+def _frontend_phase(record, phase, now=None):
+    """Exclusive monotonic wall time; independent of the capped diagnostic event trace. Caller owns status_lock."""
+    now = time.perf_counter() if now is None else now
+    previous = record.get("_frontend_phase")
+    if previous == phase:
+        return
+    if previous is not None:
+        record["frontend"]["seconds"][previous] += now - record["_frontend_since"]
+    record["_frontend_phase"], record["_frontend_since"] = phase, now
+    if phase is not None:
+        record["frontend"]["counts"][phase] += 1
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3747,6 +3940,7 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.phase_log = NativePhaseLog()
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -3794,6 +3988,11 @@ class Service:
         self.lifecycles = collections.deque(maxlen=500)
         self.lifecycle_boot = uuid.uuid4().hex
         self.lifecycle_local = threading.local()
+        self.frontend_totals = {p: {o: {"requests": 0, "seconds": dict.fromkeys(FRONTEND_PHASES, 0.0),
+                                       "counts": dict.fromkeys(FRONTEND_PHASES, 0),
+                                       "first_token_s": 0.0, "first_token_count": 0,
+                                       "first_content_s": 0.0, "first_content_count": 0}
+                                   for o in ATTRIBUTION_OUTCOMES} for p in ("foreground", "background")}
         self.store_timing = os.environ.get("STRATA_STORE_TIMING") == "1"
         self.preparation = conversation_offers.PreparationBudget()   # the queued frontier's own preparation bytes
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
@@ -3954,6 +4153,8 @@ class Service:
         return {"slots": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                 "request_queue_limit": self.request_queue_limit,
                 "active": len(self.admission_active), "waiting": len(self.admission_waiters),
+                "waiting_by_priority": {p: sum(r["priority"] == p for r in self.admission_waiters)
+                                        for p in ("foreground", "background")},
                 "score_slots": 1,
                 "score_active": sum(bool(r.get("_score")) for r in self.admission_active.values()),
                 "score_waiting": sum(bool(r.get("_score")) for r in self.admission_waiters),
@@ -3966,7 +4167,9 @@ class Service:
     def _refresh_foreground_pending(self):
         """Publish an atomic scalar under status_lock; native control never locks the HTTP queue."""
         self._foreground_pending = any(r["priority"] == "foreground" for r in self.admission_waiters) or any(
-            r["priority"] == "foreground" and not r.get("_executing") for r in self.admission_active.values())
+            r["priority"] == "foreground" and not r.get("_executing") and
+            r["state"] in ("queued", "admitted", "preparing", "engine_wait")
+            for r in self.admission_active.values())
 
     def register_lifecycle(self, req, cancel, *, score=False):
         priority = req.get("strata_priority", "foreground")
@@ -3980,13 +4183,20 @@ class Service:
                   "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
                   "events": [{"state": "queued", "elapsed_s": 0.0}], "events_dropped": 0, "_clock": now,
                   "_deadline": now + timeout, "_cancel": cancel}
+        record.update(boot_id=self.lifecycle_boot, first_content_s=None,
+                      frontend={"seconds": dict.fromkeys(FRONTEND_PHASES, 0.0),
+                                "counts": dict.fromkeys(FRONTEND_PHASES, 0)},
+                      native_submissions=[], native_submissions_dropped=0, native_submission_count=0)
+        _frontend_phase(record, "admission_wait", now)
         with self.admission_cv:
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
             if self.shutting_down:
                 record.update(state="rejected", error="the server is shutting down", completion_s=0.0)
                 record["events"].append({"state": "rejected", "elapsed_s": 0.0})
                 self.lifecycles.append(record)
-                raise AdmissionError("the server is shutting down; no new request is accepted", 503)
+                record["rejection_reason"] = "shutdown"
+                raise AdmissionError("the server is shutting down; no new request is accepted", 503,
+                                     lifecycle=record)
             # SCORE uses its own bounded control lane, not a generation reservation.
             limit = score_api.capabilities(self.engine)["max_pending"] if score else capacity + self.request_queue_limit
             pending = (sum(bool(r.get("_score")) == score for r in self.admission_active.values()) +
@@ -3995,7 +4205,8 @@ class Service:
                 record.update(state="rejected", error="request queue is full", completion_s=0.0)
                 record["events"].append({"state": "rejected", "elapsed_s": 0.0})
                 self.lifecycles.append(record)
-                raise AdmissionError("request queue is full; retry after a request completes")
+                record["rejection_reason"] = "queue_full"
+                raise AdmissionError("request queue is full; retry after a request completes", lifecycle=record)
             self.admission_waiters.append(record)
             self.lifecycles.append(record)
             self.status["queued"] += 1
@@ -4003,6 +4214,99 @@ class Service:
             self._refresh_foreground_pending()
             self.admission_cv.notify_all()
         return record
+
+    def frontend_phase(self, record, phase):
+        if record is not None:
+            with self.status_lock:
+                if not record.get("_frontend_finished"):
+                    _frontend_phase(record, phase)
+
+    def native_submitted(self, record, slot=None, correlation=None):
+        """Frontend submission correlation, not a native receipt or a fabricated compute interval."""
+        with self.status_lock:
+            engine = self.engine
+            if correlation is None:
+                engine._submission_sequence = getattr(engine, "_submission_sequence", 0) + 1
+                correlation = {"engine_incarnation": getattr(engine, "gen", None),
+                               "submission_sequence": engine._submission_sequence, "slot": slot}
+            record["native_submission_count"] += 1
+            if len(record["native_submissions"]) < 128:
+                record["native_submissions"].append(correlation)
+            else:
+                record["native_submissions_dropped"] += 1
+            record["last_native_submission"] = correlation
+            _frontend_phase(record, "native_active")
+
+    def _finish_frontend(self, record, now=None):
+        """Close even a cancelled open wait and accumulate exactly once. Caller owns status_lock."""
+        if record.get("_frontend_finished"):
+            return
+        now = time.perf_counter() if now is None else now
+        _frontend_phase(record, None, now)
+        record["_frontend_finished"] = True
+        record["completion_s"] = now - record["_clock"]
+        record["finished_monotonic_s"] = now
+        record["finished_at"] = time.time()
+        record["admission_wait_s"] = record["frontend"]["seconds"]["admission_wait"]
+        record["frontend"]["seconds"]["unattributed"] += max(
+            0.0, record["completion_s"] - sum(record["frontend"]["seconds"].values()))
+        outcome = record["state"] if record["state"] in ATTRIBUTION_OUTCOMES else "error"
+        totals = self.frontend_totals[record["priority"]][outcome]
+        totals["requests"] += 1
+        for phase in FRONTEND_PHASES:
+            totals["seconds"][phase] += record["frontend"]["seconds"][phase]
+            totals["counts"][phase] += record["frontend"]["counts"][phase]
+        for field in ("first_token", "first_content"):
+            value = record.get(field + "_s")
+            if value is not None:
+                totals[field + "_s"] += value
+                totals[field + "_count"] += 1
+
+    def _native_phase_snapshot(self):
+        info = getattr(self.engine, "info", {}) or {}
+        supported = bool(info.get("phase_timing")) and info.get("phase_timing_version") == 1
+        enabled = os.environ.get("STRATA_PHASE_TIMING") == "1"
+        snapshot = self.phase_log.poll(getattr(self.engine, "log_path", None) if enabled and supported else None,
+                                       getattr(self.engine, "log_start", None))
+        return {**snapshot, "supported": supported, "enabled": enabled}
+
+    def _emit_attribution(self, record, path):
+        """Snapshot once under the admission lock; all diagnostic I/O happens outside it."""
+        with self.status_lock:
+            if record.get("_attribution_emitted"):
+                return
+            record["_attribution_emitted"] = True
+            snapshot = dict(record)
+            snapshot["frontend"] = {key: dict(values) for key, values in record["frontend"].items()}
+            snapshot["native_submissions"] = [dict(item) for item in record["native_submissions"]]
+            snapshot["_response_work"] = record.pop("_response_work", [])
+            if "_store_offer" in record:
+                snapshot["_store_offer"] = dict(record["_store_offer"])
+        native = self._native_phase_snapshot()
+        identities = {(s.get("incarnation"), s["submission_sequence"]) for s in snapshot["native_submissions"]}
+        matching = [r for r in native["records"] if r.get("correlated") and r.get("request") == snapshot["id"] and
+                    (r.get("incarnation"), r.get("leg")) in identities and r["kind"] in ("request", "resident")]
+        commands = {(r.get("incarnation"), r.get("leg")) for r in matching if r["kind"] == "request"}
+        resident = {(r.get("incarnation"), r.get("leg")) for r in matching
+                    if r["kind"] == "resident" and r.get("event") == "terminal"}
+        required_resident = {(r.get("incarnation"), r.get("leg")) for r in matching
+                             if r["kind"] == "request" and r.get("continuation") == "resident"}
+        missing = max(0, snapshot["native_submission_count"] - len(commands))
+        resident_missing = len(required_resident - resident)
+        incomplete = missing or resident_missing or len(matching) > 128 or any(
+            r.get("trace_dropped") or r.get("trace_truncated") or
+            r.get("aggregate_overflow") or r.get("terminal_overflow") for r in matching)
+        snapshot["_native_phase"] = {
+            "supported": native["supported"], "enabled": native["enabled"],
+            "receipts": matching[:128], "receipts_dropped": max(0, len(matching) - 128),
+            "log_gaps": native["gaps"], "log_records_dropped": native["records_dropped"],
+            "submissions_without_receipt": missing, "resident_terminals_missing": resident_missing,
+            "log_invalid": native["invalid"], "semantics": native["semantics"],
+            "status": ("partial" if incomplete else "observed") if matching else "unavailable"}
+        attribution = _response_attribution(snapshot, path)
+        with self.status_lock:
+            record["attribution"] = {k: v for k, v in attribution.items() if k != "cache_offer"}
+        print("[strata] response_attribution: " + json.dumps(attribution, separators=(",", ":")), flush=True)
 
     def lifecycle_note(self, record, state, **values):
         with self.status_lock:
@@ -4044,6 +4348,12 @@ class Service:
                     self.status["queued"] -= 1
                     record["_admitted_clock"] = time.perf_counter()
                     record["queue_s"] = round(record["_admitted_clock"] - record["_clock"], 6)
+                    record["admission_wait_s"] = record["_admitted_clock"] - record["_clock"]
+                    record["admission_reason"] = ("foreground_quota" if record["priority"] == "background" and
+                                                  self.admission_foreground[score] == 0 and
+                                                  any(r["priority"] == "foreground" for r in self.admission_waiters)
+                                                  else "priority_fifo")
+                    _frontend_phase(record, "preparation", record["_admitted_clock"])
                     self.admission_cv.notify_all()
                     admitted = True
                 else:
@@ -4080,7 +4390,11 @@ class Service:
             if record["state"] == "queued":
                 record["queue_s"] = record["completion_s"]
             self.admission_cv.notify_all()
-        self.lifecycle_note(record, record.get("cancel_reason") or ("error" if record.get("error") else "completed"))
+        outcome = ("rejected" if record.get("rejection_reason") else
+                   record.get("cancel_reason") or ("error" if record.get("error") else "completed"))
+        self.lifecycle_note(record, outcome)
+        with self.status_lock:
+            self._finish_frontend(record)
         self.lifecycle_local.record = None
 
     def lifecycle_records(self, request_id=None):
@@ -4129,11 +4443,13 @@ class Service:
             raise ValueError("this engine does not support SCORE v1")
         record = getattr(self.lifecycle_local, "record", None)
         with contextlib.ExitStack() as turn:
+            self.frontend_phase(record, "control_occupied_wait" if not getattr(self.engine, "batch", 0) else "preparation")
             if not getattr(self.engine, "batch", 0):
                 while not self.fifo.acquire(timeout=.1):
                     if cancel.is_set():
                         raise AdmissionError("score cancelled while queued", 409)
                 turn.callback(self.fifo.release)
+                self.frontend_phase(record, "preparation")
                 self.ensure_loaded()
             elif not self.loaded():
                 with self.fifo:
@@ -4147,9 +4463,11 @@ class Service:
             def submitted():
                 if record is not None:
                     self.lifecycle_note(record, "scoring", _executing=True)
+                    self.native_submitted(record)
             try:
                 result = self.engine.score(request, cancel, request_id=record["id"] if record else None,
-                                           on_wait=waiting, on_submit=submitted)
+                                           on_wait=waiting, on_submit=submitted,
+                                           on_phase=lambda phase: self.frontend_phase(record, phase))
                 if record is not None:
                     self.lifecycle_note(record, "drained", _executing=False, score_receipt=result["receipt"])
                 return result
@@ -4157,6 +4475,8 @@ class Service:
                 if record is not None:
                     record["error"] = str(error)
                 raise
+            finally:
+                self.frontend_phase(record, "preparation")
 
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
@@ -4545,6 +4865,8 @@ class Service:
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
             totals = dict(self.totals)
+            frontend = {p: {o: {**v, "seconds": dict(v["seconds"]), "counts": dict(v["counts"])}
+                           for o, v in outcomes.items()} for p, outcomes in self.frontend_totals.items()}
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -4587,7 +4909,8 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None),
                                     (tel.get("now") or {}).get("pressure"))
-        return {**({"request_activity": request_activity} if os.environ.get("STRATA_THROUGHPUT") == "1" else {}), "throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
+        native_phase = self._native_phase_snapshot()
+        return {"native_phase": native_phase, "frontend": frontend, **({"request_activity": request_activity} if os.environ.get("STRATA_THROUGHPUT") == "1" else {}), "throughput": aggregate, "engine": engine, "live": live, "admission": admission, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -5685,8 +6008,6 @@ class Service:
                   flush=True)
         return True
 
-    PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
-
     def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False, limit=None, *,
                        field="strata_prefix") -> dict | None:
         """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
@@ -5698,9 +6019,11 @@ class Service:
         the boundary included), or {} when the prefix cannot be marked (said in the log: the request is never refused for
         it).  A malformed field is a 400.
 
-        `limit` is the preparation's own token bound: the head this resolves against is tokenized under it as well,
-        and None then (rather than a partial answer) means "not prepared inside the allowance" - the demand resolves
-        this same spec without a bound and gets its pin as always."""
+        Text boundaries use genuine selected request messages, including later text a template may require.
+        Message boundaries conservatively stop at the last included selected text, before its closing wrapper.
+        Earlier declared-shared structure remains intact; following context stops before unsupported fields.
+        Marker order and intact target/suffix text are verified against the full prompt. `limit` bounds rendering,
+        literal restoration and head tokenization too; None defers preparation, never supplies a partial answer."""
         keys = ("messages", "message", "chars", "tokens")
         if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
                 set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
@@ -5722,26 +6045,90 @@ class Service:
                 n += 1
             return n
 
-        def head_ids(msgs):
-            """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there).
+        def head_ids(i, chars):
+            """Verify a declared text cut in genuine rendering context, then compare against the full actual ids."""
+            # Select before adding nonempty guards, using the renderer's canonical empty-turn policy. Distinct
+            # shallow copies retain original spec indices even when callers reuse the same message object.
+            indexed = [dict(message) for message in messages]
+            positions = {id(message): j for j, message in enumerate(indexed)}
+            selected = self.template._examples(indexed)
+            included = [j for j, message in enumerate(selected) if positions[id(message)] <= i]
+            if not included:
+                return []
+            target = included[-1]
+            if chars is not None and positions[id(selected[target])] != i:
+                return []                           # a character hint cannot target an omitted turn
+            def unsupported(message):
+                return (not isinstance(message.get("content"), str) or
+                        message.get("tool_calls") or message.get("reasoning_content"))
 
-            Under a preparation `limit` the head is rendered and restored within the frontend's own bounds as well
-            (None: over the allowance, never a shortened head) - it is one more rendering of the same request.
-            """
+            if unsupported(selected[target]):
+                return []
+            # Earlier fields are already inside the declared shared portion. Keep them intact;
+            # only later unshared structured fields must be absent from the additional render.
+            stop = next((j for j in range(target + 1, len(selected)) if unsupported(selected[j])), len(selected))
+            msgs = selected[:stop]
+            base = "\u0001strata-prefix-" + uuid.uuid4().hex + "-"
+            boundary = base + "boundary\u0001"
+            content = msgs[target]["content"]
+            cut_chars = len(content) if chars is None else chars
+            msgs[target] = {**msgs[target], "content": content[:cut_chars] + boundary + content[cut_chars:]}
             marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            # Verify the target and following text in source order. Earlier declared-shared
+            # structures stay unchanged, including non-string tool-call content.
+            # Add guards after literal marking so a leading inline assistant <think> keeps its semantics.
+            # Put them inside outer whitespace: templates commonly apply `|trim`, and wrapping outside that
+            # whitespace would make the marker itself prevent the real normalization.
+            guarded, expected, guarded_cores = [], [], []
+            for j, message in enumerate(marked):
+                if j < target:
+                    guarded.append(message)
+                    continue
+                start, end = base + f"{j}start\u0001", base + f"{j}end\u0001"
+                expected.append(start)
+                if j == target:
+                    expected.append(boundary)
+                expected.append(end)
+                content = message["content"]
+                begin, finish = len(content) - len(content.lstrip()), len(content.rstrip())
+                if begin > finish:                  # an all-whitespace following turn
+                    begin = finish = len(content) // 2
+                guarded_cores.append(content[begin:finish])
+                guarded.append({**message, "content": content[:begin] + start + content[begin:finish] +
+                                                       end + content[finish:]})
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
             bound = None if limit is None else self.preparation_render_chars()
-            text = self.template.render(marked, tools=marked_tools, **kw) if bound is None else \
-                self.template.render_within(marked, tools=marked_tools, limit=bound, **kw)
+            try:
+                text = self.template.render(guarded, tools=marked_tools, **kw) if bound is None else \
+                    self.template.render_within(guarded, tools=marked_tools, limit=bound, **kw)
+            except Exception:                      # noqa: BLE001 - only hint rendering; the full request succeeded
+                # The actual full request rendered already. Only the hint's genuine context/instrumentation failed.
+                return []
             if text is None:
                 return None
-            cut = text.find(self.PREFIX_END)
-            if cut >= 0:
-                text = text[:cut]
+            marker = re.compile(re.escape(base) + r"(?:boundary|\d+(?:start|end))\x01")
+            found = list(marker.finditer(text))
+            if [m.group() for m in found] != expected:
+                return []
+            # Order alone cannot detect a template moving the character marker past this message's private suffix.
+            # Require the guarded text itself to survive intact too; transformed text is conservatively unmarkable.
+            spans = iter(found)
+            cores = iter(guarded_cores)
+            for j, message in enumerate(marked):
+                if j < target:
+                    continue
+                start = next(spans)
+                if j == target:
+                    next(spans)                    # the boundary inside this content
+                end = next(spans)
+                if text[start.end():end.start()] != next(cores):
+                    return []
+            cut = next(m.start() for m in found if m.group() == boundary)
+            text = marker.sub("", text[:cut])
             plain: tuple = ()
             if changed:
                 restored = unmark_think_literals(text, self.literals, restore_limit=bound,
@@ -5760,7 +6147,7 @@ class Service:
                 print(f"[strata] {field}.messages={k} ignored: the request has {len(messages)} message(s) and the "
                       "prefix must leave at least the last one", flush=True)
                 return {}
-            head = head_ids(messages[:k])
+            head = head_ids(k - 1, None)
             if head is None:
                 return None
             n = lcp(head, ids)
@@ -5770,8 +6157,7 @@ class Service:
             if not isinstance(text, str) or chars > len(text):
                 print(f"[strata] {field} ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
-            cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
-            head = head_ids(cut)
+            head = head_ids(i, chars)
             if head is None:
                 return None
             n = lcp(head, ids)
@@ -5834,7 +6220,14 @@ class Service:
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+            lifecycle = getattr(self.lifecycle_local, "record", None)
+            with contextlib.closing(self._run(ids, thinking, tools, max_new, sampling, cancel, force)) as events:
+                for kind, value in events:
+                    if (lifecycle is not None and lifecycle["first_content_s"] is None and kind == "event" and
+                            value.kind == "content" and value.text):
+                        with self.status_lock:
+                            lifecycle["first_content_s"] = time.perf_counter() - lifecycle["_clock"]
+                    yield kind, value
         finally:
             if ka is not None:
                 ka.release()
@@ -5862,6 +6255,8 @@ class Service:
                 def slot_assigned(slot):
                     self.lifecycle_note(lifecycle, "admitted", slot=slot)
                 sampling = {**(sampling or {}), "_strata_control_ready": control_ready,
+                            "_strata_submission": lambda correlation: self.native_submitted(lifecycle, correlation=correlation),
+                            "_strata_frontend_phase": lambda phase: self.frontend_phase(lifecycle, phase),
                             "_strata_slot": slot_assigned, "_strata_native_waiting": native_waiting,
                             "_strata_submitted": submitted, "_strata_request_id": lifecycle["id"],
                             "_strata_foreground_pending": lambda: self._foreground_pending}
@@ -5936,6 +6331,7 @@ class Service:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
             if not getattr(self.engine, "batch", 0):
+                self.frontend_phase(lifecycle, "control_occupied_wait")
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
@@ -5956,11 +6352,14 @@ class Service:
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
             with turn:
+                self.frontend_phase(lifecycle, "preparation")
                 try:
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
+                        if lifecycle is not None and not par:
+                            lifecycle["queue_s"] += time.perf_counter() - waiting
                         if not par:
                             self.status["queued"] -= 1
                             counted = False
@@ -6006,6 +6405,7 @@ class Service:
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             if lifecycle is not None and not isinstance(self.engine, StrataEngine):
+                                self.frontend_phase(lifecycle, "native_active")
                                 self.lifecycle_note(lifecycle, "generating", _executing=True)
                             # A value the frontend holds back (a tool call's array or object argument is sent
                             # whole, once complete) can keep the stream silent for minutes while tokens are
@@ -6105,10 +6505,12 @@ class Service:
                         finally:
                             try:
                                 if lifecycle is not None:
+                                    self.frontend_phase(lifecycle, "cleanup")
                                     self.lifecycle_note(lifecycle, "draining")
                                 gen.close()             # drain before freeing request admission or embeddings
                                 if lifecycle is not None:
                                     self.lifecycle_note(lifecycle, "drained", _executing=False)
+                                    self.frontend_phase(lifecycle, "preparation")
                             except EngineDied as e:
                                 finish = "error"
                                 self._say_died(e)
@@ -6418,11 +6820,24 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
             "finish": figures.get("finish"),
             "committed_tokens": figures.get("generated"),
             "output_tokens": sum(part["output_tokens"] for part in work),
-            "interval": {"started_at": lifecycle["started_at"], "finished_at": time.time(),
+            "interval": {"started_at": lifecycle["started_at"], "finished_at": lifecycle.get("finished_at", time.time()),
                          "duration_s": lifecycle["completion_s"]},
             "queue_s": lifecycle.get("queue_s"),
             "registered_monotonic_s": lifecycle.get("_clock"),
             "admitted_monotonic_s": lifecycle.get("_admitted_clock"),
+            "finished_monotonic_s": lifecycle.get("finished_monotonic_s"),
+            "events_dropped": lifecycle.get("events_dropped", 0),
+            "boot_id": lifecycle.get("boot_id"), "priority": lifecycle.get("priority"),
+            "admission_wait_s": lifecycle.get("admission_wait_s"),
+            "admission_reason": lifecycle.get("admission_reason"),
+            "rejection_reason": lifecycle.get("rejection_reason"),
+            "frontend": lifecycle.get("frontend"),
+            "native_phase": lifecycle.get("_native_phase"),
+            "native_submissions": lifecycle.get("native_submissions", []),
+            "native_submission_count": lifecycle.get("native_submission_count", 0),
+            "native_submissions_dropped": lifecycle.get("native_submissions_dropped", 0),
+            "last_native_submission": lifecycle.get("last_native_submission"),
+            "first_content_s": lifecycle.get("first_content_s"),
             "first_token_s": lifecycle.get("first_token_s"),
             "drafts_accepted": figures.get("drafts_accepted"), "drafts_offered": figures.get("drafts_offered"),
             "legs": figures.get("legs", [])}
@@ -7481,6 +7896,8 @@ def make_handler(svc: Service):
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except AdmissionError as e:
+                if self.lifecycle is None:
+                    self.lifecycle = e.lifecycle
                 self._json(e.status, {"error": {"type": "admission_error", "message": str(e)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
@@ -7521,6 +7938,7 @@ def make_handler(svc: Service):
                 self._note(error={"type": "internal_error"})
                 raise
             finally:
+                svc.frontend_phase(self.lifecycle, "cleanup")
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -7536,13 +7954,7 @@ def make_handler(svc: Service):
                 if self.lifecycle is not None:
                     svc.withdraw_offer(self.lifecycle)       # a prepared offer's lifetime is its request's
                     svc.finish_lifecycle(self.lifecycle)
-                    attribution = _response_attribution(self.lifecycle, path)
-                    with svc.status_lock:
-                        # Offer correlation is diagnostic-only, not a lifecycle HTTP API extension.
-                        self.lifecycle["attribution"] = ({k: v for k, v in attribution.items() if k != "cache_offer"}
-                                                         if "cache_offer" in attribution else attribution)
-                    print("[strata] response_attribution: " + json.dumps(attribution, separators=(",", ":")),
-                          flush=True)
+                    svc._emit_attribution(self.lifecycle, path)
                 record = self.record
                 if record is not None:
                     with svc.status_lock:

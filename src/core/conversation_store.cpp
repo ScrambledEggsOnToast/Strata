@@ -77,6 +77,8 @@ constexpr uint64_t kDirectoryCharge = 4096;    // one block per file for its dir
 constexpr uint64_t kReadSlabBytes = uint64_t(1) << 20;
 constexpr uint64_t kReadFixedOverhead = uint64_t(64) << 10;
 constexpr uint64_t kJobFixedOverhead = 1024;
+// Fixed 256-bit tracker, a stack-only two-character shard name plus NUL, and one transient descriptor.
+constexpr uint64_t kShardBatchWorkspace = 4 * sizeof(uint64_t) + 3 * sizeof(char) + sizeof(int);
 constexpr uint64_t kMaxScanEntries = uint64_t(1) << 20;
 constexpr uint64_t kMaxReclaimPerPass = 65536;
 constexpr uint64_t kTempNameAttempts = 32;
@@ -148,6 +150,7 @@ struct StoreReadTrace {
     bool head_event;
     uint64_t plan_version, catalog_version, replacement_head, head_leases, pinned, protected_seg, recency;
     uint64_t charged_bytes, free_bytes, quota_bytes, floor_bytes;
+    uint64_t live_tokens, stages, live_cut;
 };
 
 struct StoreReadTraceBatch {
@@ -176,11 +179,14 @@ struct StoreReadTraceBatch {
                 char line[1024];
                 const int length = std::snprintf(line, sizeof line,
                     "store_head event=%s reason=%s state_ns=%" PRIu64 " applied_ns=%" PRIu64
+                    " request_id=%" PRIu64 " generation=%" PRIu64
                     " head=%" PRIu64 " cut=%" PRIu64 " epoch=%" PRIu64
+                    " live_tokens=%" PRIu64 " stages=%" PRIu64 " live_cut=%" PRIu64
                     " plan_version=%" PRIu64 " catalog_version=%" PRIu64 " replacement_head=%" PRIu64
                     " head_leases=%" PRIu64 " pinned=%" PRIu64 " protected=%" PRIu64 " recency=%" PRIu64
                     " charged_bytes=%" PRIu64 " free_bytes=%" PRIu64 " quota_bytes=%" PRIu64 " floor_bytes=%" PRIu64 "\n",
-                    r.event, r.reason, r.ts_ns, r.finish_ns, r.head, r.cut, r.epoch,
+                    r.event, r.reason, r.ts_ns, r.finish_ns, r.request_id, r.generation, r.head, r.cut, r.epoch,
+                    r.live_tokens, r.stages, r.live_cut,
                     r.plan_version, r.catalog_version, r.replacement_head, r.head_leases, r.pinned, r.protected_seg,
                     r.recency, r.charged_bytes, r.free_bytes, r.quota_bytes, r.floor_bytes);
                 if (length > 0 && size_t(length) < sizeof line) write_line(line, size_t(length));
@@ -304,6 +310,7 @@ struct WriterWorkspace {
     uint64_t buffer = 0;          // the largest single chunk it reads into one buffer
     uint64_t manifest = 0;        // its own encoded manifest
     uint64_t catalog_apply = 0;   // the candidate catalog copy, the apply staging and the retire queue's room
+    uint64_t shard_batch = 0;     // opt-in fixed shard tracker and sequential drain workspace
 
     // Every structure that is live while one chunk is read and written, kept apart from the manifest and the catalog
     // plan because those overlap with it rather than replace it: the chunk records, the referenced and charged object
@@ -330,7 +337,8 @@ struct WriterWorkspace {
     // away; the single chunk buffer and the manifest/apply phase do not coexist.
     uint64_t peak() const {
         const uint64_t base = sat_add(sat_add(request_copy, layout), donor_decoded);
-        return sat_add(sat_add(base, chunk_state()), std::max(buffer, sat_add(manifest, catalog_apply)));
+        return sat_add(sat_add(sat_add(base, shard_batch), chunk_state()),
+                       std::max(buffer, sat_add(manifest, catalog_apply)));
     }
 };
 
@@ -597,35 +605,13 @@ int open_shard_fd(const RootDirs& dirs, const std::string& shard, std::string& w
     return open_child_dir(dirs.objects, shard.c_str(), why);
 }
 
-// An object is durable before any manifest names it: a scratch file, a flush, a rename into its shard, then the
-// shard's own flush - and the shard entry itself is flushed in `objects/` before anything can name it.
-bool write_object_file(RootDirs& dirs, const std::string& temp, const Digest& id, const uint8_t* data, size_t size,
-                       PendingFile& orphan, std::string& why) {
-    const std::string hex = sha256_hex(id);
-    const std::string shard = hex.substr(0, 2);
-    bool created = false;
-    if (!make_child_dir(dirs.objects, shard.c_str(), created, why)) return false;
-    if (created && !fsync_dir(dirs.objects, "objects", why)) return false;
-    const int shard_fd = open_shard_fd(dirs, shard, why);
-    if (shard_fd < 0) return false;
-    // The scratch name is reported to the caller before it is created, so a failure here can always account for the
-    // bytes of a file that may exist.
-    orphan.where = Where::tmp;
-    orphan.name = temp;
-    if (!write_new_file(dirs.tmp, temp, data, size, why)) {
-        ::close(shard_fd);
-        return false;
-    }
-    if (::renameat(dirs.tmp, temp.c_str(), shard_fd, hex.c_str()) != 0) {
-        why = std::string("cannot publish an object: ") + std::strerror(errno);
-        ::close(shard_fd);
-        return false;
-    }
-    orphan = PendingFile{};
-    const bool ok = fsync_dir(shard_fd, "an object shard", why);
-    ::close(shard_fd);
-    return ok;
-}
+struct ShardFd {
+    int fd;
+    explicit ShardFd(int value) : fd(value) {}
+    ShardFd(const ShardFd&) = delete;
+    ShardFd& operator=(const ShardFd&) = delete;
+    ~ShardFd() { if (fd >= 0) ::close(fd); }
+};
 
 // Own the current validated object descriptor through its synchronous hash/copy, including error exits.
 struct ReadObject {
@@ -778,6 +764,7 @@ struct ConversationStore::Impl {
     RootDirs dirs;
     uint32_t reader_threads = 1;
     bool read_timing = false;          // STRATA_STORE_TIMING=1, sampled once before workers start
+    bool dir_fsync_batch = false;     // STRATA_STORE_DIR_FSYNC_BATCH=1, sampled before workers start
 
     // ---- authority ----
     std::mutex mutex;
@@ -905,6 +892,8 @@ struct ConversationStore::Impl {
     void* read_progress_gate_context = nullptr;
     void (*catalog_gate)(void*, bool) = nullptr;
     void* catalog_gate_context = nullptr;
+    void (*object_batch_gate)(void*) = nullptr;
+    void* object_batch_gate_context = nullptr;
 #endif
 
     // ---- publication ----
@@ -946,6 +935,8 @@ struct ConversationStore::Impl {
         uint64_t new_head = 0;                    // publish only
         const char* eviction_reason = "space";
         uint64_t replaced_head = 0;               // diagnostics: distinguish a covered replacement from head pressure
+        uint64_t request_id = 0, generation = 0, live_tokens = 0; // publication diagnostics, never authority
+        uint64_t applied_ns = 0, applied_catalog_version = 0; // exact successful visibility boundary
         bool defer_reclaim = false;               // final catalog: reclaim only after proven intent removal
         std::vector<Digest> new_objects;          // publish only: everything the new manifest references
         std::map<Digest, uint64_t> new_object_charges;   // the ones this publication created (already charged)
@@ -977,7 +968,7 @@ struct ConversationStore::Impl {
 
     // ---- counters and test seams ----
     ConversationStoreCounters counters;
-    std::set<std::string> fault_steps;   // armed failure steps; each one fires once and is then disarmed
+    std::set<std::string, std::less<>> fault_steps; // transparent lookup avoids per-object temporary fault keys
     std::atomic<uint64_t> source_bytes_read{0};
     std::atomic<uint64_t> name_counter{0};
 
@@ -1052,6 +1043,10 @@ struct ConversationStore::Impl {
     bool make_room(uint64_t incoming_bytes, bool& floor_limited, std::string& why);
     CommitOutcome write_catalog_or_refuse(CommitPlan& plan, std::string& why);
     bool take_fault(const char* step);
+    bool write_object_file(const std::string& temp, const Digest& id, const uint8_t* data, size_t size,
+                           PendingFile& orphan, std::string& why);
+    // Revalidate a leased orphan's directory entries outside the catalog mutex before naming it in a manifest.
+    bool sync_revived_object(const Digest& id, std::string& why);
 
     // ---- catalog copy headroom, writer workspace and the post-rename apply ----
     // The physical charge of the catalog's *next* copy: the current catalog plus the most one commit can add to it.
@@ -1075,11 +1070,13 @@ struct ConversationStore::Impl {
     void unstage_apply_locked(CommitPlan& plan);
     void apply_staged_locked(CommitPlan& plan);   // allocation-free: the staged nodes are moved, never built
     void trace_retirement_locked(StoreReadTraceBatch& trace, const CommitPlan& plan, const char* event) const;
+    void trace_publication_locked(StoreReadTraceBatch& trace, const CommitPlan& plan) const;
 
     // Lookup: catalog metadata only, under the mutex, no payload read and no GPU pointer exposed.
     void collect_matches(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
                          const std::vector<ConversationImageKey>& images,
-                         std::vector<ConversationStoreMatch>& out) const;
+                         std::vector<ConversationStoreMatch>& out, StoreReadTraceBatch* trace,
+                         const ConversationStoreQuery* query, bool demand) const;
 
     // Read pipeline.  Settlement is idempotent and every path funnels through it.
     bool admit_read_locked(const ConversationStoreQuery& query, bool demand, std::string& why,
@@ -1202,6 +1199,62 @@ bool ConversationStore::Impl::take_fault(const char* step) {
     if (found == fault_steps.end()) return false;
     fault_steps.erase(found);
     return true;
+}
+
+// An object is durable before any manifest names it. Default writes flush here; the opt-in caller marks every
+// renamed object's shard and drains its shards and objects/ before encoding or creating a manifest.
+bool ConversationStore::Impl::write_object_file(const std::string& temp, const Digest& id, const uint8_t* data,
+                                               size_t size, PendingFile& orphan, std::string& why) {
+    const std::string hex = sha256_hex(id);
+    const char shard[] = {hex[0], hex[1], '\0'};
+    bool created = false;
+    if (!make_child_dir(dirs.objects, shard, created, why)) return false;
+    // An existing shard can be the residue of mkdir followed by a failed parent flush. Existence alone is not a
+    // durability proof, so even that retry must flush objects/ before the new object can be published.
+    if (!dir_fsync_batch) {
+        if (take_fault("object-parent-sync")) {
+            why = "injected fault: the objects directory flush";
+            return false;
+        }
+        if (!fsync_dir(dirs.objects, "objects", why)) return false;
+    }
+    const ShardFd shard_fd(open_child_dir(dirs.objects, shard, why));
+    if (shard_fd.fd < 0) return false;
+    // The scratch name is reported to the caller before it is created, so a failure here can always account for the
+    // bytes of a file that may exist.
+    orphan.where = Where::tmp;
+    orphan.name = temp;
+    if (!write_new_file(dirs.tmp, temp, data, size, why)) return false;
+    if (::renameat(dirs.tmp, temp.c_str(), shard_fd.fd, hex.c_str()) != 0) {
+        why = std::string("cannot publish an object: ") + std::strerror(errno);
+        return false;
+    }
+    orphan = PendingFile{};
+    if (dir_fsync_batch) return true; // The caller marks this shard before any subsequent payload is emitted.
+    if (take_fault("object-shard-sync")) {
+        why = "injected fault: an object shard flush";
+        return false;
+    }
+    return fsync_dir(shard_fd.fd, "an object shard", why);
+}
+
+bool ConversationStore::Impl::sync_revived_object(const Digest& id, std::string& why) {
+    // The file was flushed before its rename, but the prior publication may have failed either directory flush.
+    // Its lease pins the inode while both directory entries are revalidated, without holding the catalog mutex.
+    static constexpr char hex[] = "0123456789abcdef";
+    const char shard[] = {hex[id[0] >> 4], hex[id[0] & 15], '\0'};
+    const ShardFd shard_fd(open_child_dir(dirs.objects, shard, why));
+    if (shard_fd.fd < 0) return false;
+    if (take_fault("object-shard-sync")) {
+        why = "injected fault: a revived object shard flush";
+        return false;
+    }
+    if (!fsync_dir(shard_fd.fd, "a revived object shard", why)) return false;
+    if (take_fault("object-parent-sync")) {
+        why = "injected fault: the revived objects directory flush";
+        return false;
+    }
+    return fsync_dir(dirs.objects, "objects", why);
 }
 
 bool ConversationStore::Impl::open_root(std::string& why) {
@@ -1998,6 +2051,7 @@ WriterWorkspace ConversationStore::Impl::writer_workspace_locked(const Conversat
                                                                  const conversation_store_detail::ImageShape& shape)
     const {
     WriterWorkspace work;
+    work.shard_batch = dir_fsync_batch ? kShardBatchWorkspace : 0;
     work.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
                                 kJobFixedOverhead);
     work.layout = conversation_store_detail::image_layout_workspace(shape);
@@ -2309,6 +2363,12 @@ bool ConversationStore::Impl::stage_apply_locked(CommitPlan& plan, std::string& 
         ObjectState state;
         const auto charge = plan.new_object_charges.find(object);
         state.bytes = charge == plan.new_object_charges.end() ? 0 : charge->second;
+        if (charge == plan.new_object_charges.end()) {
+            // Revival already carries a global physical charge. Transfer its value into the new index node,
+            // not into charged again; lease release then leaves the live node responsible for eventual credit.
+            const auto lease = object_leases.find(object);
+            if (lease != object_leases.end()) state.bytes = lease->second.charge;
+        }
         state.refs = 1;
         plan.staged_objects.emplace(object, state);
     }
@@ -2403,6 +2463,8 @@ void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace
         auto record = trace_state_locked(event, "head_limit", ConversationStoreReadStatus::none);
         record.head_event = true;
         record.head = victim;
+        record.request_id = plan.request_id;
+        record.generation = plan.generation;
         record.plan_version = plan.version;
         record.catalog_version = catalog_version;
         record.replacement_head = plan.new_head;
@@ -2421,10 +2483,53 @@ void ConversationStore::Impl::trace_retirement_locked(StoreReadTraceBatch& trace
             record.pinned = head.pinned;
             record.protected_seg = head.protected_seg;
             record.recency = recency_of_locked(head);
-            for (const auto& cut : head.cuts) record.cut = std::max(record.cut, uint64_t(cut.tokens));
+            record.stages = head.stages;
+            for (const auto& cut : head.cuts) {
+                record.cut = std::max(record.cut, uint64_t(cut.tokens));
+                if (cut.live) record.live_tokens = std::max(record.live_tokens, uint64_t(cut.tokens));
+            }
             break;
         }
         trace.add(record);
+    }
+}
+
+void ConversationStore::Impl::trace_publication_locked(StoreReadTraceBatch& trace, const CommitPlan& plan) const {
+    if (!read_timing || plan.kind != CommitPlan::Kind::publish || !plan.new_head) return;
+    for (const auto& head : catalog.heads) {
+        if (head.head_id != plan.new_head) continue;
+        StoreReadTrace record{};
+        record.head_event = true;
+        record.event = "published_cut";
+        record.reason = "all_stage";
+        record.ts_ns = store_timing_ns();
+        record.request_id = plan.request_id;
+        record.generation = plan.generation;
+        record.head = head.head_id;
+        record.epoch = head.epoch;
+        record.live_tokens = plan.live_tokens;
+        record.stages = head.stages;
+        record.plan_version = plan.version;
+        record.catalog_version = catalog_version;
+        const auto lease = head_leases.find(head.head_id);
+        record.head_leases = lease == head_leases.end() ? 0 : lease->second;
+        record.pinned = head.pinned;
+        record.protected_seg = head.protected_seg;
+        record.recency = recency_of_locked(head);
+        record.charged_bytes = charged;
+        record.free_bytes = free_sample;
+        record.quota_bytes = options.quota_bytes;
+        record.floor_bytes = options.min_free_bytes;
+        for (size_t i = 0; i < head.cuts.size(); ++i) {
+            if (trace.count == sizeof trace.records / sizeof trace.records[0]) {
+                trace.dropped += head.cuts.size() - i;
+                break;
+            }
+            record.cut = head.cuts[i].tokens;
+            record.live_cut = head.cuts[i].live;
+            trace.add(record);
+        }
+        return;
     }
 }
 
@@ -2591,10 +2696,12 @@ CommitOutcome ConversationStore::Impl::write_catalog_or_refuse(CommitPlan& plan,
         std::lock_guard<std::mutex> guard(mutex);
         trace_retirement_locked(trace, plan, "retired");
         apply_staged_locked(plan);
-        if (trace.count) {
-            const uint64_t applied = store_timing_ns();
+        plan.applied_catalog_version = catalog_version;
+        trace_publication_locked(trace, plan);
+        const uint64_t applied = options.publication_timing || trace.count ? store_timing_ns() : 0;
+        if (options.publication_timing) plan.applied_ns = applied;
+        if (trace.count)
             for (size_t i = 0; i < trace.count; ++i) trace.records[i].finish_ns = applied;
-        }
     } catch (const std::exception& error) {
         trace.count = 0;
         trace.dropped = 0; // an uncertain apply must not emit a confirmed retirement
@@ -2716,18 +2823,49 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
 
 void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& selector, const int32_t* ids,
                                              size_t count, const std::vector<ConversationImageKey>& images,
-                                             std::vector<ConversationStoreMatch>& out) const {
+                                             std::vector<ConversationStoreMatch>& out, StoreReadTraceBatch* trace,
+                                             const ConversationStoreQuery* query, bool demand) const {
     out.clear();
     if (!on || faulted || shutdown != ConversationStoreShutdownState::none) return;
     const Digest bucket = conversation_store_detail::store_bucket_digest(options, selector);
     conversation_store_detail::PrefixChain chain(bucket, ids, count, images);
+    auto reject = [&](const CatalogHead& head, const auto& cut, const char* reason) {
+        if (!read_timing || !trace || !query) return;
+        if (trace->count == sizeof trace->records / sizeof trace->records[0]) {
+            ++trace->dropped;
+            return;
+        }
+        auto record = trace_state_locked("candidate_rejected", reason, ConversationStoreReadStatus::none);
+        record.request_id = query->request_id;
+        record.generation = query->generation;
+        record.demand = demand;
+        record.head = head.head_id;
+        record.cut = cut.tokens;
+        record.epoch = head.epoch;
+        trace->add(record);
+    };
     for (const auto& head : catalog.heads) {
-        if (!(head.bucket == bucket) || head.epoch != epoch) continue;
+        if (!(head.bucket == bucket)) continue; // unrelated namespaces never enter diagnostics
+        if (head.epoch != epoch) {
+            if (read_timing && trace)
+                for (const auto& cut : head.cuts) reject(head, cut, "epoch_mismatch");
+            continue;
+        }
         for (const auto& cut : head.cuts) {
             // The last prompt token always starts the next verify window, so only a strictly shorter prefix is usable.
-            if (cut.tokens == 0 || cut.tokens >= count) continue;
+            if (cut.tokens == 0 || cut.tokens >= count) {
+                if (read_timing && trace) reject(head, cut, "not_strict_prefix");
+                continue;
+            }
             Digest digest{};
-            if (!chain.digest(cut.tokens, digest) || !(digest == cut.digest)) continue;
+            if (!chain.digest(cut.tokens, digest)) {
+                if (read_timing && trace) reject(head, cut, "prefix_unavailable");
+                continue;
+            }
+            if (!(digest == cut.digest)) {
+                if (read_timing && trace) reject(head, cut, "prefix_mismatch");
+                continue;
+            }
             ConversationStoreMatch match;
             match.head_id = head.head_id;
             match.tokens = int64_t(cut.tokens);
@@ -2838,7 +2976,9 @@ void ConversationStore::Impl::trace_refusal_locked(StoreReadTraceBatch& trace, c
 
 // The real attempt boundary also owns always-on byte progress; opt-in timing uses that same identity.
 void ConversationStore::Impl::trace_begin_locked(ReadJob& job, uint64_t previous) {
+    const bool prior_unmeasured = job.progress.prior_materialize_unmeasured || job.progress.materialize_started;
     job.progress = {};
+    job.progress.prior_materialize_unmeasured = prior_unmeasured;
     job.progress.attempt_id = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!read_timing) return;
     job.trace_attempt = job.progress.attempt_id;
@@ -3117,7 +3257,8 @@ bool ConversationStore::Impl::refresh_read_locked(const std::shared_ptr<ReadJob>
         return false; // integrity/resource failures are terminal, not speculative refresh candidates
     std::vector<ConversationStoreMatch> found;
     try {
-        collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images, found);
+        collect_matches(job->query.selector, job->query.tokens.data(), job->query.tokens.size(), job->query.images,
+                        found, &trace, &job->query, job->demand);
     } catch (const std::bad_alloc&) {
         return false; // keep useful prepared work when optional revalidation cannot allocate
     }
@@ -3298,7 +3439,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
             }
             std::vector<ConversationStoreMatch> found;
             collect_matches(previous_job->query.selector, previous_job->query.tokens.data(),
-                            previous_job->query.tokens.size(), previous_job->query.images, found);
+                            previous_job->query.tokens.size(), previous_job->query.images, found,
+                            &trace, &previous_job->query, true);
             if (!found.empty()) {
                 // A real selection exists but did not fit the unchanged preparation/allowance checks.
                 previous_job->cancelled = true;
@@ -3377,7 +3519,8 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
         return false;
     }
     std::vector<ConversationStoreMatch> found;
-    collect_matches(query.selector, query.tokens.data(), query.tokens.size(), query.images, found);
+    collect_matches(query.selector, query.tokens.data(), query.tokens.size(), query.images, found,
+                    &trace, &query, demand);
     if (previous_job && previous_job->head_id &&
         (found.empty() || uint64_t(found.front().tokens) < previous_job->tokens ||
          (uint64_t(found.front().tokens) == previous_job->tokens &&
@@ -3481,6 +3624,9 @@ bool ConversationStore::Impl::admit_read_locked(const ConversationStoreQuery& qu
     queue.push_back(job);
     counters.matches++;
     trace_begin_locked(*job, previous);
+    if (previous_job)
+        job->progress.prior_materialize_unmeasured = previous_job->progress.prior_materialize_unmeasured ||
+                                                   previous_job->progress.materialize_started;
     trace_job_locked(trace, *job, "admission", "queued");
     if (previous) trace_job_locked(trace, *job, "reissue", reissue_reason);
     if (demand) revoke_speculation_locked(trace);
@@ -3856,6 +4002,7 @@ void ConversationStore::Impl::reader_body() {
         // The peak is charged here, under the same lock that guards `admission_suspended`, so a later suspension
         // always sees every byte this read can still allocate.
         chosen->active = true;
+        chosen->progress.materialize_started = true;
         chosen->reserved_bytes = chosen->peak_bytes;
         ram_held += chosen->peak_bytes;
         counters.peak_bytes = std::max(counters.peak_bytes, resident_locked());
@@ -4203,6 +4350,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                                   conversation_store_detail::manifest_read_workspace_bound(
                                       conversation_store_detail::manifest_encoded_size(donor.second)));
     WriterWorkspace actual;
+    actual.shard_batch = dir_fsync_batch ? kShardBatchWorkspace : 0;
     actual.request_copy = sat_add(sat_mul(uint64_t(request.reuse.size()), sizeof(ConversationStoreReuse)),
                                   kJobFixedOverhead);
     actual.layout = conversation_store_detail::image_layout_workspace(job->shape);
@@ -4225,6 +4373,8 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     std::map<Digest, uint64_t> referenced;
     std::map<Digest, uint64_t> charged_objects;      // objects this attempt created, and their charge
     uint64_t new_bytes = 0, reused_bytes = 0;
+    uint64_t dirty_shards[4]; // Disabled mode never initializes or reads the opt-in tracker.
+    if (dir_fsync_batch) std::fill_n(dirty_shards, 4, uint64_t(0));
     size_t adopted_chunks = 0;
     bool aborted = false;
     bool floor_limited = false;
@@ -4265,7 +4415,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                 source_bytes_read += size;
                 const Digest object = conversation_store_detail::object_digest(identity_scope, id.kind,
                                                                               identity_ordinal, size, buffer.data());
-                bool known = false;
+                bool known = false, revived = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex);
                     if (job->coalesced || job->cancelled) {
@@ -4278,23 +4428,36 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                                 "the execution domain advanced while the image was written");
                         return false;
                     }
-                    known = charged_objects.count(object) != 0 || objects.count(object) != 0;
+                    const bool ours = charged_objects.count(object) != 0;
+                    const auto state = objects.find(object);
+                    const auto lease = object_leases.find(object);
+                    // Only this single writer acquires object leases, and writer_body releases all of a job's
+                    // leases before starting the next job. Thus a lease here belongs to this publication, including
+                    // an orphan revived by an earlier identical chunk. Reclamation treats it as a reference.
+                    known = ours || state != objects.end() || lease != object_leases.end();
                     if (known) counters.dedup_chunks++;
-                    const bool ours = known && charged_objects.count(object) != 0;
-                    uint64_t lease_charge = 0;
-                    if (!known) {
-                        // A complete file for this content address may exist as an accounted orphan: adopting it
-                        // rather than rewriting it keeps its charge honest and keeps it out of the reclaimer's way.
-                        lease_charge = pending_object_charge_locked(object);
-                        known = revive_object_locked(object);
-                    } else if (!ours) {
-                        const auto state = objects.find(object);
-                        lease_charge = state == objects.end() ? 0 : state->second.bytes;
+                    if (!ours && lease == object_leases.end()) {
+                        const uint64_t charge = state == objects.end() || state->second.refs == 0
+                            ? pending_object_charge_locked(object) : 0;
+                        if (charge != 0) {
+                            // Allocate the lease before removing the pending record: allocation failure must leave
+                            // the orphan's original ownership and charge available to reclamation. An indexed
+                            // object with zero refs can also be pending after an earlier failed deletion.
+                            lease_object_locked(job, object, charge);
+                            known = revived = revive_object_locked(object);
+                        } else if (state != objects.end()) {
+                            // An indexed object may lose its last retained head during make_room(); pin it until apply.
+                            lease_object_locked(job, object, state->second.bytes);
+                        }
                     }
-                    // An object this attempt will name but did not create is leased until the transaction settles:
-                    // the head that owns it may be evicted - and the object reclaimed - by a later make_room() while
-                    // this manifest is still being written.
-                    if (known && !ours) lease_object_locked(job, object, lease_charge);
+                }
+                if (revived) {
+                    if (dir_fsync_batch) {
+                        dirty_shards[object[0] / 64] |= uint64_t(1) << (object[0] % 64);
+                    } else if (!sync_revived_object(object, why)) {
+                        abandon(ConversationStorePublishStatus::failed, why);
+                        return false;
+                    }
                 }
                 if (!known) {
                     const uint64_t charge = allocated_charge(size);
@@ -4317,7 +4480,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                         note_file(Where::objects, object_name, charge, object, object_name.substr(0, 2));
                     const std::string scratch_name = "ob-" + temp_name();
                     PendingFile scratch;
-                    if (!write_object_file(dirs, scratch_name, object, buffer.data(), size_t(size), scratch, why)) {
+                    if (!write_object_file(scratch_name, object, buffer.data(), size_t(size), scratch, why)) {
                         // The object is charged once, so the attempt carries exactly one record for the file that
                         // may really exist.  The scratch is reported whenever the bytes never reached their shard
                         // (a failed write, or a rename that did not happen), and it is empty when they did: there
@@ -4329,6 +4492,8 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                         abandon(ConversationStorePublishStatus::failed, why);
                         return false;
                     }
+                    if (dir_fsync_batch)
+                        dirty_shards[object[0] / 64] |= uint64_t(1) << (object[0] % 64);
                     charged_objects[object] = charge;
                     new_bytes += size;
                     {
@@ -4466,6 +4631,73 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         }
         published_order = ++catalog.published_order_counter;
     }
+    // All storage work stays outside the catalog mutex. No manifest may name an object until this drain completes.
+    if (dir_fsync_batch && (dirty_shards[0] || dirty_shards[1] || dirty_shards[2] || dirty_shards[3])) {
+#ifdef STRATA_STORE_TEST_HOOKS
+        void (*gate)(void*) = nullptr;
+        void* context = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            gate = object_batch_gate;
+            context = object_batch_gate_context;
+        }
+        if (gate) gate(context);
+#endif
+#ifdef STRATA_STORE_TEST_HOOKS
+        bool flushed = false;
+#endif
+        for (unsigned byte = 0; byte < 256; ++byte) {
+            if (!(dirty_shards[byte / 64] & (uint64_t(1) << (byte % 64)))) continue;
+#ifdef STRATA_STORE_TEST_HOOKS
+            if ((flushed && take_fault("batch-shard-partial")) || take_fault("batch-shard-open")) {
+                fail(ConversationStorePublishStatus::failed, "injected fault: object shard batch open");
+                return;
+            }
+#endif
+            static constexpr char hex[] = "0123456789abcdef";
+            const char name[] = {hex[byte / 16], hex[byte % 16], '\0'};
+            const ShardFd shard(open_child_dir(dirs.objects, name, why));
+            if (shard.fd < 0) {
+                fail(ConversationStorePublishStatus::failed, why);
+                return;
+            }
+#ifdef STRATA_STORE_TEST_HOOKS
+            // Exercise stack unwinding while the transient descriptor is owned, without changing authority.
+            if (take_fault("batch-shard-allocate")) throw std::bad_alloc();
+            if (take_fault("batch-shard-sync")) {
+                fail(ConversationStorePublishStatus::failed, "injected fault: object shard batch flush");
+                return;
+            }
+#endif
+            // Generic flush faults retain their meaning in both modes: refuse the actual directory boundary.
+            if (take_fault("object-shard-sync")) {
+                fail(ConversationStorePublishStatus::failed, "injected fault: an object shard flush");
+                return;
+            }
+            if (!fsync_dir(shard.fd, "an object shard", why)) {
+                fail(ConversationStorePublishStatus::failed, why);
+                return;
+            }
+#ifdef STRATA_STORE_TEST_HOOKS
+            flushed = true;
+#endif
+        }
+        // Always flush the parent for a nonempty batch, including shards left behind by failed attempts.
+#ifdef STRATA_STORE_TEST_HOOKS
+        if (take_fault("batch-parent-sync")) {
+            fail(ConversationStorePublishStatus::failed, "injected fault: objects parent batch flush");
+            return;
+        }
+#endif
+        if (take_fault("object-parent-sync")) {
+            fail(ConversationStorePublishStatus::failed, "injected fault: the objects directory flush");
+            return;
+        }
+        if (!fsync_dir(dirs.objects, "objects", why)) {
+            fail(ConversationStorePublishStatus::failed, why);
+            return;
+        }
+    }
     meta.bucket = bucket;
     meta.domain = options.domain;
     meta.epoch = epoch_now;
@@ -4557,6 +4789,9 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     {
         std::lock_guard<std::mutex> guard(mutex);
         plan.kind = CommitPlan::Kind::publish;
+        plan.request_id = request.request_id;
+        plan.generation = request.generation;
+        plan.live_tokens = image.live.ids.size();
         plan.version = catalog_version;
         copy_catalog_locked(plan);
         CatalogHead head;
@@ -4706,6 +4941,8 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     out.payload_bytes = layout.payload_bytes;
     out.new_bytes = new_bytes;
     out.reused_bytes = reused_bytes;
+    out.applied_ns = plan.applied_ns;
+    out.catalog_version = plan.applied_catalog_version;
     out.detail = status == ConversationStorePublishStatus::retained_branch
                      ? "the predecessor keeps a divergent or pinned cut, so both branches are retained"
                      : std::string();
@@ -4720,6 +4957,8 @@ ConversationStore::ConversationStore(ConversationStoreOptions options, Conversat
     Impl& self = *impl_;
     const char* timing = std::getenv("STRATA_STORE_TIMING");
     self.read_timing = timing && std::strcmp(timing, "1") == 0;
+    const char* batch = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    self.dir_fsync_batch = batch && std::strcmp(batch, "1") == 0;
     self.options = std::move(options);
     self.limits = limits;
     // The retention figures are derived here, from the format's own representability bounds and the configured
@@ -4848,13 +5087,18 @@ uint64_t ConversationStore::domain_digest_truncated() const {
 
 void ConversationStore::for_each_match(const ConversationStoreSelector& selector, const int32_t* ids, size_t count,
                                        const ConversationImageKey* images, size_t image_count,
-                                       const std::function<void(const ConversationStoreMatch&)>& visit) const {
+                                       const std::function<void(const ConversationStoreMatch&)>& visit,
+                                       ConversationStoreLookupFrontier* frontier) const {
     std::vector<ConversationImageKey> keys;
     if (images && image_count) keys.assign(images, images + image_count);
     std::vector<ConversationStoreMatch> found;
     {
         std::lock_guard<std::mutex> guard(impl_->mutex);
-        impl_->collect_matches(selector, ids, count, keys, found);
+        impl_->collect_matches(selector, ids, count, keys, found, nullptr, nullptr, false);
+        if (frontier) {
+            frontier->observed_ns = store_timing_ns();
+            frontier->catalog_version = impl_->catalog_version;
+        }
     }
     for (const auto& match : found) visit(match);
 }
@@ -4864,8 +5108,15 @@ std::vector<ConversationStoreMatch> ConversationStore::matches(const Conversatio
                                                               const std::vector<ConversationImageKey>& images) const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     std::vector<ConversationStoreMatch> found;
-    impl_->collect_matches(selector, ids.data(), ids.size(), images, found);
+    impl_->collect_matches(selector, ids.data(), ids.size(), images, found, nullptr, nullptr, false);
     return found;
+}
+
+bool ConversationStore::retains_head(uint64_t head_id) const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    for (const auto& head : impl_->catalog.heads)
+        if (head.head_id == head_id) return true;
+    return false;
 }
 
 bool ConversationStore::manifest_info(uint64_t head_id, ConversationStoreManifestInfo& out) const {
@@ -5738,6 +5989,12 @@ void ConversationStore::set_catalog_gate_for_test(void (*gate)(void*, bool), voi
     std::lock_guard<std::mutex> guard(impl_->mutex);
     impl_->catalog_gate = gate;
     impl_->catalog_gate_context = context;
+}
+
+void ConversationStore::set_object_batch_gate_for_test(void (*gate)(void*), void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->object_batch_gate = gate;
+    impl_->object_batch_gate_context = context;
 }
 #endif
 

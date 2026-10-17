@@ -20,11 +20,13 @@ static_assert(sizeof(ResidentSlot) + sizeof(core::SessionOwner) <= plan::kReside
 
 ResidentSlots::ResidentSlots(const core::ModelGeometry& geometry, std::vector<ResidentStage> stages,
                              core::MtpDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
-                             int64_t context, bool cache)
+                             int64_t context, bool cache, int64_t checkpoint_chain_limit, uint64_t checkpoint_byte_limit)
     : geometry_(geometry), stages_(std::move(stages)), draft_(draft), prompt_(prompt), dispatch_(dispatch),
-      slots_(stages_.empty() ? 0 : stages_[0].slots.size()), context_(context), cache_(cache) {
+      slots_(stages_.empty() ? 0 : stages_[0].slots.size()), context_(context),
+      checkpoint_chain_limit_(checkpoint_chain_limit), checkpoint_byte_limit_(checkpoint_byte_limit), cache_(cache) {
     next_request_ = dispatch_.request_generation;
-    if (context <= 0 || slots_.size() > plan::kResidentMaxSlots)
+    if (context <= 0 || context > INT32_MAX || checkpoint_chain_limit <= 0 || checkpoint_chain_limit > INT32_MAX ||
+        slots_.size() > plan::kResidentMaxSlots || (!slots_.empty() && !checkpoint_byte_limit_))
         throw std::invalid_argument("resident slot/context extent invalid");
     for (const auto& stage : stages_)
         if (!stage.main || !stage.verifier || stage.slots.size() != slots_.size() ||
@@ -33,7 +35,7 @@ ResidentSlots::ResidentSlots(const core::ModelGeometry& geometry, std::vector<Re
     for (auto& slot : slots_) {
         slot.ids.reserve((size_t) context_);
         slot.prompt.reserve((size_t) context_);
-        slot.checks.reserve(1);
+        slot.checks.reserve((size_t) checkpoint_chain_limit_);
     }
 }
 
@@ -330,7 +332,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
                          bool parked, bool from_start, std::string& error) {
     const bool timing = admission_timing_enabled();
     auto phase = timing ? Clock::now() : Clock::time_point{};
-    if (working_failed_ || !available(slot) || !working_.request || prefix.empty() || prefix.size() >= (uint64_t) context_ ||
+    if (request.checkpoint_limit < -1 || working_failed_ || !available(slot) || !working_.request || prefix.empty() || prefix.size() >= (uint64_t) context_ ||
         (!parked && (input_.max_new <= 1 || destination_ != slot)) ||
         (parked && (!cache_ || input_.images || !working_prompt_ || (destination_ >= 0 && destination_ != slot) ||
          prefix.size() >= working_prompt_->size() || !std::equal(prefix.begin(), prefix.end(), working_prompt_->begin())))) {
@@ -351,6 +353,10 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     };
     core::ConversationCheckpoint* root = nullptr;
     core::ConversationCheckpoint* latest = nullptr;
+    size_t selected_count = 0;
+    const auto payload_capacity = [](const core::CheckpointBytes& bytes) {
+        return bytes.empty() ? size_t(0) : bytes.capacity(); // empty builders are copied, never sealed/retained
+    };
     if (request.checkpoints && !input_.images)
         for (auto& checkpoint : *request.checkpoints) {
             if (!eligible(checkpoint)) continue;
@@ -361,9 +367,35 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
                 error = "resident admission: checkpoint parts do not describe the same prefix";
                 return false;
             }
+            plan::LogicalBytes capacity;
+            uint64_t retained_bytes = 0;
+            for (size_t i = 0; i < stages_.size(); ++i) {
+                const auto& part = i ? checkpoint.stage_parts[i - 1] : checkpoint;
+                if (!core::conversation_checkpoint_validate(part, *stages_[i].main, geometry_, error))
+                    return false;
+                // Only array backing survives sealing. IDs and stage directories
+                // are newly copied at logical size; their caller-only reserves
+                // are not retained. Charge future shared controls even if unsealed.
+                retained_bytes = capacity.sum({retained_bytes, sizeof(core::ConversationCheckpoint),
+                    5 * core::CheckpointBytes::owner_bytes,
+                    capacity.product({part.ids.size(), sizeof(int32_t)}),
+                    payload_capacity(part.gdn), payload_capacity(part.ple), payload_capacity(part.tails),
+                    payload_capacity(part.dead), payload_capacity(part.block_pos)});
+            }
+            if (!capacity.valid || retained_bytes > checkpoint_byte_limit_) {
+                error = "resident admission: checkpoint capacity exceeds admitted allowance";
+                return false;
+            }
             if (!root || checkpoint.ids.size() < root->ids.size()) root = &checkpoint;
             if (!latest || checkpoint.ids.size() > latest->ids.size()) latest = &checkpoint;
+            if (checkpoint.pinned) ++selected_count;
         }
+    if (root && !root->pinned) ++selected_count;
+    if (latest && latest != root && !latest->pinned) ++selected_count;
+    if (selected_count > (uint64_t) checkpoint_chain_limit_) {
+        error = "resident admission: selected checkpoint chain exceeds admitted limit";
+        return false;
+    }
     for (size_t b = 0; b < slots_.size(); ++b)
         if ((int) b != slot && slots_[b].request == working_.request) {
             error = "resident admission: request already owns another slot"; return false;
@@ -376,6 +408,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     // Capture possibly aliased checkpoint metadata before clearing the target.
     std::vector<core::ConversationCheckpoint> selected;
     try {
+        selected.reserve(selected_count);
         if (request.checkpoints && !input_.images)
             for (auto& checkpoint : *request.checkpoints)
                 if (eligible(checkpoint) && (checkpoint.pinned || &checkpoint == root || &checkpoint == latest)) {
@@ -403,6 +436,9 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     touched_ = true;
     state.checks.swap(selected);
     selected.clear();
+    // Release the old top-level directory too: it must not overlap transfer
+    // scratch, whose bound is a serial maximum rather than a sum.
+    std::vector<core::ConversationCheckpoint>().swap(selected);
     if (timing) report_admission_timing(slot, "retire_checkpoint_bind", -1, 1, phase);
     try {
         if (!copy_to(slot, prefix, error)) return fail(slot);
@@ -614,10 +650,7 @@ bool ResidentSlots::copy_from(int slot, const core::ConversationCheckpoint* at, 
             continue;
         }
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch slot restore: device sync failed"; return false; }
-        if (at) {
-            if (!core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, geometry_, error))
-                return false;
-        } else {
+        if (!at) {
             core::ConversationCheckpoint checkpoint;
             checkpoint.ids = prefix;
             if (!core::conversation_checkpoint_save(checkpoint, from, geometry_, error) ||
@@ -631,6 +664,10 @@ bool ResidentSlots::copy_from(int slot, const core::ConversationCheckpoint* at, 
             if (!core::conversation_kv_restore(image, to.qsa_states[to.qsa_ord0 + j], geometry_, upto, true, error))
                 return false;
         }
+        // The retained slot may have completed the cut's pooled block. Restore
+        // its selected spare-row repair last, after copying the later KV image.
+        if (at && !core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, geometry_, error))
+            return false;
         if (cudaDeviceSynchronize() != cudaSuccess) { error = "batch slot restore: device sync failed"; return false; }
         observed.complete();
     }

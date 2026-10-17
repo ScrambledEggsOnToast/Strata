@@ -4,6 +4,7 @@
 #include "strata/core/graph.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/resident_memory.hpp"
 #include "strata/prefill/prefill.hpp"
 
 #include <cstdio>
@@ -20,7 +21,11 @@ int main() {
     core::ExpertDispatch dispatch;
     dispatch.completion.emplace_back(core::ExpertCompletion::kCapacity);
     program::ResidentStage stage{&main.state(), &verifier, {&a.state(), &b.state()}, -1};
-    program::ResidentSlots slots(geometry, {stage}, draft, prompt, dispatch, 64, true);
+    plan::ResidentCheckpointPayload checkpoint;
+    plan::ResidentHostBytes host;
+    if (!core::conversation_checkpoint_payload(geometry, 64, 1, nullptr, checkpoint) ||
+        !plan::resident_host_bytes(64, checkpoint, 0, 0, 1, host)) return 1;
+    program::ResidentSlots slots(geometry, {stage}, draft, prompt, dispatch, 64, true, 6, host.checkpoints);
     std::string error;
     int failures = 0;
     auto check = [&](bool ok, const char* message) {

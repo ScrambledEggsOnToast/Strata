@@ -15,6 +15,7 @@
 // to an already-budgeted cache image; only the queue head may acquire an image and its transferred lease.
 
 #include "strata/core/conversation_store.hpp"
+#include "strata/program/phase_receipts.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,7 @@ struct ConversationPublicationOwner {
     uint64_t generation = 0;
     ConversationPublicationLineage lineage;
     bool force_fresh = false;   // a shared restore owes one fresh, one-shot private publication
+    phase::Identity phase_producer;   // diagnostic only; never lineage or scheduling authority
 
     // Borrowed shared state never establishes private ancestry, including through
     // a late completion of the state it replaced.
@@ -76,6 +78,7 @@ struct ConversationPublicationCapture {
     size_t lease_bytes = 0;            // acquired head's exact charge; zero while its image is still parked
     uint32_t attempts = 0;             // bounded retries; a permanently refused entry is dropped and counted
     bool deferred_reported = false;    // one diagnostic per entry: a deferral repeats by design
+    phase::Publication phase;
 };
 
 struct ConversationPublicationCaptureResult {
@@ -99,6 +102,7 @@ struct ConversationPublicationPending {
     bool cvec = true;
     std::vector<int32_t> live;
     size_t lease_bytes = 0;
+    phase::Publication phase;
 };
 
 // The figures `strata serve` reports at shutdown for this module.  A deferral is deliberately not one of them: the
@@ -148,6 +152,10 @@ struct ConversationPublicationSink {
     // of the writer that follows it, so a regression can land a completion exactly in the window that is the reason
     // the flush reconciles again once it has seen the writer idle.
     std::function<void()> between_harvest_and_idle_for_test;
+    // Optional bounded observer. Never consumes store results or performs I/O.
+    // The engine drains terminal receipts after each public queue operation,
+    // outside ownership locks; intermediate traces may wait until terminal/idle.
+    std::function<void(const phase::PublicationEvent&)> phase_event;
 };
 
 class ConversationPublicationQueue {
@@ -228,16 +236,15 @@ public:
     // Retirement bookkeeping, deliberately independent of the generation-guarded adoption below: a completed
     // *replacement* removed its predecessor from the store's catalog, so every reference to that head - the lineage
     // of each owner that mounted or continued it, and every queued capture that was captured from it, whichever
-    // owner it belongs to - now names a head the store no longer has.  A capture recorded after the completion
-    // cannot adopt the new head (its generation is newer), and without this its own predecessor hint would stay
-    // pointed at the removed head, which the store refuses as stale, for every one of its bounded attempts: the
-    // history the capture holds would be dropped with an "it was stale" line even though its bytes are perfectly
-    // representable as a branch of its own.  Returns how many references were invalidated.
+    // owner it belongs to - now names a head the store no longer has. A capture recorded after the completion
+    // cannot adopt the new head (its generation is newer); clearing its predecessor hint allows it to publish as
+    // its own branch instead of losing an accepted capture to terminal staleness. References are cleared only in
+    // the proven retirement epoch. Returns how many references were invalidated.
     //
     // Rebase is deliberately not an option here: turning the capture into a cover of the *new* head requires the
     // new head's whole record to be an exact prefix of this capture, which `covers()` proves and this bookkeeping
     // never assumes.  Forgetting the hint makes the capture a fresh branch, which is always representable.
-    size_t retire(uint64_t retired_head);
+    size_t retire(uint64_t retired_head, uint64_t epoch);
     // Adopt a completion into the owner lineage it belongs to.  Precondition: `created(result)`.  Returns whether
     // the lineage moved - it does not when the capture does not continue an owner branch or when the owner's
     // generation has already moved past the one that captured it.
@@ -249,7 +256,9 @@ public:
     // again (or remounted, or taken over by another conversation) since it was queued is dropped instead of
     // attaching itself to a state it does not describe, and a cancelled, stale or refused publication never
     // establishes a lineage at all.  A replacement always retires the references to the head it superseded, adopted
-    // or not.  Returns how many results were harvested.
+    // or not. A stale result also retires dangling references if its predecessor is proven absent in the capture's
+    // still-current epoch; a still-retained stale predecessor is never rebranched. The failed accepted capture is
+    // best-effort and not reconstructed; only later queued/future captures can recover. Returns the harvest count.
     size_t reconcile(strata::core::ConversationStore& store, const ConversationPublicationSink& sink,
                      uint64_t wait_ms);
 

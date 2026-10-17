@@ -71,9 +71,10 @@ or exercised in this wave.
 
 `Prefill::run_retained` validates an owned 2048-row arena on each distinct device,
 resident KV, complete expert residency and no helper/CPU-share borrowers. The
-serving guard also refuses adaptation, borrowed scratch, peer experts, split
-speculation and the old foreground-budget mode. Tail chunks keep their original
-row count. Each existing prompt span is partitioned into the same 2048-row chunks.
+serving guard also refuses adaptation, borrowed scratch, peer experts and split
+speculation. A positive foreground budget is supported only by the opt-in `stage`
+candidate below; layer mode still refuses it. Tail chunks keep their original row
+count. Each existing prompt span is partitioned into the same 2048-row chunks.
 
 The coordinator's first stage-only smoke refused before serving a request:
 the startup guard required the requested `no_prefill_borrow` setting even though
@@ -98,12 +99,159 @@ ancestor's device to decode, so ancestors reacquire it before their epilogues.
 Entry acquisition polls decode before waiting on a shared stream. Ordinary
 interior boundaries synchronize only their local bulk producers.
 
-The callback offers one pipeline pump, then prevents launches on the returning
-bulk device while polling its current stage to completion. It does not close a
-whole generation round. Commit/draft remain synchronous existing operations;
-this is not an asynchronous commit rewrite. The existing global admission fence
-and working-to-resident copies remain at prompt-span completion. BYIELD is not
-consumed by the new layer callback; existing pipelined admission behavior remains.
+With budget `0`, the callback offers one pipeline pump, then prevents launches on
+the returning bulk device while polling its current stage to completion. It does
+not close a whole generation round. Commit/draft remain synchronous existing
+operations; this is not an asynchronous commit rewrite. The existing global
+admission fence and working-to-resident copies remain at prompt-span completion.
+BYIELD is not consumed by a layer callback; legacy pipelined admission is unchanged.
+
+## Opt-in retained-stage budget candidate
+
+Composition baseline: `fcd3b1034e4d1da759f462eed0a65d61d9f28110` plus the
+pinned Phase0 integration baseline/new-file patches and reviewed orphan-revival
+repair. Select `STRATA_PREFILL_RETAINED_LAYERS=stage` together with
+`--foreground-budget-ms 1000 --background-share 0.25`. This is an unqualified
+candidate, not a default or a measured improvement. Keep four general seats, two MTP
+groups, distinct devices, complete expert and KV residency, owned 2048 scratch
+and all existing adaptation/helper/peer/speculation refusals. The combination
+refuses `STRATA_PREFILL_SPLIT_OVER_BUDGET=1024` and refuses a restored pending
+1024 split frontier. It does not offer the ordinary idle two-chunk fill.
+Losing that fill may regress cold prompts or idle/cohort throughput relative
+to the flag-off schedule. Keep the old candidate intact for its first screen;
+do not interpret reduced decode gaps alone as a win or silently restore the fill.
+
+The ownership proof uses the actual serial retained call path:
+
+- `Prefill::run_retained` calls `run`, and the retained successor branch calls
+  `next_->run_impl` directly. Only the non-retained branch submits `std::async`.
+  Thus every retained callback runs on the issuing thread, not a stage worker.
+  A previous scheduler map's worker-thread inference was incorrect. The callback
+  checks issuer identity before touching the pump or control queue in budget mode;
+  an asynchronous handoff would require a different proof and is not supported.
+- During the blocking retained call, only its callback may pump. Each chunk uses
+  `bounded_round` and the existing `round_started` markers: each group has at most
+  one start, with the same opportunity retained across stage releases. Starts
+  require the existing `decode_due` and `decode_allowed` decisions; already-owned
+  consumers still progress when no new decode is authorized or STOP is pending.
+- The callback only reads `TimeBudget`. After the retained call and a full peer
+  drain, the same issuer updates it. Callback and final-drain wall time is charged
+  once as a complete decode quantum and subtracted from prefill wall time. Full
+  successful 2048 chunks train the existing estimate; tails and failed partial
+  work earn only background-service credit. Credit remains capped at one budget;
+  the full indivisible-quantum debit, including overrun, remains debt.
+  Decode age retains the last actual pump/drain timestamp; bulk-only time after
+  that service is not hidden by stamping the later chunk return.
+- This cap is on one in-chunk quantum, not a new time-share policy. At the drained
+  chunk seam the ordinary control/decode loop still serves additional complete
+  rounds while the same budget says they are due and allowed. No credit is reset,
+  borrowed or invented at a stage transition, and the share parameters are unchanged.
+- The returning stage is excluded while its current verifier consumer drains;
+  exclusion resets on failure and exception unwinding. All groups drain before
+  a store/publication seam, BYIELD snapshot, next admission or return, including
+  cancellation/error. Contiguous BSTOP/priority controls are polled at stage cuts
+  without crossing queued admissions. BYIELD is handled only at the existing
+  fully drained chunk frontier, never inside a retained callback.
+- Existing checkpoint-part callbacks execute inside `run_retained`. Chunks due
+  to save any stage part or assemble a periodic checkpoint therefore use global
+  closure: enter with all decode consumers idle and authorize no in-chunk starts.
+  Snapshot cadence, bytes and authority are unchanged; these chunks still use
+  the ordinary budgeted decode seam afterward. This limit can remove stage
+  interleave entirely if every chunk creates a checkpoint.
+- Phase0 receipt identity and ownership stay diagnostic, not scheduling authority.
+  The native leg's `prefill_run` span wraps the entire retained call, including
+  synchronous callbacks; it does not subtract scheduler-accounted decode service.
+  The scheduler alone subtracts callback/full-drain service before learning
+  prefill cost and charges the complete service once after idle closure.
+  `decode_interleave` stays unavailable for retained work: overlapped per-resident
+  GPU service cannot be reconstructed from this issuer's host span. Successful
+  BYIELD keeps the existing resident-copy span and transfers the current native
+  request/leg/incarnation identity to the exact resident publication owner.
+  Resident terminal generation and captured-publication producer identity remain
+  on their original owners; no receipt event, GPU timer or diagnostic fence is added.
+
+Control progress is bounded by the existing indivisible stage/commit operations,
+not milliseconds. The budget is not a token-gap guarantee. This candidate adds
+no native priority guarantee; HTTP admission stays 3:1. Arithmetic, allocations,
+residency, memory reserve, cache authority and disabled-path scheduling stay as
+before. Layer mode with budget `0` remains available, and flag-off budgeted reads
+still have their original idle fill and optional 1024 experiment.
+
+The deterministic CPU regression compiles the production `prompt_boundary` and
+`read_part` closures. Its synthetic Prefill adapter invokes entry, stage-release
+and ancestor-reacquisition callbacks; its decode adapter preserves group leases
+and stage exclusion. Independent, bounded per-group/per-stage completion delays
+and both completion traversal orders exercise local reacquisition while a peer
+remains live, peer-stage completion during local exclusion, and a final full
+drain. Every group/stage must complete exactly once before the store seam.
+Seam decode uses the same synthetic pump to complete one bounded round, rather
+than advancing only the clock: a due/credited seam serves multiple complete
+rounds after in-chunk service, while an overrun-debt seam serves none.
+
+Slot-specific BSTOP deactivates slot 0 without disabling peer slot 2. Assertions
+require the cancelled group's existing consumer to drain, no later start for
+that inactive group, and a peer round to complete after cancellation. A queued
+admission still blocks a following BSTOP. This is **not** a proof of actual
+cancelled-incarnation fencing: the adapter has no resident generation authority,
+slot readmission, verifier output publication or device KV. The real-engine
+obligation is to cancel an occupied slot, keep the other group progressing,
+readmit that same slot number, and prove that the old incarnation cannot emit
+tokens, publish/cache state or change the replacement's KV/frontier.
+
+BYIELD checks the exact parked token prefix and fully drained frontier, then
+starts a retained continuation at that frontier. Joined ranges must match the
+uninterrupted retained run and cover the entire prompt contiguously without
+lost or duplicate tokens, including the short tail. This proves caller range
+selection only: device KV/residual/checkpoint restoration, sampling/RNG state
+and output/state parity with uninterrupted execution remain real-model GPU
+obligations; the synthetic continuation deliberately does not claim to restore
+those authorities or a live budget.
+
+Other cases cover issuer rejection, no callback budget mutation, due/credit
+gating, one start per group, overrun repayment, truthful decode age, checkpoint
+closure, STOP, failed local drains, error aliasing, tails and disabled behavior.
+The policy regression in `prefill_interleave_test` checks exact debt repayment
+through `TimeBudget`'s public decisions. The extracted closure also compiles the
+real Phase0 receipt module and asserts observed retained-prefill scope,
+unavailable overlapped decode service and exact BYIELD producer identity.
+These are scheduling/control-flow assertions, not CUDA cleanup, state parity,
+latency or throughput qualification.
+
+Parent validation commands, from the integrated engine root (not run in this
+implementation assignment):
+
+```sh
+cmake -S . -B build-retained-budget-cpu -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_ENABLE_SYCL=OFF -DSTRATA_BUILD_TESTS=ON -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_NATIVE_EXPERTS=OFF
+cmake --build build-retained-budget-cpu --target prefill_interleave_test batch_read_test plan_admission_test resident_grouping_test share_rules_test -j2
+ctest --test-dir build-retained-budget-cpu -R '^(prefill_interleave_test|batch_read_test|plan_admission_test|resident_grouping_test|share_rules_test)$' --output-on-failure
+```
+
+The separate read-only reference worktree
+`/home/joshkirklin/strata-workspace/worktrees/bottleneck-retained-20261017`
+has five passing CPU scheduling suites (`prefill_interleave_test`,
+`batch_read_test`, `plan_admission_test`, `resident_grouping_test`,
+`share_rules_test`). That observation predates this Phase0/storage composition
+and does not qualify its integrated source or any GPU path. No checks, builds,
+formatters or model runs were performed during this composition.
+
+The parent must rerun those five suites on the composed source and retain
+Phase0 `phase_receipts_test` plus existing publication/store identity coverage.
+Rebuild target `strata` in the parent's configured CUDA-12 SM70+SM86 and HIP
+builds. Before promotion, retain the cancellation-repair vehicle and qualify a
+separate occupied-decoder, fixed-2048 stage-mode budget-on/off arm, including
+resident cancellation, same-slot readmission, BYIELD/resume, state isolation and
+publication cuts. Old-incarnation outputs/captures must not advance its successor.
+Exercise a periodic checkpoint that actually fires; a resumed native leg can
+reset the threshold, so a successful resume alone is not checkpoint evidence.
+Compare the same one-chunk contended service, screen cold/idle two-chunk-fill
+loss and cohort throughput, and keep existing resource and thermal stops.
+
+Unresolved qualification interactions are checkpoint cadence suppressing stage
+interleave, repayment of deferred service across live BYIELD/resume budgets,
+native-incarnation/publication attribution under cancellation/readmission and
+the repaired store writer sharing host wall time with these inclusive spans.
+No core store or frontend behavior, profile default, GPU safety limit or
+authority is changed by this candidate.
 
 ## Bounded assertions and coordinator validation
 

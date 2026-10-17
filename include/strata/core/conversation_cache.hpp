@@ -354,11 +354,14 @@ public:
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
 
-    // ---- Immutable publication leases -------------------------------------
+    // ---- Fixed ownership and immutable publication leases ------------------
     // Waiting publications protect their existing parked owner, without a
     // second image or charge. take_publication transfers that exact charge to a
     // held lease when the writer acquires it. Separately reserved aliases remain
     // charged in full, so every live ownership path stays inside one envelope.
+    // A startup resident-checkpoint lease uses the same held ownership and is
+    // never refunded by request/publication cleanup. It reduces RAM parking
+    // and read headroom for the entire cache lifetime, including poison clears.
     bool try_reserve_lease(size_t bytes) {
         const size_t occupied = envelope_bytes();
         if (occupied > budget_ || bytes > budget_ - occupied) return false;
@@ -661,7 +664,7 @@ private:
     }
 
     // Bytes the envelope can still admit for a new image: budget minus this
-    // image's own held charge, the outstanding publication leases and nothing
+    // image's own held charge and all fixed/publication leases, and nothing
     // else (0 when the charges alone already exceed the budget).
     size_t room(size_t held) const {
         if (held_bytes_ > budget_ || held > budget_ - held_bytes_) return 0;
@@ -669,7 +672,7 @@ private:
     }
 
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
-    size_t held_bytes_ = 0;    // outstanding immutable publication leases (see try_reserve_lease)
+    size_t held_bytes_ = 0;    // fixed resident ownership plus outstanding immutable publication leases
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;

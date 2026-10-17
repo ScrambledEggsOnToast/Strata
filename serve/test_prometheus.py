@@ -96,6 +96,38 @@ class Units(unittest.TestCase):
         self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
 
+    def test_frontend_metric_dimensions_are_fixed_and_never_include_correlation_ids(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, None)
+        before = parse(render(svc.metrics(), svc.latencies.snapshot()))
+        for number in range(40):
+            for priority in ("foreground", "background"):
+                record = svc.register_lifecycle({"strata_priority": priority}, threading.Event())
+                svc.acquire_request(record)
+                svc.engine.gen = number
+                svc.native_submitted(record, number)
+                record["first_token_s"], record["first_content_s"] = 1.0, 2.0
+                svc.finish_lifecycle(record)
+        snapshot = svc.metrics()
+        after = parse(render(snapshot, svc.latencies.snapshot()))
+        self.assertEqual(set(before), set(after))
+        dimensions = [labels for name, labels in after if name.startswith("strata:frontend_") or
+                      name.startswith("strata:request_outcomes") or name.startswith("strata:time_to_first_")]
+        for labels in dimensions:
+            self.assertEqual(set(re.findall(r'([a-z_]+)="', labels)) - {"model_name"},
+                             {"priority", "outcome", "phase"} if 'phase="' in labels else {"priority", "outcome"})
+        self.assertFalse(any("request_id=" in labels or "incarnation=" in labels or "slot=" in labels
+                             for name, labels in after))
+        self.assertEqual(sum(values["requests"] for outcomes in snapshot["frontend"].values()
+                             for values in outcomes.values()), 80)
+
+    def test_slot_metric_states_are_disjoint_and_include_decoding(self):
+        states = ("idle", "reserved", "parked", "reading", "decoding", "releasing")
+        samples = parse(render({"live": {"slots": [{"state": s} for s in states]}}, Latencies().snapshot()))
+        slots = {labels: value for (name, labels), value in samples.items() if name == "strata:live_slots"}
+        self.assertEqual(len(slots), 6)
+        self.assertEqual(list(slots.values()), [1] * 6)
+
 
 class Endpoint(unittest.TestCase):
     @classmethod

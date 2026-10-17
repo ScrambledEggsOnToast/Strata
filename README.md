@@ -243,6 +243,18 @@ an empty draft state only in that unloaded configuration; missing state with an
 active MTP drafter remains an error. Batch cancellation releases a slot once,
 after `BDONE`, so a successor's reservation cannot be freed by the old consumer.
 
+`STRATA_RESIDENT_DIRECT_COPY=1` is frozen once before native resident admission.
+Its strict same-device handoff never allocates an intermediate KV image or falls
+back to the snapshot path after a mismatch/copy failure. Admission therefore omits
+only those serial main/draft images: one stage's checkpoint state/repair payload,
+12.5% margin and 4 KiB remain. Retained histories/checkpoints, authoritative
+streamed/ring host pools, device owners, opaque allowances and safety reserves are
+unchanged. Unset, `0` and unknown values keep the legacy envelope. The offline
+planner still reports that conservative legacy envelope. This source accounting
+change is not a full-model, HIP or daily qualification; the protected resident
+fixture must establish the new host-scratch bound before full-model use. See
+[the allocation audit and fixture limits](docs/experiments/direct-slot-discriminator.md#mode-specific-host-transient-accounting-source-only).
+
 
 ## Credits and license
 

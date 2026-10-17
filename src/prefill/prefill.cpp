@@ -1477,6 +1477,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+bool Prefill::owns_work_buffers() const { return impl_->initialized && !impl_->borrowed; }
 
 bool Prefill::local_idle(std::string& err) const {
     const Impl& m = *impl_;

@@ -6,7 +6,9 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/resident_memory.hpp"
 #include "conversation_snapshot_equivalence.hpp"
+#include "strata/kernels/qsa.hpp"
 #include <cuda_runtime.h>
 #include <array>
 #include <cstdio>
@@ -19,8 +21,62 @@ using strata::test::same_snapshot;
 void* fail_destination = nullptr;
 bool transfer_failed = false;
 
+// GNU/ELF wrapping of ordinary C++ allocations made by the statically linked
+// engine: vectors, segmented images and checkpoint payloads. No interception of
+// CUDA/driver C allocations or RSS claim; those keep their opaque allowance.
+// The fixed thread-local directory cannot allocate or perturb measured peaks.
+// Resident transfer payloads use ordinary vector new/delete, not aligned new.
+struct HostTransferScratch {
+    struct Entry { void* pointer; size_t bytes; };
+    Entry entries[16384]{};
+    uint64_t live = 0, peak = 0;
+    bool active = false, overflow = false;
+    void begin() {
+        for (auto& entry : entries) entry = {};
+        live = peak = 0;
+        overflow = false;
+        active = true;
+    }
+    void allocated(void* pointer, size_t bytes) {
+        if (!active) return;
+        if (bytes > UINT64_MAX - live) { overflow = true; return; }
+        for (auto& entry : entries) if (!entry.pointer) {
+            entry = {pointer, bytes};
+            live += bytes;
+            peak = std::max(peak, live);
+            return;
+        }
+        overflow = true;
+    }
+    void released(void* pointer) {
+        if (!active || !pointer) return;
+        for (auto& entry : entries) if (entry.pointer == pointer) {
+            live -= entry.bytes;
+            entry = {};
+            return;
+        }
+    }
+};
+thread_local HostTransferScratch host_transfer_scratch;
+
 }
 extern "C" cudaError_t __real_cudaMemcpy(void*, const void*, size_t, cudaMemcpyKind);
+extern "C" void* __real__Znwm(size_t);
+extern "C" void __real__ZdlPv(void*);
+extern "C" void __real__ZdlPvm(void*, size_t);
+extern "C" void* __wrap__Znwm(size_t bytes) {
+    void* pointer = __real__Znwm(bytes);
+    host_transfer_scratch.allocated(pointer, bytes);
+    return pointer;
+}
+extern "C" void __wrap__ZdlPv(void* pointer) {
+    host_transfer_scratch.released(pointer);
+    __real__ZdlPv(pointer);
+}
+extern "C" void __wrap__ZdlPvm(void* pointer, size_t bytes) {
+    host_transfer_scratch.released(pointer);
+    __real__ZdlPvm(pointer, bytes);
+}
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size, cudaMemcpyKind kind) {
     if (dst == fail_destination && size) {
         fail_destination = nullptr;
@@ -590,46 +646,82 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
                     "MTP ring handoff fixture needs a resident working owner and ring-backed slot");
             std::puts("MTP_RING_HANDOFF working=resident slot=ring");
         }
+        const int64_t cells = stages[0].main->max_cells;
+        int64_t boundaries[2] = {stages[0].main->layer_hi, stages[1].main->layer_hi};
+        plan::QsaRolePlacements roles;
+        roles.working_main.format = core::qsa_kv_format(
+            stages[0].main->qsa_states[stages[0].main->qsa_primary()]);
+        roles.working_draft.format = core::qsa_kv_format(draft.kv_state());
+        plan::ResidentHostBytes host_price;
+        require(core::resident_host_payload(geometry, cells, true, roles, stages.size(), boundaries,
+                                            core::resident_direct_copy_enabled(), owner.checkpoint_chain_limit(), host_price),
+                "price the actual frozen owner formats and stage boundaries");
+        auto transfer = [&](const char* operation, auto&& run) {
+            host_transfer_scratch.begin();
+            bool ok = false;
+            try { ok = run(); }
+            catch (...) { host_transfer_scratch.active = false; throw; }
+            host_transfer_scratch.active = false;
+            require(!host_transfer_scratch.overflow && host_transfer_scratch.peak <= host_price.transfer_transient,
+                    "actual engine-owned C++ host transfer payload stays inside the admitted transient");
+            std::printf("RESIDENT_HOST_SCRATCH operation=%s direct=%d peak_cpp_bytes=%llu bound=%llu "
+                        "stages=%zu scope=resident_owner failures=0\n", operation,
+                        core::resident_direct_copy_enabled(), (unsigned long long)host_transfer_scratch.peak,
+                        (unsigned long long)host_price.transfer_transient, stages.size());
+            return ok;
+        };
         const std::vector<int32_t> prefix{11, 22};
         const std::vector<int64_t> prompt{11, 22, 33, 44};
         const std::vector<core::ConversationImageKey> images;
         const std::vector<core::ConversationCheckpoint> empty_checks;
-        const core::ConversationView view{prefix, images, empty_checks, true};
-        size_t snapshot_bytes = core::conversation_kv_bytes(draft.kv_state(), geometry, 2, false);
+        const int64_t index_block = kernels::qsa_real_shapes().idx_block;
+        require(index_block > 1, "index block supports aligned and partial cuts");
+        const std::vector<int32_t> advanced_prefix(size_t(2 * index_block + 1), 11);
+        const std::vector<int64_t> rewind_prompt(advanced_prefix.size() + 1, 11);
+        const core::ConversationView diagnostic_view{advanced_prefix, images, empty_checks, true};
+        size_t snapshot_bytes = core::conversation_kv_bytes(
+            draft.kv_state(), geometry, (int64_t) advanced_prefix.size(), false);
         for (const auto& stage : stages) {
             require(stage.main && stage.slots.size() == 4, "complete stationary stage owners");
             size_t bytes = 0;
-            require(core::conversation_snapshot_bytes(view, *stage.main, geometry, nullptr, bytes, error),
+            require(core::conversation_snapshot_bytes(diagnostic_view, *stage.main, geometry, nullptr, bytes, error),
                     "price full-model diagnostic image");
             require(bytes <= SIZE_MAX - snapshot_bytes, "bounded diagnostic image sum");
             snapshot_bytes += bytes;
         }
         constexpr uint64_t fixture_allowance = uint64_t{2} << 30;
         uint64_t available = 0, physical = 0;
-        // Eight complete images conservatively cover the retained comparisons,
-        // checkpoint copies and an in-progress capture. No admission credit.
-        require(snapshot_bytes <= fixture_allowance / 8 &&
+        // A cap-sized target, one mutable refusal input, the original/peer
+        // checkpoints and sequential comparison snapshots coexist. Shared
+        // refusal aliases do not duplicate state. Ten image-equivalents beyond
+        // the target cap conservatively cover the remaining snapshots/metadata;
+        // add the deliberately over-reserved array's entire admitted bound.
+        const uint64_t diagnostic_images = uint64_t(owner.checkpoint_chain_limit()) + 10;
+        require(owner.checkpoint_byte_limit() < fixture_allowance &&
+                snapshot_bytes <= (fixture_allowance - owner.checkpoint_byte_limit()) / diagnostic_images &&
                 core::available_memory_bytes(available, nullptr, &physical) &&
-                available >= fixture_allowance && physical >= fixture_allowance + (uint64_t{8} << 30),
-                "diagnostic images fit explicit 2 GiB allowance above 8 GiB reserve");
+                available >= fixture_allowance && physical >= fixture_allowance + (uint64_t{12} << 30),
+                "diagnostic owners fit the unchanged 2 GiB allowance above 12 GiB reserve");
         struct Image {
             std::array<core::SavedConversation, 3> main;
             core::ConversationKv draft;
         };
-        auto capture = [&](int slot) {
+        auto capture_at = [&](int slot, const std::vector<int32_t>& ids) {
+            const core::ConversationView at_view{ids, images, empty_checks, true};
             Image result;
             for (size_t i = 0; i < stages.size(); ++i) {
                 device(stages[i].device);
                 auto* state = slot < 0 ? stages[i].main : stages[i].slots[slot];
-                require(core::conversation_snapshot_save(result.main[i], view, *state, geometry, nullptr, error),
+                require(core::conversation_snapshot_save(result.main[i], at_view, *state, geometry, nullptr, error),
                         "capture all authoritative stage payloads");
             }
             device(stages.back().device);
             const auto* state = slot < 0 ? &draft.kv_state() : draft.slot_state(slot);
-            require(state && core::conversation_kv_save(result.draft, *state, geometry, 2, false, error),
+            require(state && core::conversation_kv_save(result.draft, *state, geometry, (int64_t) ids.size(), false, error),
                     "capture actual draft owner on final device");
             return result;
         };
+        auto capture = [&](int slot) { return capture_at(slot, prefix); };
         auto equal = [](const Image& a, const Image& b) {
             for (size_t i = 0; i < a.main.size(); ++i)
                 if (!same_snapshot(a.main[i], b.main[i])) return false;
@@ -675,7 +767,8 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
         }
         program::ResidentAdmission admission{33, &checkpoint_chain};
         auto opening = capture(-1);
-        require(owner.park(0, prefix, admission, true, error), "park working request");
+        require(transfer("fresh", [&] { return owner.park(0, prefix, admission, true, error); }),
+                "park working request");
         require(equal(opening, capture(0)), "admission preserves every stage and draft payload");
         stationary();
         require(!owner.park(1, prefix, admission, true, error) && !owner.slots()[1].request,
@@ -683,12 +776,13 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
         require(owner.release_resources(error) && !owner.release_resources(error), "release exactly once");
         require(owner.begin(-1, prompt, request, error) && owner.working().request == identity &&
                 owner.working().sampling.seed == seed, "released resend preserves identity and seed");
-        require(owner.resume(0, nullptr, error) && equal(opening, capture(-1)),
+        require(transfer("live", [&] { return owner.resume(0, nullptr, error); }) && equal(opening, capture(-1)),
                 "live resume preserves every stage and draft payload");
         require(owner.init_resources(error) && owner.park(0, prefix, admission, true, error),
                 "reinitialize and retain the continuation");
         require(owner.begin(0, prompt, request, error) && owner.working().request == identity &&
-                owner.working().sampling.seed == seed && owner.resume(0, &checkpoint, error) &&
+                owner.working().sampling.seed == seed &&
+                transfer("selected_cut_initial", [&] { return owner.resume(0, &checkpoint, error); }) &&
                 equal(opening, capture(-1)), "selected-cut resume preserves payload and identity");
         stationary();
         owner.cancel(0);
@@ -697,10 +791,274 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
                 "cancelled identity cannot resurrect in successor");
         owner.cancel(0);
         require(owner.finish(0, error), "finish cancelled successor with no submitted row consumer");
-        require(owner.begin(1, prompt, request, error) && owner.admit(1, prefix, admission, error),
+        // Peer admits a disjoint payload owner, not an alias of the retained cuts.
+        std::vector<core::ConversationCheckpoint> peer_chain(1);
+        peer_chain.front().ids = prefix;
+        peer_chain.front().stage_parts.resize(stages.size() - 1);
+        for (size_t i = 0; i < stages.size(); ++i) {
+            auto& part = i ? peer_chain.front().stage_parts[i - 1] : peer_chain.front();
+            part.ids = prefix;
+            device(stages[i].device);
+            require(core::conversation_checkpoint_save(part, *stages[i].main, geometry, error),
+                    "capture independent peer checkpoint");
+        }
+        program::ResidentAdmission peer_admission{33, &peer_chain};
+        require(owner.begin(1, prompt, request, error) && owner.admit(1, prefix, peer_admission, error),
                 "admit independent peer");
         opening = capture(1);
         const auto peer_identity = owner.slots()[1].request;
+        {
+            const size_t limit = (size_t) owner.checkpoint_chain_limit();
+            require(limit >= 4, "multi-pin ownership fixture needs the unchanged working cache cap >= 4");
+            auto make_cut = [&](size_t ordinal, bool pinned, size_t count) {
+                core::ConversationCheckpoint cut;
+                cut.ids.assign(prefix.begin(), prefix.begin() + count);
+                cut.used = ordinal + 1;
+                cut.pinned = pinned;
+                cut.stage_parts.resize(stages.size() - 1);
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    auto& part = i ? cut.stage_parts[i - 1] : cut;
+                    part.ids = cut.ids;
+                    // Shape comes from the independent native capture. These
+                    // opaque synthetic bytes are not inference state; do not
+                    // copy a full GPU checkpoint only to overwrite every byte.
+                    const auto& shape = i ? checkpoint.stage_parts[i - 1] : checkpoint;
+                    const uint8_t marker = uint8_t(1 + ordinal * stages.size() + i);
+                    part.gdn.assign(shape.gdn.size(), marker);
+                    part.ple.assign(shape.ple.size(), marker);
+                    part.tails.assign(shape.tails.size(), marker);
+                    part.dead.assign(shape.dead.size(), marker);
+                    part.block_pos.assign(shape.block_pos.size(), marker);
+                }
+                return cut;
+            };
+            std::vector<core::ConversationCheckpoint> cuts;
+            cuts.reserve(limit + 1);
+            // Root and latest are separately unpinned; equal-length interior
+            // pins remain distinguishable by used, ordering and payload markers.
+            cuts.push_back(make_cut(0, false, 1));
+            cuts.push_back(make_cut(1, false, prefix.size()));
+            for (size_t i = 2; i < limit; ++i) cuts.push_back(make_cut(i, true, prefix.size()));
+            // Reserve that is either priced as array backing or not retained
+            // must not turn a valid checkpoint into a rejected request.
+            cuts.front().gdn.write().reserve(cuts.front().gdn.size() + 1);
+            cuts.front().ids.reserve(prefix.size() + 8);
+            cuts.front().imgs.reserve(1);
+            cuts.front().stage_parts.reserve(stages.size() + 4);
+            std::array<std::array<size_t, 5>, 3> expected_sizes{};
+            for (size_t i = 0; i < stages.size(); ++i) {
+                const auto& part = i ? cuts.front().stage_parts[i - 1] : cuts.front();
+                expected_sizes[i] = {part.gdn.size(), part.ple.size(), part.tails.size(),
+                                     part.dead.size(), part.block_pos.size()};
+            }
+            auto oracle = [&](const auto& chain) {
+                if (chain.size() != limit) return false;
+                for (size_t n = 0; n < limit; ++n) {
+                    const auto& cut = chain[n];
+                    const std::vector<int32_t> ids(prefix.begin(), prefix.begin() + (n ? prefix.size() : 1));
+                    if (cut.ids != ids || cut.used != n + 1 || cut.pinned != (n >= 2) ||
+                        cut.stage_parts.size() != stages.size() - 1) return false;
+                    for (size_t i = 0; i < stages.size(); ++i) {
+                        const auto& part = i ? cut.stage_parts[i - 1] : cut;
+                        if (part.ids != ids) return false;
+                        const uint8_t marker = uint8_t(1 + n * stages.size() + i);
+                        size_t field = 0;
+                        for (const auto* bytes : {&part.gdn, &part.ple, &part.tails, &part.dead, &part.block_pos}) {
+                            if (bytes->size() != expected_sizes[i][field++]) return false;
+                            for (auto byte : bytes->read()) if (byte != marker) return false;
+                        }
+                    }
+                }
+                return true;
+            };
+            require(oracle(cuts), "input membership pins order and synthetic payload match independent oracle");
+            program::ResidentAdmission retained{33, &cuts};
+            require(!owner.slots()[0].checks.empty(), "old nonempty target overlaps cap-sized alias construction");
+            require(owner.begin(0, prompt, request, error) &&
+                    transfer("cap_chain", [&] { return owner.park(0, prefix, retained, true, error); }),
+                    "bind root/latest and multiple pins under the admitted chain cap");
+            cuts.clear();
+            cuts.shrink_to_fit();
+            require(oracle(owner.slots()[0].checks), "complete input release preserves independently specified chain");
+            const auto target_image = capture(0);
+            // Compare the same live object's representation, including every
+            // request/sampling field and vector descriptor, without payload copies.
+            const auto metadata = [](const program::ResidentSlot& s) {
+                std::array<unsigned char, sizeof(program::ResidentSlot)> bytes{};
+                std::memcpy(bytes.data(), &s, bytes.size());
+                return bytes;
+            };
+            const auto old_metadata = metadata(owner.slots()[0]);
+            const auto old_ids = owner.slots()[0].ids, old_prompt = owner.slots()[0].prompt;
+            const auto peer_metadata = metadata(owner.slots()[1]);
+            const auto unchanged = [&] {
+                {
+                    const auto now = capture(0);
+                    require(metadata(owner.slots()[0]) == old_metadata &&
+                            owner.slots()[0].ids == old_ids && owner.slots()[0].prompt == old_prompt &&
+                            oracle(owner.slots()[0].checks) && equal(target_image, now),
+                            "refusal preserves target metadata device state and retained chain");
+                }
+                {
+                    const auto now = capture(1);
+                    require(metadata(owner.slots()[1]) == peer_metadata &&
+                            owner.slots()[1].request == peer_identity && equal(opening, now),
+                            "refusal preserves the independent peer");
+                }
+            };
+            auto seals_match = [&](bool shared_tail = false) {
+                for (size_t n = 0; n < cuts.size(); ++n) for (size_t i = 0; i < stages.size(); ++i) {
+                    const auto& part = i ? cuts[n].stage_parts[i - 1] : cuts[n];
+                    for (const auto* bytes : {&part.gdn, &part.ple, &part.tails, &part.dead, &part.block_pos})
+                        if (bytes->sealed() != (shared_tail && n != 0 && !bytes->empty())) return false;
+                }
+                return true;
+            };
+            const auto check_refusal = [&](const char* operation, auto&& run, bool shared_tail = false) {
+                const bool rejected = !transfer(operation, run);
+                const bool source_preserved = seals_match(shared_tail);
+                std::printf("RESIDENT_HOST_REFUSAL operation=%s rejected=%d source_seals_preserved=%d\n",
+                            operation, rejected, source_preserved);
+                require(rejected, "invalid retained input refuses");
+                require(source_preserved, "refusal preserves source sealing");
+                unchanged();
+            };
+            cuts.push_back(make_cut(0, true, prefix.size())); // first source remains mutable
+            for (size_t i = 0; i < limit; ++i) {
+                cuts.push_back(owner.slots()[0].checks[i]); // share sealed payloads, not another full mutable chain
+                cuts.back().pinned = true;
+            }
+            require(seals_match(true) && owner.begin(0, prompt, request, error), "prepare mixed-ownership over-cap source");
+            check_refusal("over_cap_refusal", [&] { return owner.park(0, prefix, retained, true, error); }, true);
+            cuts.clear();
+            cuts.push_back(make_cut(0, false, prefix.size()));
+            cuts.front().stage_parts.front().stage_parts.emplace_back();
+            check_refusal("nested_refusal", [&] { return owner.park(0, prefix, retained, true, error); });
+            cuts.front().stage_parts.front().stage_parts.clear();
+            cuts.front().stage_parts.front().gdn.push_back(0);
+            check_refusal("shape_refusal", [&] { return owner.park(0, prefix, retained, true, error); });
+            cuts.clear();
+            cuts.push_back(make_cut(0, false, prefix.size()));
+            auto& oversized = cuts.front().gdn.write();
+            oversized.reserve(size_t(owner.checkpoint_byte_limit()) + 1);
+            check_refusal("capacity_refusal", [&] { return owner.park(0, prefix, retained, true, error); });
+            program::ResidentAdmission no_checks{33, nullptr};
+            require(owner.resume(0, nullptr, error) && owner.admit(0, prefix, no_checks, error),
+                    "activate parked seat through valid resume and admission");
+            owner.cancel(0);
+            require(owner.finish(0, error), "finish active retained-chain discriminator");
+        }
+        // Complete the selected cut's pooled block in a longer-lived owner.
+        // No token arithmetic is needed: distinct keys make the restore order
+        // observable through the real park/begin/resume and copy_from path.
+        for (const int64_t cut : {index_block, index_block + 1}) {
+            const std::vector<int32_t> cut_ids(size_t(cut), 11);
+            std::vector<core::ConversationCheckpoint> cuts(1);
+            auto& selected = cuts.front();
+            selected.ids = cut_ids;
+            selected.stage_parts.resize(stages.size() - 1);
+            require(owner.begin(2, rewind_prompt, request, error), "begin retained-cut discriminator");
+            const auto cut_identity = owner.working().request;
+            const auto cut_seed = owner.working().sampling.seed;
+            for (size_t i = 0; i < stages.size(); ++i) {
+                device(stages[i].device);
+                auto& state = *stages[i].main;
+                require(state.qsa_alloc > 0 && state.max_cells > (int64_t) advanced_prefix.size(),
+                        "every stage owns an indexer and the advanced prefix fits");
+                const std::vector<float> key(size_t(geometry.idx_key_dim), float(10 + i));
+                const int32_t position = int32_t(cut % index_block);
+                for (int64_t j = 0; j < state.qsa_alloc; ++j) {
+                    const auto& qsa = state.qsa_states[state.qsa_ord0 + j];
+                    require(cudaMemcpy(qsa.idx_dead, key.data(), key.size() * sizeof(float),
+                                       cudaMemcpyHostToDevice) == cudaSuccess &&
+                            cudaMemcpy(qsa.idx_pooled + (cut / index_block) * geometry.idx_key_dim,
+                                       key.data(), key.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                            cudaMemcpy(qsa.idx_block_pos, &position, sizeof(position),
+                                       cudaMemcpyHostToDevice) == cudaSuccess,
+                            "seed selected checkpoint and its repaired pooled row");
+                }
+                auto& part = i == 0 ? selected : selected.stage_parts[i - 1];
+                part.ids = cut_ids;
+                require(core::conversation_checkpoint_save(part, state, geometry, error),
+                        "capture selected aligned or partial cut on every stage");
+            }
+            const auto expected = capture_at(-1, cut_ids);
+            for (size_t i = 0; i < stages.size(); ++i) {
+                device(stages[i].device);
+                auto& state = *stages[i].main;
+                const std::vector<float> completed(size_t(geometry.idx_key_dim), float(20 + i));
+                const int32_t position = int32_t(advanced_prefix.size() % size_t(index_block));
+                for (int64_t j = 0; j < state.qsa_alloc; ++j) {
+                    const auto& qsa = state.qsa_states[state.qsa_ord0 + j];
+                    require(cudaMemcpy(qsa.idx_pooled + (cut / index_block) * geometry.idx_key_dim,
+                                       completed.data(), completed.size() * sizeof(float),
+                                       cudaMemcpyHostToDevice) == cudaSuccess &&
+                            cudaMemcpy(qsa.idx_block_pos, &position, sizeof(position),
+                                       cudaMemcpyHostToDevice) == cudaSuccess,
+                            "advance past cut block with a different completed pooled key");
+                }
+            }
+            const program::ResidentAdmission cut_admission{11, &cuts};
+            require(transfer("advanced", [&] { return owner.park(2, advanced_prefix, cut_admission, true, error); }) &&
+                    owner.slots()[2].ids.size() / size_t(index_block) > size_t(cut / index_block) &&
+                    owner.slots()[2].checks.size() == 1,
+                    "park advanced owner with its earlier selected checkpoint");
+            const auto& retained_cut = owner.slots()[2].checks.front();
+            const auto retained = capture_at(2, advanced_prefix);
+            auto check_rows = [&](bool restored) {
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    device(stages[i].device);
+                    const auto& state = restored ? *stages[i].main : *stages[i].slots[2];
+                    const auto& part = i == 0 ? retained_cut : retained_cut.stage_parts[i - 1];
+                    const size_t row_bytes = size_t(geometry.idx_key_dim) * sizeof(float);
+                    std::vector<float> row(size_t(geometry.idx_key_dim));
+                    for (int64_t j = 0; j < state.qsa_alloc; ++j) {
+                        const auto& qsa = state.qsa_states[state.qsa_ord0 + j];
+                        require(cudaMemcpy(row.data(), qsa.idx_pooled + (cut / index_block) * geometry.idx_key_dim,
+                                           row_bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+                                "read cut pooled row from its actual owning device");
+                        const bool selected_row = std::memcmp(row.data(), part.dead.data() + size_t(j) * row_bytes,
+                                                               row_bytes) == 0;
+                        require(selected_row == restored, restored ?
+                                "selected checkpoint dead key wins over advanced pooled row on every stage" :
+                                "advanced retained pooled row really differs from selected checkpoint dead key");
+                    }
+                }
+            };
+            check_rows(false);
+            require(owner.begin(2, rewind_prompt, request, error) &&
+                    owner.working().request == cut_identity && owner.working().sampling.seed == cut_seed &&
+                    owner.working().resume_slot == 2, "select retained-cut request identity");
+            {
+                const auto before_refusal = capture_at(-1, advanced_prefix);
+                auto invalid_cut = retained_cut;
+                invalid_cut.stage_parts.pop_back();
+                require(!transfer("invalid_cut", [&] { return owner.resume(2, &invalid_cut, error); }) &&
+                        equal(before_refusal, capture_at(-1, advanced_prefix)) &&
+                        equal(retained, capture_at(2, advanced_prefix)) &&
+                        equal(opening, capture(1)) && owner.slots()[1].request == peer_identity &&
+                        owner.slots()[2].request == cut_identity && !owner.slots()[2].failed &&
+                        owner.working().request == cut_identity && owner.working().sampling.seed == cut_seed,
+                        "invalid cut refuses before writes or identity and peer mutation");
+            }
+            error.clear(); // the rejected malformed cut above is an expected refusal
+            require(transfer("selected_cut", [&] { return owner.resume(2, &retained_cut, error); }),
+                    "resume selected cut through ResidentSlots::copy_from");
+            check_rows(true);
+            require(equal(expected, capture_at(-1, cut_ids)) &&
+                    equal(retained, capture_at(2, advanced_prefix)) &&
+                    owner.slots()[2].request == cut_identity && !owner.slots()[2].failed &&
+                    equal(opening, capture(1)) && owner.slots()[1].request == peer_identity &&
+                    owner.slots()[1].active,
+                    "cut restore preserves full payload, retained source, identities and independent peer");
+            stationary();
+            require(owner.admit(2, cut_ids, cut_admission, error),
+                    "admit restored selected-cut request before active-slot retirement");
+            owner.cancel(2);
+            require(owner.finish(2, error), "retire selected-cut discriminator without poisoning reuse");
+            std::printf("RESIDENT_CUT_REPAIR direct=%d cut=%lld advanced=%zu stages=%zu failures=0\n",
+                        core::resident_direct_copy_enabled(), (long long) cut, advanced_prefix.size(), stages.size());
+        }
         require(owner.begin(0, prompt, request, error), "begin replacement before injected failure");
         transfer_failed = false;
         const bool draft_failure = std::getenv("STRATA_TEST_DRAFT_COPY_REFUSAL") != nullptr;
@@ -719,7 +1077,8 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
                     cudaMemset(payload(*target, true), 0xa5, 4) == cudaSuccess &&
                     cudaDeviceSynchronize() == cudaSuccess, "mark distinct draft key/value payloads");
             fail_destination = payload(*target, true);
-            require(!owner.admit(0, prefix, admission, error) && transfer_failed, "partial draft admission refuses");
+            require(!transfer("draft_refusal", [&] { return owner.admit(0, prefix, admission, error); }) &&
+                    transfer_failed, "partial draft admission refuses");
             device(stages.back().device);
             uint32_t key = 0, value = 0;
             require(cudaMemcpy(&key, payload(*target, false), 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
@@ -732,7 +1091,8 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
             device(stages[0].device);
             require(cudaMemset(stages[0].main->gdn_state, 0x3c, 4) == cudaSuccess, "mark main source");
             fail_destination = stages[0].slots[0]->ple_hist;
-            require(fail_destination && !owner.admit(0, prefix, admission, error) && transfer_failed,
+            require(fail_destination &&
+                    !transfer("main_refusal", [&] { return owner.admit(0, prefix, admission, error); }) && transfer_failed,
                     "partial main admission refuses");
             device(stages[0].device);
             uint32_t changed = 0;
@@ -749,7 +1109,7 @@ int resident_host_model_checks(strata::program::ResidentSlots& owner, strata::co
             require(owner.begin(1, prompt, request, error), "select peer for working-resume failure");
             transfer_failed = false;
             fail_destination = stages[0].main->ple_hist;
-            require(!owner.resume(1, nullptr, error) && transfer_failed &&
+            require(!transfer("live_refusal", [&] { return owner.resume(1, nullptr, error); }) && transfer_failed &&
                     !owner.begin(-1, prompt, request, error) && !owner.available(1),
                     "partial working resume poisons reuse");
             require(owner.release_resources(error), "release fixture resources");

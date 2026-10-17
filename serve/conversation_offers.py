@@ -18,9 +18,10 @@ Fixed 72-byte little-endian header (the native side's `conversation_offers.hpp`)
     struct.pack("<4sHHQQQII32s", magic, version, type, request_id, generation, deadline_monotonic_ns,
                 token_count, flags, scope)
 
-* HELLO (type 1, child to frontend): `request_id=0`, `generation` is the domain epoch, the deadline field is the
-  metadata budget in bytes, `token_count` is the queue frontier (1 or 2), flags bit 0 says the store persists
-  histories and `scope` is the 32-byte issuer key (all zero when it does not).
+* HELLO (type 1, child to frontend): `request_id=0`, `generation` is the domain epoch (nonzero when the store is
+  enabled; it may be zero without a persistent domain), the deadline field is the metadata budget in bytes,
+  `token_count` is the queue frontier (1 or 2), flags bit 0 says the store persists histories, and `scope` is the
+  32-byte issuer key (all zero when it does not).
 * OFFER (type 2, frontend to child): nonzero request id and generation, the deadline field is the original request's
   deadline in monotonic nanoseconds, `token_count` is the payload's token count, flags bit 0 asks for the request's
   control vector, `scope` is the authorized 32-byte conversation scope, and one `SCM_RIGHTS` descriptor carries
@@ -83,7 +84,7 @@ class OfferProtocolError(ValueError):
 class Hello:
     """What the engine's startup message says about this incarnation."""
 
-    generation: int                     # the execution domain's epoch (nonzero)
+    generation: int                     # the domain epoch; may be zero when persistence is disabled
     frontier: int                       # how many queued requests may be prepared ahead of admission (1 or 2)
     metadata_bytes: int                 # the byte budget for outstanding token descriptors
     enabled: bool                       # flags bit 0: the store persists histories
@@ -110,7 +111,7 @@ def parse_hello(payload: bytes) -> Hello:
         raise OfferProtocolError("a HELLO carries no request id")
     if flags & ~FLAG_STORE_ENABLED:
         raise OfferProtocolError("unknown HELLO flags")
-    if generation == 0:
+    if generation == 0 and flags & FLAG_STORE_ENABLED:
         raise OfferProtocolError("a HELLO must carry its domain epoch")
     if token_count not in (1, 2):
         raise OfferProtocolError("the prepared-queue frontier is one request, or two")

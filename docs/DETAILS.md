@@ -312,6 +312,79 @@ per-request samples; do not sum repeated reports. `STRATA_PREFILL_TIMING=1` prin
 GPU phase and host staging/setup/wait summaries for prefill. It enables GPU event timing and host accounting,
 not a cache-read or whole-response timer. Unset all these switches for uninstrumented comparisons.
 
+**Native request phases (opt-in diagnostics):** `STRATA_PHASE_TIMING=1` enables
+`STRATA_PHASE v=1` records on the native serving engine's stderr and advertises
+`phase_timing=1 phase_timing_version=1` in its startup `INFO`. Optional internal
+`GEN`/`GENI`/`BGEN`/`BGENI` keys `phase_request`, `phase_leg`, `phase_incarnation`
+and `phase_priority` correlate a request leg; absent, partial, duplicate or
+malformed identities are reported unbound, never borrowed from the previous slot.
+Host spans are inclusive and may overlap asynchronous storage or resident work:
+they are not GPU execution times or an additive latency breakdown. No GPU events,
+fences or per-token receipt logging are added. Normal request terminals are emitted
+and flushed before their stdout terminal, including `ERR`; an exit guard is only
+the fallback for exceptional unwinding.
+
+Resident terminals also expose their actual monotonic `started_ns` and `ended_ns`
+from the existing admission/retirement clocks. These bound residence, not GPU
+execution or continuous runnable eligibility; a cancelled slot may already have
+stopped before retirement. Join only matching engine/slot generations, and keep
+legacy duration-only receipts temporally unlocated. In particular,
+`demand_wait_ms - demand_materialize_ms` is reader/dispatch residue, not uncovered
+GPU time: materialization itself may overlap a runnable peer.
+
+Request terminals also report `periodic_checkpoint_count` and the last such cut's
+`periodic_checkpoint_last_tokens` and `periodic_checkpoint_last_ns`. They count only
+a newly assembled periodic checkpoint still retained after cache policy, not an
+incomplete multi-stage set, a pre-existing cut, a tail/turn cut or an evicted save.
+The timestamp is the actual memory-checkpoint completion, not disk durability or
+a save-duration estimate. Only the last event is located; legacy absence remains
+unknown. This adds no per-token/window record or scheduling/fence change.
+
+Demand identity fields describe only the latest fallback operation: a new demand
+clears the previous request, generation, attempt and head even when refused before
+admission. Materialization totals span all fallbacks. They stay unavailable if any
+dispatched attempt has no exposed duration, including an attempt replaced between
+polls; a later ready sample cannot relabel a partial sum as complete. Queued reads
+and unstarted admission refusals do not count as attempted materialization.
+
+Request terminals report `shared_prefix_tokens`, the accepted usable shared-hint extent
+(zero when absent or ignored), and `shared_prefix_restored_tokens`, the shared-catalog
+extent actually mounted after successful validation and restoration of every stage.
+Candidate selection, a failed mount and fallback do not count as restored sharing.
+Publication records report `shared_prefix_tokens` from the captured shared image
+(zero for private captures), retained with its producer through queued, pending and
+terminal events, never inferred from its owner or executor. These are unsigned
+64-bit counts, not token contents. Legacy records missing these fields remain
+unknown; absence of scope or pin strings in normal logs says nothing about sharing.
+Receipts expose no scopes, token arrays or issuer keys and add no metric labels.
+Shared catalog lookups additionally report the mutex-consistent lookup
+`shared_lookup_ns`, `shared_lookup_catalog_version`, raw catalog match count,
+eligible exact-cut indicator and selected head. `na` means no shared catalog
+lookup; zero is a real first-version, miss count or false indicator. No prompt,
+scope or digest is exposed.
+
+Publication records retain the capture's producer separately from the current
+executor; only the real publication reconciliation supplies a durable result/head.
+Successful publication terminals report `durable_ns`, the steady-clock instant
+at which the durably flushed catalog was applied under the catalog mutex,
+`catalog_version`, and `writer_ms` from store admission to that apply. Other
+outcomes report `na`; none of these values is inferred from terminal
+reconciliation or observation. Within one native-engine lifetime, identified by
+the same frontend phase incarnation, a lookup catalog version below a donor's
+publication version proves that lookup read a catalog before the donor became
+visible. Versions reset on reopen. An equal or newer lookup version alone does
+not prove the donor remained visible or eligible because an intervening
+transaction may have retired it. Intermediate publication trace is a bounded,
+lossy 128-record bank.
+Terminal publication outcomes have a separate 24-record bank: a single
+maintenance operation can retire at most the 16 initially queued plus 8 pending
+captures. Native serving drains terminals after each flush, capture, abandonment
+and shutdown reconciliation, outside the observer and store ownership locks,
+to preserve publication closure. Only actual terminal production triggers that
+maintenance drain; idle token/window polls emit nothing. `trace_dropped` describes
+expendable observations, while nonzero `terminal_overflow` would indicate a broken
+caller drain/bound contract rather than ordinary trace pressure.
+
 **Queued cache restoration (opt-in diagnostics):** set `STRATA_STORE_TIMING=1` in both the frontend and engine
 environment. The frontend emits metadata-only `[strata] store_offer:` lifecycle diagnostics and adds `cache_offer`
 to the logged `response_attribution` record, not to HTTP responses or the lifecycle API. Join its frontend
@@ -328,6 +401,25 @@ including refusals that do no I/O and attempts that are later reissued. Material
 envelope that may include file reads, page-cache service, validation and copies; it is not physical-device I/O
 latency or proof of SSD traffic. Queue time is not device service time either. These store diagnostics add no GPU
 synchronization and dump no prompts, token arrays, scopes or credentials. Keep them off for headline measurements.
+
+Native `store_head event=published_cut` records identify the durable head, epoch,
+actual publication `request_id`/`generation`, captured top-level `live_tokens`,
+stage count and each canonical all-stage `cut`. `live_cut=1` means that cut is
+the live record in every stage. A longer captured live length is not proof of a
+usable cut: stages can agree on earlier checkpoints without agreeing on the live
+record. Publication identities belong to the store publication ticket, not the
+HTTP request or read-offer namespace; join through capture/publication correlation.
+Publication and retirement records describe an applied durable catalog transition,
+not a selected victim or an attempted rename.
+
+`store_read event=candidate_rejected` attributes same-bucket enumeration failures
+to the native read request/generation, head and cut: `epoch_mismatch`,
+`not_strict_prefix`, `prefix_unavailable` or `prefix_mismatch`. Unrelated buckets
+are not logged. These reasons do not replace later capacity/lease refusal records.
+Both channels use the same fixed 64-record allocation-free batch, emit after
+unlock, and report dropped observations with `store_read event=trace_overflow`.
+Missing records after overflow are not evidence of missing publications or
+candidates. The switch remains off by default.
 
 **Where prompt time goes (opt-in attribution):** `STRATA_PREFILL_ATTRIBUTION=1` enables the existing
 `PfTimer` event pool and emits `strata prefill attribution:` JSON records: one per layer/chunk/device, one
@@ -1045,11 +1137,23 @@ canonical/native `experts.bin` or native GGUF planes. No buffered fallback is us
 pointers expire at every explicit layer boundary or first fetch for a different layer; supported
 consumers finish their reads before recycling. Static caching requires `--expert-profile`, and
 prefill/serving requires `STRATA_PREFILL_RING=8` to exclude whole-chunk pointer retention.
-Splits, mmap/resident/shared arenas, adaptive and remote caches are refused. The ring's byte
-bound does not bound reader stacks/metadata or source page cache. Admission still charges the
-full guest/physical-host source-page envelope: guest O_DIRECT alone cannot prove host bypass,
-particularly when virtiofsd does not enable direct I/O. This mode does not yet make the current
-full model safely admissible.
+Distinct-device layer splits use independent source lanes. Mmap/resident/shared arenas,
+adaptive caches and remote source-sharing paths are incompatible. The ring's byte bound
+does not bound reader stacks/metadata or source page cache. Host-native admission charges
+direct-only rings and bounded source metadata; VM scopes retain conservative source-page
+bounds unless qualified receipts establish otherwise. Accounting alone is not runtime qualification.
+
+`--retire-resident-source` is a separate default-off mode for batched host-native windowed
+serving with positive prefill. After every allocation/trimming/init decision, it requires
+complete live owning-cache coverage, independently owned scratch and no current or future
+loan, elastic/adaptive/peer/helper/CPU-share or Foresight/lookahead worker path. Checked
+device selection and drains precede allocation-free readback of every GPU residency table
+against independent owning-cache mappings. Only then can all rings retire, before any
+conversation-cache/checkpoint payload or lease. The ring is startup-only; resident checkpoint
+and parked-conversation charges are runtime-only. Other charges and all reserves remain.
+Retirement preserves source/file/layout/reader metadata, makes future reads fail closed
+without automatic reopen, and reports released allocation bytes, not an asserted RSS drop.
+This source contract is not evidence of an exercised transition or daily qualification.
 
 ### Graph capture qualification seams
 
@@ -1479,8 +1583,8 @@ establish latency gains or committed-token equality.
 
 **Exact prompt prefixes across conversations (opt-in).** On the three text-generation endpoints,
 `"strata_shared_prefix": {"messages": K}`, `{"message": I, "chars": N}` or `{"tokens": N}` opts the rendered
-prompt's token-zero prefix into a separate shared store namespace. It resolves by the same head rendering,
-tokenization and longest-common-start rule as `strata_prefix` below, and supplies the ordinary resolved pin.
+prompt's token-zero prefix into a separate shared store namespace. It resolves by the same genuine-context boundary
+marking, tokenization and longest-common-start rule as `strata_prefix` below, and supplies the ordinary resolved pin.
 If both fields resolve to different token counts, the server returns 400; the same count is idempotent.
 Malformed fields are 400s; an unusable head is logged and ignored.
 
@@ -1507,6 +1611,23 @@ window and ignored, and a malformed field is a 400. Each working history has one
 retarget replaces it, while a request for an unavailable checkpoint leaves the existing pin unchanged. Independent
 parked histories retain their own pins. This needs `--prompt-cache 3` or more (checkpoint positions, not execution
 slots). `tools/research_run.py` runs a document and a question list against a server with and without it.
+Text hints use the renderer's normal empty-assistant-turn selection before adding boundary markers, while message
+indices still refer to the original request. A message-count hint ends at the last selected text among the first K
+messages, before its closing template wrapper; a character hint targeting an omitted turn is ignored. Tokenizer
+merges may shorten either boundary further.
+Earlier declared-shared history remains intact, including tool calls, results and reasoning. Only the target
+text and following supported text context receive guards. For all-text conversations that includes a later user
+query required by some templates; otherwise the context stops before the first unsupported message after the
+target. An unsupported target, or a template requiring a query beyond that stop, makes only the hint unusable.
+The resolver does not invent a query or search for a template-compatible truncation. Missing, duplicated,
+reordered or transformed guarded text cannot authorize a later cut. Comparing the verified head with actual
+full-prompt IDs also shortens or rejects it if a template hoists omitted private material ahead of the document.
+A real full-request template error is unchanged. Tool definitions, literal control-token text, explicit
+token-count hints and sharing authorization retain their normal rules.
+Each text hint costs one additional context render and head tokenization, plus linear marker/text validation; an
+all-text history therefore renders its full context again. There is no measured latency claim. Queued preparation
+bounds that additional marked rendering including marker overhead; exceeding its allowance defers preparation to
+demand rather than shortening the prompt or fabricating a pin.
 The engine's own key is `pin=N` on the `GEN` line.
 
 Trusted frontend requests may additionally send `sscope=<64 nonzero lowercase hex digits>`, with the exact count
@@ -1637,6 +1758,50 @@ and the exact token/image prefixes it was captured at. Publication order is file
 are superseded roots and unreferenced objects reclaimed. Bytes deduplicate by payload digest, so two separately
 validated manifests can share an identical object.
 
+Object directory durability is a correctness requirement, not a batching optimization. New objects keep the ordinary
+per-object file/rename/shard-flush path. The writer also flushes `objects/` for an existing shard: a prior `mkdir`
+may have succeeded while its parent flush failed, so directory existence is not proof of durability. An accounted
+orphan reused after failed deletion is leased and its shard and `objects/` are flushed again, outside the catalog
+mutex, before a manifest can name it. This adds directory flushes to writes/revivals; no performance gain is claimed.
+Repeated chunks in the single writer's publication reuse that same lease without rewriting or charging the object
+again. Successful catalog apply carries the existing lease charge into the object index, so later confirmed deletion
+returns it exactly once. Refused revival returns ownership to reclamation; uncertain catalog commits retain the files
+and charges under the existing fault/epoch-distrust rules.
+
+*Object-directory flush batching (bounded CPU-storage qualification; default off).* Set
+`STRATA_STORE_DIR_FSYNC_BATCH=1` in the native engine environment before opening
+the store. Unset it (or use any other value) for the repaired per-object path
+above. Both modes retain its publication-local lease deduplication and transfer
+the original revived-object charge into the live index without charging again.
+Batching changes only when object directory entries are flushed: each immutable
+payload is still written, file-fsynced, closed and renamed before reuse.
+
+The enabled writer initializes a fixed 256-bit tracker and marks every shard
+containing a newly renamed object or a revived accounted orphan. Before encoding
+or creating any manifest it opens, flushes and closes each marked shard
+sequentially, then flushes `objects/` once, including existing shards left by a
+failed earlier parent flush. Entirely authorized donor/dedup reuse needs no batch.
+The tracker, three-byte stack shard name and one transient descriptor (39 bytes)
+are counted in admission and actual writer workspace against the shared RAM allowance and
+preparation ceiling. Shard names and transparent fault lookup allocate no heap
+storage. The existing descriptor owner is reused; no per-object/shard descriptor
+collection or additional RAII owner is introduced.
+
+A refused drain precedes manifest creation and leaves catalog authority unchanged.
+Abandoned objects are credited only after confirmed deletion; undeletable orphans
+remain charged in the stable orphan ledger. Revival must traverse the flush
+boundary again, not infer durability from file/directory existence. Generic
+`object-shard-sync` and `object-parent-sync` faults refuse the actual flush in both
+modes. The default parent fault occurs before writing; the batch parent fault
+occurs after payload renames, so their cleanup assertions distinguish that timing.
+Candidate-specific faults and the batch gate exist only in test-hook builds.
+
+This opt-in is not adopted for daily use. With N new objects, R revived objects
+and S touched shards, directory flushes change from 2(N+R) on the repaired default
+path to S+1 for a nonempty batch; file, manifest and catalog fsyncs are unchanged.
+Sequential reopening adds work and small batches can regress. The bounded
+observations below are CPU-storage evidence, not serving-throughput qualification.
+
 *Three separate identities.* The **authorized scope** is the frontend's 32-byte per-tenant/per-conversation value
 derived from the store's private issuer key; it is never logged and a scope change discards reuse exactly as it does
 for parking. The **execution domain** is a canonical digest of the resolved engine identity, the runtime geometry, the
@@ -1688,6 +1853,15 @@ it preserves that cut. Subsequent covering captures remain replaceable: the poli
 not every turn. This internal cut promise does not make the head immune to quota eviction. Replacement completions
 clear retired-head references independently of owner adoption; a queued divergent capture becomes a fresh branch
 rather than claiming a retired predecessor. A completion can attach to an owner only at its original generation.
+
+If ordinary cache pressure evicts a latest head without a replacement completion, the next covering publication can
+be accepted and then settle **stale**. That is one terminal failure, not eight admission retries. On that exceptional
+result, the engine checks that the predecessor is actually absent from the catalog in the capture's still-current
+epoch, then clears only that head's same-epoch lineage and queued hints through the existing retirement bookkeeping.
+Subsequent valid captures can publish as fresh branches. A still-retained predecessor (including an older-generation
+stale cover), another head, or a different epoch is not rebranched by this recovery. Read/object leases and pinned or
+divergent cut promises are unchanged. The failed accepted capture remains best-effort: it is not reconstructed from
+an optional RAM alias, so that capture itself may not persist.
 
 A checkpoint disk mount records the full persisted live record in owner lineage before shortening the execution
 prefix. Resuming a shorter cut does not authorize retiring the longer donor; re-creating its full prefix can still
@@ -1797,12 +1971,43 @@ assertions specify these boundaries rather than matching diagnostic wording:
 | Session directory flush after rename | `conversation_file_test`: `dir_flush`; failure reports `published` and leaves the complete new file. POSIX `EINVAL` reports an unsupported flush instead. |
 | Store publication phases | `check_failed_write_charges_once`: `objects`, `manifest`, `catalog`; failure preserves the predecessor and catalog, refunds abandoned files, drops image/object leases, and permits a same-run retry that survives restart. The object hook precedes creation; it is not an injected short write or file-fsync failure. |
 | Store operation-level temporary creation and manifest rename | The same store test makes the relevant directory unwritable, checks single-charge cleanup and restores the predecessor. These permission-denial cases require an unprivileged account. |
+| Store orphan revival and retirement | `check_orphan_revival`: a real unprivileged shard permission denial retains an object after `catalog-rename`; one- and two-chunk histories reuse its inode without rewriting. Repeated `object-shard-sync`/`object-parent-sync` refusals precede manifest creation, preserve authority and return the same charge to the stable orphan ledger; successful revival, restore and retirement must refund that charge in the same process, without reopening to reconstruct the ledger. |
+| Store new-object directory retry | `check_object_directory_retry`: repeated `object-parent-sync` refusals encounter the same shard left by successful `mkdir`, without assuming its parent is durable. `object-shard-sync` refuses after rename; normal cleanup refunds the real file once, and a fully flushed retry can publish and retire. |
+| Opt-in batch refusal and reopen | `check_failed_write_charges_once`: test-only `batch-shard-open`, `batch-shard-sync`, `batch-shard-partial`, `batch-parent-sync`, `batch-shard-allocate`; each refusal preserves predecessor authority, releases leases/descriptors, refunds confirmed deletions and permits a same-run retry surviving clean reopen. The allocator fault unwinds with the shard descriptor owned. |
+| Opt-in retained-orphan revalidation | `check_object_directory_batch`: permission-denied deletion retains newly renamed objects across shard/parent refusal. Retrying must repeat the boundary, retain stable orphan charges and inodes, and succeed with `new_bytes == 0`; clean reopen restores the history byte for byte. Permission-denial cases require an unprivileged account. |
+| Opt-in admission, duplicate, donor and partial drain | The same fixture checks the fixed workspace admission floor, constructs distinct objects sharing a shard and repeats a chunk. A partial-drain fault stays armed on a one-shard batch and fires on a later multi-shard publication; authorized donor/dedup reuse leaves a shard fault armed. |
+| Opt-in selected reader, cancellation and intent distrust | A selected predecessor restores unchanged while its successor is paused before the drain, with no successor manifest or authority. Cancelling that already-started publication leaves its writer active and does not prevent storage after the drain. Orderly destruction without clean close after a refused batch advances the epoch on reopen; this is not abrupt process/power-loss coverage or retained-orphan crash recovery. |
 | Catalog rename and post-rename uncertainty | `check_commit_outcomes`: `catalog-rename` leaves old authority intact; `catalog-sync` and `catalog-apply` retain both catalogs' possible payloads, stop reuse and leave the run intent active while releasing the publication's RAM lease. Restart distrusts both records and reclaims payloads and interrupted scratch writes. |
 | Intent clearing and re-arm | `check_bootstrap_and_intent`: `intent-unlink-sync`, with and without `intent-rearm-sync`, checks the actual marker, its single charge and idempotent close; restart retires the distrusted record and a healthy close removes the marker. Dirty-bootstrap quota refusal is covered separately in the same test. |
 
 Session write/flush cases and catalog/intent fault scenarios were already present; the additional store assertions
 cover cleanup, lease release and restart consequences without duplicating those scenarios. These are deterministic
 process-level cases, not power-loss qualification or independent syscall-failure coverage for every store file.
+
+The revival fixture uses the existing catalog gate to retain the object before injecting directory-flush refusal on
+revival. There is no existing pause between a new object's rename and its first shard flush at which to revoke unlink
+permissions, so it does not claim that exact retained-first-flush interleaving. The separate new-object fixture covers
+post-rename refusal with successful deletion. Fault strings alone do not prove
+syscall ordering or stable-storage behavior.
+
+Bounded observed qualification: both targeted existing fixture modes passed 873
+checks each. The r6 actual-userspace syscall ordering, fault, retained-revival and
+SIGKILL dirty/clean-reopen proof passed, with peak one shard descriptor. This
+observes the userspace durability sequence, not kernel, device or power-loss
+correctness. Cancellation of an already-started publication remains a no-op;
+the inherited late-publication epoch window is not repaired or qualified here.
+
+Observer-off synthetic screens used 1 MiB chunks, three stages, k8v4, one pinned
+midpoint and no draft, at 5,120 and 30,720 tokens plus a 1,024-token append. Both
+the first screen and confirmation with explicit reversed ordering within each
+shape passed frozen gates: fresh publication was 22–31% faster in the first
+screen and 23–26% in confirmation; incremental publication improved about 19%
+and 19–22%, respectively. Statuses, new/reused bytes, head and full-tree clean
+reopen matched, and the dedup guard passed. The first screen directory was
+`strata-fsync-usefulness-hqkxyzsx`; confirmation was
+`strata-fsync-usefulness-confirm-3yb4huhu`, both under the conversation-cache
+storage root. These are bounded CPU-storage observations, not serving throughput,
+an exact daily capture or daily adoption; the default remains off.
 
 *Known limits of this first implementation.* Retained-K/V reuse intervals are offered only for a capture that kept a
 donor's own K/V head (`conversation_store_reuse_intervals`), and the store re-validates every one of them: the donor
@@ -3062,13 +3267,81 @@ per record. `completion_s` includes response handling and drain; engine `timings
 waiting for the engine's serialized control owner. A first token is a native generated token, even if it
 is an end-of-turn marker or buffered by structured output rather than visible to the client.
 
-Each registered generation response logs one compact JSON line, `[strata] response_attribution: {...}`, after
+An HTTP reservation is not foreground execution intent. The reservation stays owned through native drain and
+response retirement, but a drained or errored foreground request no longer defers background control acquisition.
+Only its queued/admitted/preparing/engine-wait work can assert pending foreground intent; a later continuation
+can assert it again when preparation actually resumes. Slots remain general and admission remains 3:1.
+
+Each registered response (generation or score), including queue-full and shutdown refusals during registration,
+logs exactly one compact JSON line, `[strata] response_attribution: {...}`, after
 response handling and native drain. Its `request_id` matches `X-Strata-Request-Id`; use that identity, not a
 matching token count, to join engine work to a client request. The record contains the endpoint `path`, terminal
 `outcome`, last native `finish`, `committed_tokens` from native completion counts, and `output_tokens` from the
 frontend (which can also include inserted thinking-budget wrap-up tokens). The `interval` has Unix-second
 `started_at`/`finished_at` endpoints and a monotonic `duration_s`: registration through response handling and
 drain, including queue wait but not body upload. The private lifecycle record also retains it as `attribution`.
+
+The attribution includes bounded `priority`, process `boot_id`, and monotonic registration/admission/terminal
+timestamps. `queue_s` remains the compatibility total: HTTP admission plus the existing serialized frontend
+control waits. Do not interpret it as pure HTTP admission or add it to the partition below.
+`admission_wait_s` is registration-to-HTTP-admission wall time (or the whole queued lifetime if cancelled).
+`first_token_s` is the first native token observation; `first_content_s` is the first nonempty parsed content
+event, before the handler writes it, not proof of client receipt. Both include admission wait and remain
+`null` when absent. Refusals include `rejection_reason` (`queue_full` or `shutdown`) and no native work.
+
+`frontend.seconds` is the exclusive, monotonic wall-time partition from registration through terminal cleanup:
+`admission_wait`, `control_selector_wait`, `physical_slot_wait`, `control_occupied_wait`, `preparation`,
+`native_active`, `cleanup`, and explicit `unattributed` remainder. The corresponding fixed `frontend.counts`
+count entries, including repeated control reacquisitions. When several control gates fail, reason precedence
+is **selector/deadline deferral, then no eligible physical slot, then occupied control ownership**.
+The existing selection, priority budgets, and slot decisions are unchanged. `native_active` means a submitted
+native consumer is active, not exclusive GPU compute. Cleanup covers synchronous drain and final handler
+retirement; preparation also includes frontend response processing between native consumers.
+Totals/counts and terminal timestamps are independent of the first-128-event diagnostic trace:
+`events_dropped` exposes trace truncation without losing final accounting. No per-token trace is added.
+
+Each actual native generation submission has an engine-start UUID `incarnation`, local numeric
+`engine_incarnation` when available, `submission_sequence`, and optional physical `slot`. These identities are
+diagnostic only, not scheduling inputs. The first 128 submissions and the last submission are retained;
+`native_submission_count` and `native_submissions_dropped` describe longer responses explicitly.
+Do not join by slot alone: it can have a different owner by the time asynchronous work finishes.
+
+**Optional native phase receipts:** set `STRATA_PHASE_TIMING=1` in frontend and engine. Only an engine
+advertising `INFO phase_timing=1` receives the internal `phase_request`, `phase_leg`, `phase_incarnation`,
+and metadata-only `phase_priority` keys. These are minted by the frontend, not accepted from API fields.
+Version-1 `STRATA_PHASE` stderr records carry explicit producer request/leg/incarnation identity. The
+response's `native_phase.receipts` binds only exact matching request and submission identities; missing,
+unsupported, or truncated observations stay explicitly unavailable/incomplete, never fabricated zeros.
+Legacy DONE/BDONE optional field parsing and response `timings` are unchanged.
+
+Native receipts use **inclusive host wall time**, may overlap each other and the frontend partition, and
+must never be summed into the exclusive partition or described as GPU kernel time. `kind=request` closes
+a GEN/BGEN command; `continuation=resident` means its slot decoding continues separately. `kind=resident`
+closes the resident leg, and shared decode compute remains unknown when not truthfully attributable.
+`gpu_mount_ms` measures host snapshot-mount wall time, not synchronized GPU execution; `decode_run_ms`
+remains unavailable for shared resident execution. Demand request/generation/attempt/head identities and
+status remain distinct from the HTTP request and submission leg.
+A resident continuation is reported `observed` only when its separately bound resident terminal is present;
+`resident_terminals_missing` makes a missing terminal explicit instead of treating the admission receipt as completion.
+Terminal settlement also closes active nested host spans at the same terminal timestamp.
+`kind=publication` preserves the original producer through capture/admission/terminal results, with executor
+identity separate. Publications can arrive after HTTP completion and remain in the independent JSON
+`/metrics.native_phase` diagnostic collection, never attached to the slot's current owner.
+Publication receipts retain capture/publication/owner-generation/epoch/head identities, attempts,
+observation timestamp, capture-to-observation, queue and admitted-to-observation wall time where reported.
+Successful publications also carry the store's mutex-consistent catalog version, durable-apply timestamp and
+admission-to-apply writer time; unsuccessful outcomes remain `null`. Request receipts can carry the exact shared
+lookup catalog version, time, raw match count, eligible indicator and selected head. These values are sampled at
+the real store seams and are never inferred from queue or reconciliation time.
+The reader retains 512 receipts, reads at most 256 KiB per poll, limits each line to 8 KiB, and polls only
+at response finalization or metrics scrape, never per token. Response-bound receipt detail is capped at 128;
+log gaps, invalid records, overflow, unsupported fields, and unavailable phases are explicit.
+
+Prometheus adds fixed `priority`/`outcome`/`phase` dimensions for `strata:request_outcomes_total`,
+`strata:frontend_phase_seconds_total`, and `strata:frontend_phase_entries_total`; first-token/content
+observation sums/counts use only priority/outcome. `strata:admission_waiting` uses priority.
+Request, generation, submission, offer, publication, and slot identities never become metric labels.
+
 
 `legs` keeps the native completion figures across solo/slot hand-backs and frontend continuations, with each
 batch leg's `slot`, generated count, native prompt/decode milliseconds, finish and draft counters. A batch leg
@@ -3091,6 +3364,11 @@ Counts and the hint are sampled together under the admission lock. `active` incl
 waiting and execution; `executing` does not claim
 concurrently executing GPU kernels or prefill/decode overlap. Active slot rows carry the stable frontend
 `request_id`, also returned in `X-Strata-Request-Id`.
+Slot rows in health and metrics distinguish `reserved` (frontend claim before a native read), `parked`
+(yielded read or temporarily quarantined busy slot), `reading`, `decoding`, `releasing` (awaiting terminal
+drain), and genuinely `idle` (no busy flag, claim or release). Cached held tokens alone do not make a slot busy.
+Prometheus `strata:live_slots{state="..."}` uses the same six bounded states, including `decoding`.
+
 Existing `queued` and native slot/control-wait metrics are unchanged. Queue capacity remains effective slots
 plus depth. Streaming errors after HTTP 200 headers keep their existing SSE form, not an HTTP retry hint.
 

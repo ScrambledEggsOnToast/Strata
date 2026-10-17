@@ -851,6 +851,24 @@ class StatusNeedsTheKey(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_health_does_not_expose_request_slot_details(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "k3y"
+        private = [{"slot": 0, "state": "decoding", "request_id": "private-request",
+                    "prompt_tokens": 123, "generated": 4}]
+        with mock.patch.object(svc.engine, "slots_view", return_value=private, create=True):
+            httpd = serve(svc, port=0)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{httpd.server_address[1]}/health", timeout=10) as response:
+                    body = json.load(response)
+                self.assertEqual(body["status"], "ok")
+                self.assertNotIn("slots", body)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 class _Reached(Exception):
     """raised by the patched serve(): main() got past the API key checks."""
@@ -1899,15 +1917,19 @@ class SharedPrefix(unittest.TestCase):
                        {"strata_prefix": {"tokens": True}}, {"strata_prefix": "x"}):
             self.assertFalse([k for k in self.keys(**absent) if k.startswith("pin=")], absent)
 
-    def test_messages_resolve_to_the_boundary_token(self):
+    def test_messages_resolve_to_a_conservative_text_boundary(self):
         req = {"strata_prefix": {"messages": 2}}
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)
         n = req["strata_prefix"]["tokens"]
         text = self.tok.decode(ids[:n], errors="replace")
-        self.assertTrue(text.endswith("DOC<|im_end|>\n"), text[-40:])   # right where the next message's turn starts
-        self.assertEqual(self.tok.decode(ids[n:n + 1]), "<|im_start|>")
-        head = self.svc.encode_prompt(self.MSGS[:2], None, {"add_generation_prompt": False})
-        self.assertEqual(ids[:n], head[:n])
+        self.assertIn("DOC " * 39, text)
+        self.assertNotIn("Which word repeats?", text)
+        other = self.MSGS[:2] + [{"role": "user", "content": "A different private question"}]
+        other_req = {"strata_prefix": {"messages": 2}}
+        other_ids, _, _ = self.svc.prepare(other, None, {}, 16, req=other_req)
+        self.assertEqual(other_req["strata_prefix"], req["strata_prefix"])
+        self.assertEqual(other_ids[:n], ids[:n])
+        self.assertNotEqual(other_ids[n:], ids[n:])
 
     def test_tokens_and_unusable_prefixes(self):
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16)
@@ -1944,6 +1966,353 @@ class SharedPrefix(unittest.TestCase):
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)
         self.assertEqual(req, {"temperature": 0})
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
+
+
+class CompleteContextPrefix(unittest.TestCase):
+    """Text hints keep the real template's required later query, including during bounded offer preparation."""
+
+    SOURCE = (
+        "{% if not messages|selectattr('role', 'equalto', 'user')|list %}"
+        "{{ raise_exception('No user query found in messages.') }}{% endif %}"
+        "{% if tools %}{{ tools|tojson }}{% endif %}"
+        "{% for message in messages %}"
+        "[{{ message.role }}]{{ message.content|trim }}[/{{ message.role }}]"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}[assistant]{% endif %}"
+    )
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "query_required.jinja"
+        self.tok = ThinkTokenizer()
+        self.svc = self.service(self.SOURCE)
+
+    def service(self, source):
+        self.path.write_text(source, encoding="utf-8")
+        return Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok, ChatTemplate(self.path))
+
+    def test_system_and_chars_boundaries_keep_the_complete_request(self):
+        shared = "amber table entry " * 30
+        for field in ("strata_prefix", "strata_shared_prefix"):
+            for spec in ({"messages": 1}, {"message": 0, "chars": len(shared)}):
+                with self.subTest(field=field, spec=spec):
+                    prefixes = []
+                    suffixes = []
+                    for private in ("PRIVATE_ALPHA", "PRIVATE_BETA"):
+                        document = shared + (private if "chars" in spec else "")
+                        body = {"messages": [{"role": "system", "content": document},
+                                             {"role": "user", "content": private + " question?"}],
+                                field: dict(spec), "max_tokens": 4}
+                        resolved = self.svc.resolve_openai(body, load=False)
+                        unpinned = self.svc.prepare(resolved.messages, resolved.tools, resolved.kw, 4)
+                        frozen = self.svc.freeze_generation(resolved)
+                        self.assertIsNotNone(frozen)
+                        self.assertEqual(resolved.req[field], spec, "freezing rewrote the client's boundary")
+                        prepared = self.svc.prepare(resolved.messages, resolved.tools, resolved.kw, 4,
+                                                    req=resolved.req)
+                        self.assertEqual(prepared, unpinned, "the hint changed the full prompt")
+                        ids = prepared[0]
+                        n = resolved.req["strata_prefix"]["tokens"]
+                        self.assertGreater(n, 0)
+                        self.assertLess(n, len(ids) - 1)
+                        self.assertEqual(frozen.prefix, {"tokens": n})
+                        self.assertEqual(frozen.ids, tuple(ids))
+                        text = self.tok.decode(ids[:n])
+                        self.assertIn("amber table entry " * 29, text)
+                        self.assertNotIn(private, text)
+                        prefixes.append(ids[:n])
+                        suffixes.append(ids[n:])
+                    self.assertEqual(prefixes[0], prefixes[1])
+                    self.assertNotEqual(suffixes[0], suffixes[1])
+
+
+    def test_leading_whitespace_trim_keeps_the_document_in_the_prefix(self):
+        document = "\n\n" + "amber table entry " * 30
+        messages = [{"role": "system", "content": document},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        expected = self.svc.prepare(messages, None, {}, 4)
+        request = {"strata_shared_prefix": {"messages": 1}}
+        self.assertEqual(self.svc.prepare(messages, None, {}, 4, req=request), expected)
+        n = request["strata_prefix"]["tokens"]
+        prefix = self.tok.decode(expected[0][:n])
+        self.assertIn("amber table entry " * 29, prefix)
+        self.assertNotIn("PRIVATE", prefix)
+    def test_empty_assistant_selection_keeps_original_document_indices(self):
+        bundled = (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+        document = "amber table entry " * 30
+        with mock.patch.dict(os.environ, {"STRATA_KEEP_EMPTY_TURNS": "0"}):
+            for source in (self.SOURCE, bundled):
+                svc = self.service(source)
+                for empty in ("", " \n "):
+                    for spec in ({"messages": 3}, {"message": 2, "chars": len(document)}):
+                        for field in ("strata_prefix", "strata_shared_prefix"):
+                            with self.subTest(source=source, empty=empty, spec=spec, field=field):
+                                messages = [{"role": "user", "content": "Earlier question"},
+                                            {"role": "assistant", "content": empty},
+                                            {"role": "user", "content": document},
+                                            {"role": "user", "content": "PRIVATE question?"}]
+                                expected = svc.prepare(messages, None, {}, 4)
+                                request = {field: dict(spec)}
+                                self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+                                n = request["strata_prefix"]["tokens"]
+                                prefix = self.tok.decode(expected[0][:n])
+                                self.assertIn("amber table entry " * 29, prefix)
+                                self.assertNotIn("PRIVATE", prefix)
+                                compact = messages[:1] + messages[2:]
+                                compact_spec = ({"messages": 2} if "messages" in spec else
+                                                {"message": 1, "chars": len(document)})
+                                compact_req = {field: compact_spec}
+                                compact_ids = svc.prepare(compact, None, {}, 4, req=compact_req)[0]
+                                self.assertEqual(compact_ids, expected[0])
+                                self.assertEqual(compact_req["strata_prefix"], request["strata_prefix"])
+
+    def test_tool_and_reasoning_suffixes_preserve_the_real_document_prefix(self):
+        bundled = (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+        # Also exercise a deployed-style template that refuses a system-only head without a real user query.
+        required_user = self.SOURCE.split("{% if tools %}", 1)[0]
+        document = "amber table entry " * 30
+        for source in (bundled, required_user + bundled):
+            svc = self.service(source)
+            for kind in ("tool", "reasoning"):
+                for spec in ({"messages": 1}, {"message": 0, "chars": len(document)}):
+                    for field in ("strata_prefix", "strata_shared_prefix"):
+                        prefixes, suffixes = [], []
+                        for private in ("PRIVATE_ALPHA", "PRIVATE_BETA"):
+                            with self.subTest(source=source, kind=kind, spec=spec, field=field, private=private):
+                                if kind == "tool":
+                                    history = [{"role": "assistant", "content": None,
+                                                "tool_calls": [{"function": {"name": "read",
+                                                                            "arguments": {"path": private}}}]},
+                                               {"role": "tool", "content": private + " result"}]
+                                else:
+                                    history = [{"role": "assistant", "content": private + " answer",
+                                                "reasoning_content": private + " reasoning"}]
+                                messages = [{"role": "user", "content": document}] + history + [
+                                    {"role": "user", "content": private + " question?"}]
+                                expected = svc.prepare(messages, None, {}, 4)
+                                request = {field: dict(spec)}
+                                self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+                                n = request["strata_prefix"]["tokens"]
+                                prefix = self.tok.decode(expected[0][:n])
+                                self.assertIn("amber table entry " * 29, prefix)
+                                self.assertNotIn(private, prefix)
+                                self.assertIn(private, self.tok.decode(expected[0][n:]))
+                                prefixes.append(expected[0][:n])
+                                suffixes.append(expected[0][n:])
+                        self.assertEqual(prefixes[0], prefixes[1])
+                        self.assertNotEqual(suffixes[0], suffixes[1])
+
+    def test_document_after_structured_history_keeps_its_shared_prefix(self):
+        svc = self.service((ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+        document = "amber table entry " * 30 + "SHARED_DOCUMENT_END\n"
+        for kind in ("tool", "reasoning"):
+            if kind == "tool":
+                history = [{"role": "user", "content": "Earlier shared query"},
+                           {"role": "assistant", "content": None,
+                            "tool_calls": [{"function": {"name": "read", "arguments": {"path": "shared-input"}}}]},
+                           {"role": "tool", "content": "Earlier shared tool result"}]
+            else:
+                history = [{"role": "user", "content": "Earlier shared query"},
+                           {"role": "assistant", "content": "Earlier shared answer",
+                            "reasoning_content": "Earlier shared reasoning"}]
+            index = len(history)
+            for spec in ({"messages": index + 1}, {"message": index, "chars": len(document)}):
+                prefixes, suffixes = [], []
+                for private in ("PRIVATE_ALPHA", "PRIVATE_BETA"):
+                    with self.subTest(kind=kind, spec=spec, private=private):
+                        content = document + (private if "chars" in spec else "")
+                        messages = history + [{"role": "user", "content": content},
+                                              {"role": "user", "content": private + " question?"}]
+                        expected = svc.prepare(messages, None, {}, 4)
+                        request = {"strata_shared_prefix": dict(spec)}
+                        self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+                        n = request["strata_prefix"]["tokens"]
+                        prefix = self.tok.decode(expected[0][:n])
+                        self.assertIn("SHARED_DOCUMENT_END", prefix)
+                        self.assertNotIn(private, prefix)
+                        prefixes.append(expected[0][:n])
+                        suffixes.append(expected[0][n:])
+                self.assertEqual(prefixes[0], prefixes[1])
+                self.assertNotEqual(suffixes[0], suffixes[1])
+
+    def test_system_document_retains_the_real_query_before_structured_history(self):
+        required_user = self.SOURCE.split("{% if tools %}", 1)[0]
+        svc = self.service(required_user + (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+        document = "amber table entry " * 30
+        for spec in ({"messages": 1}, {"message": 0, "chars": len(document)}):
+            messages = [{"role": "system", "content": document},
+                        {"role": "user", "content": "PRIVATE initial query"},
+                        {"role": "assistant", "content": "PRIVATE answer",
+                         "reasoning_content": "PRIVATE reasoning"},
+                        {"role": "user", "content": "PRIVATE followup?"}]
+            request = {"strata_prefix": spec}
+            expected = svc.prepare(messages, None, {}, 4)
+            self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+            n = request["strata_prefix"]["tokens"]
+            self.assertIn("amber table entry " * 29, self.tok.decode(expected[0][:n]))
+            self.assertNotIn("PRIVATE", self.tok.decode(expected[0][:n]))
+
+    def test_hoisted_private_structure_cannot_extend_the_shared_token_prefix(self):
+        hoist = (
+            "{% for message in messages %}"
+            "{% if message.tool_calls %}{{ message.tool_calls|tojson }}{% endif %}"
+            "{% if message.reasoning_content %}{{ message.reasoning_content }}{% endif %}"
+            "{% endfor %}"
+        )
+        svc = self.service(hoist + self.SOURCE)
+        for kind in ("tool", "reasoning"):
+            for spec in ({"messages": 1}, {"message": 0, "chars": 30}):
+                prompts, cuts = [], []
+                for private in ("PRIVATE_ALPHA", "PRIVATE_BETA"):
+                    with self.subTest(kind=kind, spec=spec, private=private), contextlib.redirect_stdout(io.StringIO()):
+                        structured = ({"tool_calls": [{"name": "read", "arguments": {"path": private}}]}
+                                      if kind == "tool" else {"reasoning_content": private + " reasoning"})
+                        messages = [{"role": "user", "content": "amber table " * 20},
+                                    {"role": "assistant", "content": private + " answer", **structured},
+                                    {"role": "user", "content": private + " question?"}]
+                        expected = svc.prepare(messages, None, {}, 4)
+                        request = {"strata_prefix": dict(spec)}
+                        self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+                        n = request["strata_prefix"].get("tokens", 0)
+                        self.assertNotIn("PRIVATE_", self.tok.decode(expected[0][:n]))
+                        prompts.append(expected[0])
+                        cuts.append(n)
+                # Stable framing may be reusable; variable private material may not.
+                common = 0
+                for a, b in zip(*prompts):
+                    if a != b:
+                        break
+                    common += 1
+                self.assertTrue(all(n <= common for n in cuts))
+
+    def test_insufficient_genuine_text_context_ignores_only_the_hint(self):
+        # The first unsupported message precedes the only user query. Do not invent a user or search past it.
+        messages = [{"role": "system", "content": "amber table " * 20},
+                    {"role": "assistant", "content": "PRIVATE answer", "reasoning_content": "PRIVATE reasoning"},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        expected = self.svc.prepare(messages, None, {}, 4)
+        for spec in ({"messages": 1}, {"message": 0, "chars": 30}, {"messages": 2}):
+            with self.subTest(spec=spec), contextlib.redirect_stdout(io.StringIO()):
+                request = {"strata_prefix": spec}
+                self.assertEqual(self.svc.prepare(messages, None, {}, 4, req=request), expected)
+                self.assertEqual(request["strata_prefix"], {})
+
+    def test_real_full_request_template_failure_is_not_swallowed(self):
+        svc = self.service((ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+        messages = [{"role": "user", "content": "amber table " * 20},
+                    {"role": "assistant", "content": None, "tool_calls": [{"function": {"arguments": {}}}]},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        for request in (None, {"strata_prefix": {"messages": 1}},
+                        {"strata_shared_prefix": {"message": 0, "chars": 30}}):
+            with self.subTest(request=request), self.assertRaisesRegex(ValueError, "missing a function name"):
+                svc.prepare(messages, None, {}, 4, req=request)
+
+    def test_omitted_duplicated_or_reordered_markers_never_pin_a_later_suffix(self):
+        variants = (
+            self.SOURCE.replace("message.content|trim", "message.content.split('\\u0001')[0]|trim"),
+            self.SOURCE.replace("{{ message.content|trim }}", "{{ message.content|trim }}" * 2),
+            self.SOURCE.replace("for message in messages", "for message in messages|reverse"),
+            self.SOURCE.replace("{{ message.content|trim }}",
+                                "{% if '\\u0001' in message.content %}"
+                                "{{ raise_exception('instrumented text not supported') }}{% endif %}"
+                                "{{ message.content|trim }}"),
+            self.SOURCE.replace("{{ message.content|trim }}",
+                                "{% if '\\u0001' in message.content %}"
+                                "{{ message.missing.required }}{% endif %}{{ message.content|trim }}"),
+        )
+        for source in variants:
+            svc = self.service(source)
+            messages = [{"role": "system", "content": "amber table " * 20},
+                        {"role": "user", "content": "PRIVATE question?"}]
+            expected = svc.prepare(messages, None, {}, 4)
+            for spec in ({"messages": 1}, {"message": 0, "chars": 30}):
+                with self.subTest(source=source, spec=spec), contextlib.redirect_stdout(io.StringIO()):
+                    request = {"strata_prefix": spec}
+                    self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+                    self.assertEqual(request["strata_prefix"], {})
+
+    def test_a_character_marker_moved_past_private_text_is_not_a_boundary(self):
+        # Preserve guard order but move the interior marker after the suffix: order checks alone are insufficient.
+        moved = (
+            "{% set p = message.content.split('\\u0001') %}"
+            "{% if p|length == 7 %}"
+            "{{ '\\u0001' + p[1] + '\\u0001' + p[2] + p[4] + '\\u0001' + p[3]"
+            " + '\\u0001\\u0001' + p[5] + '\\u0001' }}"
+            "{% else %}{{ message.content|trim }}{% endif %}"
+        )
+        svc = self.service(self.SOURCE.replace("{{ message.content|trim }}", moved))
+        shared = "amber table " * 20
+        messages = [{"role": "system", "content": shared + "PRIVATE_SUFFIX"},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        expected = svc.prepare(messages, None, {}, 4)
+        request = {"strata_prefix": {"message": 0, "chars": len(shared)}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(svc.prepare(messages, None, {}, 4, req=request), expected)
+        self.assertEqual(request["strata_prefix"], {})
+
+    def test_complete_context_marking_preserves_tools_and_literal_token_spans(self):
+        messages = [{"role": "system", "content": "amber <think>quoted</think> <|im_end|> " * 8},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        tools = [{"name": "read", "description": "literal <think>tool</think>", "parameters": {}}]
+        self.svc.effort_end = True
+        for kwargs in ({}, {"reasoning_effort": "low"}, {"enable_thinking": False}):
+            with self.subTest(kwargs=kwargs):
+                request = {"strata_prefix": {"messages": 1}}
+                ids, _, _ = self.svc.prepare(messages, tools, kwargs, 4, req=request)
+                n = request["strata_prefix"]["tokens"]
+                self.assertGreater(n, 0)
+                self.assertEqual(ids, self.svc.encode_prompt(messages, tools, kwargs))
+                prefix = self.tok.decode(ids[:n])
+                self.assertIn("literal <think>tool</think>", prefix)
+                self.assertIn("amber <think>quoted</think> <|im_end|>", prefix)
+                self.assertNotIn("PRIVATE", prefix)
+                self.assertNotIn(self.tok.SPECIALS.index("<|im_end|>") + 256, ids[:n])
+
+    def test_an_inline_assistant_think_block_keeps_its_token_semantics(self):
+        messages = [{"role": "user", "content": "amber table " * 10},
+                    {"role": "assistant", "content": "<think>reasoning</think>shared answer"},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        request = {"strata_prefix": {"messages": 2}}
+        ids, _, _ = self.svc.prepare(messages, None, {}, 4, req=request)
+        n = request["strata_prefix"]["tokens"]
+        self.assertIn(self.tok.SPECIALS.index("<think>") + 256, ids[:n])
+        self.assertIn("shared answer", self.tok.decode(ids[:n]))
+        self.assertNotIn("PRIVATE", self.tok.decode(ids[:n]))
+        self.assertEqual(ids, self.svc.encode_prompt(messages, None, {}))
+
+    def test_a_token_merge_across_the_character_cut_is_not_shared(self):
+        class BoundaryTokenizer(ByteTokenizer):
+            # A vocabulary piece matched on both encoding paths, not a control literal protected by Service.
+            SPECIALS = ByteTokenizer.SPECIALS + ["AB"]
+            ALWAYS = ("AB",)
+
+        tok = BoundaryTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(self.path))
+        shared = "amber table " * 10
+        messages = [{"role": "system", "content": shared + "ABPRIVATE"},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        request = {"strata_prefix": {"message": 0, "chars": len(shared) + 1}}
+        ids, _, _ = svc.prepare(messages, None, {}, 4, req=request)
+        n = request["strata_prefix"]["tokens"]
+        prefix = tok.decode(ids[:n])
+        self.assertIn(shared, prefix)
+        self.assertNotIn("A", prefix)
+        self.assertNotIn(tok.SPECIALS.index("AB") + 256, ids[:n])
+        self.assertIn(tok.SPECIALS.index("AB") + 256, ids[n:])
+
+    def test_marker_render_over_the_preparation_allowance_returns_none(self):
+        messages = [{"role": "system", "content": "amber table " * 20},
+                    {"role": "user", "content": "PRIVATE question?"}]
+        ids = self.svc.encode_prompt(messages, None, {})
+        bound = len(self.svc.render_prompt(messages, None, {}))
+        with mock.patch.object(self.svc, "preparation_render_chars", return_value=bound):
+            self.assertEqual(self.svc.encode_prompt(messages, None, {}, limit=len(ids)), ids)
+            self.assertIsNone(self.svc.prepare(messages, None, {}, 4,
+                                              req={"strata_prefix": {"messages": 1}}, limit=len(ids)))
+        request = {"strata_prefix": {"messages": 1}}
+        self.assertIsNotNone(self.svc.prepare(messages, None, {}, 4, req=request))
+        self.assertGreater(request["strata_prefix"]["tokens"], 0)
 
 
 class CrossConversationPrefix(unittest.TestCase):
@@ -6178,7 +6547,7 @@ class QueueRetryHint(unittest.TestCase):
 
     def test_idle_but_full_queue_is_small_and_old_waiter_increases_hint(self):
         self.svc.configure_admission({"request_queue_limit": 0})
-        self.svc.admission_waiters = [{"_clock": 100}]
+        self.svc.admission_waiters = [{"_clock": 100, "priority": "foreground"}]
         fresh = self.snapshot()
         self.assertEqual((fresh["active"], fresh["waiting"], fresh["retry_after_s"]), (0, 1, 1))
         self.svc.admission_waiters[0]["_clock"] = 96
@@ -6188,7 +6557,7 @@ class QueueRetryHint(unittest.TestCase):
     def test_service_estimate_excludes_queue_and_uses_recent_successes(self):
         self.svc.history.append({"finish": "stop", "duration_s": 1000, "queue_s": 0})
         self.svc.history.extend({"finish": "stop", "duration_s": 100.25, "queue_s": 100} for _ in range(32))
-        self.svc.admission_waiters = [{"_clock": 98}]
+        self.svc.admission_waiters = [{"_clock": 98, "priority": "foreground"}]
         snapshot = self.snapshot()
         self.assertEqual(snapshot["service_time_estimate_s"], 0.25)
         self.assertEqual(snapshot["retry_after_s"], 3)
@@ -6205,10 +6574,10 @@ class QueueRetryHint(unittest.TestCase):
         self.assertEqual((snapshot["service_time_estimate_s"], snapshot["retry_after_s"]), (4, 6))
 
     def test_active_service_age_is_a_lower_bound_without_its_queue_wait(self):
-        self.svc.admission_active = {"active": {"_clock": 90, "queue_s": 8, "state": "admitted"}}
+        self.svc.admission_active = {"active": {"_clock": 90, "queue_s": 8, "state": "admitted", "priority": "foreground"}}
         snapshot = self.snapshot()
         self.assertEqual((snapshot["service_time_estimate_s"], snapshot["retry_after_s"]), (2, 2))
-        self.svc.admission_waiters = [{"_clock": 98}]
+        self.svc.admission_waiters = [{"_clock": 98, "priority": "foreground"}]
         self.assertEqual(self.snapshot()["retry_after_s"], 4)
 
     def test_pathological_estimates_stay_inside_timeout_aware_clamp(self):
@@ -6217,7 +6586,7 @@ class QueueRetryHint(unittest.TestCase):
                 self.svc.configure_admission({"request_timeout_s": timeout})
                 self.svc.history.clear()
                 self.svc.history.append({"finish": "stop", "duration_s": 1e300, "queue_s": 0})
-                self.svc.admission_waiters = [{"_clock": -1e300}]
+                self.svc.admission_waiters = [{"_clock": -1e300, "priority": "foreground"}]
                 snapshot = self.snapshot()
                 self.assertEqual(snapshot["retry_after_ceiling_s"], ceiling)
                 self.assertEqual(snapshot["service_time_estimate_s"], ceiling)

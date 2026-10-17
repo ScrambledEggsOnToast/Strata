@@ -35,6 +35,8 @@ using conversation_store_detail::images_equal;
 
 int failures = 0;
 int checks = 0;
+std::vector<std::string> phase_lines;
+void phase_report(const char* text) { phase_lines.emplace_back(text); }
 
 void check(bool ok, const char* what) {
     ++checks;
@@ -94,6 +96,7 @@ ConversationStoreOptions options_for(const std::string& root) {
     ConversationStoreOptions options;
     options.root = root;
     options.domain = bytes_from("domain:native-publication-test");
+    options.publication_timing = true;
     options.model = bytes_from("model:native-publication-test");
     options.engine = bytes_from("engine:native-publication-test");
     options.quota_bytes = uint64_t(1) << 30;
@@ -743,6 +746,9 @@ void check_waiting_ownership_and_release() {
     ConversationStore store(options_for(root.path));
     Sink sink(store, size_t(64) << 20, 2);
     ConversationPublicationQueue publications;
+    const size_t fixed = size_t(16) << 20;
+    check(sink.cache.try_reserve_lease(fixed), "the resident chain reserves its startup charge");
+    sink.refresh_allowance();
     SavedConversation first = stored_record(161, 64);
     first.checkpoints.clear();   // protection here is the publication ticket, not a pinned checkpoint
     const SavedConversation later = turn_on(first, 96, 161);
@@ -756,8 +762,11 @@ void check_waiting_ownership_and_release() {
         check(!entry.image && entry.lease_bytes == 0, "waiting queue entries own neither image aliases nor leases");
     check_eq(sink.cache.size(), 2, "supersession does not remove an older pending owner");
     check_eq(sink.cache.superseded(), 0, "no protected predecessor is counted as superseded");
-    check_eq(sink.cache.leased_bytes(), 0, "queued metadata creates no second image reservation");
+    check_eq(sink.cache.leased_bytes(), fixed, "queued metadata adds nothing to the fixed reservation");
     const size_t envelope = sink.cache.envelope_bytes();
+    const size_t held = size_t(store.ram_held_bytes());
+    check_eq(store.ram_available_bytes(), sink.budget - envelope - held,
+             "store reads share the reduced envelope after fixed and parked ownership");
     bool retained_in_cache = false;
     SavedConversation borrowed = sink.cache.take(0, retained_in_cache);
     check(retained_in_cache && borrowed.publication_ticket == 0, "ordinary restore explicitly reports a borrowed pending alias");
@@ -783,7 +792,7 @@ void check_waiting_ownership_and_release() {
     publications.flush(store, sink.out, 0);
     check(sink.cache.has_publication(first_ticket) && !publications.queued().front().image,
           "shared-root allocation failure retains the protected parked owner");
-    check_eq(sink.cache.leased_bytes(), 0, "failed acquisition transfers no charge");
+    check_eq(sink.cache.leased_bytes(), fixed, "failed acquisition preserves only the fixed reservation");
     check_eq(publications.queued().front().attempts, 0, "allocation failure spends no store-refusal attempt");
     check_eq(publications.counters().refused, refused_before, "allocation retry is not a fabricated store refusal");
     sink.fail_acquire = false;
@@ -794,17 +803,50 @@ void check_waiting_ownership_and_release() {
     check(!sink.cache.has_publication(first_ticket) && sink.cache.has_publication(later_ticket),
           "acquisition consumes only the head's protected ticket");
     check_eq(sink.cache.envelope_bytes(), envelope, "parked-to-lease transfer leaves the complete envelope identical");
-    check_eq(sink.cache.leased_bytes(), publications.queued().front().lease_bytes, "the head owns the exact transferred lease");
+    check_eq(sink.cache.leased_bytes(), fixed + publications.queued().front().lease_bytes,
+             "the acquired head adds exactly its transferred image charge to the fixed reservation");
     check_eq(sink.acquisitions, 2, "one failed allocation and one head acquisition never acquire the waiter");
     publications.drop(0, "explicit acquired-head drop", sink.out);
-    check_eq(sink.cache.leased_bytes(), 0, "dropping an acquired head releases its lease exactly once");
+    check_eq(sink.cache.leased_bytes(), fixed, "dropping an acquired head preserves the fixed reservation");
     check_eq(sink.lease_releases, 1, "acquired-head drop uses the lease-release path");
     publications.abandon("execution state abandoned", sink.out);
     check(!sink.cache.has_publication(later_ticket), "abandon clears every still-parked publication protection");
     check_eq(sink.ticket_releases, 1, "a waiting drop releases protection instead of subtracting a lease");
     check(sink.cache.evict_oldest(), "an abandoned unpinned owner becomes ordinarily evictable");
 
-    check(capture_image(publications, sink, 0, 3, 0, true, first, store.epoch()), "an epoch-bound image is captured");
+    check(capture_image(publications, sink, 0, 3, 0, true, first, store.epoch()),
+          "a poison-clear retry head is captured");
+    check(capture_image(publications, sink, 0, 4, 0, true, later, store.epoch()),
+          "a protected waiter coexists with the retry head");
+    store.publish_read_allowance(1);
+    publications.flush(store, sink.out, 0);
+    check(publications.queued().size() == 2 && publications.queued().front().image &&
+              !publications.queued()[1].image,
+          "real admission pressure leaves an acquired retry head beside a waiting ticket");
+    if (publications.queued().size() != 2) return;
+    const size_t retry_charge = publications.queued().front().lease_bytes;
+    const size_t releases_before_clear = sink.lease_releases;
+    const size_t tickets_before_clear = sink.ticket_releases;
+    sink.cache.clear();
+    check_eq(sink.cache.leased_bytes(), fixed + retry_charge,
+             "poison clearing parked owners cannot refund the acquired retry image or fixed chain");
+    publications.abandon("poisoned execution state abandoned", sink.out);
+    check_eq(sink.cache.leased_bytes(), fixed,
+             "abandon refunds the acquired image but not the fixed chain after poison clear");
+    check_eq(sink.lease_releases, releases_before_clear + 1, "the acquired path refunds exactly one image");
+    check_eq(sink.ticket_releases, tickets_before_clear + 1, "the cleared waiter uses only ticket release");
+    publications.abandon("repeated poison abandonment", sink.out);
+    publications.reconcile(store, sink.out, 0);
+    check_eq(sink.cache.leased_bytes(), fixed, "repeated cleanup cannot refund the fixed chain");
+    check_eq(sink.lease_releases, releases_before_clear + 1, "repeated cleanup cannot refund the image twice");
+    check_eq(sink.ticket_releases, tickets_before_clear + 1, "repeated cleanup cannot release the waiter twice");
+    const size_t parking_room = sink.budget - fixed - size_t(store.ram_held_bytes());
+    check(sink.cache.can_fit(parking_room, size_t(store.ram_held_bytes())),
+          "the real parking budget admits exactly the remaining nonresident bytes");
+    check(!sink.cache.can_fit(parking_room + 1, size_t(store.ram_held_bytes())),
+          "parking cannot borrow a byte from the fixed resident chain");
+
+    check(capture_image(publications, sink, 0, 5, 0, true, first, store.epoch()), "an epoch-bound image is captured");
     const uint64_t epoch_ticket = publications.queued().front().image_ticket;
     const size_t acquisitions_before = sink.acquisitions;
     check(store.invalidate_domain("publication epoch regression"), "the real store advances its execution epoch");
@@ -812,13 +854,13 @@ void check_waiting_ownership_and_release() {
     check(publications.queued().empty() && !sink.cache.has_publication(epoch_ticket), "epoch drop releases parked protection");
     check_eq(sink.acquisitions, acquisitions_before, "a retired-epoch image is never acquired");
 
-    check(capture_image(publications, sink, 0, 4, 0, true, first, store.epoch()), "a missing-ticket case is captured");
+    check(capture_image(publications, sink, 0, 6, 0, true, first, store.epoch()), "a missing-ticket case is captured");
     sink.cache.clear();   // the safety invalidation seam is allowed to discard the protected physical owner
     publications.flush(store, sink.out, 0);
     check(publications.queued().empty(), "a missing protected owner is diagnosed and dropped");
     check(sink.reports.find("protected publication ticket has no image") != std::string::npos,
           "missing-ticket drop is visible rather than silently counted as publication");
-    check_eq(sink.cache.leased_bytes(), 0, "a missing ticket invents no lease");
+    check_eq(sink.cache.leased_bytes(), fixed, "a missing ticket invents no lease and preserves the fixed chain");
 }
 
 // Metadata exhaustion is an honest publication refusal, not lost RAM caching. No compatibility path may accept an
@@ -1137,6 +1179,137 @@ void check_shared_head_is_evictable() {
           "real head pressure evicts the shared head rather than pinning capacity forever");
 }
 
+// Ordinary head pressure can remove an owner's latest without a replacement result. The first later capture still
+// receives one accepted-then-stale verdict; that must not poison the queued capture or every future capture too.
+void check_evicted_latest_does_not_strand_publications() {
+    TempRoot root;
+    auto options = options_for(root.path);
+    options.head_limit = 2;
+    ConversationStore store(options);
+    if (!store.enabled()) return;
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    const uint64_t epoch = store.epoch();
+    SavedConversation initial = stored_record(231, 32);
+    initial.checkpoints.clear();
+    const SavedConversation record = turn_on(initial, 64, 231);
+    check(capture_image(publications, sink, 0, 1, 0, true, initial, epoch), "the owner's initial cut is captured");
+    settle(publications, store, sink);
+    const uint64_t first = publications.owner(0).lineage.head;
+    check(capture_image(publications, sink, 0, 2, first, true, record, epoch), "the owner's latest cut is captured");
+    settle(publications, store, sink);
+    const uint64_t evicted = publications.owner(0).lineage.head;
+    check(evicted != 0 && evicted != first && store.counters().pinned_heads == 0,
+          "a real completion adopts an unpinned latest while retaining the initial live-cut promise");
+    const auto publish_pressure = [&](const SavedConversation& image) {
+        const uint64_t ticket = ++sink.next_ticket;
+        auto entry = capture_of(UINT64_MAX, ticket, 0, false, image, epoch, ticket);
+        entry.shared_prefix = true;
+        SavedConversation captured = image;
+        check(publications.capture(sink.cache, std::move(captured), std::move(entry),
+                                   size_t(store.ram_held_bytes()), 0, sink.out).queued,
+              "an unpinned pressure cut is captured through the real queue");
+        sink.refresh_allowance();
+        settle(publications, store, sink);
+    };
+    SavedConversation older = stored_record(233, 64);
+    older.checkpoints.clear();
+    SavedConversation retained = stored_record(235, 64);
+    retained.checkpoints.clear();
+    publish_pressure(older);
+    publish_pressure(retained);
+    ConversationStoreManifestInfo info;
+    check(!store.manifest_info(evicted, info) && store.counters().evictions == 2,
+          "normal small-head-limit eviction removes the unpinned latest without a replacement result");
+    check(publications.owner(0).lineage.valid && publications.owner(0).lineage.head == evicted,
+          "the evicted latest initially remains in the owner's lineage");
+    auto demand = query_of(retained, 810, 1);
+    std::string why;
+    check(store.demand(demand, why), "a distinct retained head has a real demand lease during recovery");
+    ConversationStoreRead read;
+    check(store.wait_ready(810, 1, read, 5000) && read.status == ConversationStoreReadStatus::ready && read.image,
+          "the distinct head's object lease is handed out");
+    publications.owner(1).mount(read.head_id, epoch, retained.live.ids, int64_t(retained.live.ids.size()),
+                                retained.scope, retained.cvec);
+    const uint64_t other_head = publications.owner(1).lineage.head;
+    const uint64_t other_generation = publications.owner(1).generation;
+
+    const SavedConversation failed = turn_on(record, 96, 231);
+    const SavedConversation queued = turn_on(record, 128, 231);
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1, evicted, true, failed, epoch),
+          "the first post-eviction capture is queued with its dangling hint");
+    publications.flush(store, sink.out, 0);
+    check(publications.queued().empty() && publications.pending().size() == 1 &&
+              publications.pending().front().supersedes == evicted,
+          "the first post-eviction capture is accepted once, not refused eight times at admission");
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1, evicted, true, queued, epoch),
+          "a newer capture waits with the same dangling predecessor");
+    publications.reconcile(store, sink.out, 5000);
+    check_eq(publications.counters().refused, 1, "the accepted capture keeps its terminal stale refusal");
+    check_eq(store.counters().refusals_stale, 1, "the writer reports exactly one stale publication");
+    check(publications.pending().empty() && publications.queued().size() == 1 &&
+              publications.queued().front().attempts == 0,
+          "terminal staleness does not spend the queued capture's admission allowance");
+    check(!publications.owner(0).lineage.valid && publications.queued().front().supersedes_hint == 0,
+          "missing-predecessor recovery clears the dangling owner and queued hint");
+    check(publications.owner(1).lineage.valid && publications.owner(1).lineage.head == other_head &&
+              publications.owner(1).generation == other_generation && store.manifest_info(other_head, info),
+          "recovery leaves the distinct owner's retained predecessor and generation alone");
+    check(read.image && images_equal(*read.image, retained, why),
+          "recovery does not revoke or mutate an active read/object lease");
+    settle(publications, store, sink);
+    check_eq(publications.counters().refused, 1, "the queued capture does not repeat the persistence failure");
+    check(publications.owner(0).lineage.valid && publications.owner(0).lineage.head != evicted,
+          "the queued valid capture establishes its own fresh lineage after recovery");
+    read.image.reset();
+    store.release_read(810, 1);
+    const uint64_t recovered = publications.owner(0).lineage.head;
+    const SavedConversation future = turn_on(queued, 160, 231);
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1,
+                        publications.owner(0).lineage.head, true, future, epoch),
+          "another future capture uses only the recovered lineage");
+    settle(publications, store, sink);
+    check_eq(publications.counters().refused, 1, "future captures no longer repeat the missing-head stale failure");
+    check(publications.owner(0).lineage.head != recovered,
+          "a subsequent valid capture also publishes rather than remaining stranded");
+    store.close();
+    ConversationStore reopened(options);
+    check(reopened.enabled(), "the eviction-recovery catalog reopens");
+    if (reopened.enabled()) check_record_restores(reopened, future, 811);
+}
+
+// Stale is not synonymous with evicted: an older/equal publication generation must keep naming the still-retained
+// predecessor and must not silently become a fresh branch. Once numbering is valid, the original cover still works.
+void check_retained_stale_predecessor_is_not_rebranched() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    if (!store.enabled()) return;
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    const SavedConversation record = stored_record(237, 64);
+    const uint64_t head = mount_latest(store, publications, sink, record);
+    const SavedConversation continued = turn_on(record, 96, 237);
+    const uint64_t published = publications.counters().published;
+    sink.next_id = 0;   // two deliberately stale generations, both at or below the retained head's generation
+    for (int i = 0; i < 2; ++i) {
+        check(capture_image(publications, sink, 0, publications.owner(0).generation + 1,
+                            head, true, continued, store.epoch()), "an older-generation cover is captured");
+        settle(publications, store, sink);
+        ConversationStoreManifestInfo info;
+        check(store.manifest_info(head, info) && publications.owner(0).lineage.valid &&
+                  publications.owner(0).lineage.head == head,
+              "a retained stale predecessor is not cleared or rebranched");
+    }
+    check_eq(publications.counters().refused, 2, "both retained-predecessor stale refusals are preserved");
+    check_eq(publications.counters().published, published, "neither stale capture creates an unauthorized branch");
+    sink.next_id = store.publication_generation_floor();
+    check(capture_image(publications, sink, 0, publications.owner(0).generation + 1,
+                        head, true, continued, store.epoch()), "a correctly numbered cover is captured");
+    settle(publications, store, sink);
+    check_eq(publications.counters().published, published + 1, "a valid later capture still publishes");
+    check_eq(store.counters().heads, 1, "the valid cover replaces the retained predecessor, not a new branch");
+}
+
 // Keep a real production pending entry unreconciled while other callers finish more publications than the result
 // queue can hold. Backpressure must preserve that first completion, not quietly leave its owner pending forever.
 void check_unreaped_results_preserve_production_pending() {
@@ -1146,12 +1319,17 @@ void check_unreaped_results_preserve_production_pending() {
     options.head_limit = bound + 2;
     ConversationStore store(options);
     Sink sink(store);
+    const size_t fixed = size_t(16) << 20;
+    check(sink.cache.try_reserve_lease(fixed), "the completion fixture reserves its resident chain at startup");
+    sink.refresh_allowance();
     ConversationPublicationQueue publications;
     const SavedConversation record = stored_record(143, 32);
     check(capture_image(publications, sink, 0, 1, 0, true, record, store.epoch()),
           "a production capture is protected before the completion flood");
     publications.flush(store, sink.out, 0);
     check_eq(publications.pending().size(), 1, "the production capture owns a real pending publication");
+    check_eq(sink.cache.leased_bytes(), fixed, "accepted handoff refunds only the transferred publication image");
+    check_eq(sink.lease_releases, 1, "accepted handoff transfers the refundable image exactly once");
     const auto wait_idle = [&] {
         for (int waited = 0; waited < 5000 && store.writer_busy(); ++waited) ::usleep(1000);
         check(!store.writer_busy(), "the completion flood settles without reaping production's result");
@@ -1187,6 +1365,139 @@ void check_unreaped_results_preserve_production_pending() {
     check_eq(publications.counters().published, 1, "a second reconciliation cannot account the outcome twice");
     check_eq(sink.lease_releases, 1, "the production image charge transfers only once");
     check_eq(store.ram_lease_bytes(), 0, "completed flood publications retain no image lease");
+    check_eq(sink.cache.leased_bytes(), fixed, "terminal reconciliation cannot consume the fixed resident chain");
+    publications.abandon("completed queue abandoned", sink.out);
+    publications.reconcile(store, sink.out, 0);
+    check_eq(sink.cache.leased_bytes(), fixed, "cleanup after completion preserves the fixed resident chain");
+    check_eq(sink.lease_releases, 1, "cleanup after completion cannot refund the transferred image again");
+}
+
+void check_phase_producer_survives_owner_reuse() {
+    namespace phase = strata::program::phase;
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    std::vector<phase::PublicationEvent> events;
+    sink.out.phase_event = [&](const phase::PublicationEvent& event) { events.push_back(event); };
+    const auto producer = phase::parse_input("GEN 1 phase_request=producer phase_leg=1 "
+        "phase_incarnation=0123456789abcdef0123456789abcdef 1,2").identity;
+    const auto successor = phase::parse_input("GEN 1 phase_request=successor phase_leg=2 "
+        "phase_incarnation=0123456789abcdef0123456789abcdef 1,2").identity;
+    auto record = stored_record(191, 64);
+    auto captured = record;
+    auto entry = capture_of(0, 7, 0, true, record, store.epoch(), ++sink.next_ticket);
+    entry.phase.producer = producer;
+    check(publications.capture(sink.cache, std::move(captured), std::move(entry),
+          size_t(store.ram_held_bytes()), 0, sink.out).queued, "the phase fixture queues one real capture");
+    sink.refresh_allowance();
+    publications.flush(store, sink.out, 0);
+    check(!publications.pending().empty(), "the phase fixture retains the admitted result owner");
+    publications.owner(0).borrow(); // completion must not attach to this successor
+    publications.owner(0).phase_producer = successor;
+    settle(publications, store, sink);
+    check_eq(events.size(), 3, "capture, admission and terminal each have one phase observation");
+    uint64_t publication = 0;
+    for (const auto& event : events) {
+        check(std::strcmp(event.publication.producer.request, "producer") == 0 &&
+              event.publication.producer.leg == 1, "late publication keeps its producer, never the reused owner");
+        check_eq(event.publication.capture_ticket, 1, "every publication phase retains the exact capture ticket");
+        check_eq(event.publication.owner_generation, 7, "every publication phase retains the captured generation");
+        if (std::strcmp(event.event, "admitted") == 0) {
+            publication = event.publication.publication;
+            check(publication != 0 && event.publication.admitted_ns >= event.publication.captured_ns,
+                  "admission carries its own publication identity and chronological timestamps");
+        }
+        if (std::strcmp(event.event, "terminal") == 0)
+            check(publication != 0 && event.publication.publication == publication && event.head != 0 &&
+                  event.publication.applied_ns != 0 && event.publication.catalog_version != 0,
+                  "only real reconciliation supplies the matching terminal head and catalog visibility boundary");
+    }
+    check(!publications.owner(0).lineage.valid, "diagnostic correlation never bypasses the ownership generation guard");
+    check_eq(publications.reconcile(store, sink.out, 0), 0, "the phase observer did not consume or duplicate a result");
+
+    captured = record;
+    entry = capture_of(0, 8, 0, true, record, store.epoch(), ++sink.next_ticket);
+    entry.phase.producer = successor;
+    check(publications.capture(sink.cache, std::move(captured), std::move(entry),
+          size_t(store.ram_held_bytes()), 0, sink.out).queued, "a successor capture queues independently");
+    publications.drop(0, "cancelled before handover", sink.out);
+    check(std::strcmp(events.back().event, "terminal") == 0 &&
+          std::strcmp(events.back().status, "dropped") == 0 &&
+          std::strcmp(events.back().publication.producer.request, "successor") == 0,
+          "cancel/drop emits one terminal for the capture it actually released");
+    // A failed diagnostic destination must not change persistence or ownership.
+    sink.out.phase_event = [](const phase::PublicationEvent&) { throw std::bad_alloc(); };
+    const auto independent = stored_record(193, 64);
+    check(capture_image(publications, sink, 0, 9, 0, true, independent, store.epoch()),
+          "an observer failure cannot refuse a real capture");
+    settle(publications, store, sink);
+    check(!publications.holds_work(), "observer failure cannot strand publication ownership");
+    check_eq(publications.counters().published, 2, "observer failure does not change successful publication results");
+}
+
+// The production queue/store, not synthetic publication outcomes: sixteen
+// protected captures each spend eight real synchronous refusals before drop.
+void check_phase_terminals_survive_trace_saturation() {
+    namespace phase = strata::program::phase;
+    static_assert(phase::Receipts::max_publication_terminals >=
+                  ConversationPublicationQueue::kMaxQueued + ConversationPublicationQueue::kMaxPending);
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    auto receipts = std::make_unique<phase::Receipts>(&phase_report);
+    phase_lines.clear();
+    const auto executor = phase::parse_input("GEN 1 phase_request=executor phase_leg=2 "
+        "phase_incarnation=0123456789abcdef0123456789abcdef 1,2").identity;
+    sink.out.phase_event = [&](const phase::PublicationEvent& event) { receipts->publication(event, executor); };
+    const auto drain_terminals = [&] {
+        if (receipts->terminal_size()) receipts->drain(); // same post-operation seam as the engine
+    };
+    for (size_t i = 0; i < ConversationPublicationQueue::kMaxQueued; ++i) {
+        auto image = stored_record(191 + i * 2, 64);
+        auto entry = capture_of(i, 100 + i, 0, true, image, store.epoch(), ++sink.next_ticket);
+        entry.phase.producer = phase::parse_input("GEN 1 phase_request=publisher-" + std::to_string(i) +
+            " phase_leg=1 phase_incarnation=0123456789abcdef0123456789abcdef 1,2").identity;
+        check(publications.capture(sink.cache, std::move(image), std::move(entry),
+              size_t(store.ram_held_bytes()), 0, sink.out).queued, "saturation fixture queues a real protected capture");
+        drain_terminals();
+    }
+    for (size_t i = 0; i < phase::Receipts::max_trace; ++i) receipts->trace("expendable trace\n");
+    store.publish_read_allowance(1); // deterministic genuine admission refusal, never a fake result
+    for (size_t i = 0; i <= ConversationPublicationQueue::kMaxQueued * ConversationPublicationQueue::kMaxAttempts &&
+                       publications.holds_work(); ++i) {
+        const size_t before = phase_lines.size();
+        publications.flush(store, sink.out, 0);
+        check_eq(phase_lines.size(), before, "the publication observer never performs receipt I/O");
+        drain_terminals();
+    }
+    check(!publications.holds_work(), "all permanently refused captures reach actual terminal drop");
+    check_eq(publications.counters().refused,
+             ConversationPublicationQueue::kMaxQueued * ConversationPublicationQueue::kMaxAttempts,
+             "all eight attempts of each real capture were refused");
+    check_eq(publications.counters().dropped, ConversationPublicationQueue::kMaxQueued,
+             "every protected capture retires exactly once");
+    check(receipts->dropped() > 0, "the expendable trace really saturated");
+    check_eq(receipts->terminal_overflow(), 0, "the per-operation terminal bound was sufficient");
+    for (size_t i = 0; i < ConversationPublicationQueue::kMaxQueued; ++i) {
+        const std::string producer = "kind=publication request=publisher-" + std::to_string(i) + " leg=1 ";
+        size_t terminals = 0;
+        for (const auto& line : phase_lines) {
+            if (line.find(producer) == std::string::npos ||
+                line.find("event=terminal status=dropped ") == std::string::npos) continue;
+            ++terminals;
+            check(line.find("capture_ticket=" + std::to_string(i + 1) + " ") != std::string::npos &&
+                  line.find("publication=na") == std::string::npos,
+                  "saturated terminal retains its exact capture and real publication identity");
+            check(line.find("owner=" + std::to_string(i) + " owner_generation=" + std::to_string(100 + i) + " ") !=
+                  std::string::npos, "saturated terminal retains its captured owner generation");
+            check(line.find("head=na attempts=8 ") != std::string::npos &&
+                  line.find("executor_request=executor executor_leg=2 ") != std::string::npos,
+                  "saturated terminal reports the actual exhausted verdict and current executor");
+        }
+        check_eq(terminals, 1, "trace saturation loses or duplicates no publication terminal");
+    }
 }
 
 } // namespace
@@ -1215,7 +1526,11 @@ int main() {
     check_private_resume_never_publishes_unrecomputed_shared_rows();
     check_shared_borrow_and_owner_neutral_publication();
     check_shared_head_is_evictable();
+    check_evicted_latest_does_not_strand_publications();
+    check_retained_stale_predecessor_is_not_rebranched();
     check_unreaped_results_preserve_production_pending();
+    check_phase_producer_survives_owner_reuse();
+    check_phase_terminals_survive_trace_saturation();
     std::fprintf(stderr, "conversation_publication_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

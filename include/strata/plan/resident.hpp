@@ -80,9 +80,10 @@ struct ResidentHostBytes {
     uint64_t histories = 0, checkpoints = 0, transfer_transient = 0;
 };
 inline bool resident_host_bytes(uint64_t cells, const ResidentCheckpointPayload& checkpoint,
-                                 uint64_t main_image, uint64_t draft_image, ResidentHostBytes& out) {
+                                 uint64_t main_image, uint64_t draft_image, uint64_t chain_limit,
+                                 ResidentHostBytes& out) {
     out = {};
-    if (!cells || cells > INT32_MAX || !checkpoint.stages || !checkpoint.bytes ||
+    if (!chain_limit || chain_limit > INT32_MAX || !cells || cells > INT32_MAX || !checkpoint.stages || !checkpoint.bytes ||
         !checkpoint.stage_peak || checkpoint.stage_peak > checkpoint.bytes) return false;
     LogicalBytes count;
     const auto margin = [](uint64_t n) {
@@ -92,12 +93,22 @@ inline bool resident_host_bytes(uint64_t cells, const ResidentCheckpointPayload&
     // The third old "history" was the checkpoint ID vector: charge it in each
     // stage's checkpoint instead. ResidentSlot itself retains only ids/prompt.
     b.histories = count.product({cells, 2, sizeof(int32_t)});
-    b.checkpoints = count.sum({checkpoint.bytes, margin(count.sum({checkpoint.bytes, b.histories})),
-                               count.product({checkpoint.stages, kResidentCheckpointMetadataBytes})});
+    b.checkpoints = count.product({chain_limit, count.sum({
+        checkpoint.bytes, margin(count.sum({checkpoint.bytes, b.histories})),
+        count.product({checkpoint.stages, kResidentCheckpointMetadataBytes})})});
     // copy_to: one stage checkpoint + one main layer image; draft.save_slot
     // starts only after copy_to returns. Neither seats nor stages multiply it.
+    // Strict resident direct copies supply zero image bytes, not zero demand:
+    // retain the checkpoint peak, percentage margin and metadata envelope.
     const uint64_t transfer = std::max(count.sum({checkpoint.stage_peak, main_image}), draft_image);
-    b.transfer_transient = count.sum({transfer, margin(transfer), kResidentCheckpointMetadataBytes});
+    // The old target remains alive while aliases are prepared. Payload sealing
+    // moves/shares storage; only IDs, stage objects and shared controls are new.
+    // Flat stage topology is validated before bind allocates any aliases.
+    const uint64_t alias = count.product({chain_limit, checkpoint.stages,
+        count.sum({count.product({cells, sizeof(int32_t)}), kResidentCheckpointMetadataBytes})});
+    b.transfer_transient = std::max(
+        count.sum({transfer, margin(transfer), kResidentCheckpointMetadataBytes}),
+        count.sum({alias, margin(alias)}));
     if (!count.valid) return false;
     out = b;
     return true;
@@ -138,7 +149,7 @@ inline const char* resident_role_unpriced(const strata::kernels::QsaShapes& s, i
 // slots is the REQUESTED --batch count, additional to the main working session.
 // Never replace it with a count trimmed by a later runtime fallback. Calls are serial;
 // weights, verifier/MTP scratch and opaque graph allowance are shared, not multiplied.
-// One state-only checkpoint (with stage-local IDs/PLE) and two seat histories.
+// A bounded selected checkpoint chain (with stage-local IDs/PLE) and two seat histories.
 // The supplied host bound is derived from the actual checkpoint/image definitions.
 inline bool resident_bytes(uint64_t slots, uint64_t cells, uint64_t nq, uint64_t tail_floats,
                            const ResidentPayload& working_main, const ResidentPayload& slot_main, uint64_t init_transient,

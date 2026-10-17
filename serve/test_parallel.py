@@ -448,6 +448,53 @@ class AdaptiveSpeculation(unittest.TestCase):
 
 
 class ControlBudget(unittest.TestCase):
+    def test_control_wait_partition_obeys_gate_precedence_without_holding_condition(self):
+        engine = StrataEngine("missing-executable", [], lazy=True)
+        stage, clock = [0], [100.0]
+        class ScriptedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                clock[0] += 1
+                stage[0] += 1
+                if stage[0] == 3:
+                    engine.ctl.release()
+        engine.slot_cv = ScriptedCondition()
+        engine.ctl.acquire()
+        engine.foreground_budget_s, engine.background_share = 1, .25
+        engine.alive = lambda: True
+        svc = Service(engine, ByteTokenizer(), None)
+        def observe(phase):
+            if phase == "control_selector_wait":
+                inspected = threading.Event()
+                def inspect_waiters():
+                    with engine.slot_cv:
+                        inspected.set()
+                probe = threading.Thread(target=inspect_waiters, daemon=True)
+                probe.start()
+                self.assertTrue(inspected.wait(1), "phase accounting must not hold the engine condition")
+                probe.join(1)
+            svc.frontend_phase(record, phase)
+        try:
+            with mock.patch("serve.server.time.perf_counter", side_effect=lambda: clock[0]):
+                record = svc.register_lifecycle({}, threading.Event())
+                svc.acquire_request(record)
+                turn = engine._take_control(threading.Event(), 10, priority="background",
+                                            background_due=time.monotonic() + 100,
+                                            foreground_pending=lambda: stage[0] == 0,
+                                            slot_ready=lambda: stage[0] >= 2, on_phase=observe)
+                with self.assertRaises(StopIteration) as finished:
+                    next(turn)
+                self.assertTrue(finished.exception.value)
+                svc.finish_lifecycle(record)
+            seconds = record["frontend"]["seconds"]
+            self.assertEqual(seconds["control_selector_wait"], 1)
+            self.assertEqual(seconds["physical_slot_wait"], 1)
+            self.assertEqual(seconds["control_occupied_wait"], 1)
+            self.assertEqual(sum(seconds.values()), record["completion_s"])
+            self.assertEqual(engine.waiting, 0)
+            self.assertEqual(list(engine.control_waiters), [])
+        finally:
+            engine.ctl.release()
+
     def test_arrival_trace_bounds_background_wait_without_reordering_foreground(self):
         import collections
         engine = object.__new__(StrataEngine)
@@ -554,13 +601,14 @@ class ControlBudget(unittest.TestCase):
     def test_http_foreground_waiter_is_visible_but_cannot_starve_due_background(self):
         import collections
         service = object.__new__(Service)
-        foreground = {"priority": "foreground"}
+        foreground = {"priority": "foreground", "state": "queued"}
         service.admission_waiters = [foreground]
         service.admission_active = {}
         service._refresh_foreground_pending()
         self.assertTrue(service._foreground_pending)
         service.admission_waiters.remove(foreground)
         service.admission_active["foreground"] = foreground
+        foreground["state"] = "admitted"
         service._refresh_foreground_pending()
         self.assertTrue(service._foreground_pending, "admitted but unsubmitted requests are still waiting")
         foreground["_executing"] = True
@@ -611,6 +659,8 @@ class PickSlot(unittest.TestCase):
         e.slot_groups = 1
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
+        e.slot_claims = set()
+        e.slot_releasing = set()
         e.slot_group = [0] * n
         return e
 
@@ -654,6 +704,17 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(e.pick_slot(prompt, "a"), 2)
         self.assertEqual(e.pick_slot(prompt, "other"), 1)
         self.assertEqual(e.pick_slot(prompt, ""), 1)
+
+    def test_slot_states_never_describe_a_reserved_or_releasing_slot_as_idle(self):
+        e = self.engine(6)
+        e.slot_busy = [False, True, True, True, True, True]
+        e.slot_claims.update((1, 2, 3, 4, 5))
+        e.slot_releasing.add(5)
+        for b, state in ((2, "parked"), (3, "reading"), (4, "decoding"), (5, "decoding")):
+            e.slot_live[b] = {"state": state, "prompt_tokens": 9, "generated": 1,
+                              "started": time.time(), "first_token": None}
+        self.assertEqual([r["state"] for r in e.slots_view()],
+                         ["idle", "reserved", "parked", "reading", "decoding", "releasing"])
 
     def test_slots_view(self):
         e = self.engine(2)

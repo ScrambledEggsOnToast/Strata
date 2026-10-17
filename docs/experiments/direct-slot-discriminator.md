@@ -1,20 +1,21 @@
 # Resident handoff: direct-copy candidate
 
-Source base: `498d28b7b9ea2bfd27afd0e24b4eb718f5291353`. The coordinator's
-full-model observer run at
-`/home/joshkirklin/.local/state/strata-host/gen-copy-observer-on-e1/engine.log`
-reported **783273504 successful transfer bytes and no copy failures** across its
-exercised admission/resume operations. That is supplied baseline evidence, not a
-measurement of this candidate. This checkout was **not built or run**; no tests,
-formatters, downloads, GPU commands or services were executed. Startup failures
-from earlier worker-start attempts are unchanged.
+The original source-only candidate used base
+`498d28b7b9ea2bfd27afd0e24b4eb718f5291353`. Its supplied observer baseline
+reported 783273504 successful transfer bytes without copy failures; that was
+not a measurement of this candidate. The 2026-10-17 selected-cut verification
+below now exercises the corrected legacy and direct paths on real three-GPU
+owners. It establishes bounded movement/lifecycle correctness, not a speedup
+or daily/default promotion.
 
 ## One switch and bounded scope
 
 Set **`STRATA_RESIDENT_DIRECT_COPY=1`** in the isolated engine profile. Only the
 exact value `1` enables the native CUDA/HIP path; unset, `0`, or any other value
-uses the existing snapshot path. SYCL explicitly refuses `1` at startup. Keep
-all existing capacity, arithmetic, residency and scheduling flags unchanged.
+uses the existing snapshot path. Selection is frozen once before native memory
+admission and shared by every later main/MTP handoff, even if the environment is
+subsequently changed. SYCL explicitly refuses `1` at startup. Keep all existing
+capacity, arithmetic, residency and scheduling flags unchanged.
 
 This is a copy optimization, **not zero-copy binding or direct-to-slot prefill**.
 The working prefill/first-token verifier and resident slot graphs keep their
@@ -38,14 +39,60 @@ invalidation remain with `ResidentSlots` and `MtpDrafter::Operation`. A failed
 main admission invalidates its destination; a failed resume also poisons working
 reuse. Failed draft operations retain their existing poisoned scratch ownership.
 Map/ring repair in the new helper is synchronized before publication, including
-MTP's nonblocking consumer stream. A selected checkpoint resumes KV first, then
-its saved GDN/PLE/index tail and spare-row repair: copying the longer-lived slot's
-pooled rows last would overwrite the selected cut's repaired row. The off path's
-existing sequence is unchanged; this cut difference needs explicit validation.
+MTP's nonblocking consumer stream. Both copy paths resume a selected checkpoint's
+KV first, then its saved GDN/PLE/index tail and spare-row repair: copying the
+longer-lived slot's pooled rows last would overwrite the selected cut's repaired
+row. The legacy live-resume order and all existing fences are unchanged.
 
 `resume_work` prices one transfer leg for direct state, two for the old bounce,
 and retains the host checkpoint restore and spare-row charge. Its direct route
 has a separate cost identity; no scheduling policy is changed.
+
+## Selected-cut resident regression and verification
+
+`resident_host_model_checks` now parks a real retained owner beyond the selected
+index block, then resumes that owner's saved checkpoint through
+`ResidentSlots::resume` / `copy_from`. It covers an aligned cut at `idx_block`
+and a partial-block cut at `idx_block + 1`, with the retained prefix at
+`2 * idx_block + 1`. Every owned QSA layer on all three stages has an explicitly
+different completed pooled key and selected checkpoint `dead` key; the fixture
+reads both on their owning devices and requires the selected key after resume.
+Full main/draft snapshots, the unchanged retained source, identity/seed, peer
+payload/identity, invalid-cut refusal before writes, and stationary addresses
+remain checked. The existing terminal partial-copy poison checks still run.
+This is synthetic lifecycle state on the real allocated owners, not an inference
+arithmetic, throughput, or backend-qualification claim.
+
+On 2026-10-17, the test-only discriminator on
+`fcd3b1034e4d1da759f462eed0a65d61d9f28110` failed the legacy selected pooled-key
+assertion: 258 checks, one failure. The corrected fixture subsequently passed
+**572 checks in each of the legacy and direct arms**, with cuts 4 and 5,
+advanced prefix 9, three stages and four seats. Each arm emitted both
+`RESIDENT_CUT_REPAIR ... failures=0` records and completed owned process/MPS
+cleanup without errors. The unfixed direct path was not run in this comparison.
+
+Retained captures are under
+`/home/joshkirklin/strata-workspace/scratch/bottleneck-trials-20261017/`:
+
+- `resident-cut-red-r2-run/result.json`: original failing legacy discriminator.
+- `resident-cut-green-r3-legacy-run/result.json`: corrected legacy path.
+- `resident-cut-green-r3-direct-run/result.json`: corrected direct path.
+
+The corrected fixture binary's SHA256 is
+`04b4e3513de384b4354cf9842bbfaaf592a481e9975feaa10ec11bdc6a91a6c7`;
+it contains 59 SM70 and 59 SM86 images. These synthetic-state checks do not
+qualify inference arithmetic or turn fixture wall time into performance evidence.
+
+For further movement checks, use the existing finite host fixture and shared
+machine window with `STRATA_RESIDENT_DIRECT_COPY=0` or `1`; keep
+`STRATA_TEST_PREFILL_SPLIT_OWNER` unset because it selects a different terminal
+fixture. The current experiment contract in the project record,
+`evidence/concurrency-campaign-20261016/bottleneck-trials-20261017.json`,
+supersedes the earlier source-only instructions below: paired diagnostic
+screens hold observer settings fixed, and promising candidates require a
+reverse-order or held-out confirmation. Observer-off usefulness remains
+necessary before promotion.
+
 
 ## Source-based memory price
 
@@ -71,9 +118,185 @@ pool arrays and one five-`size_t` array. These named objects total at most **360
 bytes on the 64-bit target**, conservatively counting validation and transfer
 locals together; scalar locals and compiler call frames are additional, not a
 measured RSS claim. There is no context-sized stack buffer. No capacity cap or
-8 GiB physical reserve may be reduced to admit this experiment. Parent must
+12 GiB physical reserve may be reduced to admit this experiment. Parent must
 retain ordinary monitor checks; bounded metadata overhead is within the approved
 proportional acceptance scope, not grounds for daily/default promotion.
+
+### Mode-specific host transient accounting (source only)
+
+**Safety hold:** independent source review found a pre-existing retained-chain
+undercharge; no OOM was observed. The source correction now prices each seat for
+`L = max(prompt_cache, 1)` complete checkpoint owners independently of working/cache
+aliases. Bind rejects a selected root/latest/all-pins chain above L before freezing,
+allocating aliases or changing the old target; it never drops a pin to fit.
+Flat stage topology, matching token IDs and stage payload shapes are validated first.
+The boundary additionally checks actual retained storage before freezing: the five
+nonempty array capacities, copied logical IDs, stage objects and future shared
+controls must fit the per-checkpoint allowance computed by native admission.
+That same precomputed allowance is passed to the owner; it is not repriced or
+guessed at bind time. Capacity padding within the existing allowance is valid.
+Caller-only ID/image/stage-directory reserve and empty mutable-array reserve are
+not retained by the alias and are not a reason to reject an otherwise valid cut.
+Shape alone cannot bound storage, but neither does storage require `capacity==size`.
+Arrays above the actual admitted allowance refuse without spending opaque bytes.
+For C checkpoint payload bytes, H seat-history bytes and S stages, the per-seat
+checkpoint charge is `L * (C + ceil((C + H)/8) + S*4096)`.
+Bind adds a serial alias peak A of `L*S*(4*cells + 4096)`, plus `ceil(A/8)`:
+IDs and stage objects are newly allocated while the old target still exists;
+the five sealed payload controls move/share payload storage rather than copying it.
+Transfer and alias construction do not overlap, so admission uses their maximum,
+not their sum. Histories remain `8*cells` per seat. Legacy image pricing and all
+retention/settings stay unchanged. Offline planning stays in legacy-copy mode.
+After swapping the prepared chain into the seat, bind clears old elements **and
+destroys their top-level directory allocation** with an empty-vector swap before
+`copy_to`. Thus no residual old directory is hidden in the serial transfer maximum.
+During alias construction, old owners are covered by their persistent seat charge;
+new ID vectors, flat stage objects and five shared controls per stage are covered
+by A and the compile-time metadata assertion in `core/resident_memory.hpp`.
+Eligible pins are counted in discovery, then distinct unpinned root/latest are
+added; there is no third eligibility/prefix scan.
+The CPU arithmetic and real-owner multi-pin/refusal regressions are source-only:
+they have not been built or executed for this correction. Reduced-envelope model
+runs remain unqualified pending parent review and those checks.
+
+The full `resident_checkpoints` charge is now owned inside the existing
+conversation envelope when prompt caching, a positive conversation budget and
+positive parking slots are configured. Native admission saves the exact total and refuses, before
+model allocation, if the envelope cannot contain it. `conversation_parked`
+charges only the checked remainder; resident checkpoint bytes remain charged
+in full. The cache is constructed before `ResidentSlots` (including the model
+fixture return) and holds one non-evictable startup lease until teardown.
+Publication refunds and poison clears do not refund that fixed ownership.
+Disabled prompt caching, zero parking slots or a zero conversation budget keeps
+checkpoint bytes external with no fixed lease.
+
+For Fixed3GPU, 24 admitted elements at 137463862 B consume **3299132688 B**
+of the unchanged **12884901888 B** conversation envelope, leaving
+**9585769200 B** for parking, reads and other cache/store ownership. This is
+reduced RAM parking/read headroom, not a quota increase, a freed allocation,
+or a reduction in physical reserve, worker ceiling, context, prefill, slots
+or groups. The standalone cache regression exercises real publication
+handoff/refund, reservation eviction/refusal and poison-style clearing with
+fixed ownership present; execution remains the parent's responsibility.
+
+Source-only regression contracts: `tests/core/resident_model_test.cpp` constructs
+separately unpinned root/latest and multiple pins with distinct ordered `used`
+identities and stage-specific synthetic bytes using `CheckpointBytes::assign`.
+Expected membership, pin flags, sizes and marker oracle exist before bind. Every
+cut is freshly saved; the peer is independently saved, not a payload alias.
+After input release, the real seat is checked against that oracle. The existing
+ordinary-C++ allocation observer wraps cap-sized bind while the old target is
+nonempty, and wraps unsealed over-cap, nested-stage, bad-shape and excess-capacity
+refusals. Error capacity is reserved before observation, so refusal must allocate
+zero observed bytes and leave all source payloads unsealed. Same-object metadata
+representations, target/peer device snapshots, and retained contents must remain
+unchanged. Completion resumes and admits the parked seat before cancellation/
+finish; production lifecycle gates are unchanged. CPU arithmetic adds explicit
+nonintegral ceiling and below/equal/above serial-max crossover constants in
+`src/core/conversation_validation_test.cpp::resident_transfer_envelopes`.
+
+Complete constructor inventory (source search of include/src/tests and SYCL,
+after LSP references returned only the declaration): declaration/definition in
+`program/resident_slots.hpp` / `src/program/resident_slots.cpp`; production
+construction in `src/program/generate.cpp` supplies `max(o.prompt_cache,1)` and
+the same precomputed per-checkpoint byte bound; `tests/core/resident_slots_test.cpp`
+derives an explicit bound from the native pricing helper and supplies count six.
+The model fixture borrows an existing owner, never constructs a second engine. No other constructor
+caller occurs in those trees. Top-level `CMakeLists.txt` builds the same native
+resident library for CUDA/HIP and links the generator and CPU preflight; the
+allocation-observer vehicle is Unix/non-Apple and excluded for HIP. SYCL's
+`strata_resolve` prefers migrated local sources and resolves its own generator;
+no SYCL-local ResidentSlots constructor occurs. This is caller/source inventory,
+not a claim that SYCL has native resident feature parity.
+
+Parent verification only: build `conversation_validation_test`,
+`resident_slots_test` and `strata-resident-test` in the approved configured build;
+run CPU `conversation_validation_test` and CTest `resident_slots_preflight`.
+The protected three-stage/four-seat resident-host fixture remains safety-held
+until independent source review; do not run it as an ordinary CTest/model command.
+
+
+The native preallocation adapter remains pure: its caller supplies the same
+process-immutable selection later read by `ResidentSlots` and `MtpDrafter`.
+Existing role-placement resolution/validation is unchanged. Both price modes
+still validate main/draft image formats, geometry and checked byte arithmetic;
+unknown placements, elastic growth and invalid geometry still refuse. Unknown
+environment values select the unchanged conservative legacy path, not direct.
+
+Allocation/lifetime audit:
+
+- Legacy `copy_to` holds one fresh stage checkpoint while capturing/restoring
+  one `ConversationKv` at a time. The checkpoint dies at the stage boundary;
+  each image dies at the layer boundary. Main stages are serial. Draft save
+  begins only after all main stages return, so the old bound remains
+  `max(stage_checkpoint_peak + main_image, draft_image)`.
+- Direct `copy_to` and live `copy_from` call `conversation_session_copy` without
+  constructing either temporary owner. The session helper validates every
+  source/target layer before writes and copies into the existing pools.
+  Direct selected-cut restore copies KV first, then reads the retained host
+  checkpoint and repairs the spare pooled row. These are borrowed payloads,
+  not a new KV image; the retained-chain accounting correction above is separate.
+- Both MTP slot directions call `conversation_kv_copy` in direct mode, never
+  `conversation_kv_save`. Native resident KV, authoritative streamed host KV,
+  hybrid K8V4, scales and draft rings use the same validated layout/pool helpers.
+  `copy_payload` uses fixed metadata and bounded transfer chunks, not chunk
+  allocations. Stream reset launches a kernel into existing map storage.
+  Ring repair copies existing authoritative host runs into existing device
+  slots and synchronizes; it allocates neither a host image nor a new ring.
+- Format/extent/carve/device incompatibility returns false before copying.
+  Transfer and ring-copy failures retain their existing failure handling;
+  a streaming-reset launch error can terminate the native process. Neither
+  outcome falls back to allocating snapshot code.
+  The per-thread/device stream directory remains reused process-lifetime
+  metadata. Runtime/driver internal staging is not proved absent and keeps its
+  separate opaque allowance. True host-cache/store captures/restores remain
+  image-backed and retain their independently admitted cache envelopes.
+
+Only direct native resident transfer pricing passes zero serial image bytes to
+the existing host-bound arithmetic. It **does not price zero transient**: it
+retains `stage_checkpoint_peak + ceil(stage_checkpoint_peak / 8) + 4096`.
+For the existing 262144-cell, split `20,39`, K8V4/MTP arithmetic reference, the
+checkpoint peak is 50456596 B and the direct envelope is **56767767 B**, versus
+the unchanged **335165271 B** legacy envelope (278397504 B less). These are
+allocation-derived bounds, not an empirical RSS saving or a reason to fit
+thresholds after refusal. Histories/checkpoints, startup scratch, physical
+reserve, cgroup ceiling, cache budget, slots and model are unchanged. The
+offline planner intentionally remains conservative at the legacy bound.
+
+The existing host-only validation/transfer fixture now checks supported and
+unknown main/draft formats, invalid context/splits/placements, overflow, retained
+checkpoint/repair demand, and frozen selection across environment mutation.
+Run it in separate processes with direct selection unset, `0`, `1`, and an
+unknown value. Existing late-layer/failure/ring tests cover the strict no-fallback
+consumer boundary rather than interpreting missing DMA counters as allocation
+proof.
+
+The three-stage/four-seat `strata-resident-test` vehicle now also wraps ordinary
+C++ `new`/sized and unsized `delete` in its statically linked engine. A fixed
+thread-local directory measures simultaneous newly allocated vector payload
+bytes only while actual owner fresh, live, aligned/partial selected-cut,
+invalid-cut, and terminal main/draft refusal operations run. It requires each
+peak to fit the actual configuration's priced transient and prints
+`RESIDENT_HOST_SCRATCH operation=... peak_cpp_bytes=... bound=... failures=0`.
+Successful owner operations exercise main and draft transfers; invalid-cut or
+main-refusal operations can stop before draft execution. The scope label is not
+an execution attestation. The measure includes newly allocated metadata, but
+excludes pre-existing owners, diagnostic snapshots, allocator bookkeeping and
+driver-internal C allocations.
+It is not total heap/RSS or GPU-compute telemetry. Directory exhaustion fails
+the fixture, never silently undercounts. The observer is linked only into the
+fixture; its directory scans add test-only overhead, so its timings must not be
+used as performance evidence.
+
+No new checks, builds or GPU/model runs have been executed for this accounting
+change. Before using the reduced bound, the coordinator must run the minimal
+protected real-owner vehicle in both modes, including the separate terminal
+draft-refusal arm, and retain these scratch records alongside existing payload,
+selected-row repair and cleanup checks. All earlier refused full-model runs
+remain negative evidence. Neither this bound nor previous copy qualification
+establishes full-model admission success, arithmetic quality, daily performance
+or new HIP/SYCL qualification.
+
 
 ## Accounting and smallest acceptance checks
 
@@ -134,7 +357,7 @@ two groups, 2048 prefill, 24576 experts and model. Parent pins each candidate
 binary/hash/profile and plan before running its approved `window.py` invocation.
 These cases alone do not establish cached/cut restore exposure: the existing
 retained-history fixture must emit actual live/cut resume and draft scopes, or
-those surfaces remain unexercised. Keep 8 GiB reserve and thermal/resource stops.
+those surfaces remain unexercised. Keep the current 12 GiB reserve and thermal/resource stops.
 
 Remaining assertions are compilation, real-device fixture success, actual
 copy-direction/count reductions, lifecycle/state equivalence and measured

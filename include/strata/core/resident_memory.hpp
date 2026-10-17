@@ -11,7 +11,8 @@ static_assert(sizeof(SessionOwner) <= strata::plan::kResidentOwnerBytes,
               "increase resident owner ABI envelope in native and Python planner");
 static_assert(sizeof(QsaState) <= strata::plan::kResidentQsaBytes,
               "increase resident QSA ABI envelope in native and Python planner");
-static_assert(sizeof(ConversationCheckpoint) <= strata::plan::kResidentCheckpointMetadataBytes &&
+static_assert(sizeof(ConversationCheckpoint) + 5 * CheckpointBytes::owner_bytes <=
+                  strata::plan::kResidentCheckpointMetadataBytes &&
               sizeof(ConversationKv) <= strata::plan::kResidentCheckpointMetadataBytes,
               "increase checkpoint/image metadata envelope in native and Python planner");
 
@@ -59,7 +60,7 @@ inline bool conversation_checkpoint_payload(const ModelGeometry& g, int64_t cell
 inline bool resident_host_payload(const ModelGeometry& g, int64_t cells, bool mtp,
                                    const strata::plan::QsaRolePlacements& roles,
                                    uint64_t stages, const int64_t* split_at,
-                                   strata::plan::ResidentHostBytes& out) {
+                                   bool direct_copy, uint64_t chain_limit, strata::plan::ResidentHostBytes& out) {
     out = {};
     strata::plan::ResidentCheckpointPayload checkpoint;
     if (!conversation_checkpoint_payload(g, cells, stages, split_at, checkpoint)) return false;
@@ -70,7 +71,13 @@ inline bool resident_host_payload(const ModelGeometry& g, int64_t cells, bool mt
     strata::plan::QsaImageBytes main, draft;
     if (g.n_qsa_layers() && !strata::plan::qsa_image_bytes(shape, cells, roles.working_main.format, true, main)) return false;
     if (mtp && !strata::plan::qsa_image_bytes(shape, cells, roles.working_draft.format, false, draft)) return false;
-    return strata::plan::resident_host_bytes(cells, checkpoint, main.bytes, draft.bytes, out);
+    // Validate image geometry/formats in both modes. The strict direct path
+    // copies into the existing authoritative pools and never constructs a
+    // ConversationKv; failed validation/copies return false, never fall back.
+    // Keep one stage checkpoint plus its margin for selected-cut state/repair
+    // and checkpoint metadata work, even though live direct copies need none.
+    return strata::plan::resident_host_bytes(cells, checkpoint,
+        direct_copy ? 0 : main.bytes, direct_copy ? 0 : draft.bytes, chain_limit, out);
 }
 // Use the drafter's whole format without temporarily mutating process dispatch.
 inline strata::plan::ResidentPayload resident_draft_payload(const ModelGeometry& g, int64_t cells,
@@ -85,8 +92,8 @@ inline strata::plan::ResidentPayload resident_draft_payload(const ModelGeometry&
 // pools and authoritative streamed backing. Unknown demand still fails closed.
 inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int64_t k,
                                       int requested_slots, bool mtp,
-                                      const strata::plan::QsaRolePlacements& placements,
-                                      strata::plan::ResidentBytes& out, const char*& unpriced_class,
+                                      const strata::plan::QsaRolePlacements& placements, bool direct_copy,
+                                      uint64_t chain_limit, strata::plan::ResidentBytes& out, const char*& unpriced_class,
                                       uint64_t stage_count = 1, const int64_t* split_at = nullptr,
                                       int64_t layer_lo = 0, int64_t layer_hi = -1) {
     out = {};
@@ -108,7 +115,8 @@ inline bool resident_allocation_bytes(const ModelGeometry& g, int64_t cells, int
                                 : strata::plan::ResidentPayload{};
     strata::plan::ResidentHostBytes host;
     unpriced_class = "resident_checkpoints";
-    if (requested_slots && !resident_host_payload(g, cells, mtp, placements, stage_count, split_at, host)) return false;
+    if (requested_slots && !resident_host_payload(g, cells, mtp, placements, stage_count, split_at,
+                                                direct_copy, chain_limit, host)) return false;
     unpriced_class = "resident_ownership_payload";
     if (!strata::plan::resident_bytes((uint64_t) requested_slots, (uint64_t) cells,
         (uint64_t) g.n_qsa_layers(), (uint64_t) (shape.idx_block - 1) * g.idx_key_dim,
