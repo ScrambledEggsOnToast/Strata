@@ -297,8 +297,10 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = sizeof(scope) + live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
-        for (const auto& s : stage_images) n += s.bytes();
+                   kv.capacity() * sizeof(ConversationKv) +
+                   stage_images.capacity() * sizeof(SavedConversation);
+        // Each directory slot already owns its stage's inline scope.
+        for (const auto& s : stage_images) n += s.bytes() - sizeof(s.scope);
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
         return n;

@@ -457,6 +457,37 @@ int main() {
             check(same_image(current, *expected[index]), "impossible reclamation preserves every original image");
         });
     }
+    {
+        // Layer-split accounting: each directory capacity slot owns the inline
+        // stage metadata, including scope; only external payload is added recursively.
+        SavedConversation split;
+        const size_t solo = split.bytes();
+        split.stage_images.reserve(1);
+        check(split.bytes() == solo + sizeof(SavedConversation),
+              "one reserved stage-image directory slot is charged exactly once");
+        const SavedConversation stage = image({1, 2, 3});
+        split.stage_images.push_back(stage);
+        check(split.bytes() == solo + sizeof(SavedConversation) + stage.bytes() - sizeof(stage.scope),
+              "one stage image charges its inline scope only through its directory slot");
+    }
+    {
+        // An empty stage owns no external allocation: its entire contribution
+        // is already in the preallocated directory, including unused slots.
+        SavedConversation split;
+        split.scope = test_scope;
+        split.stage_images.reserve(3);
+        split.stage_images.emplace_back();
+        const size_t expected = sizeof(ConversationScope) +
+                                split.stage_images.capacity() * sizeof(SavedConversation);
+        check(split.bytes() == expected,
+              "empty stage adds no payload beyond its full directory allocation");
+        ConversationCache short_cache(expected - 1, 1);
+        check(!short_cache.put(std::move(split)) && short_cache.bytes() == 0 && short_cache.size() == 0,
+              "empty-stage insertion refuses a budget one byte below allocation ownership");
+        ConversationCache exact_cache(expected, 1);
+        check(exact_cache.put(std::move(split)) && exact_cache.bytes() == expected && exact_cache.size() == 1,
+              "empty-stage insertion fits the exact independently derived allocation boundary");
+    }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
     {
         ConversationCache cache(1024, 2);
