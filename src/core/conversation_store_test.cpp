@@ -3663,7 +3663,8 @@ void check_promotion_eviction_absorption() {
               "the next runnable publication must evict real bytes before writing its replacement");
         gate.resume(true, 1);
         gate.await(false, 2);
-        check_eq(store.counters().evictions, 1, "the second candidate is an actual quota eviction");
+        check(store.retains_head(oldest_head.head_id),
+              "selecting a quota victim does not remove its authoritative head before commit");
         check_eq(store.counters().promotions_absorbed, 1, "the eviction candidate absorbs the earlier pending hint");
         store.confirmed_restore(middle_head.head_id);
         check(store.describe().find("promotion pending yes") != std::string::npos,
