@@ -1723,6 +1723,22 @@ unfinished future-deadline request. Fault/poison exits keep intent armed; a kill
 The next start distrusts that domain instead of reusing it. Only compatible, catalog-authorized completed publications
 are preserved by a durable-clean switch (same profile, or pair → three-GPU → pair); no uncommitted response tail is promised.
 
+*Deterministic durability fault coverage.* The CPU-only tests use real temporary files and store catalogs; their
+assertions specify these boundaries rather than matching diagnostic wording:
+
+| Boundary | Existing test seam and required result |
+| --- | --- |
+| Session temporary write, file flush and rename | `conversation_file_test`: `write`, `file_flush`, `rename`; failure preserves the old file and removes the temporary. |
+| Session directory flush after rename | `conversation_file_test`: `dir_flush`; failure reports `published` and leaves the complete new file. POSIX `EINVAL` reports an unsupported flush instead. |
+| Store publication phases | `check_failed_write_charges_once`: `objects`, `manifest`, `catalog`; failure preserves the predecessor and catalog, refunds abandoned files, drops image/object leases, and permits a same-run retry that survives restart. The object hook precedes creation; it is not an injected short write or file-fsync failure. |
+| Store operation-level temporary creation and manifest rename | The same store test makes the relevant directory unwritable, checks single-charge cleanup and restores the predecessor. These permission-denial cases require an unprivileged account. |
+| Catalog rename and post-rename uncertainty | `check_commit_outcomes`: `catalog-rename` leaves old authority intact; `catalog-sync` and `catalog-apply` retain both catalogs' possible payloads, stop reuse and leave the run intent active while releasing the publication's RAM lease. Restart distrusts both records and reclaims payloads and interrupted scratch writes. |
+| Intent clearing and re-arm | `check_bootstrap_and_intent`: `intent-unlink-sync`, with and without `intent-rearm-sync`, checks the actual marker, its single charge and idempotent close; restart retires the distrusted record and a healthy close removes the marker. Dirty-bootstrap quota refusal is covered separately in the same test. |
+
+Session write/flush cases and catalog/intent fault scenarios were already present; the additional store assertions
+cover cleanup, lease release and restart consequences without duplicating those scenarios. These are deterministic
+process-level cases, not power-loss qualification or independent syscall-failure coverage for every store file.
+
 *Known limits of this first implementation.* Retained-K/V reuse intervals are offered only for a capture that kept a
 donor's own K/V head (`conversation_store_reuse_intervals`), and the store re-validates every one of them: the donor
 still authorized and in this bucket and epoch, each adopted chunk on the donor's own chunk grid and still present, and

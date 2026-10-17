@@ -569,8 +569,8 @@ int main() {
             check(!ok && st.error == c.kind, "fault: the failure has its kind");
             check(st.published == c.published, "fault: publication reported exactly");
             if (c.published) {
-                check(slurp(p) == image && error.find("replaced") != std::string::npos,
-                      "fault: after a published failure the new file is there and the error says so");
+                check(slurp(p) == image && !error.empty(),
+                      "fault: a published failure leaves the complete replacement and reports an error");
             } else {
                 check(slurp(p) == old, "fault: a failure before the rename keeps the old file");
             }

@@ -534,6 +534,13 @@ std::vector<std::string> directory_names(const std::string& path) {
     return out;
 }
 
+std::vector<std::string> intent_names(const std::string& path) {
+    std::vector<std::string> out;
+    for (const auto& name : directory_names(path))
+        if (name.compare(0, 7, "intent-") == 0) out.push_back(name);
+    return out;
+}
+
 // One probe of a publication admission against one published allowance.  Every probe uses its own root and its own
 // store: `attempt` seeds whatever state the publication needs (a donor, a predecessor) and returns the request, so no
 // probe can drift with another one's commits.  The result is the admission class the store chose, which is what the
@@ -5899,6 +5906,7 @@ void check_commit_outcomes() {
               "the predecessor of the refused commit is stored");
         const uint64_t charged_before = store.disk_charged_bytes();
         const std::string catalog_before = file_digest(path + "/catalog");
+        const auto inventory_before = file_inventory(path);
         store.set_publish_fault_for_test("catalog-rename");
         auto image = std::make_shared<SavedConversation>(head_image);
         ConversationStorePublish cover;
@@ -5912,6 +5920,10 @@ void check_commit_outcomes() {
         check(store.wait_publish(refused, 5000), "the refused commit settles");
         check(refused.status == ConversationStorePublishStatus::failed, "a refused catalog commit fails the publication");
         check(!refused.detail.empty(), "the failure carries a reason");
+        check(refused.released, "a failed catalog rename reports its publication image released");
+        check_eq(store.ram_lease_bytes(), 0, "a failed catalog rename releases its publication lease");
+        check(directory_names(path + "/tmp").empty(), "a failed catalog rename removes its catalog temporary");
+        check(file_inventory(path) == inventory_before, "a failed catalog rename removes every abandoned file");
         check(store.healthy(), "a catalog commit that changed nothing does not fault the store");
         check_eq(store.counters().heads, 1, "a refused commit authorizes no head and retires none");
         ConversationStoreManifestInfo info;
@@ -5966,16 +5978,23 @@ void check_commit_outcomes() {
             const uint64_t charged_before_attempt = store.disk_charged_bytes();
             store.set_publish_fault_for_test(injected);
             auto image2 = std::make_shared<SavedConversation>(fixture(363, 2048));
+            const std::weak_ptr<SavedConversation> uncertain_alias = image2;
             ConversationStorePublish request;
             request.request_id = 2;
             request.generation = 2;
             std::string why;
             check(store.publish(image2, request, why) == kAccepted, "the publication that will be uncertain is admitted");
+            image2.reset();
             ConversationStorePublishResult uncertain;
             check(store.wait_publish(uncertain, 5000), "the uncertain publication settles");
             check(uncertain.status == ConversationStorePublishStatus::failed,
                   "an unconfirmed catalog rename fails the publication");
             check(!store.healthy(), "an unconfirmed catalog rename latches a fault");
+            check(uncertain.released && uncertain_alias.expired(),
+                  "uncertain disk authority does not retain the publication image");
+            check_eq(store.ram_lease_bytes(), 0, "an uncertain publication releases its RAM lease");
+            check(directory_names(path + "/tmp").empty(), "the uncertain catalog really left its temporary name");
+            check_eq(intent_names(path).size(), 1, "an uncertain publication retains a real run-intent marker");
             // Every file this attempt created - and every file that existed before it - is still there.
             const std::vector<std::string> after = file_inventory(path);
             bool retained = true;
@@ -6013,6 +6032,20 @@ void check_commit_outcomes() {
             check(file_inventory(path) == after, "closing an uncertain store deletes nothing");
         }
         {
+            check_eq(intent_names(path).size(), 1, "a faulted close leaves its distrust marker on disk");
+            // A process can also die with incomplete object/catalog scratch files. Recovery must use neither as
+            // authority, and must retire them along with the real payloads retained by the uncertain transaction.
+            for (const char* name : {"interrupted-object", "interrupted-catalog"}) {
+                const std::string scratch = path + "/tmp/" + name;
+                const int fd = ::open(scratch.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                check(fd >= 0, "an interrupted-write scratch file is created");
+                if (fd >= 0) {
+                    const uint8_t partial[] = {1, 2, 3};
+                    check(::write(fd, partial, sizeof partial) == ssize_t(sizeof partial),
+                          "the scratch file holds a real incomplete payload");
+                    check(::close(fd) == 0, "the interrupted-write scratch fixture closes");
+                }
+            }
             // The next start re-reads the authority instead of trusting the uncertain view.
             ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
             check(store.enabled(), "the root reopens after an uncertain transaction");
@@ -6020,7 +6053,20 @@ void check_commit_outcomes() {
             const ConversationStoreQuery query = query_of(fixture(362, 2048), 5, 5);
             check(store.matches(query.selector, query.tokens, query.images).empty(),
                   "an uncertain run's records are never reused");
+            const ConversationStoreQuery successor = query_of(fixture(363, 2048), 6, 6);
+            check(store.matches(successor.selector, successor.tokens, successor.images).empty(),
+                  "restart also distrusts the head in the unconfirmed replacement catalog");
+            check_eq(store.counters().heads, 0, "restart retires every head of the uncertain domain");
+            check_eq(store.counters().objects, 0, "restart keeps no object authority from the uncertain domain");
+            check_eq(store.counters().manifests, 0, "restart keeps no manifest authority from the uncertain domain");
+            check(file_inventory(path + "/objects").empty() && directory_names(path + "/manifests").empty() &&
+                      directory_names(path + "/tmp").empty(),
+                  "restart reclaims both catalogs' abandoned payloads and scratch files");
+            check_eq(store.counters().pending_delete_bytes, 0, "uncertain-run recovery leaves no orphan deletion lease");
+            check_eq(store.counters().recovered_orphans, 2, "restart accounts both interrupted scratch writes");
             store.close();
+            check(!store.run_intent_active() && intent_names(path).empty(),
+                  "the recovered store clears the real marker only after its healthy close");
         }
     }
 }
@@ -6086,35 +6132,52 @@ void check_bootstrap_and_intent() {
         TempRoot root;
         const std::string path = std::string(root.path) + "/intent";
         uint64_t epoch = 0;
+        uint64_t head_id = 0;
+        const SavedConversation image = fixture(352, 2048);
         {
             ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
-            const SavedConversation image = fixture(352, 2048);
             ConversationStorePublishResult result;
             check(publish_and_wait(store, image, 1, 1, result) &&
                       result.status == ConversationStorePublishStatus::stored,
                   "the intent store stores its branch");
             epoch = store.epoch();
+            head_id = result.head_id;
+            const auto markers = intent_names(path);
+            check_eq(markers.size(), 1, "the intent store has one real marker before close");
+            const std::string marker_digest = markers.empty() ? "" : file_digest(path + "/" + markers[0]);
+            const uint64_t charged = store.disk_charged_bytes();
             store.set_publish_fault_for_test("intent-unlink-sync");
             if (*extra) store.set_publish_fault_for_test(extra);
             store.close();
             check(!store.healthy(), "a close that cannot prove its marker gone is not a healthy close");
             check(store.run_intent_active(), "a failed marker removal leaves the run intent armed");
-            const std::string described = store.describe();
-            check(described.find("re-armed") != std::string::npos,
-                  "the re-armed marker is reported rather than hidden");
-            if (*extra)
-                check(described.find("not durably flushed") != std::string::npos,
-                      "a re-arm that could not be flushed is reported as such");
-            else
-                check(described.find("flushed") != std::string::npos,
-                      "a re-arm that was flushed is reported honestly");
+            check(intent_names(path) == markers, "a failed marker removal actually re-creates the same marker");
+            check(!markers.empty() && file_digest(path + "/" + markers[0]) == marker_digest,
+                  "the re-armed marker preserves the original distrust payload");
+            check_eq(store.disk_charged_bytes(), charged, "a failed marker clear charges its re-arm exactly once");
+            check_eq(store.ram_lease_bytes(), 0, "a failed marker clear retains no image lease");
+            const auto after = file_inventory(path);
+            store.close();
+            check(file_inventory(path) == after, "repeating a failed close neither removes nor duplicates its marker");
+            check_eq(store.disk_charged_bytes(), charged, "repeating a failed close does not double-charge its marker");
         }
         {
             ConversationStore store(options_for(path, uint64_t(1) << 30, 0));
             check(store.enabled(), "the root reopens after a failed marker removal");
             check_eq(store.epoch(), epoch + 1, "the re-armed marker makes the next start distrust this domain");
             check(store.run_intent_active(), "the reopened store arms its own intent");
+            const auto query = query_of(image, 7, 1);
+            check(store.matches(query.selector, query.tokens, query.images).empty(),
+                  "a re-armed intent prevents reuse of the previous run's record");
+            ConversationStoreManifestInfo info;
+            check(!store.manifest_info(head_id, info), "restart retires the record distrusted by the re-armed intent");
+            check_eq(store.counters().heads, 0, "the re-armed domain has no authorized record after recovery");
+            check(file_inventory(path + "/objects").empty() && directory_names(path + "/manifests").empty(),
+                  "intent recovery reclaims the retired record's files");
+            check_eq(store.counters().pending_delete_bytes, 0, "intent recovery leaves no deletion lease");
             store.close();
+            check(!store.run_intent_active() && intent_names(path).empty(),
+                  "healthy recovery removes the re-armed marker from disk");
         }
     }
 }
@@ -6618,6 +6681,98 @@ void check_inflight_object_lease() {
 // temporary, and the store must credit that one file exactly once - never a temporary *and* the name it never
 // reached.  The failure is injected at the operation itself (the directory refuses the write), not ahead of it.
 void check_failed_write_charges_once() {
+    // The phase hooks are distinct from the operation-level permission failures below: objects refuses before any
+    // new file, manifest after object creation, and catalog after both objects and a manifest have been written.
+    // Each failure must release the image and its object leases without retiring the covered predecessor.
+    for (const char* step : {"objects", "manifest", "catalog"}) {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        const SavedConversation prior = fixture(371, 1024);
+        const SavedConversation grown = appended_turn(prior, 2048, 371);
+        uint64_t head_id = 0;
+        uint64_t epoch = 0;
+        uint64_t successor_id = 0;
+        {
+            ConversationStore store(options);
+            ConversationStorePublishResult head;
+            check(publish_and_wait(store, prior, 1, 1, head) &&
+                      head.status == ConversationStorePublishStatus::stored,
+                  "the phase-failure root stores its predecessor");
+            head_id = head.head_id;
+            epoch = store.epoch();
+            const uint64_t charged = store.disk_charged_bytes();
+            const auto inventory = file_inventory(root.path);
+            const std::string catalog = file_digest(root.path + "/catalog");
+            const auto markers = intent_names(root.path);
+            check_eq(markers.size(), 1, "the phase-failure root has one real run-intent marker");
+            store.set_publish_fault_for_test(step);
+            auto image = std::make_shared<SavedConversation>(grown);
+            const std::weak_ptr<SavedConversation> alias = image;
+            ConversationStorePublish request;
+            request.request_id = 2;
+            request.generation = 2;
+            request.supersedes = head_id;
+            request.cover = true;
+            std::string why;
+            check(store.publish(image, request, why) == kAccepted, "the phase-failure cover is admitted");
+            image.reset();
+            ConversationStorePublishResult failed;
+            check(store.wait_publish(failed, 5000), "the phase-failure cover settles");
+            check(failed.status == ConversationStorePublishStatus::failed && !failed.detail.empty(),
+                  "a refused publication phase reports failure");
+            check(failed.released && alias.expired(), "a failed phase really drops its publication image");
+            check(!store.writer_busy(), "a failed phase releases its writer slot");
+            check_eq(store.ram_lease_bytes(), 0, "a failed phase leaves no publication lease");
+            check(store.healthy(), "a failed phase before catalog publication leaves authority trustworthy");
+            check_eq(store.counters().heads, 1, "a failed phase neither authorizes a successor nor retires its predecessor");
+            ConversationStoreManifestInfo info;
+            check(store.manifest_info(head_id, info), "a failed phase preserves the predecessor's manifest authority");
+            check(file_digest(root.path + "/catalog") == catalog, "a failed phase preserves the durable catalog");
+            check(file_inventory(root.path) == inventory, "a failed phase removes every file its attempt created");
+            check(directory_names(root.path + "/tmp").empty(), "a failed phase leaves no scratch file");
+            check(intent_names(root.path) == markers && store.run_intent_active(),
+                  "an ordinary publication failure retains the real run intent");
+            check_eq(store.disk_charged_bytes(), charged, "a failed phase refunds only its abandoned files");
+            check_eq(store.counters().pending_delete_bytes, 0, "a failed phase leaves no unpaid deletion");
+            ConversationStoreRead read;
+            check(store.demand(query_of(prior, 3, 1), why) && store.wait_ready(3, 1, read, 5000) &&
+                      read.status == ConversationStoreReadStatus::ready && read.image &&
+                      images_equal(*read.image, prior, why),
+                  "a failed phase leaves the predecessor restorable byte for byte");
+            read.image.reset();
+            store.release_read(3, 1);
+            check(store.publish(std::make_shared<SavedConversation>(grown), request, why) == kAccepted,
+                  "the one-shot phase fault permits an immediate retry");
+            ConversationStorePublishResult retried;
+            check(store.wait_publish(retried, 5000) && retried.status == ConversationStorePublishStatus::replaced,
+                  "the same-run retry replaces the original authority");
+            successor_id = retried.head_id;
+            check(!store.manifest_info(head_id, info), "the retry retires the predecessor's manifest authority");
+            check_eq(store.counters().pending_delete_bytes, 0, "a failed attempt leaves no object lease blocking retirement");
+            store.close();
+            check(!store.run_intent_active() && intent_names(root.path).empty(),
+                  "an ordinary phase failure still permits a genuinely clean close");
+            check_eq(store.ram_lease_bytes(), 0, "a clean close after a failed phase leaves no image lease");
+        }
+        {
+            ConversationStore store(options);
+            check(store.enabled() && store.healthy(), "the root reopens after an ordinary phase failure");
+            check_eq(store.epoch(), epoch, "a clean close after a phase failure preserves the epoch");
+            check_eq(store.counters().heads, 1, "restart retains only the successfully retried authority");
+            check_eq(store.counters().corrupt_records, 0, "a failed phase leaves no corrupt record for restart");
+            ConversationStoreRead read;
+            std::string why;
+            check(store.demand(query_of(grown, 4, 1), why) && store.wait_ready(4, 1, read, 5000) &&
+                      read.status == ConversationStoreReadStatus::ready && read.head_id == successor_id && read.image &&
+                      images_equal(*read.image, grown, why),
+                  "restart restores the successful retry byte for byte");
+            read.image.reset();
+            store.release_read(4, 1);
+            check_eq(store.ram_lease_bytes(), 0, "the restarted read releases its image lease");
+            store.close();
+        }
+    }
+
     // (1) The object write: its temporary directory refuses the write, so the shard never receives the object.
     {
         TempRoot root;
@@ -6642,6 +6797,9 @@ void check_failed_write_charges_once() {
         check(failed.status == ConversationStorePublishStatus::failed, "a refused object write fails the publication");
         check(!failed.detail.empty(), "the failure carries a reason");
         check(store.healthy(), "a failed object write is an ordinary failure, not a fault");
+        check(failed.released && store.ram_lease_bytes() == 0,
+              "an object creation failure drops its publication lease");
+        check(directory_names(path + "/tmp").empty(), "a failed object creation leaves no temporary file");
         check_eq(store.counters().reclaimed_objects, reclaimed,
                  "an object that was never written is never counted as reclaimed");
         check_eq(store.disk_charged_bytes(), charged,
@@ -6684,6 +6842,9 @@ void check_failed_write_charges_once() {
         check(failed.status == ConversationStorePublishStatus::failed,
               "a refused manifest rename fails the publication");
         check(store.healthy(), "a failed manifest rename is an ordinary failure, not a fault");
+        check(failed.released && store.ram_lease_bytes() == 0,
+              "a manifest rename failure drops its publication lease");
+        check(directory_names(path + "/tmp").empty(), "a failed manifest rename removes its real temporary file");
         check_eq(store.disk_charged_bytes(), charged,
                  "the manifest's one charge is credited exactly once");
         check_eq(store.counters().pending_delete_bytes, 0,
