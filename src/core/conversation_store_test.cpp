@@ -8344,6 +8344,76 @@ void check_bounded_candidate_rejections() {
           "the receipt truthfully counts the rest of the twenty-four rejected cuts");
     check(read_trace(records, "settled", 120, "no_io") && read_trace(records, "adopt", 120) &&
               !read_trace(records, "trace_overflow", 0), "candidate fanout cannot displace ownership or settlement records");
+
+    // Each rejection names the head and cut it refused, with the origin of the selection that refused it, and a
+    // delivered read names the same head and cut it adopted. Nothing here carries prompt text, token ids or keys.
+    {
+        StoreReadTraceCapture reason_trace;
+        TempRoot reason_root;
+        auto reason_options = options_for(reason_root.path, uint64_t(1) << 30, 0);
+        reason_options.head_limit = 8;
+        ConversationStore scoped(reason_options);
+        SavedConversation matched = fixture(861, 128), diverging = fixture(861, 128), longer = fixture(861, 512);
+        // One token past the shared prefix: both 128-token histories keep the same scope and cut lengths, so only the
+        // digest distinguishes them, and the 512-token history can only be refused for its length.
+        diverging.live.ids[5] += 1;
+        diverging.checkpoints[0].ids[5] += 1;
+        ConversationStorePublishResult matched_pub, diverging_pub, longer_pub;
+        check(publish_and_wait(scoped, matched, 300, 1, matched_pub) &&
+                  publish_and_wait(scoped, diverging, 301, 1, diverging_pub) &&
+                  publish_and_wait(scoped, longer, 302, 1, longer_pub),
+              "the reason fixture stores a matching, a diverging and a longer history");
+        const auto records_by_selection = [&] { return reason_trace.records(); };
+        const auto refusal = [](const std::vector<StoreReadTraceRecord>& records, uint64_t request_id,
+                                const char* reason, uint64_t head) -> const StoreReadTraceRecord* {
+            for (const auto& record : records)
+                if (record.text("event") == "candidate_rejected" && record.number("request_id") == request_id &&
+                    record.text("reason") == reason && record.number("head") == head) return &record;
+            return nullptr;
+        };
+        ConversationStoreQuery query = query_of(matched, 310, 1);
+        query.tokens.resize(100);
+        std::string reason_why;
+        check(scoped.prefetch(query, reason_why), "the reason fixture prefetches a real candidate set");
+        ConversationStoreRead delivered;
+        check(scoped.wait_ready(310, 1, delivered, 5000) &&
+                  delivered.status == ConversationStoreReadStatus::ready,
+              "the matching checkpoint is delivered beside the refused candidates");
+        check(delivered.head_id == matched_pub.head_id && delivered.tokens == 64 && !delivered.live,
+              "the delivered read names its own head and checkpoint cut");
+        scoped.release_read(310, 1);
+        query = query_of(matched, 311, 1);
+        query.tokens.resize(100);
+        ConversationStoreRead demanded;
+        check(scoped.demand(query, reason_why) && scoped.wait_ready(311, 1, demanded, 5000) &&
+                  demanded.status == ConversationStoreReadStatus::ready &&
+                  demanded.head_id == matched_pub.head_id && demanded.tokens == 64,
+              "the same selection is delivered for a demand");
+        scoped.release_read(311, 1);
+        scoped.close();
+        const auto selection = records_by_selection();
+        const auto* prefetch_longer = refusal(selection, 310, "not_strict_prefix", longer_pub.head_id);
+        check(prefetch_longer && prefetch_longer->number("cut") == 512 &&
+                  prefetch_longer->text("origin") == "prefetch",
+              "a longer candidate is refused by name, head, cut and origin");
+        const auto* prefetch_diverging = refusal(selection, 310, "prefix_mismatch", diverging_pub.head_id);
+        check(prefetch_diverging && prefetch_diverging->number("cut") == 64 &&
+                  prefetch_diverging->text("origin") == "prefetch",
+              "a diverging prefix is refused at the cut it failed, not at the request length");
+        const auto* demand_diverging = refusal(selection, 311, "prefix_mismatch", diverging_pub.head_id);
+        check(demand_diverging && demand_diverging->number("cut") == 64 &&
+                  demand_diverging->text("origin") == "demand",
+              "the same refusal is attributed to the demand that made it");
+        const auto* matched_adopt = read_trace(selection, "adopt", 310, "ready");
+        check(matched_adopt && matched_adopt->number("head") == matched_pub.head_id &&
+                  matched_adopt->number("cut") == 64 && matched_adopt->text("status") == "ready",
+              "the delivered attempt carries the same head and cut as the read it produced");
+        const auto scope_digest = sha256_hex(conversation_store_detail::sha256(
+            matched.scope.value.data(), matched.scope.value.size()));
+        check(reason_trace.contents().find(reason_root.path) == std::string::npos &&
+                  reason_trace.contents().find(scope_digest) == std::string::npos,
+              "refusal diagnostics carry neither the store path nor the authorized scope");
+    }
 }
 
 // The dimensions are intentionally small; these are storage/authority proofs, not inference proofs.
