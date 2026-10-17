@@ -676,6 +676,41 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
       target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
+      # Compile the actual horizon selection, callback dispatch and both pruning
+      # paths against host row writers, then capture with the real snapshot code.
+      function(shared_draft_fixture_piece source begin end output)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${source}" text)
+        string(FIND "${text}" "${begin}" first)
+        if(first LESS 0)
+          message(FATAL_ERROR "shared draft fixture: ${output} start not found")
+        endif()
+        string(SUBSTRING "${text}" ${first} -1 text)
+        string(FIND "${text}" "${end}" last)
+        if(last LESS 0)
+          message(FATAL_ERROR "shared draft fixture: ${output} end not found")
+        endif()
+        string(SUBSTRING "${text}" 0 ${last} text)
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${output}.inc" "${text}\n")
+      endfunction()
+      shared_draft_fixture_piece(src/program/generate.cpp
+        "// A shared cut's draft state" "            conversations.limit_reuse("
+        shared_draft_horizon)
+      shared_draft_fixture_piece(src/program/generate.cpp
+        "        sp.on_chunk = " "            // progress for the server window:"
+        shared_draft_callback)
+      shared_draft_fixture_piece(src/prefill/prefill.cpp
+        "    const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);"
+        "    // per row: emb/e2" shared_draft_batched_range)
+      shared_draft_fixture_piece(src/core/mtp.cpp
+        "    const int64_t first_needed = " "    // E-4:" shared_draft_first_needed)
+      shared_draft_fixture_piece(src/core/mtp.cpp
+        "\n        for (int64_t c = 0; c < n; c += max_t_) {"
+        "            if (!capture_prefill_dev(T, err))" shared_draft_async_range)
+      shared_draft_fixture_piece(src/core/mtp.cpp
+        "\n    for (int64_t c = 0; c < n; c += max_t_) {"
+        "        if (!capture_prefill(T, err))" shared_draft_sync_range)
+      target_include_directories(conversation_transfer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
       target_link_options(conversation_transfer_test PRIVATE
         -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize
         -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaStreamCreateWithFlags

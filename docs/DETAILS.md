@@ -1517,7 +1517,9 @@ fresh one-shot branch. Only a prompt read that actually stops at the pin may pub
 the current request must have recomputed every row the shared image retains: its actual prefill start must be at
 or before the retained draft window's start. A later private resume can leave row `R-1` dependent on the old suffix
 and earlier window rows stale, so that request logs and skips shared publication, without disabling private serving
-or shared lookup. A diagnostic reread uses its actual start at zero, not the checkpoint length.
+or shared lookup. A diagnostic reread uses its actual start at zero, not the checkpoint length, both to choose
+the shared-cut draft horizon before prefill and to authorize capture. This also applies when the selected private
+checkpoint is at or beyond the pin; the longer private suffix must not cause prefix draft rows to be skipped.
 The capture contains no other checkpoints, clears inactive K/V/index bytes, and records the owning draft's extent
 as exactly `N-1` (draft row `N-1` consumes private token `N`). Native shared validation, every stage restore and draft
 read-back explicitly require that exact-cut contract; rounded-cell metadata cannot disable excluded-byte checks.

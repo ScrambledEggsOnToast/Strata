@@ -16161,8 +16161,8 @@ int main(int argc, char** argv) {
             tr("request", n, geni ? 1 : 0);
             // A shared cut's draft state must be reusable with any suffix. Do not
             // skip prefix rows based on this request's longer private suffix.
-            if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && resume < req_pin ? req_pin + 1 : n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+            if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && read_from < req_pin ? req_pin + 1 : n);
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
