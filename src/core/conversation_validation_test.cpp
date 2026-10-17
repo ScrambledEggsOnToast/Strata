@@ -725,23 +725,20 @@ void exact_shared_cut(int format, int64_t cut) {
     ConversationView exact{ids, no_images, no_checks, true, true, cut - 1, begin};
     size_t estimate = 0;
     copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
-    auto invalid = exact;
-    invalid.draft_tokens = cut + 1;
-    check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error) &&
+    const ConversationView invalid_beyond{ids, no_images, no_checks, true, true, cut + 1, begin};
+    check(!conversation_snapshot_bytes(invalid_beyond, ss, g, &draft.st, estimate, error) &&
           copy_calls == 0 && sync_calls == 0, "draft extent beyond an exact cut is refused before device access");
-    invalid.draft_tokens = cut;
-    check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error),
+    const ConversationView invalid_consuming_suffix{ids, no_images, no_checks, true, true, cut, begin};
+    check(!conversation_snapshot_bytes(invalid_consuming_suffix, ss, g, &draft.st, estimate, error),
           "the draft row consuming the first private suffix token cannot be claimed");
     if (cut > 1) {
-        invalid = exact;
-        invalid.draft_tokens = cut - 2;
-        check(!conversation_snapshot_bytes(invalid, ss, g, &draft.st, estimate, error),
+        const ConversationView invalid_short{ids, no_images, no_checks, true, true, cut - 2, begin};
+        check(!conversation_snapshot_bytes(invalid_short, ss, g, &draft.st, estimate, error),
               "an exact capture must own all N-1 draft rows, not an arbitrary shorter extent");
     }
-    invalid = exact;
-    invalid.draft_read_from = begin + 1;
+    const ConversationView invalid_read{ids, no_images, no_checks, true, true, cut - 1, begin, begin + 1};
     SavedConversation refused;
-    check(!conversation_snapshot_save(refused, invalid, ss, g, &draft.st, error) &&
+    check(!conversation_snapshot_save(refused, invalid_read, ss, g, &draft.st, error) &&
           refused.live.ids.empty() && refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
           "a private resume past the retained draft start produces no shared image or device access");
     SavedConversation unsafe_meta;
@@ -775,9 +772,10 @@ void exact_shared_cut(int format, int64_t cut) {
     check(rows_equal(first.kv.front(), 0, cut) && rows_equal(first.kv.back(), begin, cut - 1),
           "all heads, formats, scale runs, skipped draft cells and page tails obey the exact cut");
     const size_t active_tail = size_t(cut % 4) * size_t(g.idx_key_dim) * 4;
-    check(std::all_of(first.live.tails.begin() + active_tail, first.live.tails.end(),
+    check(std::all_of(first.live.tails.read().begin() + active_tail, first.live.tails.read().end(),
                       [](uint8_t b) { return b == 0; }) &&
-          std::all_of(first.live.block_pos.begin(), first.live.block_pos.end(), [](uint8_t b) { return b == 0; }),
+          std::all_of(first.live.block_pos.read().begin(), first.live.block_pos.read().end(),
+                      [](uint8_t b) { return b == 0; }),
           "inactive indexer tails and position scratch cannot retain another conversation");
 
     const auto poison_rows = [&](Pools& pools, int64_t lo, int64_t hi) {
@@ -921,8 +919,9 @@ void exact_shared_cut(int format, int64_t cut) {
         SavedConversation stage;
         check(conversation_snapshot_save(stage, cut_view, unused, g, nullptr, error),
               "capture a carved stage whose primary QSA owns no attention layer");
-        const auto zeros = [](const auto& bytes) {
-            return std::all_of(bytes.begin(), bytes.end(), [](uint8_t b) { return b == 0; });
+        const auto zeros = [](const CheckpointBytes& bytes) {
+            const auto& source = bytes.read();
+            return std::all_of(source.begin(), source.end(), [](uint8_t b) { return b == 0; });
         };
         const auto zero_buffer = [](const ConversationBuffer& bytes) {
             return bytes.visit(0, bytes.size(), [](const uint8_t* p, size_t n, size_t) {

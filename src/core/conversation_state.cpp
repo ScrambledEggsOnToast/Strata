@@ -509,9 +509,11 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     if (exact) {
         // Mirror the capture's excluded running-state bytes for every carve.
         // These checks never depend on a record-controlled K/V extent.
-        const auto zeros = [](const auto& bytes, size_t begin, size_t end) {
-            return begin <= end && end <= bytes.size() &&
-                std::all_of(bytes.begin() + begin, bytes.begin() + end, [](uint8_t byte) { return byte == 0; });
+        const auto zeros = [](const CheckpointBytes& bytes, size_t begin, size_t end) {
+            const auto& source = bytes.read();
+            return begin <= end && end <= source.size() &&
+                std::all_of(source.begin() + begin, source.begin() + end,
+                            [](uint8_t byte) { return byte == 0; });
         };
         if ((ss.layer_lo > 0 && !zeros(image.live.ple, 0, image.live.ple.size())) ||
             !zeros(image.live.block_pos, 0, image.live.block_pos.size()))
