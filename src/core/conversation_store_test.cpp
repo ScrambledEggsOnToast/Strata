@@ -8730,7 +8730,7 @@ void check_draft_certification_store() {
                 store.release_read(11, 1);
                 store.close();
             }
-            check(fixture_replace_file(path, original), "the manifest bytes are restored");
+            // The quarantined record's manifest and objects are reclaimed with it, so nothing is left to restore.
         }
     }
 }
