@@ -8678,18 +8678,59 @@ void check_draft_certification_store() {
             check(fixture_contents(root.path) == before, "authority refusal preserves every history and file byte");
             check(fixture_replace_file(root.path + "/issuer.key", floor), "the exact recognized authority is restored");
         }
-        for (bool catalog : {true, false}) {
-            const auto names = directory_names(root.path + "/manifests");
-            if (!catalog && names.empty()) { check(false, "the unsupported-manifest fixture has a real manifest"); continue; }
-            const std::string path = root.path + (catalog ? "/catalog" : "/manifests/" + names.front());
+        {
+            // The catalog is the root's authority: its schema cannot be quarantined record by record, so an
+            // unrecognized tag refuses the open with nothing read, rewritten or deleted.
+            const auto original = fixture_file_bytes(root.path + "/catalog");
+            auto future = original;
+            future[7] = '9';
+            check(fixture_replace_file(root.path + "/catalog", future), "the unsupported catalog fixture is written");
+            const auto before = fixture_contents(root.path);
+            { ConversationStore store(options); check(!store.enabled(), "an unknown catalog schema refuses before recovery"); }
+            check(fixture_contents(root.path) == before, "catalog refusal cannot reconcile or delete histories");
+            check(fixture_replace_file(root.path + "/catalog", original), "the original catalog bytes are restored");
+        }
+        {
+            // A manifest's own tag is that record's defect, not the root's: it is quarantined exactly as before and
+            // every other history stays authorized. A record written by a newer reader never reaches this point,
+            // because the issuer envelope refuses such a root first.
+            TempRoot damaged;
+            const uint64_t damaged_quota = uint64_t(1) << 30;
+            const SavedConversation survivor = fixture(961, 64), victim = fixture(963, 64);
+            std::string victim_manifest;
+            {
+                ConversationStore store(options_for(damaged.path, damaged_quota, 0));
+                check(store.enabled(), "the quarantine fixture root opens");
+                const auto before = directory_names(damaged.path + "/manifests");
+                ConversationStorePublishResult stored;
+                check(publish_and_wait(store, survivor, 1, 1, stored), "the surviving history is stored");
+                check(publish_and_wait(store, victim, 2, 1, stored), "the history that will be damaged is stored");
+                const auto after = directory_names(damaged.path + "/manifests");
+                for (const auto& name : after)
+                    if (!inventory_contains(before, name)) victim_manifest = name;
+                check(!victim_manifest.empty(), "the damaged publication wrote its own manifest");
+                store.close();
+            }
+            const std::string path = damaged.path + "/manifests/" + victim_manifest;
             const auto original = fixture_file_bytes(path);
             auto future = original;
             future[7] = '9';
-            check(fixture_replace_file(path, future), "the unsupported schema fixture is written");
-            const auto before = fixture_contents(root.path);
-            { ConversationStore store(options); check(!store.enabled(), "unsupported schemas refuse before recovery"); }
-            check(fixture_contents(root.path) == before, "unsupported schema refusal cannot reconcile or delete histories");
-            check(fixture_replace_file(path, original), "the original schema bytes are restored");
+            check(fixture_replace_file(path, future), "the unknown manifest tag is written");
+            {
+                ConversationStore store(options_for(damaged.path, damaged_quota, 0));
+                check(store.enabled(), "an unknown manifest tag does not disable the root");
+                check_eq(store.counters().corrupt_records, 1, "exactly the record with the unknown tag is corrupt");
+                check_eq(store.counters().heads, 1, "only the damaged record is dropped");
+                std::string why;
+                check(store.demand(query_of(survivor, 11, 1), why), "the surviving history is still demandable");
+                ConversationStoreRead read;
+                check(store.wait_ready(11, 1, read, 5000) && read.status == ConversationStoreReadStatus::ready &&
+                      read.image && images_equal(*read.image, survivor, why),
+                      "the surviving history restores byte-identically beside a quarantined record");
+                store.release_read(11, 1);
+                store.close();
+            }
+            check(fixture_replace_file(path, original), "the manifest bytes are restored");
         }
     }
 }

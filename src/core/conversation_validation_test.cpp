@@ -68,7 +68,6 @@ public:
                   std::string&, const char**) {
         ++batched_calls;
         if (!accept_batched) return false;
-        constexpr int slot = 8;
 #include "shared_draft_batched_range.inc"
         mtp.write(cell0 + r0, n - r0);
         mtp.coverage.completed(cell0 + r0, cell0 + n, r0 < n ? tokens[n - 1] : -1);
@@ -823,7 +822,7 @@ void resident_transfer_envelopes() {
 namespace shared_draft_fixture {
 int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
                       int64_t req_pin = 8192, int64_t n = 65536) {
-    const bool use_mtp = true, packed_prefill = true;
+    const bool use_mtp = true;
     const ConversationScope req_shared_scope = shared ? ConversationScope{{1}} : ConversationScope{};
 #include "shared_draft_horizon.inc"
     return read_from;
@@ -955,20 +954,31 @@ void exact_shared_cut(int format, int64_t cut) {
         check(!conversation_snapshot_bytes(invalid_short, ss, g, &draft.st, estimate, error),
               "an exact capture must own all N-1 draft rows, not an arbitrary shorter extent");
     }
-    auto invalid_read = exact;
-    invalid_read.draft_boundary_position = cut;
+    // A view holds references, so each refusal case is its own copy-constructed view: binding a fresh copy keeps
+    // the same objects while changing only the scalars under test.
     SavedConversation refused;
-    check(!conversation_snapshot_save(refused, invalid_read, ss, g, &draft.st, error) &&
-          refused.live.ids.empty() && refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
-          "wrong-position residual produces no shared image or device access");
-    invalid_read = exact; invalid_read.draft_boundary_owner = 18;
-    check(!conversation_snapshot_save(refused, invalid_read, ss, g, &draft.st, error) &&
-          refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
-          "a residual from a different request generation is rejected before writes");
-    invalid_read = exact; invalid_read.draft_boundary_residual = nullptr;
-    invalid_read.draft_boundary_owner = 0; invalid_read.draft_boundary_position = -1;
-    check(!conversation_snapshot_bytes(invalid_read, ss, g, &draft.st, estimate, error),
-          "completed KV without the final residual cannot claim a catchup-capable exact image");
+    {
+        auto wrong_position = exact;
+        wrong_position.draft_boundary_position = cut;
+        check(!conversation_snapshot_save(refused, wrong_position, ss, g, &draft.st, error) &&
+              refused.live.ids.empty() && refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
+              "wrong-position residual produces no shared image or device access");
+    }
+    {
+        auto wrong_owner = exact;
+        wrong_owner.draft_boundary_owner = 18;
+        check(!conversation_snapshot_save(refused, wrong_owner, ss, g, &draft.st, error) &&
+              refused.kv.empty() && copy_calls == 0 && sync_calls == 0,
+              "a residual from a different request generation is rejected before writes");
+    }
+    {
+        auto no_residual = exact;
+        no_residual.draft_boundary_residual = nullptr;
+        no_residual.draft_boundary_owner = 0;
+        no_residual.draft_boundary_position = -1;
+        check(!conversation_snapshot_bytes(no_residual, ss, g, &draft.st, estimate, error),
+              "completed KV without the final residual cannot claim a catchup-capable exact image");
+    }
     SavedConversation unsafe_meta;
     std::vector<SessionKvSource> unsafe_sources;
     check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, draft.st, error) &&
