@@ -124,13 +124,22 @@ struct Fixture {
 };
 
 bool empty_map(const QsaState& st) {
-    std::vector<int32_t> table(st.n_pages), slots(st.n_slots);
-    cuda_check(cudaMemcpy(table.data(),st.map.page_table,table.size()*4,cudaMemcpyDeviceToHost));
-    cuda_check(cudaMemcpy(slots.data(),st.map.slot_block,slots.size()*4,cudaMemcpyDeviceToHost));
+    // Read on an independent nonblocking consumer: a legacy-stream read would
+    // hide a missing completion fence in the restore API.
+    int32_t* table=nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&table),(st.n_pages+st.n_slots)*sizeof(int32_t),0));
+    int32_t* slots=table+st.n_pages;
+    cudaStream_t consumer=nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&consumer,cudaStreamNonBlocking));
+    cuda_check(cudaMemcpyAsync(table,st.map.page_table,st.n_pages*sizeof(int32_t),cudaMemcpyDeviceToHost,consumer));
+    cuda_check(cudaMemcpyAsync(slots,st.map.slot_block,st.n_slots*sizeof(int32_t),cudaMemcpyDeviceToHost,consumer));
+    cuda_check(cudaStreamSynchronize(consumer));
+    const bool empty=std::all_of(table,table+st.n_pages,[](int32_t x){return x==-1;}) &&
+                     std::all_of(slots,slots+st.n_slots,[](int32_t x){return x==-1;});
+    cuda_check(cudaStreamDestroy(consumer));
+    cuda_check(cudaFreeHost(table));
     const auto counters=kv_stream_counters(st.map);
-    return std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}) &&
-           std::all_of(slots.begin(),slots.end(),[](int32_t x){return x==-1;}) &&
-           counters.calls==0 && counters.lookups==0 && counters.misses==0 && counters.overflow==0;
+    return empty && counters.calls==0 && counters.lookups==0 && counters.misses==0 && counters.overflow==0;
 }
 
 void direct_kv(int fmt, int source_mode, int target_mode) {
@@ -203,9 +212,6 @@ void release_reinit(int fmt, int mode) {
     uint64_t fingerprint=0;
     check(conversation_kv_restore(image,state,source.g,9,index,err),
           "native owner accepts the saved image");
-    // conversation_kv_restore leaves ring refill on the legacy stream; the
-    // diagnostic verifier requires the documented completion fence.
-    cuda_check(cudaDeviceSynchronize());
     check(conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),
           "native owner restores all authoritative and ring bytes");
     qsa_state_release(state);
@@ -222,7 +228,6 @@ void release_reinit(int fmt, int mode) {
     check(!conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),"fresh owner does not inherit released payload");
     check(conversation_kv_restore(image,state,source.g,9,index,err),
           "re-initialized native owner accepts the saved image");
-    cuda_check(cudaDeviceSynchronize());
     check(conversation_kv_verify(image,state,source.g,9,index,fingerprint,err),
           "saved state survives release and re-initialization");
     qsa_state_release(state);
@@ -557,13 +562,17 @@ int main() {
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
+            if (mode==1) {
+                cuda_check(cudaMemset(f.state.map.page_table,0,f.state.n_pages*sizeof(int32_t)));
+                cuda_check(cudaMemset(f.state.map.slot_block,0,f.state.n_slots*sizeof(int32_t)));
+            }
             // Restore uses the private non-blocking copy stream, so finish the
             // legacy-stream fixture mutation before both save B and restore A.
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
             check(upto==0 || !equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
-            cuda_check(cudaDeviceSynchronize());
+            if (mode==1) check(empty_map(f.state),"restore completes outgoing map invalidation before a nonblocking consumer");
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
@@ -631,7 +640,6 @@ int main() {
                     cuda_check(cudaDeviceSynchronize());
                     check(conversation_kv_restore(a,f.state,f.g,cut,false,err,upto),
                           "restore selected draft prefix from longer wrapped image");
-                    cuda_check(cudaDeviceSynchronize());
                     check(conversation_kv_verify(a,f.state,f.g,cut,false,fingerprint,err,upto),
                           "selected draft prefix authoritative bytes and resident ring agree");
                 }

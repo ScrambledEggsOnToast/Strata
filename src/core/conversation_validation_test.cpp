@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <cstring>
+#include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 #include "strata/core/native_head.hpp"
@@ -77,6 +78,10 @@ public:
 // host-backend fault injection, not a claim of hardware-failure recovery.
 namespace {
 int copy_calls = 0, sync_calls = 0, stream_sync_calls = 0, fail_copy = 0, fail_sync = 0;
+int residency_sync_calls = 0;
+bool defer_residency_copies = false, fail_residency_sync = false;
+struct PendingCopy { void* dst; const void* src; size_t bytes; };
+std::vector<PendingCopy> pending_residency_copies;
 size_t copied_bytes = 0;
 }
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
@@ -90,10 +95,25 @@ extern "C" cudaError_t __wrap_cudaGetDevice(int* dev) { *dev = 0; return cudaSuc
 extern "C" cudaError_t __wrap_cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int) {
     *s = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(1)); return cudaSuccess;
 }
-extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t) {
+extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t stream) {
+    if (!stream && defer_residency_copies) {
+        if (++copy_calls == fail_copy) return cudaErrorInvalidValue;
+        copied_bytes += n;
+        pending_residency_copies.push_back({dst, src, n});
+        return cudaSuccess;
+    }
     return __wrap_cudaMemcpy(dst, src, n, cudaMemcpyDefault);
 }
-extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { ++stream_sync_calls; return cudaSuccess; }
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
+    ++stream_sync_calls;
+    if (!stream) {
+        ++residency_sync_calls;
+        if (fail_residency_sync) return cudaErrorUnknown;
+        for (const auto& copy : pending_residency_copies) std::memcpy(copy.dst, copy.src, copy.bytes);
+        pending_residency_copies.clear();
+    }
+    return cudaSuccess;
+}
 extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
@@ -288,6 +308,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         std::fill(gdn.begin(),gdn.end(),0xa5); std::fill(history.begin(),history.end(),0xa5);
         ss.ple_prev[0] = ss.ple_prev[1] = -1;
         copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
+        residency_sync_calls = 0; fail_residency_sync = false;
     };
     reset(); fail_sync = 1;
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::transfer_failed,
@@ -308,6 +329,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     reset();
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored,
           "injected host transfer backend completes a valid restore");
+    check(!residency_sync_calls, "fully resident snapshot restore adds no legacy-stream fence");
     check(gdn==image.live.gdn && history==image.live.ple && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
           "successful restore publishes correct running state and PLE window");
     uint64_t fingerprint = 0;
@@ -315,6 +337,28 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     draft.data[0][0] ^= 1;
     check(!conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back detects corrupted draft byte");
     draft.data[0][0] ^= 1;
+    if (experts==256 && !zero_qsa && ple) {
+        // The main layers remain resident; only this draft needs a stream-0
+        // ring repair. A failure must stop before publishing running state.
+        const auto saved = draft.st;
+        Pools authoritative(g,format);
+        std::array<int32_t,24> table{};
+        draft.st.kv_mode=2; draft.st.n_slots=2; draft.st.page_table=table.data();
+        draft.st.host.k_pool=authoritative.st.k_pool; draft.st.host.v_pool=authoritative.st.v_pool;
+        draft.st.host.k_q=authoritative.st.k_q; draft.st.host.v_q=authoritative.st.v_q;
+        draft.st.host.k_scale=authoritative.st.k_scale; draft.st.host.v_scale=authoritative.st.v_scale;
+        draft.st.host.k_q4=authoritative.st.k_q4; draft.st.host.v_q4=authoritative.st.v_q4;
+        reset(); fail_residency_sync=true;
+        check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::transfer_failed &&
+              residency_sync_calls==1 && sync_calls==1 && ss.ple_prev[0]==-1 &&
+              error.find("residency synchronize")!=std::string::npos,
+              "snapshot propagates the draft residency fence failure before restoring running state");
+        reset();
+        check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored &&
+              residency_sync_calls==1,
+              "snapshot completes its draft repair with exactly one legacy-stream fence");
+        draft.st=saved;
+    }
     fail_copy = copy_calls + 1;
     check(!conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back transfer failure is not a successful fingerprint");
     reset(); copied_bytes = 0;
@@ -432,6 +476,44 @@ void ring_refusal(int format) {
               "ring failure stops after a partial repair and never submits the wrapped page");
         fail_copy=0;
     }
+    Pools source(g,format), authoritative(g,format), ring(g,format);
+    for (auto& bytes : source.data) std::fill(bytes.begin(),bytes.end(),0x3c);
+    ring.st.kv_mode=2; ring.st.n_slots=2;
+    std::array<int32_t,24> table{};
+    ring.st.page_table=table.data();
+    ring.st.host.k_pool=authoritative.st.k_pool; ring.st.host.v_pool=authoritative.st.v_pool;
+    ring.st.host.k_q=authoritative.st.k_q; ring.st.host.v_q=authoritative.st.v_q;
+    ring.st.host.k_scale=authoritative.st.k_scale; ring.st.host.v_scale=authoritative.st.v_scale;
+    ring.st.host.k_q4=authoritative.st.k_q4; ring.st.host.v_q4=authoritative.st.v_q4;
+    std::string error;
+    ConversationKv image;
+    check(conversation_kv_save(image,source.st,g,9,false,error),"capture ring completion source");
+    // Model a nonblocking consumer: private-stream copy fences cannot complete
+    // stream-0 repair submissions. Only the residency fence drains this queue.
+    defer_residency_copies=true;
+    for (bool direct : {false,true}) for (bool fail : {false,true}) {
+        copy_calls=sync_calls=stream_sync_calls=residency_sync_calls=fail_copy=fail_sync=0;
+        fail_residency_sync=fail;
+        for (auto& bytes : ring.data) std::fill(bytes.begin(),bytes.end(),0xa5);
+        const bool ok=direct?conversation_kv_copy(source.st,ring.st,g,9,false,error)
+                            :conversation_kv_restore(image,ring.st,g,9,false,error);
+        check(ok!=fail && residency_sync_calls==1 && !sync_calls,
+              "restore and direct copy each own exactly one stream-0 repair fence");
+        if (fail) {
+            check(!pending_residency_copies.empty() && ring.data[0][0]==0xa5 &&
+                  error.find("residency synchronize")!=std::string::npos &&
+                  error.find(cudaGetErrorString(cudaErrorUnknown))!=std::string::npos,
+                  "failed repair completion cannot return success or lose the synchronization error");
+            pending_residency_copies.clear();
+        } else {
+            uint64_t fingerprint=0;
+            check(pending_residency_copies.empty() &&
+                  conversation_kv_verify(image,ring.st,g,9,false,fingerprint,error),
+                  "successful restore completes wrapped ring codes and scales before a nonblocking consumer");
+        }
+    }
+    defer_residency_copies=fail_residency_sync=false;
+    copy_calls=sync_calls=stream_sync_calls=residency_sync_calls=fail_copy=fail_sync=0;
 }
 #endif
 

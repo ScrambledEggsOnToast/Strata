@@ -16,7 +16,8 @@ bool resident_direct_copy_enabled();
 // Copy between existing same-device owners, using their authoritative pools (which
 // may already be mapped host pools). No intermediate image or CPU fallback.
 // Caller joins all consumers and synchronizes before copying and after all layers;
-// false after a write invalidates the destination. Validation performs no CUDA calls.
+// successful copies complete map/ring repair, including on nonblocking consumers.
+// False after a write invalidates the destination. Validation performs no CUDA calls.
 bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                                    int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
@@ -32,7 +33,7 @@ bool conversation_session_copy(const SessionState& from, SessionState& to, const
                                const std::vector<int32_t>& ids, const ConversationCheckpoint* at,
                                std::string& error);
 
-// Caller synchronizes the device before saving, and after restoring all layers.
+// Caller synchronizes the device before saving or restoring into an active owner.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
 // A nonzero unchanged_tokens is valid only for storage retained from an image
@@ -65,10 +66,14 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
+// Success completes authoritative copies and any streaming-map/draft-ring repair;
+// no caller completion fence is needed, even for nonblocking compute streams.
+// Repair submission or synchronization failure returns false and may leave partial
+// state: the destination MUST NOT resume inference.
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error,
                              int64_t captured_tokens = -1);
-// Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
+// Diagnostic read-back after a successful restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
@@ -153,8 +158,10 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
-// Invalid images are rejected before any CUDA call/write. Transfer failure may
-// leave partial state: caller MUST NOT continue inference from that session.
+// Invalid images are rejected before any CUDA call/write. Success includes complete
+// map/ring residency repair, even for nonblocking compute streams. Transfer failure
+// (including repair synchronization) may leave partial state: caller MUST NOT
+// continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);

@@ -127,10 +127,22 @@ bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
                                              std::max<int64_t>(0, end - st.n_slots), end, st.n_slots,
                                              shapes, nullptr, error)) return false;
     }
-    const auto status = cudaGetLastError();
-    if (status == cudaSuccess) return true;
-    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
-    return false;
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+        return false;
+    }
+    // Repairs use stream 0, which a nonblocking compute/copy stream does not
+    // join. Complete them before returning or publishing the restored owner,
+    // without stalling unrelated nonblocking work.
+    if (st.kv_mode != 0) {
+        status = cudaStreamSynchronize((cudaStream_t) 0);
+        if (status != cudaSuccess) {
+            error = std::string("conversation snapshot residency synchronize: ") + cudaGetErrorString(status);
+            return false;
+        }
+    }
+    return true;
 }
 
 bool copy_layout(const QsaState& from, const QsaState& to, const ModelGeometry& g,
@@ -164,18 +176,7 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
             at += bytes;
         }
     }
-    if (!restore_residency(to, g, upto, error)) return false;
-    // Repairs run on the legacy/default stream; synchronize that stream without
-    // stalling unrelated work on MTP's nonblocking consumer stream.
-    // Do not publish the copied owner until its map/ring repair has completed.
-    if (to.kv_mode != 0) {
-        const auto status = cudaStreamSynchronize((cudaStream_t) 0);
-        if (status != cudaSuccess) {
-            error = std::string("resident direct copy residency synchronize: ") + cudaGetErrorString(status);
-            return false;
-        }
-    }
-    return true;
+    return restore_residency(to, g, upto, error);
 }
 
 } // namespace
