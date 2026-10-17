@@ -1,8 +1,11 @@
 """CPU-only regression for opt-in reasoning recovery: python -m unittest serve.test_reasoning_loop_recovery."""
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
+from serve.frontend import ChatTemplate
 from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
-                          reasoning_repeat_coverage, focused_recovery_prompt)
+                          credential_fingerprint, reasoning_repeat_coverage, focused_recovery_prompt)
 
 
 class Tokenizer(ByteTokenizer):
@@ -87,6 +90,53 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(len(engine.sampling_objects), 2)
         self.assertIs(engine.sampling_objects[0], engine.sampling_objects[1])
         self.assertIs(engine.sampling_objects[1], sampler)
+
+    def test_shared_opt_in_drops_stale_bindings_on_recovery_direct_and_prepared(self):
+        for frozen in (False, True):
+            for ordinary in (False, True):
+                with self.subTest(frozen=frozen, ordinary=ordinary):
+                    engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nComplete solution.'])
+                    engine.cache_model_id = "ab" * 32
+                    template = ChatTemplate(Path(__file__).resolve().parent / "chat_template.jinja")
+                    service = Service(engine, self.tok, template)
+                    service.api_key = "client-key"
+                    service.reasoning_loop_recovery = "recover"
+                    record = {"id": "shared-recovery", "_cache_principal":
+                              ("principal", "client-key", credential_fingerprint("client-key"))}
+                    service.lifecycle_local.record = record
+                    body = {"messages": [{"role": "system", "content": HIGH_EFFORT},
+                                         {"role": "user", "content": "Solve this unchanged task"}],
+                            "max_tokens": 40000, "strata_shared_prefix": {"tokens": 100},
+                            "temperature": 1.0, "presence_penalty": 1.5}
+                    if ordinary:
+                        body["strata_prefix"] = {"tokens": 100}
+                        body["_strata_shared_prefix_pin"] = True  # client JSON cannot claim pin provenance
+                    resolved = service.resolve_openai(body, load=False)
+                    with mock.patch.object(service, "scope_key", return_value=bytes(range(32))), \
+                            mock.patch.object(service, "render_identity", return_value="cd" * 32):
+                        if frozen:
+                            prepared = service.freeze_generation(resolved)
+                            self.assertIsNotNone(prepared)
+                            record["_prepared"] = prepared
+                        ids, thinking, wanted = service.prepare(
+                            resolved.messages, resolved.tools, resolved.kw, resolved.max_new_requested,
+                            force=resolved.force, req=resolved.req)
+                    original = dict(resolved.req)
+                    service.lifecycle_local.record = None
+                    events = list(service.run(ids, thinking, [], wanted, resolved.req, threading.Event()))
+                    self.assertEqual(len(engine.calls), 2)
+                    self.assertNotEqual(engine.calls[0][0][:100], engine.calls[1][0][:100])
+                    self.assertEqual(events[-1][1]["reasoning_recoveries"], 1)
+                    first, second = engine.sampling_calls
+                    self.assertRegex(first["_strata_cache_shared_scope"], r"^[0-9a-f]{64}$")
+                    self.assertEqual(first["strata_prefix"], {"tokens": 100})
+                    self.assertNotIn("_strata_cache_shared_scope", second)
+                    self.assertNotIn("_strata_shared_prefix_pin", second)
+                    if ordinary:
+                        self.assertEqual(second["strata_prefix"], {"tokens": 100})
+                    else:
+                        self.assertNotIn("strata_prefix", second)
+                    self.assertEqual(resolved.req, original, "recovery must not mutate the original request")
 
     def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
         engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\nComplete solution.'])

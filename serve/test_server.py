@@ -2022,6 +2022,31 @@ class CrossConversationPrefix(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("different boundary", body["error"]["message"])
 
+    def test_unusable_ordinary_boundary_suppresses_sharing_direct_and_prepared(self):
+        self.svc.lifecycle_local.record["id"] = "unusable-ordinary-boundary"
+        for frozen in (False, True):
+            for ordinary in ({"messages": 3}, {"messages": 9}, {"tokens": 10000},
+                             {"message": 1, "chars": 5000}, {"message": 7, "chars": 3}):
+                with self.subTest(frozen=frozen, ordinary=ordinary), contextlib.redirect_stdout(io.StringIO()):
+                    body = {"messages": SharedPrefix.MSGS, "max_tokens": 4,
+                            "strata_prefix": dict(ordinary), "strata_shared_prefix": {"tokens": 4}}
+                    resolved = self.svc.resolve_openai(body, load=False)
+                    if frozen:
+                        prepared = self.svc.freeze_generation(resolved)
+                        self.assertIsNotNone(prepared)
+                        self.assertEqual(prepared.prefix, {}, "freezing must not substitute the shared pin")
+                        self.assertEqual(resolved.req["strata_prefix"], ordinary, "freezing changed the request")
+                        self.svc.lifecycle_local.record["_prepared"] = prepared
+                    with mock.patch.object(self.svc, "encode_prompt", wraps=self.svc.encode_prompt) as encoded:
+                        self.svc.prepare(resolved.messages, resolved.tools, resolved.kw, resolved.max_new_requested,
+                                         force=resolved.force, req=resolved.req)
+                    self.assertEqual(encoded.call_count, 0 if frozen else 1)
+                    self.assertEqual(resolved.req["strata_prefix"], {})
+                    self.assertEqual(resolved.req["strata_shared_prefix"], {})
+                    self.assertNotIn("_strata_cache_shared_scope", resolved.req)
+                    keys = StrataEngine.sampling_keys(resolved.req).split()
+                    self.assertFalse(any(key.startswith(("sscope=", "pin=")) for key in keys))
+
     def test_bad_shared_specs_name_the_public_field_and_unusable_heads_only_drop_sharing(self):
         for bad in ({"messages": 0}, {"messages": "2"}, {"messages": True}, {"tokens": 1.5}, {"x": 1},
                     {"messages": 1, "tokens": 2}, {"message": 1}, {"chars": 3}, {"message": -1, "chars": 3}, [], "pin", {}):
@@ -2039,7 +2064,7 @@ class CrossConversationPrefix(unittest.TestCase):
                 self.assertIn("strata_shared_prefix", log.getvalue())
 
     def test_client_internal_scope_is_stripped_even_without_the_public_opt_in(self):
-        request = {"_strata_cache_shared_scope": "de" * 32}
+        request = {"_strata_cache_shared_scope": "de" * 32, "_strata_shared_prefix_pin": True}
         self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
         self.assertEqual(request, {})
         request = {"strata_shared_prefix": {"tokens": 4}, "_strata_cache_shared_scope": "de" * 32}

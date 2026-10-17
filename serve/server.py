@@ -5529,8 +5529,11 @@ class Service:
         """
         record = getattr(self.lifecycle_local, "record", None)
         self.lifecycle_local.render_fallback = False
+        # Capture the client's ordinary boundary before a frozen shared-only pin is applied.
+        ordinary_prefix_supplied = req is not None and req.get("strata_prefix") is not None
         if req is not None:
             req.pop("_strata_cache_shared_scope", None)
+            req.pop("_strata_shared_prefix_pin", None)  # provenance is internal, never client-authored
         prepared = self.take_prepared(record, messages, tools, kwargs, max_new, force, req=req)
         if prepared is not None:
             self.embeddings.path = None       # a prepared request is text-only (see resolve_for_offer)
@@ -5538,7 +5541,8 @@ class Service:
             if req is not None:
                 self.bind_offer(req, prepared, record=record)
                 prepared.apply_to(req)        # the pin boundary the store was offered, not a second resolution
-                self.resolve_shared_prefix(req, messages, tools, kwargs, ids)
+                self.resolve_shared_prefix(req, messages, tools, kwargs, ids,
+                                           ordinary_prefix_supplied=ordinary_prefix_supplied)
             prepared.release()                # the demand owns the tokens now: the request keeps only the offer
             return ids, thinking, wanted
         if req is not None:
@@ -5639,12 +5643,14 @@ class Service:
                 return None
             req["strata_prefix"] = prefix
         if req is not None and not self.resolve_shared_prefix(
-                req, messages, tools, kwargs, ids, shared_has_images, limit):
+                req, messages, tools, kwargs, ids, shared_has_images, limit,
+                ordinary_prefix_supplied=ordinary_prefix_supplied):
             return None
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def resolve_shared_prefix(self, req, messages, tools, kwargs, ids, has_images=False, limit=None) -> bool:
-        """Resolve the public opt-in using the existing pin seam; over-budget preparation never publishes a scope."""
+    def resolve_shared_prefix(self, req, messages, tools, kwargs, ids, has_images=False, limit=None, *,
+                              ordinary_prefix_supplied: bool) -> bool:
+        """Resolve sharing without replacing an unusable ordinary pin; track shared-only pins for prompt recovery."""
         spec = req.get("strata_shared_prefix")
         if spec is None:
             return True
@@ -5656,8 +5662,15 @@ class Service:
         if not prefix:
             return True
         private = req.get("strata_prefix")
-        if isinstance(private, dict) and private.get("tokens") is not None and private != prefix:
-            raise ValueError("strata_shared_prefix: resolves to a different boundary than strata_prefix")
+        if ordinary_prefix_supplied:
+            if not private:
+                req["strata_shared_prefix"] = {}
+                print("[strata] strata_shared_prefix ignored: strata_prefix has no usable boundary", flush=True)
+                return True
+            if private != prefix:
+                raise ValueError("strata_shared_prefix: resolves to a different boundary than strata_prefix")
+        else:
+            req["_strata_shared_prefix_pin"] = True
         req["strata_prefix"] = dict(prefix)
         record = getattr(self.lifecycle_local, "record", None)
         scope = self.shared_cache_scope(
@@ -6129,6 +6142,14 @@ class Service:
                             break
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
+                            # The effort splice changes authenticated prefix tokens. Never reuse their old scope;
+                            # an independently requested ordinary pin retains its existing recovery semantics.
+                            if sampling and ("_strata_cache_shared_scope" in sampling
+                                             or sampling.get("_strata_shared_prefix_pin")):
+                                sampling = dict(sampling)
+                                sampling.pop("_strata_cache_shared_scope", None)
+                                if sampling.pop("_strata_shared_prefix_pin", False):
+                                    sampling.pop("strata_prefix", None)
                             # Only the two settings that keep the same words coming are raised (temperature to at
                             # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
                             # touched, and its own request dict is copied, not changed.
