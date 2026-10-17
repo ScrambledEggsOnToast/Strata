@@ -121,7 +121,8 @@ class NvmlOwnership(unittest.TestCase):
             service.append(svc)
             return real_serve(svc, **kwargs)
 
-        def close_engine():
+        def close_engine(*, timeout_s):
+            self.assertEqual(timeout_s, server.SHUTDOWN_WAIT_S)
             lib.nvmlShutdown.assert_called_once_with()
             self.assertFalse(service[0].telemetry._thread.is_alive())
 
@@ -139,7 +140,7 @@ class NvmlOwnership(unittest.TestCase):
             self.assertEqual(server.main(), 0)
         lib.nvmlInit_v2.assert_called_once_with()
         lib.nvmlShutdown.assert_called_once_with()
-        engine.close.assert_called_once_with()
+        engine.close.assert_called_once_with(timeout_s=server.SHUTDOWN_WAIT_S)
 
 
 class SamplerOwnership(unittest.TestCase):
