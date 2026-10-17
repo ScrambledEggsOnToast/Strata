@@ -11554,6 +11554,57 @@ int main(int argc, char** argv) {
                          (unsigned long long) query.request_id, (unsigned long long) now_ns());
             strata::core::ConversationStoreRead read;
             const uint64_t wait_started = now_ns();
+            strata::core::ConversationStoreReadProgress previous_progress;
+            bool observed_progress = false;
+            const auto observe_restore = [&] {
+                const auto current = conversation_store->request_progress(query.request_id, query.generation);
+                const bool advanced = current.acknowledged_after(previous_progress);
+                const bool changed = !observed_progress || current.attempt_id != previous_progress.attempt_id ||
+                    current.state != previous_progress.state || current.status != previous_progress.status ||
+                    current.totals_known != previous_progress.totals_known;
+                if (changed) {
+                    using State = strata::core::ConversationStoreReadState;
+                    const char* where = "request: restore unknown";
+                    switch (current.state) {
+                        case State::queued: where = "request: restore queued"; break;
+                        case State::materializing: where = "request: restore materializing"; break;
+                        case State::settled: where = "request: restore settled"; break;
+                        case State::handed_out: where = "request: restore handed_out"; break;
+                        case State::released: where = "request: restore released"; break;
+                        case State::unknown: break;
+                    }
+                    strata::core::progress_at(where);
+                }
+                if (advanced) strata::core::progress_beat(); // verified bytes only; a wake/timer/state is not work
+                if (changed || advanced) {
+                    using Component = strata::core::ConversationStoreReadComponent;
+                    const auto& metadata = current.components[size_t(Component::metadata)];
+                    const auto& recurrent = current.components[size_t(Component::recurrent)];
+                    const auto& ple = current.components[size_t(Component::ple)];
+                    const auto& indexer = current.components[size_t(Component::indexer)];
+                    const auto& main_kv = current.components[size_t(Component::main_kv)];
+                    const auto& draft = current.components[size_t(Component::draft)];
+                    std::fprintf(stderr, "strata serve: conversation store: restore progress request=%llu "
+                                         "generation=%llu attempt=%llu head=%llu state=%s status=%s totals_known=%d "
+                                         "metadata=%llu/%llu recurrent=%llu/%llu ple=%llu/%llu indexer=%llu/%llu "
+                                         "main_kv=%llu/%llu draft=%llu/%llu\n",
+                                 (unsigned long long) query.request_id, (unsigned long long) query.generation,
+                                 (unsigned long long) current.attempt_id, (unsigned long long) current.head_id,
+                                 strata::core::conversation_store_read_state_name(current.state),
+                                 strata::core::conversation_store_read_status_name(current.status),
+                                 int(current.totals_known),
+                                 (unsigned long long) metadata.acknowledged, (unsigned long long) metadata.total,
+                                 (unsigned long long) recurrent.acknowledged, (unsigned long long) recurrent.total,
+                                 (unsigned long long) ple.acknowledged, (unsigned long long) ple.total,
+                                 (unsigned long long) indexer.acknowledged, (unsigned long long) indexer.total,
+                                 (unsigned long long) main_kv.acknowledged, (unsigned long long) main_kv.total,
+                                 (unsigned long long) draft.acknowledged, (unsigned long long) draft.total);
+                }
+                previous_progress = current;
+                observed_progress = true;
+                return current;
+            };
+            (void) observe_restore();
             for (;;) {
                 if (cancelled()) {
                     conversation_store->cancel_read(query.request_id, query.generation);
@@ -11566,12 +11617,20 @@ int main(int argc, char** argv) {
                 const uint64_t now = now_ns();
                 if (now >= wait_until) break;
                 const uint64_t slice_ms = std::min<uint64_t>(250, (wait_until - now) / 1000000ull + 1);
-                if (conversation_store->wait_ready(query.request_id, query.generation, read, slice_ms)) break;
-                const auto status = conversation_store->request_status(query.request_id, query.generation);
-                if (status != strata::core::ConversationStoreReadStatus::none &&
-                    status != strata::core::ConversationStoreReadStatus::ready) {
-                    read.status = status;
-                    break; // A terminal refusal/cancellation cannot become a deliverable image.
+                const bool delivered = conversation_store->wait_ready(query.request_id, query.generation, read, slice_ms);
+                const auto current = observe_restore();
+                if (delivered) break; // only delivery, never a wake or terminal state, supplied the whole image
+                // Settlement can race the timeout-to-snapshot gap. Try real delivery once more rather than
+                // interpreting a ready snapshot as an image or abandoning a completion that just became available.
+                if (current.state == strata::core::ConversationStoreReadState::settled &&
+                    conversation_store->take_ready(query.request_id, query.generation, read)) {
+                    (void) observe_restore();
+                    break;
+                }
+                if (current.state != strata::core::ConversationStoreReadState::queued &&
+                    current.state != strata::core::ConversationStoreReadState::materializing) {
+                    read.status = current.status;
+                    break; // false is ambiguous: settled/handed/released/unknown cannot be waited into success
                 }
             }
             if (read.status != strata::core::ConversationStoreReadStatus::ready || !read.image) {

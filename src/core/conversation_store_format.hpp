@@ -308,6 +308,12 @@ Digest object_scope_digest(uint16_t kind, const KvMeta* kv, const ConversationSc
 bool stream_object_identity(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
                             const Digest& model, Digest& scope, uint64_t& ordinal, std::string& why);
 
+// Allocation-free restore diagnostics. Classification shares the physical object's draft-ordinal rule; totals
+// include every declared logical stream once and the validated manifest bytes, never unique-object accounting.
+ConversationStoreReadComponent stream_read_component(uint16_t kind, uint64_t object_ordinal);
+bool restore_progress_totals(const ManifestMeta& meta, uint64_t encoded_bytes,
+                             ConversationStoreReadProgress& out, std::string& why);
+
 // Exact authorized-prefix digests of one token/image prefix, at the cut lengths a lookup needs.  Built once per
 // record (publish) or per query (lookup), then asked for any prefix length: the chain states at the image positions
 // make each answer O(the tokens since the last image), and the full prefix is already recorded.  The caller keeps the

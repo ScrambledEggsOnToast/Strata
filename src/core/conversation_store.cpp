@@ -880,6 +880,7 @@ struct ConversationStore::Impl {
         uint32_t stages = 0;
         uint64_t payload_bytes = 0;
         double materialize_ms = 0;
+        ConversationStoreReadProgress progress; // fixed-size counters, protected by the existing catalog mutex
         std::shared_ptr<const SavedConversation> image;
         std::string detail;
         // Diagnostic scalars only. They do not participate in cancellation, admission or accounting.
@@ -892,6 +893,7 @@ struct ConversationStore::Impl {
         bool trace_io_attempted = false;
         uint64_t trace_bytes_read = 0;
     };
+    static_assert(sizeof(ReadJob) <= kJobFixedOverhead, "read progress must fit the admitted descriptor overhead");
     std::vector<std::shared_ptr<ReadJob>> jobs;      // queued, active, ready or handed out (bounded)
     std::deque<std::shared_ptr<ReadJob>> queue;      // waiting for the allowance and a slot (demand before prefetch)
     std::deque<std::shared_ptr<ReadJob>> ready;      // settled, waiting for take_ready()
@@ -899,6 +901,8 @@ struct ConversationStore::Impl {
 #ifdef STRATA_STORE_TEST_HOOKS
     void (*read_gate)(void*) = nullptr;
     void* read_gate_context = nullptr;
+    void (*read_progress_gate)(void*) = nullptr;
+    void* read_progress_gate_context = nullptr;
     void (*catalog_gate)(void*, bool) = nullptr;
     void* catalog_gate_context = nullptr;
 #endif
@@ -2832,9 +2836,12 @@ void ConversationStore::Impl::trace_refusal_locked(StoreReadTraceBatch& trace, c
     trace.add(record);
 }
 
+// The real attempt boundary also owns always-on byte progress; opt-in timing uses that same identity.
 void ConversationStore::Impl::trace_begin_locked(ReadJob& job, uint64_t previous) {
+    job.progress = {};
+    job.progress.attempt_id = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!read_timing) return;
-    job.trace_attempt = store_read_attempt.fetch_add(1, std::memory_order_relaxed) + 1;
+    job.trace_attempt = job.progress.attempt_id;
     job.trace_previous = previous;
     job.trace_enqueue = store_timing_ns();
     job.trace_admit = job.trace_start = job.trace_finish = job.trace_ready = 0;
@@ -3538,6 +3545,10 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     };
     Digest manifest_id{};
     uint64_t manifest_bytes = 0;
+#ifdef STRATA_STORE_TEST_HOOKS
+    void (*progress_gate)(void*) = nullptr;
+    void* progress_gate_context = nullptr;
+#endif
     {
         StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (read_timing) job->trace_start = started;
@@ -3561,6 +3572,10 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         }
         manifest_id = job->manifest_id;
         manifest_bytes = job->manifest_bytes;
+#ifdef STRATA_STORE_TEST_HOOKS
+        progress_gate = read_progress_gate;
+        progress_gate_context = read_progress_gate_context;
+#endif
         if (read_timing) job->trace_io_attempted = true;
     }
     const uint64_t materialize_started = store_timing_ns();
@@ -3637,6 +3652,11 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
         stop_with(ConversationStoreReadStatus::missing, "the stored image no longer holds that cut");
         return;
     }
+    ConversationStoreReadProgress decoded_progress;
+    if (!conversation_store_detail::restore_progress_totals(meta, raw.size(), decoded_progress, why)) {
+        stop_with(ConversationStoreReadStatus::corrupt, why);
+        return;
+    }
     // The exact figure the restore will hold, computed from the decoded metadata before any of it is allocated: a
     // read whose restored image would not fit the published allowance fails here and is never charged past it.
     const uint64_t scaffolding = uint64_t(meta.streams.size()) *
@@ -3648,6 +3668,10 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
     {
         StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
         if (job->cancelled.load()) return;
+        // The manifest is byte-verified, decoded and bound to this query. Publish its exact component totals and
+        // acknowledge only that validated metadata; none of the payload targets is visible to the owner.
+        job->progress.components = decoded_progress.components;
+        job->progress.totals_known = true;
         // Retain the decoded peak even on refusal, so a smaller allowance
         // increase cannot reissue the same manifest read and fail again.
         job->peak_bytes = std::max(job->peak_bytes, needed);
@@ -3675,6 +3699,9 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
             job->prepared_bytes = prepared;
         }
     }
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (progress_gate) progress_gate(progress_gate_context);
+#endif
     std::vector<conversation_store_detail::RestoreTarget> targets;
     SavedConversation image;
     if (!conversation_store_detail::restore_prepare(meta, limits, image, targets, why)) {
@@ -3693,6 +3720,7 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
             stop_with(ConversationStoreReadStatus::corrupt, why);
             return;
         }
+        const size_t component = size_t(conversation_store_detail::stream_read_component(id.kind, identity_ordinal));
         for (const auto& chunk : meta.streams[i].chunks) {
             if (job->cancelled.load()) return;
             {
@@ -3726,8 +3754,14 @@ void ConversationStore::Impl::read_body(const std::shared_ptr<ReadJob>& job, Rea
                 StoreReadTimedLock guard(mutex, read_timing, job->trace_body_lock_wait);
                 counters.bytes_read += chunk.length;
                 if (read_timing) job->trace_bytes_read += chunk.length;
+                // hash_and_copy_object and the content-address comparison both succeeded. A wake, read attempt,
+                // short read or failed digest never acknowledges even a partially copied chunk.
+                job->progress.components[component].acknowledged += chunk.length;
             }
             source_bytes_read += chunk.length;
+#ifdef STRATA_STORE_TEST_HOOKS
+            if (progress_gate) progress_gate(progress_gate_context);
+#endif
         }
     }
     conversation_store_detail::restore_finish(image);
@@ -5111,6 +5145,26 @@ ConversationStoreReadStatus ConversationStore::request_status(uint64_t request_i
     return ConversationStoreReadStatus::none;
 }
 
+ConversationStoreReadProgress ConversationStore::request_progress(uint64_t request_id, uint64_t generation) const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    const Impl::ReadJob* found = nullptr;
+    for (const auto& job : impl_->jobs) {
+        if (job->query.request_id != request_id || job->query.generation != generation) continue;
+        found = job.get();
+        if (!job->released) break; // a new owner can reuse an identity while its old released worker unwinds
+    }
+    if (!found) return {};
+    auto out = found->progress;
+    out.status = found->status;
+    out.head_id = found->head_id;
+    out.state = found->released ? ConversationStoreReadState::released :
+        found->handed ? ConversationStoreReadState::handed_out :
+        found->active ? ConversationStoreReadState::materializing :
+        found->status == ConversationStoreReadStatus::none ? ConversationStoreReadState::queued :
+        ConversationStoreReadState::settled;
+    return out;
+}
+
 void ConversationStore::confirmed_restore(uint64_t head_id) {
     Impl& self = *impl_;
     std::lock_guard<std::mutex> guard(self.mutex);
@@ -5674,6 +5728,12 @@ void ConversationStore::set_read_gate_for_test(void (*gate)(void*), void* contex
     impl_->read_gate_context = context;
 }
 
+void ConversationStore::set_read_progress_gate_for_test(void (*gate)(void*), void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->read_progress_gate = gate;
+    impl_->read_progress_gate_context = context;
+}
+
 void ConversationStore::set_catalog_gate_for_test(void (*gate)(void*, bool), void* context) {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     impl_->catalog_gate = gate;
@@ -5704,6 +5764,18 @@ const char* conversation_store_read_status_name(ConversationStoreReadStatus stat
         case ConversationStoreReadStatus::refused_limits: return "refused_limits";
         case ConversationStoreReadStatus::failed: return "failed";
         case ConversationStoreReadStatus::disabled: return "disabled";
+    }
+    return "unknown";
+}
+
+const char* conversation_store_read_state_name(ConversationStoreReadState state) {
+    switch (state) {
+        case ConversationStoreReadState::unknown: return "unknown";
+        case ConversationStoreReadState::queued: return "queued";
+        case ConversationStoreReadState::materializing: return "materializing";
+        case ConversationStoreReadState::settled: return "settled";
+        case ConversationStoreReadState::handed_out: return "handed_out";
+        case ConversationStoreReadState::released: return "released";
     }
     return "unknown";
 }

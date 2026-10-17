@@ -638,6 +638,9 @@ void check_zero_allowance_adoption_controls();
 void check_demand_reclaim_interleavings();
 void check_cancel_and_release();
 void check_read_timing();
+void check_read_progress();
+void check_read_progress_failures();
+void check_read_progress_reissue();
 void check_revoked_prefetch_demand();
 void check_active_prefetch_replacement();
 void check_prefetch_catalog_refresh();
@@ -737,6 +740,14 @@ int main() {
         std::printf("conversation_store_test lifetime: %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
     }
+    if (::getenv("STRATA_STORE_PROGRESS_ONLY")) {
+        check_read_progress();
+        check_read_progress_failures();
+        check_read_progress_reissue();
+        check_budget_deferred_expanded_peak();
+        std::printf("conversation_store_test progress: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     check_crypto();
     check_layout();
     check_identity();
@@ -771,6 +782,9 @@ int main() {
     check_cancel_and_release();
     check_revoked_prefetch_demand();
     check_read_timing();
+    check_read_progress();
+    check_read_progress_failures();
+    check_read_progress_reissue();
     check_active_prefetch_replacement();
     check_prefetch_catalog_refresh();
     check_prefetch_catalog_reuse_and_cancel();
@@ -2637,6 +2651,289 @@ struct SelectedHoldGate {
     }
 };
 
+// Each permit releases one actual acknowledgement, not a timer. The metadata notification is first, followed by
+// exactly one notification per verified/copied chunk; no callback exists in production.
+struct ReadProgressGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t reached = 0, permitted = 0;
+    bool open = false, timed_out = false;
+    void pause() {
+        std::unique_lock<std::mutex> lock(mutex);
+        const uint64_t step = ++reached;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(5), [&] { return open || permitted >= step; })) timed_out = true;
+    }
+    bool await(uint64_t step) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool entered = cv.wait_for(lock, std::chrono::seconds(5), [&] { return reached >= step; });
+        check(entered, "the progress test reaches its actual acknowledgement seam");
+        return entered;
+    }
+    void permit(uint64_t step) {
+        std::lock_guard<std::mutex> lock(mutex);
+        permitted = step;
+        cv.notify_all();
+    }
+    void resume() {
+        std::lock_guard<std::mutex> lock(mutex);
+        open = true;
+        cv.notify_all();
+    }
+};
+
+void check_read_progress() {
+    using State = ConversationStoreReadState;
+    using Component = ConversationStoreReadComponent;
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    auto image = split_fixture(971, 257, 3);
+    image.stage_images.back().kv.push_back(image.stage_images.back().kv.front()); // extra pool = draft
+    for (auto* stage : {&image, &image.stage_images[0], &image.stage_images[1]})
+        for (auto& kv : stage->kv) kv.pooled.resize(9, 0x4a);
+    ConversationStorePublishResult stored;
+    check(publish_and_wait(store, image, 1, 1, stored), "the component-progress split image is stored");
+    const auto manifests = directory_names(root.path + "/manifests");
+    struct stat info {};
+    check(manifests.size() == 1 && ::stat((root.path + "/manifests/" + manifests.front()).c_str(), &info) == 0,
+          "the progress fixture has one actual encoded manifest");
+    const uint64_t manifest_bytes = uint64_t(info.st_size);
+    std::array<uint64_t, size_t(Component::count)> expected{};
+    expected[size_t(Component::metadata)] = manifest_bytes;
+    const auto add_record = [&](const ConversationCheckpoint& record) {
+        expected[size_t(Component::metadata)] += record.ids.size() * sizeof(int32_t) +
+                                                record.imgs.size() * sizeof(ConversationImageKey);
+        expected[size_t(Component::recurrent)] += record.gdn.size();
+        expected[size_t(Component::ple)] += record.ple.size();
+        expected[size_t(Component::indexer)] += record.tails.size() + record.dead.size() + record.block_pos.size();
+    };
+    for (const auto* stage : {&image, &image.stage_images[0], &image.stage_images[1]}) {
+        add_record(stage->live);
+        for (const auto& checkpoint : stage->checkpoints) add_record(checkpoint);
+        for (size_t i = 0; i < stage->kv.size(); ++i) {
+            const auto& kv = stage->kv[i];
+            const bool draft = stage == &image.stage_images.back() && i == 1;
+            expected[size_t(draft ? Component::draft : Component::main_kv)] +=
+                kv.k.size() + kv.v.size() + kv.k_scale.size() + kv.v_scale.size();
+            expected[size_t(draft ? Component::draft : Component::indexer)] += kv.pooled.size();
+        }
+    }
+    uint64_t notifications = 1;
+    for (const auto& stream : conversation_store_streams(image))
+        notifications += (stream.bytes + 4095) / 4096;
+
+    const auto unknown = store.request_progress(2, 1);
+    ConversationStoreRead read;
+    check(unknown.state == State::unknown && !unknown.attempt_id &&
+              !store.wait_ready(2, 1, read, 0), "an unknown request is not a successful wait");
+    store.suspend_read_admission();
+    std::string why;
+    check(store.demand(query_of(image, 2, 1), why), "the component-progress demand owns a queued descriptor");
+    const auto queued = store.request_progress(2, 1);
+    check(queued.state == State::queued && queued.status == ConversationStoreReadStatus::none &&
+              queued.attempt_id && !queued.totals_known, "queued ownership is distinct from an unknown request");
+    check(!store.wait_ready(2, 1, read, 1) &&
+              !store.request_progress(2, 1).acknowledged_after(queued),
+          "a queue timer cannot report delivery or acknowledged progress");
+    SelectedHoldGate start;
+    ReadProgressGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &start);
+    store.set_read_progress_gate_for_test([](void* p) { static_cast<ReadProgressGate*>(p)->pause(); }, &gate);
+    store.publish_read_allowance(uint64_t(64) << 20);
+    start.await();
+    const auto active = store.request_progress(2, 1);
+    check(active.state == State::materializing && active.attempt_id == queued.attempt_id &&
+              !active.totals_known && !active.acknowledged_after(queued),
+          "a reader reservation is materializing, not acknowledged I/O");
+    check(!store.wait_ready(2, 1, read, 1) &&
+              !store.request_progress(2, 1).acknowledged_after(active) && !read.image,
+          "a no-I/O worker stall stays invisible to the engine's byte-only heartbeat predicate");
+    start.resume();
+    auto previous = active;
+    for (uint64_t step = 1; step <= notifications; ++step) {
+        if (!gate.await(step)) break;
+        const auto current = store.request_progress(2, 1);
+        check(current.state == State::materializing && current.totals_known &&
+                  current.attempt_id == active.attempt_id, "partial progress cannot settle or replace the image");
+        check(current.acknowledged_after(previous), "each verification seam advances real acknowledged bytes");
+        for (size_t i = 0; i < current.components.size(); ++i) {
+            check_eq(current.components[i].total, expected[i], "component totals match the actual all-stage payload");
+            check(current.components[i].acknowledged >= previous.components[i].acknowledged &&
+                      current.components[i].acknowledged <= current.components[i].total,
+                  "each component's acknowledged count is monotonic and bounded within the attempt");
+        }
+        if (step == 1)
+            check_eq(current.components[size_t(Component::metadata)].acknowledged, manifest_bytes,
+                     "only the validated manifest is acknowledged before the first object");
+        check(!store.wait_ready(2, 1, read, 1) && !read.image &&
+                  !store.request_progress(2, 1).acknowledged_after(current),
+              "repeated polls/timers cannot mount a partial image or manufacture progress");
+        previous = current;
+        gate.permit(step);
+    }
+    gate.resume();
+    check(await_status(store, 2, 1, ConversationStoreReadStatus::ready), "the complete materialization settles");
+    const auto settled = store.request_progress(2, 1);
+    check(settled.state == State::settled && settled.status == ConversationStoreReadStatus::ready,
+          "successful settlement precedes whole-image hand-over");
+    for (size_t i = 0; i < settled.components.size(); ++i) {
+        check(expected[i] != 0, "the fixture exercises every restore component");
+        check_eq(settled.components[i].acknowledged, expected[i], "terminal success acknowledges each entire component");
+    }
+    check(store.take_ready(2, 1, read) && read.image && images_equal(*read.image, image, why),
+          "only the complete verified all-stage image is handed out");
+    const auto handed = store.request_progress(2, 1);
+    check(handed.state == State::handed_out && handed.components == settled.components &&
+              !handed.acknowledged_after(settled), "hand-over changes ownership, not acknowledged byte progress");
+    check(!store.wait_ready(2, 1, read, 0), "a handed-out image cannot be delivered twice");
+    read.image.reset();
+    store.release_read(2, 1);
+    check(store.request_progress(2, 1).state == State::unknown,
+          "a settled release erases the descriptor instead of retaining a tombstone");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    store.set_read_progress_gate_for_test(nullptr, nullptr);
+    store.close();
+    check(!start.timed_out && !gate.timed_out, "all real progress gates were released explicitly");
+}
+
+void check_read_progress_failures() {
+    using State = ConversationStoreReadState;
+    using Component = ConversationStoreReadComponent;
+    for (int damage = 0; damage < 3; ++damage) {
+        TempRoot root;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const auto image = fixture(973, 1025, 1);
+        ConversationStorePublishResult stored;
+        check(publish_and_wait(store, image, 1, 1, stored), "the progress-corruption fixture is stored");
+        const auto manifests = directory_names(root.path + "/manifests");
+        if (manifests.empty()) { check(false, "the damage fixture needs its manifest"); continue; }
+        const std::string manifest = root.path + "/manifests/" + manifests.front();
+        struct stat info {};
+        check(::stat(manifest.c_str(), &info) == 0, "the actual manifest byte count is available");
+        std::string victim = manifest;
+        if (damage != 2) {
+            std::pair<Digest, uint64_t> identity;
+            const ConversationStoreStreamId ids{0, uint16_t(ConversationStoreStreamKind::ids), 0, 0};
+            std::string why;
+            check(identity_of(image, ids, identity, why), "the first token chunk's physical identity is known");
+            const auto hash = conversation_store_detail::object_digest(
+                identity.first, ids.kind, identity.second, 4096,
+                reinterpret_cast<const uint8_t*>(image.live.ids.data()));
+            const std::string name = sha256_hex(hash);
+            victim = root.path + "/objects/" + name.substr(0, 2) + "/" + name;
+        }
+        const int fd = ::open(victim.c_str(), O_RDWR | O_CLOEXEC);
+        check(fd >= 0, "the exact first object or manifest opens for deterministic damage");
+        if (fd >= 0) {
+            if (damage == 1) check(::ftruncate(fd, 0) == 0, "a short object is introduced");
+            else {
+                uint8_t byte = 0;
+                check(::pread(fd, &byte, 1, 0) == 1, "the damaged byte is read");
+                byte ^= 0x80;
+                check(::pwrite(fd, &byte, 1, 0) == 1, "a same-length digest mismatch is introduced");
+            }
+            ::close(fd);
+        }
+        std::string why;
+        check(store.demand(query_of(image, 2, 1), why), "the damaged image's demand owns its descriptor");
+        check(await_status(store, 2, 1, ConversationStoreReadStatus::corrupt), "the failed verification settles");
+        const auto failed = store.request_progress(2, 1);
+        check(failed.state == State::settled && failed.status == ConversationStoreReadStatus::corrupt,
+              "settled is not synonymous with ready");
+        check(failed.totals_known == (damage != 2), "a corrupt manifest never publishes trusted component totals");
+        for (size_t i = 0; i < failed.components.size(); ++i) {
+            const uint64_t expected = damage != 2 && i == size_t(Component::metadata) ? uint64_t(info.st_size) : 0;
+            check_eq(failed.components[i].acknowledged, expected,
+                     "a failed copy/digest acknowledges no byte of its chunk");
+            check(failed.components[i].acknowledged <= failed.components[i].total,
+                  "failure keeps all component counters bounded");
+        }
+        ConversationStoreRead read;
+        check(store.wait_ready(2, 1, read, 0) && read.status == ConversationStoreReadStatus::corrupt && !read.image,
+              "a delivered terminal failure never exposes its partially written target");
+        store.release_read(2, 1);
+        store.close();
+    }
+
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const auto image = fixture(975, 64);
+    ConversationStorePublishResult stored;
+    check(publish_and_wait(store, image, 1, 1, stored), "the cancellation-progress image is stored");
+    store.suspend_read_admission();
+    std::string why;
+    check(store.demand(query_of(image, 2, 1), why), "a queued cancellation owns a descriptor");
+    const auto queued = store.request_progress(2, 1);
+    store.cancel_read(2, 1);
+    ConversationStoreRead read;
+    const auto cancelled = store.request_progress(2, 1);
+    check(!store.wait_ready(2, 1, read, 0) && cancelled.state == State::settled &&
+              cancelled.status == ConversationStoreReadStatus::cancelled &&
+              !cancelled.acknowledged_after(queued), "false also describes settled undeliverable cancellation");
+    store.release_read(2, 1);
+    SelectedHoldGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+    store.publish_read_allowance(uint64_t(64) << 20);
+    check(store.demand(query_of(image, 3, 1), why), "an active release owns its allocation frame");
+    gate.await();
+    const auto active = store.request_progress(3, 1);
+    store.release_read(3, 1);
+    const auto released = store.request_progress(3, 1);
+    check(released.state == State::released && !released.acknowledged_after(active) &&
+              !store.wait_ready(3, 1, read, 0), "released ownership is observable only while the active frame unwinds");
+    check(store.demand(query_of(image, 3, 1), why), "a fresh owner can reuse an actively released identifier");
+    const auto replacement = store.request_progress(3, 1);
+    check(replacement.state == State::queued && replacement.attempt_id != released.attempt_id &&
+              !replacement.acknowledged_after(released), "polling prefers the fresh owner, not its old released worker");
+    store.cancel_read(3, 1);
+    store.release_read(3, 1);
+    gate.resume();
+    store.set_read_gate_for_test(nullptr, nullptr);
+    store.close();
+    check(store.request_progress(3, 1).state == State::unknown && !gate.timed_out,
+          "unwinding the released frame erases its bounded diagnostic state");
+}
+
+void check_read_progress_reissue() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+    const auto old_image = fixture(977, 128);
+    const auto new_image = appended_turn(old_image, 256, 977);
+    ConversationStorePublishResult old_head, new_head;
+    check(publish_and_wait(store, old_image, 1, 1, old_head), "the earlier progress cut is stored");
+    const auto query = query_of(new_image, 3, 1);
+    std::string why;
+    check(store.prefetch(query, why) && await_status(store, 3, 1, ConversationStoreReadStatus::ready),
+          "the earlier selected attempt fully materializes");
+    const auto previous = store.request_progress(3, 1);
+    check(previous.totals_known && previous.components[0].acknowledged > 0, "the old attempt had real progress");
+    check(publish_and_wait(store, new_image, 2, 2, new_head), "a longer eligible image is published");
+    SelectedHoldGate gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &gate);
+    check(store.demand(query, why), "demand reissues the revoked earlier selection");
+    gate.await();
+    const auto retry = store.request_progress(3, 1);
+    check(retry.state == ConversationStoreReadState::materializing && retry.attempt_id != previous.attempt_id &&
+              retry.head_id == new_head.head_id && !retry.totals_known && !retry.acknowledged_after(previous),
+          "a real reissue binds a new attempt/manifest without crediting discarded bytes");
+    for (const auto& component : retry.components)
+        check(component.total == 0 && component.acknowledged == 0, "reissue resets every component together");
+    gate.resume();
+    ConversationStoreRead read;
+    check(store.wait_ready(3, 1, read, 5000) && read.image && images_equal(*read.image, new_image, why),
+          "the reissued read still delivers exactly one complete image");
+    const auto ready = store.request_progress(3, 1);
+    check(ready.attempt_id == retry.attempt_id && ready.acknowledged_after(retry),
+          "the new attempt's verified bytes, not its wakeup, count as progress");
+    for (const auto& component : ready.components)
+        check_eq(component.acknowledged, component.total, "the new successful attempt completes all components");
+    read.image.reset();
+    store.release_read(3, 1);
+    store.set_read_gate_for_test(nullptr, nullptr);
+    store.close();
+    check(!gate.timed_out, "the replacement attempt's real worker was explicitly released");
+}
+
 // Each permit releases one real transaction seam. A timeout is only a deadlock guard; assertions below observe
 // reached seams, committed results and joined workers, never the absence of progress during a guessed delay.
 struct PromotionCatalogGate {
@@ -3802,6 +4099,10 @@ void check_budget_deferred_expanded_peak() {
           "decoded restore scaffolding exceeds the original read reservation");
     store.set_read_gate_for_test(nullptr, nullptr);
     check(!gate.timed_out, "the expanded-peak reader was released explicitly");
+    const auto refused_progress = store.request_progress(935, 1);
+    check(refused_progress.state == ConversationStoreReadState::settled && refused_progress.totals_known &&
+              refused_progress.components[0].acknowledged > 0,
+          "a decoded budget refusal keeps its attempt's validated manifest progress, not a successful image");
     const auto first = trace.records();
     check_eq(read_trace_count(first, "read_start", 935), 1,
              "the first refusal follows one real manifest read");
@@ -3809,9 +4110,25 @@ void check_budget_deferred_expanded_peak() {
     const auto insufficient = trace.records();
     check_eq(read_trace_count(insufficient, "reissue", 935), 0,
              "capacity below the discovered restore peak does not repeat materialization");
+    const auto unchanged_progress = store.request_progress(935, 1);
+    check(unchanged_progress.attempt_id == refused_progress.attempt_id &&
+              unchanged_progress.components == refused_progress.components,
+          "an insufficient allowance wake cannot create an attempt or reset acknowledged bytes");
+    SelectedHoldGate retry_gate;
+    store.set_read_gate_for_test([](void* p) { static_cast<SelectedHoldGate*>(p)->pause(); }, &retry_gate);
     store.publish_read_allowance(uint64_t(64) << 20);
+    retry_gate.await();
+    const auto retry_progress = store.request_progress(935, 1);
+    check(retry_progress.attempt_id != refused_progress.attempt_id && !retry_progress.totals_known &&
+              !retry_progress.acknowledged_after(refused_progress),
+          "a real allowance retry resets its fixed component counters under a new attempt identity");
+    for (const auto& component : retry_progress.components)
+        check(component.total == 0 && component.acknowledged == 0, "a retried decode starts with no credited bytes");
+    retry_gate.resume();
     check(await_status(store, 935, 1, ConversationStoreReadStatus::ready),
           "sufficient capacity rearms the same offer before demand");
+    store.set_read_gate_for_test(nullptr, nullptr);
+    check(!retry_gate.timed_out, "the allowance retry's actual allocation frame was explicitly released");
     check(store.demand(query_of(image, 935, 1), why), "demand adopts the recovered expanded-peak offer");
     ConversationStoreRead restored;
     check(store.wait_ready(935, 1, restored, 5000) && restored.image &&

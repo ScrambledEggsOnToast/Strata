@@ -1704,6 +1704,27 @@ read, verified and validated first) and then restored exactly like a parked one;
 cancelled or outlasted read is an ordinary miss that falls back to the source the request would have used, so the
 engine still reads the prompt itself. The wait is bounded, honours `STOP`/cancellation, and never runs under the
 request admission or generation-pipe lock.
+
+`request_progress()` reports descriptor ownership separately from its verdict: `unknown`, `queued`,
+`materializing`, `settled`, `handed_out` and `released`. `settled` can be failure or retryable speculation,
+not successful restoration. A released active reader stays visible only until its allocation frame unwinds;
+after bounded descriptor erasure it is `unknown`, with no retained per-request tombstone. A newer owner reusing
+the same keys takes precedence over an older released worker. `wait_ready()` returning false is deliberately
+ambiguous: timeout, unknown/released keys, an already-handed image, settled cancellation, or a stopped/faulted
+store can all return false. Inspect both state and status; only a successful delivery supplies an image.
+
+Each real read attempt has its own nonzero identity and six fixed-size byte counters. Totals become known only
+after the manifest and authorized cut validate. They cover metadata (encoded manifest, token IDs and image keys),
+recurrent GDN state, PLE history, indexer state (tails, dead/block positions and main-model pooled keys), main K/V
+and scales, and every part of the extra draft pool. Draft classification uses the same global-ordinal sentinel
+as immutable-object identity, not a guessed last main layer. These are logical component bytes, not unique
+objects, raw device I/O or bandwidth. Acknowledgement follows successful whole-chunk copy **and** digest verification;
+counts are monotonic and bounded by their totals within an attempt, and every component equals its total on
+`ready`. Refresh/retry changes the attempt identity and resets all counters together. No partial image is exposed.
+The demand loop names its `request: restore ...` watchdog stage and logs component `acknowledged/total` progress
+only on state/status/attempt changes or real byte advancement. Only acknowledged byte advancement beats the
+watchdog: timer expiry, a condition-variable wake, queue admission and hand-over alone cannot hide a no-I/O stall.
+
 Revoked or budget-refused speculation is re-admitted from the complete query when it becomes demand, rather than
 waiting on a retired prefetch. Advisory withdrawal cannot cancel an adopted demand or release its image lease.
 Explicit read cancellation remains terminal until the demand owner acknowledges it; publication cancellation is a

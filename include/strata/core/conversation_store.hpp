@@ -277,7 +277,7 @@ struct ConversationStoreQuery {
 // ---------------------------------------------------------------------------------------------------------------
 
 enum class ConversationStoreReadStatus : uint8_t {
-    none = 0,     // request_status(): still queued or being materialized
+    none = 0,     // no verdict: inspect request_progress() to distinguish an unknown, queued or active read
     ready,        // a complete, verified image is attached
     missing,      // no eligible stored prefix (an ordinary cache miss)
     corrupt,      // an eligible record failed validation: treat as a miss, never restore it
@@ -291,6 +291,52 @@ enum class ConversationStoreReadStatus : uint8_t {
 };
 
 const char* conversation_store_read_status_name(ConversationStoreReadStatus status);
+
+// Descriptor ownership, independent of the verdict above. `settled` includes failures and revoked/deferred
+// speculation: it promises neither success nor delivery, and an explicit retry starts a new attempt.
+enum class ConversationStoreReadState : uint8_t {
+    unknown = 0,  // no descriptor (including an already-erased release or terminal hand-over)
+    queued,       // accepted selection waiting for a reader, allowance or incoming-image slot
+    materializing, // a reader owns the reservation; no partial image can be consumed
+    settled,      // the allocation frame unwound; inspect status before attempting delivery
+    handed_out,   // the complete image was handed over and its lease awaits owner release
+    released,     // owner released it, but an active allocation frame has not yet unwound
+};
+
+const char* conversation_store_read_state_name(ConversationStoreReadState state);
+
+enum class ConversationStoreReadComponent : uint8_t { metadata, recurrent, ple, indexer, main_kv, draft, count };
+
+struct ConversationStoreReadBytes {
+    uint64_t total = 0;
+    uint64_t acknowledged = 0;
+    bool operator==(const ConversationStoreReadBytes&) const = default;
+};
+
+struct ConversationStoreReadProgress {
+    ConversationStoreReadState state = ConversationStoreReadState::unknown;
+    ConversationStoreReadStatus status = ConversationStoreReadStatus::none;
+    // Refresh/retry may replace the manifest under the same request identity. Totals and acknowledgements belong
+    // only to this attempt; its nonzero identity changes and all component counts reset at that transition.
+    uint64_t attempt_id = 0;
+    uint64_t head_id = 0;
+    bool totals_known = false; // false until manifest validation and authorized-cut checks have succeeded
+    // Logical bytes, not unique objects or physical disk traffic. Metadata includes the validated encoded manifest,
+    // token IDs and image keys; recurrent is GDN; PLE is its history; indexer includes tails/dead/block positions and
+    // main-model pooled keys; main_kv is main K/V and scales; draft is every part of the extra draft pool.
+    // Within an attempt, acknowledged only grows after successful verification/copy, never exceeds total, and
+    // equals total for every component on `ready`. Even then, only take_ready()/wait_ready() can hand out an image.
+    std::array<ConversationStoreReadBytes, size_t(ConversationStoreReadComponent::count)> components{};
+
+    // A watchdog may beat only for acknowledged bytes, never a state change, timer or condition-variable wake.
+    // A new attempt has a zero baseline: discarded bytes from an earlier manifest cannot count as new work.
+    bool acknowledged_after(const ConversationStoreReadProgress& previous) const {
+        for (size_t i = 0; i < components.size(); ++i)
+            if (components[i].acknowledged > (attempt_id == previous.attempt_id ?
+                                             previous.components[i].acknowledged : 0)) return true;
+        return false;
+    }
+};
 
 // Advisory recovery information for a fresh demand refused solely by its image peak.
 // Includes descriptor ownership and a conservative bound for post-decode restore scaffolding.
@@ -587,7 +633,9 @@ public:
     bool wait_ready(ConversationStoreRead& out, uint64_t timeout_ms);
     // Request-specific delivery: only that read's own completion is ever consumed.  A caller that mounts what it
     // receives must use these - a global take_ready() can hand back another request's completion, and mounting that
-    // would restore the wrong history.  False while the request has not settled (and for an unknown request).
+    // would restore the wrong history. False means no result was delivered: a timeout, unknown/erased descriptor,
+    // already-handed result, cancellation or stopped/faulted store can all return false. A wake is not success;
+    // inspect request_progress()'s state AND status to distinguish pending work from an undeliverable verdict.
     bool take_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out);
     bool wait_ready(uint64_t request_id, uint64_t generation, ConversationStoreRead& out, uint64_t timeout_ms);
     // The single lease release: the caller reports that this read is finished AND that every alias of the returned
@@ -600,6 +648,10 @@ public:
     // confirmed deletion returns their physical charge without waiting for another publication or close.
     void release_read(uint64_t request_id, uint64_t generation);
     ConversationStoreReadStatus request_status(uint64_t request_id, uint64_t generation) const;
+    // Side-effect-free, mutex-consistent ownership/verdict/byte snapshot; allocates no image and triggers no retry.
+    // Prefer an unreleased descriptor if an old released worker still unwinds under the same request identity.
+    // Released descriptors disappear when that frame unwinds; no unbounded per-identifier history is retained.
+    ConversationStoreReadProgress request_progress(uint64_t request_id, uint64_t generation) const;
     // Recency promotion after a *confirmed* restore (never on prefetch or on a mere append): moves the head into the
     // protected segment so eviction reclaims other histories first, demoting the oldest protected head when the
     // segment is at its three-quarter ceiling. This call allocates no work item and performs no storage wait: one
@@ -727,6 +779,8 @@ public:
 #ifdef STRATA_STORE_TEST_HOOKS
     // Pause the real worker after reservation, outside the store mutex. Absent from production builds.
     void set_read_gate_for_test(void (*gate)(void*), void* context);
+    // Pause after publishing validated manifest totals or acknowledging a verified chunk, outside the mutex.
+    void set_read_progress_gate_for_test(void (*gate)(void*), void* context);
     // Pause a real catalog transaction outside the mutex, before staging (false) or after staging (true).
     void set_catalog_gate_for_test(void (*gate)(void*, bool staged), void* context);
 #endif

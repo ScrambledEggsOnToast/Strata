@@ -2129,13 +2129,10 @@ Digest object_scope_digest(uint16_t kind, const KvMeta* kv, const ConversationSc
     return hash.digest();
 }
 
-bool stream_object_identity(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
-                            const Digest& model, Digest& scope, uint64_t& ordinal, std::string& why) {
-    if (containers.empty() || !containers.front().scope.valid()) {
-        why = "a physical object has no authorized conversation";
-        return false;
-    }
-    const KvMeta* kv = nullptr;
+namespace {
+bool stream_kv_layout(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
+                      const KvMeta*& kv, uint64_t& ordinal, std::string& why) {
+    kv = nullptr;
     ordinal = id.ordinal;
     if (conversation_store_kv_kind(id.kind)) {
         const ContainerMeta* stage = nullptr;
@@ -2163,7 +2160,68 @@ bool stream_object_identity(const std::vector<ContainerMeta>& containers, const 
         ordinal = id.ordinal == allocated ? uint64_t{1} << 63 : uint64_t(first) + id.ordinal;
         kv = &stage->kv[size_t(id.ordinal)];
     }
+    return true;
+}
+} // namespace
+
+bool stream_object_identity(const std::vector<ContainerMeta>& containers, const ConversationStoreStreamId& id,
+                            const Digest& model, Digest& scope, uint64_t& ordinal, std::string& why) {
+    if (containers.empty() || !containers.front().scope.valid()) {
+        why = "a physical object has no authorized conversation";
+        return false;
+    }
+    const KvMeta* kv = nullptr;
+    if (!stream_kv_layout(containers, id, kv, ordinal, why)) return false;
     scope = object_scope_digest(id.kind, kv, containers.front().scope, model);
+    return true;
+}
+
+ConversationStoreReadComponent stream_read_component(uint16_t kind, uint64_t object_ordinal) {
+    if (conversation_store_kv_kind(kind) && object_ordinal == (uint64_t{1} << 63))
+        return ConversationStoreReadComponent::draft;
+    switch (ConversationStoreStreamKind(kind)) {
+        case ConversationStoreStreamKind::live_gdn:
+        case ConversationStoreStreamKind::cp_gdn:
+        case ConversationStoreStreamKind::part_gdn: return ConversationStoreReadComponent::recurrent;
+        case ConversationStoreStreamKind::live_ple:
+        case ConversationStoreStreamKind::cp_ple:
+        case ConversationStoreStreamKind::part_ple: return ConversationStoreReadComponent::ple;
+        case ConversationStoreStreamKind::live_tails:
+        case ConversationStoreStreamKind::live_dead:
+        case ConversationStoreStreamKind::live_block_pos:
+        case ConversationStoreStreamKind::cp_tails:
+        case ConversationStoreStreamKind::cp_dead:
+        case ConversationStoreStreamKind::cp_block_pos:
+        case ConversationStoreStreamKind::part_tails:
+        case ConversationStoreStreamKind::part_dead:
+        case ConversationStoreStreamKind::part_block_pos:
+        case ConversationStoreStreamKind::kv_pooled: return ConversationStoreReadComponent::indexer;
+        case ConversationStoreStreamKind::kv_k:
+        case ConversationStoreStreamKind::kv_v:
+        case ConversationStoreStreamKind::kv_k_scale:
+        case ConversationStoreStreamKind::kv_v_scale: return ConversationStoreReadComponent::main_kv;
+        default: return ConversationStoreReadComponent::metadata;
+    }
+}
+
+bool restore_progress_totals(const ManifestMeta& meta, uint64_t encoded_bytes,
+                             ConversationStoreReadProgress& out, std::string& why) {
+    decltype(out.components) components{};
+    components[size_t(ConversationStoreReadComponent::metadata)].total = encoded_bytes;
+    for (const auto& stream : meta.streams) {
+        const KvMeta* kv = nullptr;
+        uint64_t ordinal = 0;
+        if (!stream_kv_layout(meta.containers, stream.id, kv, ordinal, why)) return false;
+        auto& component = components[size_t(stream_read_component(stream.id.kind, ordinal))];
+        if (stream.bytes > UINT64_MAX - component.total) {
+            why = "a restore component byte count overflows";
+            return false;
+        }
+        component.total += stream.bytes;
+    }
+    components[size_t(ConversationStoreReadComponent::metadata)].acknowledged = encoded_bytes;
+    out.components = components;
+    out.totals_known = true;
     return true;
 }
 
