@@ -163,6 +163,8 @@ struct ConversationStoreOptions {
     uint32_t max_read_requests = 16;
     // Extra *same-lineage* publications that may replace the one in flight (see publish()).  Never a second
     // admitted image for a different branch.
+    // Completed, unharvested publication results plus the admitted writer are bounded by 4 * this value + 4.
+    // Admission defers at that bound until take_publish()/wait_publish() consumes a result; no verdict is evicted.
     uint32_t max_pending_publishes = 1;
     // 0: no read allowance has been published yet.  No read materializes and a speculative read is refused, and no
     // publication is admitted either: reads and publications are both admitted against this one envelope, and a
@@ -613,8 +615,11 @@ public:
     // request, layout, prefix chains, parent/donor decode, chunk vectors and scratch, object/orphan records, encoded
     // manifest and catalog copy) must both fit the envelope, and the workspace must also fit the preparation ceiling
     // beside the index, read descriptors, admitted read preparation and diagnostic decode.
-    // Eligible speculation is revoked before an occupied-resource deferral; active workers keep their
-    // reservations until settlement and handed-out images keep their leases until owner release.
+    // Eligible speculation is revoked before a RAM/preparation deferral; active workers keep their reservations
+    // until settlement and handed-out images keep their leases until owner release.
+    // Each accepted request reserves one terminal-result slot until take_publish()/wait_publish() consumes it,
+    // including coalesced, cancelled and close-time outcomes. A full result queue defers admission (counted in
+    // deferred_publishes), retaining the caller's image and lease; deferred/refused calls produce no later result.
     // While the writer is busy, a new publication is admitted only
     // when it is proven to be the *same lineage* as the one in flight (both carry `cover` for the same nonzero
     // `supersedes` and this one is the newer generation): it then
@@ -625,6 +630,7 @@ public:
                                               const ConversationStorePublish& request, std::string& why);
     // Cancel only a not-yet-started publication, never a read with coincident identifiers.
     void cancel_publication(uint64_t request_id, uint64_t generation);
+    // Consume each admitted request's terminal result exactly once, in settlement order; no result expires.
     bool take_publish(ConversationStorePublishResult& out);
     bool wait_publish(ConversationStorePublishResult& out, uint64_t timeout_ms);
     bool writer_busy() const;

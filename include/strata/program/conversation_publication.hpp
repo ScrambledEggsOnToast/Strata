@@ -84,7 +84,8 @@ struct ConversationPublicationCaptureResult {
 };
 
 // One record per publication the store has admitted and not yet reported, so its result can move the exact owner
-// generation it belongs to and its lease can be reported when the store releases it.
+// generation it belongs to and its lease can be reported when the store releases it. Admission reserves the store's
+// terminal-result slot: completion pressure defers later handoffs, never discards a pending entry's verdict.
 struct ConversationPublicationPending {
     uint64_t request_id = 0;
     uint64_t generation = 0;

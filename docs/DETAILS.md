@@ -1677,6 +1677,12 @@ CPU-only handovers reap completed results and may prepare metadata, but do not w
 without an owner-thread chunk boundary (the no-slot bypass and a layer split with no time budget) retain
 once-per-request handover.
 
+Every accepted publication reserves its terminal-result slot, including a coalesced, cancelled or close-time
+completion. Completed but unharvested results plus the admitted writer are bounded by
+`4 * max_pending_publishes + 4`. At that bound the store returns a counted **deferred** admission without taking
+the image or its lease; the caller must harvest results before retrying. Results keep their request and generation
+identity until consumed exactly once, so a slow harvest cannot silently evict a verdict and strand a pending owner.
+
 A fresh branch promises its live cut in the publication metadata, so a later cover cannot retire the root unless
 it preserves that cut. Subsequent covering captures remain replaceable: the policy retains a root and a latest cut,
 not every turn. This internal cut promise does not make the head immune to quota eviction. Replacement completions

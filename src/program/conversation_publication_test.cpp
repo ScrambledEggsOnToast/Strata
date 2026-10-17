@@ -1135,6 +1135,56 @@ void check_shared_head_is_evictable() {
     settle(publications, store, sink);
     check(store.counters().heads == 1 && store.counters().evictions == 1 && publications.owner(0).lineage.valid,
           "real head pressure evicts the shared head rather than pinning capacity forever");
+// Keep a real production pending entry unreconciled while other callers finish more publications than the result
+// queue can hold. Backpressure must preserve that first completion, not quietly leave its owner pending forever.
+void check_unreaped_results_preserve_production_pending() {
+    TempRoot root;
+    ConversationStoreOptions options = options_for(root.path);
+    const size_t bound = size_t(options.max_pending_publishes) * 4 + 4;
+    options.head_limit = bound + 2;
+    ConversationStore store(options);
+    Sink sink(store);
+    ConversationPublicationQueue publications;
+    const SavedConversation record = stored_record(143, 32);
+    check(capture_image(publications, sink, 0, 1, 0, true, record, store.epoch()),
+          "a production capture is protected before the completion flood");
+    publications.flush(store, sink.out, 0);
+    check_eq(publications.pending().size(), 1, "the production capture owns a real pending publication");
+    const auto wait_idle = [&] {
+        for (int waited = 0; waited < 5000 && store.writer_busy(); ++waited) ::usleep(1000);
+        check(!store.writer_busy(), "the completion flood settles without reaping production's result");
+    };
+    wait_idle();
+    auto foreign_image = std::make_shared<SavedConversation>(stored_record(145, 32));
+    std::string why;
+    const uint64_t deferred_before = store.counters().deferred_publishes;
+    for (size_t i = 0; i < bound * 2; ++i) {
+        ConversationStorePublish request;
+        request.request_id = 1000 + i;
+        request.generation = 2000 + i;
+        request.epoch = store.epoch();
+        const auto admission = store.publish(foreign_image, request, why);
+        check(admission == (i < bound - 1 ? ConversationStorePublishAdmission::accepted
+                                        : ConversationStorePublishAdmission::deferred),
+              "foreign publications stop at the bounded outstanding-verdict capacity");
+        wait_idle();
+    }
+    check_eq(store.counters().published, bound, "unreaped results impose a hard admission bound");
+    check_eq(store.counters().deferred_publishes, deferred_before + bound + 1,
+             "the overflow is explicit and counted rather than silently evicted");
+    check_eq(publications.pending().size(), 1, "the original owner still awaits its terminal outcome");
+    // Reconcile all batches, including foreign results: only this queue's matching pending entry may be counted.
+    for (size_t i = 0; i < bound; ++i) publications.reconcile(store, sink.out, 0);
+    check(!publications.holds_work(), "completion pressure cannot strand an admitted production pending entry");
+    check_eq(publications.counters().published, 1, "the production result is accounted exactly once");
+    check_eq(publications.counters().refused, 0, "foreign backpressure does not refuse the production publication");
+    check_eq(publications.counters().dropped, 0, "completion pressure never drops the production capture");
+    check(publications.owner(0).lineage.valid && publications.owner(0).lineage.head != 0,
+          "the preserved completion installs its exact production owner's lineage");
+    check_eq(publications.reconcile(store, sink.out, 0), 0, "all outcomes have been harvested without duplicates");
+    check_eq(publications.counters().published, 1, "a second reconciliation cannot account the outcome twice");
+    check_eq(sink.lease_releases, 1, "the production image charge transfers only once");
+    check_eq(store.ram_lease_bytes(), 0, "completed flood publications retain no image lease");
 }
 
 } // namespace
@@ -1163,6 +1213,7 @@ int main() {
     check_private_resume_never_publishes_unrecomputed_shared_rows();
     check_shared_borrow_and_owner_neutral_publication();
     check_shared_head_is_evictable();
+    check_unreaped_results_preserve_production_pending();
     std::fprintf(stderr, "conversation_publication_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

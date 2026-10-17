@@ -611,6 +611,8 @@ void check_native_split_restore();
 void check_request_specific();
 void check_incoming_lifetime();
 void check_publication_rules();
+void check_publication_result_backpressure();
+void check_coalesced_publication_result_backpressure();
 void check_restart_generation_ordering();
 void check_pinned_branch();
 void check_queued_read_protects_frontier();
@@ -751,6 +753,8 @@ int main() {
     check_request_specific();
     check_incoming_lifetime();
     check_publication_rules();
+    check_publication_result_backpressure();
+    check_coalesced_publication_result_backpressure();
     check_restart_generation_ordering();
     check_pinned_branch();
     check_queued_read_protects_frontier();
@@ -1942,6 +1946,83 @@ void check_request_specific() {
     store.close();
 }
 
+// Completed verdicts still belong to their admitted callers. Fill the bound without harvesting, offer more than
+// another bound's worth, then free exactly one slot and exercise normal, cancelled and close-time settlement.
+void check_publication_result_backpressure() {
+    for (int settlement = 0; settlement < 3; ++settlement) {
+        TempRoot root;
+        ConversationStoreOptions options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.max_pending_publishes = settlement == 0 ? 2 : 1;
+        const uint64_t bound = uint64_t(options.max_pending_publishes) * 4 + 4;
+        options.head_limit = size_t(bound + 2);
+        ConversationStore store(options);
+        auto image = std::make_shared<SavedConversation>(fixture(63, 32));
+        const auto wait_idle = [&] {
+            for (int waited = 0; waited < 5000 && store.writer_busy(); ++waited) ::usleep(1000);
+            check(!store.writer_busy(), "a publication settles without harvesting its verdict");
+        };
+        const auto request_for = [&](uint64_t id) {
+            ConversationStorePublish request;
+            request.request_id = id;
+            request.generation = 1000 + id;
+            request.epoch = store.epoch();
+            return request;
+        };
+        std::string why;
+        for (uint64_t id = 1; id <= bound; ++id) {
+            check(store.publish(image, request_for(id), why) == kAccepted,
+                  "every publication up to the unreaped-result bound is admitted");
+            wait_idle();
+        }
+        check_eq(store.counters().published, bound, "every admitted image finishes before the result queue is reaped");
+        const uint64_t held = store.ram_held_bytes();
+        const uint64_t deferred_before = store.counters().deferred_publishes;
+        const uint64_t overflow_attempts = bound + 2;
+        for (uint64_t attempt = 0; attempt < overflow_attempts; ++attempt) {
+            check(store.publish(image, request_for(bound + 1), why) == kDeferred,
+                  "a full result queue defers admission instead of losing an older verdict");
+            check(!why.empty(), "result backpressure explains the deferral");
+            wait_idle();
+        }
+        check_eq(store.counters().deferred_publishes, deferred_before + overflow_attempts,
+                 "every completion-capacity deferral is counted exactly once");
+        check_eq(store.counters().published, bound, "deferred images never become untracked publications");
+        check_eq(store.ram_held_bytes(), held, "completion-capacity deferrals allocate no image or writer lease");
+        check_eq(store.ram_lease_bytes(), 0, "the caller retains ownership during completion backpressure");
+
+        ConversationStorePublishResult result;
+        check(store.take_publish(result), "harvesting one verdict releases one completion slot");
+        check_eq(result.request_id, 1, "backpressure preserves the oldest result's request identity");
+        check_eq(result.generation, 1001, "backpressure preserves the oldest result's generation");
+        check(result.status == ConversationStorePublishStatus::stored && result.released,
+              "the oldest caller receives its original terminal outcome");
+        const ConversationStorePublish retry = request_for(bound + 1);
+        check(store.publish(image, retry, why) == kAccepted, "one harvested verdict permits exactly one new admission");
+        if (settlement == 1) store.cancel_publication(retry.request_id, retry.generation);
+        if (settlement == 2) store.close();
+        else wait_idle();
+
+        uint64_t received = 0;
+        uint64_t stored = 1;   // the first result was harvested above
+        while (store.take_publish(result)) {
+            ++received;
+            check_eq(result.request_id, received + 1, "each remaining result keeps its FIFO request identity");
+            check_eq(result.generation, 1001 + received, "each remaining result keeps its capture generation");
+            const bool made = result.status == ConversationStorePublishStatus::stored;
+            if (made) ++stored;
+            const bool terminal = made ||
+                (received == bound && settlement == 1 && result.status == ConversationStorePublishStatus::stale) ||
+                (received == bound && settlement == 2 && result.status == ConversationStorePublishStatus::disabled);
+            check(terminal && result.released, "every admitted publication retains exactly one terminal verdict");
+        }
+        check_eq(received, bound, "no admitted caller is stranded and no deferred attempt emits a verdict");
+        check_eq(store.counters().published, stored, "harvesting counts each completed publication exactly once");
+        check(!store.wait_publish(result, 0), "an exhausted completion queue cannot report an outcome twice");
+        check_eq(store.ram_lease_bytes(), 0, "all settled publications release their image lease");
+        store.close();
+    }
+}
+
 void check_publication_rules() {
     TempRoot root;
     ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
@@ -2930,6 +3011,68 @@ SavedConversation promotion_fixture(uint64_t seed, int64_t tokens = 128) {
     auto image = fixture(seed, tokens);
     for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
     return image;
+}
+
+void check_coalesced_publication_result_backpressure() {
+    TempRoot root;
+    PromotionCatalogGate gate;
+    const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+    const uint64_t bound = uint64_t(options.max_pending_publishes) * 4 + 4;
+    ConversationStore store(options);
+    const SavedConversation image = promotion_fixture(707, 32);
+    ConversationStorePublishResult predecessor;
+    check(publish_and_wait(store, image, 1, 1, predecessor),
+          "coalescing backpressure starts from a retained predecessor");
+    store.set_catalog_gate_for_test([](void* p, bool staged) {
+        static_cast<PromotionCatalogGate*>(p)->pause(staged);
+    }, &gate);
+    store.confirmed_restore(predecessor.head_id);
+    gate.await(false, 1);   // hold the worker on durable work: every offered publication remains not-yet-started
+    auto shared = std::make_shared<SavedConversation>(image);
+    const auto request_for = [&](uint64_t id) {
+        ConversationStorePublish request;
+        request.request_id = 100 + id;
+        request.generation = 200 + id;
+        request.epoch = store.epoch();
+        request.supersedes = predecessor.head_id;
+        request.cover = true;
+        return request;
+    };
+    std::string why;
+    for (uint64_t id = 1; id <= bound; ++id)
+        check(store.publish(shared, request_for(id), why) == kAccepted,
+              "same-lineage replacements each reserve their own result slot");
+    check_eq(store.counters().coalesced_publishes, bound - 1,
+             "all but the active writer have one counted coalesced outcome");
+    for (uint64_t attempt = 0; attempt < bound + 1; ++attempt)
+        check(store.publish(shared, request_for(bound + 1), why) == kDeferred,
+              "the active writer's reserved verdict prevents coalescing past the result bound");
+    check_eq(store.counters().coalesced_publishes, bound - 1,
+             "a completion-capacity deferral cannot displace the admitted writer");
+    ConversationStorePublishResult result;
+    check(store.take_publish(result) && result.request_id == 101 && result.generation == 201 &&
+              result.status == ConversationStorePublishStatus::coalesced && result.released,
+          "the oldest coalesced caller receives its own terminal verdict");
+    check(store.publish(shared, request_for(bound + 1), why) == kAccepted,
+          "harvesting one coalesced verdict permits one additional same-lineage handoff");
+    check(store.publish(shared, request_for(bound + 2), why) == kDeferred,
+          "the newly admitted writer retains its own completion reservation");
+    check_eq(store.counters().deferred_publishes, bound + 2, "coalescing backpressure counts every deferred offer once");
+    gate.release();
+    check(await_store_progress([&] { return !store.writer_busy(); }), "the final admitted cover settles");
+    uint64_t received = 0;
+    while (store.take_publish(result)) {
+        ++received;
+        check_eq(result.request_id, 101 + received, "coalesced pressure preserves every request identity");
+        check_eq(result.generation, 201 + received, "coalesced pressure preserves every generation");
+        check(result.released && result.status == (received == bound ? ConversationStorePublishStatus::replaced
+                                                                    : ConversationStorePublishStatus::coalesced),
+              "each admitted cover gets exactly its own coalesced or committed verdict");
+    }
+    check_eq(received, bound, "all coalesced and active reservations become terminal results without overflow");
+    check_eq(store.counters().coalesced_publishes, bound, "each displaced image is counted exactly once");
+    store.close();
+    gate.check_visits(3); // held promotion, final cover, clean close
 }
 
 void check_promotion_burst_coalescing() {

@@ -928,6 +928,8 @@ struct ConversationStore::Impl {
         std::vector<Digest> leased_objects;
     };
     std::shared_ptr<PublishJob> publishing;
+    // publish() reserves one result slot per admitted job, including a coalesced predecessor. Finished results plus
+    // the active writer never exceed max_pending_publishes * 4 + 4; only harvesting frees a slot.
     std::deque<ConversationStorePublishResult> publish_done;
 
     struct CommitPlan {
@@ -3900,9 +3902,8 @@ void ConversationStore::Impl::reader_body() {
 // ---------------------------------------------------------------------------------------------------------------
 
 void ConversationStore::Impl::push_publish_result_locked(ConversationStorePublishResult&& result) {
+    // Admission already reserved this slot. Never evict another caller's terminal verdict.
     publish_done.push_back(std::move(result));
-    const size_t keep = size_t(options.max_pending_publishes) * 4 + 4;
-    while (publish_done.size() > keep) publish_done.pop_front();
     cv_publish.notify_all();
 }
 
@@ -5191,6 +5192,15 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
                     "lease the caller transferred"
                   : "the publication image and its writer workspace do not fit the published RAM allowance";
         return ConversationStorePublishAdmission::refused;
+    }
+    // Every accepted request needs its own terminal result, even when the pending writer is coalesced, cancelled or
+    // closed before starting. Count that writer's reserved slot as well as completed, unreaped results before taking
+    // another image. Harvesting is the only way to make room; revoking speculative reads cannot recover these slots.
+    const uint64_t result_bound = uint64_t(self.options.max_pending_publishes) * 4 + 4;
+    if (uint64_t(self.publish_done.size()) + uint64_t(bool(self.publishing)) >= result_bound) {
+        self.counters.deferred_publishes++;
+        why = "the publication result queue is full; harvest completed publications before retrying";
+        return ConversationStorePublishAdmission::deferred;
     }
     // What is left is *occupancy*: another operation's live preparation, or a read's reservation and lease, may be
     // holding the ceiling or the allowance at this instant.  Speculative reads are revocable and an outgoing capture
