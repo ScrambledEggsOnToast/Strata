@@ -182,10 +182,14 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
-    /// The caller has queued an asynchronous copy out of `blob` (a pointer this source handed out) on `stream` (a
-    /// cudaStream_t): the source must not overwrite or recycle that memory until the copy has finished.  A source whose
-    /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
-    /// returned, where a pageable one is staged by the driver before it returns.)
+    /// Acquire a blob for one asynchronous reader before handing its pointer to the copy API. Recyclable sources
+    /// may return nullptr while another reader owns it. Pair each successful handout with exactly one
+    /// note_async_read after enqueue; an enqueue failure retains the claim until source teardown.
+    /// CPU reads and blocking copies use blob/blob_stable instead. Defaults to the stable pointer.
+    virtual const uint8_t* blob_async(int64_t layer, int64_t expert) { return blob_stable(layer, expert); }
+    /// The blob_async reader has queued its copy on stream (a cudaStream_t). Transfer its claim to a completion
+    /// fence, or release it after a successful synchronous drain. Failure to prove either retains ownership.
+    /// A source whose pointers are never recycled ignores this; an unpaired notification cannot replace a fence.
     virtual void note_async_read(const uint8_t* blob, void* stream) { (void) blob; (void) stream; }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
@@ -609,6 +613,7 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// No host submitter may still use this source. Drain device readers before freeing staged buffers.
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -712,6 +717,7 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
+    const uint8_t* blob_async(int64_t layer, int64_t expert) override;
     void note_async_read(const uint8_t* blob, void* stream) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
@@ -776,7 +782,8 @@ private:
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
     bool open_gguf(std::string& err);
-    const uint8_t* staged_blob(int64_t layer, int64_t expert);
+    const uint8_t* blob_impl(int64_t layer, int64_t expert, bool async);
+    const uint8_t* staged_blob(int64_t layer, int64_t expert, bool async = false);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
@@ -841,11 +848,17 @@ private:
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;
     bool stage_pin_said_ = false, stage_pin_failed_said_ = false;   ///< the one-time notes in claim_stage
-    // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
-    // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
+    // One bounded async reader claim per buffer, acquired under stage_mu_ before pointer handout and held
+    // until note_async_read arms its event (or proves a synchronous drain). No refill or second async handout
+    // may pass an outstanding claim. A failed enqueue/arm with no proven drain keeps it until teardown.
+    std::vector<char> stage_reader_;
+    // The previous reader's event must retire successfully before refill or another async handout, so a later
+    // stream can never replace an earlier stream's live fence. cudaEvent_t is untyped (no cuda_runtime.h here).
     std::vector<void*> stage_ev_;
-    std::vector<char> stage_ev_live_;                 ///< a copy was queued since the buffer was last waited for
+    std::vector<char> stage_ev_live_;
     std::unordered_map<const uint8_t*, size_t> stage_idx_;   ///< buffer address -> index (the buffers never move)
+    bool stage_retire_event(size_t v);               ///< stage_mu_ held; failures retain the live fence
+    bool stage_needs_drain() const;                 ///< stage_mu_ held; reader claims or live fences only
     void stage_free_events();
     std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
     std::atomic<int64_t> ram_reads_{0};
@@ -875,7 +888,7 @@ private:
     void io_worker();
     void io_enqueue(int64_t layer, int64_t expert);
     void io_stop();
-    const uint8_t* io_blob(int64_t layer, int64_t expert);
+    const uint8_t* io_blob(int64_t layer, int64_t expert, bool async = false);
     const uint8_t* base_ = nullptr;
     int64_t blobs_ = 0;
     int64_t n_layers_ = 0;

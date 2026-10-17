@@ -2720,12 +2720,21 @@ the pairs in which the switched arm won). They are here so you can try them on y
   measured the same on 2x RTX 3090 (the misses per layer are below one there, so the CPU round trip stays). Left off.
 - **`STRATA_STAGE_PIN`: pinned stage buffers** (Zhong Uncle, #1237; **opt-in, `STRATA_STAGE_PIN=1`**. It was on by default in
   development, but the 0.1.41 release gate found IQ3_S decode corrupted after a 4096-token prompt with it on, likely a stage
-  buffer recycled before its asynchronous copy finished; it stays off until that is fixed). Where the experts are served from the GGUF in
+  buffer recycled before its asynchronous copy finished; it remains opt-in pending pinned-stage runtime requalification).
+  Where the experts are served from the GGUF in
   place (`--mmap-experts`, or too little RAM for the arena) the buffers the cache fill copies from are page-locked, so the
   copy no longer goes through the driver's bounce buffer (about 0.4-0.6 GiB of pinned RAM, one buffer falls back to
   pageable when the driver refuses). Decode, median tok/s on, off, 6 pairs of whole runs: Tesla P100 with the RAM capped at
   24 GB (cgroup) 13.9 -> 15.0 (+8%, 6/6 pairs faster); RTX 5070 `--mmap-experts` +1.2% (5/6); RTX 3060 `--mmap-experts`
   -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
+  Asynchronous stage consumers acquire through `ExpertSource::blob_async` before DMA enqueue, then call
+  `note_async_read` once the copy is queued. Each buffer has one outstanding reader claim; an overlapping handout
+  is refused. The claim prevents refill before enqueue, and its completion event prevents refill after enqueue.
+  Reusing that event for another stream first retires the previous reader's fence. Failed enqueue or an event-arm
+  failure without a successful stream drain retains the claim until teardown. CPU and blocking-copy consumers
+  keep using `blob` or `blob_stable`; the pinning default is unchanged. Stage teardown requires a CUDA drain only
+  while an async reader claim or live completion fence remains, not merely because a stage slot/event was allocated.
+  A required teardown drain failure is fatal; pageable CPU-only reads close without initializing CUDA for a drain.
 - **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
 - **`STRATA_ADAPT_OVERLAP` (`=1` turns it on, on every backend; the startup log names the state and, when it cannot run, why): the adaptive tier's copies land while the next

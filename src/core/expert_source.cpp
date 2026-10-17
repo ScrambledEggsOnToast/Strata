@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -799,7 +800,7 @@ void FileExpertSource::io_worker() {
 // The decode's hand-out of a blob in the experts.bin file tier with io prefetch on: what a layer's prediction read
 // ahead is staged; a blob whose pages are all cached is the mapping itself (no copy); the rest is read with one
 // pread into a staging buffer, not faulted in by the kernels one small request at a time.
-const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
+const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert, bool async) {
     const int64_t key = layer * n_expert_ + expert;
     if (io_fill_) {
         const uint8_t* b = mapped_blob(layer, expert);
@@ -824,7 +825,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
             return b;
         }
     }
-    return staged_blob(layer, expert);
+    return staged_blob(layer, expert, async);
 }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
@@ -1060,8 +1061,8 @@ void FileExpertSource::close() {
     direct_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
-        // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        // Only outstanding async ownership needs a CUDA drain; CPU-only stage slots have null events.
+        if (stage_needs_drain() && cudaDeviceSynchronize() != cudaSuccess) std::terminate();
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
@@ -1257,7 +1258,8 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 
 // Pinned stage buffers (PR 1237): opt-in (STRATA_STAGE_PIN=1).  On by default they corrupted IQ3_S decode after a 4096-token
 // prompt in the 0.1.41 release gate (48 tokens of id 0; off = identical to 0.1.40.4): with page-locked buffers the cache-fill
-// copy is truly asynchronous, so a recycled stage buffer can be overwritten before its copy finishes.  Off until that is fixed.
+// copy is truly asynchronous, so a recycled stage buffer can be overwritten before its copy finishes. The default stays off
+// pending pinned-stage runtime requalification; the claim/fence protocol below protects both enqueue and completion.
 #define STAGE_PIN_DEFAULT 0
 constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
 void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
@@ -1265,10 +1267,9 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
     else delete[] p;
 }
 
-// A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
-// its blob has not been asked for during `kStageAge` layers (begin_layer) or 256 assemblies, whichever comes
-// first, and never while it is being filled: the pool computes a layer's misses before it starts the next, and a
-// fill (the GPU cache at startup, an adaptive swap, a helper GPU) copies the blob right away.
+// A blob assembled from the three role slices. Age alone never permits refill while an async reader holds its
+// pre-enqueue claim. Once that reader transfers ownership to an event, successful retirement proves DMA is done.
+// CPU consumers retain the existing kStageAge/256-assembly lifetime; async consumers acquire through blob_async.
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
@@ -1287,7 +1288,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     v = stage_buf_.size();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
     for (size_t i = 0; i < stage_buf_.size(); ++i)
-        if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
+        if (!stage_busy_[i] && !stage_reader_[i] &&
+            (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
             stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
@@ -1314,6 +1316,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned});
         stage_idx_[raw] = stage_buf_.size() - 1;
+        stage_reader_.push_back(0);
         stage_ev_.push_back(nullptr);
         stage_ev_live_.push_back(0);
         if (pinned && !stage_pin_said_) {
@@ -1335,21 +1338,9 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
                          stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
         }
     } else {
+        if (!stage_retire_event(v)) return false;
         stage_of_.erase(stage_key_[v]);
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
-        // #1237: a page-locked buffer is read by the DMA after the copy call returned: it is refilled only once the
-        // last copy queued out of it (note_async_read) has finished.  Rare: the pool is sized so that a buffer asked
-        // for has long been consumed; a wait here means the stream is more than a pool behind.
-        if (v < stage_ev_live_.size() && stage_ev_live_[v]) {
-            stage_ev_live_[v] = 0;
-            if (stage_ev_[v] != nullptr) {
-                if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
-                    stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
-                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
-                }
-                (void) cudaGetLastError();
-            }
-        }
     }
     stage_key_[v] = key;
     stage_epoch_[v] = epoch_;
@@ -1385,39 +1376,67 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
     stage_cv_.notify_all();
 }
 
+// stage_mu_ held. A failed query/wait is not completion proof: keep the fence live and refuse reuse.
+bool FileExpertSource::stage_retire_event(size_t v) {
+    if (!stage_ev_live_[v]) return true;
+    if (stage_ev_[v] == nullptr) return false;
+    cudaError_t status = cudaEventQuery((cudaEvent_t) stage_ev_[v]);
+    if (status == cudaErrorNotReady) {
+        stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
+        status = cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+    }
+    if (status != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    stage_ev_live_[v] = 0;
+    return true;
+}
+
 void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
     if (blob == nullptr) return;
     std::lock_guard<std::mutex> lk(stage_mu_);
     const auto it = stage_idx_.find(blob);
     if (it == stage_idx_.end()) return;                 // not a stage buffer: the mapping or the resident arena
     const size_t v = it->second;
-    if (!stage_buf_[v].get_deleter().pinned) return;    // pageable: the driver copied it before the call returned
+    if (!stage_reader_[v]) return;                    // no handout: never replace another stream's live fence
+    if (!stage_buf_[v].get_deleter().pinned) {         // pageable: the driver copied it before enqueue returned
+        stage_reader_[v] = 0;
+        return;
+    }
     if (stage_ev_[v] == nullptr) {
         cudaEvent_t ev = nullptr;
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
-            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
+            if (cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess) stage_reader_[v] = 0;
             return;
         }
         stage_ev_[v] = ev;
     }
     if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
         (void) cudaGetLastError();
-        (void) cudaStreamSynchronize((cudaStream_t) stream);
+        if (cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess) stage_reader_[v] = 0;
         return;
     }
     stage_ev_live_[v] = 1;
+    stage_reader_[v] = 0;                             // the successfully armed event now owns the DMA lifetime
+}
+
+bool FileExpertSource::stage_needs_drain() const {
+    return std::any_of(stage_reader_.begin(), stage_reader_.end(), [](char reader) { return reader != 0; }) ||
+           std::any_of(stage_ev_live_.begin(), stage_ev_live_.end(), [](char live) { return live != 0; });
 }
 
 void FileExpertSource::stage_free_events() {
     for (void*& e : stage_ev_)
         if (e != nullptr) { (void) cudaEventDestroy((cudaEvent_t) e); e = nullptr; }
     stage_ev_.clear();
+    stage_reader_.clear();
     stage_ev_live_.clear();
     stage_idx_.clear();
 }
 
-const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
+const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert, bool async) {
     const int64_t key = layer * n_expert_ + expert;
     size_t v = 0;
     bool fill = false;
@@ -1433,17 +1452,28 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         std::unique_lock<std::mutex> lk(stage_mu_);
         const bool have = claim_stage(key, v, fill);
         if (!have && !fill) return nullptr;
+        if (async) {
+            if (stage_reader_[v] || !stage_retire_event(v)) return nullptr;
+            stage_reader_[v] = 1;   // before waiting for publication: no publish-to-handout reuse window
+        }
         dst = stage_buf_[v].get();
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
-            if (stage_key_[v] != key) return nullptr;   // its fill failed
+            if (stage_key_[v] != key) {
+                if (async) stage_reader_[v] = 0;
+                return nullptr;   // its fill failed; no pointer was handed out
+            }
             lk.unlock();
             crit();
             return dst;
         }
     }
     const bool ok = fill_stage(v, layer, expert, dst);
+    if (!ok && async) {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        stage_reader_[v] = 0;   // failed fill handed out no pointer, so no DMA reader exists
+    }
     crit();
     return ok ? dst : nullptr;
 }
@@ -1830,6 +1860,11 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
     direct_.clear();
     {   // the mapped tier hands out the mapping: the startup's stage buffers go
         std::lock_guard<std::mutex> lk(stage_mu_);
+        if (stage_needs_drain() && cudaDeviceSynchronize() != cudaSuccess) {
+            why = "FileExpertSource: startup stage readers could not be drained";
+            return false;
+        }
+        stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
@@ -3458,6 +3493,14 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
+    return blob_impl(layer, expert, false);
+}
+
+const uint8_t* FileExpertSource::blob_async(int64_t layer, int64_t expert) {
+    return blob_impl(layer, expert, true);
+}
+
+const uint8_t* FileExpertSource::blob_impl(int64_t layer, int64_t expert, bool async) {
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
@@ -3474,9 +3517,9 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     }
     if (from_files) {
         if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
-            result = io_blob(layer, expert);              // staged when it had to be read, the mapping when cached
+            result = io_blob(layer, expert, async);       // staged when it had to be read, the mapping when cached
         } else if (staged()) {
-            result = staged_blob(layer, expert);          // counts its bytes
+            result = staged_blob(layer, expert, async);   // counts its bytes; claims before async handout
         } else {
             result = mapped_blob(layer, expert);
             if (result != nullptr) {
@@ -4272,9 +4315,8 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                     ++d.cache_refused;
                     continue;
                 }
-                // `blob` is asked ONLY for an expert about to be filled, so the source's read counter stays a
-                // count of distinct experts moved rather than of looks.
-                const uint8_t* b = d.src->blob(d.layers, e);
+                // Only the expert about to be filled is asked for; acquire its stage claim before DMA enqueue.
+                const uint8_t* b = d.src->blob_async(d.layers, e);
                 std::string ferr;
                 if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
                     d.failed = true;

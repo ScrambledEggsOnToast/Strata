@@ -164,7 +164,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         const auto& pr = pick[i];
         if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
         const int32_t slot = cache_.admit(pr.first, pr.second);
-        const uint8_t* b = src.blob(pr.first, pr.second);
+        const uint8_t* b = src.blob_async(pr.first, pr.second);
         if (slot < 0 || b == nullptr || !cache_.fill_slot(slot, b, refill_, err, (int64_t) lay.blob_bytes(pr.first))) {
             err = "peer experts: fill failed: " + err;
             close();
@@ -306,11 +306,13 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     for (const Swap& s : swaps) {
         const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
         const int32_t slot = res_[out];
-        const uint8_t* b = src_->blob(s.layer, s.in);
-        if (slot < 0 || b == nullptr) continue;
+        if (slot < 0) continue;
+        const uint8_t* b = src_->blob_async(s.layer, s.in);
+        if (b == nullptr) continue;
         if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
                                 refill_), "refill", err))
             return false;
+        src_->note_async_read(b, refill_);
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;

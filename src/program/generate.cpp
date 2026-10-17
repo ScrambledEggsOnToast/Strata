@@ -9514,10 +9514,15 @@ int main(int argc, char** argv) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
-                const uint8_t* b = srcp->blob_stable(l, e);
+                const uint8_t* b = srcp->blob_async(l, e);
                 if (b == nullptr) continue;
-                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
-                                nullptr);
+                if (cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l),
+                                    cudaMemcpyHostToDevice, nullptr) != cudaSuccess) {
+                    std::fprintf(stderr, "strata: queuing an expert cache refill failed: %s\n",
+                                 cudaGetErrorString(cudaGetLastError()));
+                    return false;   // the failed enqueue retains the source's stage claim
+                }
+                srcp->note_async_read(b, nullptr);
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
@@ -13587,7 +13592,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
-                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
+                    const uint8_t* b = srcp->blob_async(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
@@ -16483,14 +16488,16 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                const bool blocking = o.windowed_experts || refill_blocking();
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    const uint8_t* b = blocking ? srcp->blob_stable(i / g.n_expert, i % g.n_expert)
+                                                : srcp->blob_async(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !((o.windowed_experts || refill_blocking())
+                    if (b == nullptr || !(blocking
                             ? p.cache->fill_slot_blocking(slot, b, e, nb)
                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
-                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                    if (!blocking) srcp->note_async_read(b, nullptr);   // transfer the stage claim to its DMA fence
                     host_res[(size_t) i] = slot;
                 }
                 return true;
@@ -18704,16 +18711,18 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
+            const bool blocking = o.windowed_experts || refill_blocking();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                const uint8_t* b = blocking ? srcp->blob_stable(i / g.n_expert, i % g.n_expert)
+                                            : srcp->blob_async(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                if (b == nullptr || !((o.windowed_experts || refill_blocking())
+                if (b == nullptr || !(blocking
                         ? xcache.fill_slot_blocking(slot, b, err, nb)
                         : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                if (!blocking) srcp->note_async_read(b, nullptr);   // transfer the stage claim to its DMA fence
                 host_res[(size_t) i] = slot;
             }
             if (!xcache.sync_queued(err)) {

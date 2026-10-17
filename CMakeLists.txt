@@ -620,6 +620,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
       add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
       set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+      if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
+        add_executable(expert_stage_lease_test tests/core/expert_stage_lease_test.cpp)
+        target_link_libraries(expert_stage_lease_test PRIVATE strata_engine)
+        target_link_options(expert_stage_lease_test PRIVATE
+          -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost -Wl,--wrap=cudaGetLastError
+          -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaStreamSynchronize
+          -Wl,--wrap=cudaEventCreateWithFlags -Wl,--wrap=cudaEventRecord -Wl,--wrap=cudaEventQuery
+          -Wl,--wrap=cudaEventSynchronize -Wl,--wrap=cudaEventDestroy)
+        add_test(NAME expert_stage_lease_test COMMAND expert_stage_lease_test)
+        set_tests_properties(expert_stage_lease_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+      endif()
     endif()
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)

@@ -180,7 +180,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
         if (swaps.empty()) continue;
         const OnDevice on(r.device_);
         for (const auto& s : swaps) {
-            const uint8_t* in_blob = source.blob(s.layer, s.in);
+            const uint8_t* in_blob = source.blob_async(s.layer, s.in);
             if (!r.cache_.fill_slot(r.cache_.slot_of(s.layer, s.out), in_blob,
                                     r.stream_, err, (int64_t) lay.blob_bytes(s.layer))) return false;
             source.note_async_read(in_blob, r.stream_);   // #1237
