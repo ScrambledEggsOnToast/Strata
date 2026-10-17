@@ -188,6 +188,25 @@ struct MtpDrafterCertificationFixture {
         check(!cancelled.completed_coverage().known() && !cancelled.context_idle(error),
               "abandoned operation drains but cannot retain stale prior certification");
         cancelled.cs_ = nullptr;
+        // Coverage belongs to the request that wrote it: a later bind without its own completed
+        // writes must not advertise the earlier request's rows as this request's own.
+        MtpDrafter rebound;
+        rebound.coverage_ = {0, 8, 11};
+        rebound.coverage_owner_ = 41;
+        rebound.working_request_ = 42;
+        {
+            const std::vector<int32_t> ids(size_t(16), 7);
+            const std::vector<ConversationImageKey> no_images;
+            const std::vector<ConversationCheckpoint> no_checks;
+            ConversationView view{ids, no_images, no_checks, true};
+            rebound.certify_view(view);
+            check(view.draft_owner == 0 && view.draft_begin == -1 && view.draft_tokens == -1,
+                  "a later request's bind leaves the earlier request's coverage unadvertised");
+            rebound.working_request_ = 41;
+            rebound.certify_view(view);
+            check(view.draft_owner == 41 && view.draft_begin == 0 && view.draft_tokens == 8,
+                  "the request that wrote the coverage can still certify it");
+        }
     }
 };
 }

@@ -512,8 +512,9 @@ int main() {
               "one reserved stage-image directory slot is charged exactly once");
         const SavedConversation stage = image({1, 2, 3});
         split.stage_images.push_back(stage);
-        check(split.bytes() == solo + sizeof(SavedConversation) + stage.bytes() - sizeof(stage.scope),
-              "one stage image charges its inline scope only through its directory slot");
+        check(split.bytes() == solo + sizeof(SavedConversation) + stage.bytes() - sizeof(stage.scope) -
+                                    SavedConversation::draft_metadata_bytes,
+              "one stage image charges its inline scope and certification only through its directory slot");
     }
     {
         // An empty stage owns no external allocation: its entire contribution
@@ -522,7 +523,7 @@ int main() {
         split.scope = test_scope;
         split.stage_images.reserve(3);
         split.stage_images.emplace_back();
-        const size_t expected = sizeof(ConversationScope) +
+        const size_t expected = sizeof(ConversationScope) + SavedConversation::draft_metadata_bytes +
                                 split.stage_images.capacity() * sizeof(SavedConversation);
         check(split.bytes() == expected,
               "empty stage adds no payload beyond its full directory allocation");

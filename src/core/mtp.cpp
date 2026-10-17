@@ -226,8 +226,8 @@ void MtpDrafter::set_boundary_capture(int64_t position) {
 }
 
 bool MtpDrafter::capture_boundary(const float* residual, int64_t position, uint64_t request, std::string& err) {
-    if (!residual || !request || request != working_request_ || !coverage_.known() ||
-        position < coverage_.begin || coverage_.cells != position) {
+    if (!residual || !request || request != working_request_ || coverage_owner_ != working_request_ ||
+        !coverage_.known() || position < coverage_.begin || coverage_.cells != position) {
         err = "mtp: boundary residual owner/position mismatch"; return false;
     }
     const OnDevice on(device_);
@@ -243,7 +243,10 @@ void MtpDrafter::certify_view(ConversationView& view, int slot) const {
                                     slots_[(size_t) slot].tail_token} : ConversationDraftCoverage{};
     view.draft_tokens = view.draft_begin = -1; view.draft_next_token = -1; view.draft_owner = 0;
     view.draft_boundary_residual = nullptr; view.draft_boundary_position = -1; view.draft_boundary_owner = 0;
-    if (!interval.known() || async_owned_) return;
+    // The working coverage describes the request that wrote it: a later bind without its own completed writes
+    // leaves the previous request's interval unusable rather than advertising rows this view never recomputed.
+    // A resident slot's own certification is already keyed by its request.
+    if (!interval.known() || async_owned_ || (slot == 8 && coverage_owner_ != working_request_)) return;
     view.draft_owner = slot == 8 ? coverage_owner_ : slot_state(slot) ? slots_[size_t(slot)].request : 0;
     const int64_t live = int64_t(view.ids.size());
     const int64_t end = view.exact_cut ? live - 1 : std::min(interval.cells, live);
