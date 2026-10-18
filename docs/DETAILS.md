@@ -1769,8 +1769,11 @@ new suffix and refuse the legacy first-token-to-batch handoff. No interval is in
 Disk export remains separately gated by packed prefill: feature-off publication offers a shallow legacy view with
 unknown draft coverage (`STCSMAN1`), without changing the certified RAM/retry image or activating the reader floor.
 Unknown coverage still refuses direct resident source reuse rather than treating a cold retry as reuse.
-This RAM repair does not certify old `STCSMAN1` disk images: the legacy ordinary disk-mount path still accepts
-unknown intervals, and later suffix-only writes can therefore still refuse batch adoption after a restart.
+MTP engines decline legacy `STCSMAN1` disk candidates before mounting any GPU state, falling back to the request's
+existing RAM prefix or cold prefill. The engine logs the cause once:
+`strata serve: conversation store: legacy MAN1 image declined for MTP engine: draft coverage not certified`.
+This refusal does not repair or delete the stored image. Non-MTP engines still restore `STCSMAN1`; certified
+`STCSMAN2` and RAM-parked restore keep their existing validation and coverage contracts.
 
 The shutdown drain budget is 8 s by default and can be raised with `STRATA_STORE_DRAIN_MS` (clamped to 1-120 s) when a run publishes many large histories; the frontend's independent QUIT escalation is unchanged.
 

@@ -11788,6 +11788,7 @@ int main(int argc, char** argv) {
             uint64_t request_id = 0, generation = 0;
         };
         std::function<bool()> packed_wait_commands;
+        bool legacy_store_mtp_decline_reported = false;
         auto store_demand_restore = [&](const std::vector<int32_t>& prompt,
                                         const std::vector<ImgKey>& imgs,
                                         const strata::core::ConversationScope& scope, bool want_cvec,
@@ -12021,6 +12022,16 @@ int main(int argc, char** argv) {
                 read.image.reset();
                 out.status = strata::core::ConversationStoreReadStatus::stale;
                 return out;
+            }
+            if (!strata::program::conversation_store_restore_compatible(image, use_mtp)) {
+                if (!legacy_store_mtp_decline_reported) {
+                    std::fprintf(stderr, "strata serve: conversation store: legacy MAN1 image declined for MTP "
+                                         "engine: draft coverage not certified\n");
+                    legacy_store_mtp_decline_reported = true;
+                }
+                read.image.reset();
+                out.status = strata::core::ConversationStoreReadStatus::missing;
+                return out; // no mounted alias or GPU state: the caller keeps its RAM/cold fallback
             }
             out.status = read.status;
             out.head_id = read.head_id;

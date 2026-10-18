@@ -4,6 +4,7 @@
 // checked against actual admissions, actual catalog commits and a fresh open of the same root - never against a
 // stand-in that would agree with whatever the handover happened to decide.
 #include "strata/program/conversation_publication.hpp"
+#include "strata/program/conversation_store_admission.hpp"
 
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
@@ -996,15 +997,15 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
 // Storage/authority policy only: these are explicit small store fixtures, not
 // claimed CUDA writes or a substitute for the real GEN-to-resident regression.
 void check_ram_certification_is_independent_of_disk_export() {
-    for (bool export_certification : {false, true}) {
+    for (bool split : {false, true}) for (bool export_certification : {false, true}) {
         TempRoot root;
         const auto options = options_for(root.path);
         ConversationStore store(options);
         Sink sink(store);
         sink.out.export_draft_certification = export_certification;
         ConversationPublicationQueue publications;
-        auto record = all_stage_record(241, 64);
-        auto& draft_owner = record.stage_images.back();
+        auto record = split ? all_stage_record(241, 64) : stored_record(241, 64);
+        auto& draft_owner = split ? record.stage_images.back() : record;
         draft_owner.kv.push_back(draft_owner.kv.back());
         draft_owner.draft_begin = 0;
         draft_owner.draft_cells = 64;
@@ -1017,7 +1018,7 @@ void check_ram_certification_is_independent_of_disk_export() {
         if (sink.cache.size() == 1) {
             bool retained = false;
             const auto ram = sink.cache.take(0, retained);
-            const auto& owner = ram.stage_images.back();
+            const auto& owner = split ? ram.stage_images.back() : ram;
             check(owner.draft_begin == 0 && owner.draft_cells == 64 && owner.draft_next_token == 731,
                   "disk export policy never strips the RAM image's completed interval or boundary token");
         }
@@ -1055,9 +1056,14 @@ void check_ram_certification_is_independent_of_disk_export() {
         ConversationStoreRead read;
         check(reopened.wait_ready(1201, 1, read, 5000) &&
               read.status == ConversationStoreReadStatus::ready && read.image &&
-              read.image->stage_images.size() == 2, "disk-only restore returns the complete physical stages");
-        if (read.image && read.image->stage_images.size() == 2) {
-            const auto& owner = read.image->stage_images.back();
+              read.image->stage_images.size() == (split ? 2 : 0),
+              "disk-only restore returns the complete physical stages");
+        if (read.image && read.image->stage_images.size() == (split ? 2 : 0)) {
+            check(strata::program::conversation_store_restore_compatible(*read.image, false),
+                  "a non-MTP engine accepts both MAN1 and MAN2 disk candidates");
+            check(strata::program::conversation_store_restore_compatible(*read.image, true) == export_certification,
+                  "an MTP engine declines MAN1 disk candidates and accepts certified MAN2");
+            const auto& owner = split ? read.image->stage_images.back() : *read.image;
             check(owner.draft_begin == (export_certification ? 0 : -1) &&
                   owner.draft_cells == (export_certification ? 64 : -1) &&
                   owner.draft_next_token == (export_certification ? 731 : -1),

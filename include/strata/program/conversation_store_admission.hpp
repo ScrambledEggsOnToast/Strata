@@ -58,6 +58,15 @@ struct ConversationStoreDemandAdmission {
     uint64_t allowance_bytes = 0;
 };
 
+// Disk mount policy only: the reader leaves MAN1 draft coverage unknown. MTP
+// requires the explicit interval on the final physical stage before any GPU write.
+// RAM-parked restore keeps its own certification contract.
+inline bool conversation_store_restore_compatible(const core::SavedConversation& image, bool use_mtp) {
+    if (!use_mtp) return true;
+    const auto& draft = image.stage_images.empty() ? image : image.stage_images.back();
+    return draft.draft_begin >= 0 && draft.draft_cells >= draft.draft_begin;
+}
+
 // One authoritative RAM rollback candidate survives every demand in a shared ->
 // private-disk -> RAM chain. Only a disk candidate belongs in private_disk: a
 // second copy of ram would retain a stale cache index after admission compacts it.
