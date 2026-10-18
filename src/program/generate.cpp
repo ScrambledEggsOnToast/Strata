@@ -1811,8 +1811,20 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 #endif
 }
 
+/// `STRATA_BOOT_TIMING=1`: milliseconds since this engine process started, at a boot milestone. The milestones are
+/// the ones `mem_mark` already visits, so the timeline and the memory trace line up; the launcher's engine_load_s
+/// is the total these partitions.
+void boot_mark(const char* where) {
+    static const bool on = std::getenv("STRATA_BOOT_TIMING") != nullptr;
+    static const auto started = std::chrono::steady_clock::now();
+    if (!on) return;
+    std::fprintf(stderr, "strata boot: %8.0f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), where);
+}
+
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
+    boot_mark(where);
     static const char* const env = std::getenv("STRATA_TRACE");
     if (env == nullptr) return;
     size_t free_b = 0, total_b = 0;
@@ -7622,6 +7634,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: windowed expert sources: %zu independent lanes, %llu B total rings\n",
                      stage_sources.size() + 1, (unsigned long long) windowed_resident_bytes);
+        boot_mark("the expert source lanes");
     } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
