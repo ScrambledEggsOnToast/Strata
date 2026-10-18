@@ -73,7 +73,7 @@ public:
         const size_t full = extra / limit, tail = extra % limit;
         if (!add(total, full * limit)) return SIZE_MAX;
         if (tail && !add(total, segment_capacity(tail, full ? limit :
-                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0))) return SIZE_MAX;
+                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0, size_))) return SIZE_MAX;
         const size_t new_segments = full + (tail != 0);
         if (sharing_ && (new_segments > SIZE_MAX / Segment::owner_bytes ||
             !add(total, new_segments * Segment::owner_bytes))) return SIZE_MAX;
@@ -86,7 +86,8 @@ public:
     void resize(size_t n, uint8_t value = 0) {
         if (n > size_) {
             const size_t limit = extent_bytes();
-            const bool growing = size_ != 0;
+            const size_t held = size_;
+            const bool growing = held != 0;
             const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
             const size_t extend = std::min(n - size_, spare);
             const size_t extra = n - size_ - extend;
@@ -99,7 +100,7 @@ public:
                 const size_t count = std::min(limit, n - size_);
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
                 Segment segment(sharing_);
-                segment.reserve(segment_capacity(count, previous, growing));
+                segment.reserve(segment_capacity(count, previous, growing, held));
                 segment.resize(count, value);
                 segments_.push_back(std::move(segment));
                 size_ += count;
@@ -257,9 +258,12 @@ private:
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
-    size_t segment_capacity(size_t count, size_t previous, bool growing) const {
+    // Bound reserve slack by an eighth of the existing payload as well as the extent policy.
+    size_t segment_capacity(size_t count, size_t previous, bool growing, size_t held) const {
         if (!growing) return count;
-        return std::max(count, std::min(extent_bytes(), std::max<size_t>(65536, std::min(previous, extent_bytes()/2)*2)));
+        const size_t limit = extent_bytes();
+        const size_t geometric = std::min(limit, std::max<size_t>(65536, std::min(previous, limit / 2) * 2));
+        return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
     }
     static bool add(size_t& n, size_t extra) {
         if (extra > SIZE_MAX - n) return false;

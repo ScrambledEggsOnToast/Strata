@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/layout.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -47,7 +48,7 @@ inline bool session_fingerprint(const core::SessionState& session, const core::Q
     }
     core::ConversationStateSizes sizes;
     if (!core::conversation_session_sizes(g, session, sizes, err)) return false;
-    const auto shape = kernels::qsa_real_shapes();
+    const auto shape = core::qsa_shapes(g);
     std::array<uint8_t, 65536> buffer;
     bool ok = true;
     auto bytes = [&](const void* p, size_t n, uint64_t h) {

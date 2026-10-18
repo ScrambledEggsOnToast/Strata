@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/plan/qsa_memory.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -35,11 +36,15 @@
 #include <atomic>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -505,9 +510,7 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
 // ================================ the QSA mixer ================================
 namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaShapes;
-/// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
-/// the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and `idx_top_k`, which are kernel contracts.
-QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = strata::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
+// `qsa_shapes(g)` (layout.hpp): the geometry the QSA kernels want, every field from the model's geometry
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
 struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = (T*) (p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
@@ -519,6 +522,61 @@ namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
+
+// The KV host copy: pinned and device-mapped. cudaHostAlloc is the default, but under WSL2 the driver caps what
+// cudaHostAlloc(Mapped) may pin at about 1 GiB in all, while cudaHostRegister of ordinary memory is not capped there:
+// the expert arena registers tens of GiB the same way (pinned.cu). So under WSL2, detected as generate.cpp's
+// under_wddm() does (/dev/dxg, the device its GPU goes through to the Windows driver), the copy is anonymous memory
+// registered Portable|Mapped before any page is touched, which also leaves WSL's small cudaHostAlloc budget to the
+// staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
+// is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first.
+// The owning QsaState records which release operation this allocation requires.
+uint8_t* kv_host_alloc(uint64_t bytes, bool& registered) {
+    registered = false;
+    auto host_alloc = [](uint64_t n) -> uint8_t* {
+        uint8_t* h = nullptr;
+        if (cudaHostAlloc((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
+        (void) cudaGetLastError();
+        return nullptr;
+    };
+#ifdef _WIN32
+    return host_alloc(bytes);
+#else
+    static const bool register_first = [] {
+        const char* e = std::getenv("STRATA_KV_HOST_REGISTER");
+        if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
+        return std::filesystem::exists("/dev/dxg");
+    }();
+    auto register_anon = [&registered](uint64_t n) -> uint8_t* {
+        void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) return nullptr;
+        const cudaError_t status = cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "strata: KV streaming: cudaHostRegister refused the host copy: %s\n",
+                         cudaGetErrorString(status));
+            (void) cudaGetLastError();
+            if (munmap(m, (size_t) n) != 0) {
+                std::fprintf(stderr, "strata QSA allocation: unmap after failed registration failed\n");
+                std::terminate();
+            }
+            return nullptr;
+        }
+        registered = true;
+        static bool said = false;
+        if (!said) {
+            std::fprintf(stderr, "strata: KV streaming: the host copy is pinned with cudaHostRegister\n");
+            said = true;
+        }
+        return (uint8_t*) m;
+    };
+    if (register_first) {
+        if (uint8_t* m = register_anon(bytes)) return m;
+        return host_alloc(bytes);
+    }
+    if (uint8_t* h = host_alloc(bytes)) return h;
+    return register_anon(bytes);
+#endif
+}
 
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
@@ -756,7 +814,24 @@ void qsa_state_release(QsaState& st) noexcept {
     if (st.owns_rope) strata::kernels::rope_table_release(st.cos_tab);
     if (st.host_step) qsa_release_check(cudaFreeHost(st.host_step), "free step staging");
     if (st.host_pos) qsa_release_check(cudaFreeHost(st.host_pos), "free position staging");
-    if (st.host_allocation) qsa_release_check(cudaFreeHost(st.host_allocation), "free host KV");
+    if (st.host_registered) {
+        if (!st.host_allocation) {
+            std::fprintf(stderr, "strata QSA teardown: registered host KV has no allocation handle\n");
+            std::terminate();
+        }
+        qsa_release_check(cudaHostUnregister(st.host_allocation), "unregister host KV");
+#ifndef _WIN32
+        if (munmap(st.host_allocation, (size_t) st.host_allocation_bytes) != 0) {
+            std::fprintf(stderr, "strata QSA teardown: unmap registered host KV failed\n");
+            std::terminate();
+        }
+#else
+        std::fprintf(stderr, "strata QSA teardown: registered host KV is not an mmap allocation on Windows\n");
+        std::terminate();
+#endif
+    } else if (st.host_allocation) {
+        qsa_release_check(cudaFreeHost(st.host_allocation), "free host KV");
+    }
     if (st.allocation_id && std::getenv("STRATA_STATE_HASH"))
         std::fprintf(stderr, "STATE_QSA owner=%llu phase=release allocations=%u bytes=%llu\n",
                      (unsigned long long) st.allocation_id, st.pinned_allocations, (unsigned long long) st.pinned_bytes);
@@ -908,17 +983,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         if (!hc.valid) { std::fprintf(stderr, "strata: QSA pinned carve exceeds price\n"); return 0; }
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* d = nullptr;
-        const cudaError_t pinned = cudaHostAlloc(&st.host_allocation, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
-        if (pinned == cudaSuccess) {
+        st.host_allocation = kv_host_alloc(bytes, st.host_registered);
+        if (st.host_allocation) {
             allocated(bytes);
             g_kv_host_bytes += bytes;
             st.host_allocation_bytes = bytes;
         }
-        if (pinned != cudaSuccess || cudaHostGetDevicePointer((void**) &d, st.host_allocation, 0) != cudaSuccess) {
-            // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
+        if (!st.host_allocation || cudaHostGetDevicePointer((void**) &d, st.host_allocation, 0) != cudaSuccess) {
+            // The owning state releases either allocation kind if mapping the device alias failed.
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
-                                 "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
-                                 "WSL the driver pins only about 1 GiB in all)\n", (double) bytes / 1073741824.0,
+                                 "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
+                                 "or run without --kv-resident\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
@@ -1523,12 +1598,12 @@ st_begin(layer, 0, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = (const uint16_t*) w_down[0]->data;
-        fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1);
+        fa.w_up = NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1); fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1), (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1546,12 +1621,12 @@ st_begin(layer, 3, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = (const uint16_t*) w_down[1]->data;
-        fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1);
+        fa.w_up = NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1); fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1), (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {

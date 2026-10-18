@@ -244,6 +244,7 @@ struct QsaState {
     /// Allocation handle, NOT the mapped device alias in `host`; retained even during partial init.
     void* host_allocation = nullptr;
     uint64_t host_allocation_bytes = 0;
+    bool host_registered = false;
     uint64_t allocation_id = 0;
     uint64_t pinned_bytes = 0;
     uint32_t pinned_allocations = 0;

@@ -30,7 +30,10 @@ inline uint64_t cpu_share_host_bytes(int64_t tokens, int64_t experts) {
     if (tokens <= 0 || tokens > INT32_MAX / kCpuShareRoutes || experts <= 0 || experts > kernels::cpu::NE)
         return UINT64_MAX;
     const uint64_t t = (uint64_t) tokens, e = (uint64_t) experts;
+    // 0.1.44's CPU-share rows carry their own row-scale (`cpu_ones`, all ones: the CPU's rows carry s_down
+    // already): `rows * 2` floats, grown with the rows' headroom and never counted here before the merge.
     return (t + 2 * cpu_share_max_rows(tokens, experts)) * kernels::cpu::H * sizeof(float)
+        + 2 * cpu_share_max_rows(tokens, experts) * sizeof(float)
         + t * (kernels::cpu::kNativeActBytes + sizeof(kernels::cpu::ActQ) + sizeof(char))
         + e * (sizeof(kernels::cpu::ExpertJobMulti) + sizeof(std::pair<int32_t, int32_t>)
                + sizeof(char) + sizeof(const uint8_t*));

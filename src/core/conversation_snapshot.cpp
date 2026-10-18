@@ -104,10 +104,17 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error, admission_copy::Part part, admission_copy::Direction direction) {
+bool transfer(void* dst, const void* src, size_t n, std::string& error, admission_copy::Part part,
+              admission_copy::Direction direction, bool queued = false) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
+    if (queued) {
+        const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n, true);
+        if (e == cudaSuccess) return true;
+        error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
+        return false;
+    }
     admission_copy::Transfer observed(part, direction, n);
     const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
     observed.finish(e == cudaSuccess);
@@ -115,7 +122,8 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error, admissio
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
-bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error,
+                       bool queued = false) {
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -135,7 +143,7 @@ bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
     // Repairs use stream 0, which a nonblocking compute/copy stream does not
     // join. Complete them before returning or publishing the restored owner,
     // without stalling unrelated nonblocking work.
-    if (st.kv_mode != 0) {
+    if (!queued && st.kv_mode != 0) {
         status = cudaStreamSynchronize((cudaStream_t) 0);
         if (status != cudaSuccess) {
             error = std::string("conversation snapshot residency synchronize: ") + cudaGetErrorString(status);
@@ -162,7 +170,7 @@ bool copy_layout(const QsaState& from, const QsaState& to, const ModelGeometry& 
 }
 
 bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                  int64_t upto, const Layout& l, std::string& error) {
+                  int64_t upto, const Layout& l, std::string& error, bool queued = false) {
     const auto src = pools(from), dst = pools(to);
     const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     for (size_t i = 0; i < sizes.size(); ++i) {
@@ -172,11 +180,17 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
             const size_t bytes = std::min(ConversationBuffer::segment_bytes, sizes[i] - at);
             if (!transfer(static_cast<uint8_t*>(dst[i]) + at, static_cast<const uint8_t*>(src[i]) + at,
                           bytes, error, static_cast<admission_copy::Part>(admission_copy::key + i),
-                          admission_copy::direct)) return false;
+                          admission_copy::direct, queued)) return false;
             at += bytes;
         }
     }
-    return restore_residency(to, g, upto, error);
+    if (queued && to.kv_mode != 0) {
+        const cudaError_t e = conversation_detail::order_after_queued();
+        if (e != cudaSuccess) {
+            error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false;
+        }
+    }
+    return restore_residency(to, g, upto, error, queued);
 }
 
 } // namespace
@@ -198,10 +212,10 @@ bool conversation_kv_copy_validate(const QsaState& from, const QsaState& to, con
 }
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool index, std::string& error) {
+                          int64_t upto, bool index, std::string& error, bool queued) {
     Layout source{};
     return copy_layout(from, to, g, upto, index, source, error) &&
-           copy_payload(from, to, g, upto, source, error);
+           copy_payload(from, to, g, upto, source, error, queued);
 }
 
 bool conversation_detail::copy_prevalidated_kv(const QsaState& from, const QsaState& to, const ModelGeometry& g,
@@ -383,6 +397,11 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::restore);
             })) return false;
     return restore_residency(st, g, upto, error);
+}
+
+bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                    int64_t captured, int64_t upto, bool index, std::string& error) {
+    return conversation_kv_restore(image, st, g, upto, index, error, captured);
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

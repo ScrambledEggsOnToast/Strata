@@ -116,6 +116,7 @@ public:
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
+    void set_window_R(const float* window_R) { window_R_ = window_R; }
 
     /// Boot/calibration after bind: capture + upload all reachable prefill/round widths and
     /// chain steps, including coupled variants when configured, without launching kernels.
@@ -131,6 +132,10 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
+    /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
+    /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+    /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+    bool reserve_prefill(int64_t n, std::string& err);
     cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
@@ -185,6 +190,8 @@ public:
     const float* chain_prob() const { return chain_prob_; }
 
     double ms_draft = 0, ms_prefill = 0;
+    double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
+    int64_t n_src = 0;
     int64_t rounds = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V

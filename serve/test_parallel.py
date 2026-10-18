@@ -133,6 +133,7 @@ def window():        # one batch window: every active slot one token
         else:
             active[b] = [left, max_new, produced]
 log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
+PPK = int(args[args.index("--pp-every") + 1]) if "--pp-every" in args else 1
 READF = "--readfield" in args   # DONE's 15th field: the prompt tokens the engine read (a continued prompt: the 1 it copies)
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
 def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
@@ -305,6 +306,8 @@ while True:
         read_reused = max(reused(ids), start)   # Resumed legs include this request's own parked work.
         for q in range(start + CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
+            if (q // CH) % PPK:   # --pp-every K: a PP line and a boundary every K chunks (the pipelined groups' pieces)
+                continue
             if "--quiet-prefill" not in args:
                 print(f"PP {q} {len(ids)} 1 1", flush=True)
             if log and "--says-budget" in args:
@@ -574,6 +577,29 @@ class ControlBudget(unittest.TestCase):
         self.assertIs(engine._control_turn(1.0), background)
         self.assertFalse(engine._can_yield(2), "rollback preserves the legacy policy")
 
+    def test_short_first_orders_new_reads_without_bypassing_background_deadlines(self):
+        import collections
+        engine = object.__new__(StrataEngine)
+        engine.foreground_budget_s = 1.0
+        background = [10, object(), "background", 40.0, 0.0, True]
+        long = [3000, object(), "foreground", float("inf"), 0.0, True]
+        short = [20, object(), "foreground", float("inf"), 2.0, True]
+        engine.wait_lens = [background, long, short]
+        engine.control_waiters = collections.deque(engine.wait_lens)
+        with mock.patch("serve.server.ADMIT_SHORT_FIRST", 100), \
+                mock.patch("serve.server.ADMIT_MAX_WAIT_S", 30.0), \
+                mock.patch("serve.server.time.monotonic", return_value=10.0):
+            self.assertIs(engine._control_turn(10.0), short, "short-first stays within the foreground tier")
+            with mock.patch("serve.server.time.monotonic", return_value=31.0):
+                self.assertIs(engine._control_turn(31.0), long, "an aged long prompt cannot starve")
+            self.assertIs(engine._control_turn(40.0), background, "a due background read still goes first")
+            engine.control_waiters.remove(background)
+            engine.wait_lens.remove(background)
+            long[5] = False
+            self.assertIs(engine._control_turn(10.0), long, "a parked continuation keeps its FIFO turn")
+        with mock.patch("serve.server.ADMIT_SHORT_FIRST", 0):
+            self.assertIs(engine._control_turn(10.0), long, "disabled short-first retains FIFO")
+
     def test_foreground_waiting_for_a_physical_slot_stays_in_the_control_queue(self):
         import collections
         engine = object.__new__(StrataEngine)
@@ -734,6 +760,35 @@ class PickSlot(unittest.TestCase):
         self.assertIsNone(e.pick_slot([7, 8], 'a'))
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3], 'a'), 1)                 # a held prompt is never the WHOLE prompt
+
+    def test_a_rewritten_next_turn_goes_to_the_slot_of_its_chat(self):
+        # #2518: two chats in two slots; each next turn renders the history again but not the reply it decoded or the
+        # assistant header, so the held stream (prompt + reply) is no start of it.  The engine's turn checkpoint sits at
+        # the last <|im_start|> of the old prompt: the prompt that agrees up to there belongs to that slot.  Before, both
+        # went to the least recently used slot in turn, and the first one overwrote the other chat's cache.
+        T = StrataEngine.TURN_ID
+        hist_a, hist_b = list(range(1000, 1600)), list(range(2000, 2600))
+        held_a = hist_a + [T, 7, 8, 9] + [50, 51, 52]                  # prompt (ends with the assistant header) + reply
+        held_b = hist_b + [T, 7, 8, 9] + [60, 61]
+        e = self.engine(2)
+        e.slot_held = [held_a, held_b]
+        e.slot_used = [10.0, 20.0]                                      # slot 0 was used longer ago
+        next_a = hist_a + [T, 5, 6, 7, 8, 9] + list(range(3000, 3100))  # the history again, then new turns
+        next_b = hist_b + [T, 5, 6, 7, 8, 9] + list(range(3000, 3100))
+        self.assertEqual(e.pick_slot(next_b, "a"), 1)                   # the LRU slot 0 holds the other chat
+        self.assertEqual(e.pick_slot(next_a, "a"), 0)
+        e.slot_busy[0] = True                                           # a busy slot is never picked
+        self.assertEqual(e.pick_slot(next_a, "a"), 1)
+        e.slot_busy[0] = False
+        # a chat that agrees with neither (a new one, or one that rewrote its history) keeps the old order
+        self.assertEqual(e.pick_slot(list(range(5000, 5200)), "a"), 0)
+        self.assertEqual(e.pick_slot(hist_a[:300] + [T, 5, 6] + list(range(3000, 3100)), "a"), 0)
+        e.slot_held[0] = []                                             # an empty slot still comes before evicting one
+        self.assertEqual(e.pick_slot(list(range(5000, 5200)), "a"), 0)
+        # the whole held stream continued is still the longer match
+        e.slot_held = [held_a, held_b + [T, 1, 2]]
+        self.assertEqual(e.pick_slot(held_b + [T, 1, 2, 3, 4], "a"), 1)
+        self.assertEqual(e.pick_slot(next_b, "other"), 0, "a turn checkpoint never crosses an authorized scope")
 
     def test_batch_groups_spread_requests_over_the_groups(self):
         # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
@@ -1652,6 +1707,19 @@ class ParallelService(unittest.TestCase):
             self.assertEqual(len(self.svc.history), 2)
         self.assertFalse(any(self.engine.slot_busy))
 
+    def test_the_way_is_asked_between_far_apart_progress_lines(self):
+        """#656 when the PP lines come far apart (the pipelined groups' read in pieces of one chunk: one PP per piece,
+        at its end): the BYIELD goes out while the engine is quiet, so the read gives way at the first boundary after
+        the short request came.  Asked only at a PP line, it reached the engine after that boundary's check and the
+        read gave way one piece later."""
+        self.start(2, more=["--pp-every", "80"])   # a boundary every 80 chunks (~0.8 s): one in this read
+        long_q, short_q = "long " * 600, "short"
+        res = self.race(long_q, short_q)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        yields = [x for x in self.log.read_text().splitlines() if x.startswith("YIELD ")]
+        self.assertEqual([int(x.split()[2]) for x in yields], [80 * 32], yields)
+
     def test_three_requests_long_long_short_do_not_deadlock(self):
         """ENGINE_REVIEW finding 1 (0.1.41 check): two long prompts fill both slots, a short one arrives a moment later
         and wants one of them (the yield path).  The reviewer's repro: long, long, short at 0.25 s steps.  Every
@@ -1789,6 +1857,25 @@ class ParallelService(unittest.TestCase):
                         "active decoders must commit while long prefill advances")
         self.assertFalse(any(self.engine.slot_busy))
 
+    def test_an_admission_is_asked_between_far_apart_progress_lines(self):
+        """As above for a read admitted beside a decoding slot (BGEN, `ask()`): with one PP line per 80 chunks the
+        short request's BYIELD still reaches the first boundary."""
+        self.start(3, more=["--pp-every", "80"])
+        bg = threading.Thread(target=lambda: self.chat("LONGREPLY background", max_tokens=60))
+        bg.start()
+        time.sleep(0.05)
+        long_q, short_q = "long " * 600, "short"
+        res = self.race(long_q, short_q)
+        bg.join(30)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        log = self.log.read_text().splitlines()
+        admitted = [x.split() for x in log if x.startswith("BGEN ") and int(x.split()[2]) > 2600]
+        self.assertTrue(admitted, log)                                 # the long read was an admission
+        yields = [x.split()[1:] for x in log if x.startswith("YIELD ")]
+        self.assertEqual(yields[:1], [[admitted[0][1], str(80 * 32)]], log)
+        self.assertFalse(any(self.engine.slot_busy))
+
     def test_no_way_given_to_a_long_one(self):
         """Two prompts of about the same length: no BYIELD (it only goes to a much shorter one)."""
         self.start(2)
@@ -1884,6 +1971,13 @@ class ParallelService(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "static or adaptive"):
                 StrataEngine("not-launched", [])
             spawn.assert_not_called()
+
+    def test_no_way_given_to_a_long_one_between_far_apart_progress_lines(self):
+        """The ask between PP lines keeps the rule: a waiting request about as long gets no BYIELD there either."""
+        self.start(2, more=["--pp-every", "80"])
+        res = self.race("long " * 600, "lung " * 600)
+        self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 2)
+        self.assertFalse(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
 
     def test_left_alone_it_goes_back_to_the_solo_path(self):
         """A request decoding in a slot whose neighbour finished goes back to the solo path (MTP drafts), continued
