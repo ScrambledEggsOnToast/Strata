@@ -4574,12 +4574,18 @@ int main(int argc, char** argv) {
                          mps_verification.client_pid, mps_verification.server_pid);
             for (size_t i = 0; i < mps_verification.devices.size(); ++i) {
                 const auto& row = mps_verification.devices[i];
+                // Only the front device carries a residual readback (mps_ceiling.cpp); printing 0 for the
+                // others reads as "no room left" in a log the operator scans for that.
+                char residual[32];
+                if (i == 0) std::snprintf(residual, sizeof(residual), "%llu",
+                                          (unsigned long long) row.residual_free_bytes);
+                else std::snprintf(residual, sizeof(residual), "%s", "unmeasured");
                 std::fprintf(stderr, "%s{device=%d,gpu_uuid=%s,cap_bytes=%llu,default_cap_bytes=%llu,"
-                                     "server_cap_bytes=%llu,residual_free_bytes=%llu,physical_free_bytes=%llu,"
+                                     "server_cap_bytes=%llu,residual_free_bytes=%s,physical_free_bytes=%llu,"
                                      "physical_free_measured=%d,outside_client_allowance_bytes=%llu}",
                              i == 0 ? "" : ",", row.device, row.gpu_uuid.c_str(),
                              (unsigned long long) row.cap_bytes, (unsigned long long) row.default_cap_bytes,
-                             (unsigned long long) row.server_cap_bytes, (unsigned long long) row.residual_free_bytes,
+                             (unsigned long long) row.server_cap_bytes, residual,
                              (unsigned long long) row.physical_free_bytes, row.physical_free_measured ? 1 : 0,
                              (unsigned long long) row.outside_client_allowance_bytes);
             }
@@ -13712,10 +13718,24 @@ int main(int argc, char** argv) {
                             v.draft_boundary_owner = source.boundary_request;
                         }
                     } else if (retained.draft_begin >= 0 && retained.draft_cells >= retained.draft_begin) {
-                        v.draft_begin = retained.draft_begin; v.draft_tokens = retained.draft_cells;
-                        v.draft_owner = retained.owner.request;
-                        v.draft_next_token = retained.draft_cells == int64_t(v.ids.size())
-                            ? retained.draft_next_token : -1;
+                        // The chain's completed extent can outrun the conversation the snapshot holds: after a
+                        // proposal it has written the next cell, and a yielded read leaves the live ids at the
+                        // frontier. Certifying what this snapshot can prove - never more - keeps the captured
+                        // image valid instead of skipping the whole park (2026-10-18: every such skip sat at a
+                        // yield and cost the resumed turn its RAM snapshot).
+                        const int64_t live_n = int64_t(v.ids.size());
+                        int64_t tokens = std::min(retained.draft_cells, live_n);
+                        int32_t next = retained.draft_cells == live_n ? retained.draft_next_token : -1;
+                        if (tokens == live_n && next < 0) { tokens = live_n - 1; next = -1; }
+                        if (tokens >= retained.draft_begin) {
+                            if (tokens != retained.draft_cells)
+                                std::fprintf(stderr, "strata serve: conversation cache: certifying %lld of the "
+                                             "chain's %lld cells for this snapshot (live %lld)\n",
+                                             (long long) tokens, (long long) retained.draft_cells, (long long) live_n);
+                            v.draft_begin = retained.draft_begin; v.draft_tokens = tokens;
+                            v.draft_owner = retained.owner.request;
+                            v.draft_next_token = next;
+                        }
                     }
                 } else if (!source.shared_prefix && displaced_draft) {
                     if (displaced_draft->draft_begin >= 0 &&
