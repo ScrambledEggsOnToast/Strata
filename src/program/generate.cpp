@@ -11097,6 +11097,9 @@ int main(int argc, char** argv) {
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         strata::core::ConversationScope live_scope;
+        // Only spans the next request's bind-to-park seam; never survives a restore or write.
+        std::optional<strata::core::ConversationDraftCoverage> displaced_draft;
+        uint64_t displaced_draft_owner = 0;
         // ---- the persistent conversation store (private, CPU-only) -------------
         // One coordinator owns the cache root, its catalog, its quota and its storage threads; it is the sole disk
         // authority and never touches GPU state.  It extends the sources above instead of competing with them: the
@@ -12278,6 +12281,11 @@ int main(int argc, char** argv) {
                         v.draft_owner = retained.owner.request;
                         v.draft_next_token = retained.draft_cells == int64_t(v.ids.size())
                             ? retained.draft_next_token : -1;
+                    }
+                } else if (!source.shared_prefix && displaced_draft) {
+                    if (displaced_draft->known()) {
+                        v.draft_begin = displaced_draft->begin; v.draft_tokens = displaced_draft->cells;
+                        v.draft_next_token = displaced_draft->next_token; v.draft_owner = displaced_draft_owner;
                     }
                 } else mtp.certify_view(v);
                 if (!packed_prefill && source.shared_prefix) {
@@ -16888,6 +16896,13 @@ int main(int argc, char** argv) {
             input.sampling.penalty_repeat = req_penalty_repeat;
             input.sampling.penalty_freq = req_penalty_freq;
             input.sampling.penalty_present = req_penalty_present;
+            // begin() rebinds the working drafter before the outgoing live image is parked.
+            // Certify its unchanged completed interval while its producer still owns it.
+            strata::core::ConversationView outgoing_draft{live, live_imgs, checks, cvec_cached};
+            mtp.certify_view(outgoing_draft);
+            displaced_draft = strata::core::ConversationDraftCoverage{
+                outgoing_draft.draft_begin, outgoing_draft.draft_tokens, outgoing_draft.draft_next_token};
+            displaced_draft_owner = outgoing_draft.draft_owner;
             if (!resident.begin(admit_slot, ids, input, err)) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
             }
@@ -17330,9 +17345,13 @@ int main(int argc, char** argv) {
                               // A one-shot borrow (ckpt=0) leaves its donor alone: its capture is a branch of its
                               // own, and it never supersedes the head that donor came from.
                               req_ckpt != 0)) {
+                displaced_draft.reset();
+                displaced_draft_owner = 0;
                 phase_error("ERR %s\n", err.c_str());
                 return 1;
             }
+            displaced_draft.reset();
+            displaced_draft_owner = 0;
             // QUIT has no later request to park the last completed conversation, so the clean-shutdown seam parks it
             // itself.  Only the decision the next request would have taken is recorded: this request's own keys say
             // whether its history is continued at all (ckpt=0 is a one-shot that must neither be parked nor supersede
