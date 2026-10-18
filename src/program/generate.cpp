@@ -8495,11 +8495,18 @@ int main(int argc, char** argv) {
         const bool batch = windowed != nullptr && (int64_t) order.size() <= st.cache.slots();
         size_t at = 0;
         while (at < order.size()) {
-            if (out.filled >= st.cache.slots()) return;
+            if (out.filled >= st.cache.slots()) {
+                out.err = "the stage expert cache holds " + std::to_string(st.cache.slots()) + " slots but its profile "
+                          "needs " + std::to_string(order.size()) + "; complete local residency does not fit";
+                return;
+            }
             if (!batch) {
                 const auto& pr = order[at];
                 const int32_t slot = st.cache.admit(pr.first, pr.second);
-                if (slot == strata::core::kNotResident) return;
+                if (slot == strata::core::kNotResident) {
+                    out.err = "the stage expert cache admitted no slot for its profile";
+                    return;
+                }
                 const auto blob_began = std::chrono::steady_clock::now();
                 const uint8_t* b = lane->blob_stable(pr.first, pr.second);
                 const auto copy_began = std::chrono::steady_clock::now();
