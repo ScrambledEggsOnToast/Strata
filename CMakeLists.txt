@@ -1880,6 +1880,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(batch_residency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(batch_residency_test PRIVATE strata_warnings)
   add_test(NAME batch_residency_test COMMAND batch_residency_test)
+  # #249: the per-request packed composition policy is a header-only pure rule, so the chosen
+  # owners are checked without a GPU, a model or a frontend.
+  add_executable(packed_selection_test tests/program/packed_selection_test.cpp)
+  target_include_directories(packed_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(packed_selection_test PRIVATE strata_warnings)
+  add_test(NAME packed_selection_test COMMAND packed_selection_test)
   add_executable(source_receipt_test tests/core/source_receipt_test.cpp)
   target_include_directories(source_receipt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(source_receipt_test PRIVATE strata_warnings)

@@ -3268,6 +3268,12 @@ The server cannot infer native quanta or pauses from HTTP token arrival times. P
 FIFO, with yielded chunk reads rejoining behind current waiters; native safe boundaries remain responsible
 for interleaving prefill and decode. No per-token state swapping is introduced by the service.
 
+All three generation endpoints also accept `"strata_packing": "eligible"` (default) or `"solo"` (#249), an
+independent per-request packing policy validated before admission and forwarded as the packed owner's
+`packing=` key. It does not change `strata_priority`, control/admission order or decode quanta, and it has no
+effect while packed prefill is off. A gateway that preserves unknown request fields (the Koko route does)
+passes it through unchanged; it is not inferred from the model name.
+
 #### Experimental segmented packed prefill
 
 `STRATA_PACKED_PREFILL=1` is an exact, default-off native switch. It requires serving with one to four
@@ -3297,10 +3303,11 @@ Trusted native clients may send `BGENQ1` through `BGENQ4`. One newline terminate
 The suffix is the exact number of owner records, separated by a single TAB:
 
 ```
-BGENQ2 tag-a 0 1 scope=<scope-a> <ids-a><TAB>tag-b 1 4 priority=background scope=<scope-b> <ids-b>
+BGENQ2 tag-a 0 1 packing=solo scope=<scope-a> <ids-a><TAB>tag-b 1 4 priority=background packing=eligible scope=<scope-b> <ids-b>
 ```
 
 Each record is `<tag> <slot> <max_new> [existing sampling/cache/phase keys] <comma-separated ids>`.
+`packing` is `eligible` when absent; any other value than `eligible` or `solo` refuses the frame's records.
 A tag has 1..96 ASCII letters, digits, underscores or hyphens and belongs to one submission.
 Every destination is prevalidated before the all-or-none CPU reservation. A frame has at most four owners;
 the complete-input queue holds at most eight frames, each bounded by the configured context and four records.
@@ -3343,7 +3350,7 @@ Two further experimental native controls are independent and default off:
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `STRATA_PACKED_PREFILL_FOREGROUND_CAP` | unset / `0` | Exact `1`..`4` limits the selected prefill owners while a prepared foreground request awaits its first token. Select foreground owners before background owners, retaining physical-slot order within each class; otherwise retain the original four-owner selection. Unselected destinations stay reserved for drained reselection; there is no wait to fill the cap. |
-| `STRATA_PACKED_PREFILL_DECODER_SLICE` | unset / `0` | Exact `1` stops issuing after one at-most-2,048-row pack when a live slot is decoding, drains the complete stage chain, then offers one existing bounded decode round before the next prefill selection. A round is one normal MTP window per active group, not necessarily one output token. With no live decoder the original prompt pipeline is retained. |
+| `STRATA_PACKED_PREFILL_DECODER_SLICE` | unset / `0` | Exact `1` stops issuing after one at-most-2,048-row pack when a live slot is decoding, drains the complete stage chain, then offers one existing bounded decode round before the next prefill selection. A round is one normal MTP window per active group, not necessarily one output token. With no live decoder the original prompt pipeline is retained. This slicing is also automatic while a `packing=solo` owner is streaming (#249), whether or not this variable is set. |
 
 Invalid values refuse startup. Either nonzero control requires `STRATA_PACKED_PREFILL=1`; decoder slicing
 also requires at least two requested and effective resident slots. All existing packed-mode refusals remain.
@@ -3363,6 +3370,25 @@ the single host pump owner are unchanged; there is no prefill/decode kernel over
 Kernel and sampling rules are unchanged, but a different owner composition can change floating-point
 partitioning; bitwise identity, responsiveness gains and throughput costs require matched runtime evidence.
 These controls do not change `STRATA_STORE_DRAIN_MS` or its existing 8-second default.
+
+**Per-request packing eligibility (#249).** Each `BGENQ` record may carry `packing=eligible` (the default)
+or `packing=solo`. A solo owner is excluded from multi-owner prompt arithmetic: at the next scheduling
+boundary it is the only selected owner, so it executes a one-owner pack while an ordinary pack that was
+already issuing finishes its at-most-2,048 rows. It still uses the segmented caller with one owner; this
+policy changes composition, not the arithmetic implementation or the command verb. `priority=` still sets
+the existing admission/decode class: the two keys are independent, and a gateway that sends only
+`priority=` keeps today's composition.
+
+When solo owners wait for prefill or first content, ordinary prompt work runs ahead by at most the in-flight
+pack. Sustained solo traffic cannot starve ordinary owners: after four consecutive solo packs, one ordinary
+pack runs and solo resumes; a fairness pack never contains a solo owner, and the foreground cap applies only
+to that ordinary composition. While a solo answer streams, every ordinary pack boundary also offers one
+bounded decode round (the decoder-slice path above), even with `STRATA_PACKED_PREFILL_DECODER_SLICE` unset.
+This is all per request in one model allocation: no process-wide toggle between requests and no second model
+copy. `STRATA_PACKED_PREFILL=0`/unset remains the control and rollback. A solo owner still waits for work
+already in flight; this is not GPU preemption, zero interference or a hard first-token deadline. Receipts
+name the decision: `event=reserved ... packing=solo|eligible`,
+`event=drained kind=solo|packed|fairness owners=N`, and `event=frontier ... packing=`.
 
 Prepared store offers still use the existing `cache_offer`, `cache_generation` and request-deadline keys.
 The store owns lookup/materialization and its read lease; preparation validates any mounted image and

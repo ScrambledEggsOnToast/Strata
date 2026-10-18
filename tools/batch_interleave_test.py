@@ -60,11 +60,12 @@ def packed_cases(eng, prompts):
     threading.Thread(target=reader, daemon=True).start()
     deadline = time.monotonic() + 300
     owners, events = {}, []
-    def record(tag, slot, prompt, maximum=1, scope=None):
+    def record(tag, slot, prompt, maximum=1, scope=None, packing=None):
         owners[tag] = {"slot": slot, "prompt": list(prompt), "maximum": maximum, "identity": None,
                        "tokens": [], "terminal": None, "progress": 0}
         scope = scope or format(slot + 1, "x") * 64
-        return f"{tag} {slot} {maximum} scope={scope} " + ",".join(map(str, prompt))
+        extra = f" packing={packing}" if packing else ""
+        return f"{tag} {slot} {maximum} scope={scope}{extra} " + ",".join(map(str, prompt))
     def read_frame(allow_fatal=False):
         left = deadline - time.monotonic()
         if left <= 0:
@@ -194,6 +195,36 @@ def packed_cases(eng, prompts):
     assert all(owners[tag]["terminal"][0] == "BQREJECT" for tag in ("atomic-busy", "atomic-free"))
     eng.send("BGENQ1 " + record("after-atomic", 3, short))
     drain(["atomic-held", "after-atomic"])
+    # #249: ordinary owners share one pack; a priority owner asking for the solo policy is admitted
+    # late and executes alone.  The engine receipts, not the configured keys, prove the composition.
+    mixed_offset = Path(eng.log_path).stat().st_size
+    mixed = ["mixed-ordinary-a", "mixed-ordinary-b"]
+    eng.send("BGENQ2 " + "\t".join(record(tag, slot, long_prompt, 2, packing="eligible")
+                                   for slot, tag in enumerate(mixed)))
+    while any(owners[tag]["identity"] is None for tag in mixed):
+        read_frame()
+    eng.send("BGENQ1 " + record("mixed-priority", 2, long_prompt, 2, packing="solo"))
+    drain(mixed + ["mixed-priority"])
+    tail = Path(eng.log_path).read_text()[mixed_offset:]
+    executions = {}
+    for line in tail.splitlines():
+        if "PACKED_PREFILL event=drained" not in line:
+            continue
+        fields = dict(item.split("=", 1) for item in line.split() if "=" in item)
+        executions[fields["execution"]] = {"kind": fields["kind"], "owners": int(fields["owners"]), "frontiers": []}
+    for line in tail.splitlines():
+        if "PACKED_PREFILL event=frontier" not in line:
+            continue
+        fields = dict(item.split("=", 1) for item in line.split() if "=" in item)
+        executions[fields["execution"]]["frontiers"].append((fields["tag"], fields["packing"]))
+    assert any(e["kind"] == "packed" and e["owners"] > 1 and {tag for tag, _ in e["frontiers"]} == set(mixed)
+               for e in executions.values()), ("ordinary owners did not share one pack", executions)
+    solo = [e for e in executions.values() if e["kind"] == "solo"]
+    assert solo, ("the priority owner did not run alone", executions)
+    assert all(e["owners"] == 1 and e["frontiers"] == [("mixed-priority", "solo")] for e in solo), executions
+    assert all(e["owners"] == 1 for e in executions.values() if e["kind"] == "fairness"), executions
+    assert any("tag=mixed-priority" in line and "packing=solo" in line for line in tail.splitlines()), \
+        "the priority reservation did not report its packing policy"
     eng.send("BGENQ1 " + record("eos-probe", 1, a[-1:], scope="f" * 64))
     drain(["eos-probe"])
     eos_token = owners["eos-probe"]["tokens"][0]

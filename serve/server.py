@@ -2141,6 +2141,9 @@ class StrataEngine:
         priority = sampling.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
+        packing = sampling.get("strata_packing", "eligible")
+        if packing not in ("eligible", "solo"):
+            raise ValueError("strata_packing must be eligible or solo")
         scope = sampling.get("_strata_cache_scope", "")
         on_phase = sampling.get("_strata_frontend_phase")
         ready = lambda: self.pick_slot(ids, scope) is not None
@@ -2199,7 +2202,7 @@ class StrataEngine:
             if callable(on_slot):
                 on_slot(slot)
             keys = self.sampling_keys(sampling) + self._phase_keys(sampling, slot)
-            self._send(f"BGENQ1 {tag} {slot} {int(max_new)} priority={priority}{keys} "
+            self._send(f"BGENQ1 {tag} {slot} {int(max_new)} priority={priority} packing={packing}{keys} "
                        + ",".join(str(int(token)) for token in ids))
             sent = True
             on_submit = sampling.get("_strata_submitted")
@@ -4395,6 +4398,9 @@ class Service:
         priority = req.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
+        packing = req.get("strata_packing", "eligible")
+        if packing not in ("eligible", "solo"):
+            raise ValueError("strata_packing must be eligible or solo")
         timeout = req.get("strata_timeout_s", self.request_timeout_s)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= self.request_timeout_s:
             raise ValueError("strata_timeout_s must be positive and no greater than request_timeout_s")

@@ -180,7 +180,9 @@ while True:
                 reuse += 1
         packed[slot] = [tag, packed_serial, packed_serial, ids, max_new, reply(ids), [], False, scope, reuse]
         if log:
-            log.write(f"BGENQ {tag} {slot} {len(ids)}\n"); log.flush()
+            packing = next((f[8:] for f in fields[4:-1] if f.startswith("packing=")), "")
+            priority = next((f[9:] for f in fields[4:-1] if f.startswith("priority=")), "")
+            log.write(f"BGENQ {tag} {slot} {len(ids)} packing={packing} priority={priority}\n"); log.flush()
         print(f"BACK {tag} {slot} {packed_serial} {packed_serial}", flush=True)
         if "--packed-fatal" in args:
             print("FATAL packed admission failed: destination lease invalid", flush=True)
@@ -831,9 +833,11 @@ class ParallelService(unittest.TestCase):
         if getattr(self, "tmp", None):
             self.tmp.cleanup()
 
-    def chat(self, text, max_tokens=64, priority="foreground"):
+    def chat(self, text, max_tokens=64, priority="foreground", packing=None):
         body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
                 "reasoning_effort": "none", "strata_priority": priority}
+        if packing is not None:
+            body["strata_packing"] = packing
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -2167,6 +2171,23 @@ class PackedTransport(unittest.TestCase):
         self.assertEqual(reply["usage"]["completion_tokens"], 1)
         self.assertIn("BGENQ ", self.log.read_text())
         self.assertFalse(any(self.engine.slot_busy))
+        self.assertFalse(self.engine.packed_q)
+
+    def test_packing_policy_is_per_request_and_reaches_the_wire(self):
+        self.start(2, more=("--packed",))
+        self.chat("ordinary request", max_tokens=1)
+        self.chat("priority request", max_tokens=1, packing="solo")
+        lines = [line for line in self.log.read_text().splitlines() if line.startswith("BGENQ ")]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("packing=eligible", lines[0])
+        self.assertIn("packing=solo", lines[1])
+
+    def test_invalid_packing_is_refused_before_the_engine(self):
+        self.start(1, more=("--packed",))
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            self.chat("bad policy", max_tokens=1, packing="packed")
+        self.assertEqual(refused.exception.code, 400)
+        self.assertIn("strata_packing", refused.exception.read().decode())
         self.assertFalse(self.engine.packed_q)
 
     def test_reservation_ack_releases_control_before_prefill_with_four_general_slots(self):
