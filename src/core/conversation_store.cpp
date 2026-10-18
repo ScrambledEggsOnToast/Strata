@@ -3038,6 +3038,25 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
 // Matching: catalog metadata only, no payload is read and no GPU pointer is exposed
 // ---------------------------------------------------------------------------------------------------------------
 
+
+// Opt-in: name every input of the bucket digest so a cross-process miss can be attributed to one
+// component instead of the whole key.  Never printed without STRATA_STORE_TIMING.
+static void trace_bucket(const char* where, const ConversationStoreOptions& options,
+                         const ConversationStoreSelector& selector, const Digest& bucket) {
+    if (!std::getenv("STRATA_STORE_TIMING")) return;
+    uint64_t d0 = 0, m0 = 0, e0 = 0, b0 = 0, s0 = 0;
+    std::memcpy(&d0, options.domain.data(), sizeof d0);
+    std::memcpy(&m0, options.model.data(), sizeof m0);
+    std::memcpy(&e0, options.engine.data(), sizeof e0);
+    std::memcpy(&b0, bucket.data(), sizeof b0);
+    std::memcpy(&s0, selector.scope.value.data(), sizeof s0);
+    std::fprintf(stderr, "strata serve: conversation store: bucket %s=%016llx domain=%016llx model=%016llx "
+                         "engine=%016llx scope=%016llx cvec=%d geometry=%d layer=%lld:%lld\n",
+                 where, (unsigned long long) b0, (unsigned long long) d0, (unsigned long long) m0,
+                 (unsigned long long) e0, (unsigned long long) s0, int(selector.cvec),
+                 int(selector.geometry.size()), (long long) selector.layer_lo, (long long) selector.layer_hi);
+}
+
 void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& selector, const int32_t* ids,
                                              size_t count, const std::vector<ConversationImageKey>& images,
                                              std::vector<ConversationStoreMatch>& out, StoreReadTraceBatch* trace,
@@ -3045,6 +3064,7 @@ void ConversationStore::Impl::collect_matches(const ConversationStoreSelector& s
     out.clear();
     if (!on || faulted || shutdown != ConversationStoreShutdownState::none) return;
     const Digest bucket = conversation_store_detail::store_bucket_digest(options, selector);
+    trace_bucket("lookup", options, selector, bucket);
     conversation_store_detail::PrefixChain chain(bucket, ids, count, images);
     size_t rejections = 0;
     uint64_t omitted = 0;
@@ -4508,6 +4528,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         selector.layer_lo = image.layer_lo;
         selector.layer_hi = image.layer_hi;
         bucket = conversation_store_detail::store_bucket_digest(options, selector);
+        trace_bucket("publish", options, selector, bucket);
         // Every head this publication reads from - its predecessor and every reuse donor - is protected from eviction
         // (including this publication's own quota evictions) until it has committed.
         if (request.supersedes) eviction_excluded.insert(request.supersedes);
