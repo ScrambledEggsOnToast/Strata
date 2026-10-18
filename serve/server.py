@@ -1105,6 +1105,7 @@ class StrataEngine:
         self.offers = None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.short_read = short_read_of(args)   # --short-read: how far short of the prompt the batched path stops
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -7636,7 +7637,21 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 # prompt.  A PP that close to the end says the prompt is read.  It matters because a prompt shorter than one `--prefill`
 # chunk sends exactly one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and
 # the answer's first token ends the progress for the client anyway.
-PP_DONE_TAIL = 64
+PP_DONE_TAIL = 64        # generate.cpp's own default: also what an engine that names no --short-read stops short by
+
+
+def short_read_of(args: list) -> int:
+    """The engine's effective `--short-read`, parsed as generate.cpp parses it (`max(0LL, atoll(next(...)))`, once per
+    flag): the LAST one wins, a negative is 0 (0 = off: the whole prompt is batched), and a value is read up to its
+    first non-digit ("128junk" is 128, "abc" is 0).  `PP_DONE_TAIL` when the args name it nowhere, so a mock or an
+    engine older than the flag keeps the default tail."""
+    tail = PP_DONE_TAIL
+    for i, a in enumerate(args[:-1]):
+        if a != "--short-read":
+            continue
+        m = re.match(r"\s*[-+]?[0-9]+", str(args[i + 1]))   # atoll: leading space, sign, then decimal digits
+        tail = max(0, int(m.group())) if m else 0
+    return tail
 
 
 def prompt_progress(svc: Service):
@@ -7652,7 +7667,7 @@ def prompt_progress(svc: Service):
     if not progress:
         return None
     read, total = progress
-    if total <= 0 or total - read <= PP_DONE_TAIL:
+    if total <= 0 or total - read <= getattr(engine, "short_read", PP_DONE_TAIL):
         return None
     return {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}

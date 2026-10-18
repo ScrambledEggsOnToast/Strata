@@ -1227,6 +1227,33 @@ int main() {
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
     }
     {
+        // #250: every parked entry holds a pin, so there is no admissible victim and the cache refuses instead of
+        // choosing one.  The live byte-pressure path (reserve_snapshot), the RAM gate's step (evict_oldest) and the
+        // park itself (put) all refuse atomically; both pins stay restorable, which is the documented refusal.
+        auto first = image({1, 2, 3}), second = image({9, 8, 7});
+        for (auto* s : {&first, &second}) {
+            s->checkpoints.push_back(ConversationCheckpoint{});
+            s->checkpoints.back().ids = s->live.ids;
+            s->checkpoints.back().pinned = true;
+            s->checkpoints.back().gdn.resize(64, 1);
+        }
+        const size_t both = first.bytes() + second.bytes();
+        ConversationCache cache(both, 2);
+        check(cache.put(SavedConversation(first)) && cache.put(SavedConversation(second)),
+              "both pinned conversations fill the cache exactly");
+        const size_t before_reserve = cache.envelope_bytes();
+        check(!cache.reserve_snapshot(1) && cache.size() == 2 && cache.bytes() == both && cache.evictions() == 0 &&
+                  cache.envelope_bytes() == before_reserve,
+              "all-pinned byte pressure refuses the reservation atomically, spending no pin");
+        check(!cache.evict_oldest() && cache.size() == 2 && cache.bytes() == both,
+              "the RAM gate's step refuses too: nothing admissible is left");
+        check(!cache.put(image({4, 5, 6})) && cache.size() == 2 && cache.bytes() == both,
+              "a new conversation is not parked beside them");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true, test_scope).tokens == 3 &&
+                  cache.best(std::vector<int32_t>{9, 8, 7, 6}, {}, true, test_scope).tokens == 3,
+              "the refusal keeps both pinned histories restorable");
+    }
+    {
         using namespace strata::program;
         PrefixCosts costs;
         PrefixWork resident{1000, 11}, parked{10000, 22}, park{5000, 33};

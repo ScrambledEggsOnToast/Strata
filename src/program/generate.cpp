@@ -84,6 +84,7 @@
 #include "strata/program/readout_reference.hpp"
 #include "logits_dump.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/checkpoint_preservation.hpp"
 #include "strata/program/conversation_offers.hpp"
 #include "strata/program/conversation_publication.hpp"
 #include "strata/program/conversation_store_admission.hpp"
@@ -113,9 +114,6 @@
 #endif
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
-#if defined(STRATA_HAVE_QWEN35)
-#include "strata/qwen35/engine.hpp"
-#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -1060,6 +1058,11 @@ struct Options {
 void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
+                 "\n"
+                 "  Families: this engine runs Qwen3.8-Flash-Next (GGUF architecture qwen4exp).  A Qwen3.6-35B-A3B\n"
+                 "  file (qwen35moe) is refused before any allocation: its own engine path bypasses the admission\n"
+                 "  pricing and the conversation scope.  `strata --families` prints what this build runs; the\n"
+                 "  separate strata-q36 executable is the unadmitted reference engine for that family.\n"
                  "\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
@@ -2712,13 +2715,10 @@ int main(int argc, char** argv) {
             std::printf("strata %s\n", STRATA_VERSION);
             return 0;
         }
-        // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
+        // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one).  The list
+        // is the engine path's own: a family this fork refuses must not appear, or setup downloads its model first.
         if (std::strcmp(argv[i], "--families") == 0) {
-#if defined(STRATA_HAVE_QWEN35)
-            std::printf("qwen4exp qwen35moe\n");
-#else
-            std::printf("qwen4exp\n");
-#endif
+            std::printf("%s\n", strata::model_families().c_str());
             return 0;
         }
     }
@@ -2784,8 +2784,9 @@ int main(int argc, char** argv) {
         }
         if (qwen35) {
             std::fprintf(stderr, "strata generate: %s is a qwen35moe family file, whose own engine path is not admitted "
-                                 "by this fork: it bypasses the admission pricing and the conversation scope.  The "
-                                 "family port is a separate change.\n", argv[i + 1]);
+                                 "by this fork: it bypasses the admission pricing and the conversation scope.  Run the "
+                                 "separate strata-q36 executable for an unadmitted reference run, or use a "
+                                 "Qwen3.8-Flash-Next model file.\n", argv[i + 1]);
             return 2;
         }
         break;
@@ -12848,6 +12849,17 @@ int main(int argc, char** argv) {
         // covered by exactly the same rule.
         if (store_on) publication_serial = conversation_store->publication_generation_floor();
         bool store_faulted = false;
+        // #252: whether the last optional capture failed on the device itself (a sync or a launch) or only on its own
+        // copy.  Only the device class ends the request; a durability failure drops that capture and serving continues.
+        bool capture_device_fault = false;
+        auto capture_failure = [&] {
+            return capture_device_fault ? strata::program::PreservationFailure::device
+                                        : strata::program::PreservationFailure::durability;
+        };
+        auto drop_capture = [&](const char* what) {
+            strata::program::preservation_report_drop(stderr, what, err.empty() ? "capture failed" : err);
+            err.clear();
+        };
         auto poison_store = [&] {
             store_faulted = true;
             if (conversation_store) conversation_store->set_unhealthy("non-finite logits");
@@ -13589,6 +13601,7 @@ int main(int argc, char** argv) {
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
                                     const strata::core::SavedConversation* held_image, size_t held_entries) -> bool {
+            capture_device_fault = false;   // this capture's own class, never a previous request's
             const auto& live = source.tokens;
             const auto& live_imgs = source.images;
             auto& checks = source.checkpoints;
@@ -13778,8 +13791,10 @@ int main(int argc, char** argv) {
             // valid capture is ready to publish; resource-pressure eviction here
             // remains permitted and is not a transactional-capture guarantee.
             if (!conversations.reserve_snapshot(estimate, capture_held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
-                             estimate >> 20);
+                size_t pinned = 0;   // #250: the refusal is the pin contract, and the line says why
+                conversations.for_each_image([&](size_t, const auto& saved) { if (saved.pinned()) ++pinned; });
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget; %zu pinned)\n",
+                             estimate >> 20, pinned);
                 return true;
             }
             const auto t0 = Clock::now();
@@ -13809,9 +13824,11 @@ int main(int argc, char** argv) {
                        conversations.evict_oldest())
                     ++evicted;
                 if (!admit()) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                    size_t pinned = 0;   // #250: a pinned entry is never the eviction this gate asked for
+                    conversations.for_each_image([&](size_t, const auto& saved) { if (saved.pinned()) ++pinned; });
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked, %zu pinned)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 evicted, conversations.size());
+                                 evicted, conversations.size(), pinned);
                     return true;
                 }
                 if (evicted)
@@ -13833,7 +13850,11 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                    if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                        capture_device_fault = true;
+                        err = std::string("stage sync failed (") + cudaGetErrorString(se) + ")";
+                        return false;
+                    }
                     strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached, source.shared_prefix};
                     certify_capture(view_k, draft_of(k) != nullptr);
                     strata::core::SavedConversation part;
@@ -14113,6 +14134,7 @@ int main(int argc, char** argv) {
         // #613: why the last checkpoint_at failed - a failed device sync is the GPU itself (a hang Windows then resets),
         // not the checkpoint, and the error says so
         std::string ckpt_why;
+        bool ckpt_device_fault = false;   // #252: a failed device sync, not a failed copy, ended the last checkpoint
         // STRATA_TRACE: what each checkpoint cost - the device syncs, the copies into RAM (the vectors' first fill
         // included), the eviction that frees one - one line per checkpoint; with the prompt's read parts summed per
         // request for a batch admission's line (below, at BADM)
@@ -14124,6 +14146,7 @@ int main(int argc, char** argv) {
         auto gpu_sync_ok = [&]() -> bool {
             const cudaError_t e = cudaDeviceSynchronize();
             if (e == cudaSuccess) return true;
+            ckpt_device_fault = true;
             ckpt_why = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
@@ -14131,6 +14154,7 @@ int main(int argc, char** argv) {
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
+            ckpt_device_fault = false;   // this checkpoint's own class, never a previous one's
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -14191,7 +14215,7 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n; ++k)
                     if (thrown[k]) std::rethrow_exception(thrown[k]);
                 for (size_t k = 0; k < n; ++k) {
-                    if (!synced[k]) { ckpt_why = why[k]; return false; }
+                    if (!synced[k]) { ckpt_device_fault = true; ckpt_why = why[k]; return false; }
                     if (!saved[k]) return false;
                 }
                 if (ckpt_trace) {   // sync: the first stage's (the others' are in their parts' times)
@@ -14369,7 +14393,16 @@ int main(int argc, char** argv) {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                     assembled = saved;
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                if (!saved) {
+                    if (ckpt_device_fault) {   // #252: the device stopped responding; only that ends the request
+                        e = "saving a conversation checkpoint failed" + ckpt_why;
+                        return false;
+                    }
+                    strata::program::preservation_report_drop(stderr, "a conversation checkpoint",
+                                                              ckpt_why.empty() ? std::string_view("capture failed")
+                                                                               : std::string_view(ckpt_why).substr(2));
+                    ckpt_why.clear();
+                }
                 if (periodic_checkpoint) {
                     pp_next_check = done + o.prompt_cache_every;
                     if (phase_current && assembled && !already_retained && retained_at_done()) {
@@ -14393,7 +14426,10 @@ int main(int argc, char** argv) {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    if (!checkpoint_save(part, stage_ss, g)) {   // #252: no part, so this cut is not assembled
+                        strata::program::preservation_report_drop(stderr, "a checkpoint stage part", "copy failed");
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -17251,7 +17287,10 @@ int main(int argc, char** argv) {
                 const bool retains = old.reusable(next.input.scope, next.input.steering) &&
                     old.ids.size() < next.tokens.size() &&
                     std::equal(old.ids.begin(), old.ids.end(), next.tokens.begin());
-                if (!retains && !park_completed(slot, 0, nullptr)) return false;
+                if (!retains && !park_completed(slot, 0, nullptr)) {
+                    if (strata::program::preservation_ends_serving(capture_failure())) return false;
+                    drop_capture("a replaced resident conversation");
+                }
             }
             for (int index = 0; index < count; ++index) {
                 const int slot = seats[size_t(index)];
@@ -17780,7 +17819,10 @@ int main(int argc, char** argv) {
                     // A preceding owner's synchronous capture may have queued
                     // this owner's cancellation. Consume it before borrowing.
                     if (!packed_collect()) return false;
-                    if (owner.shared_boundary_request && !packed_publish_shared(owner)) return false;
+                    if (owner.shared_boundary_request && !packed_publish_shared(owner)) {
+                        if (strata::program::preservation_ends_serving(capture_failure())) return false;
+                        drop_capture("the packed shared prefix");
+                    }
                 }
                 decoder_slice_due =
                     strata::prefill::packed_slice_due(packed_decoder_slice, solo_streaming, issued_rows);
@@ -19401,8 +19443,11 @@ int main(int argc, char** argv) {
                               // own, and it never supersedes the head that donor came from.
                               req_ckpt != 0)) {
                 displaced_draft.reset();
-                phase_error("ERR %s\n", err.c_str());
-                return 1;
+                if (strata::program::preservation_ends_serving(capture_failure())) {
+                    phase_error("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                drop_capture("the outgoing conversation snapshot");
             }
             displaced_draft.reset();
             // QUIT has no later request to park the last completed conversation, so the clean-shutdown seam parks it
@@ -20260,7 +20305,7 @@ int main(int argc, char** argv) {
                         yield_requested = true;
                         // only where the rest is read the same way after it (more than a chunk and more than a short
                         // read left), text only, and into a slot that is not decoding
-                        const bool can = resident.available(ys) &&
+                        bool can = resident.available(ys) &&
                                          (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                          b0 - q > std::max<int64_t>(C, o.short_read);
                         if (can && !stages.empty() && strata::prefill::Prefill::pipe_setting() > 0) {
@@ -20275,7 +20320,16 @@ int main(int argc, char** argv) {
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                         const strata::program::ResidentAdmission request{
                             0, &checks, nullptr, q, q < split_until ? split_until : 0};
-                        if (can && !park_replaced(ys)) { batch_fatal = true; e = err; return false; }
+                        if (can && !park_replaced(ys)) {
+                            if (capture_device_fault) {   // #252: only a failed device sync ends the request
+                                batch_fatal = true; e = err; return false;
+                            }
+                            strata::program::preservation_report_drop(
+                                stderr, "the batch prompt-read park",
+                                err.empty() ? std::string_view("capture failed") : std::string_view(err));
+                            err.clear();
+                            can = false;   // no park, so no yield: this request keeps reading
+                        }
                         const bool parked_phase = can && [&] {
                             phase::Span phase_span(phase_current, phase::Stage::resident_copyin);
                             return resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye);
@@ -20759,8 +20813,13 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { cancelled = true; break; }
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
-                    phase_error("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+                    if (ckpt_device_fault) {   // #252: the device stopped responding; a copy failure only drops the cut
+                        phase_error("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    strata::program::preservation_report_drop(stderr, "a conversation checkpoint",
+                                                              ckpt_why.empty() ? std::string_view("capture failed")
+                                                                               : std::string_view(ckpt_why).substr(2));
                 }
                 if (to == pin_at && !strata::program::conv_cache::pin_checkpoint(checks, pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
@@ -20787,8 +20846,11 @@ int main(int argc, char** argv) {
                         if (!park_source({prefix, no_park_images, no_checks, req_shared_scope,
                                 want_cvec, true, nullptr, kSessionOwner, false, true},
                                 0, nullptr, 0)) {
-                            phase_error("ERR saving the exact shared prefix: %s\n", err.c_str());
-                            return 1;
+                            if (strata::program::preservation_ends_serving(capture_failure())) {
+                                phase_error("ERR saving the exact shared prefix: %s\n", err.c_str());
+                                return 1;
+                            }
+                            drop_capture("the exact shared prefix");
                         }
                     }
                     if (use_mtp) mtp.set_prompt_len(n);
@@ -22038,7 +22100,10 @@ int main(int argc, char** argv) {
                     const bool retained_by_replacement = input.checkpoint && !input.images &&
                         old.reusable(req_scope, want_cvec) && starts_with(old.ids, {});
                     if (!retained_by_replacement && !park_replaced(admit_slot)) {
-                        phase_error("ERR preserving completed resident: %s\n", err.c_str()); return 1;
+                        if (strata::program::preservation_ends_serving(capture_failure())) {
+                            phase_error("ERR preserving completed resident: %s\n", err.c_str()); return 1;
+                        }
+                        drop_capture("the completed resident conversation");
                     }
                     const strata::program::ResidentAdmission request{
                         x, &checks, batch_mtp ? last_committed_residual : nullptr, (int64_t) live.size() - 1};
@@ -22299,15 +22364,16 @@ int main(int argc, char** argv) {
             if (exit_park_allowed && live_ok && live_scope.valid() && !live.empty()) {
                 any = true;
                 if (!park_current(0, nullptr)) {
+                    // #252: an optional capture is not a store fault.  Marking the store unhealthy here left the
+                    // run-intent armed and made the next start retire every record of the execution domain.
                     std::fprintf(stderr, "strata serve: conversation store: the last serial conversation could not be "
                                          "parked at shutdown (%s)\n", err.c_str());
-                    store_faulted = true;
-                    conversation_store->set_unhealthy("shutdown snapshot capture failed");
+                } else {
+                    drain_owner(kSessionOwner);
                 }
                 err.clear();
-                if (!store_faulted) drain_owner(kSessionOwner);
             }
-            for (int b = 0; !store_faulted && b < (int) bs.size(); ++b) {
+            for (int b = 0; b < (int) bs.size(); ++b) {
                 // An owner that finished a turn: the same source the serving path would park when the next request
                 // replaced it.  A slot with nothing completed reports no source and is skipped.
                 std::string probe;
@@ -22320,13 +22386,13 @@ int main(int argc, char** argv) {
                 }
                 any = true;
                 if (!park_completed(b, 0, nullptr)) {
+                    // #252: as above, a capture failure is not authority uncertainty: report it, keep finalizing.
                     std::fprintf(stderr, "strata serve: conversation store: resident owner in slot %d could not be "
                                          "parked at shutdown (%s)\n", b, err.c_str());
-                    store_faulted = true;
-                    conversation_store->set_unhealthy("shutdown snapshot capture failed");
+                } else {
+                    drain_owner(kResidentOwnerFirst + (uint64_t) b);
                 }
                 err.clear();
-                if (!store_faulted) drain_owner(kResidentOwnerFirst + (uint64_t) b);
             }
             // The short per-owner waits above let subsequent owners capture while the writer
             // works. They are not the shutdown deadline: finish outstanding publications with

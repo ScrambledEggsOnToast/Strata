@@ -1480,6 +1480,8 @@ print(r.choices[0].message.content)
   `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
   sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
   through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
+  The server drops a PP that close to the end and reads `--short-read` out of the engine argv the way the engine does
+  (the last one wins, a negative is 0), so the dropped line follows the configured threshold, not the default 64.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
   Zed's llama.cpp provider reads `/props` and offers tools from `chat_template_caps`. Its generic OpenAI-compatible
   provider does not: add `"capabilities": {"tools": true, "chat_completions": true}` on that model in Zed's settings.
@@ -1810,6 +1812,15 @@ after capture succeeds and full live-prefix lineage, scope, images, steering, la
 Capture reservations count bytes independently from publication entries. A non-consuming donor
 reserves both its bytes and its return entry. Refused/failed captures publish no partial image;
 failed restores refuse rather than decode from partially restored state.
+A pin is never spent: when every parked slot holds a pin or a pending publication, a new
+conversation is not parked, the request still completes, and the skip line says how many entries
+are pinned. That is the contract - the cache has no all-pinned victim fallback, unlike the working
+chain's own eviction - so a `pin=N` history keeps its slot until it is resumed or the cache is
+cleared after non-finite logits.
+A failed capture - a copy, allocation, validation or publication failure - drops that checkpoint and keeps serving;
+it is neither a request failure nor a store fault, and at shutdown it leaves the store's finalization and durable
+close untouched. Only a failed device synchronisation ends the request, because the stream it would decode from is no
+longer trustworthy.
 Upstream's automatic earlier-checkpoint borrowing (#1164) leaves a parked donor in
 place while a sibling request resumes its prefix, logging "borrowed"; matches on the
 live state, newest checkpoint or pinned prefix instead move the donor into the session.
@@ -2839,7 +2850,8 @@ The config snippets for every client, the tool arguments and the safety rules ar
 
 ## Images (vision)
 
-(Qwen3.6-35B-A3B reads pictures the same way, with its own `mmproj-F16.gguf`: [QWEN36.md](QWEN36.md).)
+(Qwen3.6-35B-A3B reads pictures the same way, with its own `mmproj-F16.gguf`, on the separate `strata-q36` executable:
+this fork's `strata` refuses the family. [QWEN36.md](QWEN36.md).)
 
 The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model). It is **optional**: say yes when the setup asks

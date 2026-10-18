@@ -4,6 +4,7 @@
 #include "strata/program/time_budget.hpp"
 #include "strata/program/serve_controls.hpp"
 #include "strata/program/phase_receipts.hpp"
+#include "strata/program/checkpoint_preservation.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -478,6 +479,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     ConvCheckpoint::PromptPlan resume_plan, seg_plan;
     int64_t resume_plan_at = -1, resume_plan_end = -1;
     int64_t seg_lend = 0;
+    bool capture_device_fault = false;   // #252: the park source's own class, set by a failed device sync
 #include "prefill_read_part.inc"
 
     std::string& e = err;

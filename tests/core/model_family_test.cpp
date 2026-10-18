@@ -206,8 +206,13 @@ int main(int argc, char** argv) {
         check(strata::check_architecture(b).empty(), "the architecture guard accepts qwen4exp");
         check(strata::check_architecture(c).find("'llama'") != std::string::npos, "and refuses llama, naming it");
         const std::string e = strata::check_engine_architecture(a);
-        check(e.find("Qwen3.6-35B-A3B") != std::string::npos && e.find("does not run it yet") != std::string::npos,
-              "the engine guard refuses Qwen3.6: recognised, not supported yet");
+        check(e.find("Qwen3.6-35B-A3B") != std::string::npos && e.find("src/qwen35") != std::string::npos &&
+                  e.find("does not admit") != std::string::npos,
+              "the engine guard refuses Qwen3.6: recognised, its own path not admitted");
+        check(!strata::model_family_runs(strata::ModelFamily::Qwen35Moe) &&
+                  strata::model_families().find(strata::model_family_arch(strata::ModelFamily::Qwen35Moe)) ==
+                      std::string::npos,
+              "--families never advertises a family the engine refuses: setup gates its download on this list");
         check(strata::check_engine_architecture(b).empty(), "the engine guard runs qwen4exp");
         std::vector<Kv> kv = metadata("qwen35moe", kQwen36, 8);
         for (auto it = kv.begin(); it != kv.end(); ++it)

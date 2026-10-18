@@ -424,11 +424,13 @@ FAMILIES = {
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
-# own (src/qwen35; `strata` switches to it from the file's architecture).  No pack, no expert profile, no separate MTP
-# draft layer: the engine reads the GGUF as it is, keeps every expert it can in VRAM and computes the rest on the CPU
-# (the hybrid mode), and drafts with the file's own MTP block.  Not in FAMILIES (whose entries are Flash-Next files with
-# packs): OWN_PATH_FAMILIES, offered in the same menu and installed by install_own_path.  NVIDIA (CUDA) and AMD (HIP)
-# only: the Intel Arc (SYCL) engine refuses it.
+# own (src/qwen35, the separate strata-q36 executable).  `strata` refuses the family before allocation because that
+# path bypasses admission pricing and conversation scope, so `strata --families` does not name it and the check below
+# refuses before the download; the entry stays for a build that admits it.  No pack, no expert profile, no separate
+# MTP draft layer: the engine reads the GGUF as it is, keeps every expert it can in VRAM and computes the rest on the
+# CPU (the hybrid mode), and drafts with the file's own MTP block.  Not in FAMILIES (whose entries are Flash-Next files
+# with packs): OWN_PATH_FAMILIES, offered in the same menu and installed by install_own_path.  NVIDIA (CUDA) and AMD
+# (HIP) only: the Intel Arc (SYCL) engine refuses it.
 QWEN36_FILES = {
     "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf": (22853663008, "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"),
     "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf": (32611711264, "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c"),

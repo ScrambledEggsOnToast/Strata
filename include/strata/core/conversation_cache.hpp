@@ -615,6 +615,13 @@ public:
     // impossible reservations preserve every owner, retained reuse and the fallback index.
     // held is outside ownership, still alive and fully charged. A protected parked
     // fallback survives successful reclamation and its index follows compaction.
+    //
+    // ADMISSION CONTRACT (#250). Pins and pending publications are never spent: evictable() rejects them, so a cache
+    // whose every parked entry is pinned refuses here (and in put()/make_room()) rather than choosing a victim. There
+    // is deliberately no all-pinned fallback, unlike the working chain's own eviction (program/conv_cache.hpp): the
+    // pin=N promise is that the image stays parked, and silently dropping it would break a concurrent sibling's
+    // reuse. The carrier skips parking and the request still completes; the skip line names how many entries are
+    // pinned. Only clear() drops pins, and only for the non-finite-logit poison path.
     bool reserve_snapshot(size_t incoming, size_t held = 0, size_t* protected_index = nullptr) {
         if (!enabled() || held > budget_ || incoming > room(held) ||
             (protected_index && *protected_index >= entries_.size())) return false;
