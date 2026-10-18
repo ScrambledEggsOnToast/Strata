@@ -11424,6 +11424,21 @@ int main(int argc, char** argv) {
                                 reinterpret_cast<const uint8_t*>(mtp.draft_vocab_ids()),
                                 (size_t) draft_vocab * sizeof(int32_t))));
                 }
+                if (std::getenv("STRATA_STORE_TIMING")) {
+                    // One line per resolved component so a cross-process domain difference names itself.
+                    for (const auto& value : arithmetic) {
+                        if (value.kind == strata::core::ArithmeticValueKind::number)
+                            std::fprintf(stderr, "strata serve: identity %s=%lld\n", value.name.c_str(),
+                                         (long long) value.number);
+                        else if (value.kind == strata::core::ArithmeticValueKind::digest)
+                            std::fprintf(stderr, "strata serve: identity %s=digest:%02x%02x%02x%02x\n",
+                                         value.name.c_str(), value.digest[0], value.digest[1], value.digest[2],
+                                         value.digest[3]);
+                        else
+                            std::fprintf(stderr, "strata serve: identity %s=text:%s\n", value.name.c_str(),
+                                         value.text.c_str());
+                    }
+                }
                 fields.blob("arithmetic-identity",
                             strata::core::arithmetic_execution_identity(std::move(arithmetic)));
                 // The store module owns the crypto; this file only builds the canonical field sequence.
