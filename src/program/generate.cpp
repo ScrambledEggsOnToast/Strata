@@ -17181,10 +17181,13 @@ int main(int argc, char** argv) {
                     bool seen = false;
                     const bool observe_shared = shared && phase_current;
                     uint64_t matches = 0, eligible = 0, selected_head = 0;
+                    int64_t best_tokens = 0;
+                    uint32_t best_stages = 0;
                     strata::core::ConversationStoreLookupFrontier frontier;
                     conversation_store->for_each_match(selector, store_prompt, req_imgs,
                         [&](const strata::core::ConversationStoreMatch& match) {
-                            if (observe_shared) ++matches;
+                            ++matches;
+                            if (match.tokens > best_tokens) { best_tokens = match.tokens; best_stages = match.stages; }
                             if (seen || match.stages != uint32_t(stages.size() + 1) || match.tokens <= 0 ||
                                 (shared && (!match.live || match.tokens != req_pin))) return;
                             seen = true;
@@ -17201,6 +17204,14 @@ int main(int argc, char** argv) {
                             candidate.transfer = PrefixTransfer::parked;
                             consider(std::move(candidate), std::nullopt);
                         }, observe_shared ? &frontier : nullptr);
+                    if (std::getenv("STRATA_STORE_TIMING"))
+                        std::fprintf(stderr, "strata serve: conversation store: lookup shared=%d prompt_tokens=%zu "
+                                             "matches=%llu best_tokens=%lld best_stages=%u expected_stages=%zu "
+                                             "eligible=%d catalog=%llu\n",
+                                     int(shared), store_prompt.size(),
+                                     (unsigned long long) matches, (long long) best_tokens,
+                                     unsigned best_stages, stages.size() + 1, int(seen),
+                                     (unsigned long long) frontier.catalog_version);
                     if (observe_shared && frontier.observed_ns) {
                         phase_current->shared_lookup_ns = frontier.observed_ns;
                         phase_current->shared_lookup_catalog_version = frontier.catalog_version;
