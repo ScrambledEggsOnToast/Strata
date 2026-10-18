@@ -59,5 +59,10 @@ build-vision-cuda12.bat
 .idea/
 .cursor/
 
+# Local tooling state, not source: clangd rewrites its index on every run, and the
+# compile database is a symlink into one machine's build directory.
+/.cache/
+/compile_commands.json
+
 /.ccache/
 /.rocm-win/
