@@ -1136,6 +1136,14 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     int64_t reads() const override { return reads_; }
 
+    /// Fills `n` pairs **of one layer** into ring slots with up to `depth` reads outstanding, and hands back their
+    /// pointers, which stay valid exactly as `blob()`'s do. This exists for the startup fill: `blob()` submits one
+    /// read and waits for it, so the drive is held at depth one (measured: 97.6% of the fill was that wait).
+    /// A pair's own spans stay in order -- its later spans share its slot's scratch region -- and one role's spans
+    /// for a layer all come from one file, so a batch of same-role spans waits on a single completion queue.
+    bool blob_batch(int64_t layer, const std::pair<int32_t, int32_t>* pairs, size_t n, const uint8_t** out,
+                    size_t depth, std::string& err);
+
     /// Where the startup fill's time goes, under `STRATA_FILL_TIMING=1`. Read-only counters: the fill calls
     /// `blob()` once per expert, and this splits each call into its reads, the queue/completion handoff inside
     /// each read, the unpadding move and the whole call. A native pack's blob is up to three spans and each
@@ -1168,6 +1176,11 @@ private:
     bool open_files(std::string& err);
     bool fill_slot(int64_t layer, int64_t expert, uint64_t slot, std::string& err);
     bool read_span_direct(const BlobSpan& span, uint8_t* slot_base, uint64_t tag, std::string& err);
+    /// The reads one blob needs, in order: one span for an experts.bin pack, gate/up/down for a native one.
+    void blob_spans(int64_t layer, int64_t expert, BlobSpan out[3], int& count) const;
+    /// `read_span_direct` split, so several spans can be in flight: queue one, then settle it.
+    bool submit_span(const BlobSpan& span, uint8_t* slot_base, uint64_t tag, std::string& err);
+    bool finish_span(const BlobSpan& span, uint8_t* slot_base, bool ok, uint32_t bytes, std::string& err);
     void advance_epoch(int64_t layer);
     void fail(const std::string& message);
     /// `close()` under the held mutex; `open()` reuses it so a failed open leaves nothing behind.

@@ -8192,44 +8192,85 @@ int main(int argc, char** argv) {
         // slot numbers move. With fewer slots than pairs the order decides which pairs are resident, so it is
         // left alone.
         std::vector<std::pair<int32_t, int32_t>> fill_order(profile.begin(), profile.begin() + (size_t) std::min<int64_t>(want, (int64_t) profile.size()));
-        if (!per_layer && (int64_t) fill_order.size() <= xcache.slots()) {
+        const bool reordered = !per_layer && (int64_t) fill_order.size() <= xcache.slots();
+        if (reordered) {
             std::stable_sort(fill_order.begin(), fill_order.end(), [](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : a.second < b.second;
             });
-        } else {
-            fill_order.assign(profile.begin(), profile.begin() + (size_t) std::min<int64_t>(want, (int64_t) profile.size()));
         }
-        for (int64_t i = 0; i < want; ++i) {
-            if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
-                if (ahead.valid()) ahead.get();
-                else read_batch(i);
-                if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
+        // **Several reads in flight.** With a layer-major order the source can queue a chunk of one role's spans
+        // and settle them together, instead of one submit-and-wait per span; that wait was 97.6% of the fill.
+        auto* windowed_fill = dynamic_cast<strata::core::WindowedExpertSource*>(srcp);
+        constexpr size_t read_depth = 8;
+        const bool batch_reads = reordered && windowed_fill != nullptr;
+        int64_t i = 0;
+        while (i < want) {
+            if (!batch_reads) {
+                if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
+                    if (ahead.valid()) ahead.get();
+                    else read_batch(i);
+                    if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
+                }
+                if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
+                const int32_t layer = fill_order[(size_t) i].first;
+                const int32_t expert = fill_order[(size_t) i].second;
+                const int32_t slot = xcache.admit(layer, expert);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) { ++i; continue; }
+                    break;
+                }
+                const auto blob_began = std::chrono::steady_clock::now();
+                const uint8_t* b = srcp->blob_stable(layer, expert);
+                const auto copy_began = std::chrono::steady_clock::now();
+                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                 (long long) i, err.c_str());
+                    return 1;
+                }
+                if (fill_timed) {
+                    const auto done = std::chrono::steady_clock::now();
+                    t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                    t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+                }
+                fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                ++prefilled;
+                ++i;
+                continue;
             }
-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t layer = fill_order[(size_t) i].first;
-            const int32_t expert = fill_order[(size_t) i].second;
-            const int32_t slot = xcache.admit(layer, expert);
-            if (slot == strata::core::kNotResident) {
-                if (per_layer) continue;
-                break;
+            size_t run = (size_t) i;
+            while (run < (size_t) want && fill_order[run].first == layer) ++run;
+            for (size_t base = (size_t) i; base < run; base += read_depth) {
+                const size_t n = std::min(read_depth, run - base);
+                const uint8_t* ptrs[read_depth];
+                const auto blob_began = std::chrono::steady_clock::now();
+                if (!windowed_fill->blob_batch(layer, fill_order.data() + base, n, ptrs, read_depth, err)) {
+                    std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                 (long long) base, err.c_str());
+                    return 1;
+                }
+                const auto copy_began = std::chrono::steady_clock::now();
+                for (size_t k = 0; k < n; ++k) {
+                    const auto& pr = fill_order[base + k];
+                    const int32_t slot = xcache.admit(pr.first, pr.second);
+                    if (slot == strata::core::kNotResident ||
+                        !xcache.fill_slot_blocking(slot, ptrs[k], err,
+                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first))) {
+                        std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                     (long long) (base + k), err.c_str());
+                        return 1;
+                    }
+                    fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(pr.first);
+                    ++prefilled;
+                }
+                if (fill_timed) {
+                    const auto done = std::chrono::steady_clock::now();
+                    t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                    t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+                }
             }
-            const uint8_t* b = nullptr;
-            const auto blob_began = std::chrono::steady_clock::now();
-            b = srcp->blob_stable(layer, expert);
-            const auto copy_began = std::chrono::steady_clock::now();
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
-            }
-            if (fill_timed) {
-                const auto done = std::chrono::steady_clock::now();
-                t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
-                t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
-            }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(layer);
-            ++prefilled;
+            i = (int64_t) run;
         }
         report_fill_timing("CUDA0", srcp, (uint64_t) prefilled, fill_bytes, t_blob, t_copy);
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
@@ -8396,25 +8437,62 @@ int main(int argc, char** argv) {
         // is admitted. The order was fixed with the slot sizes in phase 1, because `open_sized` sized each slot
         // for the pair at its index.
         const std::vector<std::pair<int32_t, int32_t>>& order = fill_orders[index];
-        for (const auto& pr : order) {
-            if (out.filled >= st.cache.slots()) break;
-            const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
-            const auto blob_began = std::chrono::steady_clock::now();
-            const uint8_t* b = lane->blob_stable(pr.first, pr.second);
-            const auto copy_began = std::chrono::steady_clock::now();
-            if (b == nullptr) {
-                out.err = "the expert source returned no blob";
-                return;
+        auto* windowed = dynamic_cast<strata::core::WindowedExpertSource*>(lane);
+        constexpr size_t depth = 8;
+        const bool batch = windowed != nullptr && (int64_t) order.size() <= st.cache.slots();
+        size_t at = 0;
+        while (at < order.size()) {
+            if (out.filled >= st.cache.slots()) return;
+            if (!batch) {
+                const auto& pr = order[at];
+                const int32_t slot = st.cache.admit(pr.first, pr.second);
+                if (slot == strata::core::kNotResident) return;
+                const auto blob_began = std::chrono::steady_clock::now();
+                const uint8_t* b = lane->blob_stable(pr.first, pr.second);
+                const auto copy_began = std::chrono::steady_clock::now();
+                if (b == nullptr) {
+                    out.err = "the expert source returned no blob";
+                    return;
+                }
+                if (!st.cache.fill_slot_blocking(slot, b, out.err, (int64_t) lay.blob_bytes(pr.first))) return;
+                if (fill_timed) {
+                    const auto done = std::chrono::steady_clock::now();
+                    t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                    t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+                    bytes += lay.blob_bytes(pr.first);
+                }
+                ++out.filled;
+                ++at;
+                continue;
             }
-            if (!st.cache.fill_slot_blocking(slot, b, out.err, (int64_t) lay.blob_bytes(pr.first))) return;
-            if (fill_timed) {
-                const auto done = std::chrono::steady_clock::now();
-                t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
-                t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
-                bytes += lay.blob_bytes(pr.first);
+            const int32_t layer = order[at].first;
+            size_t run = at;
+            while (run < order.size() && order[run].first == layer) ++run;
+            for (size_t base = at; base < run; base += depth) {
+                const size_t n = std::min(depth, run - base);
+                const uint8_t* ptrs[depth];
+                const auto blob_began = std::chrono::steady_clock::now();
+                if (!windowed->blob_batch(layer, order.data() + base, n, ptrs, depth, out.err)) return;
+                const auto copy_began = std::chrono::steady_clock::now();
+                for (size_t k = 0; k < n; ++k) {
+                    const auto& pr = order[base + k];
+                    const int32_t slot = st.cache.admit(pr.first, pr.second);
+                    if (slot == strata::core::kNotResident ||
+                        !st.cache.fill_slot_blocking(slot, ptrs[k], out.err,
+                            (int64_t) lay.blob_bytes(pr.first))) {
+                        if (out.err.empty()) out.err = "the batch admitted no slot";
+                        return;
+                    }
+                    bytes += lay.blob_bytes(pr.first);
+                    ++out.filled;
+                }
+                if (fill_timed) {
+                    const auto done = std::chrono::steady_clock::now();
+                    t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                    t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+                }
             }
-            ++out.filled;
+            at = run;
         }
         if (fill_timed) {
             char label[32];

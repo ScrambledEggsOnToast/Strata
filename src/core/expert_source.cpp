@@ -5606,28 +5606,13 @@ bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slo
     static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
     const auto blob_began = std::chrono::steady_clock::now();
     uint8_t* const slot_base = ring_ + (size_t) slot * (size_t) slot_stride_;
+    BlobSpan spans[3];
+    int count = 0;
+    blob_spans(layer, expert, spans, count);
     uint64_t moved = 0;
-    if (!gguf_mode_) {
-        const BlobSpan span{0,
-                            layer_offsets_[(size_t) layer] +
-                                (uint64_t) expert * layer_blob_bytes_[(size_t) layer],
-                            layer_blob_bytes_[(size_t) layer], 0};
-        if (!read_span_direct(span, slot_base, slot, err)) return false;
-        moved = span.len;
-    } else {
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        const size_t i = (size_t) layer;
-        const auto& fm = lay.fmt[i];
-        uint64_t per[3];
-        plane_spans(fm, layer_blob_bytes_[i], per);
-        const uint64_t at[3] = {0, fm.up_off, fm.down_off};
-        for (int r = 0; r < 3; ++r) {
-            const BlobSpan span{(size_t) layer_file_[(size_t) (3 * layer + r)],
-                                lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * per[r], per[r],
-                                at[r]};
-            if (!read_span_direct(span, slot_base, slot, err)) return false;
-            moved += per[r];
-        }
+    for (int r = 0; r < count; ++r) {
+        if (!read_span_direct(spans[r], slot_base, slot, err)) return false;
+        moved += spans[r].len;
     }
     io_bytes_ += moved;   // the blob's own bytes: what the driver's read total means
     if (timed) {
@@ -5639,8 +5624,28 @@ bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slo
     return true;
 }
 
-bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_base, uint64_t tag,
-                                            std::string& err) {
+void WindowedExpertSource::blob_spans(int64_t layer, int64_t expert, BlobSpan out[3], int& count) const {
+    if (!gguf_mode_) {
+        out[0] = BlobSpan{0,
+                          layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer],
+                          layer_blob_bytes_[(size_t) layer], 0};
+        count = 1;
+        return;
+    }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const size_t i = (size_t) layer;
+    const auto& fm = lay.fmt[i];
+    uint64_t per[3];
+    plane_spans(fm, layer_blob_bytes_[i], per);
+    const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+    for (int r = 0; r < 3; ++r) {
+        out[r] = BlobSpan{(size_t) layer_file_[(size_t) (3 * layer + r)],
+                          lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * per[r], per[r], at[r]};
+    }
+    count = 3;
+}
+
+bool WindowedExpertSource::submit_span(const BlobSpan& span, uint8_t* slot_base, uint64_t tag, std::string& err) {
     SourceFile& f = *files_[span.file];
     const uint64_t off_lo = span.off - span.off % align_;
     const uint64_t pad = span.off - off_lo;
@@ -5653,16 +5658,145 @@ bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_
     }
     // dst 0 is a blob's FIRST span: the slot front is still empty there, so the cover reads straight into it
     // and one memmove unpads it.  Every later span reads through the scratch tail, which the stride keeps
-    // disjoint from the assembled front for every plane size.
+    // disjoint from the assembled front for every plane size - and that is why a blend of two spans of ONE blob
+    // may never be in flight at once, while spans of different blobs may.
     uint8_t* const read_at = slot_base + (span.dst == 0 ? (size_t) 0 : (size_t) scratch_at_);
-    static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
-    const auto span_began = std::chrono::steady_clock::now();
     std::string ferr;
     if (!f.direct.submit(off_lo, read_at, (uint32_t) cover, tag, ferr)) {
         err = "WindowedExpertSource: the direct read of " + f.path + " could not be queued: " + ferr;
         return false;
     }
+    return true;
+}
+
+bool WindowedExpertSource::finish_span(const BlobSpan& span, uint8_t* slot_base, bool ok, uint32_t bytes,
+                                       std::string& err) {
+    SourceFile& f = *files_[span.file];
+    const uint64_t off_lo = span.off - span.off % align_;
+    const uint64_t pad = span.off - off_lo;
+    if (!ok || bytes < pad + span.len) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "WindowedExpertSource: short or failed direct read of %llu B at %llu in %s (got %u B)",
+                      (unsigned long long) span.len, (unsigned long long) span.off, f.path.c_str(), bytes);
+        err = buf;
+        return false;
+    }
+    uint8_t* const read_at = slot_base + (span.dst == 0 ? (size_t) 0 : (size_t) scratch_at_);
+    if (pad != 0 || span.dst != 0)
+        std::memmove(slot_base + (size_t) span.dst, read_at + (size_t) pad, (size_t) span.len);
+    return true;
+}
+
+bool WindowedExpertSource::blob_batch(int64_t layer, const std::pair<int32_t, int32_t>* pairs, size_t n,
+                                      const uint8_t** out, size_t depth, std::string& err) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (failed_ || ring_ == nullptr) {
+        err = "WindowedExpertSource: blob_batch on a closed source";
+        return false;
+    }
+    if (layer < 0 || layer >= n_layers_) {
+        fail("WindowedExpertSource: blob_batch layer " + std::to_string(layer) + " is outside the geometry");
+        return false;
+    }
+    advance_epoch(layer);
+    static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+    const auto batch_began = std::chrono::steady_clock::now();
+    std::vector<uint8_t*> bases(n, nullptr);
+    std::vector<BlobSpan> spans(n * 3);
+    std::vector<int> counts(n, 0);
+    uint64_t moved = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t expert = pairs[i].second;
+        if (expert < 0 || expert >= n_expert_) {
+            fail("WindowedExpertSource: blob_batch expert " + std::to_string(expert) + " is outside the geometry");
+            return false;
+        }
+        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+        if (slot_of_[index] >= 0) {   // already this epoch's: hand it back, as blob() does
+            out[i] = ring_ + (size_t) slot_of_[index] * (size_t) slot_stride_;
+            continue;
+        }
+        int64_t chosen = -1;
+        for (size_t probe = 0; probe < slot_count_; ++probe) {
+            const size_t cand = (slot_cursor_ + probe) % slot_count_;
+            if (!slot_used_[cand]) {
+                chosen = (int64_t) cand;
+                break;
+            }
+        }
+        if (chosen < 0) {
+            fail("WindowedExpertSource: layer " + std::to_string(layer) + " routed more than the ring's " +
+                 std::to_string(slot_count_) + " distinct experts before a layer boundary; enlarge Config::slots");
+            return false;
+        }
+        slot_of_[index] = (int32_t) chosen;
+        slot_used_[(size_t) chosen] = 1;
+        slot_cursor_ = ((size_t) chosen + 1) % slot_count_;
+        bases[i] = ring_ + (size_t) chosen * (size_t) slot_stride_;
+        out[i] = bases[i];
+        blob_spans(layer, (int32_t) expert, &spans[i * 3], counts[i]);
+        ++blobs_;
+    }
+    // **Pipeline by role.** Every pair's role-r span comes from the same file for a given layer, so a chunk of
+    // them waits on ONE completion queue; and role r+1 is not submitted until r has settled, which keeps a pair's
+    // own spans in order without any per-pair state machine.
+    const size_t chunk = std::max<size_t>(1, std::min<size_t>(depth, std::max<size_t>(n, 1)));
+    for (int r = 0; r < 3; ++r) {
+        size_t first = 0;
+        while (first < n && (bases[first] == nullptr || counts[first] <= r)) ++first;
+        if (first == n) break;   // no pair needs this role
+        const size_t file = spans[first * 3 + r].file;
+        SourceFile& f = *files_[file];
+        for (size_t base = 0; base < n; base += chunk) {
+            const size_t end = std::min(n, base + chunk);
+            size_t queued = 0;
+            for (size_t i = base; i < end; ++i) {
+                if (bases[i] == nullptr || counts[i] <= r) continue;
+                const BlobSpan& span = spans[i * 3 + r];
+                if (span.file != file) { err = "WindowedExpertSource: a batch mixed source files"; return false; }
+                if (!submit_span(span, bases[i], i, err)) return false;
+                if (timed) ++timing_.spans;
+                ++queued;
+            }
+            for (size_t done = 0; done < queued;) {
+                strata::platform::Completion c;
+                const int got = f.direct.wait(&c, 1, -1);
+                if (got < 0 || (got == 0 && !f.direct.is_open())) {
+                    err = "WindowedExpertSource: the direct reader for " + f.path + " failed";
+                    return false;
+                }
+                if (got == 0) continue;
+                const size_t i = (size_t) c.tag;
+                if (i < base || i >= end || bases[i] == nullptr || counts[i] <= r) {
+                    err = "WindowedExpertSource: a batch completion did not match its submission";
+                    return false;
+                }
+                if (!finish_span(spans[i * 3 + r], bases[i], c.ok, c.bytes, err)) return false;
+                moved += spans[i * 3 + r].len;
+                ++done;
+            }
+        }
+    }
+    io_bytes_ += moved;
+    if (timed) {
+        timing_.blob_us += (uint64_t) std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - batch_began).count();
+        timing_.read_bytes += moved;
+        timing_.blobs += (uint64_t) n;
+    }
+    return true;
+}
+
+bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_base, uint64_t tag,
+                                            std::string& err) {
+    SourceFile& f = *files_[span.file];
+    static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+    const auto span_began = std::chrono::steady_clock::now();
+    if (!submit_span(span, slot_base, tag, err)) return false;
     const auto submitted = std::chrono::steady_clock::now();
+    bool ok = false;
+    uint32_t bytes = 0;
     for (;;) {
         strata::platform::Completion c;
         const int n = f.direct.wait(&c, 1, -1);
@@ -5671,19 +5805,12 @@ bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_
             return false;
         }
         if (n == 0 || c.tag != tag) continue;   // not ours (nothing else submits or wakes this pool)
-        if (!c.ok || c.bytes < pad + span.len) {
-            char buf[320];
-            std::snprintf(buf, sizeof buf,
-                          "WindowedExpertSource: short or failed direct read of %llu B at %llu in %s (got %u B)",
-                          (unsigned long long) span.len, (unsigned long long) span.off, f.path.c_str(), c.bytes);
-            err = buf;
-            return false;
-        }
+        ok = c.ok;
+        bytes = c.bytes;
         break;
     }
     const auto completed = std::chrono::steady_clock::now();
-    if (pad != 0 || span.dst != 0)
-        std::memmove(slot_base + (size_t) span.dst, read_at + (size_t) pad, (size_t) span.len);
+    if (!finish_span(span, slot_base, ok, bytes, err)) return false;
     if (timed) {
         const auto moved = std::chrono::steady_clock::now();
         const auto us = [](auto from, auto to) {
