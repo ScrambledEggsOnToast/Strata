@@ -4965,6 +4965,17 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             return;
         }
     }
+    if (std::getenv("STRATA_STORE_TIMING")) {
+        uint64_t b0 = 0, d0 = 0, e0 = 0, m0 = 0;
+        std::memcpy(&b0, bucket.data(), sizeof b0);
+        std::memcpy(&d0, options.domain.data(), sizeof d0);
+        std::memcpy(&m0, options.model.data(), sizeof m0);
+        std::memcpy(&e0, options.engine.data(), sizeof e0);
+        std::fprintf(stderr, "strata serve: conversation store: bucket stored=%016llx domain=%016llx model=%016llx "
+                             "engine=%016llx\n",
+                     (unsigned long long) b0, (unsigned long long) d0, (unsigned long long) m0,
+                     (unsigned long long) e0);
+    }
     meta.bucket = bucket;
     meta.domain = options.domain;
     meta.epoch = epoch_now;
