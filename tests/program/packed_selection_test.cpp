@@ -136,6 +136,18 @@ int main() {
         CHECK(!packed_slice_due(false, false, 2048));
     }
 
+    // A streaming solo answer caps each ordinary pack to the streaming quantum, split across the
+    // selected owners; a pack that is already shorter is not extended.
+    {
+        CHECK(packed_span_rows(true, 1, 1000) == 128);
+        CHECK(packed_span_rows(true, 2, 1000) == 64);
+        CHECK(packed_span_rows(true, 4, 4096) == 32);
+        CHECK(packed_span_rows(true, 4, 20) == 20);
+        CHECK(packed_span_rows(false, 4, 1000) == 1000);
+        CHECK(packed_span_rows(true, 0, 1000) == 128);
+        CHECK(packed_span_rows(true, 2, 0) == 0);
+    }
+
     // Selection is constexpr-safe for the fixed engine sizes.
     static_assert(kPrefillOwners == 4);
     static_assert(kPackedSoloPacksBeforeOrdinary == 4);

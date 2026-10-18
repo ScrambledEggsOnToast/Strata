@@ -3383,7 +3383,16 @@ When solo owners wait for prefill or first content, ordinary prompt work runs ah
 pack. Sustained solo traffic cannot starve ordinary owners: after four consecutive solo packs, one ordinary
 pack runs and solo resumes; a fairness pack never contains a solo owner, and the foreground cap applies only
 to that ordinary composition. While a solo answer streams, every ordinary pack boundary also offers one
-bounded decode round (the decoder-slice path above), even with `STRATA_PACKED_PREFILL_DECODER_SLICE` unset.
+bounded decode round (the decoder-slice path above), even with `STRATA_PACKED_PREFILL_DECODER_SLICE` unset,
+and each ordinary pack is capped to 128 rows in total across its selected owners (32..128 rows per owner)
+instead of the full 2,048-row arena. That cap makes the boundary that carries the decode round cheap: the
+stream waits for a fraction of a full 1.8-2.7 s pack, not for the whole pack.
+
+The frontend admission selector applies the same intent before the engine: a solo foreground request is
+taken before an eligible foreground one, so it reaches a reserved slot at the next admission boundary. The
+existing `strata_priority` class and its 3:1 foreground/background rule are unchanged, and after four
+consecutive solo foreground admissions one eligible foreground request is taken so ordinary admission
+cannot starve.
 This is all per request in one model allocation: no process-wide toggle between requests and no second model
 copy. `STRATA_PACKED_PREFILL=0`/unset remains the control and rollback. A solo owner still waits for work
 already in flight; this is not GPU preemption, zero interference or a hard first-token deadline. Receipts

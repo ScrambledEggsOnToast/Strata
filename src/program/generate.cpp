@@ -16202,6 +16202,12 @@ int main(int argc, char** argv) {
                 packed_choice.kind == strata::prefill::PackedPackKind::solo ? "solo" :
                 packed_choice.kind == strata::prefill::PackedPackKind::fairness ? "fairness" :
                 packed_choice.kind == strata::prefill::PackedPackKind::packed ? "packed" : "none";
+            // A solo answer that already streams bounds this ordinary pack to a fraction of the arena, so the
+            // decode slice runs at a boundary that is cheap relative to a full 1.8-2.7 s pack.
+            const bool solo_streaming = packed_solo_streaming();
+            int selected_owners = 0;
+            for (size_t slot = 0; slot < packed_owners.size(); ++slot)
+                if (selected & (uint32_t(1) << slot)) ++selected_owners;
             bool decoder_slice_due = false;
             std::array<strata::prefill::OwnerSpan, 4> spans;
             std::array<int, 4> span_slots{};
@@ -16225,7 +16231,8 @@ int main(int argc, char** argv) {
                 span.incarnation = owner.lease.incarnation;
                 span.slot = slot;
                 span.position = begin;
-                span.rows = owner.boundary - begin;
+                span.rows = strata::prefill::packed_span_rows(solo_streaming && !owner.solo, selected_owners,
+                                                              owner.boundary - begin);
                 span.tokens = owner.tokens.data() + begin;
                 span.next_tokens = bs[size_t(slot)].prompt.data() + begin + 1;
                 span.stages = owner.lease.stages;
@@ -16239,7 +16246,6 @@ int main(int argc, char** argv) {
                 unsigned probes = 0;
                 const char* yield_trigger = nullptr;
                 uint64_t stop_epoch = epoch;
-                const bool solo_streaming = packed_solo_streaming();
                 const bool slice_enabled = packed_decoder_slice || solo_streaming;
                 const bool slice_decoder = slice_enabled && packed_decoding();
                 const auto pending = [&] {

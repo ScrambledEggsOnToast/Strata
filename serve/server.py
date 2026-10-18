@@ -4201,6 +4201,7 @@ class Service:
         self.admission_waiters = []
         self.admission_active = {}
         self.admission_foreground = {False: 0, True: 0}  # independent generation / score fairness
+        self.admission_solo = {False: 0, True: 0}        # consecutive solo foreground admissions, for fairness
         self._foreground_pending = False
         self.shutting_down = False                       # a shutdown refuses new requests and cancels the accepted
         self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
@@ -4405,7 +4406,8 @@ class Service:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= self.request_timeout_s:
             raise ValueError("strata_timeout_s must be positive and no greater than request_timeout_s")
         now = time.perf_counter()
-        record: dict[str, Any] = {"id": uuid.uuid4().hex, "_score": score, "priority": priority, "state": "queued", "started_at": time.time(),
+        record: dict[str, Any] = {"id": uuid.uuid4().hex, "_score": score, "_packing": packing,
+                  "priority": priority, "state": "queued", "started_at": time.time(),
                   "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
                   "events": [{"state": "queued", "elapsed_s": 0.0}], "events_dropped": 0, "_clock": now,
                   "_deadline": now + timeout, "_cancel": cancel}
@@ -4563,7 +4565,8 @@ class Service:
                     record["_cancel"].set()
                     raise AdmissionError("request timed out while queued", 408)
                 score = bool(record.get("_score"))
-                order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score], 1)
+                order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score], 1,
+                                            self.admission_solo[score])
                 chosen = order[0] if order else None
                 capacity = 1 if score else max(1, int(getattr(self.engine, "batch", 0) or 0))
                 active = sum(bool(r.get("_score")) == score for r in self.admission_active.values())
@@ -4571,6 +4574,11 @@ class Service:
                     self.admission_waiters.remove(record)
                     self.admission_active[record["id"]] = record
                     self.admission_foreground[score] = self.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
+                    if record["priority"] == "foreground":
+                        self.admission_solo[score] = (self.admission_solo[score] + 1
+                                                     if record.get("_packing") == "solo" else 0)
+                    else:
+                        self.admission_solo[score] = 0
                     self.status["queued"] -= 1
                     record["_admitted_clock"] = time.perf_counter()
                     record["queue_s"] = round(record["_admitted_clock"] - record["_clock"], 6)
@@ -5476,24 +5484,40 @@ class Service:
                 "received_fds": 0, "closed": True, "reader_error": None, **prepared}
 
     @staticmethod
-    def selector_order(score: bool, waiters, foreground_count: int, limit: int) -> list:
+    def selector_order(score: bool, waiters, foreground_count: int, limit: int, solo_count: int = 0) -> list:
         """The admissions the selector would make next, in its own order: the queue frontier is a prefix of this.
 
         The rule `acquire_request` decides by - this score class's own waiters, its longest-waiting foreground one
         first, and its longest-waiting background one as soon as three foreground admissions have gone by since the
-        last background one - so preparation and admission can never disagree about who is next.
+        last background one - so preparation and admission can never disagree about who is next. Within the
+        foreground class a request that asked for the solo packed path is taken before an eligible one: it cannot
+        gain priority at the engine until it owns a reserved slot, so without this preference a packing policy
+        only changes composition after a queue wait that hides its latency benefit. The 3:1 foreground/background
+        rule and the `strata_priority` class are unchanged. Solo admissions are bounded the same way the
+        engine bounds solo packs: after four consecutive solo foreground admissions one eligible foreground
+        request is taken, so sustained priority traffic cannot starve ordinary admission.
         """
         pending = [r for r in waiters if bool(r.get("_score")) == score]
-        order, counter = [], foreground_count
+        order, counter, solo_streak = [], foreground_count, solo_count
         while pending and len(order) < limit:
             foreground = next((r for r in pending if r["priority"] == "foreground"), None)
+            solo = next((r for r in pending if r["priority"] == "foreground" and r.get("_packing") == "solo"), None)
+            eligible = next((r for r in pending if r["priority"] == "foreground" and r.get("_packing") != "solo"), None)
             background = next((r for r in pending if r["priority"] == "background"), None)
-            chosen = background if background is not None and (foreground is None or counter >= 3) else foreground
+            if background is not None and (foreground is None or counter >= 3):
+                chosen = background
+            elif solo is not None and (eligible is None or solo_streak < 4):
+                chosen = solo
+            elif eligible is not None:
+                chosen = eligible
+            else:
+                chosen = foreground
             if chosen is None:
                 break
             order.append(chosen)
             pending = [r for r in pending if r is not chosen]
             counter = counter + 1 if chosen["priority"] == "foreground" else 0
+            solo_streak = solo_streak + 1 if chosen["priority"] == "foreground" and chosen.get("_packing") == "solo" else 0
         return order
 
     def offer_turn(self, record, link) -> bool:
@@ -5508,7 +5532,7 @@ class Service:
             if not any(w is record for w in self.admission_waiters):
                 return False
             order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score],
-                                        self.offer_frontier(link))
+                                        self.offer_frontier(link), self.admission_solo[score])
         return any(w is record for w in order)
 
     def preparation_token_limit(self) -> int:

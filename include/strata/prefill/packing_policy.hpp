@@ -13,6 +13,7 @@
 // consecutive solo packs, one ordinary pack runs before solo resumes.  Both directions are
 // deterministic: no timer, no second scheduler and no process-wide toggle per request.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -40,6 +41,17 @@ inline bool parse_packing_eligibility(std::string_view text, PackingEligibility&
 
 // Consecutive solo packs allowed before a waiting ordinary owner gets one pack.
 inline constexpr unsigned kPackedSoloPacksBeforeOrdinary = 4;
+
+// While a solo answer streams, ordinary prompt work is bounded to this many rows per pack (distributed
+// across the selected ordinary owners) rather than the full 2,048-row arena.  The decode slice then runs
+// at a boundary whose cost is a fraction of a full pack instead of the pack's whole 1.8-2.7 s.
+inline constexpr int64_t kPackedStreamingRows = 128;
+
+inline int64_t packed_span_rows(bool solo_streaming, int selected_owners, int64_t remaining) {
+    if (!solo_streaming || remaining <= 0) return remaining;
+    const int owners = selected_owners > 0 ? selected_owners : 1;
+    return std::min<int64_t>(remaining, std::max<int64_t>(1, kPackedStreamingRows / owners));
+}
 
 // One owner with prefill rows left.  `foreground` is the existing admission/decode class and is
 // deliberately separate from packing eligibility, so this policy never changes dispatch priority.

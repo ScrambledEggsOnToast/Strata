@@ -1250,14 +1250,37 @@ class FrontierOrder(unittest.TestCase):
         self.peer.start()
         self.svc = Service(PlainEngine(self.tok, link=self.link), self.tok, ChatTemplate(TEMPLATE))
 
-    def queue(self, text, priority="foreground"):
+    def queue(self, text, priority="foreground", packing=None):
         """One request accepted and waiting exactly as the POST dispatch leaves it: registered and scoped, no work."""
         req = {"messages": [{"role": "user", "content": text}], "strata_priority": priority}
+        if packing is not None:
+            req["strata_packing"] = packing
         req["_strata_cache_scope"] = self.svc.cache_scope(req, "tenant")
         return self.svc.register_lifecycle(req, threading.Event()), req
 
     def prepare(self, record, req) -> None:
         self.svc.prefetch_offer(record, "/v1/chat/completions", req)
+
+    def test_solo_foreground_precedes_eligible_but_not_a_due_background(self):
+        eligible, _ = self.queue("an ordinary foreground turn")
+        solo, _ = self.queue("the priority foreground turn", packing="solo")
+        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 0, 2)],
+                         [solo["id"], eligible["id"]],
+                         "a solo foreground waiter must reach a slot before an earlier eligible one")
+        background, _ = self.queue("the background turn", priority="background")
+        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 3, 3)],
+                         [background["id"], solo["id"], eligible["id"]],
+                         "the existing 3:1 background admission still precedes the solo preference")
+        later, _ = self.queue("a later priority turn", packing="solo")
+        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 0, 2)],
+                         [solo["id"], later["id"]], "solo waiters keep their arrival order")
+
+    def test_sustained_solo_admissions_give_ordinary_one_turn_after_four(self):
+        eligible, _ = self.queue("an ordinary foreground turn")
+        solo, _ = self.queue("the priority foreground turn", packing="solo")
+        self.assertEqual(self.svc.selector_order(False, self.svc.admission_waiters, 0, 1, 3)[0]["id"], solo["id"])
+        self.assertEqual(self.svc.selector_order(False, self.svc.admission_waiters, 0, 1, 4)[0]["id"],
+                         eligible["id"], "ordinary admission must progress under sustained priority traffic")
 
     def test_only_the_selector_frontier_is_prepared_and_in_its_order(self):
         for i in range(3):                      # three real foreground admissions: no background one yet
