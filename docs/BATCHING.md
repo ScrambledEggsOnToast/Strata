@@ -660,7 +660,9 @@ so the slots never wait for the read and the read is one run with no drain insid
   pictures is read the usual way. This fork also keeps it off beside the foreground budget, batched MTP
   (`--batch-mtp`, `--batch-mtp-pipeline`), packed or retained prefill, `--resident-multiplex`, the judge lane,
   `--adapt-async` and `--spec-split`: each of those owns the slots or the drafter the reader would share, and the
-  reason is printed once.
+  reason is printed once. One exception: a **retired** windowed ring (`--retire-resident-source`, whose fill is
+  complete and which can hand out no more buffers) is allowed, because nothing reads from it during serving - the
+  fully-resident case this mode is for.
 
 One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default

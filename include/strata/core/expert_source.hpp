@@ -203,6 +203,11 @@ public:
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
 
+    /// True once this source can hand out no more blobs (a retired windowed ring, whose fill is complete): nothing
+    /// reads from it any more, so it cannot recycle a buffer under a second thread.  A concurrent prompt read may
+    /// share the device with the decoding windows when this is true (#255); every other source answers false.
+    virtual bool io_retired() const { return false; }
+
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
@@ -1286,6 +1291,10 @@ public:
 
     bool ready() const { return ring_ != nullptr; }
     int64_t blobs() const { return blobs_; }
+
+    /// A retired ring has handed every expert to the resident cache and can produce no more: it recycles nothing, so
+    /// a concurrent prompt read beside the decoding windows cannot share a staging buffer with it (#255).
+    bool io_retired() const override { return retired_; }
 
     // ---- the envelope and the run report ----
     /// Resident envelope: the ring's PAYLOAD - the one large allocation this class is responsible for.  The

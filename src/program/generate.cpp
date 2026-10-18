@@ -20330,7 +20330,11 @@ int main(int argc, char** argv) {
                         s.helper_caches = prefill_src != srcp;
                         for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
                         s.staged_source = srcp == &src && src.stages_blobs();
-                        s.other_source = srcp != &src && srcp != &arena_src;
+                        // #255: a retired windowed ring has completed its fill and can hand out no more buffers,
+                        // so the reader cannot share its recycling.  That is the fully-resident serve case: the
+                        // experts come from the cache and nothing reads the source during a read.
+                        const bool retired_ring = srcp != nullptr && srcp->io_retired();
+                        s.other_source = srcp != &src && srcp != &arena_src && !retired_ring;
                         off = strata::program::concurrent_read_off(s);
                     }
                     if (off != nullptr) {
