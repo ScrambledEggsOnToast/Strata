@@ -1558,14 +1558,21 @@ int32_t MtpDrafter::slot_next_token(int slot) const {
     return slot_state(slot) ? slots_[(size_t) slot].tail_token : -1;
 }
 
+// Two questions share this predicate. Given a prompt length, the certified interval must reach the
+// oldest cell that prompt's retained window still holds: that is what makes reusing the chain safe.
+// Given only a frontier cell (propose at cells-1, advance at cells), the chain must merely contain
+// it. A chain that legally begins at a resumed position - a gap below `begin` starts a new interval,
+// never a union over missing cells (conversation_cache.hpp) - is a real certificate of its own rows,
+// and refusing it at its own frontier ended the engine on 2026-10-18.
 bool MtpDrafter::slot_covers(int slot, int64_t cells, int64_t prompt_length) const {
     if (!slot_state(slot)) return false;
     const auto& target = slots_[(size_t) slot];
     if (cells < 0 || cells > target.completed_cells || prompt_length < 0 ||
         prompt_length > target.state.max_cells || (prompt_length && cells >= prompt_length)) return false;
-    const int64_t end = prompt_length ? prompt_length : cells + 1;
-    const int64_t needed = window_ > 0 ? std::max<int64_t>(0, end - window_) : 0;
-    return target.request && target.certified && target.begin >= 0 && target.begin <= std::min(cells, needed);
+    if (!target.request || !target.certified || target.begin < 0 || target.begin > cells) return false;
+    if (!prompt_length) return true;
+    const int64_t needed = window_ > 0 ? std::max<int64_t>(0, prompt_length - window_) : 0;
+    return target.begin <= std::min(cells, needed);
 }
 
 bool MtpDrafter::prepare_slot(int slot, uint64_t request, int64_t prompt_length,

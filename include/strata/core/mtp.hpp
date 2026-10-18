@@ -245,6 +245,7 @@ private:
     friend class strata::prefill::Prefill;
     friend class strata::program::ResidentSlots;
     friend struct MtpDrafterCertificationFixture;
+    friend struct MtpDraftFrontierFixture;
     // One host submitter; a failed operation poisons the lease until teardown.
     // A successful operation releases it only after the device stream drains.
     class Operation {
