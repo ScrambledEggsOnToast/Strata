@@ -15553,11 +15553,23 @@ int main(int argc, char** argv) {
                 selector.scope = scope;
                 selector.cvec = owner.input.steering;
                 bool candidate = false;
+                uint64_t matches = 0;
+                int64_t best_tokens = 0;
+                uint32_t best_stages = 0;
                 conversation_store->for_each_match(selector, prompt, no_park_images,
                     [&](const strata::core::ConversationStoreMatch& match) {
+                        ++matches;
+                        if (match.tokens > best_tokens) { best_tokens = match.tokens; best_stages = match.stages; }
                         if (match.stages == stages.size() + 1 && match.tokens > ram_tokens &&
                             (!shared || (match.live && match.tokens == owner.input.pin))) candidate = true;
                     });
+                if (std::getenv("STRATA_STORE_TIMING"))
+                    std::fprintf(stderr, "strata serve: conversation store: legacy lookup shared=%d prompt_tokens=%zu "
+                                         "matches=%llu best_tokens=%lld best_stages=%u expected_stages=%zu "
+                                         "candidate=%d ram_tokens=%lld\n",
+                                 int(shared), prompt.size(), (unsigned long long) matches,
+                                 (long long) best_tokens, (unsigned) best_stages, stages.size() + 1,
+                                 int(candidate), (long long) ram_tokens);
                 if (!candidate) return false;
                 mounted = store_demand_restore(prompt, no_park_images, scope, owner.input.steering,
                     shared ? 0 : owner.cache_offer, shared ? 0 : owner.cache_generation,
