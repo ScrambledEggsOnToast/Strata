@@ -19994,7 +19994,15 @@ int main(int argc, char** argv) {
             // Admission/wait budget only, not a claim that storage workers can be interrupted after eight seconds.
             // The frontend's independent 15-second QUIT escalation is unchanged.
             const uint64_t shutdown_started = now_ms();
-            const uint64_t deadline = shutdown_started + 8000;
+            // Bounded by default; a longer budget is an operational choice for large published
+            // histories, never a claim that a blocked filesystem call can be interrupted.
+            const uint64_t drain_budget_ms = [] {
+                const char* value = std::getenv("STRATA_STORE_DRAIN_MS");
+                if (!value || !*value) return uint64_t{8000};
+                const long long parsed = std::atoll(value);
+                return (uint64_t) std::clamp<long long>(parsed, 1000, 120000);
+            }();
+            const uint64_t deadline = shutdown_started + drain_budget_ms;
             store_allowance();
             flush_publishes(0);
             size_t skipped_owners = 0;

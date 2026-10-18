@@ -1772,6 +1772,8 @@ Unknown coverage still refuses direct resident source reuse rather than treating
 This RAM repair does not certify old `STCSMAN1` disk images: the legacy ordinary disk-mount path still accepts
 unknown intervals, and later suffix-only writes can therefore still refuse batch adoption after a restart.
 
+The shutdown drain budget is 8 s by default and can be raised with `STRATA_STORE_DRAIN_MS` (clamped to 1-120 s) when a run publishes many large histories; the frontend's independent QUIT escalation is unchanged.
+
 A resident MTP proposal refusal includes the requested/stored/completed positions, graph readiness, validity
 predicates, and working/slot certification extents. This failure-only detail contains no token IDs or residual
 contents; the position and certified-coverage guards are unchanged.
