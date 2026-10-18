@@ -71,6 +71,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/packing_policy.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/batch_read.hpp"
@@ -8163,6 +8164,13 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
+    // **The primary stage's fill runs beside the split stages'.** It is wrapped rather than moved, so the
+    // non-split path keeps the statement it had. When the split keeps one source lane per stage, phase 2 starts
+    // this in its own thread and joins it with the others: the two blocks used to add up, and now they overlap.
+    // A shared source (every other mode) keeps the serial order, because a lane's ring may not be read twice.
+    const bool primary_fills_concurrently =
+        multi_gpu && o.windowed_experts && !stages.empty() && stage_sources.size() == stages.size();
+    auto run_primary_fill = [&]() -> int {
     if (!profile.empty() && srcp != nullptr) {
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
@@ -8322,10 +8330,23 @@ int main(int argc, char** argv) {
                          sl.size(), copy_ok ? "" : ", A READ-BACK FAILED");
         }
     }
-    if (o.windowed_experts && o.expert_cache > 0 && xcache.resident() != xcache.slots()) {
-        std::fprintf(stderr, "strata generate: --windowed-experts requires a fully populated static cache; "
-                             "dynamic asynchronous fills cannot retain ring pointers across epochs\n");
-        return 1;
+    return 0;
+    };
+    // The primary cache's residency is only knowable once its fill has finished, which the concurrent path does
+    // in phase 2, so the check is callable from both places rather than living after the block.
+    auto check_primary_residency = [&]() -> int {
+        if (o.windowed_experts && o.expert_cache > 0 && xcache.resident() != xcache.slots()) {
+            std::fprintf(stderr, "strata generate: --windowed-experts requires a fully populated static cache; "
+                                 "dynamic asynchronous fills cannot retain ring pointers across epochs\n");
+            return 1;
+        }
+        return 0;
+    };
+    std::thread primary_fill;
+    int primary_status = 0;
+    if (!primary_fills_concurrently) {
+        if ((primary_status = run_primary_fill()) != 0) return primary_status;
+        if ((primary_status = check_primary_residency()) != 0) return primary_status;
     }
 
     size_t split_stage_index = 0;
@@ -8501,6 +8522,12 @@ int main(int argc, char** argv) {
         }
         out.ok = true;
     };
+    if (primary_fills_concurrently) {
+        primary_fill = std::thread([&] {
+            strata::aux_cpus::pin_current_thread();
+            primary_status = run_primary_fill();
+        });
+    }
     if (independent_lanes && stages.size() > 1 && fill_lanes_concurrent()) {
         std::vector<std::thread> workers;
         workers.reserve(stages.size());
@@ -8516,6 +8543,11 @@ int main(int argc, char** argv) {
             strata::aux_cpus::pin_current_thread();
             fill_stage(i);
         }
+    }
+    if (primary_fill.joinable()) {
+        primary_fill.join();
+        if (primary_status != 0) return primary_status;
+        if ((primary_status = check_primary_residency()) != 0) return primary_status;
     }
     for (size_t i = 0; i < stages.size(); ++i) {
         if (outcomes[i].ok) continue;
@@ -14399,6 +14431,8 @@ int main(int argc, char** argv) {
             strata::program::ResidentPreparation lease;
             uint64_t cache_offer = 0, cache_generation = 0, deadline_ns = 0;
             bool pending = false, prepared = false, first = false;
+            // #249: an explicit per-request composition policy.  Solo owners never share a pack.
+            bool solo = false;
             bool checkpoint_due = false;
             const char* terminal_reason = nullptr;
             int64_t draft_accepted = 0, draft_offered = 0;
@@ -14422,6 +14456,8 @@ int main(int argc, char** argv) {
             std::optional<phase::Leg> phase_leg;
         };
         std::array<PackedOwner, 4> packed_owners;
+        // #249: consecutive one-owner packs, so sustained priority traffic cannot starve ordinary prompt work.
+        unsigned packed_solo_streak = 0;
         std::atomic<bool> packed_first_ready{false};
         auto packed_done = [&](int slot, const char* reason) {
             if (!packed_prefill || slot < 0 || size_t(slot) >= packed_owners.size()) return false;
@@ -15653,6 +15689,12 @@ int main(int argc, char** argv) {
                     } else if (key == "priority") {
                         if (value != "foreground" && value != "background") why = "invalid priority";
                         foreground = value == "foreground";
+                    } else if (key == "packing") {
+                        strata::prefill::PackingEligibility eligibility;
+                        if (!strata::prefill::parse_packing_eligibility(value, eligibility))
+                            why = "invalid packing";
+                        else
+                            owner.solo = eligibility == strata::prefill::PackingEligibility::solo;
                     } else if (key == "cvec") steering = std::atoi(value.data()) != 0;
                     else if (key == "ckpt") owner.input.checkpoint = std::atoi(value.data()) != 0;
                     else if (key == "pin") owner.input.pin = std::max<int64_t>(0, std::atoll(value.data()));
@@ -15761,10 +15803,11 @@ int main(int argc, char** argv) {
                 std::printf("BACK %s %d %llu %llu\n", owner.tag.c_str(), owner.lease.slot,
                             (unsigned long long)owner.lease.request, (unsigned long long)owner.lease.incarnation);
                 std::fprintf(stderr, "PACKED_PREFILL event=reserved tag=%s slot=%d request=%llu incarnation=%llu "
-                                     "prompt=%zu endpoint=%lld phase_request=%s\n",
+                                     "prompt=%zu endpoint=%lld packing=%s phase_request=%s\n",
                              owner.tag.c_str(), owner.lease.slot, (unsigned long long)owner.lease.request,
                              (unsigned long long)owner.lease.incarnation, owner.tokens.size(),
-                             (long long)owner.lease.endpoint, owner.phase_input.identity.request);
+                             (long long)owner.lease.endpoint, owner.solo ? "solo" : "eligible",
+                             owner.phase_input.identity.request);
             }
             std::fflush(stdout);
             return true;
@@ -15796,6 +15839,14 @@ int main(int argc, char** argv) {
         auto packed_decoding = [&] {
             // resident.active() also includes preparing slots, which cannot decode.
             return std::any_of(bs.begin(), bs.end(), [](const BSlot& slot) { return slot.active && !slot.stop; });
+        };
+        // #249: a priority answer that finished prefill and is streaming.  Ordinary packed prompt work then
+        // yields a decode round at each pack boundary, so exclusion from packing does not merely move its
+        // latency into longer streaming pauses.
+        auto packed_solo_streaming = [&] {
+            for (size_t slot = 0; slot < packed_owners.size() && slot < bs.size(); ++slot)
+                if (!packed_owners[slot].tag.empty() && packed_owners[slot].solo && bs[slot].active) return true;
+            return false;
         };
         auto packed_cancelled = [&](int slot) {
             std::lock_guard<std::mutex> lock(in_mu);
@@ -16100,24 +16151,25 @@ int main(int argc, char** argv) {
                 if (!resident.abort_preparation(owner.lease, err)) return false;
                 packed_done(slot, "cancel");
             }
-            const bool foreground_waiting = packed_foreground_cap &&
-                std::any_of(packed_owners.begin(), packed_owners.end(), [&](const auto& owner) {
-                    return owner.pending && owner.prepared && bs[size_t(owner.lease.slot)].foreground;
-                });
-            uint32_t selected = 0;
-            if (foreground_waiting) {
-                int seats = 0;
-                // Prefer foreground destinations without changing order within either class.
-                for (int pass = 0; pass < 2 && seats < packed_foreground_cap; ++pass)
-                    for (const auto& owner : packed_owners) {
-                        if (!owner.pending || !owner.prepared || seats == packed_foreground_cap) continue;
-                        const int slot = owner.lease.slot;
-                        if (bs[size_t(slot)].p >= owner.lease.endpoint ||
-                            bs[size_t(slot)].foreground != (pass == 0)) continue;
-                        selected |= uint32_t(1) << slot;
-                        ++seats;
-                    }
+            // #249: one composition decision for this boundary.  Solo owners take the next pack alone; an
+            // ordinary pack runs after a bounded solo streak so ordinary work keeps progressing.
+            std::array<strata::prefill::PackedCandidate, 4> candidate_set;
+            int candidate_count = 0;
+            for (size_t slot = 0; slot < packed_owners.size() && slot < bs.size(); ++slot) {
+                const auto& owner = packed_owners[slot];
+                if (!owner.pending || !owner.prepared) continue;
+                if (bs[slot].p >= owner.lease.endpoint) continue;
+                candidate_set[size_t(candidate_count++)] = {int(slot), owner.solo, bs[slot].foreground};
             }
+            const auto packed_choice = strata::prefill::select_packed_seats(
+                std::span<const strata::prefill::PackedCandidate>(candidate_set.data(), size_t(candidate_count)),
+                packed_foreground_cap, packed_solo_streak);
+            packed_solo_streak = packed_choice.solo_streak;
+            const uint32_t selected = packed_choice.seats;
+            const char* packed_kind =
+                packed_choice.kind == strata::prefill::PackedPackKind::solo ? "solo" :
+                packed_choice.kind == strata::prefill::PackedPackKind::fairness ? "fairness" :
+                packed_choice.kind == strata::prefill::PackedPackKind::packed ? "packed" : "none";
             bool decoder_slice_due = false;
             std::array<strata::prefill::OwnerSpan, 4> spans;
             std::array<int, 4> span_slots{};
@@ -16127,7 +16179,7 @@ int main(int argc, char** argv) {
                 const int slot = owner.lease.slot;
                 const int64_t begin = bs[size_t(slot)].p, endpoint = owner.lease.endpoint;
                 if (begin >= endpoint) { final_ready = true; continue; }
-                if (foreground_waiting && !(selected & (uint32_t(1) << slot))) continue;
+                if (!(selected & (uint32_t(1) << slot))) continue;
                 owner.boundary = endpoint;
                 if (owner.input.checkpoint && o.prompt_cache > 0) {
                     for (int64_t seam : owner.seams)
@@ -16155,7 +16207,9 @@ int main(int argc, char** argv) {
                 unsigned probes = 0;
                 const char* yield_trigger = nullptr;
                 uint64_t stop_epoch = epoch;
-                const bool slice_decoder = packed_decoder_slice && packed_decoding();
+                const bool solo_streaming = packed_solo_streaming();
+                const bool slice_enabled = packed_decoder_slice || solo_streaming;
+                const bool slice_decoder = slice_enabled && packed_decoding();
                 const auto pending = [&] {
                     const uint64_t observed_epoch = command_epoch.load();
                     const auto stop = [&](const char* reason) {
@@ -16179,10 +16233,10 @@ int main(int argc, char** argv) {
                 int64_t issued_rows = 0;
                 for (int index = 0; index < count; ++index)
                     issued_rows += std::max<int64_t>(0, result.frontier[size_t(index)] - spans[size_t(index)].position);
-                std::fprintf(stderr, "PACKED_PREFILL event=%s execution=%llu owners=%d touched=%u rows=%lld "
+                std::fprintf(stderr, "PACKED_PREFILL event=%s kind=%s execution=%llu owners=%d touched=%u rows=%lld "
                                      "completion=%s trigger=%s start_epoch=%llu stop_epoch=%llu host_ms=%.3f\n",
                              result.completion == strata::prefill::PrefillCompletion::failed ? "failed" : "drained",
-                             (unsigned long long)result.execution, count, result.touched, (long long)issued_rows,
+                             packed_kind, (unsigned long long)result.execution, count, result.touched, (long long)issued_rows,
                              result.completion == strata::prefill::PrefillCompletion::complete ? "complete" :
                              result.completion == strata::prefill::PrefillCompletion::pending_command ? "pending_command" : "failed",
                              result.completion == strata::prefill::PrefillCompletion::pending_command && yield_trigger
@@ -16191,9 +16245,10 @@ int main(int argc, char** argv) {
                 for (int index = 0; index < count; ++index) {
                     const auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
                     std::fprintf(stderr, "PACKED_PREFILL event=frontier execution=%llu tag=%s slot=%d request=%llu "
-                                         "incarnation=%llu from=%lld to=%lld touched=%d\n",
+                                         "incarnation=%llu packing=%s from=%lld to=%lld touched=%d\n",
                                  (unsigned long long)result.execution, owner.tag.c_str(), owner.lease.slot,
                                  (unsigned long long)owner.lease.request, (unsigned long long)owner.lease.incarnation,
+                                 owner.solo ? "solo" : "eligible",
                                  (long long)spans[size_t(index)].position, (long long)result.frontier[size_t(index)],
                                  (result.touched & (1u << index)) ? 1 : 0);
                 }
@@ -16237,8 +16292,9 @@ int main(int argc, char** argv) {
                     if (!packed_collect()) return false;
                     if (owner.shared_boundary_request && !packed_publish_shared(owner)) return false;
                 }
-                decoder_slice_due = packed_decoder_slice && issued_rows > 0;
-                if (!packed_decoder_slice && batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
+                decoder_slice_due =
+                    strata::prefill::packed_slice_due(packed_decoder_slice, solo_streaming, issued_rows);
+                if (!slice_enabled && batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
                     time_budget.decode_due(std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count(), 2048))
                     if (!decode_round(true)) return false;
             }
