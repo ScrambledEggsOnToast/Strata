@@ -3347,8 +3347,10 @@ int main(int argc, char** argv) {
         }
         }
     }
-    // Next commit: port PIPED_CONCURRENT/READ_PIECE and checkpoint moves onto ResidentSlots ownership.
-    for (const char* name : {"STRATA_PIPED_CONCURRENT", "STRATA_PIPED_READ_PIECE",
+    // Next commit: port READ_PIECE and the checkpoint moves onto ResidentSlots ownership.  PIPED_CONCURRENT is ported:
+    // its reader takes its part-read yield through ResidentSlots::park, the ordered control queue and the external
+    // serve doorbell (see read_part), so the env is accepted when its own gate allows it.
+    for (const char* name : {"STRATA_PIPED_READ_PIECE",
                              "STRATA_SLOT_CKPT_MOVE", "STRATA_SLOT_COPY_BATCHSYNC"}) {
         const char* value = std::getenv(name);
         if (value != nullptr && std::atoi(value) != 0) {
@@ -16419,6 +16421,13 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1 && !synchronous_batch_mtp;
+        // #255: STRATA_PIPED_CONCURRENT (opt-in) reads one prompt on a thread of its own while the slot groups keep
+        // decoding.  `conc_env` only reserves the group the pump drives; the full gate is evaluated in read_part,
+        // where the schedule it must not overlap (time budget, retained prefill) already exists.
+        static const bool conc_env = [] {
+            const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         if (o.judge_overlap && (!piped || !batch_mtp_pipeline || split_same)) {
             std::fprintf(stderr, "strata judge: overlap requires the distinct-device batch-MTP pipeline\n"); return 2;
         }
@@ -16476,10 +16485,17 @@ int main(int argc, char** argv) {
             int64_t since = 0;              ///< tick it started waiting (fairness)
             bool round_started = false;
         };
-        std::vector<PGroup> pg((size_t) (piped ? (o.batch_mtp_third ? 3 : o.batch_groups) : 0));
+        std::vector<PGroup> pg((size_t) (piped ? (o.batch_mtp_third ? 3 : o.batch_groups)
+                                                : (conc_env && o.batch > 0 ? 1 : 0)));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
         bool bounded_round = false;
+        // #255: the concurrent read's doorbell thread.  pump wakes it after each launch; it serves the window itself
+        // so the reader and this thread make no CUDA call that could wait for the driver's lock (#31).
+        std::mutex bell_mu;
+        std::condition_variable bell_cv;
+        std::atomic<bool> bell_waiting{false};
+        bool conc_serving = false;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         // Packet leases survive target acceptance, recursive prefix commit and
         // synchronous private-draft advance. Only metadata moves between owners.
@@ -16611,9 +16627,13 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
+                if (conc_serving && bell_waiting.load(std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lk(bell_mu);
+                    bell_cv.notify_one();
+                }
             }
             if (drive.d.failed) { phase_error("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
-            if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
+            if (piped && !pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
                 const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
@@ -20282,8 +20302,105 @@ int main(int argc, char** argv) {
                 }();
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk
                                           : std::max<int64_t>(sp.chunk(), 1);
+                // #255: the full gate for STRATA_PIPED_CONCURRENT.  The concurrent read needs the slots' schedule to
+                // be this thread's own pump (no budget quanta, no retained/packed prefill, no batched MTP sharing the
+                // drafter), and no thread but the host's making CUDA allocations or frees while it runs (#31).
+                const bool conc_on = [&] {
+                    if (!conc_env || o.batch <= 0) return false;
+                    const char* off = nullptr;
+                    if (packed_prefill) off = "packed prefill";
+                    else if (retained_prefill) off = "retained prefill";
+                    else if (batch_mtp || batch_mtp_pipeline) off = "batched MTP";
+                    else if (o.resident_multiplex) off = "--resident-multiplex";
+                    else if (o.judge_context > 0 || o.judge_overlap) off = "the judge lane";
+                    else if (o.adapt_async) off = "--adapt-async";
+                    else if (o.spec_split) off = "--spec-split";
+                    else if (strata::prefill::Prefill::pipe_setting() > 0) off = "STRATA_PREFILL_PIPE";
+                    else if (time_budget.enabled()) off = "the foreground budget";
+                    else {
+                        strata::program::ConcurrentReadSetup s;
+                        auto env_on = [](const char* k) {
+                            const char* x = std::getenv(k);
+                            return x != nullptr && std::atoi(x) != 0;
+                        };
+                        s.prefill_help = env_on("STRATA_PREFILL_HELP");
+                        s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
+                        s.fs_slots = env_on("STRATA_FS_SLOTS");
+                        s.pcie_dma = o.pcie_mode == "dma";
+                        s.helper_caches = prefill_src != srcp;
+                        for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
+                        s.staged_source = srcp == &src && src.stages_blobs();
+                        s.other_source = srcp != &src && srcp != &arena_src;
+                        off = strata::program::concurrent_read_off(s);
+                    }
+                    if (off != nullptr) {
+                        std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", off);
+                        return false;
+                    }
+                    return true;
+                }();
                 int64_t split_until = 0;
                 bool yield_requested = false;
+                // #255: leave the part read in slot ys at q.  The read is stopped and the pipeline drained, so this is
+                // the same ResidentSlots::park the sequential controls use, never a mutable-slot write.
+                // Returns true when parked (yielded_at/yielded_slot set, e = "yield"); `fatal` when the request ends.
+                auto park_partial = [&](int ys, int64_t q, bool& fatal) -> bool {
+                    fatal = false;
+                    // only where the rest is read the same way after it (more than a chunk and more than a short
+                    // read left), text only, and into a slot that is not decoding
+                    bool can = resident.available(ys) &&
+                                     (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
+                                     b0 - q > std::max<int64_t>(C, o.short_read);
+                    if (can && !stages.empty() && strata::prefill::Prefill::pipe_setting() > 0) {
+                        // Next commit: retain PromptPlan through the fork's ResidentSlots partial-handoff API.
+                        std::fprintf(stderr, "strata generate: --prefill-pipe cannot park a partial handoff with "
+                                             "the fork's resident-slot ownership\n");
+                        std::fflush(stderr);
+                        std::exit(2);
+                    }
+                    std::string ye;
+                    const auto ty = Clock::now();
+                    std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                    const strata::program::ResidentAdmission request{
+                        0, &checks, nullptr, q, q < split_until ? split_until : 0};
+                    if (can && !park_replaced(ys)) {
+                        if (capture_device_fault) {   // #252: only a failed device sync ends the request
+                            batch_fatal = true; e = err; fatal = true; return false;
+                        }
+                        strata::program::preservation_report_drop(
+                            stderr, "the batch prompt-read park",
+                            err.empty() ? std::string_view("capture failed") : std::string_view(err));
+                        err.clear();
+                        can = false;   // no park, so no yield: this request keeps reading
+                    }
+                    const bool parked_phase = can && [&] {
+                        phase::Span phase_span(phase_current, phase::Stage::resident_copyin);
+                        return resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye);
+                    }();
+                    if (parked_phase) {
+                        if (phase_receipts)
+                            store_owner(kResidentOwnerFirst + uint64_t(ys)).phase_producer =
+                                phase_current ? phase_current->input.identity : phase::Identity{};
+                        if (store_on && store_owner(kSessionOwner).force_fresh)
+                            store_owner(kResidentOwnerFirst + uint64_t(ys)).borrow();
+                        yielded_at = q;
+                        yielded_slot = ys;
+                        std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d "
+                                             "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
+                        e = "yield";
+                        return true;
+                    }
+                    if (can && bs[(size_t) ys].failed) {
+                        batch_fatal = true;
+                        e = ye;
+                        fatal = true;
+                        return false;
+                    }
+                    std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
+                                 (long long) n, ye.empty() ? "" : ": ", ye.c_str());
+                    return false;
+                };
                 auto prompt_controls = [&](int64_t q) -> bool {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     if (q <= read_from) return true; // no zero-progress re-yield of a restored native leg
@@ -20303,58 +20420,9 @@ int main(int argc, char** argv) {
                         const int ys = std::atoi(control.c_str() + 7);
                         if (ys < 0) continue;
                         yield_requested = true;
-                        // only where the rest is read the same way after it (more than a chunk and more than a short
-                        // read left), text only, and into a slot that is not decoding
-                        bool can = resident.available(ys) &&
-                                         (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
-                                         b0 - q > std::max<int64_t>(C, o.short_read);
-                        if (can && !stages.empty() && strata::prefill::Prefill::pipe_setting() > 0) {
-                            // Next commit: retain PromptPlan through the fork's ResidentSlots partial-handoff API.
-                            std::fprintf(stderr, "strata generate: --prefill-pipe cannot park a partial handoff with "
-                                                 "the fork's resident-slot ownership\n");
-                            std::fflush(stderr);
-                            std::exit(2);
-                        }
-                        std::string ye;
-                        const auto ty = Clock::now();
-                        std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                        const strata::program::ResidentAdmission request{
-                            0, &checks, nullptr, q, q < split_until ? split_until : 0};
-                        if (can && !park_replaced(ys)) {
-                            if (capture_device_fault) {   // #252: only a failed device sync ends the request
-                                batch_fatal = true; e = err; return false;
-                            }
-                            strata::program::preservation_report_drop(
-                                stderr, "the batch prompt-read park",
-                                err.empty() ? std::string_view("capture failed") : std::string_view(err));
-                            err.clear();
-                            can = false;   // no park, so no yield: this request keeps reading
-                        }
-                        const bool parked_phase = can && [&] {
-                            phase::Span phase_span(phase_current, phase::Stage::resident_copyin);
-                            return resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye);
-                        }();
-                        if (parked_phase) {
-                            if (phase_receipts)
-                                store_owner(kResidentOwnerFirst + uint64_t(ys)).phase_producer =
-                                    phase_current ? phase_current->input.identity : phase::Identity{};
-                            if (store_on && store_owner(kSessionOwner).force_fresh)
-                                store_owner(kResidentOwnerFirst + uint64_t(ys)).borrow();
-                            yielded_at = q;
-                            yielded_slot = ys;
-                            std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d "
-                                                 "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
-                                         std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
-                            e = "yield";
-                            return false;
-                        }
-                        if (can && bs[(size_t) ys].failed) {
-                            batch_fatal = true;
-                            e = ye;
-                            return false;
-                        }
-                        std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
-                                     (long long) n, ye.empty() ? "" : ": ", ye.c_str());
+                        bool fatal = false;
+                        if (park_partial(ys, q, fatal)) return false;
+                        if (fatal) return false;
                     }
                     return true;
                 };
@@ -20458,6 +20526,164 @@ int main(int argc, char** argv) {
                         if (e != "cancelled") batch_fatal = true;
                     }
                     return okay;
+                }
+                if (conc_on && (piped || batch_on())) {
+                    // #255: the prompt is read on a thread of its own while this thread keeps the slots' windows
+                    // running through the same pump.  The reader and the doorbell thread make no CUDA allocation or
+                    // free (#31: the driver lock is held by whoever is freeing, who may wait for the GPU); reserve
+                    // the buffers that would grow at first use here, with nothing in flight.  Only pump() touches
+                    // ResidentSlots; the reader calls Prefill::run alone, and a BYIELD stops it at its next chunk
+                    // (stop_at_chunk) so the park happens after the drain, as in the sequential route.
+                    if (use_mtp && !mtp.reserve_prefill(C, e)) return false;
+                    if (!sp.reserve_uploads(C))
+                        std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be "
+                                             "reserved (they grow at first use)\n");
+                    struct Doorbells {
+                        std::atomic<bool> on{true};
+                        std::thread th;
+                        std::function<void()> off;
+                        std::condition_variable& cv;
+                        explicit Doorbells(std::condition_variable& c) : cv(c) {}
+                        ~Doorbells() {
+                            on.store(false, std::memory_order_release);
+                            cv.notify_all();
+                            if (th.joinable()) th.join();
+                            if (off) off();
+                        }
+                    } bells{bell_cv};
+                    for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
+                    conc_serving = true;
+                    bells.off = [&] {
+                        for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
+                        conc_serving = false;
+                    };
+                    bells.th = std::thread([&] {
+                        auto any_busy = [&] {
+                            for (int k = 0; k < n_pipe; ++k)
+                                if (stage_verifier(k).batch_busy()) return true;
+                            return false;
+                        };
+                        while (bells.on.load(std::memory_order_acquire)) {
+                            bool busy = false;
+                            for (int k = 0; k < n_pipe; ++k) {
+                                auto& vk = stage_verifier(k);
+                                if (!vk.batch_busy()) continue;
+                                busy = true;
+                                vk.batch_serve(win_pool_fn, win_pool_user);
+                            }
+                            if (busy) continue;
+                            std::unique_lock<std::mutex> lk(bell_mu);
+                            bell_waiting.store(true, std::memory_order_relaxed);
+                            std::atomic_thread_fence(std::memory_order_seq_cst);
+                            bell_cv.wait_for(lk, std::chrono::milliseconds(2),
+                                             [&] { return !bells.on.load(std::memory_order_acquire) || any_busy(); });
+                            bell_waiting.store(false, std::memory_order_relaxed);
+                        }
+                    });
+                    for (int64_t q0 = a0; q0 < b0;) {
+                        const auto tc = Clock::now();
+                        std::vector<std::pair<int64_t, double>> st0((size_t) n_pipe);
+                        for (int k = 0; k < n_pipe; ++k)
+                            st0[(size_t) k] = {stage_verifier(k).windows, stage_verifier(k).ms_host};
+                        std::atomic<bool> done{false};
+                        std::atomic<int> want_yield{-1};
+                        bool read_ok = true;
+                        std::string read_err;
+                        in_prompt_read = true;
+                        sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
+                        std::thread reader([&] {
+                            try {
+                                if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                                read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+                            } catch (const std::exception& x) {
+                                read_ok = false;
+                                read_err = std::string("the prompt read failed: ") + x.what();
+                            } catch (...) {
+                                read_ok = false;
+                                read_err = "the prompt read failed";
+                            }
+                            done.store(true, std::memory_order_release);
+                            { std::lock_guard<std::mutex> lk(in_mu); }   // the wait below can hold in_mu
+                            in_cv.notify_all();
+                        });
+                        struct ReadEnd {   // every way out: the reader joins first, then the hook is cleared
+                            std::thread& t;
+                            std::function<bool()>& hook;
+                            bool& reading;
+                            ~ReadEnd() {
+                                if (t.joinable()) t.join();
+                                hook = nullptr;
+                                reading = false;
+                            }
+                        } read_end{reader, sp.stop_at_chunk, in_prompt_read};
+                        bool pump_ok = true;
+                        size_t seen = 0;
+                        while (!done.load(std::memory_order_acquire)) {
+                            if (stop_req.load()) {   // the reader stops at its next chunk; the loop follows it
+                                std::unique_lock<std::mutex> lk(in_mu);
+                                in_cv.wait_for(lk, std::chrono::milliseconds(2),
+                                               [&] { return done.load(std::memory_order_acquire); });
+                                continue;
+                            }
+                            const bool decoding = batch_on() || pipe_inflight();
+                            if (decoding && !pump(true)) { pump_ok = false; break; }
+                            score_controls(false);   // BSTOP/BPRIORITY, a contiguous prefix: never past an admission
+                            if (!retire_stopped()) {
+                                batch_fatal = true;
+                                e = "resident cancellation failed";
+                                return false;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lk(in_mu);
+                                // only the front BYIELD: a control behind an admission waits for the read's end
+                                if (want_yield.load(std::memory_order_acquire) < 0 && !in_lines.empty() &&
+                                    in_lines.front().rfind("BYIELD ", 0) == 0) {
+                                    want_yield.store(std::atoi(in_lines.front().c_str() + 7),
+                                                     std::memory_order_release);
+                                    in_lines.pop_front();
+                                    if (packed_prefill) in_cv.notify_all();
+                                }
+                                seen = in_lines.size();
+                            }
+                            if (!decoding) {
+                                std::unique_lock<std::mutex> lk(in_mu);
+                                in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
+                                    return done.load(std::memory_order_acquire) || in_lines.size() != seen;
+                                });
+                            }
+                        }
+                        reader.join();
+                        sp.stop_at_chunk = nullptr;
+                        in_prompt_read = false;
+                        if (!pump_ok || !pipe_drain()) {
+                            batch_fatal = true;
+                            e = "a pipelined batch window failed";
+                            return false;
+                        }
+                        const int64_t q = read_ok && sp.stopped_at() >= 0 ? q0 + sp.stopped_at() : b0;
+                        const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
+                        std::string per;
+                        for (int k = 0; k < n_pipe; ++k) {
+                            const auto& v = stage_verifier(k);
+                            const int64_t w = v.windows - st0[(size_t) k].first;
+                            const double host = w > 0 ? (v.ms_host - st0[(size_t) k].second) / (double) w : 0.0;
+                            char b[96];
+                            std::snprintf(b, sizeof b, "%sstage %d: %lld windows, %.1f ms host each", k ? "; " : "",
+                                          k + 1, (long long) w, host);
+                            per += b;
+                        }
+                        std::fprintf(stderr, "strata batch: read %lld tokens on a thread of its own in %.0f ms "
+                                             "(concurrent, to %lld of %lld); %s\n",
+                                     (long long) (q - q0), read_ms, (long long) q, (long long) n, per.c_str());
+                        if (!read_ok) { e = read_err; return false; }
+                        if (q > read_from && q < b0 && want_yield.load(std::memory_order_acquire) >= 0) {
+                            bool fatal = false;
+                            if (park_partial(want_yield.load(std::memory_order_acquire), q, fatal)) return false;
+                            if (fatal) return false;
+                        }
+                        q0 = q;   // done, or the yield was not taken there: the rest goes on the same way
+                    }
+                    return true;
                 }
                 if (o.batch <= 0 || (!time_budget.enabled() &&
                     (piped || (!stages.empty() && !batch_on()))))

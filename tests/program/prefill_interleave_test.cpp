@@ -5,9 +5,11 @@
 #include "strata/program/serve_controls.hpp"
 #include "strata/program/phase_receipts.hpp"
 #include "strata/program/checkpoint_preservation.hpp"
+#include "strata/core/expert_source.hpp"
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -136,6 +138,11 @@ struct Prefill {
     std::vector<int64_t>* checkpoint_next = nullptr;
     int64_t* next_checkpoint = nullptr;
     int64_t chunk() const { return 2048; }
+    // #255: the concurrent read's stop/park seam.  The harness never takes it (conc_env is false), but the extracted
+    // read_part compiles against the real interface.
+    std::function<bool()> stop_at_chunk;
+    int64_t stopped_at() const { return -1; }
+    bool reserve_uploads(int64_t) { return true; }
     // --prefill-pipe stays off in this harness: the extracted read_part takes the unplanned path, which is what the
     // BYIELD and retained-read assertions are about.
     static double pipe_setting() { return 0.0; }
@@ -256,6 +263,11 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         int64_t short_read = 32;
         double foreground_budget_ms;
         int64_t prompt_cache_every = 0;
+        // #255: the concurrent gate reads these; the harness never enables it.
+        const char* pcie_mode = "pinned";
+        int expert_cache_remote[3] = {0, 0, 0};
+        bool resident_multiplex = false, judge_context = false, judge_overlap = false;
+        bool adapt_async = false, spec_split = false;
     };
     const Options o{batch, 6, 32, budget_ms, retained_schedule ? retained_schedule->checkpoint_every : 0};
     std::vector<int64_t> ids((size_t) n);
@@ -480,6 +492,38 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     int64_t resume_plan_at = -1, resume_plan_end = -1;
     int64_t seg_lend = 0;
     bool capture_device_fault = false;   // #252: the park source's own class, set by a failed device sync
+    // #255 ambient names: the concurrent reader is off here, but its code is part of the extracted read_part.
+    const bool conc_env = false;
+    const bool packed_prefill = false, batch_mtp = false, batch_mtp_pipeline = false;
+    std::condition_variable in_cv;
+    bool use_mtp = false;
+    struct MtpStub { bool reserve_prefill(int64_t, std::string&) { return true; } } mtp;
+    // The gate reads these only after conc_env passes (never here); storage only, so the harness links without the
+    // expert-source translation units and never constructs a real source.
+    alignas(strata::core::FileExpertSource) unsigned char src_storage[sizeof(strata::core::FileExpertSource)];
+    alignas(strata::core::FileExpertSource) unsigned char arena_storage[sizeof(strata::core::FileExpertSource)];
+    auto& src = *reinterpret_cast<strata::core::FileExpertSource*>(src_storage);
+    auto& arena_src = *reinterpret_cast<strata::core::FileExpertSource*>(arena_storage);
+    strata::core::ExpertSource* srcp = &src;
+    strata::core::ExpertSource* prefill_src = srcp;
+    const int n_pipe = 1;
+    // (only passed through to the stub below; the real PoolMultiFn would pull the CUDA headers into this CPU harness)
+    const int win_pool_fn = 0;
+    void* win_pool_user = nullptr;
+    struct VerifierStub {
+        int64_t windows = 0;
+        double ms_host = 0.0;
+        bool batch_busy() const { return false; }
+        int batch_serve(int, void*) { return 0; }
+        void set_external_serve(bool) {}
+    };
+    VerifierStub verifier_stub;
+    auto stage_verifier = [&](int) -> VerifierStub& { return verifier_stub; };
+    auto pump = [&](bool) { return true; };
+    std::mutex bell_mu;
+    std::condition_variable bell_cv;
+    std::atomic<bool> bell_waiting{false};
+    bool conc_serving = false;
 #include "prefill_read_part.inc"
 
     std::string& e = err;

@@ -657,7 +657,10 @@ so the slots never wait for the read and the read is one run with no drain insid
   where serving a doorbell makes a CUDA call (`--pcie-mode dma`, `STRATA_FS_SLOTS`, the helper caches
   `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
   unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
-  pictures is read the usual way.
+  pictures is read the usual way. This fork also keeps it off beside the foreground budget, batched MTP
+  (`--batch-mtp`, `--batch-mtp-pipeline`), packed or retained prefill, `--resident-multiplex`, the judge lane,
+  `--adapt-async` and `--spec-split`: each of those owns the slots or the drafter the reader would share, and the
+  reason is printed once.
 
 One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default
