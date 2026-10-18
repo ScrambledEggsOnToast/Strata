@@ -5603,6 +5603,8 @@ void WindowedExpertSource::fail(const std::string& message) {
 }
 
 bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slot, std::string& err) {
+    static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+    const auto blob_began = std::chrono::steady_clock::now();
     uint8_t* const slot_base = ring_ + (size_t) slot * (size_t) slot_stride_;
     uint64_t moved = 0;
     if (!gguf_mode_) {
@@ -5628,6 +5630,12 @@ bool WindowedExpertSource::fill_slot(int64_t layer, int64_t expert, uint64_t slo
         }
     }
     io_bytes_ += moved;   // the blob's own bytes: what the driver's read total means
+    if (timed) {
+        timing_.blob_us += (uint64_t) std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - blob_began).count();
+        timing_.read_bytes += moved;
+        ++timing_.blobs;
+    }
     return true;
 }
 
@@ -5647,11 +5655,14 @@ bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_
     // and one memmove unpads it.  Every later span reads through the scratch tail, which the stride keeps
     // disjoint from the assembled front for every plane size.
     uint8_t* const read_at = slot_base + (span.dst == 0 ? (size_t) 0 : (size_t) scratch_at_);
+    static const bool timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+    const auto span_began = std::chrono::steady_clock::now();
     std::string ferr;
     if (!f.direct.submit(off_lo, read_at, (uint32_t) cover, tag, ferr)) {
         err = "WindowedExpertSource: the direct read of " + f.path + " could not be queued: " + ferr;
         return false;
     }
+    const auto submitted = std::chrono::steady_clock::now();
     for (;;) {
         strata::platform::Completion c;
         const int n = f.direct.wait(&c, 1, -1);
@@ -5670,8 +5681,20 @@ bool WindowedExpertSource::read_span_direct(const BlobSpan& span, uint8_t* slot_
         }
         break;
     }
+    const auto completed = std::chrono::steady_clock::now();
     if (pad != 0 || span.dst != 0)
         std::memmove(slot_base + (size_t) span.dst, read_at + (size_t) pad, (size_t) span.len);
+    if (timed) {
+        const auto moved = std::chrono::steady_clock::now();
+        const auto us = [](auto from, auto to) {
+            return (uint64_t) std::chrono::duration<double, std::micro>(to - from).count();
+        };
+        timing_.submit_us += us(span_began, submitted);
+        timing_.wait_us += us(submitted, completed);
+        timing_.unpad_us += us(completed, moved);
+        timing_.span_us += us(span_began, moved);
+        ++timing_.spans;
+    }
     return true;
 }
 

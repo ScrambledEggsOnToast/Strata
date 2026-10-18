@@ -139,6 +139,8 @@ inline std::span<const std::string_view> arithmetic_environment_excluded_names()
         "STRATA_STORE_MAN2",
         // Same argument: which lane fills which stage is scheduling, not arithmetic or residency policy.
         "STRATA_FILL_LANES",
+        // The fill's own timing diagnostic, in the same class as the store's: observation only.
+        "STRATA_FILL_TIMING",
         "STRATA_PREFILL_RING",
         "STRATA_PREFILL_ATTRIBUTION",
         "STRATA_PREFILL_TIMING",

@@ -1829,6 +1829,29 @@ void mem_mark(const char* where) {
     }
 }
 
+/// `STRATA_FILL_TIMING=1`: where one fill lane's time went. The caller's share (the blob call and the device
+/// copy) joins the windowed source's own counters, which split the call into queue/completion handoff, the read
+/// itself and the unpadding move. Diagnostic only: nothing is printed unless the variable is set.
+void report_fill_timing(const char* label, const strata::core::ExpertSource* source, uint64_t blobs, uint64_t bytes,
+                        uint64_t blob_call_us, uint64_t copy_us) {
+    if (std::getenv("STRATA_FILL_TIMING") == nullptr) return;
+    const double call_s = (double) blob_call_us / 1e6, copy_s = (double) copy_us / 1e6;
+    std::fprintf(stderr, "strata fill timing: %s blobs=%llu bytes=%llu blob_call=%.2f s (%.0f MB/s) copy=%.2f s "
+                         "other=%.2f s\n",
+                 label, (unsigned long long) blobs, (unsigned long long) bytes, call_s,
+                 call_s > 0 ? (double) bytes / call_s / 1e6 : 0.0, copy_s, call_s - copy_s);
+    const auto* windowed = dynamic_cast<const strata::core::WindowedExpertSource*>(source);
+    if (windowed == nullptr) return;
+    const auto& t = windowed->io_timing();
+    const double span_s = (double) t.span_us / 1e6, submit_s = (double) t.submit_us / 1e6;
+    const double wait_s = (double) t.wait_us / 1e6, unpad_s = (double) t.unpad_us / 1e6;
+    std::fprintf(stderr, "strata fill timing: %s   spans=%llu span=%.2f s (%.0f MB/s) submit=%.2f s wait=%.2f s "
+                         "(%.1f us/span) unpad=%.2f s\n",
+                 label, (unsigned long long) t.spans, span_s,
+                 wait_s > 0 ? (double) t.read_bytes / wait_s / 1e6 : 0.0, submit_s, wait_s,
+                 t.spans ? (double) t.wait_us / (double) t.spans : 0.0, unpad_s);
+}
+
 /// `STRATA_FILL_LANES=0` fills the stages one after another instead of concurrently. It is the A/B control for
 /// the fill's concurrency, not a shipping mode: the engines that keep one source lane per stage are the ones that
 /// may fill them in parallel (`WindowedExpertSource::blob` recycles a ring another caller must not be using).
@@ -8160,6 +8183,8 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
+        const bool fill_timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+        uint64_t t_blob = 0, t_copy = 0;
         for (int64_t i = 0; i < want; ++i) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
@@ -8172,16 +8197,25 @@ int main(int argc, char** argv) {
                 if (per_layer) continue;
                 break;
             }
-            const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+            const uint8_t* b = nullptr;
+            const auto blob_began = std::chrono::steady_clock::now();
+            b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+            const auto copy_began = std::chrono::steady_clock::now();
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
                     (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
+            if (fill_timed) {
+                const auto done = std::chrono::steady_clock::now();
+                t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+            }
             fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
         }
+        report_fill_timing("CUDA0", srcp, (uint64_t) prefilled, fill_bytes, t_blob, t_copy);
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
@@ -8323,17 +8357,32 @@ int main(int argc, char** argv) {
         strata::core::ExpertSource* lane = independent_lanes ? stage_sources[index].get() : srcp;
         const strata::core::OnDevice on(st.dev);
         FillOutcome& out = outcomes[index];
+        const bool fill_timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
+        uint64_t t_blob = 0, t_copy = 0, bytes = 0;
         for (const auto& pr : st.profile) {
             if (out.filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
+            const auto blob_began = std::chrono::steady_clock::now();
             const uint8_t* b = lane->blob_stable(pr.first, pr.second);
+            const auto copy_began = std::chrono::steady_clock::now();
             if (b == nullptr) {
                 out.err = "the expert source returned no blob";
                 return;
             }
             if (!st.cache.fill_slot_blocking(slot, b, out.err, (int64_t) lay.blob_bytes(pr.first))) return;
+            if (fill_timed) {
+                const auto done = std::chrono::steady_clock::now();
+                t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
+                t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
+                bytes += lay.blob_bytes(pr.first);
+            }
             ++out.filled;
+        }
+        if (fill_timed) {
+            char label[32];
+            std::snprintf(label, sizeof label, "CUDA%d", st.dev);
+            report_fill_timing(label, lane, (uint64_t) out.filled, bytes, t_blob, t_copy);
         }
         out.ok = true;
     };

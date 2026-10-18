@@ -1136,6 +1136,17 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     int64_t reads() const override { return reads_; }
 
+    /// Where the startup fill's time goes, under `STRATA_FILL_TIMING=1`. Read-only counters: the fill calls
+    /// `blob()` once per expert, and this splits each call into its reads, the queue/completion handoff inside
+    /// each read, the unpadding move and the whole call. A native pack's blob is up to three spans and each
+    /// span is submitted and waited for on its own, so a latency-bound fill shows up as `wait_us` per span well
+    /// above `read_bytes / rate`, with `submit_us` beside it.
+    struct IOTiming {
+        uint64_t blobs = 0, spans = 0, read_bytes = 0;
+        uint64_t blob_us = 0, span_us = 0, submit_us = 0, wait_us = 0, unpad_us = 0;
+    };
+    const IOTiming& io_timing() const { return timing_; }
+
 private:
     /// One open source file, read only through `direct` (O_DIRECT; the kernel contract is that these reads do
     /// not populate the guest page cache - and say nothing about the host's).
@@ -1185,6 +1196,7 @@ private:
                                                ///< `DirectFile::alignment()` both (probed at open)
     int64_t reads_ = 0;
     uint64_t io_bytes_ = 0;
+    IOTiming timing_;                  ///< STRATA_FILL_TIMING: the startup fill's own accounting; never printed otherwise
     bool failed_ = false;
     bool retired_ = false;                     ///< terminal ring-only retirement, NOT an I/O failure
     std::string error_;
