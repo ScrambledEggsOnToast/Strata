@@ -203,6 +203,17 @@ def packed_cases(eng, prompts):
                                    for slot, tag in enumerate(mixed)))
     while any(owners[tag]["identity"] is None for tag in mixed):
         read_frame()
+    # The priority request must arrive during ordinary prefill, after the ordinary owners really
+    # shared a pack (2048 of their ~5000 rows), not before their first selection.
+    mixed_until = time.monotonic() + 30
+    while True:
+        tail = Path(eng.log_path).read_text()[mixed_offset:]
+        if sum(1 for line in tail.splitlines() if "event=frontier" in line and
+               ("tag=mixed-ordinary-a" in line or "tag=mixed-ordinary-b" in line)) >= 2:
+            break
+        if time.monotonic() >= mixed_until:
+            raise AssertionError("ordinary owners did not share a pack before the priority arrival")
+        time.sleep(0.01)
     eng.send("BGENQ1 " + record("mixed-priority", 2, long_prompt, 2, packing="solo"))
     drain(mixed + ["mixed-priority"])
     tail = Path(eng.log_path).read_text()[mixed_offset:]
