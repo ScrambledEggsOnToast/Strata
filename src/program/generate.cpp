@@ -8185,6 +8185,20 @@ int main(int argc, char** argv) {
         uint64_t fill_bytes = 0;
         const bool fill_timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
         uint64_t t_blob = 0, t_copy = 0;
+        // **The fill's READ order is not the profile's order.** The profile is ranked by routing frequency, so
+        // consecutive pairs jump between layers and the source sees scattered ~645 KB reads; that same set read
+        // layer by layer is a near-sequential walk through each plane. Reordering is only possible when every
+        // profiled pair is admitted - then the resident SET is the profile's regardless of order, and only the
+        // slot numbers move. With fewer slots than pairs the order decides which pairs are resident, so it is
+        // left alone.
+        std::vector<std::pair<int32_t, int32_t>> fill_order(profile.begin(), profile.begin() + (size_t) std::min<int64_t>(want, (int64_t) profile.size()));
+        if (!per_layer && (int64_t) fill_order.size() <= xcache.slots()) {
+            std::stable_sort(fill_order.begin(), fill_order.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            });
+        } else {
+            fill_order.assign(profile.begin(), profile.begin() + (size_t) std::min<int64_t>(want, (int64_t) profile.size()));
+        }
         for (int64_t i = 0; i < want; ++i) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
@@ -8192,17 +8206,19 @@ int main(int argc, char** argv) {
                 if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
             }
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+            const int32_t layer = fill_order[(size_t) i].first;
+            const int32_t expert = fill_order[(size_t) i].second;
+            const int32_t slot = xcache.admit(layer, expert);
             if (slot == strata::core::kNotResident) {
                 if (per_layer) continue;
                 break;
             }
             const uint8_t* b = nullptr;
             const auto blob_began = std::chrono::steady_clock::now();
-            b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+            b = srcp->blob_stable(layer, expert);
             const auto copy_began = std::chrono::steady_clock::now();
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -8212,7 +8228,7 @@ int main(int argc, char** argv) {
                 t_blob += (uint64_t) std::chrono::duration<double, std::micro>(copy_began - blob_began).count();
                 t_copy += (uint64_t) std::chrono::duration<double, std::micro>(done - copy_began).count();
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(layer);
             ++prefilled;
         }
         report_fill_timing("CUDA0", srcp, (uint64_t) prefilled, fill_bytes, t_blob, t_copy);
@@ -8272,6 +8288,8 @@ int main(int argc, char** argv) {
     }
 
     size_t split_stage_index = 0;
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> fill_orders(stages.size());
+    size_t order_index = 0;
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -8302,7 +8320,22 @@ int main(int argc, char** argv) {
         }
         std::vector<int64_t> sized;
         int64_t used = 0;
-        for (const auto& pr : st.profile) {
+        // **The fill reads its residents layer by layer when every profiled pair fits**, because a frequency-ranked
+        // list scatters the ~645 KB reads and, with every pair admitted, the order only decides slot numbers.
+        // `sized` must be built in the order it is consumed: `open_sized` gives each slot the capacity of the pair
+        // at its index, so sorting the fill without sorting the sizes puts a large blob in a small slot.
+        std::vector<std::pair<int32_t, int32_t>> order(st.profile);
+        int64_t needed = 0;
+        for (const auto& pr : order) {
+            needed += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+        }
+        if (needed <= room && !o.expert_cache_per_layer) {
+            std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            });
+        }
+        fill_orders[order_index++] = order;
+        for (const auto& pr : order) {
             const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             if (used + b > room) break;
             used += b;
@@ -8359,7 +8392,11 @@ int main(int argc, char** argv) {
         FillOutcome& out = outcomes[index];
         const bool fill_timed = std::getenv("STRATA_FILL_TIMING") != nullptr;
         uint64_t t_blob = 0, t_copy = 0, bytes = 0;
-        for (const auto& pr : st.profile) {
+        // Same argument as the primary stage's fill: read the residents layer by layer when every profiled pair
+        // is admitted. The order was fixed with the slot sizes in phase 1, because `open_sized` sized each slot
+        // for the pair at its index.
+        const std::vector<std::pair<int32_t, int32_t>>& order = fill_orders[index];
+        for (const auto& pr : order) {
             if (out.filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
