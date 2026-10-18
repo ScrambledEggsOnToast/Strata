@@ -140,6 +140,13 @@ def strata(m: dict, out: list, lab: str):
         metric("admission_waiting", "gauge", "HTTP admission waiters by priority.",
                ((m.get("admission") or {}).get("waiting_by_priority") or {}).get(priority, 0),
                f',priority="{priority}"')
+    for packing in ("eligible", "solo"):
+        metric("admission_waiting_packing", "gauge", "HTTP admission waiters by per-request packing policy.",
+               ((m.get("admission") or {}).get("waiting_by_packing") or {}).get(packing, 0),
+               f',packing="{packing}"')
+        metric("admission_active_packing", "gauge", "Admitted requests by per-request packing policy.",
+               ((m.get("admission") or {}).get("active_by_packing") or {}).get(packing, 0),
+               f',packing="{packing}"')
         for outcome in ("completed", "error", "rejected", "cancelled", "timeout", "disconnected", "shutting down"):
             values = ((m.get("frontend") or {}).get(priority) or {}).get(outcome) or {}
             labels = f',priority="{priority}",outcome="{outcome}"'

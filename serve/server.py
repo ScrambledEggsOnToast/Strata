@@ -4379,6 +4379,10 @@ class Service:
                 "active": len(self.admission_active), "waiting": len(self.admission_waiters),
                 "waiting_by_priority": {p: sum(r["priority"] == p for r in self.admission_waiters)
                                         for p in ("foreground", "background")},
+                "waiting_by_packing": {p: sum(r.get("_packing") == p for r in self.admission_waiters)
+                                       for p in ("eligible", "solo")},
+                "active_by_packing": {p: sum(r.get("_packing") == p for r in self.admission_active.values())
+                                      for p in ("eligible", "solo")},
                 "score_slots": 1,
                 "score_active": sum(bool(r.get("_score")) for r in self.admission_active.values()),
                 "score_waiting": sum(bool(r.get("_score")) for r in self.admission_waiters),
