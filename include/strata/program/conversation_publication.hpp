@@ -132,6 +132,9 @@ struct ConversationPublicationSink {
     // Preserve real writer/index workspace while admitting protected parked owners: production sets this to the
     // configured store metadata_bytes ceiling. It is additional outside-cache headroom, never image/lease credit.
     size_t publication_headroom_bytes = 0;
+    // RAM provenance is independent of format activation. False strips draft
+    // certification only from the offered disk view, never the retry/RAM image.
+    bool export_draft_certification = true;
     // Allocate an empty shared root before taking the cache's protected owner. Missing ticket returns null;
     // allocation failure throws without consuming the protected image. Taking transfers parked bytes to lease
     // bytes without widening the envelope or copying any payload.

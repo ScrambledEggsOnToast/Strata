@@ -993,6 +993,84 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
 }
 
 
+// Storage/authority policy only: these are explicit small store fixtures, not
+// claimed CUDA writes or a substitute for the real GEN-to-resident regression.
+void check_ram_certification_is_independent_of_disk_export() {
+    for (bool export_certification : {false, true}) {
+        TempRoot root;
+        const auto options = options_for(root.path);
+        ConversationStore store(options);
+        Sink sink(store);
+        sink.out.export_draft_certification = export_certification;
+        ConversationPublicationQueue publications;
+        auto record = all_stage_record(241, 64);
+        auto& draft_owner = record.stage_images.back();
+        draft_owner.kv.push_back(draft_owner.kv.back());
+        draft_owner.draft_begin = 0;
+        draft_owner.draft_cells = 64;
+        draft_owner.draft_next_token = 731;
+        check(capture_image(publications, sink, 0, 1, 0, true, record, store.epoch()),
+              "private RAM certification enters the real protected publication queue");
+        settle(publications, store, sink);
+        check(!publications.holds_work() && publications.owner(0).lineage.valid &&
+              sink.cache.size() == 1, "publication commits and retains its private read-through RAM image");
+        if (sink.cache.size() == 1) {
+            bool retained = false;
+            const auto ram = sink.cache.take(0, retained);
+            const auto& owner = ram.stage_images.back();
+            check(owner.draft_begin == 0 && owner.draft_cells == 64 && owner.draft_next_token == 731,
+                  "disk export policy never strips the RAM image's completed interval or boundary token");
+        }
+        check(draft_owner.draft_begin == 0 && draft_owner.draft_cells == 64 &&
+              draft_owner.draft_next_token == 731, "publication leaves the captured source certification intact");
+        struct stat issuer {};
+        check(::stat((root.path + "/issuer.key").c_str(), &issuer) == 0 &&
+              issuer.st_size == (export_certification ? 64 : 32),
+              "only certified disk export activates the minimum-reader issuer envelope");
+        size_t manifests = 0;
+        DIR* directory = ::opendir((root.path + "/manifests").c_str());
+        check(directory != nullptr, "the committed manifest directory is readable");
+        if (directory) {
+            while (const auto* entry = ::readdir(directory)) {
+                if (entry->d_name[0] == '.') continue;
+                ++manifests;
+                const auto path = root.path + "/manifests/" + entry->d_name;
+                FILE* file = std::fopen(path.c_str(), "rb");
+                char tag[8] = {};
+                const bool read = file && std::fread(tag, 1, sizeof(tag), file) == sizeof(tag);
+                if (file) std::fclose(file);
+                check(read && std::memcmp(tag, export_certification ? "STCSMAN2" : "STCSMAN1", sizeof(tag)) == 0,
+                      "the actual persisted manifest uses the explicitly selected certificate format");
+            }
+            ::closedir(directory);
+        }
+        check_eq(manifests, 1, "the publication wrote exactly one complete all-stage manifest");
+        store.close();
+        check(store.shutdown_state() == ConversationStoreShutdownState::durable_clean,
+              "the publication root closes cleanly before a disk-only restore");
+        ConversationStore reopened(options);
+        auto query = query_of(record, 1201, 1);
+        std::string why;
+        check(reopened.demand(query, why), "the reopened store admits the persisted private image");
+        ConversationStoreRead read;
+        check(reopened.wait_ready(1201, 1, read, 5000) &&
+              read.status == ConversationStoreReadStatus::ready && read.image &&
+              read.image->stage_images.size() == 2, "disk-only restore returns the complete physical stages");
+        if (read.image && read.image->stage_images.size() == 2) {
+            const auto& owner = read.image->stage_images.back();
+            check(owner.draft_begin == (export_certification ? 0 : -1) &&
+                  owner.draft_cells == (export_certification ? 64 : -1) &&
+                  owner.draft_next_token == (export_certification ? 731 : -1),
+                  "ON restores the exported certificate; OFF disk restore remains explicitly unknown");
+        }
+        read.image.reset();
+        reopened.release_read(1201, 1);
+        reopened.close();
+        check(reopened.shutdown_state() == ConversationStoreShutdownState::durable_clean,
+              "the disk-only certificate policy check closes cleanly");
+    }
+}
+
 void check_shared_borrow_and_owner_neutral_publication() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
@@ -1465,6 +1543,7 @@ int main() {
     check_capture_refusal_is_atomic();
     check_optional_retention_failure_preserves_publication();
     check_bounded_capture_persists_the_newest_all_stage_frontier();
+    check_ram_certification_is_independent_of_disk_export();
     check_shared_borrow_and_owner_neutral_publication();
     check_shared_head_is_evictable();
     check_evicted_latest_does_not_strand_publications();

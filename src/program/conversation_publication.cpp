@@ -440,9 +440,36 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
             pending_.push_back(std::move(pending));
             // Keep the original head image throughout refusal, deferral and allocation failure. A fresh branch's
             // extra root-cut promise is offered through a metadata alias, never by mutating the retry image.
-            const std::shared_ptr<const strata::core::SavedConversation> offered = entry.shared_prefix
-                ? unpinned_shared_cut(entry.image)
-                : pins_live_cut(publish) ? pinned_live_cut(entry.image) : entry.image;
+            std::shared_ptr<const strata::core::SavedConversation> offered;
+            const auto has_draft_certification = [](const auto& stage) {
+                return stage.draft_begin != -1 || stage.draft_cells != -1 || stage.draft_next_token != -1 ||
+                    !stage.draft_boundary_residual.empty();
+            };
+            const bool legacy_view_needed = !sink.export_draft_certification &&
+                (has_draft_certification(*entry.image) ||
+                 std::any_of(entry.image->stage_images.begin(), entry.image->stage_images.end(),
+                             has_draft_certification));
+            if (legacy_view_needed) {
+                // Keep the certified retry/read-through image intact. This is
+                // one metadata alias, like the pin view below, not a payload copy.
+                auto published = entry.image->frozen_alias();
+                const auto legacy_view = [&](auto& stage) {
+                    stage.draft_begin = stage.draft_cells = -1;
+                    stage.draft_next_token = -1;
+                    stage.draft_boundary_residual = {};
+                    if (entry.shared_prefix) {
+                        stage.live.pinned = false;
+                        for (auto& cut : stage.checkpoints) cut.pinned = false;
+                    }
+                };
+                legacy_view(published);
+                for (auto& stage : published.stage_images) legacy_view(stage);
+                if (!entry.shared_prefix && pins_live_cut(publish)) published.live.pinned = true;
+                offered = std::make_shared<strata::core::SavedConversation>(std::move(published));
+            } else {
+                offered = entry.shared_prefix ? unpinned_shared_cut(entry.image)
+                    : pins_live_cut(publish) ? pinned_live_cut(entry.image) : entry.image;
+            }
             admission = store.publish(offered, publish, why);
         } catch (const std::bad_alloc&) {
             if (pending_.size() != pending_before) pending_.pop_back();

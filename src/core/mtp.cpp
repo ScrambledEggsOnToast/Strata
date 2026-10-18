@@ -1600,7 +1600,27 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
         next_token < 0 || next_token >= n_vocab_ ||
         cell < 0 || cell != slots_[(size_t) slot].cells - 1 ||
         (slots_[(size_t) slot].certified && !slot_covers(slot, cell))) {
-        err = "mtp: resident proposal position or prepared graph mismatch"; return false;
+        // Report only extents and predicate validity, never tokens or residual contents.
+        const auto* target = slot_state(slot) ? &slots_[(size_t) slot] : nullptr;
+        char detail[1024];
+        std::snprintf(detail, sizeof(detail),
+            "mtp: resident proposal position or prepared graph mismatch "
+            "(slot=%d cell=%lld stored_cells=%lld completed_cells=%lld "
+            "batch_drafting=%d slot_valid=%d graph_ready=%d residual_valid=%d token_valid=%d "
+            "cell_valid=%d position_match=%d certified=%d covers=%d slot_owner_valid=%d "
+            "slot_begin=%lld source_begin=%lld source_end=%lld source_known=%d source_owner_matches=%d "
+            "prompt_length=%lld window=%lld)",
+            slot, (long long) cell, (long long) (target ? target->cells : -1),
+            (long long) (target ? target->completed_cells : -1),
+            int(batch_drafting_), int(target != nullptr), int(target && target->advance),
+            int(residual != nullptr), int(next_token >= 0 && next_token < n_vocab_),
+            int(cell >= 0), int(target && cell == target->cells - 1),
+            int(target && target->certified), int(target && slot_covers(slot, cell)),
+            int(target && target->request), (long long) (target ? target->begin : -1),
+            (long long) coverage_.begin, (long long) coverage_.cells, int(coverage_.known()),
+            int(working_request_ && coverage_owner_ == working_request_),
+            (long long) (target ? target->prompt_len : -1), (long long) window_);
+        err = detail; return false;
     }
     if (!context_idle(err)) return false;
     auto& target = slots_[(size_t) slot];

@@ -1763,9 +1763,18 @@ completed interval** instead of leaving it unknown. An exact shared cut retains 
 immutable main-residual row at position `tokens-1` (stream kind 27, exactly `n_embd * hc * 4` bytes, on the draft-owning
 stage); a private capture may additionally name its own final token. Row `q` consumes `R_q` and token `q+1`, so the
 excluded cell is the first private suffix token: a shared image never persists it, and a full-`N` resume supplies its
-own token and completes exactly one K/V-only cell before advertising `N`. Uncatalogued images and every feature-off
-capture stay `STCSMAN1` with an unknown interval, which the resident source gate refuses at pre-parse time rather than
-treating a cold retry as reuse.
+own token and completes exactly one K/V-only cell before advertising `N`. Ordinary private RAM captures retain
+their producer's drained interval even with packed prefill disabled: dropping it on restore would certify only the
+new suffix and refuse the legacy first-token-to-batch handoff. No interval is inferred from the payload's length.
+Disk export remains separately gated by packed prefill: feature-off publication offers a shallow legacy view with
+unknown draft coverage (`STCSMAN1`), without changing the certified RAM/retry image or activating the reader floor.
+Unknown coverage still refuses direct resident source reuse rather than treating a cold retry as reuse.
+This RAM repair does not certify old `STCSMAN1` disk images: the legacy ordinary disk-mount path still accepts
+unknown intervals, and later suffix-only writes can therefore still refuse batch adoption after a restart.
+
+A resident MTP proposal refusal includes the requested/stored/completed positions, graph readiness, validity
+predicates, and working/slot certification extents. This failure-only detail contains no token IDs or residual
+contents; the position and certified-coverage guards are unchanged.
 
 Manifest tags are not a version negotiation. The existing reader classifies an unrecognized manifest tag as *that
 record's* defect and retires it, and it treats an undecodable catalog as an empty catalog while continuing; both

@@ -11502,6 +11502,7 @@ int main(int argc, char** argv) {
         // only the writer's next image moves into a separately charged lease.
         strata::program::ConversationPublicationSink publication_sink;
         publication_sink.publication_headroom_bytes = store_publication_headroom;
+        publication_sink.export_draft_certification = packed_prefill;
         publication_sink.report = [](const char* line) { std::fputs(line, stderr); };
         publication_sink.release_lease = [&](size_t lease_bytes) { conversations.release_lease(lease_bytes); };
         publication_sink.refresh_allowance = [&] { store_allowance(); };
@@ -12254,7 +12255,9 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft0 = n_st > 0 ? nullptr : draft_state;
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? draft_state : nullptr; };
             auto certify_capture = [&](strata::core::ConversationView& v, bool owns_draft) {
-                if (!owns_draft || (!packed_prefill && !source.shared_prefix)) return;
+                if (!owns_draft) return;
+                // Private restores need the producer's real completed interval even
+                // on the legacy reader; suffix writes alone cannot certify its prefix.
                 if (source.resident) {
                     const auto& retained = *source.resident;
                     if (source.shared_prefix) {
@@ -12277,7 +12280,7 @@ int main(int argc, char** argv) {
                             ? retained.draft_next_token : -1;
                     }
                 } else mtp.certify_view(v);
-                if (!packed_prefill) {
+                if (!packed_prefill && source.shared_prefix) {
                     // Legacy feature-off shared cuts retain only their observed
                     // sanitizing extent, not new persisted certification/payloads.
                     v.draft_owner = 0; v.draft_boundary_residual = nullptr;
