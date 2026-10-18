@@ -2918,6 +2918,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: persistent conversation caching stays off: %s\n",
                      persistence_disabled_reason.c_str());
     const bool packed_prefill = strata::prefill::packed_prefill_enabled();
+    const char* packed_cap_setting = std::getenv("STRATA_PACKED_PREFILL_FOREGROUND_CAP");
+    const char* packed_slice_setting = std::getenv("STRATA_PACKED_PREFILL_DECODER_SLICE");
+    if (packed_cap_setting && (packed_cap_setting[0] < '0' || packed_cap_setting[0] > '4' ||
+                               packed_cap_setting[1] != '\0')) {
+        std::fprintf(stderr, "strata packed prefill: STRATA_PACKED_PREFILL_FOREGROUND_CAP must be unset or exactly 0..4\n");
+        return 2;
+    }
+    if (packed_slice_setting && std::strcmp(packed_slice_setting, "0") != 0 &&
+        std::strcmp(packed_slice_setting, "1") != 0) {
+        std::fprintf(stderr, "strata packed prefill: STRATA_PACKED_PREFILL_DECODER_SLICE must be unset, 0 or exactly 1\n");
+        return 2;
+    }
+    const int packed_foreground_cap = packed_cap_setting ? packed_cap_setting[0] - '0' : 0;
+    const bool packed_decoder_slice = packed_slice_setting && std::strcmp(packed_slice_setting, "1") == 0;
+    if ((packed_foreground_cap || packed_decoder_slice) && !packed_prefill) {
+        std::fprintf(stderr, "strata packed prefill: foreground cap and decoder slice require STRATA_PACKED_PREFILL=1\n");
+        return 2;
+    }
+    if (packed_decoder_slice && o.batch < 2) {
+        std::fprintf(stderr, "strata packed prefill: decoder slice requires at least two resident slots\n");
+        return 2;
+    }
     if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
         (o.foreground_budget_ms > 0 && (!o.serve || o.batch < (packed_prefill ? 1 : 2) || o.prompt_cache <= 0))) {
         std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
@@ -10866,6 +10888,10 @@ int main(int argc, char** argv) {
                                  "and owned 2048 scratch on every stage\n");
             return 2;
         }
+        if (packed_decoder_slice && o.batch < 2) {
+            std::fprintf(stderr, "strata packed prefill: decoder slice requires at least two effective resident slots\n");
+            return 2;
+        }
 #ifdef STRATA_RESIDENT_MODEL_TEST
         if (o.host_native) {
             if (test_resident_stages.size() != 3 || o.batch != 4 || !batch_mtp_pipeline) {
@@ -13923,6 +13949,9 @@ int main(int argc, char** argv) {
         // Advertise before readiness, including replicas that have not received work yet.
         if (report_throughput) std::printf("INFO throughput_progress=1\n");
         if (packed_prefill) std::printf("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4\n");
+        if (packed_foreground_cap || packed_decoder_slice)
+            std::printf("INFO packed_prefill_foreground_cap=%d packed_prefill_decoder_slice=%d\n",
+                        packed_foreground_cap, int(packed_decoder_slice));
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -15470,6 +15499,10 @@ int main(int argc, char** argv) {
             return std::any_of(packed_owners.begin(), packed_owners.end(),
                                [](const auto& owner) { return owner.pending; });
         };
+        auto packed_decoding = [&] {
+            // resident.active() also includes preparing slots, which cannot decode.
+            return std::any_of(bs.begin(), bs.end(), [](const BSlot& slot) { return slot.active && !slot.stop; });
+        };
         auto packed_cancelled = [&](int slot) {
             std::lock_guard<std::mutex> lock(in_mu);
             return in_eof || bs[size_t(slot)].stop;
@@ -15759,6 +15792,25 @@ int main(int argc, char** argv) {
                 if (!resident.abort_preparation(owner.lease, err)) return false;
                 packed_done(slot, "cancel");
             }
+            const bool foreground_waiting = packed_foreground_cap &&
+                std::any_of(packed_owners.begin(), packed_owners.end(), [&](const auto& owner) {
+                    return owner.pending && owner.prepared && bs[size_t(owner.lease.slot)].foreground;
+                });
+            uint32_t selected = 0;
+            if (foreground_waiting) {
+                int seats = 0;
+                // Prefer foreground destinations without changing order within either class.
+                for (int pass = 0; pass < 2 && seats < packed_foreground_cap; ++pass)
+                    for (const auto& owner : packed_owners) {
+                        if (!owner.pending || !owner.prepared || seats == packed_foreground_cap) continue;
+                        const int slot = owner.lease.slot;
+                        if (bs[size_t(slot)].p >= owner.lease.endpoint ||
+                            bs[size_t(slot)].foreground != (pass == 0)) continue;
+                        selected |= uint32_t(1) << slot;
+                        ++seats;
+                    }
+            }
+            bool decoder_slice_due = false;
             std::array<strata::prefill::OwnerSpan, 4> spans;
             std::array<int, 4> span_slots{};
             int count = 0;
@@ -15767,6 +15819,7 @@ int main(int argc, char** argv) {
                 const int slot = owner.lease.slot;
                 const int64_t begin = bs[size_t(slot)].p, endpoint = owner.lease.endpoint;
                 if (begin >= endpoint) { final_ready = true; continue; }
+                if (foreground_waiting && !(selected & (uint32_t(1) << slot))) continue;
                 owner.boundary = endpoint;
                 if (owner.input.checkpoint && o.prompt_cache > 0) {
                     for (int64_t seam : owner.seams)
@@ -15794,6 +15847,7 @@ int main(int argc, char** argv) {
                 unsigned probes = 0;
                 const char* yield_trigger = nullptr;
                 uint64_t stop_epoch = epoch;
+                const bool slice_decoder = packed_decoder_slice && packed_decoding();
                 const auto pending = [&] {
                     const uint64_t observed_epoch = command_epoch.load();
                     const auto stop = [&](const char* reason) {
@@ -15802,12 +15856,14 @@ int main(int argc, char** argv) {
                     };
                     if (observed_epoch != epoch) return stop("command");
                     if (packed_first_ready.load(std::memory_order_acquire)) return stop("owner_ready");
-                    // Uncontended prefill retains its full three-stage pipeline.
-                    // A live decoder may request an existing budget seam only
-                    // after stage zero has had one real issuance opportunity.
-                    if (++probes > 1 && batch_on() && time_budget.enabled() &&
-                        std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count() >= o.foreground_budget_ms)
-                        return stop("budget");
+                    // One issuance opportunity precedes either policy's drained yield.
+                    // Command/owner/budget precedence and the first latched cause stay intact.
+                    if (++probes > 1) {
+                        if (batch_on() && time_budget.enabled() &&
+                            std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count() >= o.foreground_budget_ms)
+                            return stop("budget");
+                        if (slice_decoder) return stop("decoder_slice");
+                    }
                     return false;
                 };
                 const auto result = sp.run_segments(spans.data(), count, err, pending);
@@ -15873,10 +15929,19 @@ int main(int argc, char** argv) {
                     if (!packed_collect()) return false;
                     if (owner.shared_boundary_request && !packed_publish_shared(owner)) return false;
                 }
-                if (batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
+                decoder_slice_due = packed_decoder_slice && issued_rows > 0;
+                if (!packed_decoder_slice && batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
                     time_budget.decode_due(std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count(), 2048))
                     if (!decode_round(true)) return false;
             }
+            const auto decoder_slice = [&]() -> bool {
+                if (!decoder_slice_due) return true;
+                // No final_R borrow or prefill descendant survives here. Consume
+                // cancellation before a single existing, completely drained round.
+                if (!packed_collect()) return false;
+                return !packed_decoding() || (time_budget.enabled() && !time_budget.decode_allowed(0)) ||
+                       decode_round(true);
+            };
             // Cancellation before issuance discards the reservation. Once final
             // verifier rows issue, every owner must complete its MTP catch-up.
             if (!packed_collect()) return false;
@@ -15904,7 +15969,8 @@ int main(int argc, char** argv) {
                 row.mask = strata::core::BatchRowMask::active;
                 final_slots[size_t(final_count++)] = slot;
             }
-            if (!final_count || command_epoch.load() != final_epoch) return true;
+            if (command_epoch.load() != final_epoch) return true;
+            if (!final_count) return decoder_slice();
             int32_t output[4] = {};
             drive.d.failed = false;
             if (!ver.run_slot_rows(final_rows.data(), final_count, win_pool_fn, win_pool_user, output, err) ||
@@ -15962,7 +16028,7 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
             publish_ram_view();
-            return true;
+            return decoder_slice(); // ready owners publish their first token before the peer round
         };
         auto packed_front = [&] {
             std::lock_guard<std::mutex> lock(in_mu);

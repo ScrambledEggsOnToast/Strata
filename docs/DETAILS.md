@@ -3325,6 +3325,32 @@ distinguishes `trigger=owner_ready`, `command` and `budget`. The first true stop
 reason and `stop_epoch` (beside `start_epoch`); commands or owner completion during descendant drain
 cannot relabel an earlier budget stop. Guard order and the first issuance opportunity are unchanged.
 
+Two further experimental native controls are independent and default off:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `STRATA_PACKED_PREFILL_FOREGROUND_CAP` | unset / `0` | Exact `1`..`4` limits the selected prefill owners while a prepared foreground request awaits its first token. Select foreground owners before background owners, retaining physical-slot order within each class; otherwise retain the original four-owner selection. Unselected destinations stay reserved for drained reselection; there is no wait to fill the cap. |
+| `STRATA_PACKED_PREFILL_DECODER_SLICE` | unset / `0` | Exact `1` stops issuing after one at-most-2,048-row pack when a live slot is decoding, drains the complete stage chain, then offers one existing bounded decode round before the next prefill selection. A round is one normal MTP window per active group, not necessarily one output token. With no live decoder the original prompt pipeline is retained. |
+
+Invalid values refuse startup. Either nonzero control requires `STRATA_PACKED_PREFILL=1`; decoder slicing
+also requires at least two requested and effective resident slots. All existing packed-mode refusals remain.
+Enabled controls are reported before `READY` as `INFO packed_prefill_foreground_cap=N packed_prefill_decoder_slice=N`.
+The controls can be used separately or together; they do not change HTTP admission or its class-count bound.
+The cap is a composition policy, not a first-token deadline or a new native fairness guarantee.
+
+Slicing uses the existing latched stop callback (`trigger=decoder_slice`), not a second pump or a callback
+on a stage worker. Earlier command, owner-ready or budget stops keep their original cause. Certified
+frontiers, queued controls and eligible shared captures are processed after the full drain; ready owners
+then complete their separate verifier/MTP catch-up and publish their first token before the decoder round.
+Cancellation is collected again before that round. With a positive `--foreground-budget-ms`, every pack
+earns the existing wall-time credit and a slice runs only when `decode_allowed(0)` permits it; the full
+round is charged once, retaining any overrun as debt. Insufficient credit can therefore skip a slice.
+No budget means no credit gate. Owner-local histories, checkpoint cuts, committed-token accounting and
+the single host pump owner are unchanged; there is no prefill/decode kernel overlap or extra scratch.
+Kernel and sampling rules are unchanged, but a different owner composition can change floating-point
+partitioning; bitwise identity, responsiveness gains and throughput costs require matched runtime evidence.
+These controls do not change `STRATA_STORE_DRAIN_MS` or its existing 8-second default.
+
 Prepared store offers still use the existing `cache_offer`, `cache_generation` and request-deadline keys.
 The store owns lookup/materialization and its read lease; preparation validates any mounted image and
 restores it directly into the physical destination. Only a successful nonzero physical restore emits
