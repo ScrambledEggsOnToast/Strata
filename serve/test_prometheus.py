@@ -82,7 +82,7 @@ class Units(unittest.TestCase):
              "totals": {"requests": 1, "prompt_ms": 1500.0, "decode_ms": 2000.0},
              "requests": [{"hit_rate": 0.97, "decode_tok_s": 101.5}],
              "admission": {"waiting_by_packing": {"eligible": 2, "solo": 1},
-                           "active_by_packing": {"eligible": 3, "solo": 1}},
+                           "active_by_packing": {"eligible": 3, "solo": 1}, "solo_slot_reserved": True},
              "hardware": {"gpu_util": 40.0, "gpus": [{"index": 0, "util": 30.0, "mem_used": 1 << 30, "temp": 60},
                                                      {"index": 1, "util": 50.0, "mem_used": 2 << 30, "temp": 65}],
                           "cpu": 12.5, "ram_used": 8 << 30, "ram_total": 64 << 30}}
@@ -95,6 +95,7 @@ class Units(unittest.TestCase):
         self.assertEqual(got[("strata:last_hit_rate", lab)], 0.97)
         self.assertEqual(got[("strata:admission_waiting_packing", lab + ',packing="solo"')], 1)
         self.assertEqual(got[("strata:admission_active_packing", lab + ',packing="eligible"')], 3)
+        self.assertEqual(got[("strata:reserved_solo_slot", lab)], 1)
         self.assertEqual(got[("strata:gpu_util", lab + ',gpu="1"')], 50)
         self.assertEqual(got[("strata:gpu_mem_used_bytes", lab + ',gpu="0"')], 1 << 30)
         self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample

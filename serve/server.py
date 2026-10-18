@@ -4202,6 +4202,9 @@ class Service:
         self.admission_active = {}
         self.admission_foreground = {False: 0, True: 0}  # independent generation / score fairness
         self.admission_solo = {False: 0, True: 0}        # consecutive solo foreground admissions, for fairness
+        # Experiment: keep one of the generation slots available to a solo request. Off by default; the
+        # profile env STRATA_RESERVE_SOLO_SLOT=1 turns it on for a bounded comparison.
+        self.reserve_solo_slot = os.environ.get("STRATA_RESERVE_SOLO_SLOT") == "1"
         self._foreground_pending = False
         self.shutting_down = False                       # a shutdown refuses new requests and cancels the accepted
         self.request_queue_limit = DEFAULT_REQUEST_QUEUE_LIMIT
@@ -4383,6 +4386,9 @@ class Service:
                                        for p in ("eligible", "solo")},
                 "active_by_packing": {p: sum(r.get("_packing") == p for r in self.admission_active.values())
                                       for p in ("eligible", "solo")},
+                "solo_slot_reserved": bool(self.reserve_solo_slot and
+                                           (getattr(self.engine, "info", {}) or {}).get("packed_prefill") == 1 and
+                                           max(1, int(getattr(self.engine, "batch", 0) or 0)) > 1),
                 "score_slots": 1,
                 "score_active": sum(bool(r.get("_score")) for r in self.admission_active.values()),
                 "score_waiting": sum(bool(r.get("_score")) for r in self.admission_waiters),
@@ -4398,6 +4404,23 @@ class Service:
             r["priority"] == "foreground" and not r.get("_executing") and
             r["state"] in ("queued", "admitted", "preparing", "engine_wait")
             for r in self.admission_active.values())
+
+    def _capacity_allows(self, record, active: int, active_solo: int, capacity: int) -> bool:
+        """Whether this generation request may use one of the engine's reservations.
+
+        With the reservation off (or packing off, or only one slot) this is the existing `active < capacity`.
+        With it on, at most `capacity - 1` non-solo generation requests are admitted; a solo request may use any
+        free slot. The reserve is a capacity predicate, not a dedicated slot, and it never preempts active work.
+        """
+        if active >= capacity:
+            return False
+        if record.get("_score") or not self.reserve_solo_slot or capacity <= 1:
+            return True
+        if (getattr(self.engine, "info", {}) or {}).get("packed_prefill") != 1:
+            return True
+        if record["priority"] == "foreground" and record.get("_packing") == "solo":
+            return True
+        return active - active_solo < capacity - 1
 
     def register_lifecycle(self, req, cancel, *, score=False):
         priority = req.get("strata_priority", "foreground")
@@ -4422,6 +4445,10 @@ class Service:
         _frontend_phase(record, "admission_wait", now)
         with self.admission_cv:
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
+            record["_active_at_enqueue"] = len(self.admission_active)
+            record["_active_packing_at_enqueue"] = {
+                p: sum(r.get("_packing") == p for r in self.admission_active.values()) for p in ("eligible", "solo")}
+            record["_reserved_solo_slot"] = self.reserve_solo_slot
             if self.shutting_down:
                 record.update(state="rejected", error="the server is shutting down", completion_s=0.0)
                 record["events"].append({"state": "rejected", "elapsed_s": 0.0})
@@ -4574,7 +4601,10 @@ class Service:
                 chosen = order[0] if order else None
                 capacity = 1 if score else max(1, int(getattr(self.engine, "batch", 0) or 0))
                 active = sum(bool(r.get("_score")) == score for r in self.admission_active.values())
-                if chosen is record and active < capacity:
+                active_solo = sum(1 for r in self.admission_active.values()
+                                  if not r.get("_score") and r["priority"] == "foreground" and
+                                  r.get("_packing") == "solo")
+                if chosen is record and self._capacity_allows(record, active, active_solo, capacity):
                     self.admission_waiters.remove(record)
                     self.admission_active[record["id"]] = record
                     self.admission_foreground[score] = self.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
@@ -7084,6 +7114,9 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
             "boot_id": lifecycle.get("boot_id"), "priority": lifecycle.get("priority"),
             "admission_wait_s": lifecycle.get("admission_wait_s"),
             "admission_reason": lifecycle.get("admission_reason"),
+            "active_at_enqueue": lifecycle.get("_active_at_enqueue"),
+            "active_packing_at_enqueue": lifecycle.get("_active_packing_at_enqueue"),
+            "reserved_solo_slot": lifecycle.get("_reserved_solo_slot"),
             "rejection_reason": lifecycle.get("rejection_reason"),
             "frontend": lifecycle.get("frontend"),
             "native_phase": lifecycle.get("_native_phase"),

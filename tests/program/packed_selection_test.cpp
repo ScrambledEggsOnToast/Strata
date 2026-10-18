@@ -14,7 +14,9 @@ static PackedSelection select(std::vector<PackedCandidate> waiting, int cap = 0,
 }
 
 static PackedCandidate ordinary(int slot, bool foreground = true) { return PackedCandidate{slot, false, foreground}; }
-static PackedCandidate solo(int slot, bool foreground = true) { return PackedCandidate{slot, true, foreground}; }
+static PackedCandidate solo(int slot, bool foreground = true, uint64_t order = 0) {
+    return PackedCandidate{slot, true, foreground, order};
+}
 
 int main() {
     // Request classification is exact.  A typo refuses rather than choosing a composition.
@@ -90,6 +92,14 @@ int main() {
         CHECK(s.kind == PackedPackKind::solo);
         CHECK(s.seats == 0b1u);
         CHECK(s.solo_streak == kPackedSoloPacksBeforeOrdinary + 1);
+    }
+    {
+        // The earliest admitted solo owner goes first even when a later one reserved a lower slot.
+        const PackedSelection s = select({solo(2, true, 1), solo(0, true, 2)});
+        CHECK(s.seats == 0b100u);
+        CHECK(s.kind == PackedPackKind::solo);
+        const PackedSelection t = select({solo(2, true, 2), solo(0, true, 1)});
+        CHECK(t.seats == 0b001u);
     }
 
     // The existing foreground cap still orders eligible owners: foreground first in candidate

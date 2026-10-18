@@ -14465,6 +14465,7 @@ int main(int argc, char** argv) {
             bool pending = false, prepared = false, first = false;
             // #249: an explicit per-request composition policy.  Solo owners never share a pack.
             bool solo = false;
+            uint64_t admit_sequence = 0;   // earliest waiting solo owner is selected first
             bool checkpoint_due = false;
             const char* terminal_reason = nullptr;
             int64_t draft_accepted = 0, draft_offered = 0;
@@ -14490,6 +14491,7 @@ int main(int argc, char** argv) {
         std::array<PackedOwner, 4> packed_owners;
         // #249: consecutive one-owner packs, so sustained priority traffic cannot starve ordinary prompt work.
         unsigned packed_solo_streak = 0;
+        uint64_t packed_admit_sequence = 0;
         std::atomic<bool> packed_first_ready{false};
         auto packed_done = [&](int slot, const char* reason) {
             if (!packed_prefill || slot < 0 || size_t(slot) >= packed_owners.size()) return false;
@@ -15779,6 +15781,7 @@ int main(int argc, char** argv) {
                     }
                 owner.lease.slot = slot;
                 owner.pending = true;
+                owner.admit_sequence = ++packed_admit_sequence;
                 owner.started = Clock::now();
                 owner.seams[0] = foreground ? 1 : 0;
                 if ((index + 1 < count) != (tab != std::string::npos)) {
@@ -16191,7 +16194,8 @@ int main(int argc, char** argv) {
                 const auto& owner = packed_owners[slot];
                 if (!owner.pending || !owner.prepared) continue;
                 if (bs[slot].p >= owner.lease.endpoint) continue;
-                candidate_set[size_t(candidate_count++)] = {int(slot), owner.solo, bs[slot].foreground};
+                candidate_set[size_t(candidate_count++)] = {int(slot), owner.solo, bs[slot].foreground,
+                                                            owner.admit_sequence};
             }
             const auto packed_choice = strata::prefill::select_packed_seats(
                 std::span<const strata::prefill::PackedCandidate>(candidate_set.data(), size_t(candidate_count)),

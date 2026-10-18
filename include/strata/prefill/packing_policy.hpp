@@ -59,6 +59,7 @@ struct PackedCandidate {
     int slot = 0;          // physical resident slot, 0 .. kPrefillOwners-1
     bool solo = false;
     bool foreground = true;
+    uint64_t order = 0;    // admission sequence; the earliest waiting solo owner goes first
 };
 
 enum class PackedPackKind : uint8_t { none, packed, solo, fairness };
@@ -117,14 +118,16 @@ inline PackedSelection select_packed_seats(std::span<const PackedCandidate> wait
         select_ordinary(PackedPackKind::fairness);
         return choice;
     }
-    // One solo owner per pack, in physical-slot order (the caller passes candidates that way).
+    // One solo owner per pack: the earliest admitted, not simply the lowest physical slot, so a request
+    // that arrived first is not overtaken by a later one that happened to reserve a lower slot.
+    size_t chosen = count;
     for (size_t i = 0; i < count; ++i)
-        if (waiting[i].solo) {
-            choice.seats = uint32_t(1) << waiting[i].slot;
-            choice.kind = PackedPackKind::solo;
-            choice.solo_streak = solo_streak + 1;
-            return choice;
-        }
+        if (waiting[i].solo && (chosen == count || waiting[i].order < waiting[chosen].order)) chosen = i;
+    if (chosen < count) {
+        choice.seats = uint32_t(1) << waiting[chosen].slot;
+        choice.kind = PackedPackKind::solo;
+        choice.solo_streak = solo_streak + 1;
+    }
     return choice;
 }
 

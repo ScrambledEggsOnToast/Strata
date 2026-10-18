@@ -3389,10 +3389,21 @@ instead of the full 2,048-row arena. That cap makes the boundary that carries th
 stream waits for a fraction of a full 1.8-2.7 s pack, not for the whole pack.
 
 The frontend admission selector applies the same intent before the engine: a solo foreground request is
-taken before an eligible foreground one, so it reaches a reserved slot at the next admission boundary. The
+taken before an eligible foreground one, so it reaches a free slot at the next admission boundary. The
 existing `strata_priority` class and its 3:1 foreground/background rule are unchanged, and after four
 consecutive solo foreground admissions one eligible foreground request is taken so ordinary admission
-cannot starve.
+cannot starve. Among waiting solo owners the engine selects the earliest admitted, not simply the lowest
+physical slot.
+
+`STRATA_RESERVE_SOLO_SLOT=1` is an opt-in experiment on that selector: it admits at most `batch - 1`
+non-solo generation requests, so one capacity unit stays available to a foreground solo request. The
+reserve is a capacity predicate, not a dedicated slot, does not lend to ordinary work, and does not
+preempt active prompts; the 3:1 and four-solo fairness rules still decide which waiter gets its turn.
+It is ineffective with packing off, a single slot or a SCORE request, and is off by default. In one
+matched three-wave stress on the fixed three-GPU profile, priority first content fell 16.5 -> 5.0 s and
+ordinary throughput fell 1.9% mixed / 5.3% bulk, but the maximum ordinary completion in a two-priority
+burst rose 12.5 -> 22.9 s. That exceeds the predeclared ordinary-latency guard, so the reservation is
+not enabled in the daily profiles; it stays an explicit operator experiment with the cost disclosed.
 This is all per request in one model allocation: no process-wide toggle between requests and no second model
 copy. `STRATA_PACKED_PREFILL=0`/unset remains the control and rollback. A solo owner still waits for work
 already in flight; this is not GPU preemption, zero interference or a hard first-token deadline. Receipts

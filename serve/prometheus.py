@@ -162,7 +162,8 @@ def strata(m: dict, out: list, lab: str):
                        values.get(first + "_s", 0), labels)
                 metric(f"time_to_{first}_seconds_count", "counter", "Requests with a first observation.",
                        values.get(first + "_count", 0), labels)
-    metric("engine_max_context", "gauge", "The engine's context (engine.max_context).", eng.get("max_context"))
+    metric("reserved_solo_slot", "gauge", "1 when one generation slot is reserved for solo packed requests.",
+           int(bool((m.get("admission") or {}).get("solo_slot_reserved"))))
     metric("totals_prompt_seconds_total", "counter", "Time spent reading prompts (totals.prompt_ms).",
            round((totals.get("prompt_ms") or 0) / 1000, 3))
     metric("totals_decode_seconds_total", "counter", "Time spent generating (totals.decode_ms).",

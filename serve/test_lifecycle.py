@@ -15,6 +15,30 @@ from serve.frontend import ChatTemplate
 from serve.server import AdmissionError, ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve
 
 
+class ReservedSoloSlotTests(unittest.TestCase):
+    def test_reserved_capacity_predicate(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, None)
+        svc.reserve_solo_slot = True
+        svc.engine.info = {"packed_prefill": 1}
+        ordinary = svc.register_lifecycle({}, threading.Event())
+        solo = svc.register_lifecycle({"strata_packing": "solo"}, threading.Event())
+        self.assertFalse(svc._capacity_allows(ordinary, 3, 0, 4),
+                         "three ordinary reservations leave the fourth capacity unit for solo")
+        self.assertTrue(svc._capacity_allows(solo, 3, 0, 4))
+        self.assertTrue(svc._capacity_allows(ordinary, 2, 1, 4))
+        self.assertTrue(svc._capacity_allows(ordinary, 3, 1, 4))
+        self.assertFalse(svc._capacity_allows(ordinary, 4, 1, 4))
+        self.assertFalse(svc._capacity_allows(solo, 4, 1, 4))
+        svc.reserve_solo_slot = False
+        self.assertTrue(svc._capacity_allows(ordinary, 3, 0, 4))
+        svc.reserve_solo_slot = True
+        svc.engine.info = {}
+        self.assertTrue(svc._capacity_allows(ordinary, 3, 0, 4), "reservation is ineffective with packing off")
+        svc.engine.info = {"packed_prefill": 1}
+        self.assertTrue(svc._capacity_allows(ordinary, 0, 0, 1), "a single-slot engine keeps its existing rule")
+
+
 class ResidentEngine(StrataEngine):
     def __init__(self, tok):
         self.reply = MockEngine(tok, "Hello.", max_context=4096)
