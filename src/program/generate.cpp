@@ -9306,6 +9306,16 @@ int main(int argc, char** argv) {
                 return a.first != b.first ? a.first < b.first : a.second < b.second;
             });
         }
+        // A profile ranks the residents a stage would keep if it had room for all of them.  When it has fewer slots
+        // (the two-V100 pair holds ~18.5k of this model's 24,576 pairs), keep the hottest pairs the sizing above admits
+        // and stream the rest: the cache still opens fully populated (the windowed source requires that), and the
+        // report below names both counts instead of failing the whole start.  The 3-GPU profile fits unchanged.
+        if ((int64_t) order.size() > (int64_t) sized.size()) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: the profile ranks %zu pairs, this stage "
+                                 "admits %zu slots; keeping the %zu hottest and streaming the rest\n",
+                         st.dev, order.size(), sized.size(), sized.size());
+            order.resize(sized.size());
+        }
         fill_orders[order_index++] = order;
         for (const auto& pr : order) {
             const int64_t b = native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
