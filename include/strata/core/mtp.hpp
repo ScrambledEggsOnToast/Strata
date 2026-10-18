@@ -223,6 +223,10 @@ public:
     int64_t slot_prompt_len(int slot) const;
     int32_t slot_next_token(int slot) const;
     bool slot_covers(int slot, int64_t cells, int64_t prompt_length = 0) const;
+    // The cell a resume judges the chain at: its own certified extent. A park copies every row its slot
+    // holds but certifies only the cells the chain completed, so a resumed resident prefix can reach
+    // past it. Judging the resume at that prefix refused a real continuation (2026-10-18).
+    int64_t slot_resume_frontier(int slot, int64_t cells) const;
     bool advance_slot(int slot, const float* residual, int32_t next_token,
                       int64_t cell, std::string& err);
     // Drained producer certification; unknown state is never inferred from length.
@@ -246,6 +250,7 @@ private:
     friend class strata::program::ResidentSlots;
     friend struct MtpDrafterCertificationFixture;
     friend struct MtpDraftFrontierFixture;
+    friend struct MtpResumedParkFixture;
     // One host submitter; a failed operation poisons the lease until teardown.
     // A successful operation releases it only after the device stream drains.
     class Operation {

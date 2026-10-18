@@ -1130,14 +1130,24 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         }
     }
     if (draft_.kv_state().max_cells > 0) {
-        if (draft_.slots_[(size_t) slot].certified &&
-            (!working_prompt_ || !draft_.slot_covers(slot, cells, (int64_t) working_prompt_->size()))) {
+        // A park copies every draft row its slot holds but certifies only the cells the chain completed
+        // (MtpDrafter::save_slot), so the resumed resident prefix can legitimately reach past the end of
+        // the certificate. The interval is therefore judged at its own frontier: asking it to reach the
+        // resident prefix refused a real continuation, and "restoring yielded prefix" ended the engine on
+        // 2026-10-18. The certificate stays - prefill_slot only advances a certified slot - and the read
+        // that follows re-opens an interval at this frontier, exactly as a gap below `begin` starts one
+        // (mtp.cpp slot_covers).
+        const auto& chain = draft_.slots_[(size_t) slot];
+        const int64_t frontier = chain.certified ? draft_.slot_resume_frontier(slot, cells) : cells;
+        if (chain.certified &&
+            (!working_prompt_ || !draft_.slot_covers(slot, frontier, (int64_t) working_prompt_->size()))) {
             error = "resident resume: draft interval does not cover this prompt"; return false;
         }
-        if (draft_.slots_[(size_t) slot].certified && cells > draft_.slot_begin(slot)) {
+        if (chain.certified && frontier > draft_.slot_begin(slot)) {
             const auto& ids = slots_[(size_t) slot].ids;
-            const int32_t boundary = cells < (int64_t) ids.size() ? ids[(size_t) cells] : draft_.slot_next_token(slot);
-            if (boundary < 0 || boundary != (*working_prompt_)[(size_t) cells]) {
+            const int32_t boundary = frontier < (int64_t) ids.size() ? ids[(size_t) frontier] :
+                draft_.slot_next_token(slot);
+            if (boundary < 0 || boundary != (*working_prompt_)[(size_t) frontier]) {
                 error = "resident resume: draft boundary token does not match this prompt"; return false;
             }
         }

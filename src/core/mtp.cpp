@@ -1558,6 +1558,12 @@ int32_t MtpDrafter::slot_next_token(int slot) const {
     return slot_state(slot) ? slots_[(size_t) slot].tail_token : -1;
 }
 
+int64_t MtpDrafter::slot_resume_frontier(int slot, int64_t cells) const {
+    if (!slot_state(slot)) return cells;
+    const auto& target = slots_[(size_t) slot];
+    return target.certified && target.completed_cells >= 0 ? std::min(cells, target.completed_cells) : cells;
+}
+
 // Two questions share this predicate. Given a prompt length, the certified interval must reach the
 // oldest cell that prompt's retained window still holds: that is what makes reusing the chain safe.
 // Given only a frontier cell (propose at cells-1, advance at cells), the chain must merely contain
