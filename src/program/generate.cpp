@@ -2768,10 +2768,11 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
-    // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
-    // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
+    // (src/qwen35) upstream, decided here from the file's header before any of this engine's state exists.  That
+    // path parses its own options - ignoring this engine's resource-policy flags - and reuses sessions by token and
+    // image equality alone, so it bypasses both the admission pricing and the conversation scope.  This fork refuses
+    // the family until the port lands; every other file goes on below exactly as before.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
         bool qwen35 = false;
@@ -2781,10 +2782,14 @@ int main(int argc, char** argv) {
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
-        if (qwen35) return strata::qwen35::run(argc, argv);
+        if (qwen35) {
+            std::fprintf(stderr, "strata generate: %s is a qwen35moe family file, whose own engine path is not admitted "
+                                 "by this fork: it bypasses the admission pricing and the conversation scope.  The "
+                                 "family port is a separate change.\n", argv[i + 1]);
+            return 2;
+        }
         break;
     }
-#endif
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -5284,6 +5289,11 @@ int main(int argc, char** argv) {
                 v0.add_unknown(std::string("optional_workspace:") + feature,
                                "additional device copies and host conversion/registry peaks lack qualified pricing");
         }
+        // STRATA_CKPT_POOL keeps up to two complete all-stage checkpoint payloads beyond the priced prompt-cache
+        // rows; a prompt cache of N retains N+2 (plus the capture in progress) while the price allows N+1.
+        if (const char* pool = std::getenv("STRATA_CKPT_POOL"); pool && std::atoi(pool))
+            v0.add_unknown("ckpt_pool_storage",
+                           "two complete all-stage checkpoint payloads are retained beyond the priced prompt-cache rows");
         const bool profile_requested = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_requested;
         const uint64_t profile_bytes = profile_requested ? strata::core::Verifier::planned_profile_bytes(g) : 0;
         const uint64_t causal_host_bytes = causal_requested
@@ -20563,7 +20573,6 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-                if (pr_on) { pr_prev_end = Clock::now(); pr_have_prev = true; }   // for the next read's lead-in
                 return true;
             };
             apply_pending(true);

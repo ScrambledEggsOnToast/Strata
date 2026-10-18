@@ -639,6 +639,7 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
+    bool staged_ = false;                ///< stage_inputs ran for the window a prelaunched run() will serve
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);

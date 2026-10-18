@@ -30,7 +30,17 @@ struct Clock {
     static time_point now() { return time_point(std::chrono::milliseconds(ms)); }
 };
 
-struct ConvCheckpoint { std::vector<int32_t> ids; };
+struct ConvCheckpoint {
+    std::vector<int32_t> ids;
+    // --prefill-pipe: the plan a prompt segment was read in (generate.cpp keeps it on the checkpoint it takes inside
+    // the segment).  The mock never plans, so it only has to exist for the extracted read_part to compile.
+    struct PromptPlan {
+        int64_t chunk = 0, from = -1, to = -1, lend = 0;
+        double pipe = 0.0;
+        bool single = false, chunked = false;
+        bool operator==(const PromptPlan&) const = default;
+    } plan;
+};
 namespace strata::program {
 struct ResidentAdmission {
     int32_t next_token = 0;
@@ -125,6 +135,14 @@ struct Prefill {
     std::vector<int64_t>* checkpoint_next = nullptr;
     int64_t* next_checkpoint = nullptr;
     int64_t chunk() const { return 2048; }
+    // --prefill-pipe stays off in this harness: the extracted read_part takes the unplanned path, which is what the
+    // BYIELD and retained-read assertions are about.
+    static double pipe_setting() { return 0.0; }
+    static int64_t pipe_key(double) { return -1; }
+    static void log_plan(int64_t, int64_t, int) {}
+    int64_t plan_chunk(int64_t) const { return 0; }
+    void force_chunk(int64_t, bool, bool) {}
+    int stage_count() const { return 1; }
     bool run(const int64_t* data, int64_t count, int64_t pos, std::string& e) {
         if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
         result.reads.emplace_back(pos, count);
@@ -454,6 +472,12 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     };
 
     // CMake extracts this verbatim from generate.cpp and regenerates it whenever that source changes.
+    // Ambient names the extracted region reads from read_prompt's enclosing scope in generate.cpp (--prefill-pipe's
+    // resume plan and the last lend's chunk).  This harness plans and resumes nothing, so they stay empty and the
+    // extracted code takes the unplanned path the assertions below are about.
+    ConvCheckpoint::PromptPlan resume_plan, seg_plan;
+    int64_t resume_plan_at = -1, resume_plan_end = -1;
+    int64_t seg_lend = 0;
 #include "prefill_read_part.inc"
 
     std::string& e = err;

@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
     check(b.owned_device == owned((uint64_t) c.chunk * 4), "raw token allocation uses 2 MiB granules");
 
     // ---- each streaming ring slot is one aligned expert-blob slot (the ring contract admission lends by).
-    c.ring = 16;
+    c.ring = 40;   // above the STAGE_GRP (32) floor: below it the ring is floored, not grown
     check(estimate(other), "expanded ring sizing");
     check(other.loanable_device - b.loanable_device == 8 * allocation(experts.max_blob),
           "each ring slot includes its own guard/alignment");
@@ -164,7 +164,8 @@ int main(int argc, char** argv) {
     c.ring = 8;
     const uint64_t ring_base = prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, 0, 1, 0, true);
     const uint64_t ring_one = prefill::Prefill::bytes_needed_from(g, c.facts(), c.chunk, 8, 1, 0, true);
-    check(ring_one - ring_base == owned(allocation(8)), "eight tiny owned ring slots consume one granule, not eight");
+    check(ring_one - ring_base == owned(allocation(32)),
+          "the floored ring's tiny owned slots consume one granule, not one each");
 
     // ---- a loan sized for the largest chunk covers every smaller relayout of the same configuration.
     c.chunk = 8192;

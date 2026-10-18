@@ -1296,6 +1296,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
+    // STRATA_BATCH_SELF_COMMIT skips the commit graphs, so the window itself must advance every slot's recurrence;
+    // the grouped GDN launch (STRATA_BATCH_GDN_GROUPS=1) writes outputs only, so the pair would leave the recurrence
+    // behind while the convolution advanced.  Both are opt-in and neither is in a daily profile: refuse the pair.
+    if (g_batch_self_commit) {
+        const char* groups = std::getenv("STRATA_BATCH_GDN_GROUPS");
+        if (groups != nullptr && std::atoi(groups) != 0) {
+            err = "verify: STRATA_BATCH_SELF_COMMIT with STRATA_BATCH_GDN_GROUPS is unavailable: the grouped GDN "
+                  "launch does not advance the recurrence that the skipped commit graphs would";
+            return false;
+        }
+    }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
@@ -1472,7 +1483,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
-    (void) TS;
     // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
     // streams get the device's highest priority (HIP: the default priority, as the drafter's)
     auto make_stream = [](cudaStream_t* s) -> cudaError_t {
@@ -2914,12 +2924,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
             handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
                             hflag_out_d_, cs, g_test_drop > 0 ? hdrop_d_ : nullptr);   // the test word only with the hook on
+            record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);   // (the serial branch records below)
+            if (causal_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs);
             return true;
         }
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
         copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
         record_canaries(T, batch_rec_ ? brow_ : nullptr, false, false, cs);
+        if (keep_rows) record_canaries(T, brow_, false, true, cs);   // SELF_COMMIT: no later stage records these
         if (causal_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs);
         return true;
     }
@@ -3401,6 +3414,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    staged_ = true;
 }
 
 void Verifier::collect_profile() {
@@ -5416,6 +5430,7 @@ bool Verifier::capture_all(std::string& err) {
 void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]) {
     using namespace strata::kernels;
     stage_inputs(T, tokens, pos0);
+    staged_ = false;   // a later run() stages its own window
     SessionState& ss = *ss_;
     fl_ple_ = ss.ple.ready() && ple_stage();
     if (fl_ple_) {
