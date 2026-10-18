@@ -137,6 +137,8 @@ inline std::span<const std::string_view> arithmetic_environment_excluded_names()
         "STRATA_STORE_TIMING",
         // Certificate export changes storage metadata, not arithmetic; resolved session state stays bound.
         "STRATA_STORE_MAN2",
+        // Same argument: which lane fills which stage is scheduling, not arithmetic or residency policy.
+        "STRATA_FILL_LANES",
         "STRATA_PREFILL_RING",
         "STRATA_PREFILL_ATTRIBUTION",
         "STRATA_PREFILL_TIMING",

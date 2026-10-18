@@ -1829,6 +1829,17 @@ void mem_mark(const char* where) {
     }
 }
 
+/// `STRATA_FILL_LANES=0` fills the stages one after another instead of concurrently. It is the A/B control for
+/// the fill's concurrency, not a shipping mode: the engines that keep one source lane per stage are the ones that
+/// may fill them in parallel (`WindowedExpertSource::blob` recycles a ring another caller must not be using).
+bool fill_lanes_concurrent() {
+    static const bool concurrent = [] {
+        const char* e = std::getenv("STRATA_FILL_LANES");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return concurrent;
+}
+
 /// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
 bool adapt_nowait() {
     static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_NOWAIT"); return e && e[0] == '1'; }();
@@ -8292,21 +8303,73 @@ int main(int argc, char** argv) {
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
+    }
+
+    // ---- phase 2: fill every stage's residency plan.  Each stage reads through its own source lane where the
+    // engine keeps one (`--windowed-experts` registers a lane per stage), so those fills run concurrently.  The
+    // lanes are the concurrency, not threads inside a lane: `WindowedExpertSource::blob` recycles its ring at a
+    // layer boundary, so a pointer it returned may not survive another caller's fetch.  A mode that shares one
+    // source fills its stages one at a time for the same reason.
+    struct FillOutcome {
         int64_t filled = 0;
+        bool ok = false;
+        std::string err;
+    };
+    std::vector<FillOutcome> outcomes(stages.size());
+    const bool independent_lanes = o.windowed_experts && stage_sources.size() == stages.size();
+    auto fill_stage = [&](size_t index) {
+        GpuStage& st = *stages[index];
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        strata::core::ExpertSource* lane = independent_lanes ? stage_sources[index].get() : srcp;
+        const strata::core::OnDevice on(st.dev);
+        FillOutcome& out = outcomes[index];
         for (const auto& pr : st.profile) {
-            if (filled >= st.cache.slots()) break;
+            if (out.filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
+            const uint8_t* b = lane->blob_stable(pr.first, pr.second);
+            if (b == nullptr) {
+                out.err = "the expert source returned no blob";
+                return;
             }
-            ++filled;
+            if (!st.cache.fill_slot_blocking(slot, b, out.err, (int64_t) lay.blob_bytes(pr.first))) return;
+            ++out.filled;
         }
+        out.ok = true;
+    };
+    if (independent_lanes && stages.size() > 1 && fill_lanes_concurrent()) {
+        std::vector<std::thread> workers;
+        workers.reserve(stages.size());
+        for (size_t i = 0; i < stages.size(); ++i) {
+            workers.emplace_back([&fill_stage, i] {
+                strata::aux_cpus::pin_current_thread();
+                fill_stage(i);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    } else {
+        for (size_t i = 0; i < stages.size(); ++i) {
+            strata::aux_cpus::pin_current_thread();
+            fill_stage(i);
+        }
+    }
+    for (size_t i = 0; i < stages.size(); ++i) {
+        if (outcomes[i].ok) continue;
+        std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed after %lld pairs: %s\n",
+                     stages[i]->dev, (long long) outcomes[i].filled, outcomes[i].err.c_str());
+        return 1;
+    }
+
+    // ---- phase 3: prove what landed, and report it.  `verify_slot` reads the slot back and compares it byte for
+    // byte -- the one check that says the cache holds the expert it claims, which a residency table alone cannot.
+    for (size_t i = 0; i < stages.size(); ++i) {
+        GpuStage& st = *stages[i];
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const int64_t filled = outcomes[i].filled;
+        strata::core::ExpertSource* lane = independent_lanes ? stage_sources[i].get() : srcp;
+        const strata::core::OnDevice on(st.dev);
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
+                                                 lane->blob_stable(st.profile[0].first, st.profile[0].second), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
