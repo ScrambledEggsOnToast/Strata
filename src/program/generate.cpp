@@ -15855,8 +15855,13 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 if (!packed_collect()) return false; // certified frontiers are public before reselection
-                for (auto& owner : packed_owners)
+                for (auto& owner : packed_owners) {
+                    if (!owner.shared_boundary_request) continue;
+                    // A preceding owner's synchronous capture may have queued
+                    // this owner's cancellation. Consume it before borrowing.
+                    if (!packed_collect()) return false;
                     if (owner.shared_boundary_request && !packed_publish_shared(owner)) return false;
+                }
                 if (batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
                     time_budget.decode_due(std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count(), 2048))
                     if (!decode_round(true)) return false;
