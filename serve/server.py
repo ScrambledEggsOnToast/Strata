@@ -826,15 +826,17 @@ class ConvCacheLog:
 
 
 def conversation_slots(engine) -> int | None:
-    """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
-    before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
-    args = engine.spawn[1] if hasattr(engine, "spawn") else []
-    if "--conversation-cache-slots" in args[:-1]:
+    """How many conversations the engine's cache holds: its optional spawn arguments (known before a lazy start's
+    first INFO line), else its reported INFO. Engines without either source leave the encoder's default alone."""
+    spawn = getattr(engine, "spawn", None)
+    args = spawn[1] if isinstance(spawn, (tuple, list)) and len(spawn) > 1 else ()
+    if isinstance(args, (tuple, list)) and "--conversation-cache-slots" in args[:-1]:
         try:
             return int(args[args.index("--conversation-cache-slots") + 1])
         except ValueError:
             pass
-    slots = (getattr(engine, "info", None) or {}).get("conversation_cache_slots")
+    info = getattr(engine, "info", None)
+    slots = info.get("conversation_cache_slots") if isinstance(info, dict) else None
     return slots if isinstance(slots, int) else None
 
 
@@ -1957,7 +1959,8 @@ class StrataEngine:
                     stopped = True
                 if on_quiet is not None and not stopped:
                     on_quiet()
-                if time.monotonic() - beat >= 10.0:
+                # Let a cancelled consumer close and synchronously drain now, not after the next HTTP heartbeat.
+                if cancel.is_set() or time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
                 continue
@@ -7618,9 +7621,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         try:
-            # `req`: the same request this continuation belongs to, so a queued request's frozen steering is
-            # rechecked here too (and any prepared result this round cannot reuse is retired, not held).
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, req=req, cancel=cancel)
+            # `sampling` is the resolved request this continuation belongs to: recheck its frozen steering too,
+            # and retire any prepared result this round cannot reuse rather than holding it.
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, req=sampling, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break

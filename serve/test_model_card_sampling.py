@@ -101,7 +101,9 @@ class ModelCardSampling(unittest.TestCase):
 
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
-        self.assertEqual(self.keys(), "")
+        # Scope and deadline authorize and bound cache reuse; neither is a sampling default.
+        self.assertEqual([k for k in self.keys().split()
+                          if not k.startswith(("scope=", "cache_deadline_ns="))], [])
 
 
 if __name__ == "__main__":

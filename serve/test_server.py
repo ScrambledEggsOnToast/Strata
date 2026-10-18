@@ -497,9 +497,10 @@ class VisionTempFiles(unittest.TestCase):
         return sorted(p.name for p in Path(d).glob("req-*.sve"))
 
     def test_a_refused_request_writes_none(self):
-        from serve.server import EngineStarting
+        from serve.server import EngineStarting, write_temporary
         tok = ByteTokenizer()
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("serve.server.write_temporary", wraps=write_temporary) as write:
             engine = MockEngine(tok, "ok", max_context=0)
             svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
                           vision=ImageMarkers.FakeVision(d))
@@ -512,10 +513,17 @@ class VisionTempFiles(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exceeds the context"):
                 svc.prepare(self.MSGS, None, {}, CTX)
             self.assertEqual(self.leftovers(d), [])
+            write.assert_not_called()
+            self.assertIsNone(svc.embeddings.path)
+            self.addCleanup(svc.drop_embeddings)
             svc.prepare(self.MSGS, None, {}, 16)                     # one that fits has it
-            self.assertEqual(len(self.leftovers(d)), 1)
+            path = svc.embeddings.path                              # Linux may place it in /dev/shm, not d
+            self.assertEqual(write.call_count, 1)
+            self.assertEqual(path.read_bytes(), svc.vision.rows.read_bytes())
             svc.drop_embeddings()                                    # ... until the request is done
             self.assertEqual(self.leftovers(d), [])
+            self.assertFalse(path.exists())
+            self.assertIsNone(svc.embeddings.path)
 
     def test_over_http(self):
         import serve.server as server
@@ -2803,6 +2811,16 @@ class IncrementalPrompts(unittest.TestCase):
                          .prompts.keep, 3)
         self.assertEqual(self.lazy_service(["--conversation-cache-slots"]).prompts.keep, 4)
         self.assertEqual(self.lazy_service([]).prompts.keep, 4)
+
+    def test_optional_spawn_metadata_without_arguments_uses_info_or_the_default(self):
+        for spawn in (None, (), ("strata",), mock.Mock(), ("strata", None)):
+            with self.subTest(spawn=spawn):
+                engine = RecordingPrompt(self.svc.tok, "The answer.", max_context=CTX)
+                engine.spawn = spawn
+                engine.info = {"conversation_cache_slots": 3}
+                self.assertEqual(Service(engine, self.svc.tok, self.svc.template).prompts.keep, 3)
+                engine.info = None
+                self.assertEqual(Service(engine, self.svc.tok, self.svc.template).prompts.keep, 4)
 
     def test_without_a_slot_setting_four_prompts_are_kept(self):
         svc = self.service()

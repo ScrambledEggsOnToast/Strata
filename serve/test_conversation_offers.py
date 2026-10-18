@@ -1040,12 +1040,27 @@ class FrontierArithmetic(ChannelTestCase):
         first = self.start_request("first")
         second = self.start_request("second")
         self.assertTrue(self.engine.entered.wait(5), "the two engine slots were never both busy")
-        third = self.start_request("third")
-        fourth = self.start_request("fourth")
-        self.wait_queued(2)
-        self.assertIsNotNone(self.peer.next_offer(5), "the frontier's own two candidates were not both prepared")
-        self.assertIsNotNone(self.peer.next_offer(5))
-        self.assertEqual(len(self.peer.offers), 2, "the second full-context reservation was refused")
+        prepared = threading.Event()
+        offer_ids = []
+        offer_prepared = self.svc.offer_prepared
+        def note_prepared(record, link, frozen, req):
+            offer_prepared(record, link, frozen, req)
+            offer_ids.append(frozen.offer_id)
+            if len(offer_ids) == self.frontier:
+                prepared.set()
+        with mock.patch.object(self.svc, "offer_prepared", side_effect=note_prepared):
+            third = self.start_request("third")
+            fourth = self.start_request("fourth")
+            self.wait_queued(2)
+            self.assertTrue(prepared.wait(5), "the frontier's own two candidates were not both prepared")
+        pending = set(offer_ids)
+        self.assertEqual(len(pending), 2, "the second full-context reservation was refused")
+        # An initial admission can offer and consume its prompt before both engine slots fill. Its old wire offer
+        # is not one of these two still-prepared frontier requests; wait for these exact completed preparations.
+        while pending:
+            offered = self.peer.next_offer(5)
+            self.assertIsNotNone(offered, "a prepared frontier request was not offered")
+            pending.discard(offered["request_id"])
         stats = self.svc.offer_stats()
         self.assertEqual(stats["preparation_refused"], 0)
         self.assertEqual(stats["prepared_requests"], 2)

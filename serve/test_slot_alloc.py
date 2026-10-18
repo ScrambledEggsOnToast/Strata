@@ -94,9 +94,9 @@ class OneSlotGroups(unittest.TestCase):
         e.slot_held = [hist_a + [T, 7, 8] + [50, 51], hist_b + [T, 7, 8] + [60]]
         e.slot_used = [10.0, 20.0]
         again = lambda h: h + [T, 5, 6] + list(range(3000, 3050))
-        self.assertEqual(e.pick_slot(again(hist_b)), 1)
-        self.assertEqual(e.pick_slot(again(hist_a)), 0)
-        self.assertEqual(e.pick_slot(list(range(5000, 5100))), 0)      # a new chat: the least recently used one
+        self.assertEqual(e.pick_slot(again(hist_b), "conversation"), 1)
+        self.assertEqual(e.pick_slot(again(hist_a), "conversation"), 0)
+        self.assertEqual(e.pick_slot(list(range(5000, 5100)), "conversation"), 0)  # a new chat: least recently used
 
     def test_groups_of_several_slots_still_ignore_held_tokens(self):
         T = StrataEngine.TURN_ID
@@ -104,7 +104,7 @@ class OneSlotGroups(unittest.TestCase):
         self.assertEqual(e.slot_gs, 2)
         hist = list(range(1000, 1700))
         e.slot_held[3] = hist + [T, 7, 8] + [50]
-        self.assertEqual(e.pick_slot(hist + [T, 5, 6] + list(range(3000, 3050))), 0)
+        self.assertEqual(e.pick_slot(hist + [T, 5, 6] + list(range(3000, 3050)), "conversation"), 0)
 
 
 if __name__ == "__main__":

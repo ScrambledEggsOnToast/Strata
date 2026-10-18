@@ -43,9 +43,11 @@ class ScriptedEngine(MockEngine):
     def __init__(self, tok, scripts, max_context=CTX, delay_s=0.0):
         super().__init__(tok, list(scripts), max_context=max_context, delay_s=delay_s)
         self.prompts = []
+        self.samplings = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
+        self.samplings.append(dict(sampling or {}))
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
     def prompt_text(self, i):
@@ -291,6 +293,11 @@ class ToolLoop(unittest.TestCase):
         self.assertFalse([c for c in cs if c["choices"][0]["delta"].get("tool_calls")])   # nothing for the client to run
         self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(len(self.engine.prompts), 2)
+        scope = self.engine.samplings[0]["_strata_cache_scope"]
+        self.assertRegex(scope, r"^[0-9a-f]{64}$")
+        self.assertEqual([s["_strata_cache_scope"] for s in self.engine.samplings], [scope, scope])
+        self.assertEqual(self.engine.samplings[0]["_strata_cache_deadline_ns"],
+                         self.engine.samplings[1]["_strata_cache_deadline_ns"])
         first, second = self.engine.prompt_text(0), self.engine.prompt_text(1)
         self.assertIn('"name": "fake__echo"', first)                 # the MCP tools are in the prompt
         self.assertNotIn("broken__", first)                          # the server that failed is left out
