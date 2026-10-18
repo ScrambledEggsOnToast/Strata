@@ -17210,7 +17210,7 @@ int main(int argc, char** argv) {
                                              "eligible=%d catalog=%llu\n",
                                      int(shared), store_prompt.size(),
                                      (unsigned long long) matches, (long long) best_tokens,
-                                     unsigned best_stages, stages.size() + 1, int(seen),
+                                     (unsigned) best_stages, stages.size() + 1, int(seen),
                                      (unsigned long long) frontier.catalog_version);
                     if (observe_shared && frontier.observed_ns) {
                         phase_current->shared_lookup_ns = frontier.observed_ns;
