@@ -121,6 +121,7 @@ int main() {
             "STRATA_CONVERSATION_OFFER_FD", "STRATA_PREFIX_BACKING", "STRATA_IMMUTABLE_CHECKPOINTS",
             "STRATA_SNAPSHOT_DIRECT_CUT", "STRATA_MEMORY_LIMIT_MIB", "STRATA_PREFILL_RING",
             "STRATA_STATE_HASH", "STRATA_DUMP_FIRST_LOGITS", "STRATA_BATCH_TRACE",
+            "STRATA_STORE_MAN2",
         };
         for (const char* name : excluded) check_excluded(name);
     }

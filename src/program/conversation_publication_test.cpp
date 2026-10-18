@@ -997,7 +997,8 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
 // Storage/authority policy only: these are explicit small store fixtures, not
 // claimed CUDA writes or a substitute for the real GEN-to-resident regression.
 void check_ram_certification_is_independent_of_disk_export() {
-    for (bool split : {false, true}) for (bool export_certification : {false, true}) {
+    for (bool split : {false, true}) for (bool export_certification : {false, true})
+    for (bool partial : {false, true}) {
         TempRoot root;
         const auto options = options_for(root.path);
         ConversationStore store(options);
@@ -1008,8 +1009,14 @@ void check_ram_certification_is_independent_of_disk_export() {
         auto& draft_owner = split ? record.stage_images.back() : record;
         draft_owner.kv.push_back(draft_owner.kv.back());
         draft_owner.draft_begin = 0;
-        draft_owner.draft_cells = 64;
-        draft_owner.draft_next_token = 731;
+        draft_owner.draft_cells = partial ? 63 : 64;
+        draft_owner.draft_next_token = partial ? -1 : 731;
+        if (partial) {
+            record.geometry[0] = 8;
+            record.geometry[14] = 2;
+            for (auto& stage : record.stage_images) stage.geometry = record.geometry;
+            draft_owner.draft_boundary_residual.resize(64, 0x5a);
+        }
         check(capture_image(publications, sink, 0, 1, 0, true, record, store.epoch()),
               "private RAM certification enters the real protected publication queue");
         settle(publications, store, sink);
@@ -1019,11 +1026,17 @@ void check_ram_certification_is_independent_of_disk_export() {
             bool retained = false;
             const auto ram = sink.cache.take(0, retained);
             const auto& owner = split ? ram.stage_images.back() : ram;
-            check(owner.draft_begin == 0 && owner.draft_cells == 64 && owner.draft_next_token == 731,
+            check(owner.draft_begin == 0 && owner.draft_cells == (partial ? 63 : 64) &&
+                  owner.draft_next_token == (partial ? -1 : 731),
                   "disk export policy never strips the RAM image's completed interval or boundary token");
+            std::string why;
+            check(images_equal(ram, record, why),
+                  "both export policies preserve the RAM boundary row, checkpoints, pins and stage metadata");
         }
-        check(draft_owner.draft_begin == 0 && draft_owner.draft_cells == 64 &&
-              draft_owner.draft_next_token == 731, "publication leaves the captured source certification intact");
+        check(draft_owner.draft_begin == 0 && draft_owner.draft_cells == (partial ? 63 : 64) &&
+              draft_owner.draft_next_token == (partial ? -1 : 731) &&
+              draft_owner.draft_boundary_residual.size() == (partial ? 64 : 0),
+              "publication leaves the captured source interval and boundary intact");
         struct stat issuer {};
         check(::stat((root.path + "/issuer.key").c_str(), &issuer) == 0 &&
               issuer.st_size == (export_certification ? 64 : 32),
@@ -1065,9 +1078,13 @@ void check_ram_certification_is_independent_of_disk_export() {
                   "an MTP engine declines MAN1 disk candidates and accepts certified MAN2");
             const auto& owner = split ? read.image->stage_images.back() : *read.image;
             check(owner.draft_begin == (export_certification ? 0 : -1) &&
-                  owner.draft_cells == (export_certification ? 64 : -1) &&
-                  owner.draft_next_token == (export_certification ? 731 : -1),
+                  owner.draft_cells == (export_certification ? partial ? 63 : 64 : -1) &&
+                  owner.draft_next_token == (export_certification && !partial ? 731 : -1),
                   "ON restores the exported certificate; OFF disk restore remains explicitly unknown");
+            check(export_certification
+                      ? owner.draft_boundary_residual == draft_owner.draft_boundary_residual
+                      : owner.draft_boundary_residual.empty(),
+                  "certified disk export keeps the actual private N-1 boundary; the legacy alias omits it");
         }
         read.image.reset();
         reopened.release_read(1201, 1);

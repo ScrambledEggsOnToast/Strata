@@ -1766,14 +1766,24 @@ excluded cell is the first private suffix token: a shared image never persists i
 own token and completes exactly one K/V-only cell before advertising `N`. Ordinary private RAM captures retain
 their producer's drained interval even with packed prefill disabled: dropping it on restore would certify only the
 new suffix and refuse the legacy first-token-to-batch handoff. No interval is inferred from the payload's length.
-Disk export remains separately gated by packed prefill: feature-off publication offers a shallow legacy view with
-unknown draft coverage (`STCSMAN1`), without changing the certified RAM/retry image or activating the reader floor.
-Unknown coverage still refuses direct resident source reuse rather than treating a cold retry as reuse.
+Set `STRATA_STORE_MAN2=1` to export that certification independently of packed prefill; unset or exactly `0`
+keeps legacy disk export unless packed prefill is enabled, which still activates certified export. Every other
+value (including empty) refuses startup. This cache-format control does not change arithmetic execution identity;
+the existing scope and resolved state/layout bindings still apply. Certified export also captures the owned
+shared-cut or one-cell-short private boundary row, with its host allocation admitted separately from packing.
+With both activations off, publication offers a shallow legacy view with unknown draft coverage (`STCSMAN1`),
+without changing the certified RAM/retry image or activating the reader floor. Unknown coverage still refuses
+direct resident source reuse rather than treating a cold retry as reuse. Enabling export never invents coverage
+for an unknown producer or removes retained checkpoints, pin flags or stage metadata.
 MTP engines decline legacy `STCSMAN1` disk candidates before mounting any GPU state, falling back to the request's
 existing RAM prefix or cold prefill. The engine logs the cause once:
 `strata serve: conversation store: legacy MAN1 image declined for MTP engine: draft coverage not certified`.
 This refusal does not repair or delete the stored image. Non-MTP engines still restore `STCSMAN1`; certified
 `STCSMAN2` and RAM-parked restore keep their existing validation and coverage contracts.
+
+Before rebinding the ordinary working drafter to the next request, parking preserves the outgoing producer's
+completed interval **and** any immutable boundary row together. A normal private capture therefore keeps its
+actual certificate even across that bind-to-park seam; only the offered legacy disk alias strips it.
 
 The shutdown drain budget is 8 s by default and can be raised with `STRATA_STORE_DRAIN_MS` (clamped to 1-120 s) when a run publishes many large histories; the frontend's independent QUIT escalation is unchanged.
 

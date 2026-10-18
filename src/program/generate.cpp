@@ -2918,6 +2918,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: persistent conversation caching stays off: %s\n",
                      persistence_disabled_reason.c_str());
     const bool packed_prefill = strata::prefill::packed_prefill_enabled();
+    const char* man2_setting = std::getenv("STRATA_STORE_MAN2");
+    if (man2_setting && std::strcmp(man2_setting, "0") != 0 && std::strcmp(man2_setting, "1") != 0) {
+        std::fprintf(stderr, "strata serve: STRATA_STORE_MAN2 must be unset, 0 or exactly 1\n");
+        return 2;
+    }
+    const bool store_man2 = packed_prefill || (man2_setting && std::strcmp(man2_setting, "1") == 0);
     const char* packed_cap_setting = std::getenv("STRATA_PACKED_PREFILL_FOREGROUND_CAP");
     const char* packed_slice_setting = std::getenv("STRATA_PACKED_PREFILL_DECODER_SLICE");
     if (packed_cap_setting && (packed_cap_setting[0] < '0' || packed_cap_setting[0] > '4' ||
@@ -5209,10 +5215,10 @@ int main(int argc, char** argv) {
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
             "prefill and MTP independent owner staging/readback");
-        if (packed_prefill)
+        if (store_man2 && !o.mtp.empty())
             ram("draft_boundary_capture_host",
                 strata::core::ConversationBuffer(true).allocation_peak(size_t(g.hc * g.n_embd) * sizeof(float)),
-                "one opt-in packed/shared immutable source row; no device arena or default row allocation");
+                "one opt-in certified immutable source row; no device arena or default row allocation");
         if (packed_prefill) {
             ram("packed_shared_boundary_capture_host", byte_mul(4, byte_add(
                 strata::core::ConversationBuffer(true).allocation_peak(size_t(g.hc * g.n_embd) * sizeof(float)),
@@ -11123,9 +11129,9 @@ int main(int argc, char** argv) {
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         strata::core::ConversationScope live_scope;
-        // Only spans the next request's bind-to-park seam; never survives a restore or write.
-        std::optional<strata::core::ConversationDraftCoverage> displaced_draft;
-        uint64_t displaced_draft_owner = 0;
+        // Only certification fields cross the next request's bind-to-park seam.
+        // The drafter still owns any immutable boundary row until parking finishes.
+        std::optional<strata::core::ConversationView> displaced_draft;
         // ---- the persistent conversation store (private, CPU-only) -------------
         // One coordinator owns the cache root, its catalog, its quota and its storage threads; it is the sole disk
         // authority and never touches GPU state.  It extends the sources above instead of competing with them: the
@@ -11577,7 +11583,7 @@ int main(int argc, char** argv) {
         // only the writer's next image moves into a separately charged lease.
         strata::program::ConversationPublicationSink publication_sink;
         publication_sink.publication_headroom_bytes = store_publication_headroom;
-        publication_sink.export_draft_certification = packed_prefill;
+        publication_sink.export_draft_certification = store_man2;
         publication_sink.report = [](const char* line) { std::fputs(line, stderr); };
         publication_sink.release_lease = [&](size_t lease_bytes) { conversations.release_lease(lease_bytes); };
         publication_sink.refresh_allowance = [&] { store_allowance(); };
@@ -12366,14 +12372,18 @@ int main(int argc, char** argv) {
                             ? retained.draft_next_token : -1;
                     }
                 } else if (!source.shared_prefix && displaced_draft) {
-                    if (displaced_draft->known()) {
-                        v.draft_begin = displaced_draft->begin; v.draft_tokens = displaced_draft->cells;
-                        v.draft_next_token = displaced_draft->next_token; v.draft_owner = displaced_draft_owner;
+                    if (displaced_draft->draft_begin >= 0 &&
+                        displaced_draft->draft_tokens >= displaced_draft->draft_begin) {
+                        v.draft_begin = displaced_draft->draft_begin; v.draft_tokens = displaced_draft->draft_tokens;
+                        v.draft_next_token = displaced_draft->draft_next_token; v.draft_owner = displaced_draft->draft_owner;
+                        v.draft_boundary_residual = displaced_draft->draft_boundary_residual;
+                        v.draft_boundary_position = displaced_draft->draft_boundary_position;
+                        v.draft_boundary_owner = displaced_draft->draft_boundary_owner;
                     }
                 } else mtp.certify_view(v);
-                if (!packed_prefill && source.shared_prefix) {
-                    // Legacy feature-off shared cuts retain only their observed
-                    // sanitizing extent, not new persisted certification/payloads.
+                if (!store_man2 && source.shared_prefix) {
+                    // Legacy shared cuts retain their observed sanitizing extent;
+                    // certified export also retains the owned boundary row.
                     v.draft_owner = 0; v.draft_boundary_residual = nullptr;
                     v.draft_boundary_position = -1; v.draft_boundary_owner = 0;
                 }
@@ -17034,12 +17044,10 @@ int main(int argc, char** argv) {
             input.sampling.penalty_freq = req_penalty_freq;
             input.sampling.penalty_present = req_penalty_present;
             // begin() rebinds the working drafter before the outgoing live image is parked.
-            // Certify its unchanged completed interval while its producer still owns it.
+            // Preserve its producer's drained interval and owned boundary row together.
             strata::core::ConversationView outgoing_draft{live, live_imgs, checks, cvec_cached};
             mtp.certify_view(outgoing_draft);
-            displaced_draft = strata::core::ConversationDraftCoverage{
-                outgoing_draft.draft_begin, outgoing_draft.draft_tokens, outgoing_draft.draft_next_token};
-            displaced_draft_owner = outgoing_draft.draft_owner;
+            displaced_draft.emplace(outgoing_draft);
             if (!resident.begin(admit_slot, ids, input, err)) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
             }
@@ -17494,12 +17502,10 @@ int main(int argc, char** argv) {
                               // own, and it never supersedes the head that donor came from.
                               req_ckpt != 0)) {
                 displaced_draft.reset();
-                displaced_draft_owner = 0;
                 phase_error("ERR %s\n", err.c_str());
                 return 1;
             }
             displaced_draft.reset();
-            displaced_draft_owner = 0;
             // QUIT has no later request to park the last completed conversation, so the clean-shutdown seam parks it
             // itself.  Only the decision the next request would have taken is recorded: this request's own keys say
             // whether its history is continued at all (ckpt=0 is a one-shot that must neither be parked nor supersede
@@ -17790,7 +17796,7 @@ int main(int argc, char** argv) {
             // skip prefix rows based on this request's longer private suffix.
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && read_from < req_pin ? req_pin + 1 : n);
-            if (use_mtp) mtp.set_boundary_capture(packed_prefill && req_shared_scope.valid() && read_from < req_pin
+            if (use_mtp) mtp.set_boundary_capture(store_man2 && req_shared_scope.valid() && read_from < req_pin
                                                    ? req_pin - 1 : -1);
             conversations.limit_reuse(read_from);
             pp_total = n;
@@ -19867,7 +19873,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
-            if (packed_prefill && use_mtp && live_ok && !cancelled && last_committed_residual) {
+            if (store_man2 && use_mtp && live_ok && !cancelled && last_committed_residual) {
                 strata::core::ConversationView tail{live, live_imgs, checks, cvec_cached};
                 mtp.certify_view(tail);
                 if (tail.draft_tokens == int64_t(live.size()) - 1 &&

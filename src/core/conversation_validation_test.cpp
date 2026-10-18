@@ -822,9 +822,8 @@ void resident_transfer_envelopes() {
 #if defined(CONVERSATION_TEST_TRANSFERS)
 namespace shared_draft_fixture {
 int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
-                      int64_t req_pin = 8192, int64_t n = 65536) {
+                      int64_t req_pin = 8192, int64_t n = 65536, bool store_man2 = true) {
     const bool use_mtp = true;
-    const bool packed_prefill = true;
     const ConversationScope req_shared_scope = shared ? ConversationScope{{1}} : ConversationScope{};
 #include "shared_draft_horizon.inc"
     return read_from;
@@ -856,9 +855,13 @@ void diagnostic_shared_draft(bool batched, bool per_group_sync, int64_t window) 
           "private resume past the shared pin keeps the ordinary horizon");
     check(draft_horizon(mtp, true, pin, -1) == pin && mtp.prompt_len_ == prompt,
           "a resume exactly at the pin does not recompute or capture that cut");
+    check(draft_horizon(mtp, true, resume, resume, pin, prompt, false) == 0 &&
+          mtp.prompt_len_ == pin + 1 && mtp.boundary_position == -1,
+          "legacy export keeps the shared horizon without allocating a boundary row");
     const int64_t read_from = draft_horizon(mtp, true, resume, resume);
     const int64_t required_begin = std::max<int64_t>(0, pin + 1 - window - 64);
-    check(read_from == 0, "a diagnostic reread starts at zero despite selecting a deeper private checkpoint");
+    check(read_from == 0 && mtp.boundary_position == pin - 1,
+          "certified export captures the reread shared boundary independently of packed scheduling");
 
     strata::prefill::Prefill sp;
     sp.accept_batched = batched;

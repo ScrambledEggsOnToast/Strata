@@ -135,6 +135,8 @@ inline std::span<const std::string_view> arithmetic_environment_excluded_names()
         // Store diagnostics: receipts and timing only.  Binding them made a run's own observability
         // change its execution domain, so a store written with timing off could never be read with it on.
         "STRATA_STORE_TIMING",
+        // Certificate export changes storage metadata, not arithmetic; resolved session state stays bound.
+        "STRATA_STORE_MAN2",
         "STRATA_PREFILL_RING",
         "STRATA_PREFILL_ATTRIBUTION",
         "STRATA_PREFILL_TIMING",
