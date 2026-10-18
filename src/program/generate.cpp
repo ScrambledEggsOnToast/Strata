@@ -7977,6 +7977,9 @@ int main(int argc, char** argv) {
     // `quota` copies of that layer's own blob, in layer order. `--expert-cache N` stays the budget of N largest
     // blobs, and the quota is however many copies of every layer fit in it.
     std::vector<int64_t> sized_slots;
+    // The pair whose blob sizes each slot, in the same order as the primary fill below.  Non-empty only
+    // when every profiled pair is admitted and the fill is reordered layer by layer.
+    std::vector<std::pair<int32_t, int32_t>> slot_order;
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
@@ -8026,6 +8029,18 @@ int main(int argc, char** argv) {
                                  "(layer, expert) pair lifts it - tools/make_profile.py)\n", o.expert_cache,
                          profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
+        // The primary fill reads its residents layer by layer when every profiled pair is admitted. `open_sized`
+        // gives each slot the capacity of the pair at its index, so the sizes must be moved into that same order:
+        // otherwise a large layer's blob is written into a slot sized for a smaller one and overwrites its
+        // neighbour, which shows up as corrupted experts and non-finite logits long after the fill.
+        if (!o.expert_cache_per_layer && sized_slots.size() == profile.size()) {
+            slot_order.assign(profile.begin(), profile.end());
+            std::stable_sort(slot_order.begin(), slot_order.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            });
+            sized_slots.clear();
+            for (const auto& pr : slot_order) sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+        }
     }
     // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU,
     // no helper caches, serve mode: anything else keeps the one cudaMalloc, said once.
@@ -8048,7 +8063,7 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
-            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); slot_order.clear(); return false; }
             if (per_layer_bytes > 0) {
                 // Cutting the list short would put one layer's blob in the next layer's range.
                 const auto& lay = strata::kernels::cpu::expert_layout();
@@ -8069,11 +8084,12 @@ int main(int argc, char** argv) {
                 while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
                     used += (sized_slots[keep++] + 255) / 256 * 256;
                 sized_slots.resize(keep);
+                if (slot_order.size() > sized_slots.size()) slot_order.resize(sized_slots.size());
                 o.expert_cache = (int) keep;
             } else {
                 o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
             }
-            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); slot_order.clear(); return false; }
             return true;
         };
         auto cache_bytes = [&]() -> int64_t {
@@ -8212,13 +8228,16 @@ int main(int argc, char** argv) {
         // profiled pair is admitted - then the resident SET is the profile's regardless of order, and only the
         // slot numbers move. With fewer slots than pairs the order decides which pairs are resident, so it is
         // left alone.
-        std::vector<std::pair<int32_t, int32_t>> fill_order(profile.begin(), profile.begin() + (size_t) std::min<int64_t>(want, (int64_t) profile.size()));
-        const bool reordered = !per_layer && (int64_t) fill_order.size() <= xcache.slots();
-        if (reordered) {
-            std::stable_sort(fill_order.begin(), fill_order.end(), [](const auto& a, const auto& b) {
-                return a.first != b.first ? a.first < b.first : a.second < b.second;
-            });
+        std::vector<std::pair<int32_t, int32_t>> fill_order;
+        if (!slot_order.empty()) {
+            const size_t n_order = std::min<size_t>((size_t) want, slot_order.size());
+            fill_order.assign(slot_order.begin(), slot_order.begin() + (std::ptrdiff_t) n_order);
+        } else {
+            fill_order.assign(profile.begin(), profile.begin() + (std::ptrdiff_t) std::min<int64_t>(want, (int64_t) profile.size()));
         }
+        // `slot_order` is only set when every profiled pair is admitted, so reordering moves slot numbers, never
+        // the resident set. With fewer slots than pairs the profile order is kept.
+        const bool reordered = !per_layer && fill_order.size() == slot_order.size() && !slot_order.empty();
         // **Several reads in flight.** With a layer-major order the source can queue a chunk of one role's spans
         // and settle them together, instead of one submit-and-wait per span; that wait was 97.6% of the fill.
         auto* windowed_fill = dynamic_cast<strata::core::WindowedExpertSource*>(srcp);

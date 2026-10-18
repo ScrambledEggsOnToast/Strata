@@ -675,6 +675,14 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
               std::to_string(slots_ - 1);
         return false;
     }
+    // Per-slot allocation: a copy larger than this slot would overwrite the next one.  `open`'s uniform slots
+    // have `blob_` each; `open_sized` gives each slot the size of the pair at its index.
+    const uint64_t capacity = off_.empty() ? (uint64_t) blob_ : off_[(size_t) slot + 1] - off_[(size_t) slot];
+    if ((uint64_t) n > capacity) {
+        err = "ExpertCache::fill_slot: " + std::to_string(n) + " B blob exceeds the " +
+              std::to_string(capacity) + " B slot";
+        return false;
+    }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
@@ -694,6 +702,12 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
+        return false;
+    }
+    const uint64_t capacity = off_.empty() ? (uint64_t) blob_ : off_[(size_t) slot + 1] - off_[(size_t) slot];
+    if ((uint64_t) n > capacity) {
+        err = "ExpertCache::fill_slot_blocking: " + std::to_string(n) + " B blob exceeds the " +
+              std::to_string(capacity) + " B slot";
         return false;
     }
     if (host_blob == nullptr) {
