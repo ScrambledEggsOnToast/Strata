@@ -11319,6 +11319,37 @@ int main(int argc, char** argv) {
                     fields.tag(name);
                     fields.i64(value);
                 }
+                if (std::getenv("STRATA_STORE_TIMING")) {
+                    // The domain binds resolved session state beside the arithmetic list; print both halves so a
+                    // cross-process difference names its field instead of its digest.
+                    const auto state_line = [](const char* what, const strata::core::SessionState& state) {
+                        std::fprintf(stderr, "strata serve: domain %s layer=%lld:%lld alloc=%lld qsa=%lld+%lld\n",
+                                     what, (long long) state.layer_lo, (long long) state.layer_hi,
+                                     (long long) state.allocation_device, (long long) state.qsa_ord0,
+                                     (long long) state.qsa_alloc);
+                    };
+                    state_line("primary", ss);
+                    for (size_t k = 0; k < stages.size(); ++k) {
+                        std::string name = "stage" + std::to_string(k + 1);
+                        state_line(name.c_str(), stages[k]->ss);
+                    }
+                    std::fprintf(stderr, "strata serve: domain mtp=%d device=%lld max_t=%lld max_context=%lld "
+                                         "kv_resident=%lld mtp_max_t=%lld\n",
+                                 use_mtp ? 1 : 0, (long long) (use_mtp ? mtp.device() : -1),
+                                 (long long) (use_mtp ? mtp.max_t() : -1), (long long) o.max_context,
+                                 (long long) o.kv_resident, (long long) o.mtp_max_t);
+                    std::fprintf(stderr, "strata serve: domain version=%s backend=%s kv=%s mtp_window=%lld rot=%llu "
+                                         "rope_type=%lld freq_base=%.17g factor=%.17g scale=%.17g ctx=%.17g "
+                                         "ext=%.17g attn=%.17g fast=%.17g slow=%.17g switches=%zu\n",
+                                 config.engine_version, config.backend, config.kv, (long long) config.mtp_window,
+                                 (unsigned long long) config.kv_rot, (long long) config.rope.type,
+                                 config.rope.freq_base, config.rope.factor, config.rope.freq_scale,
+                                 config.rope.orig_ctx, config.rope.ext_factor, config.rope.attn_factor,
+                                 config.rope.beta_fast, config.rope.beta_slow, config.switches.size());
+                    for (const auto& [name, value] : config.switches)
+                        std::fprintf(stderr, "strata serve: domain switch %s=%lld\n", name.c_str(),
+                                     (long long) value);
+                }
                 // ---- every remaining arithmetic selection ----------------------------------------------------
                 // The switches above are the CLI's declared set.  This is everything else that can change the bits
                 // this image holds: the environment controls the kernels read for themselves (bound by name and
