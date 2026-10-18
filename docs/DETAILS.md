@@ -3302,14 +3302,17 @@ drains its own `BQDONE` before freeing the slot; malformed, mismatched or missin
 
 Ready cold and retained-suffix owners write directly to their reserved sessions. A complete late command
 changes the command epoch: stage zero stops issuing more packs, launched descendants and side consumers
-drain, and the caller publishes certified frontiers before processing commands and selecting owners again.
+drain, and the caller publishes certified frontiers, processes queued controls, then captures any eligible
+shared cut before selecting owners again.
 This is not cancellation. The union arithmetic uses at most four owner segments and 2,048 rows; recurrent,
 attention, indexer, PLE and MTP state remain owner-local. The final prompt token is excluded from segmented
 prefill and runs once in a separate physical-slot verifier operation. MTP catch-up must finish even for
 `max_new=1`, EOS or cancellation before the first token or a successful terminal can be published.
 An owner reaching its endpoint requests the same drained scheduling seam, so its separate first-token
 operation and terminal do not wait for an unrelated long request to finish. The final drain receipt
-distinguishes `trigger=owner_ready`, `command` and `budget`.
+distinguishes `trigger=owner_ready`, `command` and `budget`. The first true stop callback latches the
+reason and `stop_epoch` (beside `start_epoch`); commands or owner completion during descendant drain
+cannot relabel an earlier budget stop. Guard order and the first issuance opportunity are unchanged.
 
 Prepared store offers still use the existing `cache_offer`, `cache_generation` and request-deadline keys.
 The store owns lookup/materialization and its read lease; preparation validates any mounted image and
@@ -3323,6 +3326,27 @@ The explicit `STCSMAN2` format can carry certified intervals and the immutable b
 residual, guarded by its minimum-reader envelope. Stored private/shared sources still
 require real execution qualification; neither the format tag nor a positive reuse count
 proves a full-live restore or its one-cell catchup.
+
+Packed producers use the same exact-cut capture and publication queue as the working-session path.
+Sharing requires the store, a valid private scope, text, checkpointing, `--prompt-cache >= 3`,
+and a strictly interior pin `0 < N < prompt_tokens - 1`. An unusable sharing declaration is ignored
+without disabling an ordinary private checkpoint pin. Phase receipts name the accepted shared pin and,
+only after a successful shared mount, its actual restored cut.
+
+For each eligible fresh crossing, the last-stage owner callback copies its own main `R_(N-1)` into a
+separate, preallocated host row and joins the owning stream before freezing it. Startup charges all four
+possible source rows, their actual payload/extent directories and provenance, independently of the existing
+working-row charge; snapshot admission separately charges every retained frozen alias. Empty owner buffers
+allocate nothing, and ineligible/private requests allocate no source rows.
+After complete-chain drain and `prefilled`, queued cancellation is processed before publication. The
+preparation-only snapshot source checks the live request/incarnation, physical stages, coherent IDs/frontier,
+idle consumers and certified draft coverage; the completed-source factory remains unchanged. Only the
+exact main cut is borrowed. Its draft interval ends at `N-1`, has no next token and carries that owner's
+frozen boundary row; exact-cut capture clears cell `N-1` (already conditioned on private token `N`) and all
+excluded padding. The shared image has no private image/checkpoint chain or predecessor/donor lineage.
+A resumed prefix that did not freshly recompute the cut, or a suffix horizon that excludes its draft
+interval, skips shared publication rather than widening coverage. The source row is released after the
+synchronous capture attempt; the owner's private checkpoint chain, arithmetic and continuation are unchanged.
 
 Feature-on runtime evidence is content-free: `PACKED_PREFILL event=reserved`, `event=pack` and
 `event=segment` identify actual locally drained arithmetic, `event=drained` certifies the complete
@@ -3347,6 +3371,12 @@ legacy cases. Late-arrival ACK/completion ordering is not by itself a descendant
 proof; inspect actual native stage/drain receipts for those claims. The intentional EOF refusal is not a
 normal durable-clean store shutdown. These are test entrypoints, not measured acceptance or a performance
 claim; monitored real-runtime evidence is required before promotion.
+
+The existing single-device `strata-resident-test` vehicle with `STRATA_TEST_PACKED_RESIDENT=1` and
+`STRATA_PACKED_PREFILL=1` also borrows a real prepared interior cut, excludes its already-conditioned
+draft cell, and restores it into two distinct private conversations with different token-`N` suffixes.
+It checks stale/foreign leases and cancellation refusal at this source seam. This is not an HTTP/store
+producer proof and does not replace the monitored packed producer/follower run.
 
 
 Run-config budgets (all bounded per request, not replacements for native byte-level memory admission):

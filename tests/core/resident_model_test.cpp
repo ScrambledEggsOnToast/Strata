@@ -216,6 +216,7 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         const std::vector<int64_t> tokens_a{11, 22, 33}, tokens_b{44};
         program::ResidentRequest request_a, request_b;
         request_a.max_new = 1; request_a.scope.value[0] = 91; request_a.pin = 1;
+        request_a.shared_scope.value[0] = 93;
         request_b.max_new = 2; request_b.scope.value[0] = 92;
         request_a.sampling.greedy = request_b.sampling.greedy = true;
         request_a.sampling.temperature = request_b.sampling.temperature = 0;
@@ -238,6 +239,8 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
                 !owner.available(0) && !owner.available(1) && !owner.slots()[0].active &&
                 !owner.completed_snapshot_source(0, error) && !owner.release_resources(error),
                 "reserved owners exclude ordinary admission, snapshots and resource release");
+        require(!owner.prepared_snapshot_source(leases[0], error) && error.empty(),
+                "a reserved but unwritten preparation cannot supply snapshot state");
         require(same(untouched_a, fingerprint(a, *draft.slot_state(0), 2)) &&
                 same(untouched_b, fingerprint(b, *draft.slot_state(1), 2)),
                 "CPU reservations perform no destination writes before independent ACK publication");
@@ -274,15 +277,54 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         require(owner.prefilled(leases[0], 0, error) && owner.prefilled(leases[1], 0, error),
                 "empty prefixes certify the n-1 endpoint of a one-token prompt");
         prefix(leases[0], 0);
+        // A legal interior cut, while its resident owner is still preparing.
+        // Cell0 already consumed private token1=22; only main R0 may be shared.
+        core::ConversationBuffer interior_boundary(true);
+        core::SavedConversation interior_shared;
+        {
+            auto prepared = owner.prepared_snapshot_source(leases[0], error);
+            require(prepared && &prepared->session(0) == &a && prepared->owner.p == 1 &&
+                    prepared->draft_cells == 1 && prepared->draft_begin == 0 &&
+                    !owner.completed_snapshot_source(0, error),
+                    "prepared snapshot borrows the actual certified seat without admitting it as completed");
+            interior_boundary.resize(size_t(geometry.hc * geometry.n_embd) * sizeof(float));
+            require(interior_boundary.visit(0, interior_boundary.size(), [&](uint8_t* dst, size_t n, size_t at) {
+                        return cudaMemcpy(dst, reinterpret_cast<const uint8_t*>(verifier.final_R(0)) + at,
+                                          n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    }), "capture the interior owner's R0 before any later verifier row");
+            interior_boundary.freeze();
+            const std::vector<core::ConversationImageKey> no_images;
+            const std::vector<core::ConversationCheckpoint> no_checks;
+            core::ConversationView view{prepared->owner.ids, no_images, no_checks, true, true};
+            view.draft_begin = prepared->draft_begin; view.draft_tokens = 0;
+            view.draft_owner = prepared->owner.request; view.draft_next_token = -1;
+            view.draft_boundary_residual = &interior_boundary; view.draft_boundary_position = 0;
+            view.draft_boundary_owner = prepared->owner.request;
+            require(core::conversation_snapshot_save(interior_shared, view, prepared->session(0), geometry,
+                        prepared->draft, error) &&
+                    core::conversation_snapshot_validate(interior_shared, a, geometry, prepared->draft,
+                        core::ConversationSnapshotExpectation::exact_cut, error) &&
+                    interior_shared.live.ids == std::vector<int32_t>{11} &&
+                    interior_shared.checkpoints.empty() && interior_shared.draft_cells == 0 &&
+                    interior_shared.draft_boundary_residual == interior_boundary,
+                    "prepared exact cut sanitizes the consumed private draft cell and keeps only its owned residual");
+            interior_shared.scope = request_a.shared_scope;
+            interior_shared.freeze();
+        }
+        const auto immutable_interior = interior_shared.frozen_alias();
         prefix(leases[0], 1);
         require(same(quiet_b, fingerprint(b, *draft.slot_state(1), 2)),
                 "one owner's real prefix and MTP writes do not touch its peer");
         auto stale = leases[0];
         ++stale.incarnation;
         require(!owner.prefilled(stale, 2, error), "stale physical incarnation cannot publish a frontier");
+        require(!owner.prepared_snapshot_source(stale, error),
+                "stale physical incarnation cannot lend a prepared snapshot");
         auto foreign = leases[0];
         foreign.stages[0] = &b;
         require(!owner.prefilled(foreign, 2, error), "swapped physical owner cannot publish a frontier");
+        require(!owner.prepared_snapshot_source(foreign, error),
+                "swapped physical destination cannot lend a prepared snapshot");
         const int32_t first = row(0, 33, 2);
         // Acquire the exact row while this verifier still owns final_R, before
         // executing the peer. No destination token at position 3 is captured.
@@ -351,6 +393,8 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
                 rewound.block_pos == first_cut.block_pos,
                 "direct retained rewind restores the original real checkpoint payloads");
         owner.cancel(0);
+        require(!owner.prepared_snapshot_source(rewind, error) && error.empty(),
+                "cancellation closes the prepared capture seam before the owner is retired");
         require(owner.abort_preparation(rewind, error) && owner.available(0) &&
                 !owner.prefilled(rewind, 1, error) && !owner.completed_snapshot_source(0, error),
                 "drained cancellation discards unpublished owner and invalidates its old lease");
@@ -400,6 +444,25 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         require(same(peer, fingerprint(b, *draft.slot_state(1), 2)) &&
                 same(ambient, fingerprint(main, draft.kv_state(), 2)),
                 "failed destination changes neither peer nor ambient payload");
+        for (const int32_t token_n : {77, 78}) {
+            auto follower = request_a;
+            follower.scope.value[0] = uint8_t(token_n + 20);
+            const std::vector<int64_t> suffix{11, token_n, 33};
+            const program::ResidentPrepareInput input{1, &suffix, follower};
+            program::ResidentPreparation mounted;
+            require(owner.reserve(&input, 1, &mounted, error) &&
+                    owner.prepare(mounted, &interior_shared, nullptr,
+                        core::ConversationSnapshotExpectation::exact_cut, error) &&
+                    owner.slots()[1].p == 1 && draft.slot_cells(1) == 1 &&
+                    draft.slot_next_token(1) == token_n,
+                    "different private conversations catch up a prepared interior cut with their own tokenN");
+            prefix(mounted, 1);
+            const int32_t next = row(1, 33, 2);
+            require(owner.first_token(mounted, next, verifier.final_R(0), error) &&
+                    draft.slot_cells(1) == 3 && owner.finish(1, error) &&
+                    same_snapshot(interior_shared, immutable_interior),
+                    "both real suffixes finish without mutating the prepared shared source or mixing private rows");
+        }
         // The same immutable N-token image resumes twice at full live N. Each
         // destination must supply its own tokenN to exactly one missing KV cell.
         for (const int32_t token_n : {88, 89}) {
@@ -423,7 +486,8 @@ int packed_resident_checks(strata::program::ResidentSlots& owner, strata::core::
         require(same(ambient, fingerprint(main, draft.kv_state(), 2)) && owner.release_resources(error),
                 "shared catchup preserves ambient owner and releases all drained resources");
         std::printf("PACKED_RESIDENT_CHECKS checks=%d actual_verifier=1 direct_prepare=1 short_mtp=1 "
-                    "rewind=1 max_new1=1 cancel_after_issue=1 partial_write=1 external_store_qualified=0 failures=0\n", checks);
+                    "rewind=1 max_new1=1 cancel_after_issue=1 partial_write=1 prepared_interior_shared=1 "
+                    "external_store_qualified=0 failures=0\n", checks);
         return 0;
     } catch (const std::exception& exception) {
         fail_destination = nullptr;

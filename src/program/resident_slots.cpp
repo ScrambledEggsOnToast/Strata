@@ -1055,6 +1055,36 @@ std::optional<ResidentSnapshotSource> ResidentSlots::completed_snapshot_source(i
         draft ? draft_.slots_[size_t(slot)].completed_cells : 0, draft ? draft_.slot_next_token(slot) : -1};
 }
 
+std::optional<ResidentSnapshotSource> ResidentSlots::prepared_snapshot_source(
+        const ResidentPreparation& lease, std::string& error) {
+    error.clear();
+    if (!preparation_valid(lease, error)) return std::nullopt;
+    auto& source = slots_[(size_t) lease.slot];
+    if (!preparations_[(size_t) lease.slot].ready || source.stop || source.tainted || source.img ||
+        !source.input.checkpoint || !source.input.scope.valid() || source.ids.empty())
+        return std::nullopt;
+    if (source.active || source.p != (int64_t) source.ids.size() || source.p < lease.position ||
+        source.p > lease.endpoint || !std::equal(source.ids.begin(), source.ids.end(), source.prompt.begin()) ||
+        dispatch_.slot_requests[lease.slot] != lease.request) {
+        error = "resident prepared snapshot: incoherent owner frontier"; return std::nullopt;
+    }
+    if (!idle(error)) return std::nullopt;
+    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(lease.slot) : nullptr;
+    if (draft_.kv_state().max_cells > 0) {
+        if (!draft || draft_.slots_[(size_t) lease.slot].request != lease.request ||
+            draft_.slot_cells(lease.slot) != source.p ||
+            draft_.slots_[(size_t) lease.slot].completed_cells != source.p ||
+            !draft_.slot_covers(lease.slot, source.p, (int64_t) source.prompt.size()) ||
+            (source.p > draft_.slot_begin(lease.slot) &&
+             draft_.slot_next_token(lease.slot) != source.prompt[(size_t) source.p])) {
+            error = "resident prepared snapshot: incoherent draft owner or interval"; return std::nullopt;
+        }
+    }
+    return ResidentSnapshotSource{source, stages_, draft, lease.slot, draft ? draft_.slot_begin(lease.slot) : 0,
+        draft ? draft_.slots_[(size_t) lease.slot].completed_cells : 0,
+        draft ? draft_.slot_next_token(lease.slot) : -1};
+}
+
 bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* checkpoint,
                                 PrefixWork& work, std::string& error) const {
     work = {};

@@ -218,6 +218,12 @@ public:
     // Ineligible sources return nullopt with no error; capture uses the source's
     // own scope and must restore its borrowed checkpoint chain before replacement.
     std::optional<ResidentSnapshotSource> completed_snapshot_source(int slot, std::string& error);
+    // Preparation-only borrowed source at the last certified, drained frontier.
+    // A live lease must still own every physical stage and coherent draft row;
+    // stopped, tainted or unready owners are clean misses. No completed owner is
+    // made eligible here, and capture must not advance/mutate the preparation.
+    std::optional<ResidentSnapshotSource> prepared_snapshot_source(const ResidentPreparation& lease,
+                                                                  std::string& error);
     // Called only for a GPU-committed row. No state migration or allocation.
     bool committed(int slot, int32_t next, const float* residual, std::string& error, bool observe = true);
     bool propose(int slot, const float* residual, std::string& error);

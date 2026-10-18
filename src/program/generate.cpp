@@ -5192,6 +5192,10 @@ int main(int argc, char** argv) {
                 strata::core::ConversationBuffer(true).allocation_peak(size_t(g.hc * g.n_embd) * sizeof(float)),
                 "one opt-in packed/shared immutable source row; no device arena or default row allocation");
         if (packed_prefill) {
+            ram("packed_shared_boundary_capture_host", byte_mul(4, byte_add(
+                strata::core::ConversationBuffer(true).allocation_peak(size_t(g.hc * g.n_embd) * sizeof(float)),
+                sizeof(strata::core::ConversationBuffer) + 4 * sizeof(uint64_t))),
+                "four independent immutable owner rows and provenance; snapshot/queue aliases are charged by capture");
             ram("packed_prefill_owner_canaries_host",
                 byte_mul(stage_count, 4 * strata::core::kOperationCanaryHostBytes),
                 "per-stage bounded owner witness staging/readback");
@@ -12169,6 +12173,9 @@ int main(int argc, char** argv) {
             uint64_t owner = kSessionOwner;
             bool continues = true;
             bool shared_prefix = false;
+            const strata::core::ConversationBuffer* boundary_residual = nullptr;
+            int64_t boundary_position = -1;
+            uint64_t boundary_request = 0, boundary_incarnation = 0;
         };
         const std::vector<strata::core::ConversationImageKey> no_park_images;
         auto park_source_body = [&](const ParkSource& source, size_t held,
@@ -12184,6 +12191,18 @@ int main(int argc, char** argv) {
             };
             if (!conversations.enabled() || held_entries >= conversations.slots() ||
                 !live_ok || !live_scope.valid() || live.empty()) return true;
+            if (source.shared_prefix && source.resident) {
+                const auto& owner = source.resident->owner;
+                if (!source.boundary_residual || !source.boundary_residual->frozen() ||
+                    source.boundary_residual->size() != size_t(g.hc * g.n_embd) * sizeof(float) ||
+                    source.boundary_position != int64_t(live.size()) - 1 ||
+                    source.boundary_request != owner.request || source.boundary_incarnation != owner.incarnation ||
+                    owner.stop || owner.tainted || !owner.preparing || owner.p != int64_t(live.size()) ||
+                    owner.ids != live || !owner.input.shared_scope.matches(live_scope) ||
+                    !live_imgs.empty() || !checks.empty()) {
+                    err = "packed shared snapshot: stale or foreign boundary source"; return false;
+                }
+            }
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -12238,7 +12257,20 @@ int main(int argc, char** argv) {
                 if (!owns_draft || (!packed_prefill && !source.shared_prefix)) return;
                 if (source.resident) {
                     const auto& retained = *source.resident;
-                    if (retained.draft_begin >= 0 && retained.draft_cells >= retained.draft_begin) {
+                    if (source.shared_prefix) {
+                        // Cell N-1 already consumed this owner's private tokenN.
+                        // Exact capture excludes it and all rounded padding;
+                        // only the frozen main R_(N-1) crosses to a follower.
+                        const int64_t end = int64_t(v.ids.size()) - 1;
+                        if (retained.draft_begin >= 0 && retained.draft_begin <= end &&
+                            retained.draft_cells >= end) {
+                            v.draft_begin = retained.draft_begin; v.draft_tokens = end;
+                            v.draft_owner = retained.owner.request; v.draft_next_token = -1;
+                            v.draft_boundary_residual = source.boundary_residual;
+                            v.draft_boundary_position = source.boundary_position;
+                            v.draft_boundary_owner = source.boundary_request;
+                        }
+                    } else if (retained.draft_begin >= 0 && retained.draft_cells >= retained.draft_begin) {
                         v.draft_begin = retained.draft_begin; v.draft_tokens = retained.draft_cells;
                         v.draft_owner = retained.owner.request;
                         v.draft_next_token = retained.draft_cells == int64_t(v.ids.size())
@@ -14040,6 +14072,16 @@ int main(int argc, char** argv) {
             std::array<int64_t, 3> seams{};
             std::array<ConvCheckpoint, 4> parts;
             std::array<bool, 4> parts_ready{};
+            bool shared_capture = false;
+            strata::core::ConversationBuffer shared_boundary{true};
+            int64_t shared_boundary_position = -1;
+            uint64_t shared_boundary_request = 0, shared_boundary_incarnation = 0;
+            void release_shared_boundary() {
+                shared_capture = false;
+                shared_boundary = strata::core::ConversationBuffer(true);
+                shared_boundary_position = -1;
+                shared_boundary_request = shared_boundary_incarnation = 0;
+            }
             double prompt_ms = 0;
             Clock::time_point started;
             phase::Input phase_input;
@@ -15305,6 +15347,13 @@ int main(int argc, char** argv) {
                     why = "invalid or over-context prompt";
                 for (int64_t token : owner.tokens)
                     if (token < 0 || token >= n_vocab) why = "token outside vocabulary";
+                if (owner.input.shared_scope.valid() && (!store_on || !owner.input.scope.valid() ||
+                    !o.score_reference.empty() || owner.input.pin <= 0 ||
+                    owner.input.pin >= int64_t(owner.tokens.size()) - 1 ||
+                    !owner.input.checkpoint || o.prompt_cache < 3)) {
+                    std::fprintf(stderr, "strata serve: shared prefix ignored: no usable private scope, store, text pin seam\n");
+                    owner.input.shared_scope = {}; // ordinary/private pin semantics are unchanged
+                }
                 strata::plan::RequestDemand demand;
                 demand.prompt_tokens = int64_t(owner.tokens.size());
                 demand.max_new_tokens = owner.input.max_new;
@@ -15371,6 +15420,8 @@ int main(int argc, char** argv) {
                     (void)phase::next_sequence(phase_sequence, sequence);
                     owner.phase_leg.emplace(owner.phase_input, sequence, phase::now_ns());
                     owner.phase_leg->slot = owner.lease.slot;
+                    if (owner.input.shared_scope.valid())
+                        owner.phase_leg->shared_prefix_tokens = uint64_t(owner.input.pin);
                 }
                 resident.priority(owner.lease.slot, foreground);
                 std::printf("BACK %s %d %llu %llu\n", owner.tag.c_str(), owner.lease.slot,
@@ -15527,7 +15578,10 @@ int main(int argc, char** argv) {
             owner.resume = owner.frontier = bs[size_t(slot)].p;
             if (disk && incoming && owner.resume > 0) {
                 auto& publication = store_owner(kResidentOwnerFirst + uint64_t(slot));
-                if (shared_mount) publication.borrow();
+                if (shared_mount) {
+                    publication.borrow();
+                    if (phase_current) phase_current->shared_prefix_restored_tokens = uint64_t(owner.resume);
+                }
                 else publication.mount(mounted.head_id, mounted.epoch, incoming->live.ids, owner.resume,
                                        owner.input.scope, owner.input.steering);
                 conversation_store->confirmed_restore(mounted.head_id);
@@ -15554,8 +15608,68 @@ int main(int argc, char** argv) {
             owner.seams = {first_turn >= o.prompt_cache_root && o.prompt_cache_root > 0 ? first_turn : 0,
                            last_turn, owner.input.pin > 0 && owner.input.pin < endpoint ? owner.input.pin : 0};
             owner.periodic = o.prompt_cache_every > 0 ? owner.resume + o.prompt_cache_every : INT64_MAX;
+            if (owner.input.shared_scope.valid() && owner.resume < owner.input.pin &&
+                mtp.first_needed(slot) <= owner.input.pin - 1) {
+                auto selector = store_selector_base;
+                selector.scope = owner.input.shared_scope;
+                selector.cvec = owner.input.steering;
+                if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
+                        *conversation_store, selector, prompt, owner.input.pin, uint32_t(stages.size() + 1))) {
+                    try {
+                        // All four possible rows were charged at startup. Allocate
+                        // only eligible sources here, never in the arithmetic callback.
+                        owner.shared_boundary.resize(size_t(g.hc * g.n_embd) * sizeof(float));
+                        owner.shared_capture = true;
+                    } catch (const std::bad_alloc&) {
+                        owner.release_shared_boundary();
+                        std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip shared boundary\n");
+                    }
+                }
+            }
             publish_ram_view();
             return true;
+        };
+        auto packed_publish_shared = [&](PackedOwner& owner) -> bool {
+            struct ReleaseBoundary {
+                PackedOwner& owner;
+                ~ReleaseBoundary() { owner.release_shared_boundary(); }
+            } release{owner};
+            const int slot = owner.lease.slot;
+            if (packed_cancelled(slot)) return true; // controls were pumped after the complete-chain drain
+            if (!owner.pending || !owner.prepared || owner.frontier != owner.input.pin ||
+                owner.shared_boundary_position != owner.input.pin - 1 ||
+                owner.shared_boundary_request != owner.lease.request ||
+                owner.shared_boundary_incarnation != owner.lease.incarnation) {
+                err = "packed shared snapshot: boundary no longer belongs to its prepared owner"; return false;
+            }
+            auto source = resident.prepared_snapshot_source(owner.lease, err);
+            if (!source) return err.empty();
+            if (owner.resume >= owner.input.pin || owner.resume > source->draft_begin ||
+                source->draft_begin < 0 || source->draft_begin > owner.input.pin - 1 ||
+                source->draft_cells < owner.input.pin - 1) {
+                std::fprintf(stderr, "strata serve: conversation store: skip shared prefix publication "
+                                     "(pin=%lld; no fresh contiguous draft interval)\n", (long long)owner.input.pin);
+                return true;
+            }
+            auto selector = store_selector_base;
+            selector.scope = owner.input.shared_scope;
+            selector.cvec = owner.input.steering;
+            if (strata::program::ConversationPublicationQueue::shared_prefix_exists(
+                    *conversation_store, selector, bs[size_t(slot)].prompt, owner.input.pin,
+                    uint32_t(stages.size() + 1))) return true;
+            struct PhaseRestore {
+                phase::Leg*& current;
+                phase::Leg* previous;
+                ~PhaseRestore() { current = previous; }
+            } phase_restore{phase_current, phase_current};
+            phase_current = owner.phase_leg ? &*owner.phase_leg : nullptr;
+            std::vector<ConvCheckpoint> no_checks;
+            // Borrow only the exact drained main frontier; the owner's private
+            // checkpoint chain and store lineage are never moved or inherited.
+            return park_source({source->owner.ids, no_park_images, no_checks, owner.input.shared_scope,
+                owner.input.steering, true, &*source, kResidentOwnerFirst + uint64_t(slot), false, true,
+                &owner.shared_boundary, owner.shared_boundary_position, owner.shared_boundary_request,
+                owner.shared_boundary_incarnation}, 0, nullptr);
         };
         if (packed_prefill) {
             sp.on_segment_stage = [&](const strata::prefill::OwnerSpan& span, size_t stage,
@@ -15579,14 +15693,44 @@ int main(int argc, char** argv) {
             };
             sp.on_segment = [&](strata::prefill::Prefill& arithmetic, const strata::prefill::OwnerSpan& span,
                                 const float* residual, std::string& why) {
+                if (span.slot < 0 || size_t(span.slot) >= packed_owners.size()) {
+                    why = "packed residual outside owner lease"; return false;
+                }
+                auto& owner = packed_owners[size_t(span.slot)];
+                if (!owner.pending || !owner.prepared || owner.lease.request != span.request ||
+                    owner.lease.incarnation != span.incarnation || owner.lease.stages != span.stages) {
+                    why = "packed residual crossed an owner incarnation"; return false;
+                }
+                const int64_t position = owner.input.pin - 1;
+                if (owner.shared_capture && position >= span.position && position - span.position < span.rows) {
+                    const size_t bytes = size_t(g.hc * g.n_embd) * sizeof(float);
+                    if (!residual || owner.shared_boundary.size() != bytes || owner.shared_boundary_request) {
+                        why = "packed shared residual lacks its preallocated unique row"; return false;
+                    }
+                    const strata::core::OnDevice on(arithmetic.device());
+                    const auto stream = (cudaStream_t)arithmetic.stream();
+                    const auto* row = reinterpret_cast<const uint8_t*>(
+                        residual + (position - span.position) * g.hc * g.n_embd);
+                    const bool copied = owner.shared_boundary.visit(0, bytes, [&](uint8_t* dst, size_t n, size_t at) {
+                        return cudaMemcpyAsync(dst, row + at, n, cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                    });
+                    const auto joined = cudaStreamSynchronize(stream); // retire every writer, including on copy failure
+                    if (!copied || joined != cudaSuccess) {
+                        why = "packed shared boundary residual capture failed"; return false;
+                    }
+                    owner.shared_boundary.freeze();
+                    owner.shared_boundary_position = position;
+                    owner.shared_boundary_request = span.request;
+                    owner.shared_boundary_incarnation = span.incarnation;
+                }
                 const char* decline = nullptr;
                 const bool batched = arithmetic.draft_kv(mtp, residual, span.next_tokens, span.rows,
                     span.position, why, &decline, span.slot,
-                    int64_t(packed_owners[size_t(span.slot)].tokens.size()));
+                    int64_t(owner.tokens.size()));
                 if (!batched && !why.empty()) return false;
                 const bool drained = batched ||
                     mtp.prefill_slot(span.slot, residual, span.next_tokens, span.rows, span.position, why);
-                if (drained && span.position + span.rows == packed_owners[size_t(span.slot)].lease.endpoint)
+                if (drained && span.position + span.rows == owner.lease.endpoint)
                     packed_first_ready.store(true, std::memory_order_release);
                 return drained;
             };
@@ -15637,13 +15781,23 @@ int main(int argc, char** argv) {
                 const uint64_t epoch = command_epoch.load();
                 const auto begin = Clock::now();
                 unsigned probes = 0;
+                const char* yield_trigger = nullptr;
+                uint64_t stop_epoch = epoch;
                 const auto pending = [&] {
-                    if (command_epoch.load() != epoch || packed_first_ready.load(std::memory_order_acquire)) return true;
+                    const uint64_t observed_epoch = command_epoch.load();
+                    const auto stop = [&](const char* reason) {
+                        if (!yield_trigger) { yield_trigger = reason; stop_epoch = observed_epoch; }
+                        return true;
+                    };
+                    if (observed_epoch != epoch) return stop("command");
+                    if (packed_first_ready.load(std::memory_order_acquire)) return stop("owner_ready");
                     // Uncontended prefill retains its full three-stage pipeline.
                     // A live decoder may request an existing budget seam only
                     // after stage zero has had one real issuance opportunity.
-                    return ++probes > 1 && batch_on() && time_budget.enabled() &&
-                        std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count() >= o.foreground_budget_ms;
+                    if (++probes > 1 && batch_on() && time_budget.enabled() &&
+                        std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count() >= o.foreground_budget_ms)
+                        return stop("budget");
+                    return false;
                 };
                 const auto result = sp.run_segments(spans.data(), count, err, pending);
                 const double wall = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
@@ -15651,14 +15805,14 @@ int main(int argc, char** argv) {
                 for (int index = 0; index < count; ++index)
                     issued_rows += std::max<int64_t>(0, result.frontier[size_t(index)] - spans[size_t(index)].position);
                 std::fprintf(stderr, "PACKED_PREFILL event=%s execution=%llu owners=%d touched=%u rows=%lld "
-                                     "completion=%s trigger=%s host_ms=%.3f\n",
+                                     "completion=%s trigger=%s start_epoch=%llu stop_epoch=%llu host_ms=%.3f\n",
                              result.completion == strata::prefill::PrefillCompletion::failed ? "failed" : "drained",
                              (unsigned long long)result.execution, count, result.touched, (long long)issued_rows,
                              result.completion == strata::prefill::PrefillCompletion::complete ? "complete" :
                              result.completion == strata::prefill::PrefillCompletion::pending_command ? "pending_command" : "failed",
-                             result.completion != strata::prefill::PrefillCompletion::pending_command ? "none" :
-                             packed_first_ready.load(std::memory_order_acquire) ? "owner_ready" :
-                             command_epoch.load() != epoch ? "command" : "budget", wall);
+                             result.completion == strata::prefill::PrefillCompletion::pending_command && yield_trigger
+                                 ? yield_trigger : "none",
+                             (unsigned long long)epoch, (unsigned long long)stop_epoch, wall);
                 for (int index = 0; index < count; ++index) {
                     const auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
                     std::fprintf(stderr, "PACKED_PREFILL event=frontier execution=%llu tag=%s slot=%d request=%llu "
@@ -15701,6 +15855,8 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 if (!packed_collect()) return false; // certified frontiers are public before reselection
+                for (auto& owner : packed_owners)
+                    if (owner.shared_boundary_request && !packed_publish_shared(owner)) return false;
                 if (batch_on() && time_budget.enabled() && time_budget.decode_allowed(0) &&
                     time_budget.decode_due(std::chrono::duration<double, std::milli>(Clock::now() - last_decode).count(), 2048))
                     if (!decode_round(true)) return false;
