@@ -246,6 +246,8 @@ public:
     // Diagnostic only: the next resume_work refuses as a stale generation. Used to exercise the
     // request-local continuation refusal and peer isolation on device; never set by a normal caller.
     void inject_stale_continuation() { stale_continuation_ = true; }
+    // Diagnostic only: remove only the chosen seat's optional draft certificate, not target state/KV.
+    void inject_absent_draft(int slot);
     void cancel(int slot);
     /// #879: the running slot's state may hold the poison: `complete` must not keep it as a cache when it ends.
     void taint(int slot);
@@ -301,6 +303,10 @@ public:
     bool propose(int slot, const float* residual, std::string& error);
     bool finish(int slot, std::string& error, bool diagnostic = true);
 private:
+    friend struct ResidentDraftReadinessFixture;
+    template<class Token>
+    bool draft_ready(int slot, const core::ConversationCheckpoint* cut, const std::vector<Token>& tokens,
+                     uint64_t expected_request, uint64_t expected_incarnation, std::string& error) const;
     enum class Resources { released, ready, failed };
     struct PreparationSource {
         const core::SavedConversation* image = nullptr;

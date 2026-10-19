@@ -30,6 +30,7 @@ cp::ContinuationInput base() {
     in.needs_stages = true;
     in.has_qsa = in.has_gdn = in.has_ple = in.has_stages = true;
     in.draft_present = true;
+    in.draft_request = in.request;
     in.draft_begin = 40;
     in.draft_end = 90;
     in.draft_frontier = 80;
@@ -124,6 +125,60 @@ int main() {
         boundary.token_at_frontier = 43;
         check(cp::certify_continuation(boundary).refusal == cp::ContinuationRefusal::draft_boundary,
               "a draft boundary token that differs from the prompt is refused");
+        cp::ContinuationInput owner = base();
+        ++owner.draft_request;
+        check(cp::certify_continuation(owner).refusal == cp::ContinuationRefusal::draft_owner,
+              "a present draft owned by another request is refused, not reclassified absent");
+        interval = base();
+        interval.draft_shape_valid = false;
+        check(cp::certify_continuation(interval).refusal == cp::ContinuationRefusal::draft_interval,
+              "an inconsistent completed/materialized/ring extent remains a malformed present draft");
+        interval = base();
+        interval.draft_begin = -1;
+        check(cp::certify_continuation(interval).refusal == cp::ContinuationRefusal::draft_interval,
+              "a negative begin cannot certify a present draft");
+    }
+    {
+        const auto ready = cp::decide_draft_readiness(cp::certify_continuation(base()), 100, 60, 40960);
+        check(ready.ready && ready.reconstruction_priced && ready.residual_rows == 0 &&
+              ready.residual_bytes_known && ready.residual_bytes == 0,
+              "certified nonzero-window reuse has an exact zero reconstruction/scratch price");
+        auto absent = base();
+        absent.draft_present = false;
+        const auto target = cp::certify_continuation(absent);
+        const auto refused = cp::decide_draft_readiness(target, 100, 60, 40960);
+        check(target.certified && !target.draft_ready && !refused.ready &&
+              refused.refusal == cp::ContinuationRefusal::draft_absent,
+              "a valid target without a draft is refused without pretending readiness or replay");
+        check(refused.residual_rows == 40 && refused.residual_bytes_known &&
+              refused.residual_bytes == 1638400 && !refused.reconstruction_priced,
+              "the missing 40 residual rows are bounded but not a priced reconstruction plan");
+        const auto unpriced = cp::decide_draft_readiness(target, 100, 60, 0);
+        check(!unpriced.ready && !unpriced.residual_bytes_known && !unpriced.reconstruction_priced &&
+              unpriced.refusal == cp::ContinuationRefusal::draft_reconstruction_unpriced,
+              "an unknown input-storage price cannot authorize reconstruction");
+        const auto overflow = cp::decide_draft_readiness(target, 100, 60, UINT64_MAX);
+        check(!overflow.ready && !overflow.residual_bytes_known &&
+              overflow.refusal == cp::ContinuationRefusal::draft_reconstruction_unpriced,
+              "overflowing reconstruction input bytes are unknown, never wrapped into a cheap price");
+        const auto uncovered = cp::decide_draft_readiness(cp::certify_continuation(base()), 100, 80, 40960);
+        check(!uncovered.ready && uncovered.refusal == cp::ContinuationRefusal::draft_window &&
+              uncovered.residual_rows == 20 && uncovered.residual_bytes == 819200,
+              "a valid but stale retained window refuses with the missing input lower bound");
+        auto parked = base();
+        parked.committed_tokens = 55249;
+        parked.cut_tokens = -1;
+        parked.draft_begin = parked.draft_frontier = parked.draft_end = 53201;
+        parked.draft_boundary = parked.token_at_frontier = -1;
+        const auto historical = cp::decide_draft_readiness(cp::certify_continuation(parked), 58231, 4096, 40960);
+        check(historical.ready && historical.reconstruction_priced && historical.residual_rows == 0,
+              "the historical completed frontier is preserved, not confused with the target extent");
+        const auto wrong_frontier = cp::decide_draft_readiness(target, 80, 60, 40960);
+        check(!wrong_frontier.ready && wrong_frontier.refusal == cp::ContinuationRefusal::draft_interval,
+              "a resumed frontier must leave an actual prompt token for the next operation");
+        const auto skipped = cp::decide_draft_readiness(target, 1000, 60, 40960);
+        check(!skipped.ready && skipped.residual_rows == 0 && !skipped.reconstruction_priced,
+              "zero presently needed rows do not manufacture a new draft producer certificate");
     }
     std::printf("%s\n", g_fail == 0 ? "continuation_test: all passed" : "continuation_test: FAILED");
     return g_fail == 0 ? 0 : 1;

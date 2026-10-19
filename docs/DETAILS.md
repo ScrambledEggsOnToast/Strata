@@ -4013,6 +4013,25 @@ parked, refused the resend with the diagnostic `ERR`, and saw the peer commit al
 a clean exit. `STRATA_REFUSE_CAPTURE=<n>` similarly refuses that many optional captures before any copy; a
 device check dropped the outgoing snapshot while a peer ran, and the peer committed 64/64 before a clean exit.
 
+Target certification is not optional drafter readiness. Resident resume preflights the same common cut,
+draft producer identity, completed/materialized interval, retained window and boundary token before any
+target or draft copy. An absent draft leaves the target certificate valid but returns request-local
+`draft_readiness=draft_absent`; a stale owner, malformed present interval or mismatched boundary is refused
+as `draft_owner`, `draft_interval` or `draft_boundary`, never downgraded to absence. A valid interval that
+misses the destination's retained window returns `draft_window`. The historical independently completed
+draft frontier may precede the parked target extent; it is still judged at its own frontier.
+
+General reconstruction is not enabled: token IDs and target checkpoints do not contain the per-row final
+multi-stream residuals required to rebuild draft K/V. Refusals report the missing residual-row count and
+its checked byte lower bound; `residual_bytes_known=0` / `draft_reconstruction_unpriced` refuses an unknown
+or overflowing bound. This is not a replay or scratch allowance: `reconstruction_priced=0` and
+`extra_scratch_bytes=unknown` explicitly prevent unpriced work. Certified reuse costs zero reconstruction
+rows and additional scratch. The existing exact-cut snapshot's one-cell catch-up remains supported only
+with its owned boundary residual and preceding certified draft K/V; it cannot recover an absent interval.
+No cold replay, streamed-output replay, target-only fallback or recovery after a shared device fault is added.
+`STRATA_ABSENT_CONTINUATION_DRAFT=<n>` is a disabled-by-default diagnostic that removes only a yielded seat's
+draft certificate before the next resume preflight; it changes neither target state nor peers.
+
 Protected smoke scenarios (not results): use the same pinned full model/tokenizer and supervisor as HET-035,
 an explicit two-slot configuration, `lifecycle_api: true`, queue limit 2 and finite output/context budgets.
 Keep all raw HTTP bodies, lifecycle snapshots, native scheduler traces and exact configuration:

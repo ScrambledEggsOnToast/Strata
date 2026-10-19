@@ -229,17 +229,22 @@ ContinuationCertificate ResidentSlots::certify_continuation(int slot, const core
         return (size_t) slot < stage.slots.size() && stage.slots[(size_t) slot] != nullptr;
     });
     const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : nullptr;
-    if (draft) {
-        const int64_t frontier = draft_.slot_resume_frontier(slot, in.committed_tokens);
-        if (draft_.slot_covers(slot, frontier)) {
-            in.draft_present = true;
-            in.draft_begin = draft_.slot_begin(slot);
-            in.draft_end = std::max(frontier, in.draft_begin);
-            in.draft_frontier = frontier;
-            in.draft_boundary = draft_.slot_next_token(slot);
-            in.token_at_frontier = frontier < (int64_t) state.ids.size()
-                ? state.ids[(size_t) frontier] : in.draft_boundary;
-        }
+    if (draft && draft_.slots_[(size_t) slot].certified) {
+        const auto& chain = draft_.slots_[(size_t) slot];
+        const int64_t cells = cut ? int64_t(cut->ids.size()) : in.committed_tokens;
+        const int64_t frontier = draft_.slot_resume_frontier(slot, cells);
+        // A malformed present certificate is not an absent optional draft.
+        in.draft_present = true;
+        in.draft_request = chain.request;
+        in.draft_shape_valid = chain.completed_cells <= chain.cells && chain.cells <= draft->max_cells &&
+            chain.completed_cells <= in.committed_tokens;
+        in.draft_begin = chain.begin;
+        in.draft_end = chain.completed_cells;
+        in.draft_frontier = frontier;
+        in.draft_boundary = frontier >= 0 && frontier < chain.completed_cells &&
+            frontier < in.committed_tokens ? state.ids[(size_t) frontier] : chain.tail_token;
+        in.token_at_frontier = frontier >= 0 && frontier < in.committed_tokens
+            ? state.ids[(size_t) frontier] : in.draft_boundary;
     }
     ContinuationCertificate certificate = ::strata::program::certify_continuation(in);
     if (std::getenv("STRATA_CONTINUATION_TRACE"))
@@ -250,6 +255,52 @@ ContinuationCertificate ResidentSlots::certify_continuation(int slot, const core
                      (long long) certificate.valid_end, int(certificate.draft_ready));
     if (!certificate.certified && error) *error = std::string("continuation: ") + certificate.reason();
     return certificate;
+}
+
+void ResidentSlots::inject_absent_draft(int slot) {
+    if (!draft_.slot_state(slot)) return;
+    auto& chain = draft_.slots_[(size_t) slot];
+    chain.certified = false;
+    chain.begin = chain.completed_cells = -1;
+    chain.tail_token = -1;
+}
+
+template<class Token>
+bool ResidentSlots::draft_ready(int slot, const core::ConversationCheckpoint* cut,
+        const std::vector<Token>& tokens, uint64_t expected_request, uint64_t expected_incarnation,
+        std::string& error) const {
+    if (draft_.kv_state().max_cells <= 0) return true; // unchanged no-MTP configuration
+    const auto certificate = certify_continuation(slot, cut, expected_request, expected_incarnation);
+    uint64_t row_bytes = 0;
+    if (geometry_.hc > 0 && geometry_.n_embd > 0 &&
+        uint64_t(geometry_.hc) <= UINT64_MAX / sizeof(float) / uint64_t(geometry_.n_embd))
+        row_bytes = uint64_t(geometry_.hc) * uint64_t(geometry_.n_embd) * sizeof(float);
+    auto decision = decide_draft_readiness(certificate, int64_t(tokens.size()), draft_.window_, row_bytes);
+    if (decision.ready && certificate.draft_frontier > certificate.draft_begin) {
+        const auto& source = slots_[(size_t) slot];
+        const int64_t frontier = certificate.draft_frontier;
+        const int32_t boundary = frontier < int64_t(source.ids.size())
+            ? source.ids[(size_t) frontier] : draft_.slot_next_token(slot);
+        if (boundary < 0 || boundary != tokens[(size_t) frontier]) {
+            decision.ready = false;
+            decision.reconstruction_priced = false;
+            decision.refusal = ContinuationRefusal::draft_boundary;
+        }
+    }
+    const bool trace = std::getenv("STRATA_CONTINUATION_TRACE") != nullptr;
+    if (decision.ready && !trace) return true;
+    char detail[640];
+    std::snprintf(detail, sizeof(detail),
+        "draft_readiness=%s target_certified=%d draft_ready=%d residual_rows=%lld "
+        "residual_bytes=%llu residual_bytes_known=%d reconstruction_priced=%d extra_scratch_bytes=%s",
+        decision.reason(), int(certificate.certified), int(decision.ready), (long long) decision.residual_rows,
+        (unsigned long long) decision.residual_bytes, int(decision.residual_bytes_known),
+        int(decision.reconstruction_priced), decision.ready ? "0" : "unknown");
+    if (trace)
+        std::fprintf(stderr, "DRAFT_READINESS slot=%d request=%llu incarnation=%llu %s\n", slot,
+            (unsigned long long) certificate.request, (unsigned long long) certificate.incarnation, detail);
+    if (!decision.ready) error = std::string("resident continuation: ") + detail;
+    return decision.ready;
 }
 
 bool ResidentSlots::retained(int slot) const {
@@ -971,13 +1022,7 @@ bool ResidentSlots::resume_prompt(const ResidentPreparation& lease, const Reside
         return false;
     }
     if (!idle(error)) return false;
-    if (draft_.kv_state().max_cells > 0 &&
-        (draft_.slot_cells(lease.slot) != state.p ||
-         !draft_.slot_covers(lease.slot, state.p, int64_t(state.prompt.size())) ||
-         (state.p > draft_.slot_begin(lease.slot) &&
-          draft_.slot_next_token(lease.slot) != state.prompt[size_t(state.p)]))) {
-        error = "resident prompt: resume draft frontier is not ready"; return false;
-    }
+    if (!draft_ready(lease.slot, nullptr, state.prompt, lease.request, lease.incarnation, error)) return false;
     state.prompt_cursor.suspended = false;
     return true;
 }
@@ -1269,6 +1314,13 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         error = "resident resume: checkpoint is not a retained prefix"; return false;
     }
     const int64_t cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
+    if (draft_.kv_state().max_cells > 0 &&
+        (!working_prompt_ || !draft_ready(slot, checkpoint, *working_prompt_,
+            working_.resume_slot == slot ? working_.request : 0,
+            working_.resume_slot == slot ? slots_[(size_t) slot].incarnation : 0, error))) {
+        if (!working_prompt_) error = "resident resume: missing retained prompt";
+        return false;
+    }
     const bool direct = core::resident_direct_copy_enabled();
     if (direct) work.path(-1, -2); // don't reuse host-bounce cost samples
     for (size_t k = 0; k < stages_.size(); ++k) {
@@ -1301,27 +1353,8 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         }
     }
     if (draft_.kv_state().max_cells > 0) {
-        // A park copies every draft row its slot holds but certifies only the cells the chain completed
-        // (MtpDrafter::save_slot), so the resumed resident prefix can legitimately reach past the end of
-        // the certificate. The interval is therefore judged at its own frontier: asking it to reach the
-        // resident prefix refused a real continuation, and "restoring yielded prefix" ended the engine on
-        // 2026-10-18. The certificate stays - prefill_slot only advances a certified slot - and the read
-        // that follows re-opens an interval at this frontier, exactly as a gap below `begin` starts one
-        // (mtp.cpp slot_covers).
-        const auto& chain = draft_.slots_[(size_t) slot];
-        const int64_t frontier = chain.certified ? draft_.slot_resume_frontier(slot, cells) : cells;
-        if (chain.certified &&
-            (!working_prompt_ || !draft_.slot_covers(slot, frontier, (int64_t) working_prompt_->size()))) {
-            error = "resident resume: draft interval does not cover this prompt"; return false;
-        }
-        if (chain.certified && frontier > draft_.slot_begin(slot)) {
-            const auto& ids = slots_[(size_t) slot].ids;
-            const int32_t boundary = frontier < (int64_t) ids.size() ? ids[(size_t) frontier] :
-                draft_.slot_next_token(slot);
-            if (boundary < 0 || boundary != (*working_prompt_)[(size_t) frontier]) {
-                error = "resident resume: draft boundary token does not match this prompt"; return false;
-            }
-        }
+        // Keep the historical independently completed frontier; draft_ready preflights its certificate,
+        // prompt window and boundary before any target/draft copy or destination owner mutation.
         const auto* from = draft_.slot_state(slot);
         std::array<uint64_t, 5> parts{};
         if (!from || !core::conversation_kv_part_sizes(*from, geometry_, cells, false, parts, error)) return false;

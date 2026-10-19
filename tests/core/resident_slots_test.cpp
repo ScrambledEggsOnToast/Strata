@@ -10,6 +10,112 @@
 #include <cstdio>
 #include <type_traits>
 
+namespace strata::program {
+struct ResidentDraftReadinessFixture {
+    template<class Check> static void run(Check&& check) {
+        core::ModelGeometry geometry;
+        geometry.n_layers = 0; // no-load target with no model-required state families
+        core::SessionOwner main, a, b;
+        core::Verifier verifier;
+        core::MtpDrafter draft;
+        prefill::Prefill prompt;
+        core::ExpertDispatch dispatch;
+        dispatch.completion.emplace_back(core::ExpertCompletion::kCapacity);
+        const core::ExpertOperation peer_operation{23, 1, 51, 9, 1};
+        check(dispatch.completion[0].begin(peer_operation, 0), "a peer owns its own live operation");
+        ResidentStage stage{&main.state(), &verifier, {&a.state(), &b.state()}, -1};
+        ResidentSlots slots(geometry, {stage}, draft, prompt, dispatch, 64, true, 6, 4096);
+        slots.resources_ = ResidentSlots::Resources::ready;
+        auto& source = slots.slots_[0];
+        source.request = 17; source.incarnation = 3; source.cached = source.partial = true;
+        source.input.scope.value[0] = 1;
+        for (int token = 100; token < 148; ++token) source.prompt.push_back(token);
+        source.ids.assign(source.prompt.begin(), source.prompt.begin() + 16);
+        source.p = 16;
+        std::vector<int64_t> tokens(source.prompt.begin(), source.prompt.end());
+        slots.working_.request = 17; slots.working_.resume_slot = 0;
+        slots.input_ = source.input; slots.working_prompt_ = &tokens;
+        auto& peer = slots.slots_[1];
+        peer.request = 23; peer.incarnation = 9; peer.active = true;
+        peer.ids = {21, 22, 23}; peer.p = 3; peer.produced = 2; peer.sampling.seed = 99;
+        peer.prompt_cursor.operation = 51;
+        dispatch.slot_requests[0] = 17; dispatch.slot_requests[1] = 23;
+        draft.st_.max_cells = 64; draft.window_ = 40;
+        draft.slots_.resize(2);
+        auto& chain = draft.slots_[0];
+        chain.state.max_cells = 64; chain.request = 17; chain.certified = true;
+        chain.begin = 8; chain.cells = chain.completed_cells = 16; chain.prompt_len = 48;
+        chain.tail_token = 116;
+        auto& peer_chain = draft.slots_[1];
+        peer_chain.request = 23; peer_chain.certified = true;
+        peer_chain.begin = 0; peer_chain.cells = peer_chain.completed_cells = 3;
+        peer_chain.tail_token = 24;
+        std::string error;
+        check(decide_draft_readiness(slots.certify_continuation(0), 48, 40, 40960).ready,
+              "a certified target and a nonzero valid draft interval are ready without reconstruction");
+        const auto unchanged = [&] {
+            return source.request == 17 && source.incarnation == 3 && source.partial && !source.failed &&
+                source.ids.size() == 16 && source.ids.front() == 100 && source.ids.back() == 115 &&
+                source.p == 16 && peer.request == 23 && peer.incarnation == 9 && peer.active && !peer.failed &&
+                peer.ids == std::vector<int32_t>({21, 22, 23}) && peer.p == 3 && peer.produced == 2 &&
+                peer.sampling.seed == 99 && peer.prompt_cursor.operation == 51 &&
+                dispatch.slot_requests[0] == 17 && dispatch.slot_requests[1] == 23 &&
+                dispatch.completion[0].active() && peer_chain.request == 23 && peer_chain.certified &&
+                peer_chain.cells == 3 && peer_chain.completed_cells == 3 && peer_chain.tail_token == 24;
+        };
+        const auto refused = [&](const char* reason) {
+            PrefixWork work{123, 456};
+            error.clear();
+            check(!slots.resume_work(0, nullptr, work, error) && work.bytes == 0 && work.route == 0 &&
+                  error.find(reason) != std::string::npos,
+                  "readiness refusal happens before target/draft pricing, writes or owner mutation");
+            check(unchanged(), "refusal preserves target identity/history and the peer's state/operation witness");
+        };
+        slots.inject_absent_draft(0);
+        check(slots.certify_continuation(0).certified && !slots.certify_continuation(0).draft_ready,
+              "removing optional draft readiness leaves the target cut certified");
+        refused("draft_readiness=draft_absent");
+        check(error.find("residual_rows=8 residual_bytes=327680") != std::string::npos &&
+              error.find("reconstruction_priced=0 extra_scratch_bytes=unknown") != std::string::npos,
+              "the request receives missing-input work/storage bounds, not an invented zero scratch quote");
+        chain.certified = true; chain.begin = 8; chain.completed_cells = 16; chain.tail_token = 116;
+        chain.request = 18;
+        refused("draft_readiness=draft_owner");
+        chain.request = 17; chain.completed_cells = 17;
+        refused("draft_readiness=draft_interval");
+        chain.completed_cells = 16; chain.begin = 17;
+        refused("draft_readiness=draft_interval");
+        chain.begin = 8; chain.tail_token = 999;
+        refused("draft_readiness=draft_boundary");
+        check(error.find("draft_ready=0") != std::string::npos &&
+              error.find("reconstruction_priced=0 extra_scratch_bytes=unknown") != std::string::npos,
+              "a wrong boundary never advertises a priced reconstruction with unknown scratch");
+        chain.tail_token = 116; chain.begin = 9;
+        refused("draft_readiness=draft_window");
+        chain.begin = 8; tokens.resize(16);
+        refused("draft_readiness=draft_interval");
+        tokens.assign(source.prompt.begin(), source.prompt.end());
+        core::ConversationCheckpoint cut;
+        cut.ids.assign(source.ids.begin(), source.ids.begin() + 12);
+        const auto rewind = slots.certify_continuation(0, &cut, 17, 3);
+        check(rewind.certified && rewind.draft_frontier == 12 && rewind.draft_end == 16,
+              "a checkpoint rewind validates at its own frontier, not the live draft endpoint");
+        source.preparing = source.stop = true; source.cached = false;
+        ResidentPreparation lease;
+        lease.slot = 0; lease.request = 17; lease.incarnation = 3; lease.endpoint = 47;
+        lease.stages[0] = &a.state(); lease.allocations[0] = a.state().allocation_id = 1;
+        slots.preparations_[0].ready = true;
+        ResidentPromptCursor cursor;
+        check(!slots.resume_prompt(lease, cursor, error) && source.stop && source.preparing && peer.active,
+              "cancellation while preparing wins before readiness work or another operation is issued");
+        source.request = 18; source.incarnation = 4;
+        check(!slots.resume_prompt(lease, cursor, error) && source.request == 18 && peer.request == 23,
+              "a stale readiness completion cannot claim a successor's seat incarnation");
+        check(dispatch.completion[0].release(peer_operation), "the untouched peer drains its own operation");
+    }
+};
+} // namespace strata::program
+
 int main() {
     using namespace strata;
     static_assert(!std::is_move_constructible_v<program::ResidentSlots>);
@@ -31,6 +137,7 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    program::ResidentDraftReadinessFixture::run(check);
     check(slots.identity(0).request == 0 && slots.identity(0).incarnation == 0 &&
           slots.identity(-1).request == 0 && slots.identity(2).request == 0,
           "unbound and nonexistent seats expose no request identity");

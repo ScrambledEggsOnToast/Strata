@@ -35,7 +35,7 @@
 #include <vector>
 
 namespace strata::prefill { class Prefill; }
-namespace strata::program { class ResidentSlots; }
+namespace strata::program { class ResidentSlots; struct ResidentDraftReadinessFixture; }
 
 namespace strata::core {
 
@@ -248,6 +248,7 @@ public:
 private:
     friend class strata::prefill::Prefill;
     friend class strata::program::ResidentSlots;
+    friend struct strata::program::ResidentDraftReadinessFixture;
     friend struct MtpDrafterCertificationFixture;
     friend struct MtpDraftFrontierFixture;
     friend struct MtpResumedParkFixture;

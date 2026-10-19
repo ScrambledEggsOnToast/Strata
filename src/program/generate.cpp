@@ -20134,6 +20134,14 @@ int main(int argc, char** argv) {
                     --stale_continuation;
                     resident.inject_stale_continuation();
                 }
+                static int absent_draft = [] {
+                    const char* value = std::getenv("STRATA_ABSENT_CONTINUATION_DRAFT");
+                    return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+                }();
+                if (absent_draft > 0) {
+                    --absent_draft;
+                    resident.inject_absent_draft(yielded_source);
+                }
                 bool refused_by_injection = false;
                 if (refuse_yielded_resume > 0) {
                     --refuse_yielded_resume;
