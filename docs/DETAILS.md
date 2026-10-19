@@ -3519,6 +3519,35 @@ independent per-request packing policy validated before admission and forwarded 
 effect while packed prefill is off. A gateway that preserves unknown request fields (the Koko route does)
 passes it through unchanged; it is not inferred from the model name.
 
+#### Experimental retained resident prompt
+
+`STRATA_RETAINED_PROMPT=1` reuses the tagged private-preparation lifecycle without enabling union-row packing
+or retained-layer execution. It requires the same fixed 2,048-row, text-only, batch-MTP, fully resident stage
+allocation; unsupported compositions refuse rather than reclaiming expert slots. The no-load execution plan
+reports allocation-conditional in-place suspension, and `EPLAN`/`INFO retained_prompt=1 retained_prompt_version=1`
+after allocation report the validated capability. The default and legacy `GEN`/`BGEN` route are unchanged.
+
+The frontend serializes and submits the input once, releases admission control at `BACK`, and retains its
+generator, request deadline, output budget and physical-seat claim until one tagged `BQDONE`. After an arithmetic
+chunk and all stage/residual/MTP consumers drain, `BQSUSPEND` names the request/incarnation, physical owner,
+committed cursor, original plan/grid, pending split and operation generation. `BQRESUME` returns only that cursor;
+successful preflight emits nonterminal `BQRESUMED`. This cursor echo adds a frontend round trip per suspended
+chunk; it is not a zero-cost or independent-reader claim. No `YIELDED`, `DONE cancel`, `BADM`, prompt resend or
+seat-to-working restoration is part of this lifecycle. Native token histories, allocation generations and
+checkpoint seams remain with the preparing seat; operation scratch and events stay with their existing owners.
+
+Resumption checks identity, exact frontier/plan/split, stage/session/allocation ownership, last drained operation
+and draft readiness before mutation. Stale identities/tags and late duplicate echoes cannot cancel a successor
+or an issued final tail. A matching suspended owner with a refused cursor drains and emits one `BQDONE refused`;
+the frontend fails only that request. Cancellation before final issuance aborts the preparation at a drained
+seam; after final verifier issuance, mandatory MTP catch-up precedes release. Original short segments retain
+known-input verifier windows (no sampled output), and the final sampled verifier/MTP tail is unchanged.
+
+Admission explicitly prices retained prompt vectors, cursor/allocation descriptors, owner canaries, bounded
+command/handoff storage and checkpoint staging. There is no second device prompt arena or suspension snapshot.
+`RETAINED_PROMPT event=stage` reports executed per-stage intervals; ordinary token uploads/checkpoints are
+distinct from admission/restore movement counted by `STRATA_ADMISSION_COPY_BYTES`.
+
 #### Experimental segmented packed prefill
 
 `STRATA_PACKED_PREFILL=1` is an exact, default-off native switch. It requires serving with one to four

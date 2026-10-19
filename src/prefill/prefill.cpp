@@ -935,6 +935,7 @@ struct Prefill::Impl {
     std::array<uint64_t, kPrefillOwners> owner_requests{};
     std::array<uint64_t, kPrefillOwners> owner_incarnations{};
     std::array<core::SessionState*, kPrefillOwners> owner_sessions{};
+    std::array<uint64_t, kPrefillOwners> owner_allocations{}, owner_execution{};
     uint64_t execution = 0;
     uint64_t segment_pack = 0;
     struct Handoff {
@@ -1560,7 +1561,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     m.initialized = m.canary.init(err);
-    if (m.initialized && packed_prefill_enabled())
+    if (m.initialized && private_preparation_enabled())
         for (auto& witness : m.owner_canary)
             if (!witness.init(err)) { m.initialized = false; break; }
     return m.initialized;
@@ -3282,6 +3283,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     owner, stage_of(owner), execution, owner.position + owner.rows, err)) return false;
         }
         return true;
+    };
+    const auto trace_interval = [&](int64_t begin, int64_t end) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("STRATA_PROMPT_INTERVAL_TRACE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (enabled && !segmented)
+            std::fprintf(stderr, "PROMPT_INTERVAL request=%llu owner=working allocation=%llu "
+                                 "layer_begin=%lld layer_end=%lld from=%lld to=%lld mode=bulk\n",
+                         (unsigned long long)m.bound_request, (unsigned long long)ss.allocation_id,
+                         (long long)stage_lb_, (long long)stage_le_, (long long)begin, (long long)end);
     };
     int wmma_cc = 0;
 #if !defined(STRATA_USE_HIP)
@@ -5917,6 +5929,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!m.gemm.collect_native_profile(err)) return false;
             if (pt.attribution) pt.attribution->download_end = prefill_host_ns();
             pt.fold();   // the existing hand-off sync completed every mark; no new synchronization
+            trace_interval(p0, p0 + T);
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (segmented ? !stage_complete() : (on_stage_chunk && !on_stage_chunk(p0 + T, err))) return false;
@@ -6017,6 +6030,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const auto toc2 = Clock::now();
             if (pt.attribution) pt.attribution->finish_sync_end = prefill_host_ns();
             pt.fold();   // use the chunk's existing completion join, including timing-only observation
+            trace_interval(p0, p0 + T);
             if (segmented ? !stage_complete() : (on_stage_chunk && !on_stage_chunk(p0 + T, err))) return false;
             m.callback_thread = std::this_thread::get_id();
             if (segmented) {
@@ -6233,7 +6247,7 @@ bool Prefill::reserve_uploads(int64_t T) {
 
 bool Prefill::bind_owner(int slot, uint64_t request, uint64_t incarnation,
                         const std::array<core::SessionState*, 4>& sessions, std::string& err) {
-    if (!packed_prefill_enabled() || slot < 0 || slot >= kPrefillOwners || !request || !incarnation ||
+    if (!private_preparation_enabled() || slot < 0 || slot >= kPrefillOwners || !request || !incarnation ||
         !context_idle(err)) {
         if (err.empty()) err = "prefill: packed owner bind requires an idle initialized owner";
         return false;
@@ -6258,7 +6272,36 @@ bool Prefill::bind_owner(int slot, uint64_t request, uint64_t incarnation,
         stage->impl_->owner_requests[slot] = request;
         stage->impl_->owner_incarnations[slot] = incarnation;
         stage->impl_->owner_sessions[slot] = sessions[index];
+        stage->impl_->owner_allocations[slot] = sessions[index]->allocation_id;
+        stage->impl_->owner_execution[slot] = 0;
     }
+    return true;
+}
+
+bool Prefill::validate_owner(int slot, uint64_t request, uint64_t incarnation,
+        const std::array<core::SessionState*, 4>& sessions, const std::array<uint64_t, 4>& allocations,
+        uint64_t operation, std::string& err) const {
+    if (slot < 0 || slot >= kPrefillOwners || !request || !incarnation || !context_idle(err)) {
+        if (err.empty()) err = "prefill: invalid retained owner";
+        return false;
+    }
+    size_t index = 0;
+    for (const Prefill* stage = this; stage; stage = stage->next_, ++index) {
+        const auto& arena = *stage->impl_;
+        const auto* state = index < sessions.size() ? sessions[index] : nullptr;
+        if (!arena.initialized || arena.borrowed || arena.poisoned || !state || state == arena.original_ss ||
+            arena.owner_sessions[slot] != state || arena.owner_requests[slot] != request ||
+            arena.owner_incarnations[slot] != incarnation || arena.owner_execution[slot] != operation ||
+            !allocations[index] || arena.owner_allocations[slot] != allocations[index] ||
+            state->allocation_id != allocations[index] || state->allocation_device != arena.device ||
+            state->layer_lo != stage->stage_lb_ || state->layer_hi != stage->stage_le_) {
+            err = "prefill: retained owner allocation or operation generation changed"; return false;
+        }
+    }
+    for (; index < sessions.size(); ++index)
+        if (sessions[index] || allocations[index]) {
+            err = "prefill: retained owner has a foreign trailing stage"; return false;
+        }
     return true;
 }
 
@@ -6266,7 +6309,7 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
                                      const std::function<bool()>& command_pending) {
     SegmentedResult result;
     err.clear();
-    if (!packed_prefill_enabled() || !owners || count < 1 || count > kPrefillOwners ||
+    if (!private_preparation_enabled() || !owners || count < 1 || count > kPrefillOwners ||
         !on_segment || !on_segment_stage || !context_idle(err)) {
         if (err.empty()) err = "prefill: segmented execution requires 1..4 prepared owners and lifecycle callbacks";
         return result;
@@ -6287,6 +6330,7 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
                 arena.owner_requests[input.slot] != input.request || !state || state == arena.original_ss ||
                 arena.owner_incarnations[input.slot] != input.incarnation || arena.owner_sessions[input.slot] != state ||
                 !state->allocation_id || state->allocation_device != arena.device ||
+                arena.owner_allocations[input.slot] != state->allocation_id ||
                 state->layer_lo != stage->stage_lb_ || state->layer_hi != stage->stage_le_ ||
                 state->k != arena.ss->k || state->gdn_alloc != arena.ss->gdn_alloc ||
                 state->gdn_ord0 != arena.ss->gdn_ord0 || state->qsa_alloc != arena.ss->qsa_alloc ||
@@ -6382,6 +6426,10 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
     for (Prefill* stage = this; stage; stage = stage->next_)
         stage->impl_->gemm.flush_native_profile(okay);
     if (!okay) result.completion = PrefillCompletion::failed;
+    if (okay) for (int i = 0; i < count; ++i)
+        if (result.touched & (uint32_t(1) << i))
+            for (Prefill* stage = this; stage; stage = stage->next_)
+                stage->impl_->owner_execution[owners[i].slot] = result.execution;
     return result;
 }
 

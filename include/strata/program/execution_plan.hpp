@@ -39,6 +39,9 @@ struct ExecutionPlanInput {
     int suffix_draft = 0, lookup_chain = 0;
     bool adapt_async = false, mtp_serial = false;
     bool resident_multiplex = false, prompt_cache = false, packed_prefill = false, retained_prefill = false;
+    bool retained_prompt = false; ///< serial private preparation, independent of union-row/layer experiments
+    int64_t prefill_chunk = 2048;
+    bool private_preparation_static = true; ///< fixed text owners; no auto/elastic/adaptive/helper/judge composition
     double foreground_budget_ms = 0, background_share = 0.25;
     bool piped_concurrent = false;
     bool judge_lane = false, spec_split = false, prefill_pipe = false;
@@ -69,6 +72,7 @@ struct ExecutionPlan {
     ProposalShape proposal = ProposalShape::none;
     PlanDecision lookup;             ///< on only where the selected execution path consumes the suffix drafter
     PlanDecision budget;
+    Suspension suspension_mode = Suspension::none;
     PlanDecision concurrent_reader;
     PlanDecision suspension;         ///< on == the request keeps its seat without a resend
     std::vector<PricedClass> memory_classes;  ///< filled after admission; empty before allocation
@@ -192,7 +196,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         p.budget.support = Support::refused;
         p.budget.reason = p.refusal;
     } else if (in.foreground_budget_ms > 0) {
-        const int min_slots = in.packed_prefill ? 1 : 2;
+        const int min_slots = in.packed_prefill || in.retained_prompt ? 1 : 2;
         if (!in.serve) p.budget.reason = "a positive budget needs --serve";
         else if (p.batch_slots < min_slots) p.budget.reason = "a positive budget needs --batch >= " + std::to_string(min_slots);
         else if (!in.prompt_cache) p.budget.reason = "a positive budget needs --prompt-cache > 0";
@@ -205,6 +209,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     if (in.piped_concurrent) {
         if (p.batch_slots <= 0) p.concurrent_reader.reason = "--batch";
         else if (in.packed_prefill) p.concurrent_reader.reason = "packed prefill";
+        else if (in.retained_prompt) p.concurrent_reader.reason = "retained prompt";
         else if (in.retained_prefill) p.concurrent_reader.reason = "retained prefill";
         else if (in.batch_mtp || in.batch_mtp_pipeline) p.concurrent_reader.reason = "batched MTP";
         else if (in.resident_multiplex) p.concurrent_reader.reason = "--resident-multiplex";
@@ -218,11 +223,32 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     }
 
     // ---- prompt suspension --------------------------------------------------------------------------------
-    if (in.packed_prefill) {
+    if (in.retained_prompt) {
+        std::string refusal;
+        if (!in.serve) refusal = "retained prompt needs --serve";
+        else if (p.batch_slots < 1 || p.batch_slots > 4) refusal = "retained prompt needs 1..4 resident slots";
+        else if (!in.mtp_configured || !in.batch_mtp || p.spec < 2)
+            refusal = "retained prompt needs batch MTP and --spec >= 2";
+        else if (in.packed_prefill || in.retained_prefill)
+            refusal = "retained prompt excludes packed and retained-layer execution";
+        else if (in.prefill_chunk != 2048 || !in.private_preparation_static)
+            refusal = "retained prompt needs fixed 2048 scratch and static text owners";
+        if (!refusal.empty()) {
+            p.refused = true; p.refusal = refusal;
+            p.suspension.support = Support::refused; p.suspension.reason = refusal;
+        } else {
+            p.suspension_mode = Suspension::in_place;
+            p.suspension.support = Support::conditional;
+            p.suspension.reason = "serial private preparation retains its plan without resending input; "
+                                  "pending stage allocation and complete residency validation";
+        }
+    } else if (in.packed_prefill) {
         p.suspension.support = Support::on;
+        p.suspension_mode = Suspension::in_place;
         p.suspension.reason = "packed preparation keeps its destination and frontier";
     } else if (p.batch_slots > 0) {
         p.suspension.support = Support::conditional;
+        p.suspension_mode = Suspension::resend;
         p.suspension.reason = "a yield parks the seat and the frontend resends the retained prompt";
     } else {
         p.suspension.reason = "single-request serving has no yield boundary";
@@ -237,7 +263,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         if (!p.refusal.empty()) { p.refused = true; p.concurrent_reader.support = Support::off; }
     }
     if (!p.refused && in.batch_mtp) {
-        const int min_slots = in.packed_prefill ? 1 : 2;
+        const int min_slots = in.packed_prefill || in.retained_prompt ? 1 : 2;
         if (p.batch_slots < min_slots) p.refusal = "--batch-mtp needs --batch " + std::to_string(min_slots) + " or more";
         else if (!in.mtp_configured) p.refusal = "--batch-mtp needs --mtp";
         else if (p.spec < 2) p.refusal = "--batch-mtp needs --spec T (T >= 2)";
@@ -315,8 +341,7 @@ inline std::string ExecutionPlan::to_json() const {
     out += ",\"budget\":" + detail::decision_json(budget);
     out += ",\"concurrent_reader\":" + detail::decision_json(concurrent_reader);
     out += ",\"suspension\":{\"mode\":";
-    out += detail::json_quote(suspension.support == Support::on ? "in_place"
-                              : suspension.support == Support::conditional ? "resend" : "none");
+    out += detail::json_quote(suspension_name(suspension_mode));
     out += ",\"support\":";
     out += detail::json_quote(support_name(suspension.support));
     out += ",\"reason\":";

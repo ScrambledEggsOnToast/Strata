@@ -4,6 +4,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/program/prefix_selection.hpp"
 #include "strata/program/continuation.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -56,6 +57,38 @@ void apply_request_sampling(const ResidentWorking& owner, Verifier& verifier, Ve
     if (draft) draft->set_draft_sampling(owner.sampling);
 }
 
+// Value-only continuation of private preparation. The resident seat owns it;
+// scratch/events stay with Prefill, whose complete-chain drain precedes suspension.
+struct ResidentPromptCursor {
+    core::ConversationCheckpoint::PromptPlan plan;
+    uint64_t plan_id = 0, operation = 0;
+    int64_t next = 0, split_until = 0;
+    bool suspended = false;
+    bool windows = false; // original short segment: known-input private verifier rows, never sampled output
+
+    int64_t interval_end() const {
+        if (plan.chunk <= 0 || next < plan.from || next >= plan.to) return next;
+        return split_until > next ? std::min(next + 1024, split_until) :
+            next + std::min(plan.chunk, plan.to - next);
+    }
+    bool matches(const ResidentPromptCursor& other) const {
+        return plan_id && plan_id == other.plan_id && operation == other.operation &&
+            next == other.next && split_until == other.split_until &&
+            plan.from == other.plan.from && plan.to == other.plan.to && plan.chunk == other.plan.chunk &&
+            plan.lend == other.plan.lend && plan.pipe == other.plan.pipe &&
+            plan.single == other.plan.single && plan.chunked == other.plan.chunked && windows == other.windows;
+    }
+    bool valid(int64_t frontier, int64_t endpoint) const {
+        if (!plan_id || plan.chunk < 1 || plan.from < 0 || plan.from > frontier ||
+            plan.to <= plan.from || plan.to > endpoint || frontier > plan.to || next != frontier) return false;
+        if (split_until)
+            return plan.chunk == 2048 && split_until > frontier && split_until <= plan.to &&
+                (split_until - frontier == 1024 || split_until - frontier == 2048) &&
+                (split_until - plan.from) % plan.chunk == 0;
+        return frontier == plan.to || (frontier - plan.from) % plan.chunk == 0;
+    }
+};
+
 // Read-only to the scheduler. The vector objects and graph-referenced sessions
 // never move while bound. Token storage is reserved once per admitted slot.
 struct ResidentSlot {
@@ -76,6 +109,7 @@ struct ResidentSlot {
     bool partial = false, partial_from0 = false;
     int64_t prefill_split_until = 0; // pending second 1024 of the original selected 2048-token interval
     core::ConversationCheckpoint::PromptPlan prefill_plan; // pending plan of a partial handoff; consumed on resume
+    ResidentPromptCursor prompt_cursor; // retained private preparation; never a legacy parked alias
     bool failed = false;
     // #879: a window met non-finite logits while this slot was running: its state may have started from the
     // poisoned state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends.
@@ -86,6 +120,7 @@ struct ResidentSlot {
         active = preparing = false;
         prefill_split_until = 0;
         prefill_plan = {};
+        prompt_cursor = {};
         cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed && !tainted;
     }
     // Metadata handoff after a successful drained restore. Foreign identities
@@ -148,6 +183,7 @@ struct ResidentPreparation {
     uint64_t request = 0, incarnation = 0;
     int64_t position = 0, endpoint = 0;
     std::array<core::SessionState*, 4> stages{};
+    std::array<uint64_t, 4> allocations{}; // exact independently owned stage allocation generations
 };
 
 struct ResidentPrepareInput {
@@ -235,6 +271,12 @@ public:
     bool checkpoint(const ResidentPreparation& lease, core::ConversationCheckpoint& cut, std::string& error);
     bool first_token(const ResidentPreparation& lease, int32_t next, const float* residual, std::string& error);
     bool abort_preparation(const ResidentPreparation& lease, std::string& error);
+    // Plan installation and suspend/resume are preflight-only until every owner,
+    // allocation, frontier and draft check succeeds. Refusal never taints a peer.
+    bool plan_prompt(const ResidentPreparation& lease, const ResidentPromptCursor& cursor, std::string& error);
+    bool suspend_prompt(const ResidentPreparation& lease, uint64_t operation,
+                        ResidentPromptCursor& cursor, std::string& error);
+    bool resume_prompt(const ResidentPreparation& lease, const ResidentPromptCursor& cursor, std::string& error);
     bool park(int slot, const std::vector<int32_t>& prefix, const ResidentAdmission& request,
               bool from_start, std::string& error);
     // No transfers, synchronization or owner mutation. Prices the selected

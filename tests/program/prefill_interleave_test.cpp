@@ -5,6 +5,7 @@
 #include "strata/program/serve_controls.hpp"
 #include "strata/program/phase_receipts.hpp"
 #include "strata/program/checkpoint_preservation.hpp"
+#include "strata/program/execution_plan.hpp"
 #include "strata/core/expert_source.hpp"
 
 #include <chrono>
@@ -51,6 +52,7 @@ struct ResidentAdmission {
     const float* residual = nullptr;
     int64_t checkpoint_limit = -1;
     int64_t prefill_split_until = 0;
+    ConvCheckpoint::PromptPlan prefill_plan;
 };
 }
 // The narrow parking sink records the production lambda's chosen frontier;
@@ -494,7 +496,8 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     bool capture_device_fault = false;   // #252: the park source's own class, set by a failed device sync
     // #255 ambient names: the concurrent reader is off here, but its code is part of the extracted read_part.
     const bool conc_env = false;
-    const bool packed_prefill = false, batch_mtp = false, batch_mtp_pipeline = false;
+    const bool private_preparation = false, batch_mtp = false, batch_mtp_pipeline = false;
+    const strata::program::ExecutionPlan execution_plan;
     std::condition_variable in_cv;
     bool use_mtp = false;
     struct MtpStub { bool reserve_prefill(int64_t, std::string&) { return true; } } mtp;

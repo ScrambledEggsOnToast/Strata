@@ -58,6 +58,8 @@ if "--says-multiplex" in args:
 print("INFO score=1 score_version=1 score_max_prompt=4096 score_max_selected=256 score_max_pending=8", flush=True)
 if "--packed" in args:
     print("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4", flush=True)
+if "--retained" in args:
+    print("INFO retained_prompt=1 retained_prompt_version=1 retained_prompt_owners=4", flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
 if "--says-spec" in args:
@@ -94,12 +96,22 @@ def legacy_done(slot, produced, finish, counts=""):
 # NFSLOT ends its slot with BDONE ... nonfinite after its second token
 fired, nf_slots = set(), set()
 packed, packed_cache, packed_serial = {}, {}, 0
+retained_positions, retained_waiting, retained_resumed = {}, {}, set()
 def packed_window():
     for b, owner in list(packed.items()):
         tag, request, incarnation, ids, limit, tokens, generated, cancelled, scope, reuse = owner
         if not cancelled and hold and os.path.exists(hold):
             continue
         prefix = f"{tag} {b} {request} {incarnation}"
+        if not cancelled and "--retained" in args and len(ids) > 33 and tag not in retained_resumed:
+            if tag not in retained_waiting:
+                position = max(32, reuse)
+                retained_positions[tag] = position
+                cursor = f"{prefix} {position} 1 1 0 {len(ids) - 1} 32 0"
+                retained_waiting[tag] = cursor
+                print(f"BQPP {prefix} {position} {len(ids)} {position - reuse}", flush=True)
+                print(f"BQSUSPEND {cursor} chunk", flush=True)
+            continue
         if cancelled:
             finish = "cancel"
         else:
@@ -109,7 +121,7 @@ def packed_window():
             print(f"BQT {tag} {b} {wire_request} {incarnation} {token}", flush=True)
             finish = "stop" if token == 257 else "length" if len(generated) >= limit else None
         if finish:
-            read = len(ids) - reuse if generated else 0
+            read = len(ids) - reuse if generated else retained_positions.get(tag, reuse) - reuse
             print(f"BQDONE {prefix} {len(generated)} {len(ids)} 5 1 {finish} 0 0 {reuse} prompt_read={read}", flush=True)
             if generated:
                 packed_cache[b] = (scope, list(map(int, ids)) + generated[:-1])
@@ -187,6 +199,24 @@ while True:
         owner = packed.get(slot)
         if owner and owner[0] == tag and ((request, incarnation) == (0, 0) or (request, incarnation) == tuple(owner[1:3])):
             owner[7] = True
+        continue
+    if line.startswith("BQRESUME "):
+        fields = line.split()
+        tag, slot = fields[1], int(fields[2])
+        owner = packed.get(slot)
+        if owner and owner[0] == tag:
+            cursor = retained_waiting[tag]
+            expected = cursor.split()
+            assert fields[1:] == expected[:7] + [expected[10]], line
+            if log:
+                log.write(line + "\n"); log.flush()
+            if "--retained-refuse" in args:
+                fresh = retained_positions[tag] - owner[9]
+                print(f"BQDONE {' '.join(expected[:4])} 0 {len(owner[3])} 5 1 refused 0 0 {owner[9]} prompt_read={fresh}", flush=True)
+                del packed[slot]
+            elif "--hold-resume" not in args:
+                print(f"BQRESUMED {cursor} client", flush=True)
+                retained_resumed.add(tag)
         continue
     if line.startswith("BGENQ1 "):
         fields = line.split()
@@ -2402,6 +2432,107 @@ class PackedTransport(unittest.TestCase):
                 return
             time.sleep(.005)
         self.fail("packed transport did not reach its bounded condition")
+
+    def test_retained_resume_submits_input_once_and_keeps_one_output_budget(self):
+        self.start(2, more=("--retained",))
+        response = self.chat("retained " * 20 + "LONGREPLY", max_tokens=8)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(response["usage"]["completion_tokens"], 8)
+        submitted = [line for line in lines if line.startswith("BGENQ ")]
+        resumed = [line for line in lines if line.startswith("BQRESUME ")]
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(submitted[0].split()[1:3], resumed[0].split()[1:3])
+        self.assertEqual(len([line for line in lines if line.startswith("BQDONE ")]), 1)
+        self.assertFalse(any(line.startswith(("GEN ", "BGEN ", "BYIELD ")) for line in lines))
+        self.assertTrue(self.engine.alive())
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_retained_without_budget_waits_for_a_physical_slot(self):
+        with tempfile.TemporaryDirectory() as root:
+            hold = Path(root) / "replies-held"
+            hold.touch()
+            self.start(2, more=("--retained", "--hold-replies", str(hold)))
+            self.assertEqual(self.engine.info.get("retained_prompt"), 1)
+            self.assertNotEqual(self.engine.info.get("packed_prefill"), 1)
+            self.assertEqual(self.engine.foreground_budget_s, 0)
+            results, errors = {}, []
+            waiting, waiter_done = threading.Event(), threading.Event()
+            def phase(value):
+                if value == "physical_slot_wait":
+                    waiting.set()
+            def request(index):
+                try:
+                    sampling = {"_strata_cache_scope": "a" * 64}
+                    if index == 2:
+                        sampling["_strata_frontend_phase"] = phase
+                    results[index] = [token for token in self.engine.generate_batched(
+                        [65, 66, 67 + index], 3, sampling, threading.Event()) if token is not None]
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    if index == 2:
+                        waiter_done.set()
+            threads = [threading.Thread(target=request, args=(index,)) for index in range(3)]
+            try:
+                for thread in threads[:2]:
+                    thread.start()
+                self.wait_until(lambda: len(self.engine.packed_q) == 2 and
+                                all(owner["identity"] is not None for owner in self.engine.packed_q.values()))
+                self.assertTrue(all(self.engine.slot_busy))
+                threads[2].start()
+                self.wait_until(lambda: waiting.is_set() or waiter_done.is_set())
+                self.assertEqual(errors, [], "a full retained engine must wait, not lose its reservation")
+                self.assertTrue(waiting.is_set())
+                self.assertFalse(waiter_done.is_set())
+                self.assertFalse(self.engine.ctl.locked())
+                self.assertEqual(self.log.read_text().count("BGENQ "), 2)
+            finally:
+                hold.unlink(missing_ok=True)
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual({index: len(tokens) for index, tokens in results.items()}, {0: 3, 1: 3, 2: 3})
+            self.assertEqual(self.log.read_text().count("BGENQ "), 3)
+            self.assertTrue(self.engine.alive())
+            self.assertFalse(any(self.engine.slot_busy))
+            self.assertFalse(self.engine.packed_q)
+
+    def test_retained_suspended_cancel_keeps_peer_at_full_output(self):
+        self.start(2, more=("--retained", "--hold-resume"))
+        cancel = threading.Event()
+        result, errors = [], []
+        def reading():
+            try:
+                result.extend(self.engine.generate_batched([65] * 96, 8, {}, cancel))
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=reading)
+        thread.start()
+        self.wait_until(lambda: any(live and live["state"] == "suspended" for live in self.engine.slot_live))
+        cancel.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([token for token in result if token is not None], [])
+        # A short peer does not need suspension and must retain its entire budget.
+        peer = list(self.engine.generate_batched([66, 67], 8, {}, threading.Event()))
+        self.assertEqual(len([token for token in peer if token is not None]), 8)
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.log.read_text().count(" cancel"), 1)
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_retained_resume_refusal_is_one_request_local_terminal(self):
+        self.start(2, more=("--retained", "--retained-refuse"))
+        with self.assertRaisesRegex(ValueError, "continuation was refused"):
+            list(self.engine.generate_batched([65] * 96, 8, {}, threading.Event()))
+        peer = list(self.engine.generate_batched([66, 67], 8, {}, threading.Event()))
+        self.assertEqual(len([token for token in peer if token is not None]), 8)
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.log.read_text().count("BQRESUME "), 1)
+        self.assertFalse(any(self.engine.slot_busy))
 
     def test_one_effective_slot_still_uses_the_tagged_native_path(self):
         self.start(1, more=("--packed",))

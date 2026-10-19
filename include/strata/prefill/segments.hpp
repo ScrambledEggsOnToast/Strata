@@ -18,6 +18,16 @@ inline bool packed_prefill_enabled() {
     }();
     return enabled;
 }
+// Private preparation is shared by union-row packing and the serial retained-prompt lifecycle.
+inline bool retained_prompt_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_RETAINED_PROMPT");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+inline bool private_preparation_enabled() { return packed_prefill_enabled() || retained_prompt_enabled(); }
+
 
 // Immutable until the physical stage chain drains. tokens names exactly [position, position + rows).
 // Each stage writes an independently owned destination; the prompt arena never becomes an owner.

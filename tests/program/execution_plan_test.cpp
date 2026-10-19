@@ -130,6 +130,29 @@ int main() {
               "packed prefill is the first concurrent-reader conflict");
     }
     {
+        auto in = resident_batch();
+        in.retained_prompt = true;
+        const auto p = ep::resolve_execution_plan(in);
+        check(!p.refused && !in.packed_prefill && !in.retained_prefill && p.suspension.support == ep::Support::conditional &&
+              has(p.suspension.reason, "without resending") && has(p.suspension.reason, "pending stage allocation"),
+              "serial retained prompt reports allocation-conditional capability without packing or layer yields");
+        check(p.concurrent_reader.support == ep::Support::off && has(p.concurrent_reader.reason, "retained prompt"),
+              "retained prompt keeps the independent reader disabled");
+        in.serve = false;
+        check(ep::resolve_execution_plan(in).refused, "non-serving retained prompts refuse in the no-load resolver");
+        in.serve = true; in.mtp_configured = false;
+        check(ep::resolve_execution_plan(in).refused, "missing retained draft readiness refuses before allocation");
+        in.mtp_configured = true; in.prefill_chunk = 1024;
+        check(ep::resolve_execution_plan(in).refused, "unqualified retained scratch geometry refuses before allocation");
+        in = {};
+        in.serve = in.retained_prompt = in.batch_mtp = in.mtp_configured = in.prompt_cache = true;
+        in.batch_requested = 1; in.spec_requested = 4; in.foreground_budget_ms = 1000;
+        const auto single = ep::resolve_execution_plan(in);
+        check(!single.refused && single.suspension_mode == ep::Suspension::in_place &&
+              single.budget.support == ep::Support::on,
+              "one private retained owner consistently satisfies both MTP and foreground-budget minimums");
+    }
+    {
         ep::ExecutionPlanInput in;
         in.spec_requested = 4;
         in.suffix_draft = 12;

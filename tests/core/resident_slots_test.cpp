@@ -151,6 +151,46 @@ int main() {
         check(continued.prefill_split_until == 0 && parked.prefill_split_until == 0 && !parked.partial,
               "checkpoint rewind discards the old live-frontier interval");
     }
+    {
+        program::ResidentPromptCursor cursor;
+        cursor.plan_id = 7; cursor.operation = 11;
+        cursor.plan.from = 321; cursor.plan.to = 10321; cursor.plan.chunk = 2048;
+        cursor.plan.pipe = 1; cursor.plan.chunked = true;
+        cursor.next = 321;
+        std::vector<std::pair<int64_t, int64_t>> intervals;
+        while (cursor.next < cursor.plan.to) {
+            check(cursor.valid(cursor.next, 11000), "retained interval stays on the original nonzero plan grid");
+            const auto saved = cursor;
+            cursor.suspended = true;
+            check(cursor.matches(saved), "suspension changes no arithmetic plan, cursor or operation witness");
+            auto stale = saved;
+            for (int field = 0; field < 5; ++field) {
+                stale = saved;
+                if (field == 0) ++stale.operation;
+                if (field == 1) ++stale.plan_id;
+                if (field == 2) ++stale.next;
+                if (field == 3) ++stale.plan.from;
+                if (field == 4) stale.plan.chunked = !stale.plan.chunked;
+                check(!cursor.matches(stale), "stale operation/frontier/plan/shape cannot resume the retained cursor");
+            }
+            const int64_t end = cursor.interval_end();
+            intervals.emplace_back(cursor.next, end);
+            cursor.next = end; ++cursor.operation; cursor.suspended = false;
+        }
+        check(intervals.size() == 5 && intervals.front().first == 321 &&
+              intervals.back() == std::pair<int64_t, int64_t>{8513, 10321},
+              "resuming retains efficient 2048 chunks and exactly the original 1808-token tail");
+        cursor.next = 1345; cursor.split_until = 2369;
+        check(cursor.valid(1345, 11000) && cursor.interval_end() == 2369,
+              "a retained midpoint completes the original pending split endpoint before any tail");
+        auto wrong_half = cursor; ++wrong_half.split_until;
+        check(!cursor.matches(wrong_half) && !wrong_half.valid(1345, 11000),
+              "pending split identity cannot drift to an unrelated interval");
+        const auto peer = cursor;
+        cursor.next = 2369; cursor.split_until = 0;
+        check(peer.next == 1345 && peer.split_until == 2369,
+              "retained witnesses have no borrowed mutable storage or peer cursor alias");
+    }
     program::ResidentRequest oversized;
     oversized.max_new = 55; // two prompt cells + 55 output + the unchanged eight-cell margin > 64
     check(!slots.begin(-1, {11, 22}, oversized, error) && error.find("exceeds the context") != std::string::npos,
@@ -187,6 +227,10 @@ int main() {
         check(!slots.prepare(lease, error) && !slots.prefilled(lease, 1, error) &&
               !slots.first_token(lease, 33, nullptr, error) && !slots.abort_preparation(lease, error),
               "foreign preparation leases refuse every transition before GPU access");
+        program::ResidentPromptCursor cursor;
+        check(!slots.plan_prompt(lease, cursor, error) && !slots.suspend_prompt(lease, 1, cursor, error) &&
+              !slots.resume_prompt(lease, cursor, error) && slots.slots()[1].request == 0,
+              "foreign retained-owner transitions refuse before mutation and leave a peer untouched");
         check(draft.slot_cells(-1) == -1 && draft.slot_begin(0) == -1 &&
               draft.slot_prompt_len(0) == -1 && !draft.slot_covers(0, 0),
               "missing draft destination never advertises a retained interval");

@@ -398,6 +398,7 @@ void ResidentSlots::retire(int slot) {
     state.request = 0;
     state.preparing = false;
     state.prefill_split_until = 0;
+    state.prompt_cursor = {};
     dispatch_.slot_requests[slot] = 0;
 }
 
@@ -425,6 +426,11 @@ bool ResidentSlots::preparation_valid(const ResidentPreparation& lease, std::str
     for (size_t stage = 0; stage < lease.stages.size(); ++stage)
         if (lease.stages[stage] != (stage < stages_.size() ? stages_[stage].slots[(size_t) lease.slot] : nullptr)) {
             error = "resident preparation: foreign physical destination"; return false;
+        }
+    for (size_t stage = 0; stage < stages_.size(); ++stage)
+        if (!lease.allocations[stage] || lease.stages[stage]->allocation_id != lease.allocations[stage] ||
+            lease.stages[stage]->allocation_device != stages_[stage].device) {
+            error = "resident preparation: stage allocation ownership changed"; return false;
         }
     return true;
 }
@@ -591,8 +597,8 @@ bool ResidentSlots::validate_source(const core::SavedConversation& image, const 
 
 bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, ResidentPreparation* leases,
                             std::string& error) {
-    if (!prefill::packed_prefill_enabled()) {
-        error = "resident preparation: STRATA_PACKED_PREFILL=1 is required"; return false;
+    if (!prefill::private_preparation_enabled()) {
+        error = "resident preparation: a private-preparation lifecycle is required"; return false;
     }
     if (!inputs || !leases || count < 1 || count > 4 || stages_.empty() || stages_.size() > 4 ||
         next_request_ > UINT64_MAX - (uint64_t) count) {
@@ -696,7 +702,10 @@ bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, Resid
         ResidentPreparation lease;
         lease.slot = input.slot; lease.request = state.request; lease.incarnation = state.incarnation;
         lease.position = position; lease.endpoint = (int64_t) state.prompt.size() - 1;
-        for (size_t stage = 0; stage < stages_.size(); ++stage) lease.stages[stage] = stages_[stage].slots[(size_t) input.slot];
+        for (size_t stage = 0; stage < stages_.size(); ++stage) {
+            lease.stages[stage] = stages_[stage].slots[(size_t) input.slot];
+            lease.allocations[stage] = lease.stages[stage]->allocation_id;
+        }
         leases[index] = lease;
     }
     return true;
@@ -831,6 +840,10 @@ bool ResidentSlots::prefilled(const ResidentPreparation& lease, int64_t frontier
     }
     state.ids.assign(state.prompt.begin(), state.prompt.begin() + frontier);
     state.p = frontier;
+    if (state.prompt_cursor.plan_id) {
+        state.prompt_cursor.next = frontier;
+        if (frontier == state.prompt_cursor.split_until) state.prompt_cursor.split_until = 0;
+    }
     for (size_t stage = 0; stage < stages_.size(); ++stage) {
         auto& session = *lease.stages[stage];
         session.ple_prev[0] = frontier >= 2 ? state.prompt[(size_t) frontier - 2] : -1;
@@ -892,6 +905,80 @@ bool ResidentSlots::first_token(const ResidentPreparation& lease, int32_t next, 
     state.preparing = false; state.active = true;
     preparations_[(size_t) lease.slot] = {};
     if (!observe("admit", lease.slot, state.p, error, residual)) return fail(lease.slot);
+    return true;
+}
+
+bool ResidentSlots::plan_prompt(const ResidentPreparation& lease, const ResidentPromptCursor& cursor,
+                                std::string& error) {
+    if (!preparation_valid(lease, error)) return false;
+    auto& state = slots_[(size_t)lease.slot];
+    const auto& previous = state.prompt_cursor;
+    auto split_plan = previous;
+    split_plan.split_until = cursor.split_until;
+    const bool split = previous.plan_id && !previous.split_until &&
+        cursor.split_until == state.p + 2048 && split_plan.matches(cursor);
+    if (!preparations_[(size_t)lease.slot].ready || state.stop || cursor.suspended ||
+        !cursor.valid(state.p, lease.endpoint) || cursor.plan.chunk > prompt_.chunk() ||
+        cursor.operation != previous.operation ||
+        (previous.plan_id && (previous.suspended || (!split &&
+         (previous.next != previous.plan.to || cursor.plan.from != previous.plan.to ||
+          cursor.plan_id != previous.plan_id + 1 || cursor.operation != previous.operation))))) {
+        error = "resident prompt: plan does not continue the exact admitted frontier"; return false;
+    }
+    if (!prompt_.validate_owner(lease.slot, lease.request, lease.incarnation, lease.stages, lease.allocations,
+                                previous.operation, error)) return false;
+    state.prompt_cursor = cursor;
+    return true;
+}
+
+bool ResidentSlots::suspend_prompt(const ResidentPreparation& lease, uint64_t operation,
+                                   ResidentPromptCursor& cursor, std::string& error) {
+    if (!preparation_valid(lease, error)) return false;
+    auto& state = slots_[(size_t)lease.slot];
+    const auto& previous = state.prompt_cursor;
+    if (!preparations_[(size_t)lease.slot].ready || previous.suspended || !operation ||
+        operation <= previous.operation || !previous.valid(state.p, lease.endpoint) ||
+        state.ids.size() != size_t(state.p) ||
+        !prompt_.validate_owner(lease.slot, lease.request, lease.incarnation, lease.stages, lease.allocations,
+                                operation, error)) {
+        if (error.empty()) error = "resident prompt: suspension lacks a drained exact frontier";
+        return false;
+    }
+    if (!idle(error)) return false;
+    if (draft_.kv_state().max_cells > 0 &&
+        (draft_.slot_cells(lease.slot) != state.p ||
+         !draft_.slot_covers(lease.slot, state.p, int64_t(state.prompt.size())) ||
+         (state.p > draft_.slot_begin(lease.slot) &&
+          draft_.slot_next_token(lease.slot) != state.prompt[size_t(state.p)]))) {
+        error = "resident prompt: suspension draft frontier is not ready"; return false;
+    }
+    state.prompt_cursor.operation = operation;
+    state.prompt_cursor.suspended = true;
+    cursor = state.prompt_cursor;
+    return true;
+}
+
+bool ResidentSlots::resume_prompt(const ResidentPreparation& lease, const ResidentPromptCursor& cursor,
+                                  std::string& error) {
+    if (!preparation_valid(lease, error)) return false;
+    auto& state = slots_[(size_t)lease.slot];
+    if (!preparations_[(size_t)lease.slot].ready || state.stop || state.tainted ||
+        !state.prompt_cursor.suspended || !state.prompt_cursor.matches(cursor) ||
+        !cursor.valid(state.p, lease.endpoint) || state.ids.size() != size_t(state.p) ||
+        !prompt_.validate_owner(lease.slot, lease.request, lease.incarnation, lease.stages, lease.allocations,
+                                cursor.operation, error)) {
+        if (error.empty()) error = "resident prompt: stale identity, plan, frontier or operation";
+        return false;
+    }
+    if (!idle(error)) return false;
+    if (draft_.kv_state().max_cells > 0 &&
+        (draft_.slot_cells(lease.slot) != state.p ||
+         !draft_.slot_covers(lease.slot, state.p, int64_t(state.prompt.size())) ||
+         (state.p > draft_.slot_begin(lease.slot) &&
+          draft_.slot_next_token(lease.slot) != state.prompt[size_t(state.p)]))) {
+        error = "resident prompt: resume draft frontier is not ready"; return false;
+    }
+    state.prompt_cursor.suspended = false;
     return true;
 }
 

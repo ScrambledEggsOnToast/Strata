@@ -321,6 +321,10 @@ public:
                                  const std::function<bool()>& command_pending);
     bool bind_owner(int slot, uint64_t request, uint64_t incarnation,
                     const std::array<core::SessionState*, 4>& sessions, std::string& err);
+    // Read-only drained owner/operation witness; no rebind, upload or allocation.
+    bool validate_owner(int slot, uint64_t request, uint64_t incarnation,
+                        const std::array<core::SessionState*, 4>& sessions,
+                        const std::array<uint64_t, 4>& allocations, uint64_t operation, std::string& err) const;
     std::function<bool(const OwnerSpan&, size_t stage, uint64_t execution, int64_t frontier,
                        std::string& err)> on_segment_stage;
     std::function<bool(Prefill&, const OwnerSpan&, const float* residual, std::string& err)> on_segment;

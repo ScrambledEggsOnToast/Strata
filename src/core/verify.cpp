@@ -5116,6 +5116,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
+    if (!head_sampling_) return true; // known-input private prompt rows, like the scalar read_windows path
     bool any = false;
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];

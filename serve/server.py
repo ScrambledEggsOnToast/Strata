@@ -1354,7 +1354,7 @@ class StrataEngine:
         self.pump.start()
 
     def _route_packed(self, line, owners):
-        if not line.startswith(("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ")):
+        if not line.startswith(("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ", "BQSUSPEND ", "BQRESUMED ")):
             return False
         fields = line.split()
         if len(line) > 8192 or len(fields) < 4:
@@ -1391,7 +1391,7 @@ class StrataEngine:
                             prompt != owner["prompt_tokens"] or not 0 <= accepted <= offered or
                             not 0 <= reused < prompt or not owner["fresh"] <= fresh <= prompt - reused or
                             (generated and fresh + reused != prompt) or
-                            fields[9] not in ("stop", "length", "cancel", "nonfinite") or
+                            fields[9] not in ("stop", "length", "cancel", "nonfinite", "refused") or
                             any(not math.isfinite(value) or value < 0 for value in times)):
                         raise ValueError("packed terminal exceeded or crossed its request boundary")
                     owner["terminal"] = True
@@ -1409,6 +1409,24 @@ class StrataEngine:
                             not owner["fresh"] <= fresh <= position):
                         raise ValueError("packed progress crossed its request boundary")
                     owner["fresh"] = fresh
+                    owner["position"] = position
+                elif kind in ("BQSUSPEND", "BQRESUMED"):
+                    if len(fields) != 13 or not all(f.isdigit() for f in fields[5:12]):
+                        raise ValueError("malformed retained prompt receipt")
+                    position, plan, operation, begin, end, chunk, split = cursor = tuple(map(int, fields[5:12]))
+                    if (position != owner.get("position") or not begin <= position <= end < owner["prompt_tokens"] or
+                            min(plan, operation, chunk) < 1 or
+                            (split and not position < split <= end) or
+                            (not split and position != end and (position - begin) % chunk)):
+                        raise ValueError("retained prompt receipt crossed its admitted plan/frontier")
+                    if kind == "BQSUSPEND":
+                        if owner.get("suspended") is not None or operation <= owner.get("operation", 0):
+                            raise ValueError("duplicate or stale retained prompt suspension")
+                        owner["suspended"], owner["operation"] = cursor, operation
+                    else:
+                        if owner.get("suspended") != cursor:
+                            raise ValueError("retained prompt resume changed its continuation")
+                        owner["suspended"] = None
             try:
                 owner["queue"].put_nowait(line)
             except queue.Full:
@@ -1599,7 +1617,8 @@ class StrataEngine:
             except ValueError as error:
                 if self.proc is proc:
                     prefix = ("Packed protocol failure: " if line.startswith(
-                        ("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ")) else "Score protocol failure: ")
+                        ("BACK ", "BQT ", "BQPP ", "BQDONE ", "BQREJECT ", "BQSUSPEND ", "BQRESUMED "))
+                        else "Score protocol failure: ")
                     self.silent_note = prefix + str(error)
                     self.ended = True
                 try:
@@ -2311,7 +2330,8 @@ class StrataEngine:
                         return False
                     # Exclusive reason precedence: selector/deadline, physical slot, occupied control.
                     slot_gate = (getattr(self, "foreground_budget_s", 0) or
-                                 (getattr(self, "info", {}) or {}).get("packed_prefill") == 1)
+                                 (getattr(self, "info", {}) or {}).get("packed_prefill") == 1 or
+                                 (getattr(self, "info", {}) or {}).get("retained_prompt") == 1)
                     ready = turn and (not slot_gate or slot_ready is None or slot_ready())
                     if ready and self.ctl.acquire(blocking=False):
                         if self.alive():
@@ -2400,8 +2420,8 @@ class StrataEngine:
             finally:
                 local.native_work = previous
 
-    def _generate_packed(self, ids, max_new, sampling, cancel):
-        """Reserve one tagged native owner, then release admission control at BACK, before prefill."""
+    def _generate_retained_owner(self, ids, max_new, sampling, cancel):
+        """Submit once; retain the native owner, generator, deadline and budget until its one tagged terminal."""
         sampling = sampling or {}
         priority = sampling.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
@@ -2445,6 +2465,9 @@ class StrataEngine:
             if work is not None:
                 work.batch_done(self.last)
             held[slot] = list(ids) + output[:-1] if output else []
+            if self.last.get("finish") == "refused":
+                held[slot] = []
+                raise ValueError("the retained prompt continuation was refused before resumption")
             if self.last.get("finish") == "nonfinite":
                 held[slot] = []
                 raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2457,7 +2480,7 @@ class StrataEngine:
                 claims.add(slot)
                 owner = {"slot": slot, "identity": None, "terminal": False, "committed": 0, "fresh": 0,
                          "prompt_tokens": len(ids), "max_new": int(max_new),
-                         "queue": queue.Queue(maxsize=self.max_context + 8)}
+                         "queue": queue.Queue(maxsize=3 * self.max_context + 8)}
                 owners[tag] = owner
                 live = {"slot": slot, "state": "reserving", "prompt_tokens": len(ids), "generated": 0,
                         "started": time.time(), "first_token": None, "request_id": sampling.get("_strata_request_id")}
@@ -2505,6 +2528,16 @@ class StrataEngine:
                         yield token
                 elif fields[0] == "BQPP":
                     live["prompt_read"] = int(fields[5])
+                    yield None
+                elif fields[0] == "BQSUSPEND":
+                    live["state"] = "suspended"
+                    # No control reacquisition, new leg, token serialization or
+                    # admission: only the exact generation-checked cursor returns.
+                    if not stopped and not cancel.is_set():
+                        self._send("BQRESUME " + " ".join(fields[1:8]) + " " + fields[11])
+                    yield None
+                elif fields[0] == "BQRESUMED":
+                    live["state"] = "reading"
                     yield None
                 else:
                     terminal(line)
@@ -2555,9 +2588,12 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
-        if ((self.info or {}).get("packed_prefill") == 1 and
-                (self.info or {}).get("packed_prefill_version") == 1 and not embeddings):
-            yield from self._generate_packed(ids, max_new, sampling, cancel)
+        if (not embeddings and
+                (((self.info or {}).get("packed_prefill") == 1 and
+                  (self.info or {}).get("packed_prefill_version") == 1) or
+                 ((self.info or {}).get("retained_prompt") == 1 and
+                  (self.info or {}).get("retained_prompt_version") == 1))):
+            yield from self._generate_retained_owner(ids, max_new, sampling, cancel)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         priority = (sampling or {}).get("strata_priority", "foreground")
