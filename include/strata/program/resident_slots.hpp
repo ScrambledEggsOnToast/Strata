@@ -198,6 +198,9 @@ public:
     // Read-only wire identity; nonexistent seats return an unbound identity.
     ResidentIdentity identity(int slot) const;
     bool owns(int slot, uint64_t request, uint64_t incarnation) const;
+    // Diagnostic only: the next resume_work refuses as a stale generation. Used to exercise the
+    // request-local continuation refusal and peer isolation on device; never set by a normal caller.
+    void inject_stale_continuation() { stale_continuation_ = true; }
     void cancel(int slot);
     /// #879: the running slot's state may hold the poison: `complete` must not keep it as a cache when it ends.
     void taint(int slot);
@@ -295,6 +298,7 @@ private:
     uint64_t next_request_ = 0;
     int destination_ = -1;
     bool working_failed_ = false;
+    mutable bool stale_continuation_ = false;
     bool cache_, touched_ = false;
     Resources resources_ = Resources::released;
 };

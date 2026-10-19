@@ -1108,6 +1108,10 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         !slots_[(size_t) slot].input.scope.matches(input_.scope)) {
         error = "resident resume: no valid idle prefix"; return false;
     }
+    if (stale_continuation_) {
+        stale_continuation_ = false;
+        error = "resident resume: stale generation"; return false;
+    }
     if (checkpoint && (checkpoint->stage_parts.size() + 1 != stages_.size() ||
         checkpoint->ids.size() > slots_[(size_t) slot].ids.size() ||
         !std::equal(checkpoint->ids.begin(), checkpoint->ids.end(), slots_[(size_t) slot].ids.begin()))) {

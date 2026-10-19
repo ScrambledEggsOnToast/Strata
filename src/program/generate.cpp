@@ -19397,6 +19397,14 @@ int main(int argc, char** argv) {
                     const char* value = std::getenv("STRATA_REFUSE_YIELDED_RESUME");
                     return value != nullptr ? std::max(0, std::atoi(value)) : 0;
                 }();
+                static int stale_continuation = [] {
+                    const char* value = std::getenv("STRATA_STALE_CONTINUATION");
+                    return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+                }();
+                if (stale_continuation > 0) {
+                    --stale_continuation;
+                    resident.inject_stale_continuation();
+                }
                 bool refused_by_injection = false;
                 if (refuse_yielded_resume > 0) {
                     --refuse_yielded_resume;
