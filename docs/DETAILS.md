@@ -3919,7 +3919,8 @@ failures still end the engine; there is no transparent replay of already streame
 and peer isolation can be exercised on device; it is off unless set and does not change a successful
 continuation. A device check yielded an 8,001-token prompt at 4,096 tokens, admitted a peer while it was
 parked, refused the resend with the diagnostic `ERR`, and saw the peer commit all 64 requested tokens before
-a clean exit.
+a clean exit. `STRATA_REFUSE_CAPTURE=<n>` similarly refuses that many optional captures before any copy; a
+device check dropped the outgoing snapshot while a peer ran, and the peer committed 64/64 before a clean exit.
 
 Protected smoke scenarios (not results): use the same pinned full model/tokenizer and supervisor as HET-035,
 an explicit two-slot configuration, `lifecycle_api: true`, queue limit 2 and finite output/context budgets.

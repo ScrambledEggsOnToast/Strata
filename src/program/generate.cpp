@@ -14175,6 +14175,17 @@ int main(int argc, char** argv) {
         // ending the server
         auto park_source = [&](const ParkSource& source, size_t held,
                                const strata::core::SavedConversation* held_image, size_t held_entries = 0) -> bool {
+            // Diagnostic refusal (#265): STRATA_REFUSE_CAPTURE=<n> refuses that many optional captures before any
+            // copy. It exercises the durability-drop path and peer isolation on device; off unless set.
+            static int refuse_capture = [] {
+                const char* value = std::getenv("STRATA_REFUSE_CAPTURE");
+                return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+            }();
+            if (refuse_capture > 0) {
+                --refuse_capture;
+                err = "fault injection: refused capture";
+                return false;
+            }
             phase::Span phase_span(phase_current, phase::Stage::park_capture);
             const size_t count = conversations.size(), evictions = conversations.evictions(),
                          superseded = conversations.superseded();
