@@ -777,9 +777,11 @@ function assistantMessages(m) {
     // Keep completed reasoning too: dropping it rewrites the next prompt's token prefix (#272). This is the
     // server's raw continuation, so mark it: the active template's generation seed is restored only for declared
     // continuations, never for imported/complete assistant reasoning (#272).
-    if (m.thinking) {
+    if (m.reasoning || m.thinking) {
       msg.reasoning_content = m.reasoning || "";
-      msg.reasoning_content_is_continuation = true;
+      // Persisted pre-upgrade turns have reasoning but no thinking field: keep the reasoning, leave provenance
+      // unknown (no marker). New thinking-enabled turns are declared continuations even when the reasoning is empty.
+      if (m.thinking) msg.reasoning_content_is_continuation = true;
     }
     return [msg];
   }

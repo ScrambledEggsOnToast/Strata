@@ -282,6 +282,12 @@ class SeedHistoryContract(unittest.TestCase):
         self.assertEqual(msgs[1]["reasoning_content"], "")
         self.assertTrue(msgs[1]["reasoning_content_is_continuation"])
         self.assertEqual(self._frontend("Let me")._seed_history(msgs)[1]["reasoning_content"], "Let me")
+        msgs, _, _ = anthropic_to_messages({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "A", "reasoning_content_is_continuation": True}]})
+        self.assertEqual(msgs[1]["reasoning_content"], "")
+        self.assertTrue(msgs[1]["reasoning_content_is_continuation"])
+        self.assertEqual(self._frontend("Let me")._seed_history(msgs)[1]["reasoning_content"], "Let me")
 
     def test_collector_preserves_a_marked_empty_continuation_through_normalization(self):
         from serve.server import openai_collect

@@ -693,7 +693,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
         content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
         if isinstance(content, str):
-            messages.append({"role": m["role"], "content": content})
+            out = {"role": m["role"], "content": content}
+            if m.get("reasoning_content_is_continuation") is True:
+                out["reasoning_content"] = ""
+                out["reasoning_content_is_continuation"] = True
+            messages.append(out)
             continue
         if m.get("role") == "user" and _has_image(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
