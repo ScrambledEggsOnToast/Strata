@@ -2540,6 +2540,12 @@ class StrataEngine:
                     event[key] = owner[key]
         elif fields[0] == "BQPP" and len(fields) == 9:
             event["native_service_wait_s"] = owner["native_service_wait_s"]
+        elif fields[0] in ("BQSUSPEND", "BQRESUMED") and len(fields) >= 13:
+            # The structured equivalent of the wire cursor: position, plan, operation, begin, end, chunk, split.
+            event["cursor"] = dict(zip(
+                ("position", "plan", "operation", "begin", "end", "chunk", "split"),
+                (int(value) for value in fields[5:12])))
+            event["reason"] = fields[12]
         return event
 
     @staticmethod
