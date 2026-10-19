@@ -16,6 +16,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/prefill/segments.hpp"
+#include "strata/prefill/handoff.hpp"
 
 #include <cstdint>
 #include <atomic>
@@ -443,14 +444,17 @@ public:
     static bool cpu_share_enabled();
 
 private:
+    friend struct PrefillDrainFixture;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
-                  const OwnerSegment* segments = nullptr, int segment_count = 0, uint64_t execution = 0);
-    bool drain_pipeline(std::string& err);
+                  const OwnerSegment* segments = nullptr, int segment_count = 0, uint64_t execution = 0,
+                  const StagePacket* incoming = nullptr, uint64_t incoming_generation = 0);
+    StagePacket::Outcome join_successor(std::string& err);
+    StagePacket::Outcome drain_pipeline(std::string& err);
     const std::function<bool(Prefill*, int64_t, std::string&)>* retained_step_ = nullptr;
     bool retained_layer_yields_ = true;
     bool retained_boundary(int64_t next_layer, std::string& err, bool bulk_complete = true);
@@ -464,23 +468,14 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
-    bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
-    bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     /// FORK (HET-022): allocate one resident owner's prompt helper (streams, events, compact MMQ buffers, mapped
     /// host crossings) on its device and append it to the engaged set; false with `err` set when it cannot serve.
     bool add_prompt_helper(const PromptHelper& owner, int64_t cap_rows, std::string& err);
-    const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
-    /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
-    /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
-    const void* hand_ev_ = nullptr;
-    int hand_pieces_ = 0;
-
-    std::string next_err_;
-    std::future<bool> next_run_;
+    StagePacket* next_packet_ = nullptr; ///< owns the direct successor's completion and its borrowed payload
     int hand_buf_ = 0;
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)

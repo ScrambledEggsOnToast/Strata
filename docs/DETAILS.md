@@ -525,6 +525,29 @@ Invalid event measurements mark records incomplete. The switch is off by default
 `STRATA_PREFILL_TIMING` as well for uninstrumented comparisons.
 This observer's layer-record storage supports bounds within `[0,48]`; it explicitly refuses other bounds
 rather than emitting a partial capture. The normal unobserved engine path is unchanged.
+
+**Prompt stage packets:** the two portable pinned-host handoff slots now own their payload and direct-successor
+completion. Their immutable descriptors carry request/seat incarnation, slot generation, stage/device, FP32
+row shape and owner row intervals. Scalar, packed, staged and retained prompt paths share this lifetime rule:
+join the consumer and the producer's final outgoing copy before reuse, including cancellation and failure.
+A partial/failed physical drain quarantines storage; a logical failure never certifies successful prefill.
+Recursive drainage preserves three outcomes: complete, cancelled and failed. A physically joined
+cancellation remains a cancelled request without poisoning reusable retained ancestors; producer,
+consumer or physical-drain failure still poisons them and overrides cancellation, even in a deeper stage.
+The existing two-buffer alternation, arithmetic, placement, copy directions and optional piece schedule remain.
+Mapped/pinned host transport is still the portable default; there is no second transport or P2P policy change.
+
+The same `STRATA_PREFILL_ATTRIBUTION` prefix additionally emits request-local `kind=handoff` records.
+`producer_and_download_observed` is the existing containing host join, not isolated producer or copy time;
+the piece mode instead reports `producer_work_observed` at its existing pre-copy work join.
+`consumer_ready_observed` names the upload enqueue interval and observes readiness only at a later existing
+chunk join. Its same-consumer-device CUDA event envelope includes piece waits, copy and submission gaps.
+`retired` connects the completion joins and same-producer-device outgoing-copy event envelope to that packet.
+Host `steady-ns` intervals and device-local CUDA event milliseconds are distinct clock domains; do not align
+them across devices or subtract either from wall time. Negative event durations mean unavailable evidence.
+These diagnostics do not isolate all-resident decode graph transport or revise #271's no-transport-change
+decision. No extra event storage or event recording is enabled when attribution is off.
+
 **How good the next-layer expert prediction is (measurement only):** `STRATA_LOOKAHEAD_STATS=1` runs the router look-ahead on any expert tier and
 scores it against the routing of the next layer: every 100 windows the engine log has a `strata lookahead stats:` line with the experts per layer
 outside the GPU cache, the recall and precision of the top-k / k+4 / k+10 guesses and of the vote-ranked top 4 / 8 / 12, how much of the PCIe share they

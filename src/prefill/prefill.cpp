@@ -136,6 +136,8 @@ namespace strata::prefill {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+bool prefill_attribution_requested();
+int64_t prefill_host_ns();
 constexpr float EPS = 1e-6f;
 constexpr int64_t N = kernels::cpu::H, HC = 4, D = N * HC, LR = 320, K = kCpuShareRoutes,
                   NE = kernels::cpu::NE;
@@ -939,9 +941,113 @@ struct Prefill::Impl {
     uint64_t execution = 0;
     uint64_t segment_pack = 0;
     struct Handoff {
+        StagePacket packet;
         std::array<int64_t, kPrefillRows> tokens{};
-        std::array<OwnerSegment, kPrefillOwners> segments{};
-    } owner_handoff[2];
+        cudaStream_t stream = nullptr;
+        int device = -1, pieces = 0, slot = -1;
+        cudaEvent_t work_done = nullptr, landed[kHandPiecesMax] = {};
+        cudaEvent_t last_landed = nullptr, download[2] = {};
+        bool observed = false;
+        static void release(float* payload) { cudaFreeHost(payload); }
+        static bool drain(void* context, std::string& err) {
+            auto& handoff = *static_cast<Handoff*>(context);
+            const core::OnDevice device(handoff.device);
+            const cudaError_t result = handoff.last_landed ? cudaEventSynchronize(handoff.last_landed)
+                                                         : cudaStreamSynchronize(handoff.stream);
+            if (result != cudaSuccess) {
+                err = std::string("prefill packet: producer completion: ") + cudaGetErrorString(result);
+                return false;
+            }
+            return true;
+        }
+        bool download_rows(const float* rows, int64_t count, std::string& err) {
+            last_landed = nullptr;
+            observed = false;
+            float* host = packet.payload();
+            bool ok = !download[0] || cudaEventRecord(download[0], stream) == cudaSuccess;
+            if (pieces > 0) {
+                ok = ok && cudaEventRecord(work_done, stream) == cudaSuccess;
+                for (int i = 0; ok && i < pieces; ++i) {
+                    int64_t row = 0, n = 0;
+                    handoff_piece(count, pieces, i, row, n);
+                    if (n > 0)
+                        ok = cudaMemcpyAsync(host + row * D, rows + row * D, (size_t) n * D * 4,
+                                             cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                    ok = ok && cudaEventRecord(landed[i], stream) == cudaSuccess;
+                }
+                if (ok) last_landed = landed[pieces - 1];
+                ok = ok && (!download[1] || cudaEventRecord(download[1], stream) == cudaSuccess);
+                ok = ok && cudaEventSynchronize(work_done) == cudaSuccess;
+                if (ok && download[1]) last_landed = download[1];
+            } else {
+                ok = ok && cudaMemcpyAsync(host, rows, (size_t) count * D * 4,
+                                          cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+                ok = ok && (!download[1] || cudaEventRecord(download[1], stream) == cudaSuccess);
+                ok = ok && cudaStreamSynchronize(stream) == cudaSuccess;
+            }
+            if (!ok) {
+                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            observed = download[0] != nullptr;
+            return true;
+        }
+        bool upload_rows(float* rows, int64_t offset, int64_t count, cudaStream_t consumer, std::string& err) const {
+            const int64_t total = packet.shape().rows;
+            const float* host = packet.payload();
+            const bool whole = offset == 0 && count == total;
+            bool ok = true;
+            for (int i = 0; ok && i < pieces; ++i) {
+                int64_t row = 0, n = 0;
+                handoff_piece(total, pieces, i, row, n);
+                ok = cudaStreamWaitEvent(consumer, landed[i], 0) == cudaSuccess;
+                if (ok && whole && n > 0)
+                    ok = cudaMemcpyAsync(rows + row * D, host + row * D, (size_t) n * D * 4,
+                                         cudaMemcpyHostToDevice, consumer) == cudaSuccess;
+            }
+            if (ok && (!pieces || !whole))
+                ok = cudaMemcpyAsync(rows, host + offset * D, (size_t) count * D * 4,
+                                     cudaMemcpyHostToDevice, consumer) == cudaSuccess;
+            if (!ok) err = "prefill: the layer split's hand-off upload failed";
+            return ok;
+        }
+        void trace(const char* phase, int64_t begin, int64_t end, float gpu_ms = -1, int gpu_device = -1) const {
+            if (!prefill_attribution_requested()) return;
+            const auto& shape = packet.shape();
+            for (int i = 0; i < packet.owner_count(); ++i) {
+                const auto& segment = packet.owners()[i];
+                std::fprintf(stderr, "strata prefill attribution: {\"kind\":\"handoff\",\"phase\":\"%s\","
+                    "\"request\":%llu,\"incarnation\":%llu,\"generation\":%llu,\"storage_slot\":%d,"
+                    "\"producer_device\":%d,\"consumer_device\":%d,\"lb\":%lld,\"le\":%lld,"
+                    "\"consumer_le\":%lld,\"pos\":%lld,\"tokens\":%lld,\"columns\":%lld,"
+                    "\"owner_row\":%lld,\"owner_pos\":%lld,\"owner_rows\":%lld,\"pieces\":%d,"
+                    "\"host_clock\":\"steady-ns\",\"begin_ns\":%lld,\"end_ns\":%lld,\"observed_ns\":%lld,"
+                    "\"gpu_clock\":\"device-local-cuda-event-ms\",\"gpu_device\":%d,"
+                    "\"gpu_envelope_ms\":%.9g,\"outcome\":%d}\n", phase,
+                    (unsigned long long) segment.owner.request, (unsigned long long) segment.owner.incarnation,
+                    (unsigned long long) packet.generation(), slot, shape.producer_device, shape.consumer_device,
+                    (long long) shape.layer_begin, (long long) shape.layer_end, (long long) shape.consumer_layer_end,
+                    (long long) shape.position, (long long) shape.rows, (long long) shape.columns,
+                    (long long) segment.row, (long long) segment.owner.position, (long long) segment.owner.rows, pieces,
+                    (long long) begin, (long long) end, (long long) prefill_host_ns(), gpu_device, gpu_ms,
+                    int(packet.outcome()));
+            }
+        }
+        StagePacket::Outcome retire(std::string& err) {
+            const int64_t begin = prefill_attribution_requested() ? prefill_host_ns() : 0;
+            const bool ok = packet.drain(err);
+            if (packet.reusable() && prefill_attribution_requested()) {
+                const core::OnDevice owner(device);
+                float elapsed = -1;
+                if (observed && cudaEventElapsedTime(&elapsed, download[0], download[1]) != cudaSuccess)
+                    elapsed = -1;
+                trace("retired", begin, prefill_host_ns(), elapsed, device);
+            }
+            if (ok) return StagePacket::Outcome::complete;
+            return packet.reusable() && packet.outcome() == StagePacket::Outcome::cancelled
+                ? StagePacket::Outcome::cancelled : StagePacket::Outcome::failed;
+        }
+    } handoff[2];
     uint64_t bound_request = 0;
     std::atomic<bool> running{false};
     bool poisoned = false;
@@ -1068,11 +1174,8 @@ struct Prefill::Impl {
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
-    float* hand[2] = {};
-    // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
+    // Existing two pinned-host slots and optional piece events are owned by their packets.
     int hand_pieces = 0;
-    cudaEvent_t hand_done[2] = {};
-    cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
@@ -1177,7 +1280,9 @@ void Prefill::release() {
     if (!impl_) return;
     if (public_running_.load() || impl_->running.load()) std::terminate();
     std::string ignored;
-    if (!drain_pipeline(ignored)) std::terminate();
+    drain_pipeline(ignored);
+    for (auto& handoff : impl_->handoff)
+        if (!handoff.packet.reusable()) std::terminate();
     impl_->hand_worker.reset();   // the chain is drained; join its persistent hand-off thread before freeing buffers
     if (impl_->cs && cudaStreamSynchronize(impl_->cs) != cudaSuccess) std::terminate();
     if (impl_->copy && cudaStreamSynchronize(impl_->copy) != cudaSuccess) std::terminate();
@@ -1187,10 +1292,10 @@ void Prefill::release() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
-        if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
-        for (cudaEvent_t& e : impl_->hand_ev[b])
-            if (e) cudaEventDestroy(e);
+        auto& handoff = impl_->handoff[b];
+        if (handoff.work_done) cudaEventDestroy(handoff.work_done);
+        for (cudaEvent_t e : handoff.landed) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : handoff.download) if (e) cudaEventDestroy(e);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
@@ -1412,20 +1517,34 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            err = "prefill: the layer split's hand-off buffers";
-            return false;
+    for (auto& handoff : m.handoff) {
+        if (!next_) break;
+        handoff.device = m.device;
+        handoff.slot = int(&handoff - m.handoff);
+        handoff.stream = m.cs;
+        if (!handoff.packet.allocated()) {
+            float* payload = nullptr;
+            if (cudaHostAlloc((void**) &payload, (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+                err = "prefill: the layer split's hand-off buffers"; return false;
+            }
+            if (!handoff.packet.adopt(payload, (size_t) chunk * D, Impl::Handoff::release)) std::terminate();
         }
+        if (prefill_attribution_requested())
+            for (auto& event : handoff.download)
+                if (!event && cudaEventCreate(&event) != cudaSuccess) {
+                    err = "prefill: hand-off attribution events"; return false;
+                }
+    }
     if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
         auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
         for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
-            ok = ok && make(m.hand_done[b]);
-            for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
+            ok = ok && make(m.handoff[b].work_done);
+            for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.handoff[b].landed[i]);
         }
         if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
         m.hand_pieces = handoff_pipe_pieces();
+        for (auto& handoff : m.handoff) handoff.pieces = m.hand_pieces;
     }
     if (m.tok_dev == nullptr) {
         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
@@ -1750,7 +1869,9 @@ bool Prefill::local_idle(std::string& err) const {
 }
 
 bool Prefill::context_idle(std::string& err) const {
-    if (public_running_.load() || next_run_.valid()) {
+    if (public_running_.load() || next_packet_ ||
+        std::any_of(std::begin(impl_->handoff), std::end(impl_->handoff),
+                    [](const auto& handoff) { return !handoff.packet.reusable(); })) {
         err = "prefill: owner rebind while pipeline is in flight"; return false;
     }
     return local_idle(err) && (!next_ || next_->context_idle(err));
@@ -2740,7 +2861,7 @@ int Prefill::stage_count() const {
 int64_t Prefill::plan_chunk(int64_t n) const {
     const double pipe = pipe_value();
     const int stages = stage_count();
-    if (pipe <= 0.0 || hand_in_ != nullptr || stages < 2) return 0;
+    if (pipe <= 0.0 || stage_lb_ != 0 || stages < 2) return 0;
     return pipeline_chunk(n, impl_->T, stages, pipe > 1.0 ? pipe : 0.0);
 }
 void Prefill::force_chunk(int64_t chunk, bool single, bool planned) {
@@ -3047,6 +3168,9 @@ struct PfTimer {
     double ms[kPfCount] = {};
     std::unique_ptr<PfAttribution> attribution;
     int layer = -1;
+    cudaEvent_t incoming_begin = nullptr, incoming_end = nullptr;
+    int64_t incoming_host_begin = 0, incoming_host_end = 0;
+    float incoming_ms = -1;
     void prepare(int64_t layers, int64_t experts) {
         if (!on) return;
         // Device layers use <64 marks. A host fallback folds all preceding device marks at its route join,
@@ -3058,6 +3182,8 @@ struct PfTimer {
     void begin_chunk(int device, int64_t lb, int64_t le, int64_t pos, int64_t tokens, bool borrowed,
                      cudaStream_t stream) {
         layer = -1;
+        incoming_begin = incoming_end = nullptr;
+        incoming_ms = -1;
         if (on) {
             if (!chunk_start && cudaEventCreate(&chunk_start) != cudaSuccess)
                 throw std::runtime_error("prefill timer: cannot create chunk origin");
@@ -3096,6 +3222,13 @@ struct PfTimer {
     // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
     void fold() {
         if (!on || used < 2) return;
+        if (incoming_begin && incoming_end) {
+            if (cudaEventElapsedTime(&incoming_ms, incoming_begin, incoming_end) != cudaSuccess) {
+                incoming_ms = -1;
+                if (attribution) attribution->valid = false;
+            }
+            incoming_begin = incoming_end = nullptr;
+        }
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
             if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
@@ -3179,13 +3312,28 @@ struct PeTimer {
 }  // namespace
 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
-                      const OwnerSegment* segments, int segment_count, uint64_t execution) {
+                      const OwnerSegment* segments, int segment_count, uint64_t execution,
+                      const StagePacket* incoming, uint64_t incoming_generation) {
     err.clear();
+    const float* hand_in_ = incoming ? incoming->payload() : nullptr;
     // force_chunk is for this run only: taken before any early return can leave it to the next one
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
     const bool segmented = segment_count > 0;
+    if (incoming && (!incoming->accepts(incoming_generation, m.device, stage_lb_, stage_le_, pos0, n, D) ||
+        incoming->owner_count() != (segmented ? segment_count : 1))) {
+        err = "prefill packet: stale generation or consumer shape"; return false;
+    }
+    if (incoming) for (int i = 0; i < incoming->owner_count(); ++i) {
+        const auto& owner = incoming->owners()[i].owner;
+        if (segmented ? (owner.slot < 0 || owner.slot >= kPrefillOwners ||
+                owner.request != m.owner_requests[owner.slot] ||
+                owner.incarnation != m.owner_incarnations[owner.slot])
+                      : owner.request != m.bound_request) {
+            err = "prefill packet: stale request or incarnation"; return false;
+        }
+    }
     if (prefill_attribution_requested() && (stage_lb_ < 0 || stage_le_ > 48 || stage_lb_ >= stage_le_)) {
         err = "prefill attribution: stage layer bounds must lie within [0,48]";
         return false;
@@ -3309,8 +3457,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // The direct successor's future lives on the Prefill object. Intermediate
-    // stages therefore do not drain the complete remaining GPU chain here.
+    // Each packet owns its direct successor's completion. Intermediate stages
+    // still do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
@@ -3350,11 +3498,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t chunk_tokens = segmented || retained_step_ ? m.T : forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
     if (planned_C > 0 && chunk_tokens < std::min(n, m.T)) log_plan(n, chunk_tokens, stage_count());
     const bool single_chunk = hand_in_ == nullptr ? (forced > 0 && !segmented && !retained_step_ ? forced_single : n <= chunk_tokens)
-                                                  : single_chunk_;
+                                                  : incoming->shape().single_chunk;
     // Pipe-planned chunks do not race other stages for the CPU share, which would make their arithmetic timing-dependent.
     const bool pipe_chunked = segmented || retained_step_ ||
         (hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && chunk_tokens < std::min(n, m.T))
-                            : pipe_chunked_);
+                            : incoming->shape().pipe_chunked);
     const bool helped = !segmented && single_chunk && bind_stage_helper(n);
     if (helped) m.pp = m.help_pp.get();
     struct HelpScope {
@@ -3371,6 +3519,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     } help_scope{m, helped};
     PfTimer pt;
     pt.prepare(g.n_layers, g.n_expert);
+    auto trace_incoming = [&] {
+        if (!incoming || !pt.attribution) return;
+        static_cast<const Impl::Handoff*>(incoming->transport())->trace(
+            "consumer_ready_observed", pt.incoming_host_begin, pt.incoming_host_end, pt.incoming_ms, m.device);
+    };
     PeTimer pe;
     // FORK (HET-022): with several resident owners the engaged one is chosen per layer (Impl::layer_owner); each
     // layer's phase marks are folded at the next layer's start, on the stream of the owner they were recorded on
@@ -3520,34 +3673,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
-        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
-            // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
-            // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
-            // chunk here) every piece is waited for before the one copy.
-            const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
-            const bool whole = c0 == 0 && T == n;
-            bool ok = true;
-            for (int i = 0; ok && i < hand_pieces_; ++i) {
-                int64_t r0 = 0, nr = 0;
-                handoff_piece(n, hand_pieces_, i, r0, nr);
-                ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
-                if (ok && whole && nr > 0)
-                    ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
-                                         cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+        if (incoming) {
+            auto& handoff = *static_cast<const Impl::Handoff*>(incoming->transport());
+            if (pt.attribution) {
+                pt.incoming_begin = pt.ev[pt.used - 1];
+                pt.incoming_host_begin = prefill_host_ns();
             }
-            if (ok && !whole)
-                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
-                                     m.cs) == cudaSuccess;
-            if (!ok) {
-                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
-                      cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-        } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
-                err = "prefill: the layer split's hand-off upload failed";
-                return false;
+            if (!handoff.upload_rows(m.R, c0, T, m.cs, err)) return false;
+            if (pt.attribution) {
+                pt.incoming_host_end = prefill_host_ns();
+                pt.mark(kPfStart, cs);
+                pt.incoming_end = pt.ev[pt.used - 1];
             }
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
@@ -5900,31 +6036,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             return false;
         }
         if (next_ != nullptr) {
-            // The current hand-off slot was used two chunks ago.
-            float* h = m.hand[hand_buf_];
-            if (pt.attribution) pt.attribution->download_begin = prefill_host_ns();
-            const int hp = m.hand_pieces;
-            if (hp > 0) {
-                // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
-                // state on_stage_chunk saves, the error check), the next stage's uploads wait on the pieces' events
-                bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
-                for (int i = 0; ok && i < hp; ++i) {
-                    int64_t r0 = 0, nr = 0;
-                    handoff_piece(T, hp, i, r0, nr);
-                    if (nr > 0)
-                        ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
-                                             cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
-                    ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
-                }
-                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
-                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                    return false;
-                }
-            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
+            // Two slots, unchanged copy schedule. Reuse is now certified rather
+            // than inferred from the alternation and the previous future.
+            auto& handoff = m.handoff[hand_buf_];
+            auto& packet = handoff.packet;
+            OwnerSegment scalar;
+            scalar.owner.request = m.bound_request;
+            scalar.owner.position = p0; scalar.owner.rows = T;
+            scalar.owner.tokens = tokens + c0;
+            StagePacketShape shape{m.device, next_->impl_->device, LB, LE, next_->stage_le_,
+                                   p0, T, D, single_chunk, pipe_chunked};
+            if (!packet.begin(shape, segmented ? segments : &scalar, segmented ? segment_count : 1,
+                              &handoff, Impl::Handoff::drain, err)) return false;
+            const uint64_t generation = packet.generation();
+            const int64_t download_begin = pt.attribution ? prefill_host_ns() : 0;
+            if (pt.attribution) pt.attribution->download_begin = download_begin;
+            if (!handoff.download_rows(m.R, T, err)) return false;
+            handoff.trace(handoff.pieces ? "producer_work_observed" : "producer_and_download_observed",
+                          download_begin, pt.attribution ? prefill_host_ns() : 0);
             if (!collect_device_groups()) return false;
             if (!m.gemm.collect_native_profile(err)) return false;
             if (pt.attribution) pt.attribution->download_end = prefill_host_ns();
@@ -5934,21 +6063,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // may already have forwarded its older chunk to later GPUs.
             if (segmented ? !stage_complete() : (on_stage_chunk && !on_stage_chunk(p0 + T, err))) return false;
             if (pt.attribution) pt.attribution->successor_begin = prefill_host_ns();
-            if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+            if (join_successor(err) != StagePacket::Outcome::complete) return false;
             if (pt.attribution) pt.attribution->successor_end = prefill_host_ns();
-            auto& handoff = m.owner_handoff[hand_buf_];
-            if (segmented) {
-                std::copy_n(tokens + c0, T, handoff.tokens.data());
-                std::copy_n(segments, segment_count, handoff.segments.data());
-            }
-            next_err_.clear();
-            next_->hand_in_ = h;
-            next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
-            next_->hand_pieces_ = hp;
-            next_->single_chunk_ = single_chunk;
-            next_->pipe_chunked_ = pipe_chunked;
+            if (segmented) std::copy_n(tokens + c0, T, handoff.tokens.data());
+            if (!packet.publish(generation, handoff.pieces == 0, err)) return false;
+            next_packet_ = &packet;
             if (retained_step_) {
-                if (!next_->run_impl(tokens + c0, T, p0, err)) {
+                const bool complete = next_->run_impl(tokens + c0, T, p0, err, nullptr, 0, 0, &packet, generation);
+                if (!packet.finish(generation, complete, err)) return false;
+                if (!complete) {
                     if (next_->impl_->retained_cancelled) {
                         // The child has joined and validated its cancellation.
                         // Its callbacks may have leased our device to decode;
@@ -5962,25 +6085,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // Descendant callbacks may have leased this device to decode.
                 // Reacquire it before the parent's canary/checkpoint epilogue.
                 if (!retained_boundary(LE, err, false)) return false;
-            } else if (segmented) next_run_ = std::async(std::launch::async,
-                    [this, &handoff, T, p0, segment_count, execution] {
-                strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(handoff.tokens.data(), T, p0, next_err_,
-                                       handoff.segments.data(), segment_count, execution);
-            });
-            else if (handoff_pipe_worker()) {
-                if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
-                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
-                    const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
-                    (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
-                    return r;
-                }));
-            } else next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
-            });
+                if (join_successor(err) != StagePacket::Outcome::complete) return false;
+            } else {
+                auto consume = [this, &handoff, tokens, c0, T, p0, segment_count, execution, generation] {
+                    return next_->run_impl(segment_count ? handoff.tokens.data() : tokens + c0, T, p0,
+                        handoff.packet.consumer_error(), segment_count ? handoff.packet.owners() : nullptr,
+                        segment_count, execution, &handoff.packet, generation);
+                };
+                std::future<bool> completion;
+                if (!segmented && handoff_pipe_worker()) {
+                    if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                    completion = m.hand_worker->submit(std::packaged_task<bool()>([consume] {
+                        const bool result = consume();
+                        (void) cudaGetLastError(); // preserve the persistent worker's existing error clearing
+                        return result;
+                    }));
+                } else completion = std::async(std::launch::async, [consume] {
+                    strata::aux_cpus::pin_current_thread();
+                    return consume();
+                });
+                if (!packet.attach(generation, std::move(completion), err)) std::terminate();
+            }
             hand_buf_ ^= 1;
             pt.write_chunk(stats_.experts_streamed, stats_.experts_dma, stats_.experts_resident);
+            trace_incoming();
             continue;   // the last stage reports the chunk (on_chunk)
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
@@ -6055,6 +6183,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (pt.attribution) {
             if (!on_chunk && !on_stage_chunk) pt.attribution->valid = false;
             pt.write_chunk(stats_.experts_streamed, stats_.experts_dma, stats_.experts_resident);
+            trace_incoming();
         }
     }
     // Do not drain the successor here. This is the overlap: an intermediate
@@ -6196,38 +6325,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     return true;
 }
 
-bool Prefill::drain_pipeline(std::string& err) {
-    bool ok = true;
-
-    if (next_run_.valid()) {
-        try {
-            if (!next_run_.get()) {
-                err = next_err_;
-                ok = false;
-            }
-        } catch (const std::exception& failure) {
-            err = failure.what();
-            ok = false;
-            impl_->poisoned = true;
-        } catch (...) {
-            err = "prefill: descendant threw during drain";
-            ok = false;
-            impl_->poisoned = true;
-        }
-        // Never let a failed future skip grandchildren or authorize reuse.
-        if (!ok && retained_step_) impl_->poisoned = true;
+StagePacket::Outcome Prefill::join_successor(std::string& err) {
+    if (!next_packet_) return StagePacket::Outcome::complete;
+    auto* packet = std::exchange(next_packet_, nullptr);
+    for (auto& handoff : impl_->handoff) if (&handoff.packet == packet) {
+        const auto result = handoff.retire(err);
+        if (result == StagePacket::Outcome::failed) impl_->poisoned = true;
+        return result;
     }
+    std::terminate();
+}
 
+StagePacket::Outcome Prefill::drain_pipeline(std::string& err) {
+    using Outcome = StagePacket::Outcome;
+    auto result = join_successor(err);
+    // Cancellation is not successful prefill, but a physically joined cancellation
+    // is not a failed owner either. Keep that distinction through every ancestor;
+    // a genuine failure must dominate any earlier cancellation and its error text.
+    auto merge = [&](Outcome incoming, const std::string& failure) {
+        if (incoming == Outcome::failed && result != Outcome::failed) {
+            result = incoming;
+            err = failure;
+        } else if (incoming == Outcome::cancelled && result == Outcome::complete) {
+            result = incoming;
+            err = failure;
+        }
+    };
+    // A producer can fail before attaching a consumer, and a direct successor
+    // can fail after forwarding to a grandchild. Neither may skip the other join.
+    for (auto& handoff : impl_->handoff) if (!handoff.packet.reusable()) {
+        std::string failure;
+        const auto local = handoff.retire(failure);
+        merge(local, failure);
+        if (local == Outcome::failed) impl_->poisoned = true;
+    }
     if (next_ != nullptr) {
         std::string tail_err;
-        if (!next_->drain_pipeline(tail_err)) {
-            if (ok) err = tail_err;
-            ok = false;
-            if (retained_step_) impl_->poisoned = true;
-        }
+        const auto tail = next_->drain_pipeline(tail_err);
+        merge(tail, tail_err);
+        if (tail == Outcome::failed && retained_step_) impl_->poisoned = true;
     }
-
-    return ok;
+    return result;
 }
 
 bool Prefill::reserve_uploads(int64_t T) {
@@ -6418,7 +6556,7 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
         err = "prefill: segmented execution threw"; impl_->poisoned = true; okay = false;
     }
     std::string drain_error;
-    if (!drain_pipeline(drain_error)) {
+    if (drain_pipeline(drain_error) != StagePacket::Outcome::complete) {
         if (err.empty()) err = drain_error;
         impl_->poisoned = true;
         okay = false;
@@ -6462,7 +6600,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }
 
     std::string drain_err;
-    const bool drain_ok = drain_pipeline(drain_err);
+    const bool drain_ok = drain_pipeline(drain_err) == StagePacket::Outcome::complete;
     for (Prefill* owner = this; owner; owner = owner->next_)
         owner->impl_->gemm.flush_native_profile(body_ok && drain_ok);
     if (prefill_attribution_requested())
@@ -6521,7 +6659,7 @@ bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::
         const auto& m = *owner->impl_;
         // GPU streams can still belong to decode; the entry callback returns
         // that device's lease before run_impl submits any prompt operation.
-        if (owner->public_running_.load() || owner->next_run_.valid() || m.running.load() || m.poisoned) {
+        if (owner->public_running_.load() || owner->next_packet_ || m.running.load() || m.poisoned) {
             err = "prefill: retained bulk owner is already active or poisoned"; return false;
         }
         if (m.T != 2048 || n > m.T || m.borrowed || owner->helper_ ||
@@ -6565,7 +6703,7 @@ bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::
     if (!okay) {
         bool cancelled = impl_->retained_cancelled;
         for (Prefill* owner = this; owner; owner = owner->next_)
-            if (owner->impl_->poisoned || owner->impl_->running.load() || owner->next_run_.valid())
+            if (owner->impl_->poisoned || owner->impl_->running.load() || owner->next_packet_)
                 cancelled = false;
         // A callback's text (or STOP racing an error) is not a cancellation
         // receipt. Only the joined, validated chain may report this outcome.
@@ -6613,17 +6751,15 @@ bool Prefill::run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::st
                 okay = step(owner, err);
             }
             if (!okay || !owner->next_) break;
-            if (!owner->next_run_.valid()) {
+            if (!owner->next_packet_ || !owner->next_packet_->pending()) {
                 err = "prefill: staged successor did not retain its completion owner"; okay = false; break;
             }
-            while (owner->next_run_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            while (!owner->next_packet_->ready()) {
                 if (!step(nullptr, err)) { okay = false; break; }
                 std::this_thread::yield();
             }
             if (!okay) break;
-            if (!owner->next_run_.get()) {
-                err = owner->next_err_; okay = false; break;
-            }
+            if (owner->join_successor(err) != StagePacket::Outcome::complete) { okay = false; break; }
             owner = owner->next_;
         }
     } catch (const std::exception& failure) {
@@ -6635,14 +6771,14 @@ bool Prefill::run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::st
     // A broken generation peer is not resumed; the caller's scoring path fails closed.
     std::string drain_error;
     try {
-        if (!drain_pipeline(drain_error)) {
+        if (drain_pipeline(drain_error) != StagePacket::Outcome::complete) {
             if (okay) err = drain_error;
             okay = false;
         }
     } catch (...) {
         // A future exception cannot skip the recursive descendants it may have launched.
         for (Prefill* owner = next_; owner; owner = owner->next_) {
-            try { if (owner->next_run_.valid()) owner->next_run_.get(); } catch (...) {}
+            try { std::string ignored; owner->drain_pipeline(ignored); } catch (...) {}
         }
         err = "prefill: staged descendant failed during drain"; okay = false;
     }
