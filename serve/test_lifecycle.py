@@ -921,9 +921,31 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
             attribution = matching_attributions()[0]
         for record in (self.client_record(client), attribution):
             self.assertEqual(record["native_service_wait_s"], 0.0)
+            self.assertEqual(record["queue_s"], record["admission_wait_s"])
+            self.assertGreaterEqual(record["queue_s"], record["ingress_wait_s"])
             self.assertEqual(record["native_wait_receipts_missing"]["service"], 0)
             self.assertTrue(any(event.get("native_service_wait_s") == 0
                                 for event in record["retained_events"] if event["event"] == "BACK"))
+
+    def test_queued_acceptance_publishes_authoritative_zero_service_before_input_or_seat(self):
+        self.start_native()
+        with self.tokenization_gate("queued-counter") as (entered, release):
+            client = self.launch("queued-counter has not published any input")
+            tag = self.registered_tag(1)
+            self.client_identity(client)
+            self.assertTrue(entered.wait(2))
+            self.wait_wire("BQACCEPT", tag=tag)
+            record = self.client_record(client)
+            self.assertEqual(self.wire("BACK", tag=tag), [])
+            self.assertEqual(self.wire("BGENQ1", tag=tag, direction="sent"), [])
+            self.assertEqual(record.get("native_service_wait_s"), 0.0)
+            self.assertEqual(record["native_wait_receipts_missing"]["service"], 0)
+            accepted = next(event for event in record["retained_events"] if event["event"] == "BQACCEPT")
+            self.assertIn("native_service_wait_s=0.000000000", accepted["raw"])
+            self.assertEqual(accepted["native_service_wait_s"], 0.0)
+            self.cancel_client(client)
+            release.set()
+            self.finish_client(client, 409)
 
     def test_ingress_preparation_admission_and_service_waits_are_distinct_receipt_driven_fields(self):
         self.start_native(depth=1)
@@ -945,7 +967,7 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
             self.assertEqual(self.wire("BGENQ1", tag=tag_c, direction="sent"), [])
             accepted = self.client_record(queued)
             self.assertNotIn("native_admission_wait_s", accepted)
-            self.assertNotIn("native_service_wait_s", accepted)
+            self.assertEqual(accepted["native_service_wait_s"], 0.0)
             release_a.set()
             release_b.set()
             self.wait_wire("BACK", count=2)
@@ -973,6 +995,8 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
                 self.assertGreater(observed["frontend"]["seconds"]["preparation"], 0)
                 self.assertGreater(observed["native_admission_wait_s"], 0)
                 self.assertGreater(observed["native_service_wait_s"], 0)
+                self.assertEqual(observed["queue_s"], observed["admission_wait_s"])
+                self.assertGreaterEqual(observed["queue_s"], observed["ingress_wait_s"])
                 for name in ("native_admission_wait_s", "native_service_wait_s"):
                     self.assertAlmostEqual(observed[name], float(counters[name]), places=9)
                 self.assertTrue(all(value >= 0 for value in observed["frontend"]["seconds"].values()))

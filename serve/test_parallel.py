@@ -122,7 +122,8 @@ def native_send(raw):
     print(raw, flush=True)
 def native_accept(owner, force=False):
     if not owner["accepted"] and (force or not native_gate("accept", owner["tag"])):
-        native_send(f"BQACCEPT {owner['tag']} -1 0 0")
+        service = "" if "--native-missing-service-receipt" in args else " native_service_wait_s=0.000000000"
+        native_send(f"BQACCEPT {owner['tag']} -1 0 0" + service)
         owner["accepted"] = True
 def native_finish(owner, reason):
     tag, slot = owner["tag"], owner["slot"]

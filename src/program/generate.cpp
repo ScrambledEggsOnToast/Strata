@@ -17609,7 +17609,10 @@ int main(int argc, char** argv) {
             }
             registration.submission_sequence = ++native_submission_sequence;
             *destination = std::move(registration);
-            std::printf("BQACCEPT %s -1 0 0\n", destination->tag.c_str());
+            // Service wait starts only after seating. Publish the authoritative
+            // counter now as well, so an unseated caller need not invent zero.
+            std::printf("BQACCEPT %s -1 0 0 native_service_wait_s=%.9f\n",
+                        destination->tag.c_str(), destination->service_wait_s);
             std::fflush(stdout);
             return true;
         };
@@ -18751,7 +18754,10 @@ int main(int argc, char** argv) {
                     if (!decode_round(true)) return false;
             }
             const auto decoder_slice = [&]() -> bool {
-                if (!decoder_slice_due) return true;
+                // Final-token verification can activate a decoder after the
+                // prefill decision. Retained work rechecks at this drained seam;
+                // legacy packed work keeps its existing slice cadence.
+                if (!retained_prompt && !decoder_slice_due) return true;
                 // No final_R borrow or prefill descendant survives here. Consume
                 // cancellation before a single existing, completely drained round.
                 if (!packed_collect()) return false;

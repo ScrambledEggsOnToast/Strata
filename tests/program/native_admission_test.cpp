@@ -150,12 +150,56 @@ static void control_case() {
     enqueue(cancel);
     check(in_lines.size() == 1, "identical cancellation is coalesced without dropping its intention");
 }
+static void decoder_boundary_case(bool retained_prompt, bool previously_ready, bool newly_ready,
+                                  bool cancel, bool pending, bool suspended, bool allowed) {
+    struct { bool suspended; } cursor{suspended};
+    struct { decltype(cursor) prompt_cursor; } state{cursor};
+    std::array<decltype(state), 1> bs{state};
+    struct { bool pending; strata::program::ResidentPreparation lease; } owner{pending, {0, 1, 1}};
+    std::array<decltype(owner), 1> packed_owners{owner};
+    bool ready = previously_ready;
+    // This is the decision made before final-token verification. first_token()
+    // activates a previously preparing owner only after that transaction drains.
+    const bool decoder_slice_due = retained_prompt && ready;
+    ready = ready || newly_ready;
+    int collections = 0, rounds = 0;
+    bool charged = false;
+    auto packed_collect = [&] { ++collections; if (cancel) ready = false; return true; };
+    auto packed_decoding = [&] { return ready; };
+    struct {
+        bool allowed;
+        bool enabled() const { return true; }
+        bool decode_allowed(int) const { return allowed; }
+    } time_budget{allowed};
+    auto decode_round = [&](bool charge) { ++rounds; charged = charge; return true; };
+#include "native_decoder_slice.inc"
+    check(decoder_slice(), "a drained prompt boundary succeeds");
+    const bool charge = !retained_prompt || (pending && !suspended);
+    const bool expected = retained_prompt && (previously_ready || newly_ready) && !cancel && (!charge || allowed);
+    check(rounds == int(expected),
+          "the drained boundary serves a newly active decoder once without waiting for another prompt quantum");
+    check(!rounds || charged == charge, "suspended peers retain the existing decode-budget charge policy");
+    check(!retained_prompt || collections == 1, "retained boundary consumes cancellation before readiness");
+}
+
+static void decoder_boundary_cases() {
+    decoder_boundary_case(true, false, true, false, true, true, true);
+    decoder_boundary_case(true, true, true, false, true, false, true);
+    decoder_boundary_case(true, false, false, false, true, true, true);
+    decoder_boundary_case(true, false, true, true, true, true, true);
+    decoder_boundary_case(true, false, true, false, true, false, false);
+    decoder_boundary_case(true, false, true, false, true, true, false);
+    decoder_boundary_case(true, false, true, false, false, false, false);
+    decoder_boundary_case(false, false, true, false, true, false, true);
+}
+
 
 int main() {
     selection_case(false, true);
     selection_case(true, true);
     selection_case(true, false);
     control_case();
+    decoder_boundary_cases();
     if (!failures) std::puts("native_admission_test: all passed (real selector, synthetic resource sinks)");
     return failures ? 1 : 0;
 }

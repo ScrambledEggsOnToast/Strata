@@ -1380,8 +1380,12 @@ class StrataEngine:
             if slot != owner["slot"] and not (kind == "BACK" and unseated):
                 raise ValueError("mismatched packed generation slot")
             if kind == "BQACCEPT":
-                if not native or owner["accepted"] or len(fields) != 5 or fields[2:] != ["-1", "0", "0"]:
+                if not native or owner["accepted"] or len(fields) not in (5, 6) or fields[2:5] != ["-1", "0", "0"]:
                     raise ValueError("duplicate or malformed native acceptance")
+                if len(fields) == 6:
+                    owner["native_service_wait_s"] = self._native_wait_field(fields[5], "native_service_wait_s")
+                    if owner["native_service_wait_s"] != 0:
+                        raise ValueError("native service wait before seating")
                 owner["accepted"] = True
             elif kind == "BQREJECT":
                 if owner["identity"] is not None:
@@ -2538,6 +2542,8 @@ class StrataEngine:
             for key in ("native_admission_wait_s", "native_service_wait_s"):
                 if key in owner:
                     event[key] = owner[key]
+        elif fields[0] == "BQACCEPT" and len(fields) == 6:
+            event["native_service_wait_s"] = owner["native_service_wait_s"]
         elif fields[0] == "BQPP" and len(fields) == 9:
             event["native_service_wait_s"] = owner["native_service_wait_s"]
         elif fields[0] in ("BQSUSPEND", "BQRESUMED") and len(fields) >= 13:
@@ -5369,6 +5375,9 @@ class Service:
         seated = record.get("_native_seated_at", {})
         record["queue_s"] = record.get("ingress_wait_s", 0.0) + sum(
             max(0.0, stamp - publication[tag]) for tag, stamp in seated.items() if tag in publication)
+        # Compatibility aggregate on the frontend clock, not a native counter:
+        # dispatch/readback before BACK can wait even when native admission is zero.
+        record["admission_wait_s"] = record["queue_s"]
 
     def _register_native_leg(self, record, owner):
         with self.status_lock:

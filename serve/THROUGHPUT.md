@@ -73,14 +73,25 @@ Cancelled/expired ingress-preparation waits remain part of final `queue_s`.
 Lifecycle records and response-attribution logs expose `ingress_wait_s` separately
 from actual frontend preparation. `native_admission_wait_s` comes only from BACK
 or BQDONE. `native_service_wait_s` is published as an explicit initial zero on
-BACK, updated cumulatively on BQPP, and finalized on BQDONE. Missing service
-receipts stay missing/flagged; zero is not synthesized from admission.
+BQACCEPT (before input or seating), confirmed on BACK, updated cumulatively on
+BQPP, and finalized on BQDONE. Missing service receipts stay missing/flagged;
+zero is not synthesized from admission.
 Neither wait counter is inferred from seat-to-first-token time, which includes real restore/prefill work. The
 native admission counter includes the time after early registration, so it can
-overlap frontend preparation. `queue_s` retains its compatibility meaning of
-frontend resource wait plus post-publication native seat wait; it excludes
-preparation and native service wait. The frontend `native_active` phase is a
-receipt-fenced seated interval, not a partition of native compute and service wait.
+overlap frontend preparation. `queue_s` and its compatibility alias
+`admission_wait_s` both mean frontend ingress-resource wait plus the observed
+input-publication-to-seat-receipt interval; they exclude preparation and native
+service wait. The second interval includes command dispatch and receipt delivery:
+it can be positive even when `native_admission_wait_s` is zero. Do not subtract
+the native counters from this frontend-clock aggregate or relabel it as native
+wait. The frontend `native_active` phase is a receipt-fenced seated interval,
+not a partition of native compute and service wait.
+
+Retained prompt scheduling rechecks decode readiness once at the fully drained
+boundary, after any final-token verification and mandatory MTP catch-up have
+activated new decoders. Cancellation is consumed before the existing single
+decode round. Prompt rotation, priority fairness and budget charging are unchanged;
+this does not add a suspension point or an independent reader.
 
 `retained_events` contains the actual received BQACCEPT/BACK/BQPP/BQSUSPEND/
 BQRESUMED/BQDONE/BQREJECT frames and sent BQCANCEL controls, with monotonic receipt
