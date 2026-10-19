@@ -303,6 +303,8 @@ public:
     bool propose(int slot, const float* residual, std::string& error);
     bool finish(int slot, std::string& error, bool diagnostic = true);
 private:
+    friend class ResidentExecutor;
+    friend struct ResidentExecutorFixture;
     friend struct ResidentDraftReadinessFixture;
     template<class Token>
     bool draft_ready(int slot, const core::ConversationCheckpoint* cut, const std::vector<Token>& tokens,

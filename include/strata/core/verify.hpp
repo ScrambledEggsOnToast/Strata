@@ -41,6 +41,8 @@
 #include <string>
 #include <vector>
 
+namespace strata::program { struct ResidentExecutorFixture; }
+
 namespace strata::core {
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
@@ -463,6 +465,7 @@ public:
     std::string profile_report();
 
 private:
+    friend struct strata::program::ResidentExecutorFixture;
     struct CausalCapture;
     CausalCapture* causal_ = nullptr;
     float *causal_x_h_ = nullptr, *causal_x_m_ = nullptr;
