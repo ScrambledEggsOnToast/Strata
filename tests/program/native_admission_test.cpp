@@ -37,6 +37,7 @@ struct Owner {
     Clock::time_point accepted = Clock::now(), deadline = accepted + std::chrono::seconds(10), started, service_ready;
     double admission_wait_s = 0, service_wait_s = 0;
     strata::program::ResidentPreparation lease;
+    bool work = false;
     std::array<int, 4> seams{};
     int phase_input = 0;
     std::optional<Leg> phase_leg;
@@ -105,6 +106,17 @@ static void selection_case(bool poisoned, bool matching) {
     auto capture_failure = [] { return strata::program::PreservationFailure::durability; };
     auto drop_capture = [](const char*) {};
     auto packed_terminal = [](Owner& owner, int, const char*) { owner = {}; };
+    struct Executor {
+        int submissions = 0;
+        bool submit(const strata::program::ResidentPreparation& lease, int, std::string&) {
+            ++submissions;
+            return lease.request && lease.incarnation;
+        }
+    };
+    std::array<Executor, 1> resident_executors;
+    const int execution_plan = 0;
+    std::string err;
+    auto executor_retire = [](int) { return true; };
 #include "native_select.inc"
     check(native_select(), "native selection completes at its owner safe point");
     check(resident.reserved && packed_owners[0].pending && packed_submissions[1].tag.empty(),
@@ -114,6 +126,8 @@ static void selection_case(bool poisoned, bool matching) {
     check(resident.retained_source.size() == (poisoned ? 0U : 2U),
           "a post-poison reservation cannot copy a retained source before invalidation");
     check(resets == (poisoned ? 1 : 0), "poison reset occurs once, and healthy cache reuse is unchanged");
+    check(packed_owners[0].work && resident_executors[0].submissions == 1,
+          "native selection binds its reserved generation to exactly one executor call scope");
 }
 static void control_case() {
     std::deque<std::string> in_lines;

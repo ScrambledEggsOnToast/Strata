@@ -102,6 +102,7 @@
 #include "strata/program/batch_residency.hpp"
 #include "strata/program/time_budget.hpp"
 #include "strata/program/execution_plan.hpp"
+#include "strata/program/resident_executor.hpp"
 #include "strata/program/decode_service.hpp"
 #include "strata/program/native_admission.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -12343,6 +12344,9 @@ int main(int argc, char** argv) {
         strata::program::ResidentSlots resident(g, std::move(resident_stages), mtp, sp, drive.d,
                                                o.max_context, o.prompt_cache > 0, std::max(o.prompt_cache, 1),
                                                admitted_checkpoint_bytes);
+        std::array<strata::program::ResidentExecutor, 4> resident_executors{
+            strata::program::ResidentExecutor(resident), strata::program::ResidentExecutor(resident),
+            strata::program::ResidentExecutor(resident), strata::program::ResidentExecutor(resident)};
         if (o.batch > 0 && !resident.init_resources(err)) {
             std::fprintf(stderr, "strata serve: --batch: %s\n", err.c_str());
             return 1;
@@ -14345,14 +14349,32 @@ int main(int argc, char** argv) {
         };
         auto park_completed = [&](int slot, size_t held, const strata::core::SavedConversation* held_image) -> bool {
             if (!conversations.enabled()) return true;
+            const auto capture = [&](strata::program::ResidentSnapshotSource& source) {
+                const auto& owner = source.owner;
+                return park_source({owner.ids, no_park_images, source.checkpoints, owner.input.scope,
+                                    owner.cvec, true, &source, kResidentOwnerFirst + (uint64_t) slot, true},
+                                   held, held_image);
+            };
+            if (slot >= 0 && size_t(slot) < resident_executors.size()) {
+                auto& executor = resident_executors[size_t(slot)];
+                if (const auto work = executor.work()) {
+                    auto snapshot = executor.borrow_snapshot(work, err);
+                    if (!err.empty()) return false;
+                    if (snapshot) {
+                        const bool captured = capture(*snapshot.source());
+                        std::string returned_error;
+                        if (!executor.return_snapshot(snapshot, returned_error)) {
+                            err = std::move(returned_error);
+                            return false;
+                        }
+                        return captured; // capture and return are synchronous, before any replacement
+                    }
+                }
+            }
+            // Stopped owners and legacy admissions retain their existing certified source path;
+            // the completed-only executor borrow is deliberately not a blanket replacement.
             auto source = resident.completed_snapshot_source(slot, err);
-            if (!source) return err.empty();
-            const auto& owner = source->owner;
-            // A resident owner's own conversation is the owner of this capture: its lineage is the only one a
-            // publication of it may supersede or update, never the session's and never another slot's.
-            return park_source({owner.ids, no_park_images, source->checkpoints, owner.input.scope,
-                                owner.cvec, true, &*source, kResidentOwnerFirst + (uint64_t) slot, true},
-                               held, held_image);
+            return source ? capture(*source) : err.empty();
         };
         const char* throughput_env = std::getenv("STRATA_THROUGHPUT");
         const bool report_throughput = throughput_env && std::string(throughput_env) == "1";
@@ -16267,6 +16289,7 @@ int main(int argc, char** argv) {
             std::vector<int64_t> tokens;
             strata::program::ResidentRequest input;
             strata::program::ResidentPreparation lease;
+            strata::program::ResidentWorkHandle work;
             uint64_t cache_offer = 0, cache_generation = 0, deadline_ns = 0;
             bool pending = false, prepared = false, first = false, final_issued = false;
             bool input_ready = false, foreground = true;
@@ -16310,6 +16333,47 @@ int main(int argc, char** argv) {
         std::vector<PackedOwner> packed_submissions(retained_prompt
             ? packed_seats + strata::program::native_submission_limit : 4);
         std::span<PackedOwner> packed_owners(packed_submissions.data(), packed_seats);
+        bool packed_control_failed = false;
+        auto resident_finish = [&](int slot, std::string& why, bool diagnostic = true) {
+            if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
+                packed_owners[size_t(slot)].work)
+                return resident_executors[size_t(slot)].finish(packed_owners[size_t(slot)].work, why, diagnostic);
+            return resident.finish(slot, why, diagnostic);
+        };
+        auto resident_commit = [&](int slot, int32_t token, const float* residual, std::string& why,
+                                   bool diagnostic = true) {
+            if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
+                packed_owners[size_t(slot)].work)
+                return resident_executors[size_t(slot)].committed(packed_owners[size_t(slot)].work,
+                                                                 token, residual, why, diagnostic);
+            return resident.committed(slot, token, residual, why, diagnostic);
+        };
+        auto resident_propose = [&](int slot, const float* residual, std::string& why) {
+            if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
+                packed_owners[size_t(slot)].work)
+                return resident_executors[size_t(slot)].propose(packed_owners[size_t(slot)].work, residual, why);
+            return resident.propose(slot, residual, why);
+        };
+        const auto terminal_reason = [](const char* reason) {
+            using strata::program::ResidentTerminal;
+            return std::strcmp(reason, "timeout") == 0 ? ResidentTerminal::timeout :
+                std::strcmp(reason, "disconnect") == 0 ? ResidentTerminal::disconnected :
+                std::strcmp(reason, "refused") == 0 ? ResidentTerminal::refused : ResidentTerminal::cancelled;
+        };
+        auto resident_cancel = [&](int slot, const char* reason = "cancel") {
+            if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
+                packed_owners[size_t(slot)].work) {
+                if (!resident_executors[size_t(slot)].request_cancel(packed_owners[size_t(slot)].work,
+                                                                     terminal_reason(reason), err))
+                    packed_control_failed = true;
+            } else resident.cancel(slot);
+        };
+        auto executor_retire = [&](int slot) {
+            if (slot < 0 || size_t(slot) >= resident_executors.size()) return true;
+            auto& executor = resident_executors[size_t(slot)];
+            const auto work = executor.work();
+            return !work || executor.retire(work, err);
+        };
         strata::program::NativeAdmissionPolicy native_policy;
         if (const auto* value = std::getenv("STRATA_ADMIT_SHORT_FIRST"))
             native_policy.short_first = size_t(std::max(0, std::atoi(value)));
@@ -16421,6 +16485,17 @@ int main(int argc, char** argv) {
             if (bs[size_t(slot)].active || bs[size_t(slot)].preparing || owner.final_issued) {
                 owner.terminal_reason = reason; // consumers/resource transition still own the old seat
                 return true;
+            }
+            if (owner.work) {
+                const auto observation = resident_executors[size_t(slot)].observe(owner.work, err);
+                if (!observation || observation.event != strata::program::ResidentEvent::terminal ||
+                    !observation.fresh) {
+                    if (err.empty()) err = "resident executor: terminal precedes committed output or was already consumed";
+                    std::printf("FATAL %s\n", err.c_str());
+                    std::fflush(stdout);
+                    packed_control_failed = true;
+                    return true; // retain the owner/history; never fall back to a legacy terminal
+                }
             }
             packed_terminal(owner, slot, reason);
             return true;
@@ -16553,12 +16628,19 @@ int main(int argc, char** argv) {
             }
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
                 !packed_owners[size_t(slot)].tag.empty()) {
+                const auto observation = resident_executors[size_t(slot)].observe(packed_owners[size_t(slot)].work, err);
+                if (!observation || observation.event != strata::program::ResidentEvent::committed_token ||
+                    !observation.fresh || observation.token != token) {
+                    if (err.empty()) err = "resident executor: wire token lacks its committed observation";
+                    return false;
+                }
                 const auto& owner = packed_owners[size_t(slot)];
                 std::printf("BQT %s %d %llu %llu %d\n", owner.tag.c_str(), slot,
                             (unsigned long long)owner.lease.request,
                             (unsigned long long)owner.lease.incarnation, (int)token);
             } else std::printf("BT %d %d\n", slot, (int)token);
             if (o.foreground_budget_ms > 0) ++batch_commit_epoch;
+            return true;
         };
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
@@ -16598,7 +16680,7 @@ int main(int argc, char** argv) {
                 const BSlot& sl = bs[(size_t) b];
                 if (!sl.active || !sl.stop) continue;
                 // The previous operation has drained. Cancellation must not execute another row.
-                if (!resident.finish(b, err)) return false;
+                if (!resident_finish(b, err)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                 phase_resident_done(b, "cancel");
                 if (split_batch_mtp)
@@ -16769,7 +16851,7 @@ int main(int argc, char** argv) {
                             print_legacy_bdone(b, "nonfinite", ms);
                     }
                     resident.taint(b);
-                    if (!resident.finish(b, err, false)) {
+                    if (!resident_finish(b, err, false)) {
                         phase_error("ERR %s\n", err.c_str()); return false;
                     }
                     nan_flush = true;
@@ -16780,10 +16862,10 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < accepted; ++j) {
                     const int32_t y = outb[batch_mtp ? start + j : b];
                     last_residual = ver.final_R(start + j);
-                    if (!resident.committed(b, y, last_residual, err)) {
+                    if (!resident_commit(b, y, last_residual, err)) {
                         phase_error("ERR %s\n", err.c_str()); return false;
                     }
-                    emit_batch_token(b, y);
+                    if (!emit_batch_token(b, y)) return false;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -16793,13 +16875,13 @@ int main(int argc, char** argv) {
                         if (!packed_done(b, fin)) {
                             print_legacy_bdone(b, fin, ms, split_batch_mtp ? &batch_drafts[b] : nullptr);
                         }
-                        if (!resident.finish(b, err)) {
+                        if (!resident_finish(b, err)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
                         break;
                     }
                 }
-                if (batch_mtp && sl.active && !resident.propose(b, last_residual, err)) {
+                if (batch_mtp && sl.active && !resident_propose(b, last_residual, err)) {
                     phase_error("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
                 }
                 native_service_end(b);
@@ -16999,7 +17081,7 @@ int main(int argc, char** argv) {
                         if (!packed_done(G.rows[t], "nonfinite"))
                             print_legacy_bdone(G.rows[t], "nonfinite", ms);
                         resident.taint(G.rows[t]);
-                        if (!resident.finish(G.rows[t], err, false)) {
+                        if (!resident_finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
                         nan_flush = true;
@@ -17007,10 +17089,10 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const int32_t y = outb[t];
-                    if (!resident.committed(G.rows[t], y, vk.final_R(t), err, false)) {
+                    if (!resident_commit(G.rows[t], y, vk.final_R(t), err, false)) {
                         phase_error("ERR %s\n", err.c_str()); return false;
                     }
-                    emit_batch_token(G.rows[t], y);
+                    if (!emit_batch_token(G.rows[t], y)) return false;
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -17020,7 +17102,7 @@ int main(int argc, char** argv) {
                         phase_resident_done(G.rows[t], fin);
                         if (!packed_done(G.rows[t], fin))
                             print_legacy_bdone(G.rows[t], fin, ms);
-                        if (!resident.finish(G.rows[t], err, false)) {
+                        if (!resident_finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
                     }
@@ -17160,7 +17242,7 @@ int main(int argc, char** argv) {
                                      b, (long long) G.pos[first]);
                         print_mtp_done(b, "nonfinite");
                         resident.taint(b);
-                        if (!resident.finish(b, err, false)) {
+                        if (!resident_finish(b, err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
                         nan_flush = true;
@@ -17171,23 +17253,23 @@ int main(int argc, char** argv) {
                     for (int j = 0; j < keep[b]; ++j) {
                         const int32_t y = out[first + j];
                         residual = head.final_R(first + j);
-                        if (!resident.committed(b, y, residual, err, batch_mtp_trace)) {
+                        if (!resident_commit(b, y, residual, err, batch_mtp_trace)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
-                        emit_batch_token(b, y);
+                        if (!emit_batch_token(b, y)) return false;
                         ++bt_tokens;
                         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         const char* finish = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                            : sl.p + 1 > o.max_context ? "length" : nullptr;
                         if (finish) {
                             print_mtp_done(b, finish);
-                            if (!resident.finish(b, err, batch_mtp_trace)) {
+                            if (!resident_finish(b, err, batch_mtp_trace)) {
                                 phase_error("ERR %s\n", err.c_str()); return false;
                             }
                             break;
                         }
                     }
-                    if (sl.active && !resident.propose(b, residual, err)) {
+                    if (sl.active && !resident_propose(b, residual, err)) {
                         phase_error("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
                     }
                     native_service_end(b);
@@ -17236,7 +17318,7 @@ int main(int argc, char** argv) {
                             const BSlot& sl = bs[(size_t)b];
                             if (!sl.active || seat_leased(b)) continue;
                             if (sl.stop) {
-                                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                                if (!resident_finish(b, err, batch_mtp_trace)) return false;
                                 print_mtp_done(b, "cancel");
                                 continue;
                             }
@@ -17293,7 +17375,7 @@ int main(int argc, char** argv) {
                             const BSlot& sl = bs[(size_t) b];
                             if (!sl.active) continue;
                             if (sl.stop) {
-                                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                                if (!resident_finish(b, err, batch_mtp_trace)) return false;
                                 print_mtp_done(b, "cancel");
                                 continue;
                             }
@@ -17317,7 +17399,7 @@ int main(int argc, char** argv) {
                         const BSlot& sl = bs[(size_t) b];
                         if (!sl.active) continue;
                         if (sl.stop) {
-                            if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                            if (!resident_finish(b, err, batch_mtp_trace)) return false;
                             print_mtp_done(b, "cancel");
                             continue;
                         }
@@ -17423,7 +17505,7 @@ int main(int argc, char** argv) {
                     !resident.owns(slot, request, incarnation))
                     std::fprintf(stderr, "strata serve: ignored BSTOP slot=%d request=%llu incarnation=%llu "
                                          "(stale or unbound identity)\n", slot, request, incarnation);
-                else resident.cancel(slot); // old slot-only controls keep their existing semantics
+                else resident_cancel(slot); // old slot-only controls keep their existing semantics
                 return true;
             }
             if (command.rfind("BPRIORITY ", 0) == 0) {
@@ -17467,7 +17549,7 @@ int main(int argc, char** argv) {
             for (int b = 0; b < (int)bs.size(); ++b) {
                 const auto& sl = bs[(size_t)b];
                 if (!sl.active || !sl.stop) continue;
-                if (!resident.finish(b, err, batch_mtp_trace)) return false;
+                if (!resident_finish(b, err, batch_mtp_trace)) return false;
                 phase_resident_done(b, "cancel");
                 if (split_batch_mtp || batch_mtp_pipeline) print_mtp_done(b, "cancel");
                 else if (!packed_done(b, "cancel"))
@@ -17590,7 +17672,6 @@ int main(int argc, char** argv) {
         }
         strata::program::score::Request score_request; // retain bounded host staging across scoring requests
         std::vector<float> score_values;
-        bool packed_control_failed = false;
         size_t native_capacity = 0;
         auto native_reject = [&](PackedOwner& owner, const char* reason) {
             std::printf("BQREJECT %s -1 %s\n", owner.tag.c_str(), reason);
@@ -17663,7 +17744,7 @@ int main(int argc, char** argv) {
                     owner.cancel_reason = eof ? "cancel" : "timeout";
                 if (!owner.cancel_reason) continue;
                 if (owner.lease.slot < 0) packed_terminal(owner, -1, owner.cancel_reason);
-                else resident.cancel(owner.lease.slot);
+                else resident_cancel(owner.lease.slot, eof ? "disconnect" : owner.cancel_reason);
             }
         };
         auto retained_receipt = [&](const char* event, const auto& owner, const char* reason) {
@@ -17739,7 +17820,8 @@ int main(int argc, char** argv) {
                                          "incarnation=%llu reason=%s\n", owner.tag.c_str(), slot,
                                  (unsigned long long)owner.lease.request, (unsigned long long)owner.lease.incarnation,
                                  valid && matches ? err.c_str() : "stale_identity_or_cursor");
-                    if (!resident.abort_preparation(owner.lease, err)) packed_control_failed = true;
+                    resident_cancel(slot, "refused");
+                    if (!resident_finish(slot, err)) packed_control_failed = true;
                     else packed_done(slot, "refused");
                 } else {
                     native_service_end(slot);
@@ -17751,7 +17833,7 @@ int main(int argc, char** argv) {
                 }
                 if (matches) {
                     if (retained_prompt && !owner.cancel_reason) owner.cancel_reason = "cancel";
-                    if (slot >= 0) resident.cancel(slot);
+                    if (slot >= 0) resident_cancel(slot);
                 }
             } else {
                 const auto value = field();
@@ -17960,6 +18042,8 @@ int main(int argc, char** argv) {
                 inputs[size_t(index)].tokens = &owner.tokens;
                 inputs[size_t(index)].request = owner.input;
             }
+            for (int index = 0; index < count; ++index)
+                if (!executor_retire(seats[size_t(index)])) return false;
             if (!resident.reserve(inputs.data(), count, leases.data(), why)) {
                 for (int index = 0; index < count; ++index) {
                     const int slot = seats[size_t(index)];
@@ -17973,6 +18057,8 @@ int main(int argc, char** argv) {
                 const bool foreground = owner.seams[0] != 0;
                 owner.seams = {};
                 owner.lease = leases[size_t(index)];
+                owner.work = resident_executors[size_t(owner.lease.slot)].submit(owner.lease, execution_plan, err);
+                if (!owner.work) return false;
                 if (phase_receipts) {
                     uint64_t sequence = 0;
                     (void)phase::next_sequence(phase_sequence, sequence);
@@ -18100,6 +18186,7 @@ int main(int argc, char** argv) {
                 input.request = owner.input;
                 strata::program::ResidentPreparation lease;
                 std::string why;
+                if (!executor_retire(destination)) return false;
                 if (!resident.reserve(&input, 1, &lease, why)) {
                     std::fprintf(stderr, "NATIVE_ADMISSION event=refused tag=%s reason=%s\n",
                                  owner.tag.c_str(), why.c_str());
@@ -18107,6 +18194,8 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 owner.lease = lease;
+                owner.work = resident_executors[size_t(destination)].submit(lease, execution_plan, err);
+                if (!owner.work) return false;
                 owner.pending = true;
                 owner.seams = {};
                 owner.admit_sequence = ++packed_admit_sequence;
@@ -18136,6 +18225,7 @@ int main(int argc, char** argv) {
                  command.rfind("BQINPUTREFUSED ", 0) == 0));
         };
         auto packed_collect = [&]() -> bool {
+            if (packed_control_failed) return false;
             native_intentions();
             if (!retire_stopped()) return false;
             packed_flush();
@@ -18185,7 +18275,7 @@ int main(int argc, char** argv) {
                 auto& owner = packed_owners[size_t(slot)];
                 if (!owner.cancel_reason && (in_eof || Clock::now() >= owner.deadline)) {
                     owner.cancel_reason = in_eof ? "cancel" : "timeout";
-                    resident.cancel(slot);
+                    resident_cancel(slot, in_eof ? "disconnect" : owner.cancel_reason);
                 }
             }
             return in_eof || bs[size_t(slot)].stop;
@@ -18298,7 +18388,7 @@ int main(int argc, char** argv) {
             {
                 phase::Span phase_span(phase_current, phase::Stage::gpu_mount);
                 auto refusal = strata::program::ResidentSourceRefusal::none;
-                if (!resident.prepare(owner.lease, source, cut, expectation, err, &refusal)) {
+                if (!resident_executors[size_t(slot)].prepare(owner.work, source, cut, expectation, err, &refusal)) {
                     if (!source || refusal == strata::program::ResidentSourceRefusal::none) return false;
                     std::fprintf(stderr, "PACKED_PREFILL event=source_refused tag=%s slot=%d request=%llu "
                                          "incarnation=%llu outcome=original_reservation reason=%s\n",
@@ -18312,7 +18402,7 @@ int main(int argc, char** argv) {
                     disk = false;
                     shared_mount = false;
                     err.clear();
-                    if (!resident.prepare(owner.lease, err)) return false;
+                    if (!resident_executors[size_t(slot)].prepare(owner.work, err)) return false;
                 }
             }
             owner.prepared = true;
@@ -18517,7 +18607,8 @@ int main(int argc, char** argv) {
                 const int slot = owner.lease.slot;
                 if (!retained_prompt)
                     owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
-                if (!resident.abort_preparation(owner.lease, err)) return false;
+                resident_cancel(slot);
+                if (!resident_finish(slot, err)) return false;
                 packed_done(slot, "cancel");
             }
             // #249: one composition decision for this boundary.  Solo owners take the next pack alone; an
@@ -18640,7 +18731,7 @@ int main(int argc, char** argv) {
                                     bs[size_t(slot)].prompt.data() + position + 1, rows, position, err))
                                 return false;
                             position += rows;
-                            if (!resident.prefilled(owner.lease, position, err)) return false;
+                            if (!resident_executors[size_t(slot)].prefilled(owner.work, position, err)) return false;
                             owner.frontier = position;
                             for (size_t stage = 0; stage <= stages.size(); ++stage)
                                 std::fprintf(stderr, "RETAINED_PROMPT event=stage mode=verifier tag=%s slot=%d "
@@ -18655,7 +18746,8 @@ int main(int argc, char** argv) {
                         }
                         if (!owner.pending) continue; // a request-local refusal already drained this owner
                         if (packed_cancelled(slot)) {
-                            if (!resident.abort_preparation(owner.lease, err)) return false;
+                            resident_cancel(slot);
+                            if (!resident_finish(slot, err)) return false;
                             packed_done(slot, "cancel");
                             continue;
                         }
@@ -18756,7 +18848,8 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
-                    if (!resident.prefilled(owner.lease, result.frontier[size_t(index)], err)) return false;
+                    if (!resident_executors[size_t(owner.lease.slot)].prefilled(owner.work, result.frontier[size_t(index)], err))
+                        return false;
                     owner.frontier = result.frontier[size_t(index)];
                     if (!retained_prompt)
                         owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
@@ -18809,12 +18902,14 @@ int main(int argc, char** argv) {
             if (!packed_collect()) return false;
             std::array<strata::core::BatchRow, 4> final_rows;
             std::array<int, 4> final_slots{};
+            std::array<strata::program::ResidentFinalSelection, 4> final_owners;
             int final_count = 0;
             const uint64_t final_epoch = command_epoch.load();
             for (auto& owner : packed_owners) if (owner.pending && owner.prepared) {
                 const int slot = owner.lease.slot;
                 if (packed_cancelled(slot)) {
-                    if (!resident.abort_preparation(owner.lease, err)) return false;
+                    resident_cancel(slot);
+                    if (!resident_finish(slot, err)) return false;
                     packed_done(slot, "cancel");
                     continue;
                 }
@@ -18830,11 +18925,15 @@ int main(int argc, char** argv) {
                 row.sequence_end = row.position + 1;
                 row.output_offset = final_count;
                 row.mask = strata::core::BatchRowMask::active;
+                final_owners[size_t(final_count)] = {&resident_executors[size_t(slot)], owner.work};
                 final_slots[size_t(final_count++)] = slot;
             }
             if (command_epoch.load() != final_epoch) return true;
             if (!final_count) return decoder_slice();
             int32_t output[4] = {};
+            strata::program::ResidentFinalTransaction final_transaction;
+            if (!final_transaction.issue(final_owners.data(), final_rows.data(), final_count, err)) return false;
+            std::array<const char*, 4> final_finishes{};
             drive.d.failed = false;
             for (int index = 0; index < final_count; ++index) {
                 const int slot = final_slots[size_t(index)];
@@ -18863,8 +18962,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 const float* residual = head.final_R(index);
-                if (!resident.first_token(owner.lease, output[index], residual, err)) return false;
-                owner.final_issued = false; // the final verifier row's mandatory draft consumer is drained
+                if (!final_transaction.consume(final_transaction.receipt(index), output[index], residual, err)) return false;
                 if (retained_prompt) for (size_t stage = 0; stage <= stages.size(); ++stage)
                     std::fprintf(stderr, "RETAINED_PROMPT event=stage mode=final tag=%s slot=%d request=%llu "
                                          "incarnation=%llu stage=%zu allocation=%llu from=%lld to=%lld\n",
@@ -18882,18 +18980,16 @@ int main(int argc, char** argv) {
                 owner.frontier = int64_t(owner.tokens.size());
                 if (!retained_prompt)
                     owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
-                emit_batch_token(slot, output[index]);
+                if (!emit_batch_token(slot, output[index])) return false;
                 std::fflush(stdout);
                 native_service_end(slot);
                 const auto& state = bs[size_t(slot)];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), int64_t(output[index])) != o.eos_ids.end();
                 const char* finish = eos ? "stop" : state.stop ? "cancel" :
                     state.produced >= state.max_new || state.p + 1 > o.max_context ? "length" : nullptr;
-                if (finish) {
-                    if (!resident.finish(slot, err, batch_mtp_trace)) return false;
-                    packed_done(slot, finish);
-                } else {
-                    if (!resident.propose(slot, residual, err)) return false;
+                final_finishes[size_t(index)] = finish;
+                if (!finish) {
+                    if (!resident_propose(slot, residual, err)) return false;
                     if (owner.phase_leg) {
                         phase_receipts->request(*owner.phase_leg, "completed", "resident");
                         auto& receipt = (*phase_residents)[size_t(slot)];
@@ -18903,6 +18999,19 @@ int main(int argc, char** argv) {
                         receipt.pending = true;
                     }
                 }
+            }
+            // Every selected owner, committed-row witness and shared residual stays fenced until
+            // all mandatory catch-up/proposal consumers drain. No owner can retire inside the loop.
+            if (!final_transaction.release(err)) return false;
+            final_rows = {};
+            final_owners = {};
+            for (int index = 0; index < final_count; ++index)
+                packed_owners[size_t(final_slots[size_t(index)])].final_issued = false;
+            for (int index = 0; index < final_count; ++index) {
+                if (!final_finishes[size_t(index)]) continue;
+                const int slot = final_slots[size_t(index)];
+                if (!resident_finish(slot, err, batch_mtp_trace)) return false;
+                packed_done(slot, final_finishes[size_t(index)]);
             }
             std::fflush(stdout);
             publish_ram_view();
@@ -18951,7 +19060,8 @@ int main(int argc, char** argv) {
                 for (auto& owner : packed_owners) {
                     if (!owner.pending || !bs[size_t(owner.lease.slot)].stop || owner.final_issued) continue;
                     const int slot = owner.lease.slot;
-                    if (!resident.abort_preparation(owner.lease, err)) return 1;
+                    resident_cancel(slot);
+                    if (!resident_finish(slot, err)) return 1;
                     packed_done(slot, "cancel");
                 }
                 if (!native_select()) return 1;
@@ -19099,6 +19209,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
             }
+            if (private_preparation) packed_flush(); // drained tagged terminals precede any legacy seat replacement
             const bool budget_service = time_budget.enabled() &&
                 (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0 ||
                  line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0);
@@ -21462,6 +21573,7 @@ int main(int argc, char** argv) {
                     }
                     const bool parked_phase = can && [&] {
                         phase::Span phase_span(phase_current, phase::Stage::resident_copyin);
+                        if (!executor_retire(ys)) { ye = err; return false; }
                         return resident.park(ys, pre, request, read_from == 0 || resumed_from0, ye);
                     }();
                     if (parked_phase) {
@@ -23425,6 +23537,7 @@ int main(int argc, char** argv) {
                     }
                     const strata::program::ResidentAdmission request{
                         x, &checks, batch_mtp ? last_committed_residual : nullptr, (int64_t) live.size() - 1};
+                    if (!executor_retire(admit_slot)) { phase_error("ERR %s\n", err.c_str()); return 1; }
                     if (!resident.admit(admit_slot, live, request, err)) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                         phase_error("ERR %s\n", err.c_str()); return 1;

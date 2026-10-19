@@ -155,6 +155,18 @@ remain the timing surfaces. Report preparation/cleanup and complete-call time se
 native-active time; preparation/cleanup include rendering and protocol work, so they are not an isolated
 measurement of adapter dispatch cost. Mock-engine timings establish the partition, not GPU or installed-client speed.
 
+The opt-in private packed/retained-prompt path now binds each reserved seat to a
+`ResidentExecutor` call scope. `ResidentSlots` still owns identities, histories and model state;
+the existing scheduler still selects rows and pumps controls. The shared final-row transaction
+remains `run_slot_rows → commit_slots → wait_commit`, then the existing control pump, then
+each selected owner's first-token/MTP catch-up. Every selected owner stays fenced until all
+catch-up and residual/proposal consumers drain, including owners cancelled after issue.
+Committed output is observed before the single terminal; an idle drain does not discard output.
+Completed snapshot borrows are returned synchronously before seat replacement. Prepared and
+stopped-owner captures keep their existing paths. `STRATA_EXECUTOR_TRACE=1` enables diagnostic
+call/transaction receipts; it is off by default. This migration changes no daily profile,
+admission/residency requirement or scheduling policy and makes no performance claim.
+
 For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complete native stdout frames as
 `wire<` lines in the frontend log. Count only those trace lines' `T` and `BT` token IDs once; `ADMIT`, `BADM`,
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,

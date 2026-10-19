@@ -8,7 +8,19 @@
 #include "strata/prefill/prefill.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <type_traits>
+
+namespace {
+size_t heap_allocations = 0;
+}
+void* operator new(std::size_t bytes) {
+    if (auto* result = std::malloc(bytes ? bytes : 1)) { ++heap_allocations; return result; }
+    throw std::bad_alloc();
+}
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 namespace strata::program {
 struct ResidentExecutorFixture {
@@ -18,12 +30,12 @@ struct ResidentExecutorFixture {
         return geometry;
     }
     core::ModelGeometry geometry = empty_geometry();
-    core::SessionOwner main, a, b;
+    core::SessionOwner main, a, b, c;
     core::Verifier verifier;
     core::MtpDrafter draft;
     prefill::Prefill prompt;
     core::ExpertDispatch dispatch;
-    ResidentSlots slots{geometry, {{&main.state(), &verifier, {&a.state(), &b.state()}, -1}},
+    ResidentSlots slots{geometry, {{&main.state(), &verifier, {&a.state(), &b.state(), &c.state()}, -1}},
                         draft, prompt, dispatch, 64, true, 6, 4096};
     ResidentPreparation lease;
     ExecutionPlan plan;
@@ -35,15 +47,17 @@ struct ResidentExecutorFixture {
         a.state().allocation_device = -1;
         b.state().allocation_id = 12;
         b.state().allocation_device = -1;
+        c.state().allocation_id = 13;
+        c.state().allocation_device = -1;
         // No streams, graphs, weights or buffers. context_idle/wait_commit use their real
         // empty-operation path and never query CUDA for a negative device ordinal.
         verifier.g_ = &geometry;
         verifier.ss_ = &main.state();
-        verifier.slots_ = {&a.state(), &b.state()};
+        verifier.slots_ = {&a.state(), &b.state(), &c.state()};
         dispatch.completion.emplace_back(core::ExpertCompletion::kCapacity);
         ExecutionPlanInput input;
         input.serve = true;
-        input.batch_requested = 2;
+        input.batch_requested = 3;
         input.spec_requested = 2;
         plan = resolve_execution_plan(input);
         reserve();
@@ -53,24 +67,25 @@ struct ResidentExecutorFixture {
         peer.prompt_cursor.operation = 51;
         dispatch.slot_requests[1] = 23;
     }
-    void reserve(uint64_t request = 17, uint64_t incarnation = 3) {
-        auto& owner = slots.slots_[0];
+    void reserve(uint64_t request = 17, uint64_t incarnation = 3, int slot = 0) {
+        auto& owner = slots.slots_[size_t(slot)];
         owner.active = owner.stop = owner.failed = owner.tainted = owner.cached = false;
         owner.preparing = true;
         owner.request = request; owner.incarnation = incarnation;
         owner.ids.clear(); owner.prompt = {11, 12, 13};
         owner.p = owner.produced = 0; owner.max_new = owner.input.max_new = 8;
         owner.input.scope.value[0] = 1;
-        slots.preparations_[0] = {};
-        slots.preparations_[0].ready = true;
-        dispatch.slot_requests[0] = request;
-        verifier.committed_slot_row_[0] = {};
+        slots.preparations_[size_t(slot)] = {};
+        slots.preparations_[size_t(slot)].ready = true;
+        dispatch.slot_requests[slot] = request;
+        verifier.committed_slot_row_[slot] = {};
         lease = {};
-        lease.slot = 0; lease.request = request; lease.incarnation = incarnation; lease.endpoint = 2;
-        lease.stages[0] = &a.state(); lease.allocations[0] = a.state().allocation_id;
+        lease.slot = slot; lease.request = request; lease.incarnation = incarnation; lease.endpoint = 2;
+        lease.stages[0] = slots.stages_[0].slots[size_t(slot)];
+        lease.allocations[0] = lease.stages[0]->allocation_id;
     }
     void final_witness() {
-        auto& row = verifier.committed_slot_row_[0];
+        auto& row = verifier.committed_slot_row_[lease.slot];
         row.request_id = lease.request; row.position = lease.endpoint; row.token = 13;
     }
     bool first(int32_t token = 31) {
@@ -83,6 +98,14 @@ struct ResidentExecutorFixture {
         return peer.request == 23 && peer.incarnation == 9 && peer.active && !peer.stop && !peer.failed &&
             peer.ids == std::vector<int32_t>({21, 22, 23}) && peer.p == 3 && peer.produced == 2 &&
             peer.sampling.seed == 99 && peer.prompt_cursor.operation == 51 && dispatch.slot_requests[1] == 23;
+    }
+    static core::BatchRow final_row(const ResidentPreparation& lease, int index) {
+        core::BatchRow row;
+        row.request_id = row.cancellation_generation = lease.request;
+        row.state = lease.stages[0]; row.slot = lease.slot; row.token = 13;
+        row.position = lease.endpoint; row.sequence_end = lease.endpoint + 1;
+        row.output_offset = index; row.mask = core::BatchRowMask::active;
+        return row;
     }
 };
 } // namespace strata::program
@@ -264,7 +287,136 @@ int main() {
               f.slots.slots()[0].incarnation == 4 && !f.slots.slots()[0].stop && f.peer_untouched(),
               "return of a stale incarnation is refused without applying it to the successor");
     }
-    std::printf("resident executor contract: failures=%d executor_bytes=%zu snapshot_lease_bytes=%zu\n",
-                failures, sizeof(ResidentExecutor), sizeof(ResidentSnapshotLease));
+    {
+        ResidentExecutorFixture f;
+        ResidentExecutor first(f.slots), second(f.slots);
+        const auto a = f.lease;
+        const auto aw = first.submit(a, f.plan, f.error);
+        f.reserve(29, 5, 2);
+        const auto b = f.lease;
+        const auto bw = second.submit(b, f.plan, f.error);
+        check(first.prefilled(aw, 2, f.error) && second.prefilled(bw, 2, f.error),
+              "two selected call scopes publish their real drained prefill frontiers");
+        std::array<strata::core::BatchRow, 2> rows{f.final_row(a, 0), f.final_row(b, 1)};
+        const std::array<ResidentFinalSelection, 2> selected{{{&first, aw}, {&second, bw}}};
+        ResidentFinalTransaction transaction;
+        ++rows[1].token;
+        check(!transaction.issue(selected.data(), rows.data(), 2, f.error) && f.peer_untouched(),
+              "multi-owner issue preflight is all-or-none for the exact committed input");
+        --rows[1].token;
+        check(transaction.issue(selected.data(), rows.data(), 2, f.error), "one shared final transaction borrows both owners");
+        check(first.request_cancel(aw, ResidentTerminal::cancelled, f.error) &&
+              !first.finish(aw, f.error) && !first.drain(aw, f.error) && !first.retire(aw, f.error) &&
+              f.slots.slots()[0].preparing && f.slots.slots()[0].stop &&
+              f.slots.slots()[2].preparing && !f.slots.slots()[2].stop && f.peer_untouched(),
+              "post-issue cancellation cannot abort/reuse even before the verifier publishes its committed witness");
+        f.lease = a; f.final_witness();
+        f.lease = b; f.final_witness();
+        for (int mutation = 0; mutation < 8; ++mutation) {
+            auto stale = transaction.receipt(0);
+            switch (mutation) {
+            case 0: ++stale.work.generation; break;
+            case 1: ++stale.lease.incarnation; break;
+            case 2: ++stale.lease.allocations[0]; break;
+            case 3: ++stale.row; break;
+            case 4: ++stale.position; break;
+            case 5: ++stale.token; break;
+            case 6: ++stale.lease.slot; break;
+            case 7: stale.lease.stages[0] = b.stages[0]; break;
+            }
+            check(!transaction.consume(stale, 31, nullptr, f.error) && f.peer_untouched(),
+                  "stale work/seat/allocation/row/committed-position/token receipt is refused without consuming its peer");
+        }
+        check(!transaction.release(f.error) && transaction.consume(transaction.receipt(0), 31, nullptr, f.error),
+              "cancelled issued owner still performs the real mandatory first-token transition");
+        check(!transaction.consume(transaction.receipt(0), 31, nullptr, f.error) &&
+              !first.finish(aw, f.error) && !transaction.release(f.error),
+              "a consumed first row cannot retire while a selected peer still owns shared residual/witness storage");
+        const auto output = first.observe(aw, f.error);
+        check(output.event == ResidentEvent::committed_token && output.token == 31 &&
+              first.observe(aw, f.error).event == ResidentEvent::idle,
+              "committed first output is observable but no terminal escapes the shared transaction fence");
+        check(transaction.consume(transaction.receipt(1), 41, nullptr, f.error) && transaction.release(f.error),
+              "the uncancelled selected peer drains its own mandatory catch-up before shared release");
+        check(second.observe(bw, f.error).token == 41 && second.committed(bw, 42, nullptr, f.error) &&
+              second.observe(bw, f.error).token == 42, "peer decode commits and observes through the same call-scope facade");
+        check(first.finish(aw, f.error) && second.finish(bw, f.error), "both real owners retire resources after shared release");
+        const auto cancelled = first.observe(aw, f.error), completed = second.observe(bw, f.error);
+        check(cancelled.event == ResidentEvent::terminal && cancelled.fresh &&
+              cancelled.reason == ResidentTerminal::cancelled && completed.event == ResidentEvent::terminal &&
+              completed.fresh && completed.reason == ResidentTerminal::completed &&
+              !first.observe(aw, f.error).fresh && !second.observe(bw, f.error).fresh && f.peer_untouched(),
+              "completion/cancellation produce exactly one terminal each, only after committed output, with an unselected peer intact");
+        auto snapshot = second.borrow_snapshot(bw, f.error);
+        check(snapshot && !second.retire(bw, f.error) && second.return_snapshot(snapshot, f.error) &&
+              second.retire(bw, f.error) && first.retire(aw, f.error) && !first.work() && !second.work() &&
+              !first.observe(aw, f.error) && !second.observe(bw, f.error) &&
+              !transaction.consume(transaction.receipt(0), 99, nullptr, f.error) && f.peer_untouched(),
+              "synchronous capture borrow/return precedes retirement; no transaction or facade owner reference survives it");
+    }
+    for (const auto reason : {ResidentTerminal::cancelled, ResidentTerminal::disconnected,
+                              ResidentTerminal::timeout, ResidentTerminal::refused}) {
+        ResidentExecutorFixture f;
+        ResidentExecutor executor(f.slots);
+        const auto work = executor.submit(f.lease, f.plan, f.error);
+        check(executor.request_cancel(work, reason, f.error) && executor.finish(work, f.error),
+              "pre-issue cancellation/disconnect/refusal uses the real resource-abort path");
+        const auto end = executor.observe(work, f.error);
+        check(end.event == ResidentEvent::terminal && end.fresh && end.reason == reason &&
+              !executor.observe(work, f.error).fresh && executor.retire(work, f.error) &&
+              !executor.work() && f.peer_untouched(), "each control outcome has exactly one terminal and releases every facade reference");
+    }
+    {
+        ResidentExecutorFixture f;
+        ResidentExecutor executor(f.slots);
+        const auto original = executor.submit(f.lease, f.plan, f.error);
+        check(f.first() && executor.finish(original, f.error) && !executor.retire(original, f.error),
+              "resource retirement alone cannot release a cursor with unobserved output");
+        check(executor.observe(original, f.error).token == 31 && !executor.retire(original, f.error),
+              "observing output alone cannot release a cursor with an unobserved terminal");
+        check(executor.observe(original, f.error).fresh && executor.retire(original, f.error),
+              "the caller retires the fully observed facade before a legacy seat replacement");
+        // Seed the same physical seat as the no-load legacy caller would, while the facade is unbound.
+        f.reserve(117, 4);
+        check(f.first(43) && f.slots.finish(0, f.error), "an intervening non-facade owner completes on the physical seat");
+        f.reserve(118, 5);
+        const auto successor = executor.submit(f.lease, f.plan, f.error);
+        check(successor && successor.generation > original.generation &&
+              !executor.observe(original, f.error) && f.peer_untouched(),
+              "packed -> retired facade -> legacy -> packed does not retain a stale executor allocation/identity lease");
+        check(executor.cancel(successor, ResidentTerminal::cancelled, f.error).fresh &&
+              executor.retire(successor, f.error), "the mixed-path successor still drains exactly one terminal");
+    }
+    {
+        ResidentExecutorFixture f;
+        ResidentExecutor executor(f.slots);
+        const auto before = heap_allocations;
+        const auto started = std::chrono::steady_clock::now();
+        const auto work = executor.submit(f.lease, f.plan, f.error);
+        bool okay = bool(work) && executor.prefilled(work, 2, f.error);
+        const auto row = f.final_row(f.lease, 0);
+        const ResidentFinalSelection selected{&executor, work};
+        ResidentFinalTransaction transaction;
+        okay = okay && transaction.issue(&selected, &row, 1, f.error);
+        f.final_witness(); // No-load fixture publication, not a Verifier/GPU latency measurement.
+        okay = okay && transaction.consume(transaction.receipt(0), 31, nullptr, f.error) &&
+            transaction.release(f.error) && executor.observe(work, f.error).token == 31 &&
+            executor.committed(work, 32, nullptr, f.error) && executor.finish(work, f.error);
+        const auto drained = executor.drain(work, f.error);
+        okay = okay && drained.event == ResidentEvent::idle && executor.observe(work, f.error).token == 32;
+        const auto terminal = executor.observe(work, f.error);
+        okay = okay && terminal.event == ResidentEvent::terminal && terminal.fresh && executor.retire(work, f.error);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const auto allocations = heap_allocations - before;
+        check(okay && allocations == 0 && f.peer_untouched(),
+              "successful no-load migrated lifecycle adds no C++ heap allocation or history copy");
+        std::printf("resident executor no-load cost: cxx_heap_allocations=%zu complete_lifecycle_ns=%lld "
+                    "scope=cpu_fixture_not_model_or_gpu_latency\n", allocations, (long long)elapsed);
+    }
+    std::printf("resident executor lifecycle: failures=%d executor_bytes=%zu snapshot_lease_bytes=%zu "
+                "final_transaction_bytes=%zu final_receipt_bytes=%zu\n",
+                failures, sizeof(ResidentExecutor), sizeof(ResidentSnapshotLease),
+                sizeof(ResidentFinalTransaction), sizeof(ResidentFinalReceipt));
     return failures ? 1 : 0;
 }
