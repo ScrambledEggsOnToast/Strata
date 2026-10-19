@@ -197,6 +197,7 @@ void ResidentSlots::cancel(int slot) {
     auto& state = slots_[(size_t) slot];
     state.stop = true;
     state.prefill_split_until = 0;
+    state.prefill_plan = {};
     if (state.partial) {
         residency("cancel", slot);
         state.partial = false;
@@ -207,6 +208,7 @@ void ResidentSlots::taint(int slot) {
     if (slot >= 0 && (size_t) slot < slots_.size()) {
         slots_[(size_t) slot].tainted = true;
         slots_[(size_t) slot].prefill_split_until = 0;
+        slots_[(size_t) slot].prefill_plan = {};
     }
 }
 
@@ -215,6 +217,7 @@ std::pair<size_t, size_t> ResidentSlots::invalidate_after_nonfinite() {
     working_.prefill_split_until = 0;
     for (auto& sl : slots_) {
         sl.prefill_split_until = 0;
+        sl.prefill_plan = {};
         if (sl.active || sl.preparing) { sl.tainted = true; ++running; }
         else if (sl.cached) { sl.cached = false; sl.partial = false; sl.checks.clear(); ++idle; }
     }
@@ -339,6 +342,7 @@ bool ResidentSlots::fail(int slot) {
     state.prefill_split_until = 0;
     preparations_[(size_t) slot] = {};
     if (state.request == working_.request) working_.prefill_split_until = 0;
+    if (state.request == working_.request) working_.prefill_plan = {};
     return false;
 }
 
@@ -620,7 +624,7 @@ bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, Resid
         state.cvec = input.request.steering; state.img = false;
         state.p = position; state.produced = 0; state.max_new = input.request.max_new;
         state.x = 0; state.draft = -1; state.original_slot = input.slot;
-        state.partial_from0 = false; state.prefill_split_until = 0;
+        state.partial_from0 = false; state.prefill_split_until = 0; state.prefill_plan = {};
         state.t0 = Clock::now();
         preparations_[(size_t) input.slot] = sources[(size_t) index];
         ResidentPreparation lease;
@@ -838,6 +842,7 @@ bool ResidentSlots::abort_preparation(const ResidentPreparation& lease, std::str
     state.active = state.preparing = state.cached = state.partial = false;
     state.ids.clear(); state.prompt.clear(); state.checks.clear();
     state.p = state.produced = 0; state.draft = -1; state.prefill_split_until = 0;
+    state.prefill_plan = {};
     preparations_[(size_t) lease.slot] = {};
     return true;
 }
@@ -969,6 +974,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.stop = false;
     state.partial_from0 = parked && from_start;
     state.prefill_split_until = parked ? request.prefill_split_until : 0;
+    state.prefill_plan = parked ? request.prefill_plan : core::ConversationCheckpoint::PromptPlan{};
     dispatch_.slot_requests[slot] = working_.request;
     if (timing) report_admission_timing(slot, "slot_metadata", -1, (int64_t) prefix.size(), phase);
     if (timing) phase = Clock::now();

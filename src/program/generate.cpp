@@ -19371,13 +19371,6 @@ int main(int argc, char** argv) {
             bool resumed_from0 = false;
             ConvCheckpoint::PromptPlan resume_plan;
             int64_t resume_plan_at = -1, resume_plan_end = -1;
-            if (!stages.empty() && strata::prefill::Prefill::pipe_setting() > 0 &&
-                slot_source >= 0 && (yielded_source >= 0 || bs[(size_t) slot_source].partial)) {
-                // A partially read slot cannot be resumed on the pipe's plan yet (the #255 chunk-grid port): this
-                // request reads unpiped instead of ending the engine.
-                std::fprintf(stderr, "strata serve: --prefill-pipe off for this request: it resumes a partial handoff\n");
-                strata::prefill::Prefill::set_pipe_request(0.0);
-            }
             const auto parked = selected.parked;
             if (o.prefix_cost_selection)
                 std::fprintf(stderr, "strata serve: prefix selection: source=%s tokens=%lld longest=%lld policy=%s "
@@ -19547,6 +19540,14 @@ int main(int argc, char** argv) {
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
+                    if (yielded_source == slot_source) {
+                        const auto carried = resident.take_prefill_plan();
+                        if (carried.chunk > 0) {
+                            resume_plan = carried;
+                            resume_plan_at = slot_tokens;
+                            resume_plan_end = carried.to;
+                        }
+                    }
                     from_live = true;
                     live_scope = req_scope;
                     if (store_on && store_owner(kResidentOwnerFirst + uint64_t(slot_source)).force_fresh)
@@ -20391,21 +20392,11 @@ int main(int argc, char** argv) {
                     bool can = resident.available(ys) &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C, o.short_read);
-                    if (can && !stages.empty() && strata::prefill::Prefill::pipe_setting() > 0) {
-                        // A piped read cannot park a partial handoff: its PromptPlan does not survive the resident
-                        // slot's chunk grid yet (the #255 port). The read keeps its slot and runs to the end instead
-                        // of ending the engine; the queued request waits for the whole read, which the pipe's faster
-                        // read is meant to repay.
-                        std::fprintf(stderr, "strata generate: --prefill-pipe keeps this read whole: no partial "
-                                             "handoff with the fork's resident-slot ownership\n");
-                        std::fflush(stderr);
-                        can = false;
-                    }
                     std::string ye;
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                     const strata::program::ResidentAdmission request{
-                        0, &checks, nullptr, q, q < split_until ? split_until : 0};
+                        0, &checks, nullptr, q, q < split_until ? split_until : 0, seg_plan};
                     if (can && !park_replaced(ys)) {
                         if (capture_device_fault) {   // #252: only a failed device sync ends the request
                             batch_fatal = true; e = err; fatal = true; return false;

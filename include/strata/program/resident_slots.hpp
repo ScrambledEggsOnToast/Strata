@@ -43,6 +43,7 @@ struct ResidentWorking {
     kernels::SamplerParams sampling;
     int resume_slot = -1;
     int64_t prefill_split_until = 0; // exact full-slot continuation; consumed by the prompt loop
+    core::ConversationCheckpoint::PromptPlan prefill_plan; // the piped read's plan, carried across a BYIELD
 };
 
 // The post-prefill request setup installs the resident owner's already-resolved policy.
@@ -73,6 +74,7 @@ struct ResidentSlot {
     std::vector<core::ConversationCheckpoint> checks;
     bool partial = false, partial_from0 = false;
     int64_t prefill_split_until = 0; // pending second 1024 of the original selected 2048-token interval
+    core::ConversationCheckpoint::PromptPlan prefill_plan; // pending plan of a partial handoff; consumed on resume
     bool failed = false;
     // #879: a window met non-finite logits while this slot was running: its state may have started from the
     // poisoned state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends.
@@ -82,6 +84,7 @@ struct ResidentSlot {
     void complete(bool cache_enabled) {
         active = preparing = false;
         prefill_split_until = 0;
+        prefill_plan = {};
         cached = cache_enabled && input.checkpoint && input.scope.valid() && !img && !failed && !tainted;
     }
     // Metadata handoff after a successful drained restore. Foreign identities
@@ -89,7 +92,9 @@ struct ResidentSlot {
     void restored(ResidentWorking& working, int slot, bool full_prefix) {
         if (working.resume_slot != slot || working.request != request) return;
         const int64_t pending = std::exchange(prefill_split_until, 0);
+        const core::ConversationCheckpoint::PromptPlan carried = std::exchange(prefill_plan, {});
         working.prefill_split_until = full_prefix ? pending : 0;
+        working.prefill_plan = full_prefix ? carried : core::ConversationCheckpoint::PromptPlan{};
         partial = false;
     }
     bool reusable(const core::ConversationScope& scope, bool steering) const {
@@ -130,6 +135,7 @@ struct ResidentAdmission {
     const float* residual = nullptr;
     int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
     int64_t prefill_split_until = 0; // park only; zero once the selected interval has finished
+    core::ConversationCheckpoint::PromptPlan prefill_plan; // park only: the plan of the segment being parked
 };
 
 // A physical seat incarnation, not an ambient working-session handle. Tokens
@@ -178,6 +184,8 @@ public:
     bool begin_score(std::string& error);
     const ResidentWorking& working() const { return working_; }
     int64_t take_prefill_split_until() { return std::exchange(working_.prefill_split_until, 0); }
+    // The plan of the read being resumed after a BYIELD, so it goes on in the same chunks (read_part).
+    core::ConversationCheckpoint::PromptPlan take_prefill_plan() { return std::exchange(working_.prefill_plan, {}); }
     bool active() const;
     bool available(int slot) const;
     void cancel(int slot);
