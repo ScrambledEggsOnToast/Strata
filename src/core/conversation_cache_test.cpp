@@ -10,6 +10,9 @@
 #include <limits>
 #include <string>
 #include <cstring>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 using namespace strata::core;
 
@@ -79,6 +82,268 @@ std::string trace_event(const std::string& text, const char* site, const char* a
     const auto end = text.find("{\"kind\":\"cache_event_end\"", at);
     check(end != std::string::npos, "every mutation event closes");
     return text.substr(begin, end - begin);
+}
+std::string victim_identity_text(const ConversationVictimIdentity& value) {
+    char row[192];
+    std::snprintf(row, sizeof(row), "%llu %016llx %016llx %llu %llu",
+        (unsigned long long)value.serial, (unsigned long long)value.scope,
+        (unsigned long long)value.history, (unsigned long long)value.tokens,
+        (unsigned long long)value.bytes);
+    return row;
+}
+std::string victim_contract(ConversationCache& cache, ConversationCacheTrace& trace,
+                           const char* mode, const char* site, std::initializer_list<uint64_t> victims,
+                           const SavedConversation* subject = nullptr, uint64_t subject_serial = 0,
+                           uint64_t preceding_events = 0) {
+    ConversationVictimIdentity identity;
+    if (subject) check(ConversationVictimReplay::identify(subject_serial, *subject, identity),
+                       "the nominated incoming identity is bounded");
+    std::string text = "strata-cache-victim-replay-v1 mode " + std::string(mode) +
+        " event " + std::to_string(trace.next_event() + preceding_events) +
+        " request_sequence " + std::to_string(trace.request_sequence) +
+        " leg " + std::to_string(trace.leg) + " site " + site +
+        " subject " + victim_identity_text(identity) + " victims " + std::to_string(victims.size());
+    for (uint64_t serial : victims) {
+        const auto* image = cache.find(serial);
+        check(image && ConversationVictimReplay::identify(serial, *image, identity),
+              "the test nominates an exact retained allocation generation");
+        text += " victim " + victim_identity_text(identity);
+    }
+    return text + "\n";
+}
+void replay_phase(ConversationCacheTrace& trace) {
+    trace.request_sequence = 9; trace.leg = 2;
+    std::strcpy(trace.request, "victim-fixture");
+    std::strcpy(trace.incarnation, "0123456789abcdef0123456789abcdef");
+    trace.set_sample(nullptr, +[](void*, ConversationCacheTrace::External&) {});
+}
+void check_victim_process_contract() {
+    check(std::string_view(ConversationVictimReplay::from_path(nullptr).status) == "off" &&
+          std::string_view(ConversationVictimReplay::from_path("/nonexistent/strata-victim-contract").status) == "missing",
+          "absent/missing diagnostic contracts retain ordinary LRU");
+    check(std::string_view(ConversationVictimReplay::parse(
+              "strata-cache-victim-replay-v1 mode keep\n").status) == "keep",
+          "an explicit un-nominated keep arm is default-preserving");
+    // Descriptor pathnames under procfs are a Linux-only fixture mechanism.
+#if defined(__linux__)
+    FILE* contract = std::tmpfile();
+    FILE* output = std::tmpfile();
+    check(contract && output, "open parse-once contract and trace fixtures");
+    {
+        ConversationCacheTrace trace(output);
+        replay_phase(trace);
+        ConversationCache seed(1u << 20, 2, 0, nullptr);
+        check(seed.put(image({1,2,3})) && seed.put(image({4,5,6})), "seed the process contract identities");
+        const auto text = victim_contract(seed, trace, "alternate", "evict_oldest", {2}, nullptr, 0, 4);
+        check(std::fwrite(text.data(), 1, text.size(), contract) == text.size() && std::fflush(contract) == 0,
+              "write the exact bounded process contract");
+        const std::string path = "/proc/self/fd/" + std::to_string(fileno(contract));
+        const char* previous = std::getenv("STRATA_CACHE_VICTIM_REPLAY");
+        const bool had = previous != nullptr;
+        const std::string saved = previous ? previous : "";
+        check(::setenv("STRATA_CACHE_VICTIM_REPLAY", path.c_str(), 1) == 0, "set the diagnostic contract pathname");
+        auto& replay = ConversationVictimReplay::process();
+        check(replay.configured && replay.count == 1, "the process parses its contract before victim work");
+        ConversationCache cache(1u << 20, 2);
+        cache.set_mutation_trace(&trace);
+        check(cache.put(image({1,2,3})) && cache.put(image({4,5,6})), "seed the actual process-owned replay cache");
+        check(cache.evict_oldest() && cache.find(1) && !cache.find(2) && replay.consumed,
+              "the process contract consumes its exact generation at the real victim site");
+        const auto hash = replay.contract;
+        std::rewind(contract);
+        check(std::fputs("malformed", contract) >= 0 && std::fflush(contract) == 0 &&
+              ::setenv("STRATA_CACHE_VICTIM_REPLAY", "/nonexistent/changed-contract", 1) == 0,
+              "change both contract contents and pathname after consumption");
+        check(&ConversationVictimReplay::process() == &replay && replay.contract == hash && replay.consumed,
+              "contents/environment changes cannot reload or re-arm the process-lifetime contract");
+        ConversationCache successor(1u << 20, 2);
+        check(successor.put(image({1,2,3})) && successor.put(image({4,5,6})) &&
+              successor.evict_oldest() && !successor.find(1) && successor.find(2),
+              "a second cache cannot reuse a consumed process nomination with coincident local serials");
+        if (had) check(::setenv("STRATA_CACHE_VICTIM_REPLAY", saved.c_str(), 1) == 0, "restore the prior contract environment");
+        else check(::unsetenv("STRATA_CACHE_VICTIM_REPLAY") == 0, "restore the absent contract environment");
+    }
+    std::fclose(output); std::fclose(contract);
+#endif
+}
+void check_victim_replay() {
+    // Explicitly injected contracts exercise the production parser and real
+    // planners/compactors, without changing the process-lifetime configuration.
+    for (const char* site : {"put", "reserve_snapshot", "evict_oldest"}) {
+        for (const char* mode : {"default", "keep", "alternate", "malformed"}) {
+            FILE* file = std::tmpfile();
+            check(file != nullptr, "open the victim-plan fixture trace");
+            {
+                ConversationCacheTrace trace(file);
+                replay_phase(trace);
+                ConversationVictimReplay replay;
+                constexpr size_t budget = 1u << 20, fixed = 128;
+                ConversationCache cache(budget, 3, 0, &replay);
+                cache.set_mutation_trace(&trace);
+                auto large = image({1,2,3});
+                large.live.gdn.resize(4096, 7);
+                auto peer = image({7,8,9});
+                peer.publication_ticket = 77;
+                check(cache.try_reserve_lease(fixed) && cache.put(std::move(large)) &&
+                      cache.put(image({4,5,6})) && cache.put(std::move(peer)), "seed two eligible owners and a peer writer");
+                cache.guard(3);
+                const size_t before = cache.bytes(), small_bytes = cache.find(2)->bytes();
+                auto incoming = image({10,11,12});
+                const bool put = std::string_view(site) == "put";
+                std::string text = victim_contract(cache, trace, std::string_view(mode) == "keep" ? "keep" : "alternate",
+                                                  site, {2}, put ? &incoming : nullptr, put ? 4 : 0);
+                if (std::string_view(mode) == "malformed") text += "trailing-field";
+                if (std::string_view(mode) != "default") replay = ConversationVictimReplay::parse(text);
+                cache.set_mutation_trace(&trace);
+                size_t protected_index = 2;
+                const bool accepted = put ? cache.put(std::move(incoming)) :
+                    std::string_view(site) == "reserve_snapshot" ?
+                        cache.reserve_snapshot(budget - fixed - (before - small_bytes), 0, &protected_index) :
+                        cache.evict_oldest();
+                const bool alternate = std::string_view(mode) == "alternate";
+                check(accepted && cache.find(alternate ? 1 : 2) && !cache.find(alternate ? 2 : 1) &&
+                      cache.find(3) && cache.evictions() == 1 && cache.leased_bytes() == fixed &&
+                      cache.envelope_bytes() <= budget, "each real victim site commits its exact plan within the same envelope");
+                if (std::string_view(site) == "reserve_snapshot")
+                    check(protected_index == cache.index_of(3), "protected fallback index follows alternate compaction");
+                if (alternate || std::string_view(mode) == "keep")
+                    check(replay.consumed && std::string_view(replay.status) == (alternate ? "forced" : "keep"),
+                          "a valid keep/alternate nomination is consumed once at its specified plan");
+                if (alternate) {
+                    check(cache.evict_oldest() && !cache.find(1) && cache.find(3),
+                          "a consumed nomination cannot intercept the next convenient victim");
+                    const auto event = trace_event(trace_text(file), site, "plan");
+                    check(event.find("\"replay_decision\":\"forced\"") != std::string::npos &&
+                          event.find("\"kind\":\"cache_victim_nomination\"") != std::string::npos &&
+                          event.find("\"serial\":2,") != std::string::npos,
+                          "the live plan records the nomination and actual alternate choice");
+                }
+                bool retained = false;
+                auto alias = cache.take(cache.index_of(3), retained);
+                check(retained && cache.has_publication(77) && alias.live.ids == std::vector<int32_t>({7,8,9}) &&
+                      !cache.take_publication(77), "a peer read alias and guarded publication remain owned");
+                cache.unguard();
+                const size_t peer_bytes = cache.find(3)->bytes(), envelope = cache.envelope_bytes();
+                auto writer = cache.take_publication(77);
+                check(writer && cache.envelope_bytes() == envelope && cache.leased_bytes() == fixed + peer_bytes,
+                      "writer acquisition transfers, rather than refunds, the peer image charge");
+                cache.release_publication(77);
+                cache.release_publication(77);
+                check(cache.leased_bytes() == fixed + peer_bytes,
+                      "repeated late/cancel cleanup cannot refund an acquired peer writer");
+                alias = {}; writer.reset();
+                cache.release_lease(peer_bytes);
+                check(cache.leased_bytes() == fixed, "peer consumer drain preserves the permanent checkpoint lease");
+                trace.finish();
+                const auto terminal = trace_text(file);
+                check(terminal.find(alternate ? "\"replay_forced\":1" : "\"replay_forced\":0") != std::string::npos,
+                      "terminal receipt bounds the intervention to exactly one plan");
+            }
+            std::fclose(file);
+        }
+    }
+    for (const char* failure : {"pin", "ticket", "guard", "protected", "generation", "history", "scope",
+                                "bytes", "subject", "event", "sequence", "leg", "identity", "insufficient", "trace"}) {
+        FILE* file = std::tmpfile();
+        check(file != nullptr, "open the rejected-nomination trace");
+        {
+            ConversationCacheTrace trace(file);
+            replay_phase(trace);
+            ConversationVictimReplay replay;
+            constexpr size_t budget = 1u << 20;
+            ConversationCache cache(budget, 6, 0, &replay);
+            cache.set_mutation_trace(&trace);
+            auto large = image({1,2,3});
+            large.live.gdn.resize(4096, 7);
+            auto pin = image({7,8,9});
+            pin.checkpoints.push_back(pin.live); pin.checkpoints.back().pinned = true;
+            auto pending = image({10,11,12}); pending.publication_ticket = 77;
+            check(cache.put(std::move(large)) && cache.put(image({4,5,6})) &&
+                  cache.put(std::move(pin)) && cache.put(std::move(pending)) &&
+                  cache.put(image({13,14,15})) && cache.put(image({16,17,18})), "seed every exclusion class");
+            cache.guard(5);
+            const std::string_view why = failure;
+            const uint64_t nominated = why == "pin" ? 3 : why == "ticket" ? 4 :
+                why == "guard" ? 5 : why == "protected" ? 6 : 2;
+            replay = ConversationVictimReplay::parse(victim_contract(cache, trace, "alternate", "reserve_snapshot", {nominated}));
+            check(replay.configured, "negative fixture starts from a fully parsed nomination");
+            if (why == "generation") replay.victims[0].serial = 999;
+            if (why == "history") ++replay.victims[0].history;
+            if (why == "scope") ++replay.victims[0].scope;
+            if (why == "bytes") ++replay.victims[0].bytes;
+            if (why == "subject") replay.subject.serial = 1;
+            if (why == "event") --replay.event;
+            if (why == "sequence") ++replay.request_sequence;
+            if (why == "leg") ++replay.leg;
+            if (why == "identity") trace.incarnation[0] = '!';
+            cache.set_mutation_trace(why == "trace" ? nullptr : &trace);
+            size_t protected_index = cache.index_of(6);
+            const size_t need = why == "insufficient" ? cache.find(2)->bytes() + 1 : 1;
+            check(cache.reserve_snapshot(budget - cache.bytes() + need, 0, &protected_index) &&
+                  !cache.find(1) && cache.find(2) && cache.find(3) && cache.has_publication(77) &&
+                  cache.find(5) && cache.find(6) && protected_index == cache.index_of(6),
+                  "malformed/stale/ineligible/underfunded nominations leave ordinary LRU and all peers intact");
+            check(replay.consumed && std::string_view(replay.status) != "forced",
+                  "a refused exact nomination cannot retry against later eligibility");
+            cache.unguard(); cache.release_publication(77);
+            const size_t after = cache.size();
+            check(cache.evict_oldest() && cache.size() + 1 == after && !cache.find(2) && cache.find(3),
+                  "later cancellation/unprotection never re-arms an ineligible nomination or spends the pin");
+        }
+        std::fclose(file);
+    }
+    for (bool pressure : {false, true}) {
+        FILE* file = std::tmpfile();
+        check(file != nullptr, "open the exact victim-set trace");
+        {
+            ConversationCacheTrace trace(file);
+            replay_phase(trace);
+            ConversationVictimReplay replay;
+            constexpr size_t budget = 1u << 20;
+            ConversationCache cache(budget, 4, 0, &replay);
+            cache.set_mutation_trace(&trace);
+            auto large = image({1,2,3}); large.live.gdn.resize(4096, 7);
+            check(cache.put(std::move(large)) && cache.put(image({4,5,6})) && cache.put(image({7,8,9})),
+                  "seed a large LRU owner and a two-member alternate set");
+            auto incoming = image({10,11,12});
+            const auto text = pressure ?
+                victim_contract(cache, trace, "alternate", "reserve_snapshot", {2,3}) :
+                victim_contract(cache, trace, "alternate", "put", {2}, &incoming, 4);
+            replay = ConversationVictimReplay::parse(text);
+            cache.set_mutation_trace(&trace);
+            if (pressure) {
+                const size_t reclaim = cache.find(2)->bytes() + cache.find(3)->bytes();
+                check(cache.reserve_snapshot(budget - cache.bytes() + reclaim) && cache.size() == 1 &&
+                      cache.find(1) && !cache.find(2) && !cache.find(3) && cache.evictions() == 2,
+                      "the entire nominated set, not an LRU prefix or a proxy, is validated and committed");
+            } else {
+                check(cache.put(std::move(incoming)) && cache.size() == 4 && cache.find(2) &&
+                      cache.evictions() == 0 && replay.consumed && std::string_view(replay.status) == "no_pressure",
+                      "an exact nomination cannot manufacture pressure or evict an otherwise retained owner");
+            }
+        }
+        std::fclose(file);
+    }
+    FILE* file = std::tmpfile();
+    check(file != nullptr, "open the grammar fixture trace");
+    {
+        ConversationCacheTrace trace(file);
+        replay_phase(trace);
+        ConversationCache cache(1u << 20, 2, 0, nullptr);
+        check(cache.put(image({1,2,3})) && cache.put(image({4,5,6})), "seed strict parser fixtures");
+        const auto valid = victim_contract(cache, trace, "alternate", "evict_oldest", {2});
+        for (const auto& malformed : {std::string{}, valid + "extra", valid.substr(1),
+                std::string(ConversationVictimReplay::max_contract_bytes + 1, 'x')})
+            check(!ConversationVictimReplay::parse(malformed).configured, "unknown/truncated/oversize grammar is default-off");
+        const auto duplicate = victim_contract(cache, trace, "alternate", "reserve_snapshot", {2,2});
+        check(!ConversationVictimReplay::parse(duplicate).configured, "duplicate allocation generations cannot be nominated twice");
+        auto replay = ConversationVictimReplay::parse(valid);
+        check(replay.configured && replay.site == "evict_oldest" && replay.count == 1,
+              "parsed site names do not borrow the temporary contract buffer");
+        check(!ConversationVictimReplay::parse(
+            "strata-cache-victim-replay-v1 mode omit").configured, "a publication-omission mode is not a victim contract");
+    }
+    std::fclose(file);
 }
 void check_mutation_work_trace() {
     FILE* file = std::tmpfile();
@@ -229,8 +494,10 @@ void check_mutation_trace() {
 }
 
 int main() {
+    check_victim_process_contract();
     check_mutation_work_trace();
     check_mutation_trace();
+    check_victim_replay();
     {
         auto first = image({11, 12, 13});
         auto second = image({21, 22, 23});

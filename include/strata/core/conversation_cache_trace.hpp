@@ -1,6 +1,8 @@
 // Opt-in metadata receipts for the existing conversation-cache ownership seams.
 #pragma once
 
+#include "strata/core/conversation_cache_victim_replay.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -41,6 +43,10 @@ public:
         uint64_t work_bytes = 0, route = 0;
         bool work_known = false;
         int64_t begin_tokens = -1, end_tokens = -1;
+        uint64_t replay_contract = 0;
+        const char* replay_mode = "off";
+        const char* replay_decision = "off";
+        size_t replay_count = 0;
     };
 
     // The destination is caller-owned, create-only in serving. No trace object,
@@ -55,11 +61,40 @@ public:
     }
     uint64_t request_sequence = 0, leg = 0;
     char request[97]{}, incarnation[33]{}; // validated phase identity, otherwise empty
+    uint64_t next_event() const noexcept { return event_ + 1; }
+    bool recording() const noexcept { return file_ && !stopped_; }
+    bool accepts_victim_plan(size_t candidates, bool subject, size_t nominees) const noexcept {
+        return recording() && candidates <= max_candidates &&
+            records_ + candidates + size_t(subject) + nominees + 2 < max_records;
+    }
+    bool valid_phase_identity() const noexcept {
+        size_t n = 0;
+        for (; n < sizeof(request) && request[n]; ++n) {
+            const char c = request[n];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+        }
+        if (!n || n == sizeof(request) || !leg || incarnation[32]) return false;
+        for (size_t i = 0; i < 32; ++i)
+            if (!((incarnation[i] >= '0' && incarnation[i] <= '9') ||
+                  (incarnation[i] >= 'a' && incarnation[i] <= 'f'))) return false;
+        return true;
+    }
+    void set_victim_replay(const ConversationVictimReplay* replay) noexcept {
+        if (!replay) return;
+        replay_contract_ = replay->contract;
+        replay_status_ = replay->status;
+    }
+    void victim_replay_decision(const char* decision, bool forced) noexcept {
+        replay_status_ = decision;
+        ++replay_decisions_;
+        if (forced) ++replay_forced_;
+    }
 
     bool begin(const State& s, size_t candidates, bool subject) noexcept {
         if (!file_ || stopped_) return false;
         const size_t count = std::min(candidates, max_candidates);
-        if (records_ + count + size_t(subject) + 2 >= max_records) {
+        if (records_ + count + size_t(subject) + s.replay_count + 2 >= max_records) {
             limited_ = true;
             finish();
             return false;
@@ -89,7 +124,8 @@ public:
             "\"store_descriptors\":%llu,\"store_decode\":%llu,\"publication_image\":%llu,"
             "\"publication_workspace\":%llu,\"read_preparation\":%llu,\"read_allowance\":%llu,"
             "\"read_reserved\":%llu,\"read_image\":%llu,"
-            "\"read_admission_suspended\":%s}",
+            "\"read_admission_suspended\":%s,\"replay_contract\":\"%016llx\","
+            "\"replay_mode\":\"%s\",\"replay_decision\":\"%s\",\"replay_count\":%zu}",
             ull(event_), ull(ns), s.site, s.action, boolean(s.accepted), ull(request_sequence),
             request, ull(leg), incarnation, s.budget, s.slots, s.parked, s.parked_bytes, s.reuse_bytes,
             s.leased_bytes, s.held, s.held_entries, s.incoming, s.limit, s.available_entries,
@@ -101,8 +137,16 @@ public:
             ull(e.store.lease), ull(e.store.metadata), ull(e.store.descriptors), ull(e.store.decode),
             ull(e.store.publication_image), ull(e.store.publication_workspace), ull(e.store.read_preparation),
             ull(e.store.allowance), ull(e.store.read_reserved), ull(e.store.read_image),
-            boolean(e.store.admission_suspended));
+            boolean(e.store.admission_suspended), ull(s.replay_contract), s.replay_mode,
+            s.replay_decision, s.replay_count);
         return !stopped_;
+    }
+
+    void nomination(const ConversationVictimIdentity& image) noexcept {
+        record("{\"kind\":\"cache_victim_nomination\",\"event\":%llu,\"serial\":%llu,"
+            "\"scope_hash\":\"%016llx\",\"history_hash\":\"%016llx\","
+            "\"tokens\":%llu,\"bytes\":%llu}", ull(event_), ull(image.serial), ull(image.scope),
+            ull(image.history), ull(image.tokens), ull(image.bytes));
     }
 
     template<class Image>
@@ -138,8 +182,11 @@ public:
     void finish() noexcept {
         if (!file_ || stopped_) return;
         record("{\"kind\":\"cache_trace_end\",\"events\":%llu,\"records\":%zu,\"record_limit\":%zu,"
-            "\"limited\":%s,\"hash_limited\":%s,\"hash_words\":%llu}", ull(event_), records_, max_records,
-            boolean(limited_), boolean(hash_limited_), ull(hash_words_));
+            "\"limited\":%s,\"hash_limited\":%s,\"hash_words\":%llu,"
+            "\"replay_contract\":\"%016llx\",\"replay_status\":\"%s\","
+            "\"replay_decisions\":%zu,\"replay_forced\":%zu}", ull(event_), records_, max_records,
+            boolean(limited_), boolean(hash_limited_), ull(hash_words_), ull(replay_contract_),
+            replay_status_, replay_decisions_, replay_forced_);
         std::fflush(file_);
         stopped_ = true;
     }
@@ -164,6 +211,9 @@ private:
     Sampler sample_ = nullptr;
     size_t records_ = 0;
     uint64_t event_ = 0, hash_words_ = 0;
+    uint64_t replay_contract_ = 0;
+    const char* replay_status_ = "off";
+    size_t replay_decisions_ = 0, replay_forced_ = 0;
     bool stopped_ = false, limited_ = false, hash_limited_ = false;
 };
 } // namespace strata::core

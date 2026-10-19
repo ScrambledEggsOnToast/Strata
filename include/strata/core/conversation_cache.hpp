@@ -385,6 +385,12 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
 }
 
 class ConversationCache {
+    struct VictimChoice {
+        const ConversationVictimReplay* nomination = nullptr;
+        const char* decision = "off";
+        bool forced = false;
+        size_t remaining = 0, count = 0;
+    };
 public:
     struct Match {
         size_t index = 0;
@@ -393,8 +399,9 @@ public:
         uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
     };
 
-    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
-        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0,
+                      ConversationVictimReplay* replay = &ConversationVictimReplay::process())
+        : budget_(budget), slots_(slots), min_tokens_(min_tokens), victim_replay_(replay) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -406,21 +413,29 @@ public:
     size_t evictions() const { return evictions_; }
 
     // Diagnostic only. Caller owns the bounded sink and outlives every cache operation.
-    void set_mutation_trace(ConversationCacheTrace* trace) noexcept { trace_ = trace; }
+    void set_mutation_trace(ConversationCacheTrace* trace) noexcept {
+        trace_ = trace;
+        if (trace_) trace_->set_victim_replay(victim_replay_);
+    }
     void trace_observation(ConversationCacheTrace::State state,
-                           const SavedConversation* subject = nullptr) const noexcept {
+                           const SavedConversation* subject = nullptr,
+                           const ConversationVictimReplay* nomination = nullptr) const noexcept {
         if (!trace_) return;
         state.budget = budget_; state.slots = slots_; state.parked = entries_.size();
         state.parked_bytes = bytes_; state.reuse_bytes = reuse_.bytes(); state.leased_bytes = held_bytes_;
         state.evictions = evictions_; state.guarded = guarded_;
         if (!trace_->begin(state, entries_.size(), subject != nullptr)) return;
+        if (nomination && state.replay_count)
+            for (size_t i = 0; i < nomination->count; ++i) trace_->nomination(nomination->victims[i]);
         if (subject) trace_->image("subject", 0, state.subject_serial, *subject, false, false, false, false, false);
         size_t left = state.victims;
         for (size_t i = 0; i < std::min(entries_.size(), ConversationCacheTrace::max_candidates); ++i) {
             const bool protected_entry = state.protected_serial != 0 && serials_[i] == state.protected_serial;
             const bool superseded = subject && std::string_view(state.site) == "put" && replaces(i, *subject);
             const bool eligible = evictable(i) && !protected_entry && !superseded;
-            const bool chosen = state.accepted && state.action == std::string_view("plan") && eligible && left != 0;
+            const bool selected = nomination && std::string_view(state.replay_decision) == "forced" ?
+                nomination->contains(serials_[i]) : left != 0;
+            const bool chosen = state.accepted && state.action == std::string_view("plan") && eligible && selected;
             if (chosen) --left;
             trace_->image("candidate", i, serials_[i], entries_[i], eligible,
                           guarded_ != 0 && serials_[i] == guarded_, protected_entry, chosen, superseded);
@@ -715,18 +730,17 @@ public:
         size_t remaining = bytes_, victims = 0;
         for (size_t i = 0; i < entries_.size() && remaining > limit; ++i) {
             if (i != keep && evictable(i)) {
-                // Name each victim, as evict_oldest does: the counter alone cannot say whether pressure spends the
-                // cache on short side conversations or discards a long one (2026-10-18).
-                std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
-                                     "(%zu tokens, %zu bytes) to reserve %zu bytes\n",
-                             entries_[i].live.ids.size(), entries_[i].bytes(), incoming);
                 remaining -= entries_[i].bytes();
                 ++victims;
             }
         }
-        trace_observation({.site="reserve_snapshot", .action="plan", .accepted=remaining <= limit,
-                           .held=held, .incoming=incoming, .limit=limit, .victims=victims,
-                           .protected_serial=keep < entries_.size() ? serials_[keep] : 0});
+        ConversationCacheTrace::State plan{.site="reserve_snapshot", .action="plan", .accepted=remaining <= limit,
+            .held=held, .incoming=incoming, .limit=limit, .victims=victims,
+            .protected_serial=keep < entries_.size() ? serials_[keep] : 0};
+        const auto choice = choose_victims(plan);
+        if (choice.forced) { remaining = choice.remaining; victims = choice.nomination->count; }
+        plan.victims = victims;
+        trace_victims(plan, choice);
         if (remaining > limit) return false;
 
         // Optional retained K/V goes first. Movement, destruction and deque
@@ -734,7 +748,17 @@ public:
         reuse_ = {};
         size_t write = 0, left = victims;
         for (size_t read = 0; read < entries_.size(); ++read) {
-            if (left && read != keep && evictable(read)) { --left; continue; }
+            const bool chosen = choice.forced ? choice.nomination->contains(serials_[read]) :
+                left && read != keep && evictable(read);
+            if (chosen) {
+                assert(left && read != keep && evictable(read));
+                std::fprintf(stderr, "strata serve: conversation cache: evicting the %s conversation "
+                    "(%zu tokens, %zu bytes) to reserve %zu bytes\n",
+                    choice.forced ? "diagnostically nominated" : "least recently active",
+                    entries_[read].live.ids.size(), entries_[read].bytes(), incoming);
+                --left;
+                continue;
+            }
             if (protected_index && read == keep) *protected_index = write;
             if (write != read) {
                 entries_[write] = std::move(entries_[read]);
@@ -742,11 +766,12 @@ public:
             }
             ++write;
         }
+        assert(left == 0);
         while (entries_.size() > write) { entries_.pop_back(); serials_.pop_back(); }
         bytes_ = remaining;
         evictions_ += victims;
-        trace_observation({.site="reserve_snapshot", .action="committed", .held=held, .incoming=incoming,
-                           .limit=limit, .victims=victims});
+        trace_victims({.site="reserve_snapshot", .action="committed", .held=held, .incoming=incoming,
+                       .limit=limit, .victims=victims}, choice);
         return true;
     }
 
@@ -756,16 +781,19 @@ public:
     bool evict_oldest() {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (!evictable(i)) continue;
-            trace_observation({.site="evict_oldest", .action="plan", .victims=1});
-            // Name the victim: the eviction counter alone cannot show whether pressure is spending the cache on
-            // short side conversations or discarding a long one whose loss costs a full re-read (2026-10-18).
-            std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
-                                 "(%zu tokens, %zu bytes); %zu parked, %zu bytes held\n",
-                         entries_[i].live.ids.size(), entries_[i].bytes(), entries_.size() - 1, bytes_);
+            ConversationCacheTrace::State plan{.site="evict_oldest", .action="plan", .victims=1};
+            const auto choice = choose_victims(plan);
+            if (choice.forced) i = index_of(choice.nomination->victims[0].serial);
+            assert(i < entries_.size() && evictable(i));
+            trace_victims(plan, choice);
+            std::fprintf(stderr, "strata serve: conversation cache: evicting the %s conversation "
+                "(%zu tokens, %zu bytes); %zu parked, %zu bytes held\n",
+                choice.forced ? "diagnostically nominated" : "least recently active",
+                entries_[i].live.ids.size(), entries_[i].bytes(), entries_.size() - 1, bytes_);
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
-            trace_observation({.site="evict_oldest", .action="committed", .victims=1});
+            trace_victims({.site="evict_oldest", .action="committed", .victims=1}, choice);
             return true;
         }
         trace_observation({.site="evict_oldest", .action="refused", .accepted=false});
@@ -849,21 +877,22 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (count < available_entries && remaining <= payload_limit) break;
             if (evictable(i) && !replaces(i, image)) {
-                // The third and last eviction site: name the victim here too, so slot and byte pressure are both
-                // answerable from the log (2026-10-18).
-                std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
-                                     "(%zu tokens, %zu bytes) for a new parked conversation\n",
-                             entries_[i].live.ids.size(), entries_[i].bytes());
                 --count;
                 remaining -= entries_[i].bytes();
                 ++victims;
             }
         }
-        trace_observation({.site="put", .action="plan",
-                           .accepted=count < available_entries && remaining <= payload_limit,
-                           .held=held, .held_entries=held_entries, .incoming=n, .limit=payload_limit,
-                           .available_entries=available_entries, .victims=victims, .superseded=replaced,
-                           .subject_serial=next_serial_}, &image);
+        ConversationCacheTrace::State plan{.site="put", .action="plan",
+            .accepted=count < available_entries && remaining <= payload_limit,
+            .held=held, .held_entries=held_entries, .incoming=n, .limit=payload_limit,
+            .available_entries=available_entries, .victims=victims, .superseded=replaced,
+            .subject_serial=next_serial_};
+        const auto choice = choose_victims(plan, &image);
+        if (choice.forced) {
+            remaining = choice.remaining; count = choice.count; victims = choice.nomination->count;
+        }
+        plan.victims = victims;
+        trace_victims(plan, choice, &image);
         if (count >= available_entries || remaining > payload_limit) {
             guard_blocked_ = guarded_ != 0 && index_of(guarded_) != SIZE_MAX;
             return false;
@@ -886,7 +915,17 @@ public:
         // index until every comparison is done, and each survivor moves at most once.
         for (size_t read = 0; read < old_count; ++read) {
             if (replaces(read, next)) continue;
-            if (ordinary_left && evictable(read)) { --ordinary_left; continue; }
+            const bool chosen = choice.forced ? choice.nomination->contains(serials_[read]) :
+                ordinary_left && evictable(read);
+            if (chosen) {
+                assert(ordinary_left && evictable(read));
+                std::fprintf(stderr, "strata serve: conversation cache: evicting the %s conversation "
+                    "(%zu tokens, %zu bytes) for a new parked conversation\n",
+                    choice.forced ? "diagnostically nominated" : "least recently active",
+                    entries_[read].live.ids.size(), entries_[read].bytes());
+                --ordinary_left;
+                continue;
+            }
             if (write != read) {
                 entries_[write] = std::move(entries_[read]);
                 serials_[write] = serials_[read];
@@ -903,13 +942,75 @@ public:
         bytes_ = remaining + n;
         superseded_ += replaced;
         evictions_ += victims;
-        trace_observation({.site="put", .action="committed", .held=held, .held_entries=held_entries,
-                           .incoming=n, .limit=payload_limit, .available_entries=available_entries,
-                           .victims=victims, .superseded=replaced, .subject_serial=next_serial_ - 1});
+        trace_victims({.site="put", .action="committed", .held=held, .held_entries=held_entries,
+                       .incoming=n, .limit=payload_limit, .available_entries=available_entries,
+                       .victims=victims, .superseded=replaced, .subject_serial=next_serial_ - 1}, choice);
         return true;
     }
 
 private:
+    // Runs only at the real plan, before mutation. A missed/stale/ineligible
+    // nomination is consumed, not moved to another victim or retried later.
+    VictimChoice choose_victims(const ConversationCacheTrace::State& plan,
+                               const SavedConversation* subject = nullptr) noexcept {
+        VictimChoice choice;
+        auto* replay = victim_replay_;
+        if (!replay || !replay->configured || replay->consumed) return choice;
+        if (trace_ && trace_->next_event() < replay->event) return choice;
+        replay->consumed = true;
+        choice.nomination = replay;
+        const auto decide = [&](const char* reason, bool forced = false) {
+            choice.decision = reason; choice.forced = forced;
+            replay->status = reason;
+            if (trace_) trace_->victim_replay_decision(reason, forced);
+            std::fprintf(stderr, "strata serve: diagnostic victim replay: contract=%016llx "
+                "event=%llu nominees=%zu decision=%s\n", (unsigned long long)replay->contract,
+                (unsigned long long)replay->event, replay->count, reason);
+            return choice;
+        };
+        if (!trace_ || !trace_->accepts_victim_plan(entries_.size(), subject != nullptr, replay->count))
+            return decide("missing_trace");
+        if (trace_->next_event() != replay->event || replay->site != plan.site ||
+            replay->request_sequence != trace_->request_sequence || replay->leg != trace_->leg)
+            return decide("stale_event");
+        if (!trace_->valid_phase_identity()) return decide("missing_identity");
+        ConversationVictimIdentity actual;
+        if (subject) {
+            if (!ConversationVictimReplay::identify(plan.subject_serial, *subject, actual) ||
+                actual != replay->subject) return decide("stale_subject");
+        } else if (replay->subject != ConversationVictimIdentity{}) return decide("stale_subject");
+        if (!plan.accepted || !plan.victims) return decide("no_pressure");
+        choice.remaining = bytes_;
+        choice.count = entries_.size();
+        if (subject)
+            for (size_t i = 0; i < entries_.size(); ++i) if (replaces(i, *subject)) {
+                choice.remaining -= entries_[i].bytes(); --choice.count;
+            }
+        for (size_t i = 0; i < replay->count; ++i) {
+            const auto& nominated = replay->victims[i];
+            const size_t index = index_of(nominated.serial);
+            if (index == SIZE_MAX ||
+                !ConversationVictimReplay::identify(serials_[index], entries_[index], actual) ||
+                actual != nominated) return decide("stale_victim");
+            if (!evictable(index) || serials_[index] == plan.protected_serial ||
+                (subject && replaces(index, *subject))) return decide("ineligible");
+            choice.remaining -= entries_[index].bytes(); --choice.count;
+        }
+        if ((replay->site == "put" && choice.count >= plan.available_entries) ||
+            (replay->site != "evict_oldest" && choice.remaining > plan.limit))
+            return decide("insufficient");
+        return decide(replay->alternate ? "forced" : "keep", replay->alternate);
+    }
+    void trace_victims(ConversationCacheTrace::State state, const VictimChoice& choice,
+                       const SavedConversation* subject = nullptr) const noexcept {
+        if (choice.nomination) {
+            state.replay_contract = choice.nomination->contract;
+            state.replay_mode = choice.nomination->alternate ? "alternate" : "keep";
+            state.replay_decision = choice.decision;
+            if (std::string_view(state.action) == "plan") state.replay_count = choice.nomination->count;
+        }
+        trace_observation(state, subject, choice.nomination);
+    }
     static bool same_pin(const ConversationCheckpoint& a, const ConversationCheckpoint& b) noexcept {
         if (a.pinned != b.pinned || a.ids != b.ids || a.imgs != b.imgs || a.plan != b.plan ||
             a.stage_parts.size() != b.stage_parts.size()) return false;
@@ -974,6 +1075,7 @@ private:
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
     ConversationCacheTrace* trace_ = nullptr;
+    ConversationVictimReplay* victim_replay_ = nullptr;
 };
 
 } // namespace strata::core
