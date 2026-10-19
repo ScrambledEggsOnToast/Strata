@@ -3,6 +3,7 @@ import contextlib
 import json
 import io
 import os
+import socket
 import subprocess
 import time
 import threading
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
+from serve import server as server_module
 from serve import test_parallel as parallel_tests
 
 from serve.frontend import ChatTemplate
@@ -562,6 +564,266 @@ class RequestAdmission(unittest.TestCase):
 
 class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.TestCase):
     """The migrated admission contract through HTTP, not the legacy Python selector."""
+
+    def test_cancel_racing_first_native_token_delivers_the_committed_prefix(self):
+        self.start_native()
+        client = self.launch("cancel while the first token is crossing the frontend", stream=True, max_tokens=8)
+        tag = self.registered_tag(1)
+        identity = self.client_identity(client)
+        self.wait_wire("BACK", tag=tag)
+        native_next = self.engine._native_next
+        cancelled = threading.Event()
+
+        def cancel_on_first_token(owner, cancel):
+            line = native_next(owner, cancel)
+            if line is not None and line.startswith("BQT ") and owner["tag"] == tag and not cancelled.is_set():
+                cancelled.set()
+                self.assertTrue(self.svc.cancel_request(identity))
+            return line
+
+        with mock.patch.object(self.engine, "_native_next", side_effect=cancel_on_first_token):
+            self.gate("service", held=False)
+            self.finish_client(client)
+        self.assertTrue(cancelled.is_set(), "the race must occur after the native token was committed")
+        self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+        attribution = self.svc.lifecycle_records(identity)["attribution"]
+        tokens = self.wire("BQT", tag=tag)
+        terminal = self.wait_wire("BQDONE", tag=tag)
+        self.assertEqual(len(terminal), 1)
+        self.assertGreater(len(tokens), 0)
+        self.assertEqual(int(terminal[0]["raw"].split()[5]), len(tokens))
+        self.assertEqual(attribution["committed_tokens"], len(tokens))
+        self.assertEqual(attribution["output_tokens"], len(tokens))
+        self.assertLessEqual(len(tokens), 8)
+        events = [json.loads(line[6:]) for line in client["body"].splitlines()
+                  if line.startswith("data: ") and line != "data: [DONE]"]
+        content = "".join(event["choices"][0]["delta"].get("content", "") for event in events
+                          if event.get("choices"))
+        self.assertEqual(content, bytes(int(token["raw"].split()[5]) for token in tokens).decode())
+        self.assertEqual(client["body"].count("data: [DONE]"), 1)
+        self.assertEqual(client["body"].split("data: [DONE]", 1)[1].strip(), "")
+        self.assertEqual(attribution["finish"], "cancel")
+        self.assertTrue(self.engine.alive())
+
+    def test_cancel_after_first_native_token_before_consumer_start_keeps_its_output(self):
+        self.start_native(more=("--native-no-suspend",))
+        self.gate("token-1")
+        entered, release = threading.Event(), threading.Event()
+        handler = self.httpd.RequestHandlerClass
+        send_headers = handler._sse
+
+        def hold_consumer(request):
+            send_headers(request)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("cancelled consumer-start barrier timed out")
+
+        try:
+            with mock.patch.object(handler, "_sse", hold_consumer):
+                client = self.launch("cancel after commit but before Service.run", stream=True, max_tokens=8)
+                self.assertTrue(entered.wait(2))
+                tag = self.registered_tag(1)
+                identity = self.client_identity(client)
+                self.gate("service", held=False)
+                self.wait_wire("BQT", tag=tag)
+                self.cancel_client(client)
+                self.wait_wire("BQDONE", tag=tag)
+                release.set()
+                self.finish_client(client)
+        finally:
+            release.set()
+        self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+        attribution = self.svc.lifecycle_records(identity)["attribution"]
+        self.assertEqual(len(self.wire("BQT", tag=tag)), 1)
+        self.assertEqual(attribution["committed_tokens"], 1)
+        self.assertEqual(attribution["output_tokens"], 1)
+        self.assertIn('"content": "o"', client["body"])
+        self.assertEqual(client["body"].count("data: [DONE]"), 1)
+        self.assertEqual(client["body"].split("data: [DONE]", 1)[1].strip(), "")
+        self.assertEqual(len(self.wire("BGENQ1", tag=tag, direction="sent")), 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+
+    def test_cancel_racing_seating_does_not_discard_an_already_committed_first_token(self):
+        self.start_native(more=("--native-no-suspend",))
+        self.gate("token-1")
+        native_next = self.engine._native_next
+        cancelled = threading.Event()
+
+        def cancel_on_seating(owner, cancel):
+            line = native_next(owner, cancel)
+            if line is not None and line.startswith("BACK ") and not cancelled.is_set():
+                self.gate("service", held=False)
+                self.wait_wire("BQT", tag=owner["tag"])
+                cancelled.set()
+                self.assertTrue(self.svc.cancel_request(owner["live"]["request_id"]))
+            return line
+
+        with mock.patch.object(self.engine, "_native_next", side_effect=cancel_on_seating):
+            client = self.launch("cancel before the seating consumer returns", stream=True, max_tokens=8)
+            self.finish_client(client)
+        self.assertTrue(cancelled.is_set())
+        identity = self.client_identity(client)
+        self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+        attribution = self.svc.lifecycle_records(identity)["attribution"]
+        self.assertEqual((attribution["committed_tokens"], attribution["output_tokens"]), (1, 1))
+        self.assertIn('"content": "o"', client["body"])
+        self.assertEqual(client["body"].count("data: [DONE]"), 1)
+        self.assertEqual(client["body"].split("data: [DONE]", 1)[1].strip(), "")
+
+    def test_cancel_drains_mtp_commits_before_each_dialects_terminal_without_touching_peer(self):
+        # This is the frontend/wire seam, not a GPU-arithmetic fixture. The native
+        # stand-in publishes two accepted in-flight tokens only when drain is released.
+        self.start_native(more=("--native-cancel-catchup", "2"))
+        for index, path in enumerate(("/v1/chat/completions", "/v1/messages", "/v1/responses")):
+            with self.subTest(path=path):
+                self.gate("service")
+                cap = 5 if index == 0 else 8
+                dialect = ({"thinking": {"type": "disabled"}} if path == "/v1/messages" else
+                           {"reasoning": {"effort": "none"}} if path == "/v1/responses" else {})
+                client = self.launch(f"{index}: cancel after three delivered tokens", path=path, stream=True,
+                                     max_tokens=cap, body_updates=dialect)
+                tag = self.registered_tag(2 * index + 1)
+                identity = self.client_identity(client)
+                self.wait_wire("BACK", tag=tag)
+                self.gate("token-3", tag)
+                self.gate("drain", tag)
+                peer = self.launch(f"{index}: surviving peer", max_tokens=1)
+                peer_tag = self.registered_tag(2 * index + 2)
+                self.client_identity(peer)
+                self.wait_wire("BACK", tag=peer_tag)
+                self.gate("service", peer_tag)
+                self.gate("service", held=False)
+                self.wait_until(lambda: self.client_record(client).get("output_tokens") == 3)
+                self.cancel_client(client)
+                self.wait_wire("BQCANCEL", tag=tag, direction="sent")
+                self.assertFalse(client["done"].is_set(), "the HTTP terminal must wait for the native drain")
+                self.assertEqual(self.wire("BQDONE", tag=tag), [])
+                self.gate("drain", tag, held=False)
+                self.finish_client(client)
+                self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+                attribution = self.svc.lifecycle_records(identity)["attribution"]
+                tokens = self.wire("BQT", tag=tag)
+                terminal = self.wait_wire("BQDONE", tag=tag)
+                self.assertEqual(len(tokens), 5)
+                self.assertLessEqual(len(tokens), cap)
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0]["raw"].split()[5], "5")
+                self.assertEqual((attribution["committed_tokens"], attribution["output_tokens"]), (5, 5))
+                self.assertEqual((attribution["drafts_accepted"], attribution["drafts_offered"]), (2, 2))
+                self.assertEqual(attribution["finish"], "cancel")
+                self.assertEqual(len(self.wire("BGENQ1", tag=tag, direction="sent")), 1)
+                self.assertEqual(self.wire("BQCANCEL", tag=peer_tag, direction="sent"), [])
+                self.assertFalse(peer["done"].is_set())
+                events = [json.loads(line[6:]) for line in client["body"].splitlines()
+                          if line.startswith("data: ") and line != "data: [DONE]"]
+                if path == "/v1/chat/completions":
+                    content = "".join(event["choices"][0]["delta"].get("content", "") for event in events
+                                      if event.get("choices"))
+                    self.assertEqual(sum("error" in event for event in events), 1)
+                    self.assertIn("error", events[-1])
+                    self.assertEqual(client["body"].count("data: [DONE]"), 1)
+                    self.assertEqual(client["body"].split("data: [DONE]", 1)[1].strip(), "")
+                elif path == "/v1/messages":
+                    content = "".join(event.get("delta", {}).get("text", "") for event in events)
+                    self.assertEqual(sum(event["type"] in ("message_stop", "error") for event in events), 1)
+                    self.assertEqual(events[-1]["type"], "error")
+                else:
+                    content = "".join(event["delta"] for event in events
+                                      if event["type"] == "response.output_text.delta")
+                    self.assertEqual(sum(event["type"] in ("response.completed", "response.failed",
+                                                          "response.incomplete") for event in events), 1)
+                    self.assertEqual(events[-1]["type"], "response.failed")
+                self.assertEqual(content, "ok, d")
+                self.assertLess(tokens[-1]["monotonic_s"], terminal[0]["monotonic_s"])
+                self.gate("service", peer_tag, held=False)
+                result = self.finish_client(peer)["body"]
+                self.assertEqual(result["choices"][0]["message"]["content"], "o")
+                self.assertEqual(result["usage"]["completion_tokens"], 1)
+                self.assertEqual(len(self.wire("BQDONE", tag=peer_tag)), 1)
+                self.assertTrue(self.engine.alive())
+
+    def test_disconnected_nonstream_native_request_drains_first_token_and_mtp_without_delivery(self):
+        self.start_native(more=("--native-no-suspend", "--native-cancel-catchup", "2"))
+        entered, release = threading.Event(), threading.Event()
+        native_next = self.engine._native_next
+        tag = None
+
+        def hold_first_token(owner, cancel):
+            line = native_next(owner, cancel)
+            if line is not None and line.startswith("BQT ") and owner["tag"] == tag and not entered.is_set():
+                entered.set()
+                if not release.wait(8):
+                    raise AssertionError("disconnected first-token barrier timed out")
+            return line
+
+        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "disconnect in flight"}],
+                           "stream": False, "max_tokens": 8, "reasoning_effort": "none"}).encode()
+        token_gate = mock.patch.object(self.engine, "_native_next", side_effect=hold_first_token)
+        token_gate.start()
+        self.addCleanup(token_gate.stop)
+        sock = socket.create_connection(self.httpd.server_address, timeout=5)
+        try:
+            sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() +
+                         b"\r\n\r\n" + body)
+            tag = self.registered_tag(1)
+            self.wait_wire("BACK", tag=tag)
+            identity = self.get("/api/lifecycle")[0]["id"]
+            self.gate("token-1", tag)
+            self.gate("drain", tag)
+            push, feed = server_module.Detokenizer.push, server_module.OutputParser.feed
+            with mock.patch.object(server_module.Detokenizer, "push", autospec=True, side_effect=push) as pushed, \
+                    mock.patch.object(server_module.OutputParser, "feed", autospec=True, side_effect=feed) as fed:
+                self.gate("service", held=False)
+                self.assertTrue(entered.wait(2), "first-token commitment must precede the disconnect")
+                sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+                self.wait_until(lambda: self.svc.lifecycle_records(identity).get("cancel_reason") == "disconnected",
+                                seconds=2)
+                release.set()
+                self.wait_wire("BQCANCEL", tag=tag, direction="sent")
+                self.assertEqual(self.wire("BQDONE", tag=tag), [], "native drain must remain fenced")
+                self.gate("drain", tag, held=False)
+                self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+                attribution = self.svc.lifecycle_records(identity)["attribution"]
+                self.assertEqual(attribution["outcome"], "disconnected")
+                self.assertEqual((attribution["committed_tokens"], attribution["output_tokens"]), (3, 0))
+                self.assertEqual(self.svc.lifecycle_records(identity).get("output_tokens", 0), 0)
+                self.assertEqual(self.svc.history[-1]["output_tokens"], 0)
+                pushed.assert_not_called()
+                fed.assert_not_called()
+            self.assertEqual(len(self.wire("BQT", tag=tag)), 3)
+            self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+            self.assertEqual(len(self.wire("BGENQ1", tag=tag, direction="sent")), 1)
+            self.assertFalse(self.engine.packed_q)
+            self.assertTrue(self.engine.alive())
+        finally:
+            release.set()
+            sock.close()
+            if tag is not None:
+                self.gate("drain", tag, held=False)
+
+    def test_unseated_cancel_and_timeout_keep_preheader_status_and_zero_output(self):
+        self.start_native(admission_held=True)
+        for number, (status, reason) in enumerate(((409, "cancel"), (408, "timeout")), 1):
+            with self.subTest(status=status):
+                client = self.launch("cancel without a native seat", stream=True,
+                                     timeout=.15 if status == 408 else None, max_tokens=8)
+                tag = self.registered_tag(number)
+                identity = self.client_identity(client)
+                self.wait_wire("BGENQ1", tag=tag, direction="sent")
+                self.assertFalse(client["headers_ready"].is_set())
+                if status == 409:
+                    self.cancel_client(client)
+                self.finish_client(client, status)
+                self.assertNotIn("event-stream", client["headers"]["Content-Type"])
+                self.assertNotIn("Retry-After", client["headers"])
+                self.assert_queued_terminal(tag, reason)
+                self.wait_until(lambda: self.svc.lifecycle_records(identity).get("attribution"))
+                attribution = self.svc.lifecycle_records(identity)["attribution"]
+                self.assertEqual((attribution["committed_tokens"], attribution["output_tokens"]), (0, 0))
+                self.assertEqual(attribution["finish"], reason)
+        self.assertTrue(self.engine.alive())
 
     def test_unloaded_native_engine_reloads_before_registering_accepted_ingress(self):
         self.start_native()

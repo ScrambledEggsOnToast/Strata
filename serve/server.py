@@ -2604,7 +2604,9 @@ class StrataEngine:
         try:
             if owner is not None and (owner.get("closed") or owner.get("engine", self) is not self):
                 raise ValueError("native owner belongs to a closed or different engine")
-            if cancel.is_set():
+            # A submitted owner must still deliver/drain its committed prefix;
+            # cancellation refuses new input, not consumption of an existing one.
+            if cancel.is_set() and not (owner is not None and owner["submitted"]):
                 expired = owner is not None and time.perf_counter() >= owner["deadline"]
                 raise AdmissionError("request cancelled before native submission", 408 if expired else 409)
             bias_api.validate_request(sampling, self, None)
@@ -2752,10 +2754,9 @@ class StrataEngine:
                     callback = owner.get("sampling", {}).get("_strata_slot")
                     if callable(callback):
                         callback(owner["slot"])
-                    if cancel.is_set() or time.perf_counter() >= owner["deadline"]:
-                        self.native_close(owner)
-                        raise AdmissionError("request cancelled before native seating completed",
-                                             408 if time.perf_counter() >= owner["deadline"] else 409)
+                    # BACK has already admitted this owner. Even if cancellation
+                    # raced consumption, its issued first-token/MTP transaction may
+                    # still commit; the output consumer must deliver it before cancel.
                     owner["seating_consumed"] = True
                     return
                 if line.startswith(("BQDONE ", "BQREJECT ")):
@@ -2821,8 +2822,9 @@ class StrataEngine:
                     live.update(state="decoding", generated=live["generated"] + 1)
                     if live["first_token"] is None:
                         live["first_token"] = time.time()
-                    if not cancel.is_set():
-                        yield int(fields[5])
+                    # BQT is already committed native output, including an issued MTP
+                    # window that finishes after BQCANCEL. Deliver it before BQDONE.
+                    yield int(fields[5])
                 elif kind == "BQPP":
                     live["prompt_read"] = int(fields[5])
                     yield None
@@ -7711,7 +7713,8 @@ class Service:
             owner = lifecycle.pop("_staged_native_owner", None)
             if owner is not None:
                 sampling["_strata_native_owner"] = owner
-            self._check_ingress_cancel(lifecycle)
+            if owner is None:
+                self._check_ingress_cancel(lifecycle)
         if lifecycle is not None and not native:
             self.lifecycle_note(lifecycle, "preparing", prompt_tokens=len(ids), max_tokens=max_new,
                                 context_budget=len(ids) + max_new + CTX_SLACK, _executing=False)
@@ -7858,7 +7861,7 @@ class Service:
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
-                    if lifecycle is not None and cancel.is_set():
+                    if lifecycle is not None and cancel.is_set() and not native:
                         raise ValueError("request cancelled before generation")
                     if not par:
                         self.ensure_loaded()
@@ -7903,7 +7906,9 @@ class Service:
                             # the engine's heartbeat sends when nothing has gone out for KEEPALIVE_S.
                             last_out = time.perf_counter()
                             for t in gen:
-                                if cancel.is_set():
+                                # Only a connected native consumer delivers accepted
+                                # tokens during cancellation; a disconnect is drain-only.
+                                if cancel.is_set() and (not native or lifecycle.get("cancel_reason") == "disconnected"):
                                     break
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)

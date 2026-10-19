@@ -138,7 +138,8 @@ def native_finish(owner, reason):
         admission_wait = max(0.0, time.monotonic() - owner["registered"])
     fresh = owner["position"] - owner["reuse"] if slot >= 0 else 0
     native_send(f"BQDONE {tag} {slot} {request} {incarnation} {generated} {prompt} "
-                f"{5 if fresh else 0} {1 if generated else 0} {reason} 0 0 {owner['reuse']} "
+                f"{5 if fresh else 0} {1 if generated else 0} {reason} "
+                f"{owner.get('catchup', 0)} {owner.get('catchup', 0)} {owner['reuse']} "
                 f"prompt_read={fresh} native_admission_wait_s={admission_wait:.9f} "
                 f"native_service_wait_s={owner['service_wait']:.9f}")
     if slot >= 0:
@@ -189,6 +190,20 @@ def native_tick():
         native_accept(owner)
         reason = "cancel" if owner["cancelled"] else "timeout" if now >= owner["deadline"] else None
         if reason and not (owner["slot"] >= 0 and native_gate("drain", owner["tag"])):
+            # Transport-only stand-in for accepted rows of an already issued MTP
+            # window: publish them after cancellation, before its drained terminal.
+            if (reason == "cancel" and owner["slot"] >= 0 and owner["generated"] and
+                    "--native-cancel-catchup" in args):
+                count = int(args[args.index("--native-cancel-catchup") + 1])
+                prefix = f"{owner['tag']} {owner['slot']} {owner['identity'][0]} {owner['identity'][1]}"
+                for _ in range(min(count, owner["limit"] - len(owner["generated"]))):
+                    token = owner["tokens"].pop(0) if owner["tokens"] else 257
+                    owner["position"] = len(owner["ids"])
+                    owner["generated"].append(token)
+                    owner["catchup"] = owner.get("catchup", 0) + 1
+                    native_send(f"BQT {prefix} {token}")
+                    if token == 257:
+                        break
             native_finish(owner, reason)
     native_seat()
     for slot, owner in list(packed.items()):
@@ -205,7 +220,7 @@ def native_tick():
         if owner["cancelled"] or now >= owner["deadline"]:
             continue
         prefix = f"{tag} {slot} {owner['identity'][0]} {owner['identity'][1]}"
-        if len(owner["ids"]) > 33 and not owner["resumed"]:
+        if len(owner["ids"]) > 33 and not owner["resumed"] and "--native-no-suspend" not in args:
             if owner["cursor"] is None:
                 count = int(args[args.index("--native-progress-count") + 1]) if "--native-progress-count" in args else 1
                 position = min(len(owner["ids"]) - 1, ((max(32, owner["reuse"], count) + 31) // 32) * 32)
@@ -220,6 +235,8 @@ def native_tick():
                     continue
                 owner["cursor"] = f"{prefix} {position} 1 1 0 {len(owner['ids']) - 1} 32 0"
                 native_send(f"BQSUSPEND {owner['cursor']} chunk")
+            continue
+        if native_gate("token-" + str(len(owner["generated"])), tag):
             continue
         owner["position"] = len(owner["ids"])
         token = owner["tokens"].pop(0) if owner["tokens"] else 257
