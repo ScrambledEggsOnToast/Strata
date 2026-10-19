@@ -751,6 +751,11 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (count < available_entries && remaining <= payload_limit) break;
             if (evictable(i) && !replaces(i, image)) {
+                // The third and last eviction site: name the victim here too, so slot and byte pressure are both
+                // answerable from the log (2026-10-18).
+                std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
+                                     "(%zu tokens, %zu bytes) for a new parked conversation\n",
+                             entries_[i].live.ids.size(), entries_[i].bytes());
                 --count;
                 remaining -= entries_[i].bytes();
                 ++victims;
