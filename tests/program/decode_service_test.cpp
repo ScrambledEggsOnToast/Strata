@@ -104,6 +104,20 @@ int main() {
         check(ds::decode_window_capacity(participants({{1, true}}), 1) == 1, "the verify row cap is respected");
     }
     {
+        // Membership churn must not reset the phase to the foreground block's first ticket. The reviewer's
+        // trace: ready [F,B], serve F, add C, alternate C, and the background's turn must still arrive.
+        ds::DecodeService service(1);
+        const auto base = participants({{1, true}, {2, false}});
+        check(service.select(base).front() == 1, "the first window serves foreground");
+        int background = 0;
+        for (int window = 0; window < 20; ++window) {
+            const auto ready = window % 2 == 0 ? participants({{1, true}, {2, false}, {3, false}})
+                                               : base;
+            for (const uint64_t request : service.select(ready)) background += request == 2 ? 1 : 0;
+        }
+        check(background >= 3, "background service is not starved by membership churn");
+    }
+    {
         ds::DecodeService service(0);
         check(service.select(participants({{1, true}})).empty(), "zero capacity selects nothing");
     }

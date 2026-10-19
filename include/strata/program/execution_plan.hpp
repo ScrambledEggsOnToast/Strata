@@ -171,10 +171,14 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     if (in.suffix_draft > 0 || in.lookup_chain > 0) {
         // The suffix drafter and chaining run in the serial generation loop. Resident serving constructs the
         // drafter but no serving decode path consumes it, so advertising it as effective would be false.
-        if (p.mode == ServeMode::resident) {
-            p.lookup.reason = "the serial-generation suffix drafter is not consumed by a serving decode path";
-        } else if (spec < 2) {
+        if (spec < 2) {
             p.lookup.reason = "--suffix-draft/--lookup-chain need --spec T (T >= 2)";
+        } else if (p.mode == ServeMode::resident) {
+            // A solo serving GEN runs the serial loop and can execute lookup after its first window; a resident
+            // decode window does not, and a BGEN admission leg is a single first window (lookup skips it).
+            p.lookup.support = Support::conditional;
+            p.lookup.reason = "executes in a solo serial serving window; not in a resident decode window, and the "
+                              "BGEN single admission window skips it";
         } else {
             p.lookup.support = Support::on;
         }

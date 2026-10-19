@@ -52,8 +52,9 @@ int main() {
               "suffix and chaining resolve the effective speculative widths once");
         check(p.proposal == ep::ProposalShape::batched_pipeline, "the proposal shape is the pipelined batch MTP");
         check(p.suspension.support == ep::Support::conditional, "legacy batch suspension is a resend, not in place");
-        check(p.lookup.support == ep::Support::off && has(p.lookup.reason, "not consumed"),
-              "lookup is not advertised where no serving decode path consumes it");
+        check(p.lookup.support == ep::Support::conditional && has(p.lookup.reason, "solo serial") &&
+              has(p.lookup.reason, "resident decode"),
+              "lookup is conditional: solo serial serving can execute it, resident decode cannot");
         check(p.concurrent_reader.support == ep::Support::off && has(p.concurrent_reader.reason, "batched MTP"),
               "the concurrent reader names batched MTP as its first conflict");
         check(p.budget.support == ep::Support::off, "no budget was requested");
@@ -135,6 +136,11 @@ int main() {
         const ep::ExecutionPlan p = ep::resolve_execution_plan(in);
         check(!p.refused && p.lookup.support == ep::Support::on && p.suspension.support == ep::Support::off,
               "serial generation consumes lookup and has no suspension");
+        in.serve = true;
+        in.spec_requested = 1;
+        const ep::ExecutionPlan q = ep::resolve_execution_plan(in);
+        check(q.lookup.support == ep::Support::off && has(q.lookup.reason, "spec"),
+              "a serving lookup without the speculative width is off with its reason");
     }
     {
         ep::ExecutionPlanInput in;

@@ -12954,6 +12954,11 @@ int main(int argc, char** argv) {
             return capture_device_fault ? strata::program::PreservationFailure::device
                                         : strata::program::PreservationFailure::durability;
         };
+        // conversation_snapshot_save synchronizes internally; its sync failure is a device fault even though the
+        // capture API reports only a bool and a reason string. Classify it before the capture is dropped.
+        auto note_capture_error = [&] {
+            if (err.find("conversation snapshot synchronize") != std::string::npos) capture_device_fault = true;
+        };
         auto drop_capture = [&](const char* what) {
             strata::program::preservation_report_drop(stderr, what, err.empty() ? "capture failed" : err);
             err.clear();
@@ -13957,7 +13962,10 @@ int main(int argc, char** argv) {
                 const uint64_t reuse_donor_epoch = reuse.donor_epoch;
                 std::vector<strata::core::ConversationRetainedPrefix> retained_prefixes;
                 if (!strata::core::conversation_snapshot_save(image, view, session_at(0), g, draft0, err,
-                        std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr)) return false;
+                        std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr)) {
+                    note_capture_error();
+                    return false;
+                }
                 image.stage_images.reserve(n_st);
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -13972,8 +13980,10 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation part;
                     std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
                     if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr))
+                            std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr)) {
+                        note_capture_error();
                         return false;
+                    }
                     part.scope = live_scope;
                     for (strata::core::ConversationRetainedPrefix& prefix : stage_prefixes) {
                         prefix.stage = (uint32_t) (k + 1);   // this capture's own stage tag: the store's stream stage

@@ -106,17 +106,26 @@ private:
     }
     void rebuild(const std::vector<DecodeParticipant>& ready) {
         const uint64_t resume = cursor_ < schedule_.size() ? schedule_[cursor_] : 0;
+        // Preserve the position *within* that request's ticket block, not merely its first ticket: a
+        // membership change must not reset a background request's turn to the start of the foreground block.
+        size_t offset = 0;
+        if (resume)
+            for (size_t i = 0; i < cursor_ && i < schedule_.size(); ++i)
+                offset += schedule_[i] == resume ? 1 : 0;
         schedule_.clear();
         for (const auto& p : ready) {
             if (!p.request) continue;
             const unsigned weight = p.foreground ? foreground_weight_ : background_weight_;
             for (unsigned i = 0; i < weight; ++i) schedule_.push_back(p.request);
         }
-        // Preserve the phase at the request the cursor named, when it still participates.
         cursor_ = 0;
         if (resume) {
             const auto it = std::find(schedule_.begin(), schedule_.end(), resume);
-            if (it != schedule_.end()) cursor_ = (size_t) std::distance(schedule_.begin(), it);
+            if (it != schedule_.end()) {
+                unsigned weight = 0;
+                for (const uint64_t r : schedule_) weight += r == resume ? 1u : 0u;
+                cursor_ = (size_t) std::distance(schedule_.begin(), it) + std::min(offset, (size_t) weight - 1);
+            }
         }
     }
 

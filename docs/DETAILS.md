@@ -3625,8 +3625,9 @@ engine prints the same line before `READY`, and the frontend records it and expo
 widths and budget decision, so the report cannot disagree with execution on those fields. Facts that need the
 hardware or an allocation (the slots that actually fit, runtime source/helper state, automatic placement) are
 labelled conditional, never reported as observed capabilities. The line distinguishes requested from effective
-values and names the reason a capability is off; for example, the suffix drafter is reported as not consumed by
-a serving decode path even when its flags are configured.
+values and names the reason a capability is off; for example, the suffix drafter is reported as conditional: a solo
+serial serving window can execute it after its first window, while a resident decode window and the BGEN
+single admission window do not.
 
 **Weighted decode service (#264, opt-in, off by default).** `STRATA_DECODE_SERVICE=1` selects ready resident
 requests by a 3:1 weighted service cycle instead of adding every active slot to each decode window. One ticket
