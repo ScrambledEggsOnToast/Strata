@@ -18766,9 +18766,11 @@ int main(int argc, char** argv) {
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             if (!stages.empty() && strata::prefill::Prefill::pipe_setting() > 0 &&
                 (pipe_retained || pipe_bisection)) {
-                phase_error("ERR --prefill-pipe request cannot compose with %s before the chunk-grid ownership port\n",
-                            pipe_retained ? "retained prefill" : "budgeted STRATA_PREFILL_SPLIT_OVER_BUDGET=1024");
-                return 2;
+                // The pipe cannot compose with these yet (the #255 chunk-grid port): read unpiped for this request
+                // rather than ending the engine.
+                std::fprintf(stderr, "strata serve: --prefill-pipe off for this request: it cannot compose with %s yet\n",
+                             pipe_retained ? "retained prefill" : "budgeted STRATA_PREFILL_SPLIT_OVER_BUDGET=1024");
+                strata::prefill::Prefill::set_pipe_request(0.0);
             }
             std::vector<float> req_bias;
             std::string bias_error;
@@ -19371,9 +19373,10 @@ int main(int argc, char** argv) {
             int64_t resume_plan_at = -1, resume_plan_end = -1;
             if (!stages.empty() && strata::prefill::Prefill::pipe_setting() > 0 &&
                 slot_source >= 0 && (yielded_source >= 0 || bs[(size_t) slot_source].partial)) {
-                // Next commit: retain PromptPlan through the fork's ResidentSlots partial-handoff API.
-                phase_error("ERR --prefill-pipe cannot resume a partial handoff with the fork's resident-slot ownership\n");
-                return 2;
+                // A partially read slot cannot be resumed on the pipe's plan yet (the #255 chunk-grid port): this
+                // request reads unpiped instead of ending the engine.
+                std::fprintf(stderr, "strata serve: --prefill-pipe off for this request: it resumes a partial handoff\n");
+                strata::prefill::Prefill::set_pipe_request(0.0);
             }
             const auto parked = selected.parked;
             if (o.prefix_cost_selection)
@@ -20389,11 +20392,14 @@ int main(int argc, char** argv) {
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C, o.short_read);
                     if (can && !stages.empty() && strata::prefill::Prefill::pipe_setting() > 0) {
-                        // Next commit: retain PromptPlan through the fork's ResidentSlots partial-handoff API.
-                        std::fprintf(stderr, "strata generate: --prefill-pipe cannot park a partial handoff with "
-                                             "the fork's resident-slot ownership\n");
+                        // A piped read cannot park a partial handoff: its PromptPlan does not survive the resident
+                        // slot's chunk grid yet (the #255 port). The read keeps its slot and runs to the end instead
+                        // of ending the engine; the queued request waits for the whole read, which the pipe's faster
+                        // read is meant to repay.
+                        std::fprintf(stderr, "strata generate: --prefill-pipe keeps this read whole: no partial "
+                                             "handoff with the fork's resident-slot ownership\n");
                         std::fflush(stderr);
-                        std::exit(2);
+                        can = false;
                     }
                     std::string ye;
                     const auto ty = Clock::now();
