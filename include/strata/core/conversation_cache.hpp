@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -662,6 +663,11 @@ public:
     bool evict_oldest() {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (!evictable(i)) continue;
+            // Name the victim: the eviction counter alone cannot show whether pressure is spending the cache on
+            // short side conversations or discarding a long one whose loss costs a full re-read (2026-10-18).
+            std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
+                                 "(%zu tokens, %zu bytes); %zu parked, %zu bytes held\n",
+                         entries_[i].live.ids.size(), entries_[i].bytes(), entries_.size() - 1, bytes_);
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
