@@ -72,8 +72,10 @@ Cancelled/expired ingress-preparation waits remain part of final `queue_s`.
 
 Lifecycle records and response-attribution logs expose `ingress_wait_s` separately
 from actual frontend preparation. `native_admission_wait_s` comes only from BACK
-or BQDONE, and `native_service_wait_s` only from BQDONE; neither is synthesized
-from seat-to-first-token time, which includes real restore/prefill work. The
+or BQDONE. `native_service_wait_s` is published as an explicit initial zero on
+BACK, updated cumulatively on BQPP, and finalized on BQDONE. Missing service
+receipts stay missing/flagged; zero is not synthesized from admission.
+Neither wait counter is inferred from seat-to-first-token time, which includes real restore/prefill work. The
 native admission counter includes the time after early registration, so it can
 overlap frontend preparation. `queue_s` retains its compatibility meaning of
 frontend resource wait plus post-publication native seat wait; it excludes

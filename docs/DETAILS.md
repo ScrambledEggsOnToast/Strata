@@ -3557,7 +3557,8 @@ seat count. Full submission/input transport refuses without blocking subsequent 
 Only the native owner loop grants a seat. It applies intentions, drains consumers, finishes/aborts the old
 resource, snapshots terminal accounting, publishes one terminal, retires the association, then selects a waiter.
 Neither finish nor abort admits reentrantly. `BACK <tag> <slot> <request> <incarnation>
-native_admission_wait_s=<seconds>` precedes destination preparation. A waiter needs no resubmission or new input
+native_admission_wait_s=<seconds> native_service_wait_s=0.000000000` precedes destination preparation.
+A waiter needs no resubmission or new input
 when one seat is freed. Tagged, incarnation-fenced frontend slot observations are not admission authority;
 a delayed old consumer/finalizer cannot clear a newly seated successor.
 After a non-finite result the poisoned domain is invalidated before any next affinity lookup, capture or
@@ -3592,10 +3593,14 @@ command/handoff storage and checkpoint staging. There is no second device prompt
 `RETAINED_PROMPT event=stage` reports executed per-stage intervals; ordinary token uploads/checkpoints are
 distinct from admission/restore movement counted by `STRATA_ADMISSION_COPY_BYTES`.
 
-Native `BQDONE` appends `native_admission_wait_s` (acceptance to seat or unseated terminal) and
-`native_service_wait_s` (accumulated ready-but-not-selected intervals, excluding restoration/prefill/decode and
-suspended cursor-echo time). These work with optional phase diagnostics disabled. Lifecycle and attribution
-retain `ingress_wait_s` separately from actual frontend preparation and native waits; absent native receipts
+Native `BACK` publishes `native_admission_wait_s` (acceptance to seat) and the initial cumulative
+`native_service_wait_s=0.000000000` at the seat/runnable transition. Every native `BQPP` publishes the
+updated cumulative service-wait counter; `BQDONE` retains both final totals (or acceptance-to-terminal
+admission wait for an unseated cancellation/expiry). Service wait counts ready-but-not-selected intervals,
+excluding restoration/prefill/decode and suspended cursor-echo time. These receipts work with optional
+phase diagnostics disabled. A real zero receipt is available while an immediately admitted request is
+still in prefill, not just after its terminal; an absent receipt stays absent/flagged, never inferred from seating.
+Lifecycle and attribution retain `ingress_wait_s` separately from actual frontend preparation and native waits; absent native receipts
 remain explicitly missing, never invented zero work. Early native registration means its admission counter
 can overlap frontend preparation. Native `queue_s` preserves the compatibility total of frontend ingress
 resource wait plus post-input-publication seat wait; it excludes preparation and native service wait.

@@ -179,8 +179,9 @@ def native_seat():
         packed[free] = owner
         native_foreground = native_foreground + 1 if owner["priority"] == "foreground" else 0
         native_solo = native_solo + 1 if owner["priority"] == "foreground" and owner["packing"] == "solo" else 0
+        service = "" if "--native-missing-service-receipt" in args else " native_service_wait_s=0.000000000"
         native_send(f"BACK {owner['tag']} {free} {packed_serial} {packed_serial} "
-                    f"native_admission_wait_s={owner['admission_wait']:.9f}")
+                    f"native_admission_wait_s={owner['admission_wait']:.9f}" + service)
 def native_tick():
     now = time.monotonic()
     for owner in list(native_owners.values()):
@@ -210,7 +211,9 @@ def native_tick():
                 begin = owner.get("progress_next", max(owner["reuse"] + 1, position - count + 1))
                 end = min(position + 1, begin + 32)
                 for progress in range(begin, end):
-                    native_send(f"BQPP {prefix} {progress} {len(owner['ids'])} {progress - owner['reuse']}")
+                    service = ("" if "--native-missing-service-receipt" in args else
+                               f" native_service_wait_s={owner['service_wait']:.9f}")
+                    native_send(f"BQPP {prefix} {progress} {len(owner['ids'])} {progress - owner['reuse']}" + service)
                 owner["position"], owner["progress_next"] = end - 1, end
                 if end <= position:
                     continue

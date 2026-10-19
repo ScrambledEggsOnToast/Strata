@@ -16256,6 +16256,18 @@ int main(int argc, char** argv) {
             owner.service_ready = (bs[size_t(slot)].stop || bs[size_t(slot)].prompt_cursor.suspended ||
                 (!bs[size_t(slot)].active && !bs[size_t(slot)].preparing)) ? Clock::time_point{} : now;
         };
+        auto packed_progress = [&](const PackedOwner& owner) {
+            if (retained_prompt)
+                std::printf("BQPP %s %d %llu %llu %lld %zu %lld native_service_wait_s=%.9f\n",
+                            owner.tag.c_str(), owner.lease.slot, (unsigned long long)owner.lease.request,
+                            (unsigned long long)owner.lease.incarnation, (long long)owner.frontier,
+                            owner.tokens.size(), (long long)(owner.frontier - owner.resume), owner.service_wait_s);
+            else
+                std::printf("BQPP %s %d %llu %llu %lld %zu %lld\n",
+                            owner.tag.c_str(), owner.lease.slot, (unsigned long long)owner.lease.request,
+                            (unsigned long long)owner.lease.incarnation, (long long)owner.frontier,
+                            owner.tokens.size(), (long long)(owner.frontier - owner.resume));
+        };
         // #249: consecutive one-owner packs, so sustained priority traffic cannot starve ordinary prompt work.
         unsigned packed_solo_streak = 0;
         uint64_t packed_admit_sequence = 0;
@@ -18015,9 +18027,9 @@ int main(int argc, char** argv) {
                 }
                 resident.priority(destination, owner.foreground);
                 native_policy.granted(owner.foreground, owner.solo);
-                std::printf("BACK %s %d %llu %llu native_admission_wait_s=%.9f\n",
+                std::printf("BACK %s %d %llu %llu native_admission_wait_s=%.9f native_service_wait_s=%.9f\n",
                             owner.tag.c_str(), destination, (unsigned long long)lease.request,
-                            (unsigned long long)lease.incarnation, owner.admission_wait_s);
+                            (unsigned long long)lease.incarnation, owner.admission_wait_s, owner.service_wait_s);
                 std::fflush(stdout); // seating is public before any destination preparation
             }
         };
@@ -18564,10 +18576,7 @@ int main(int argc, char** argv) {
                         const double wall = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
                         time_budget.background_work(wall);
                         if (owner.phase_leg) owner.phase_leg->add(phase::Stage::prefill_run, wall);
-                        std::printf("BQPP %s %d %llu %llu %lld %zu %lld\n", owner.tag.c_str(), slot,
-                                    (unsigned long long)owner.lease.request,
-                                    (unsigned long long)owner.lease.incarnation, (long long)owner.frontier,
-                                    owner.tokens.size(), (long long)(owner.frontier - owner.resume));
+                        packed_progress(owner);
                         std::fflush(stdout);
                         if (owner.frontier == endpoint) final_ready = true;
                         native_service_end(slot);
@@ -18657,11 +18666,7 @@ int main(int argc, char** argv) {
                         owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
                     if (owner.phase_leg) owner.phase_leg->add(phase::Stage::prefill_run, wall);
                     if (!packed_checkpoint(owner)) return false;
-                    std::printf("BQPP %s %d %llu %llu %lld %zu %lld\n", owner.tag.c_str(), owner.lease.slot,
-                                (unsigned long long)owner.lease.request,
-                                (unsigned long long)owner.lease.incarnation,
-                                (long long)owner.frontier, owner.tokens.size(),
-                                (long long)(owner.frontier - owner.resume));
+                    packed_progress(owner);
                     if (retained_prompt && owner.frontier < owner.lease.endpoint) {
                         strata::program::ResidentPromptCursor cursor;
                         if (!resident.suspend_prompt(owner.lease, result.execution, cursor, err)) return false;

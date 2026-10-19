@@ -1397,14 +1397,18 @@ class StrataEngine:
                 if min(identity) <= 0 and not queued_terminal:
                     raise ValueError("invalid packed generation identity")
                 if kind == "BACK":
-                    expected = 6 if native else 5
-                    if owner["identity"] is not None or len(fields) != expected:
+                    # Preserve a missing live diagnostic as unavailable to qualification,
+                    # rather than inventing zero from the seating transition.
+                    expected = (6, 7) if native else (5,)
+                    if owner["identity"] is not None or len(fields) not in expected:
                         raise ValueError("duplicate or malformed packed reservation")
                     if native:
                         if (not owner["accepted"] or not owner["submitted"] or
                                 not 0 <= slot < len(owner["live_slots"])):
                             raise ValueError("native seating without acceptance or a valid seat")
                         owner["native_admission_wait_s"] = self._native_wait_field(fields[5], "native_admission_wait_s")
+                        if len(fields) == 7:
+                            owner["native_service_wait_s"] = self._native_wait_field(fields[6], "native_service_wait_s")
                         owner["slot"] = slot
                         live = owner["live"]
                         live.update(slot=slot, identity=identity, state="reading")
@@ -1447,7 +1451,7 @@ class StrataEngine:
                     if owner["committed"] > owner["max_new"]:
                         raise ValueError("packed owner exceeded its generated-token budget")
                 elif kind == "BQPP":
-                    if len(fields) != 8 or not all(f.isdigit() for f in fields[5:]):
+                    if len(fields) not in ((8, 9) if native else (8,)) or not all(f.isdigit() for f in fields[5:8]):
                         raise ValueError("malformed packed progress")
                     position, prompt, fresh = map(int, fields[5:8])
                     if (prompt != owner["prompt_tokens"] or not 0 <= position < prompt or
@@ -1455,6 +1459,11 @@ class StrataEngine:
                         raise ValueError("packed progress crossed its request boundary")
                     owner["fresh"] = fresh
                     owner["position"] = position
+                    if native and len(fields) == 9:
+                        value = self._native_wait_field(fields[8], "native_service_wait_s")
+                        if "native_service_wait_s" in owner and value < owner["native_service_wait_s"]:
+                            raise ValueError("native wait counter went backwards")
+                        owner["native_service_wait_s"] = value
                 elif kind in ("BQSUSPEND", "BQRESUMED"):
                     if len(fields) != 13 or not all(f.isdigit() for f in fields[5:12]):
                         raise ValueError("malformed retained prompt receipt")
@@ -2527,6 +2536,8 @@ class StrataEngine:
             for key in ("native_admission_wait_s", "native_service_wait_s"):
                 if key in owner:
                     event[key] = owner[key]
+        elif fields[0] == "BQPP" and len(fields) == 9:
+            event["native_service_wait_s"] = owner["native_service_wait_s"]
         return event
 
     @staticmethod

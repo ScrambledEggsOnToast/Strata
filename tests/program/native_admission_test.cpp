@@ -35,7 +35,7 @@ struct Owner {
     bool foreground = true, solo = false, input_ready = false, pending = false;
     const char* cancel_reason = nullptr;
     Clock::time_point accepted = Clock::now(), deadline = accepted + std::chrono::seconds(10), started, service_ready;
-    double admission_wait_s = 0;
+    double admission_wait_s = 0, service_wait_s = 0;
     strata::program::ResidentPreparation lease;
     std::array<int, 4> seams{};
     int phase_input = 0;

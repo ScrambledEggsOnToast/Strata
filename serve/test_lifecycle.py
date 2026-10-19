@@ -868,6 +868,63 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
             self.assertEqual((event["slot"], event["request"], event["incarnation"]), tuple(map(int, fields[2:5])))
             self.assertGreater(event["monotonic_s"], 0)
 
+    def test_native_seating_receives_zero_service_wait_before_progress_or_terminal(self):
+        self.start_native()
+        client = self.launch("immediately admitted service receipt")
+        tag = self.registered_tag(1)
+        self.wait_wire("BACK", tag=tag)
+        self.wait_until(lambda: self.engine.ended or self.client_record(client)["state"] == "prefill")
+        self.assertFalse(self.engine.ended, "the native live-counter receipt was not parsed")
+        record = self.client_record(client)
+        self.assertEqual(record["native_service_wait_s"], 0.0)
+        self.assertEqual(record["native_wait_receipts_missing"]["service"], 0)
+        back = next(event for event in record["retained_events"] if event["event"] == "BACK")
+        self.assertEqual(back["native_service_wait_s"], 0.0)
+        self.assertIn("native_service_wait_s=0.000000000", back["raw"])
+        self.assertEqual(self.wire("BQPP", tag=tag), [])
+        self.assertEqual(self.wire("BQDONE", tag=tag), [])
+        self.gate("service", held=False)
+        self.finish_client(client)
+        record = self.client_record(client)
+        progress = [event for event in record["retained_events"] if event["event"] == "BQPP"]
+        self.assertTrue(progress)
+        self.assertTrue(all(event["native_service_wait_s"] >= 0 for event in progress))
+        self.assertGreaterEqual(record["native_service_wait_s"], progress[-1]["native_service_wait_s"])
+
+    def test_missing_live_service_receipt_is_not_synthesized_from_seating(self):
+        self.start_native(more=("--native-missing-service-receipt",))
+        client = self.launch("seated owner with missing live service telemetry")
+        tag = self.registered_tag(1)
+        self.wait_wire("BACK", tag=tag)
+        self.wait_until(lambda: self.client_record(client)["state"] == "prefill")
+        record = self.client_record(client)
+        self.assertNotIn("native_service_wait_s", record)
+        self.assertEqual(record["native_wait_receipts_missing"]["service"], 1)
+        back = next(event for event in record["retained_events"] if event["event"] == "BACK")
+        self.assertNotIn("native_service_wait_s", back)
+        self.assertEqual(self.wire("BQDONE", tag=tag), [])
+        self.gate("service", held=False)
+        self.finish_client(client)
+
+    def test_immediate_zero_service_wait_is_kept_in_lifecycle_and_attribution(self):
+        self.start_native()
+        self.gate("service", held=False)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            client = self.finish_client(self.launch("immediate service without queue wait"))
+            identity = self.client_identity(client)
+            prefix = "[strata] response_attribution: "
+            def matching_attributions():
+                return [value for line in log.getvalue().splitlines() if line.startswith(prefix)
+                        and (value := json.loads(line[len(prefix):]))["request_id"] == identity]
+            self.wait_until(matching_attributions)
+            self.assertEqual(len(matching_attributions()), 1)
+            attribution = matching_attributions()[0]
+        for record in (self.client_record(client), attribution):
+            self.assertEqual(record["native_service_wait_s"], 0.0)
+            self.assertEqual(record["native_wait_receipts_missing"]["service"], 0)
+            self.assertTrue(any(event.get("native_service_wait_s") == 0
+                                for event in record["retained_events"] if event["event"] == "BACK"))
+
     def test_ingress_preparation_admission_and_service_waits_are_distinct_receipt_driven_fields(self):
         self.start_native(depth=1)
         with contextlib.redirect_stdout(io.StringIO()) as log, \
