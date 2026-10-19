@@ -2527,7 +2527,9 @@ class StrataEngine:
     @staticmethod
     def _retained_event(owner, line, direction):
         fields = line.split()
-        event = {"monotonic_s": time.monotonic(), "event": fields[0], "raw": line.rstrip("\r\n"),
+        now = time.monotonic()
+        event = {"monotonic_s": now, "monotonic_ns": int(now * 1_000_000_000),
+                 "event": fields[0], "raw": line.rstrip("\r\n"),
                  "tag": fields[1], "slot": int(fields[2]), "request": 0, "incarnation": 0,
                  "direction": direction}
         if fields[0] != "BQREJECT":
