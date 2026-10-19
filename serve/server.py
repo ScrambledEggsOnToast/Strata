@@ -2198,7 +2198,7 @@ class StrataEngine:
         return freed
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
-    YIELD_WAIT_S = 4.0   # #656: ... or to any waiter whose turn has been held this long (a budgeted profile ignores both)
+
     def _control_turn(self, now):
         """FIFO or short-first new admissions within the foreground/background deadline selector."""
         first = self.control_waiters[0]
@@ -2330,26 +2330,16 @@ class StrataEngine:
         policy = getattr(self, "speculation_policy", None)
         return alone and (policy is None or policy.prefer_solo(context, left))
 
-    def _shorter_waiting(self, plen: int, reader_priority: str = "foreground") -> bool:
-        """#656: someone waits for the control lines worth giving way to.
+    def _shorter_waiting(self, plen: int) -> bool:
+        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
 
-        Originally only a prompt under half this one's qualified, so two requests of similar length never yielded to
-        each other and the second waited for the whole first read (measured 2026-10-18: 52-70 s of
-        control_occupied_wait, and foreground paying 293 s of it across a day). A waiter whose turn has already been
-        held for YIELD_WAIT_S now qualifies too: the hold is bounded to about one read span plus that wait, whatever
-        the two prompts' lengths."""
-        now = time.monotonic()
+        An aged-wait variant (2026-10-18) also qualified a waiter held for YIELD_WAIT_S (4 s), priority-aware, so the
+        hold would have been bounded whatever the two prompts' lengths. The matched A/B rejected it: a foreground
+        request beside three background ones went 20.8 -> 36.6 s, because every extra yield pays a park, a
+        re-admission and a re-read that competes with the foreground's decode. Background latency improved only
+        slightly (max 43.7 -> 38.2 s) and at the foreground's expense."""
         with self.slot_cv:
-            for e in self.wait_lens:
-                if e[0] * 2 <= plen:              # a much shorter waiter: #656, whatever either priority is
-                    return True
-                if len(e) > 4 and now - e[4] >= self.YIELD_WAIT_S:
-                    # An aged waiter preempts only a read of the same or lower priority: a foreground read must
-                    # not defer to background work merely because that work has waited (measured: without this,
-                    # a foreground request beside three background ones went 20.9 -> 36.1 s).
-                    if reader_priority == "background" or e[2] == "foreground":
-                        return True
-            return False
+            return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         local = self.__dict__.setdefault("_tl", threading.local())
@@ -2543,7 +2533,7 @@ class StrataEngine:
         def slot_ready():
             return slot is not None or self.pick_slot(prompt, scope) is not None
         def prefill_waiter():
-            return self._shorter_waiting(len(prompt), priority) or (
+            return self._shorter_waiting(len(prompt)) or (
                 getattr(self, "foreground_budget_s", 0) and priority == "background" and
                 callable(foreground_pending) and foreground_pending())
         ok = yield from self._take_control(cancel, len(prompt), on_control, on_wait, priority, background_due,
