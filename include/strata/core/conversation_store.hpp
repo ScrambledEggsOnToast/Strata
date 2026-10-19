@@ -758,6 +758,8 @@ public:
     uint64_t ram_lease_bytes() const;
     uint64_t ram_read_budget() const;
     uint64_t ram_available_bytes() const;
+    // Observation-only coherent ledger view; never reserves, refreshes or admits.
+    ConversationStoreRamTrace ram_trace() const;
     void suspend_read_admission();
     // Sets the read-admission budget ABSOLUTELY to `bytes` and returns the value in force.  A value below
     // ram_held_bytes() never revokes admitted work: admitted reads still complete, and no new read is admitted until

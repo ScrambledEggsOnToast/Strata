@@ -388,6 +388,55 @@ per-request samples; do not sum repeated reports. `STRATA_PREFILL_TIMING=1` prin
 GPU phase and host staging/setup/wait summaries for prefill. It enables GPU event timing and host accounting,
 not a cache-read or whole-response timer. Unset all these switches for uninstrumented comparisons.
 
+**Conversation-cache mutation receipts (opt-in diagnostics):** set
+`STRATA_CACHE_MUTATION_TRACE=/absolute/new-file.jsonl` in the engine environment.
+The file is create-only; an unavailable destination disables this observer, not
+serving. Unset it for normal operation. It changes neither LRU, admission, source
+selection nor any default. The three actual victim sites emit pre-commit plans
+and committed outcomes, with ordered entry serials, eligibility (pins, pending
+publication, borrowed-donor guard and protected fallback), charged image and
+checkpoint bytes, scope/history fingerprints, supersession and chosen victims.
+Take, publication acquire/unprotect/optional return, fixed/publication lease and
+retained-K/V transitions use the same receipts. Hashes are diagnostic identity,
+never authorization or proof of equal payloads; no prompt or state payload is
+written. `checkpoint_bytes` counts the primary image's live and rewind metadata/
+state; the full recursive image charge is always `bytes`.
+
+Each seam carries the actual caller-held bytes/slots, effective admission limit,
+cache/reuse/lease charges and a coherent store-ledger snapshot. `store_held` is
+`store_payload + store_metadata + store_descriptors + store_decode`; store leases
+and read preparation are overlapping views, not extra charges. Publication image/
+workspace and read reservation/image fields separate the live payload demands.
+The fixed checkpoint lease is a subset of cache leased bytes, not another charge.
+Native command serials always correlate the serial path. When present, validated
+phase request/leg/incarnation keys also bind the request; publication tickets and
+scope/history hashes name the outgoing producer image, not the current executor.
+
+RAM/store returns, demand materialization/wait, capture/admission, checkpoint
+restore and fresh-read spans report measured host durations and existing
+`PrefixCosts` route/byte inputs without training another cost model or supplying
+an unknown disk price. Transfer receipts carry `work_known`: trace-only collection
+does not activate or train cost-based prefix selection. An unknown route or
+overflowed extent is unavailable, not a zero-cost transfer; checkpoint receipts
+carry the same explicit extent/route validity as capture and restore.
+Wait includes materialization. Materialization receipts use the incoming alias
+that survives the store-root reset; `subject_present` and `subject_complete`
+distinguish missing required image metadata. Capture/admission and the
+plan-to-commit interval include observer overhead, and request-command time is
+**not HTTP complete-call latency**. Batched/private-preparation commands and
+asynchronous publication may execute on another request's seam; do not treat its
+executor command as the producer's request or invent a client lifecycle join.
+Use the existing client request lifecycle and phase receipts for that join.
+
+The observer admits at most 4,096 records of at most 4,096 bytes, 64 candidates
+per seam and 64 million token/image hash words per capture. It allocates no
+per-entry metadata. A missing `cache_event_end`/`cache_trace_end`, `limited`,
+`hash_limited`, incomplete candidates/history/external/required-subject fields or unmatched
+plan/commit disqualifies a counterfactual replay; missing measurements are not
+zero. This synchronous bounded trace is diagnostic, not an unprofiled speed run.
+Trace-off/on observer overhead has **not been quantified**; no unprofiled
+performance or zero-overhead claim follows from these receipts.
+
 **Native request phases (opt-in diagnostics):** `STRATA_PHASE_TIMING=1` enables
 `STRATA_PHASE v=1` records on the native serving engine's stderr and advertises
 `phase_timing=1 phase_timing_version=1` in its startup `INFO`. Optional internal

@@ -67,6 +67,17 @@ inline bool conversation_store_restore_compatible(const core::SavedConversation&
     return draft.draft_begin >= 0 && draft.draft_cells >= draft.draft_begin;
 }
 
+// A validated store read hands its frozen payload to the engine before releasing
+// the store's shared root. Serving and the CPU fixture use this exact ordering.
+inline void conversation_store_mount_alias(core::ConversationStoreRead& read,
+    std::optional<core::SavedConversation>& incoming, core::ConversationCache* trace_cache = nullptr) {
+    incoming.emplace(read.image->frozen_alias());
+    read.image.reset();
+    if (trace_cache) trace_cache->trace_observation(
+        {.site="store_return", .action="materialized", .subject_required=true, .head=read.head_id,
+         .measured_ms=read.materialize_ms, .end_tokens=read.tokens}, &*incoming);
+}
+
 // One authoritative RAM rollback candidate survives every demand in a shared ->
 // private-disk -> RAM chain. Only a disk candidate belongs in private_disk: a
 // second copy of ram would retain a stale cache index after admission compacts it.

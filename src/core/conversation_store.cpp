@@ -5901,6 +5901,27 @@ uint64_t ConversationStore::ram_available_bytes() const {
     return impl_->ram_budget > held ? impl_->ram_budget - held : 0;
 }
 
+ConversationStoreRamTrace ConversationStore::ram_trace() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    ConversationStoreRamTrace out;
+    out.held = impl_->resident_locked();
+    out.payload = impl_->ram_held;
+    out.lease = impl_->ram_lease;
+    out.metadata = impl_->metadata;
+    out.descriptors = impl_->prep;
+    out.decode = impl_->decode;
+    out.publication_image = impl_->publishing ? impl_->publishing->ram_bytes : 0;
+    out.publication_workspace = impl_->publishing ? impl_->publishing->workspace_bytes : 0;
+    out.read_preparation = impl_->read_prep;
+    out.allowance = impl_->ram_budget;
+    for (const auto& job : impl_->jobs) {
+        out.read_reserved += job->reserved_bytes;
+        out.read_image += job->lease_bytes;
+    }
+    out.admission_suspended = impl_->admission_suspended;
+    return out;
+}
+
 void ConversationStore::suspend_read_admission() {
     StoreReadTraceBatch trace;
     std::lock_guard<std::mutex> guard(impl_->mutex);

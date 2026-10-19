@@ -12310,9 +12310,30 @@ int main(int argc, char** argv) {
         // Declare before resident: the fixed lease survives clears/poison and
         // remains charged until every resident payload has been destroyed.
         // Null drafts are supported: parking does not require --mtp.
+        std::unique_ptr<FILE, int (*)(FILE*)> cache_trace_file(nullptr, &std::fclose);
+        std::unique_ptr<strata::core::ConversationCacheTrace> cache_trace;
+        uint64_t cache_trace_checkpoint;
+        if (const char* path = std::getenv("STRATA_CACHE_MUTATION_TRACE"); path && *path) {
+            cache_trace_file.reset(std::fopen(path, "wx"));
+            if (cache_trace_file) {
+                try {
+                    cache_trace = std::make_unique<strata::core::ConversationCacheTrace>(cache_trace_file.get());
+                    cache_trace_checkpoint = admitted_checkpoint_lease_bytes;
+                    cache_trace->set_sample(&cache_trace_checkpoint,
+                        +[](void* context, strata::core::ConversationCacheTrace::External& e) {
+                            e.checkpoint_lease = *static_cast<const uint64_t*>(context);
+                        });
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: cache mutation trace unavailable: allocation failed\n");
+                }
+            } else {
+                std::fprintf(stderr, "strata serve: cache mutation trace unavailable: create-only open failed\n");
+            }
+        }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        conversations.set_mutation_trace(cache_trace.get());
         if (admitted_checkpoint_lease_bytes &&
             !conversations.try_reserve_lease((size_t) admitted_checkpoint_lease_bytes)) {
             std::fprintf(stderr, "strata serve: admission refused: limiting=conversation_parked "
@@ -13008,6 +13029,25 @@ int main(int argc, char** argv) {
         // remaining allowance; a fresh demand refused by that peak may reclaim
         // eligible parked ownership before one authoritative retry.
         uint64_t publication_outside_bytes = 0; // a taken incoming image and any not-yet-parked capture
+        struct CacheTraceLedger {
+            strata::core::ConversationStore* store;
+            const uint64_t* outside;
+            uint64_t checkpoint;
+        } cache_trace_ledger;
+        if (cache_trace) {
+            cache_trace_ledger = {store_on ? conversation_store.get() : nullptr,
+                                  &publication_outside_bytes, admitted_checkpoint_lease_bytes};
+            cache_trace->set_sample(&cache_trace_ledger,
+                +[](void* context, strata::core::ConversationCacheTrace::External& e) {
+                    const auto& ledger = *static_cast<const CacheTraceLedger*>(context);
+                    e.checkpoint_lease = ledger.checkpoint;
+                    e.outside = *ledger.outside;
+                    if (ledger.store) {
+                        e.preparation = kConversationPreparationBytes + kConversationOfferBytes;
+                        e.store = ledger.store->ram_trace();
+                    }
+                });
+        }
         auto store_allowance = [&]() -> uint64_t {
             if (!store_on) return 0;
             const uint64_t spare = strata::program::ConversationStoreRamBudget{
@@ -13070,14 +13110,24 @@ int main(int argc, char** argv) {
         };
         publication_sink.retain_image = [&](const std::shared_ptr<const strata::core::SavedConversation>& image) {
             if (!image) return;
+            if (cache_trace) conversations.trace_observation(
+                {.site="publication", .action="return_attempt"}, image.get());
             const uint64_t external = conversation_store->ram_held_bytes() +
                 kConversationPreparationBytes + kConversationOfferBytes;
             if (publication_outside_bytes > SIZE_MAX || external > SIZE_MAX - publication_outside_bytes) return;
             const size_t held = (size_t) (external + publication_outside_bytes);
-            if (!conversations.can_fit(image->bytes(), held)) return;
+            if (!conversations.can_fit(image->bytes(), held)) {
+                if (cache_trace) conversations.trace_observation(
+                    {.site="publication", .action="return_refused", .accepted=false, .held=held}, image.get());
+                return;
+            }
             try {
                 // Retain a cheap read-through alias only in spare RAM; never displace a pending publication.
-                if (conversations.put(image->frozen_alias(), held)) ram_view_dirty = true;
+                if (conversations.put(image->frozen_alias(), held)) {
+                    ram_view_dirty = true;
+                    if (cache_trace) conversations.trace_observation(
+                        {.site="publication", .action="returned", .held=held}, image.get());
+                }
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: RAM alias allocation failed; "
                                      "the store retains publication ownership\n");
@@ -13564,8 +13614,7 @@ int main(int argc, char** argv) {
             out.payload_bytes = read.payload_bytes;
             // Cheap immutable alias: metadata is copied, payloads are shared with the read image, and the read
             // image is released here, so the mounted copy owns its buffers alone (a later write never detaches).
-            incoming.emplace(read.image->frozen_alias());
-            read.image.reset();
+            strata::program::conversation_store_mount_alias(read, incoming, cache_trace ? &conversations : nullptr);
             out.mounted = true;
             out.request_id = query.request_id;
             out.generation = query.generation;
@@ -13576,6 +13625,9 @@ int main(int argc, char** argv) {
                          (unsigned long long) read.generation, (unsigned long long) read.attempt_id,
                          read.prefetched ? "prefetch" : "demand",
                          (double) (now_ns() - wait_started) / 1e6, read.materialize_ms, (unsigned long long) now_ns());
+            if (cache_trace) conversations.trace_observation(
+                {.site="store_return", .action="demand_wait", .head=read.head_id,
+                 .measured_ms=(double)(now_ns() - wait_started) / 1e6, .end_tokens=read.tokens});
             // The mounted copy shares the read image's payloads, so the module keeps those bytes charged to itself
             // (ram_lease_bytes) until this process reports the read finished.  That report is release_read(), and the
             // caller makes it at its own end-of-request seam - after the engine's alias of the image is gone, which
@@ -13590,7 +13642,7 @@ int main(int argc, char** argv) {
         // and are separated by operation and the actual resolved device/K/V paths.
         auto session_work = [&](int64_t tokens, bool capture, int64_t unchanged = 0) {
             PrefixWork work;
-            if (!o.prefix_cost_selection) return work;
+            if (!o.prefix_cost_selection && !cache_trace) return work;
             std::string why;
             auto kv_parts = [&](const strata::core::QsaState& qsa, bool index, int device) {
                 std::array<uint64_t, 5> parts{};
@@ -13652,7 +13704,7 @@ int main(int argc, char** argv) {
         auto checkpoint_work = [&](const ConvCheckpoint& checkpoint,
                                    const std::vector<const ConvCheckpoint*>* separated = nullptr) {
             PrefixWork work;
-            if (!o.prefix_cost_selection) return work;
+            if (!o.prefix_cost_selection && !cache_trace) return work;
             auto part = [&](const ConvCheckpoint& c, const strata::core::SessionState& state) {
                 work.path(state.allocation_device, -1);
                 for (size_t n : {c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(),
@@ -14201,6 +14253,11 @@ int main(int argc, char** argv) {
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                if (cache_trace) conversations.trace_transfer(
+                    {.site="capture", .action="capture_admission_complete", .accepted=stored,
+                     .incoming=snapshot_bytes,
+                     .measured_ms=std::chrono::duration<double, std::milli>(Clock::now() - park_t0).count(),
+                     .end_tokens=(int64_t)live.size()}, park_work.bytes, park_work.route);
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -18933,6 +18990,26 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            struct CacheTraceRequest {
+                strata::core::ConversationCacheTrace* trace;
+                strata::core::ConversationCache& cache;
+                Clock::time_point start{};
+                ~CacheTraceRequest() {
+                    if (!trace) return;
+                    cache.trace_observation({.site="request", .action="native_command_complete",
+                        .measured_ms=std::chrono::duration<double, std::milli>(Clock::now() - start).count()});
+                    trace->request[0] = 0; trace->incarnation[0] = 0; trace->leg = 0;
+                }
+            } cache_trace_request{cache_trace.get(), conversations};
+            if (cache_trace) {
+                cache_trace_request.start = Clock::now();
+                if (cache_trace->request_sequence != UINT64_MAX) ++cache_trace->request_sequence;
+                const auto identity = phase::parse_input(line).identity;
+                std::memcpy(cache_trace->request, identity.request, sizeof(identity.request));
+                std::memcpy(cache_trace->incarnation, identity.incarnation, sizeof(identity.incarnation));
+                cache_trace->leg = identity.leg;
+                conversations.trace_observation({.site="request", .action="native_command_begin"});
+            }
             if (private_preparation && packed_command(line)) {
                 if (!pipe_drain() || (!native_registration(line) && !packed_control(line) && !packed_admit_frame(line)) ||
                     packed_control_failed || !retire_stopped()) {
@@ -20292,6 +20369,14 @@ int main(int argc, char** argv) {
                     !choice.longest_known() ? "longest-unknown" : "longest-tie-or-margin",
                     selected.total_ms.value_or(-1), selected.park_ms.value_or(-1),
                     selected.restore_ms.value_or(-1), selected.prefill_ms.value_or(-1));
+            if (cache_trace) conversations.trace_transfer(
+                {.site="prefix", .action=restored_from_store ? "store_selected" :
+                    selected.source == PrefixSource::parked ? "ram_selected" :
+                    selected.source == PrefixSource::resident ? "resident_selected" :
+                    selected.source == PrefixSource::cold ? "cold_selected" : "active_selected",
+                 .subject_serial=selected.parked.serial, .measured_ms=selected.total_ms.value_or(-1),
+                 .end_tokens=selected.tokens}, selected.work.bytes, selected.work.route,
+                incoming ? &*incoming : nullptr);
             // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
             // whose pictures differ (a picture is its grid and the hash of its embeddings: an image encoded again with
             // other bits - another encoder start, a CPU encoder that is not bit-reproducible - no longer matches).  The
@@ -20583,6 +20668,11 @@ int main(int argc, char** argv) {
                              (long long) resume, direct_cut ? "direct-checkpoint" : from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
+                if (cache_trace) conversations.trace_transfer(
+                    {.site=restored_from_store ? "store_return" : "ram_return", .action="host_restore_complete",
+                     .subject_serial=selected.parked.serial, .head=restored_from_store ? store_demand.head_id : 0,
+                     .measured_ms=std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                     .end_tokens=resume}, restore_work.bytes, restore_work.route);
             }
             if (!live_scope.matches(req_scope) || want_cvec != cvec_cached) {
                 conversations.limit_reuse(0);
@@ -20663,9 +20753,20 @@ int main(int argc, char** argv) {
                     phase_error("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
+                PrefixWork traced_checkpoint_work;
                 if (o.prefix_cost_selection && reread_to < 0 && c)
-                    prefix_costs.transfer(PrefixTransfer::checkpoint, checkpoint_work(*c, incoming ? &incoming_cuts : nullptr),
+                    prefix_costs.transfer(PrefixTransfer::checkpoint,
+                        cache_trace ? traced_checkpoint_work = checkpoint_work(*c, incoming ? &incoming_cuts : nullptr) :
+                                      checkpoint_work(*c, incoming ? &incoming_cuts : nullptr),
                         std::chrono::duration<double, std::milli>(Clock::now() - checkpoint_t0).count());
+                if (cache_trace && reread_to < 0 && c) {
+                    if (!o.prefix_cost_selection)
+                        traced_checkpoint_work = checkpoint_work(*c, incoming ? &incoming_cuts : nullptr);
+                    conversations.trace_transfer(
+                        {.site="checkpoint", .action="restore_complete", .subject_serial=selected.parked.serial,
+                         .measured_ms=std::chrono::duration<double, std::milli>(Clock::now() - checkpoint_t0).count(),
+                         .end_tokens=resume}, traced_checkpoint_work.bytes, traced_checkpoint_work.route);
+                }
             }
             if (incoming) {
                 // Capture reserved both these bytes and this entry. Failure to
@@ -20696,6 +20797,8 @@ int main(int argc, char** argv) {
             // lease here.  The guard's destructor releases it on every other path, and it is declared before the image
             // so that teardown always happens first, a rejected or failed mount included.
             store_demand_lease.release();
+            if (cache_trace && restored_from_store) conversations.trace_observation(
+                {.site="store_return", .action="read_released", .head=store_demand.head_id});
             if (store_on) {
                 publish_ram_view();
                 store_allowance();
@@ -21921,7 +22024,7 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
-                const auto cost_t0 = cost_observations ? Clock::now() : Clock::time_point{};
+                const auto cost_t0 = cost_observations || cache_trace ? Clock::now() : Clock::time_point{};
                 const double cost_interleaved_ms = il_ms;
                 const int64_t cost_begin = at;
                 const bool win = windows_ok(at, to);
@@ -22029,6 +22132,11 @@ int main(int argc, char** argv) {
                     prefix_costs.prefill(cost_begin, to, win,
                         std::chrono::duration<double, std::milli>(Clock::now() - cost_t0).count() -
                             (il_ms - cost_interleaved_ms), prefill_route);
+                if (cache_trace) conversations.trace_observation(
+                    {.site="prefill", .action=win ? "window_read_complete" : "read_complete",
+                     .measured_ms=std::chrono::duration<double, std::milli>(Clock::now() - cost_t0).count() -
+                         (il_ms - cost_interleaved_ms),
+                     .route=prefill_route, .begin_tokens=cost_begin, .end_tokens=to});
             }
             if (!refill(err)) {
                 phase_error("ERR refilling a lent slot failed: %s\n", err.c_str());

@@ -8,6 +8,8 @@
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <cstring>
 
 using namespace strata::core;
 
@@ -54,9 +56,181 @@ bool same_image(const SavedConversation& a, const SavedConversation& b) {
         if (!same_image(a.stage_images[i], b.stage_images[i])) return false;
     return true;
 }
+
+std::string trace_text(FILE* file) {
+    std::fflush(file);
+    const long n = std::ftell(file);
+    std::rewind(file);
+    std::string out(size_t(std::max(n, 0l)), '\0');
+    check(std::fread(out.data(), 1, out.size(), file) == out.size(), "read the complete bounded trace");
+    std::fseek(file, 0, SEEK_END);
+    return out;
+}
+std::string trace_event(const std::string& text, const char* site, const char* action) {
+    const std::string key = "\"site\":\"" + std::string(site) + "\",\"action\":\"" + action + "\"";
+    auto at = text.find(key);
+    while (at != std::string::npos && std::string_view(action) == "plan") {
+        const auto end = text.find('\n', at);
+        if (text.substr(at, end - at).find("\"victims\":0,") == std::string::npos) break;
+        at = text.find(key, end);
+    }
+    check(at != std::string::npos, "the real mutation site emitted its named event");
+    const auto begin = text.rfind('{', at);
+    const auto end = text.find("{\"kind\":\"cache_event_end\"", at);
+    check(end != std::string::npos, "every mutation event closes");
+    return text.substr(begin, end - begin);
+}
+void check_mutation_work_trace() {
+    FILE* file = std::tmpfile();
+    check(file != nullptr, "open the transfer-work trace");
+    {
+        ConversationCacheTrace trace(file);
+        trace.set_sample(nullptr, +[](void*, ConversationCacheTrace::External&) {});
+        ConversationCache cache(1u << 20, 2);
+        cache.set_mutation_trace(&trace);
+        cache.trace_transfer({.site="capture", .action="work_unavailable", .measured_ms=3.25}, 0, 0);
+        const strata::program::PrefixWork checkpoint_work{4096, 17};
+        cache.trace_transfer({.site="checkpoint", .action="restore_complete", .measured_ms=1.25},
+                             checkpoint_work.bytes, checkpoint_work.route);
+        cache.trace_transfer({.site="checkpoint", .action="zero_known", .measured_ms=0.5}, 0, 17);
+        cache.trace_transfer({.site="checkpoint", .action="overflow_unavailable", .measured_ms=2.5},
+                             UINT64_MAX, 17);
+        const auto text = trace_text(file);
+        const auto unavailable = trace_event(text, "capture", "work_unavailable");
+        const auto checkpoint = trace_event(text, "checkpoint", "restore_complete");
+        check(unavailable.find("\"work_bytes\":0,\"route\":0,\"work_known\":false") != std::string::npos,
+              "unavailable transfer work is explicit, never a measured zero-byte/zero-route transfer");
+        check(checkpoint.find("\"work_bytes\":4096,\"route\":17,\"work_known\":true") != std::string::npos &&
+              checkpoint.find("\"measured_ms\":1.25") != std::string::npos,
+              "checkpoint receipts retain the computed transfer extent, route and measured duration");
+        check(trace_event(text, "checkpoint", "zero_known").find(
+                  "\"work_bytes\":0,\"route\":17,\"work_known\":true") != std::string::npos,
+              "a known zero-byte transfer with a real route is distinct from unavailable work");
+        check(trace_event(text, "checkpoint", "overflow_unavailable").find(
+                  "\"work_known\":false") != std::string::npos,
+              "overflowed extents are unavailable even when the route is known");
+    }
+    std::fclose(file);
+}
+
+void check_mutation_trace() {
+    FILE* file = std::tmpfile();
+    check(file != nullptr, "open a bounded metadata trace");
+    {
+        ConversationCacheTrace trace(file);
+        trace.request_sequence = 9;
+        std::strcpy(trace.request, "trace-fixture");
+        std::strcpy(trace.incarnation, "0123456789abcdef0123456789abcdef");
+        trace.leg = 2;
+        size_t samples = 0;
+        trace.set_sample(&samples, +[](void* context, ConversationCacheTrace::External& e) {
+            ++*static_cast<size_t*>(context);
+            e.checkpoint_lease = 128; e.preparation = 29; e.outside = 17;
+            e.store.held = 41; e.store.metadata = 11; e.store.descriptors = 13;
+            e.store.decode = 17; e.store.allowance = 65536;
+        });
+        constexpr size_t budget = 1u << 20;
+        ConversationCache cache(budget, 4);
+        check(cache.try_reserve_lease(128), "trace fixture reserves fixed checkpoints");
+        auto pin = image({1,2,3});
+        pin.checkpoints.push_back(pin.live);
+        pin.checkpoints.back().pinned = true;
+        auto pending = image({4,5,6});
+        pending.publication_ticket = 77;
+        check(cache.put(std::move(pin)) && cache.put(std::move(pending)) &&
+              cache.put(image({7,8,9})) && cache.put(image({10,11,12})), "fill all four eligibility classes");
+        const auto guarded = cache.best(std::vector<int32_t>{7,8,9,99}, {}, true, test_scope);
+        cache.guard(guarded.serial);
+        cache.set_mutation_trace(&trace);
+        check(cache.evict_oldest() && cache.find(4) == nullptr, "explicit eviction still selects serial four");
+        check(cache.put(image({13,14,15})) && cache.put(image({16,17,18})),
+              "put pressure still selects the only ordinary oldest owner");
+        std::vector<ConversationKv> kv(1);
+        kv[0].k.resize(32, 1);
+        cache.retain(std::move(kv), 3);
+        size_t protected_bytes = 0;
+        cache.for_each_image([&](size_t index, const auto& e) { if (index < 3) protected_bytes += e.bytes(); });
+        size_t protected_index = 1;
+        check(cache.reserve_snapshot(budget - 128 - 17 - protected_bytes, 17, &protected_index) &&
+              protected_index == 1 && cache.size() == 3, "snapshot pressure reclaims only serial six");
+        const std::string text = trace_text(file);
+        for (const char* site : {"evict_oldest", "put", "reserve_snapshot"}) {
+            const auto event = trace_event(text, site, "plan");
+            check(event.find("\"request_sequence\":9,\"request\":\"trace-fixture\",\"leg\":2") != std::string::npos &&
+                  event.find("\"incarnation\":\"0123456789abcdef0123456789abcdef\"") != std::string::npos,
+                  "each victim site binds the actual command and request leg");
+            check(event.find("\"candidate_count\":4,\"candidates_complete\":true,\"external_complete\":true") !=
+                      std::string::npos && event.find("\"leased_bytes\":128") != std::string::npos &&
+                  event.find("\"checkpoint_lease\":128,\"preparation\":29,\"outside\":17") != std::string::npos,
+                  "each victim site records its full candidates and held ledger");
+            check(event.find("\"scope_hash\":") != std::string::npos && event.find("\"history_complete\":true") !=
+                      std::string::npos && event.find("\"checkpoint_bytes\":") != std::string::npos &&
+                  event.find("\"pinned\":true") != std::string::npos &&
+                  event.find("\"publication_ticket\":77") != std::string::npos &&
+                  event.find("\"guarded\":true") != std::string::npos &&
+                  event.find("\"eligible\":true,\"chosen\":true") != std::string::npos,
+                  "each victim site exposes actual identities, byte classes, exclusions and choice");
+            const auto chosen = event.find("\"eligible\":true,\"chosen\":true");
+            const auto chosen_begin = event.rfind('{', chosen);
+            const auto chosen_end = event.find('\n', chosen);
+            const unsigned expected_serial = std::string_view(site) == "evict_oldest" ? 4 :
+                std::string_view(site) == "put" ? 5 : 6;
+            check(event.substr(chosen_begin, chosen_end - chosen_begin).find(
+                      "\"serial\":" + std::to_string(expected_serial) + ",") != std::string::npos,
+                  "each real victim plan names exactly the serial the unchanged LRU path removes");
+        }
+        const auto reserve = trace_event(text, "reserve_snapshot", "plan");
+        check(reserve.find("\"held\":17") != std::string::npos &&
+              reserve.find("\"protected_serial\":2") != std::string::npos &&
+              reserve.find("\"reuse_bytes\":0") == std::string::npos &&
+              reserve.find("\"serial\":6,") != std::string::npos,
+              "snapshot plan includes transient held, retained KV, protected fallback and exact victim serial");
+        const size_t before_samples = samples;
+        cache.set_mutation_trace(nullptr);
+        const long before_bytes = std::ftell(file);
+        const size_t before_envelope = cache.envelope_bytes();
+        check(!cache.evict_oldest() && !cache.reserve_snapshot(budget) &&
+              !cache.put(image({40,41,42}), budget) && cache.envelope_bytes() == before_envelope,
+              "disabled observer preserves protected refusal and the exact envelope");
+        check(samples == before_samples && std::ftell(file) == before_bytes,
+              "disabled observer performs no callback, hashing or output");
+        cache.unguard();
+        bool retained = false;
+        auto taken = cache.take(cache.index_of(3), retained);
+        check(!retained && taken.live.ids == std::vector<int32_t>({7,8,9}) &&
+              cache.put(std::move(taken)), "disabled take/return preserves the real payload and policy");
+        trace.finish();
+        check(trace_text(file).find("\"limited\":false,\"hash_limited\":false") != std::string::npos,
+              "the focused capture ends without silent truncation");
+    }
+    std::fclose(file);
+    file = std::tmpfile();
+    check(file != nullptr, "open the saturation trace");
+    {
+        ConversationCacheTrace trace(file);
+        ConversationCache cache(1u << 20, 1);
+        cache.set_mutation_trace(&trace);
+        trace.set_sample(nullptr, +[](void*, ConversationCacheTrace::External&) { throw std::bad_alloc(); });
+        check(cache.put(image({40,41,42})) && cache.size() == 1,
+              "a failed observer cannot refuse or consume a real cache admission");
+        cache.clear();
+        for (size_t i = 0; i < ConversationCacheTrace::max_records; ++i)
+            cache.trace_observation({.site="bounded", .action="observe"});
+        const auto text = trace_text(file);
+        check(text.find("\"limited\":true") != std::string::npos &&
+              text.find("\"external_complete\":false") != std::string::npos &&
+              size_t(std::count(text.begin(), text.end(), '\n')) <= ConversationCacheTrace::max_records &&
+              text.size() < ConversationCacheTrace::max_records * ConversationCacheTrace::max_line,
+              "record pressure closes explicitly inside the fixed record and byte bounds");
+        check(cache.put(image({1,2,3})) && cache.size() == 1, "trace saturation never refuses cache admission");
+    }
+    std::fclose(file);
+}
 }
 
 int main() {
+    check_mutation_work_trace();
+    check_mutation_trace();
     {
         auto first = image({11, 12, 13});
         auto second = image({21, 22, 23});

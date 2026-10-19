@@ -1543,9 +1543,146 @@ void check_phase_terminals_survive_trace_saturation() {
     }
 }
 
+
+// Smallest real ownership/store fixture for the mutation evidence. The optional
+// file is a diagnostic CPU capture, never a model/client latency benchmark.
+void check_cache_mutation_publication(const char* path = nullptr) {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store, size_t(64) << 20, 2);
+    FILE* file = path ? std::fopen(path, "w+x") : std::tmpfile();
+    check(file != nullptr, "create the publication mutation trace without replacing evidence");
+    if (!file) return;
+    {
+        ConversationCacheTrace trace(file);
+        trace.request_sequence = 1;
+        std::strcpy(trace.request, "cpu-publication");
+        std::strcpy(trace.incarnation, "0123456789abcdef0123456789abcdef");
+        trace.leg = 1;
+        const size_t fixed = size_t(1) << 20;
+        trace.set_sample(&store, +[](void* context, ConversationCacheTrace::External& e) {
+            e.checkpoint_lease = size_t(1) << 20;
+            e.store = static_cast<ConversationStore*>(context)->ram_trace();
+            check(e.store.held == e.store.payload + e.store.metadata + e.store.descriptors + e.store.decode,
+                  "the trace samples one coherent store ledger");
+        });
+        sink.cache.set_mutation_trace(&trace);
+        check(sink.cache.try_reserve_lease(fixed), "the trace fixture charges fixed resident checkpoints");
+        sink.refresh_allowance();
+        ConversationPublicationQueue publications;
+        std::vector<SavedConversation> records;
+        for (int i = 0; i < 4; ++i) {
+            records.push_back(stored_record(241 + 2 * i, 64 + 32 * i));
+            records.back().checkpoints.clear();
+        }
+        for (size_t i = 0; i < records.size(); ++i) {
+            trace.request_sequence = i + 1;
+            const auto start = std::chrono::steady_clock::now();
+            check(capture_image(publications, sink, i, 1, 0, true, records[i], store.epoch()),
+                  "the bounded fixture captures through the production publication queue");
+            settle(publications, store, sink);
+            sink.cache.trace_observation({.site="fixture", .action="cpu_capture_publication_complete",
+                .measured_ms=std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count(), .end_tokens=(int64_t)records[i].live.ids.size()});
+            if (i == 0) {
+                const auto match = sink.cache.best(query_of(records[0], 1, 1).tokens, {}, true, records[0].scope);
+                check(match.tokens == int64_t(records[0].live.ids.size()), "the same first image has a real RAM return");
+                const auto ram_start = std::chrono::steady_clock::now();
+                bool retained = false;
+                auto image = sink.cache.take(match.index, retained);
+                std::string why;
+                check(!retained && images_equal(image, records[0], why), "RAM return preserves the exact first image");
+                check(sink.cache.put(std::move(image)), "RAM return re-admits the same first image");
+                sink.cache.trace_observation({.site="ram_return", .action="cpu_owner_roundtrip_complete",
+                    .subject_serial=match.serial,
+                    .measured_ms=std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ram_start).count(), .end_tokens=match.tokens});
+            }
+        }
+        check_eq(sink.cache.evictions(), 2, "four real images force two RAM evictions at the unchanged two-slot budget");
+        check_eq(sink.acquisitions, 4, "every publication transfers one protected owner");
+        check_eq(sink.retentions, 4, "every publication exercises its optional same-image RAM return");
+        check_eq(sink.lease_releases, 4, "each acquired publication charge is refunded once");
+        // Both images displaced by the finite pressure suffix actually return.
+        // Materialization/I/O is real; GPU mount, fresh prefill and HTTP are absent.
+        std::vector<size_t> materialized_charges;
+        for (size_t i = 0; i < 2; ++i) {
+            trace.request_sequence = 5 + i;
+            auto query = query_of(records[i], 1001 + i, 1);
+            const auto before = store.counters();
+            const auto start = std::chrono::steady_clock::now();
+            std::string why;
+            check(store.demand(query, why), "a named displaced image is demandable from the real store");
+            ConversationStoreRead read;
+            check(store.wait_ready(query.request_id, query.generation, read, 5000) &&
+                  read.status == ConversationStoreReadStatus::ready && read.image,
+                  "the displaced store return materializes within its finite deadline");
+            if (!read.image) continue;
+            auto expected = records[i];
+            expected.live.pinned = true; // the queue's mandatory fresh-branch root promise, not a RAM pin
+            check(images_equal(*read.image, expected, why), "the store return preserves the displaced image and root pin");
+            std::optional<SavedConversation> incoming;
+            strata::program::conversation_store_mount_alias(read, incoming, &sink.cache);
+            check(!read.image && incoming && images_equal(*incoming, expected, why),
+                  "production handover preserves the incoming image after resetting the store root");
+            materialized_charges.push_back(incoming->bytes());
+            sink.cache.trace_observation({.site="store_return", .action="cpu_materialized",
+                .head=read.head_id, .measured_ms=read.materialize_ms,
+                .work_bytes=store.counters().bytes_read - before.bytes_read, .end_tokens=read.tokens}, &*incoming);
+            sink.cache.trace_observation({.site="store_return", .action="cpu_demand_roundtrip_complete",
+                .head=read.head_id, .measured_ms=std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count(), .end_tokens=read.tokens});
+            incoming.reset();
+            store.release_read(query.request_id, query.generation);
+            sink.cache.trace_observation({.site="store_return", .action="read_released"});
+        }
+        sink.cache.set_mutation_trace(nullptr);
+        trace.finish();
+        std::fflush(file);
+        const long bytes = std::ftell(file);
+        std::rewind(file);
+        std::string text(size_t(std::max(bytes, 0l)), '\0');
+        check(std::fread(text.data(), 1, text.size(), file) == text.size(), "read the complete publication mutation trace");
+        const auto take = text.find("\"site\":\"publication\",\"action\":\"take\"");
+        const auto take_end = text.find('\n', take);
+        const auto returned = text.find("\"site\":\"put\",\"action\":\"plan\"", take_end);
+        check(take != std::string::npos && returned != std::string::npos &&
+              text.find("\"action\":\"release\"", take_end) < returned,
+              "publication take transfers its lease before optional put/return");
+        check(text.find("\"subject_serial\":1", take) < take_end &&
+              text.find("\"checkpoint_lease\":1048576", take) < take_end &&
+              text.find("\"request\":\"cpu-publication\",\"leg\":1") != std::string::npos &&
+              text.find("\"publication_ticket\":1") != std::string::npos &&
+              text.find("\"history_complete\":true") != std::string::npos &&
+              text.find("\"read_image\":0") != std::string::npos,
+              "publication take/return retain serial, request, ticket, identity and exact charge fields");
+        size_t materialized_at = 0;
+        for (size_t charge : materialized_charges) {
+            materialized_at = text.find("\"site\":\"store_return\",\"action\":\"materialized\"", materialized_at);
+            check(materialized_at != std::string::npos, "the production handover emits its materialization receipt");
+            if (materialized_at == std::string::npos) break;
+            const auto end = text.find("{\"kind\":\"cache_event_end\"", materialized_at);
+            const auto event = text.substr(materialized_at, end - materialized_at);
+            check(event.find("\"subject_present\":true,\"subject_complete\":true") != std::string::npos &&
+                  event.find("\"role\":\"subject\"") != std::string::npos &&
+                  event.find("\"bytes\":" + std::to_string(charge) + ",") != std::string::npos &&
+                  event.find("\"scope_hash\":") != std::string::npos &&
+                  event.find("\"history_complete\":true") != std::string::npos &&
+                  event.find("\"checkpoint_bytes\":") != std::string::npos,
+                  "materialization retains scope/history/image/checkpoint charges after the real alias/reset ordering");
+            materialized_at = end;
+        }
+        check(text.find("\"limited\":false,\"hash_limited\":false") != std::string::npos,
+              "the forced-eviction evidence has explicit complete closure");
+        check_eq(sink.cache.leased_bytes(), fixed, "all returns leave the mandatory fixed checkpoint lease intact");
+        check_eq(store.ram_lease_bytes(), 0, "all displaced reads release their actual store leases");
+    }
+    std::fclose(file);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     // These regressions need the real store: where it is not implemented, the test is skipped, never failed.
     {
         TempRoot root;
@@ -1555,6 +1692,12 @@ int main() {
             return 77;
         }
     }
+    if (argc == 3 && std::string_view(argv[1]) == "--cache-mutation-trace") {
+        check_cache_mutation_publication(argv[2]);
+        std::fprintf(stderr, "conversation_publication_test: mutation fixture %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    check_cache_mutation_publication();
     check_checkpoint_mount_preserves_the_longer_branch();
     check_checkpoint_mount_allows_a_whole_prefix_replacement();
     check_divergent_capture_is_published_as_a_branch();

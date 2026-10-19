@@ -4,6 +4,7 @@
 
 #include "strata/core/conversation_buffer.hpp"
 #include "strata/core/checkpoint_bytes.hpp"
+#include "strata/core/conversation_cache_trace.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -404,6 +405,36 @@ public:
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
 
+    // Diagnostic only. Caller owns the bounded sink and outlives every cache operation.
+    void set_mutation_trace(ConversationCacheTrace* trace) noexcept { trace_ = trace; }
+    void trace_observation(ConversationCacheTrace::State state,
+                           const SavedConversation* subject = nullptr) const noexcept {
+        if (!trace_) return;
+        state.budget = budget_; state.slots = slots_; state.parked = entries_.size();
+        state.parked_bytes = bytes_; state.reuse_bytes = reuse_.bytes(); state.leased_bytes = held_bytes_;
+        state.evictions = evictions_; state.guarded = guarded_;
+        if (!trace_->begin(state, entries_.size(), subject != nullptr)) return;
+        if (subject) trace_->image("subject", 0, state.subject_serial, *subject, false, false, false, false, false);
+        size_t left = state.victims;
+        for (size_t i = 0; i < std::min(entries_.size(), ConversationCacheTrace::max_candidates); ++i) {
+            const bool protected_entry = state.protected_serial != 0 && serials_[i] == state.protected_serial;
+            const bool superseded = subject && std::string_view(state.site) == "put" && replaces(i, *subject);
+            const bool eligible = evictable(i) && !protected_entry && !superseded;
+            const bool chosen = state.accepted && state.action == std::string_view("plan") && eligible && left != 0;
+            if (chosen) --left;
+            trace_->image("candidate", i, serials_[i], entries_[i], eligible,
+                          guarded_ != 0 && serials_[i] == guarded_, protected_entry, chosen, superseded);
+        }
+        trace_->end();
+    }
+    void trace_transfer(ConversationCacheTrace::State state, uint64_t bytes, uint64_t route,
+                        const SavedConversation* subject = nullptr) const noexcept {
+        if (!trace_) return;
+        state.work_bytes = bytes; state.route = route;
+        state.work_known = bytes != UINT64_MAX && route != 0;
+        trace_observation(state, subject);
+    }
+
     // ---- Fixed ownership and immutable publication leases ------------------
     // Waiting publications protect their existing parked owner, without a
     // second image or charge. take_publication transfers that exact charge to a
@@ -414,11 +445,19 @@ public:
     // and read headroom for the entire cache lifetime, including poison clears.
     bool try_reserve_lease(size_t bytes) {
         const size_t occupied = envelope_bytes();
-        if (occupied > budget_ || bytes > budget_ - occupied) return false;
+        if (occupied > budget_ || bytes > budget_ - occupied) {
+            trace_observation({.site="lease", .action="acquire", .accepted=false, .incoming=bytes});
+            return false;
+        }
         held_bytes_ += bytes;
+        trace_observation({.site="lease", .action="acquire", .incoming=bytes});
         return true;
     }
-    void release_lease(size_t bytes) { held_bytes_ -= std::min(held_bytes_, bytes); }
+    void release_lease(size_t bytes) {
+        const size_t released = std::min(held_bytes_, bytes);
+        held_bytes_ -= released;
+        trace_observation({.site="lease", .action="release", .incoming=released});
+    }
     size_t leased_bytes() const { return held_bytes_; }
     /// What the configured budget has to cover: payload + retained reuse + leases.
     size_t envelope_bytes() const { return bytes() + held_bytes_; }
@@ -448,16 +487,25 @@ public:
             part.donor_epoch = donor_epoch;
             candidate.stages.push_back(std::move(part));
         }
+        const size_t incoming_bytes = trace_ ? candidate.bytes() : 0;
         const size_t available = room(0);
         if (enabled() && bytes_ <= available && candidate.bytes() <= available - bytes_)
             reuse_ = std::move(candidate);
+        if (trace_) trace_observation({.site="reuse", .action="retain", .accepted=reuse_.bytes() != 0,
+                                      .incoming=incoming_bytes, .head=donor_head, .end_tokens=tokens});
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
+        trace_observation({.site="reuse", .action="limit", .end_tokens=first_dirty});
     }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    ConversationKvReuse take_reuse() {
+        auto out = std::exchange(reuse_, {});
+        trace_observation({.site="reuse", .action="take", .incoming=trace_ ? out.bytes() : 0,
+                           .head=out.donor_head, .end_tokens=out.unchanged_tokens});
+        return out;
+    }
     size_t retained_bytes() const { return reuse_.bytes(); }
     int64_t unchanged_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
     bool can_fit(size_t incoming, size_t held = 0) const {
@@ -508,11 +556,14 @@ public:
         if (entry.publication_ticket != 0) {
             auto alias = entry.frozen_alias();
             retained_in_cache = true;
+            trace_observation({.site="take", .action="alias", .subject_serial=serials_[index]}, &entry);
             return alias;
         }
+        const uint64_t serial = serials_[index];
         SavedConversation out = std::move(entry);
         bytes_ -= out.bytes();
         erase(index);
+        trace_observation({.site="take", .action="removed", .subject_serial=serial}, &out);
         return out;
     }
 
@@ -530,12 +581,18 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) {
             auto& entry = entries_[i];
             if (entry.publication_ticket != ticket) continue;
-            if (guarded_ != 0 && serials_[i] == guarded_) return std::nullopt;
+            if (guarded_ != 0 && serials_[i] == guarded_) {
+                trace_observation({.site="publication", .action="take_refused", .accepted=false,
+                                   .subject_serial=serials_[i]}, &entry);
+                return std::nullopt;
+            }
+            const uint64_t serial = serials_[i];
             const size_t n = entry.bytes();
             std::optional<SavedConversation> out(std::in_place, std::move(entry));
             bytes_ -= n;
             held_bytes_ += n;
             erase(i);
+            trace_observation({.site="publication", .action="take", .subject_serial=serial}, &*out);
             return out;
         }
         return std::nullopt;
@@ -573,8 +630,15 @@ public:
     // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and
     // guard_blocked() says so: the caller then takes the entry as before, so the conversation that was active a
     // moment ago keeps its place.
-    void guard(uint64_t serial) { guarded_ = serial; guard_blocked_ = false; }
-    void unguard() { guarded_ = 0; }
+    void guard(uint64_t serial) {
+        guarded_ = serial; guard_blocked_ = false;
+        trace_observation({.site="guard", .action="acquire", .subject_serial=serial});
+    }
+    void unguard() {
+        const uint64_t serial = guarded_;
+        guarded_ = 0;
+        trace_observation({.site="guard", .action="release", .subject_serial=serial});
+    }
     bool guard_blocked() const { return guard_blocked_; }
     size_t borrowed() const { return borrowed_; }
     void count_borrow() { ++borrowed_; }
@@ -583,7 +647,11 @@ public:
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
         guard_blocked_ = false;
-        if (!enabled() || held > budget_ || incoming > room(held)) return false;
+        if (!enabled() || held > budget_ || incoming > room(held)) {
+            trace_observation({.site="make_room", .action="refused", .accepted=false,
+                               .held=held, .incoming=incoming});
+            return false;
+        }
         const size_t limit = room(held) - incoming;
         size_t remaining = bytes_, count = entries_.size();
         for (size_t i = 0; i < entries_.size() && (count >= slots_ || remaining > limit); ++i) {
@@ -593,12 +661,16 @@ public:
         }
         if (count >= slots_ || remaining > limit) {
             guard_blocked_ = guarded_ != 0 && index_of(guarded_) != SIZE_MAX;
+            trace_observation({.site="make_room", .action="refused", .accepted=false,
+                               .held=held, .incoming=incoming, .limit=limit});
             return false; // no owner or optional reuse is discarded by an impossible reservation.
         }
+        trace_observation({.site="make_room", .action="before", .held=held, .incoming=incoming, .limit=limit});
         if (bytes() > limit) reuse_ = {};
         while (entries_.size() >= slots_ || bytes_ > limit) {
             if (!evict_oldest()) return false;
         }
+        trace_observation({.site="make_room", .action="committed", .held=held, .incoming=incoming, .limit=limit});
         return true;
     }
 
@@ -606,8 +678,10 @@ public:
     // acquired lease. Missing tickets (including already acquired ones) are safe.
     void release_publication(uint64_t ticket) noexcept {
         if (ticket == 0) return;
-        for (auto& entry : entries_) if (entry.publication_ticket == ticket) {
+        for (size_t i = 0; i < entries_.size(); ++i) if (entries_[i].publication_ticket == ticket) {
+            auto& entry = entries_[i];
             entry.publication_ticket = 0;
+            trace_observation({.site="publication", .action="unprotect", .subject_serial=serials_[i]}, &entry);
             return;
         }
     }
@@ -624,10 +698,19 @@ public:
     // reuse. The carrier skips parking and the request still completes; the skip line names how many entries are
     // pinned. Only clear() drops pins, and only for the non-finite-logit poison path.
     bool reserve_snapshot(size_t incoming, size_t held = 0, size_t* protected_index = nullptr) {
+        const auto refused = [&] {
+            trace_observation({.site="reserve_snapshot", .action="refused", .accepted=false,
+                               .held=held, .incoming=incoming});
+            return false;
+        };
         if (!enabled() || held > budget_ || incoming > room(held) ||
-            (protected_index && *protected_index >= entries_.size())) return false;
+            (protected_index && *protected_index >= entries_.size())) return refused();
         const size_t limit = room(held) - incoming;
-        if (bytes() <= limit) return true;
+        if (bytes() <= limit) {
+            trace_observation({.site="reserve_snapshot", .action="unchanged", .held=held, .incoming=incoming,
+                               .limit=limit});
+            return true;
+        }
         const size_t keep = protected_index ? *protected_index : entries_.size();
         size_t remaining = bytes_, victims = 0;
         for (size_t i = 0; i < entries_.size() && remaining > limit; ++i) {
@@ -641,6 +724,9 @@ public:
                 ++victims;
             }
         }
+        trace_observation({.site="reserve_snapshot", .action="plan", .accepted=remaining <= limit,
+                           .held=held, .incoming=incoming, .limit=limit, .victims=victims,
+                           .protected_serial=keep < entries_.size() ? serials_[keep] : 0});
         if (remaining > limit) return false;
 
         // Optional retained K/V goes first. Movement, destruction and deque
@@ -659,6 +745,8 @@ public:
         while (entries_.size() > write) { entries_.pop_back(); serials_.pop_back(); }
         bytes_ = remaining;
         evictions_ += victims;
+        trace_observation({.site="reserve_snapshot", .action="committed", .held=held, .incoming=incoming,
+                           .limit=limit, .victims=victims});
         return true;
     }
 
@@ -668,6 +756,7 @@ public:
     bool evict_oldest() {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (!evictable(i)) continue;
+            trace_observation({.site="evict_oldest", .action="plan", .victims=1});
             // Name the victim: the eviction counter alone cannot show whether pressure is spending the cache on
             // short side conversations or discarding a long one whose loss costs a full re-read (2026-10-18).
             std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
@@ -676,8 +765,10 @@ public:
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
+            trace_observation({.site="evict_oldest", .action="committed", .victims=1});
             return true;
         }
+        trace_observation({.site="evict_oldest", .action="refused", .accepted=false});
         return false;
     }
 
@@ -686,12 +777,14 @@ public:
     // Returns how many were parked.
     size_t clear() {
         const size_t n = entries_.size();
+        trace_observation({.site="clear", .action="before"});
         entries_.clear();
         serials_.clear();
         bytes_ = 0;
         reuse_ = {};
         guarded_ = 0;
         guard_blocked_ = false;
+        trace_observation({.site="clear", .action="committed"});
         return n;
     }
 
@@ -732,11 +825,16 @@ public:
         static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
         static_assert(std::is_nothrow_destructible_v<SavedConversation>);
         guard_blocked_ = false;
+        const auto refused = [&] {
+            trace_observation({.site="put", .action="refused", .accepted=false,
+                               .held=held, .held_entries=held_entries}, &image);
+            return false;
+        };
         if (!enabled() || !image.scope.valid() || held_entries >= slots_ || held > budget_ ||
-            has_publication(image.publication_ticket)) return false;
+            has_publication(image.publication_ticket)) return refused();
         if (image.publication_ticket != 0) image.freeze();
         const size_t n = image.bytes();
-        if (n > room(held)) return false;
+        if (n > room(held)) return refused();
         const size_t available_entries = slots_ - held_entries;
         const size_t limit = room(held) - n;
         size_t count = entries_.size(), remaining = bytes_, replaced = 0, victims = 0;
@@ -761,6 +859,11 @@ public:
                 ++victims;
             }
         }
+        trace_observation({.site="put", .action="plan",
+                           .accepted=count < available_entries && remaining <= payload_limit,
+                           .held=held, .held_entries=held_entries, .incoming=n, .limit=payload_limit,
+                           .available_entries=available_entries, .victims=victims, .superseded=replaced,
+                           .subject_serial=next_serial_}, &image);
         if (count >= available_entries || remaining > payload_limit) {
             guard_blocked_ = guarded_ != 0 && index_of(guarded_) != SIZE_MAX;
             return false;
@@ -800,6 +903,9 @@ public:
         bytes_ = remaining + n;
         superseded_ += replaced;
         evictions_ += victims;
+        trace_observation({.site="put", .action="committed", .held=held, .held_entries=held_entries,
+                           .incoming=n, .limit=payload_limit, .available_entries=available_entries,
+                           .victims=victims, .superseded=replaced, .subject_serial=next_serial_ - 1});
         return true;
     }
 
@@ -867,6 +973,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    ConversationCacheTrace* trace_ = nullptr;
 };
 
 } // namespace strata::core
