@@ -1932,6 +1932,23 @@ directory, or a root that cannot be opened or locked exclusively - leaves parkin
 (`persistent conversation caching stays off: ...`); it is never a serving failure and never an error exit. A second
 engine pointing at the same root serves without persistent caching instead of sharing the store.
 
+The serving core hands its already-certified image to `ContinuationPublisher`, the facade over the existing
+publication queue. Each accepted capture reserves a terminal receipt identified by publication id, state owner,
+owner generation and capture epoch. Receipts report the actual store status, head, epoch and new/reused bytes;
+they never infer the result from a global latest head. At most 24 captures/results remain outstanding, including
+unconsumed terminal receipts. Cancellation releases queued publication protection, not another consumer's alias;
+an admitted writer keeps its ownership until its real outcome settles. The existing coverage, adoption,
+retirement, pinning, writer ordering, disk formats and default capture/retention policy are unchanged.
+
+`conversation store: persistence enabled=... healthy=... run_intent=... epoch=...` is a separate bounded readiness
+receipt, emitted on state changes independently of engine `READY`. It includes queued, pending, receipt and
+outstanding counts, capacity and the last optional error. The host operator status consumes it without turning
+a failed optional write into an inference failure. An uncertain catalog commit still faults persistence and
+keeps the run intent armed; ordinary durability failures still drop only the capture. This does not authorize
+reuse, request validity, automatic replay, a new release identity or promotion.
+Readiness preserves the first latched fault's cause. A disabled startup retains its specific disabled reason;
+an inactive run intent alone is not evidence that a shutdown completed.
+
 Capacity is **one shared physical quota** for every layout: `--conversation-cache-disk-mib` (default 131072 = 128 GiB),
 lazily allocated, with `--conversation-cache-disk-min-free-mib` (default 131072) as the filesystem floor a new
 reservation must leave free, and `--conversation-cache-disk-heads` (default 128) as the retained branch-head ceiling
@@ -2401,6 +2418,26 @@ user that runs Strata: the files hold the conversation's token IDs and state, ar
 conversation. Before it writes, a save checks that the disk has room for the whole new file plus
 `--session-min-free-mib` (an engine argument, in the config's `args`; default 4096, 0 = no check) - also when it
 replaces a file, whose space comes back only after the rename. This is a preflight, not a quota or a reservation.
+
+For the host launcher, a profile's relative `slot_save_path` is resolved against the writable run-state directory
+and passed to the frontend as an absolute path, rather than writing inside the frozen read-only frontend closure.
+This does not authorize protected controls: `STRATA_SUPERVISED=1` still refuses `/slots/` requests with `403`
+and keeps automatic engine restart disabled.
+
+A separately approved sole-owner native client can instead call `StrataEngine.session_file("save", path)` and
+`session_file("restore", path)` between completed generations, as `tools/session_pressure_test.py` does. It owns
+and serializes that engine; it must not inject commands into an HTTP frontend's pipe. The native replies' `tokens`
+and `bytes` supply the SAVE/RESTORE counts: require positive SAVE counts, matching RESTORE counts and owned clean
+shutdown. This does not make supervised HTTP `/slots/` available or authorize disabling supervision.
+Session files do not carry a RAM authorization namespace. A following scoped generation may choose another
+eligible parked/durable prefix or recompute, so report its actual reuse/source rather than treating file-transfer
+counts as proof that it decoded from the just-restored live image.
+
+Native session source and read-limit assembly use the same optional-draft contract as parked snapshots: a
+no-MTP engine includes only its main QSA layers, never an empty draft state. An MTP engine still includes its
+actual draft layer. The snapshot format, extent validation, pre-write checks and fatal partial-restore rule do
+not change.
+
 NAME may
 not contain a path, a drive, a stream (`:`), a Windows device name (`NUL`, `CON.bin`, `COM1`...), a control character,
 a leading dot or a trailing dot or space.

@@ -544,6 +544,53 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
 }
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
+void native_session_sources() {
+    ModelGeometry g;
+    g.n_layers = 4; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    std::string error;
+    ConversationStateSizes sizes;
+    check(conversation_state_sizes(g, sizes, error), "native session source state sizes");
+    Pools main(g, 3), mtp(g, 3); // the real no-MTP refusal used hybrid K8V4
+    std::vector<uint8_t> gdn(sizes.gdn, 0x35), ple(sizes.ple, 0x46);
+    SessionState session;
+    session.max_cells = 96; session.layer_hi = g.n_layers;
+    session.gdn_alloc = g.n_gdn_layers(); session.qsa_alloc = 1;
+    session.gdn_state = reinterpret_cast<float*>(gdn.data());
+    session.ple_hist = reinterpret_cast<float*>(ple.data());
+    session.qsa_states = &main.st;
+    const std::vector<int32_t> ids{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const std::vector<ConversationImageKey> images;
+    const std::vector<ConversationCheckpoint> checkpoints;
+    const ConversationView view{ids, images, checkpoints, true};
+    for (const QsaState* draft : std::array<const QsaState*, 2>{nullptr, &mtp.st}) {
+        copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
+        SessionReadLimits limits;
+        check(conversation_session_read_limits(limits, session, g, draft, 96, 2, error),
+              "native read-limit assembly accepts absent or present draft");
+        check(!copy_calls && !sync_calls, "native read-limit assembly performs no device work");
+        SavedConversation meta;
+        std::vector<SessionKvSource> sources;
+        check(conversation_snapshot_sources(meta, sources, view, session, g, draft, error),
+              "native SAVE sources accept positive live extent with absent or present draft");
+        const size_t layers = 1 + (draft ? 1 : 0);
+        check(meta.live.ids == ids && meta.kv.empty() && sources.size() == layers,
+              "native SAVE has exactly the main sources and only an actual draft");
+        check(limits.max_kv_layers == layers && limits.max_kv_bytes.size() == sources.size() &&
+              limits.max_tokens == 96 && limits.max_checkpoints == 2,
+              "native RESTORE limits match the SAVE role count without an empty draft record");
+        check(limits.max_kv_bytes[0][0] > 0 && limits.max_kv_bytes[0][4] > 0 &&
+              (!draft || (limits.max_kv_bytes.back()[0] > 0 && limits.max_kv_bytes.back()[4] == 0)),
+              "native main and present-draft byte bounds retain their index roles");
+    }
+    const QsaState empty;
+    SavedConversation refused;
+    std::vector<SessionKvSource> sources;
+    check(!conversation_snapshot_sources(refused, sources, view, session, g, &empty, error) &&
+          error == "conversation snapshot: invalid K/V extent",
+          "an explicitly present but unallocated draft remains an invalid extent");
+}
+
 void ring_refusal(int format) {
     ModelGeometry g;
     g.n_head_kv=1; g.head_dim=64; g.idx_key_dim=8;
@@ -867,7 +914,7 @@ void diagnostic_shared_draft(bool batched, bool per_group_sync, int64_t window) 
     sp.accept_batched = batched;
     struct Stage { strata::prefill::Prefill sp; int dev = 0; };
     const std::vector<std::unique_ptr<Stage>> stages;
-    const bool use_mtp = true, multi_gpu = false, split_mtp_batch = false;
+    const bool use_mtp = true, multi_gpu = false, split_mtp_batch = false, mtp_first = false;
     const std::vector<int64_t> cur(size_t(prompt), 11);
 #include "shared_draft_callback.inc"
         return true;
@@ -986,7 +1033,7 @@ void exact_shared_cut(int format, int64_t cut) {
     }
     SavedConversation unsafe_meta;
     std::vector<SessionKvSource> unsafe_sources;
-    check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, draft.st, error) &&
+    check(!conversation_snapshot_sources(unsafe_meta, unsafe_sources, exact, ss, g, &draft.st, error) &&
           copy_calls == 0 && sync_calls == 0, "streamed exports cannot bypass exact-cut sanitization");
     SavedConversation first, second, ordinary;
     check(conversation_snapshot_save(first, exact, ss, g, &draft.st, error),
@@ -1232,6 +1279,7 @@ int main() {
     checkpoint_payload_stages();
     resident_transfer_envelopes();
 #if defined(CONVERSATION_TEST_TRANSFERS)
+    native_session_sources();
     strata::core::MtpDrafterCertificationFixture::run(check);
     for (int format : {0,1,2}) ring_refusal(format);
     for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9,80}) exact_shared_cut(format, cut);

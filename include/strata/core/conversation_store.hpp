@@ -556,6 +556,15 @@ enum class ConversationStoreShutdownState : uint8_t {
 
 const char* conversation_store_shutdown_state_name(ConversationStoreShutdownState state);
 
+// One mutex-coherent, allocation-free observation; no inference-readiness or admission promise.
+struct ConversationStoreReadiness {
+    bool enabled = false;
+    bool healthy = false;
+    bool run_intent = false;
+    uint64_t epoch = 0;
+    std::array<char, 192> last_error{};
+};
+
 class ConversationStore {
 public:
     explicit ConversationStore(ConversationStoreOptions options, ConversationStoreLimits limits = {});
@@ -573,6 +582,7 @@ public:
     // its run-intent marker, never writes the catalog, and never looks like a clean close.
     bool healthy() const;
     void set_unhealthy(const char* reason);      // the owner observed a failure that must stop reuse (e.g. a safety fault)
+    ConversationStoreReadiness readiness() const;
 
     // The execution domain's current epoch, the issuer key the frontend derives authorized scopes from, and the
     // durable run-intent marker this owner holds. The secret remains exactly 32 bytes of cryptographic entropy,

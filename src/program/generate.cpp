@@ -12613,6 +12613,7 @@ int main(int argc, char** argv) {
         // owner's lock, an unusable catalog) is an ordinary miss - never a serving failure - and says why.
         std::unique_ptr<strata::core::ConversationStore> conversation_store;
         size_t store_publication_headroom = 0;
+        std::string persistence_disabled_reason = "persistence is not configured";
         // ---- publication lineage, queued captures and their handover, per state owner ---------------------------
         // The head an owner's state continues from, the capture queue, the retirement bookkeeping a replacement
         // requires and the retry policy all live in strata/program/conversation_publication.hpp, as one module whose
@@ -12622,7 +12623,7 @@ int main(int argc, char** argv) {
         using StoreOwner = strata::program::ConversationPublicationOwner;
         using QueuedPublish = strata::program::ConversationPublicationCapture;
         using PendingPublish = strata::program::ConversationPublicationPending;
-        strata::program::ConversationPublicationQueue publications;
+        strata::program::ContinuationPublisher publications;
         // Opt-in receipts share the existing log/publication seams. No allocation
         // or clock read on the disabled path, and no hot-path trace I/O.
         std::unique_ptr<phase::Receipts> phase_receipts;
@@ -12976,6 +12977,7 @@ int main(int argc, char** argv) {
             limits.max_checkpoints = (uint32_t) std::max(o.prompt_cache, 1);
             limits.max_kv_layers = (uint32_t) g.n_qsa_layers() + 1;
             if (!store_declined_reason.empty()) {
+                persistence_disabled_reason = store_declined_reason;
                 // The binding above is deliberately incomplete without a card identity, so nothing is opened and no
                 // record is ever authorized under it.
                 std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
@@ -12983,6 +12985,7 @@ int main(int argc, char** argv) {
             } else {
                 conversation_store = std::make_unique<strata::core::ConversationStore>(options, limits);
                 if (!conversation_store->enabled()) {
+                    persistence_disabled_reason = conversation_store->disabled_reason();
                     std::fprintf(stderr, "strata serve: persistent conversation caching off: %s\n",
                                  conversation_store->disabled_reason());
                 } else {
@@ -13020,10 +13023,6 @@ int main(int argc, char** argv) {
         auto drop_capture = [&](const char* what) {
             strata::program::preservation_report_drop(stderr, what, err.empty() ? "capture failed" : err);
             err.clear();
-        };
-        auto poison_store = [&] {
-            store_faulted = true;
-            if (conversation_store) conversation_store->set_unhealthy("non-finite logits");
         };
         // The store's RAM shares the parked-conversation envelope. Publish its
         // remaining allowance; a fresh demand refused by that peak may reclaim
@@ -13140,13 +13139,50 @@ int main(int argc, char** argv) {
             publication_sink.phase_event = [&](const phase::PublicationEvent& event) {
                 phase_receipts->publication(event, phase_current ? phase_current->input.identity : phase::Identity{});
             };
+        publications.configure(conversation_store.get(), std::move(publication_sink),
+                               persistence_disabled_reason.c_str());
+        strata::program::PersistenceReadiness last_persistence_status;
+        bool persistence_status_reported = false;
+        auto publication_drain = [&] {
+            phase_publication_drain();
+            strata::program::PublicationReceipt receipt;
+            while (publications.take_receipt(receipt))
+                std::fprintf(stderr, "strata serve: publication receipt: id=%llu owner=%llu generation=%llu "
+                    "capture_epoch=%llu status=%s head=%llu epoch=%llu new=%llu reused=%llu released=%d\n",
+                    (unsigned long long) receipt.handle.publication_id, (unsigned long long) receipt.handle.owner,
+                    (unsigned long long) receipt.handle.owner_generation,
+                    (unsigned long long) receipt.handle.capture_epoch,
+                    strata::program::publication_status_name(receipt.status), (unsigned long long) receipt.head,
+                    (unsigned long long) receipt.epoch, (unsigned long long) receipt.new_bytes,
+                    (unsigned long long) receipt.reused_bytes, int(receipt.released));
+            const auto status = publications.readiness();
+            if (!persistence_status_reported || status.enabled != last_persistence_status.enabled ||
+                status.healthy != last_persistence_status.healthy || status.run_intent != last_persistence_status.run_intent ||
+                status.epoch != last_persistence_status.epoch || status.queued != last_persistence_status.queued ||
+                status.pending != last_persistence_status.pending || status.last_error != last_persistence_status.last_error) {
+                std::fprintf(stderr, "strata serve: conversation store: persistence enabled=%d healthy=%d run_intent=%d "
+                    "epoch=%llu queued=%zu pending=%zu receipts=%zu outstanding=%zu capacity=%zu last_error=%s\n",
+                    int(status.enabled), int(status.healthy), int(status.run_intent), (unsigned long long) status.epoch,
+                    status.queued, status.pending, status.receipts, status.outstanding,
+                    strata::program::ContinuationPublisher::kMaxOutstanding,
+                    status.last_error[0] ? status.last_error.data() : "none");
+                last_persistence_status = status;
+                persistence_status_reported = true;
+            }
+        };
+        publication_drain();   // persistence health is independent of the inference READY frame
+        auto poison_store = [&] {
+            store_faulted = true;
+            if (conversation_store) conversation_store->set_unhealthy("non-finite logits");
+            publication_drain();
+        };
         auto flush_publishes = [&](uint64_t wait_ms) {
             if (!store_on) return;
             phase::Span phase_span(phase_current, phase::Stage::store_seam);
             const size_t count = conversations.size(), evictions = conversations.evictions(),
                          superseded = conversations.superseded();
-            publications.flush(*conversation_store, publication_sink, wait_ms);
-            phase_publication_drain();
+            publications.flush(wait_ms);
+            publication_drain();
             refresh_parked_view(count, evictions, superseded);
         };
         // The prepared offers the channel accepted.  Its own thread inserts them; the request path only looks up the
@@ -13214,8 +13250,8 @@ int main(int argc, char** argv) {
         // ever be superseded, and a capture queued for it must not be published.  Storage work the store has already
         // admitted is the store's own to retire when the epoch advances.
         auto drop_store_publications = [&](const char* why) {
-            publications.abandon(why, publication_sink);
-            phase_publication_drain();
+            publications.abandon(why);
+            publication_drain();
         };
         // ---- published RAM availability (offer filter only) --------------------
         // The offer callback runs on the channel's thread and must not inspect the mutable RAM cache or GPU state.  It
@@ -14191,9 +14227,9 @@ int main(int argc, char** argv) {
                         if (external_now <= SIZE_MAX - held) {
                             publication_attempted = true;
                             const auto admitted = publications.capture(conversations, std::move(image),
-                                std::move(queued), held + (size_t) external_now, held_entries, publication_sink);
+                                std::move(queued), held + (size_t) external_now, held_entries);
                             stored = admitted.parked;
-                            phase_publication_drain();
+                            publication_drain();
                         }
                     }
                 }
@@ -19427,6 +19463,7 @@ int main(int argc, char** argv) {
                     phase_error("ERR %s\n", err.c_str());
                     return 1;
                 }
+                const auto* session_draft = use_mtp ? &mtp.kv_state() : nullptr;
                 strata::core::SessionFileIdentity id;
                 try {
                     if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
@@ -19502,7 +19539,7 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, session_draft,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -19548,7 +19585,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, session_draft, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -19565,7 +19602,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, session_draft, err)) {
                         refuse(err);
                         continue;
                     }
@@ -19578,7 +19615,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, session_draft, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -23704,6 +23741,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation store: publication %llu still outstanding at shutdown "
                                      "(%zu MiB lease)\n", (unsigned long long) pending.request_id,
                              pending.lease_bytes >> 20);
+            // This finite drain promised no durable tail. Return every remaining queued capture's ownership and
+            // receipt before shutdown; admitted images still belong to the store until finish_shutdown settles them.
+            if (!publications.queued().empty()) {
+                publications.abandon("the bounded shutdown capture/drain ended");
+                publication_drain();
+            }
             if (offer_channel) {
                 const strata::program::ConversationOfferStats s = offer_channel->stats();
                 std::fprintf(stderr, "strata serve: conversation offers: accepted=%llu cancelled=%llu "
@@ -23717,12 +23760,11 @@ int main(int argc, char** argv) {
                 // This deadline decides whether finalization may start AFTER workers drain, never bounds their join.
                 conversation_store->request_shutdown(deadline);
                 const auto state = conversation_store->finish_shutdown();
-                if (phase_receipts)
-                    for (size_t i = 0; i < strata::program::ConversationPublicationQueue::kMaxPending; ++i) {
-                        const auto reaped = publications.reconcile(*conversation_store, publication_sink, 0);
-                        phase_publication_drain();
-                        if (!reaped) break;
-                    }
+                for (size_t i = 0; i < strata::program::ConversationPublicationQueue::kMaxPending; ++i) {
+                    const auto reaped = publications.reconcile(0);
+                    publication_drain();
+                    if (!reaped) break;
+                }
                 std::fprintf(stderr, "strata serve: conversation store: shutdown state=%s after %llu ms\n",
                              strata::core::conversation_store_shutdown_state_name(state),
                              (unsigned long long) (now_ms() - shutdown_started));

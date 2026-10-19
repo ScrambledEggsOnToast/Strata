@@ -99,8 +99,9 @@ bool conversation_kv_clear_inactive(ConversationKv& image, int64_t tokens, int64
 // Disk sessions: the read limits this session can ever restore - its geometry and layer range, at most
 // min(max_tokens, its cells) tokens, `max_checkpoints` checkpoints, the exact running-state sizes and the K/V part
 // sizes at that many tokens - so session_file_read refuses an oversized or foreign file before it allocates.
+// A null draft has no source/limit entry, matching the ordinary optional-draft snapshot contract.
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
-                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
 
 struct ConversationStateSizes {
@@ -167,11 +168,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationRetainedPrefix>* retained = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
-// checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
-// synchronized and must not run the session until the file is written.
+// checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft, when present.
+// Caller has synchronized and must not run the session until the file is written.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
-                                   const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

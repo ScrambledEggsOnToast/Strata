@@ -155,6 +155,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
     src/program/conversation_publication.cpp src/core/conversation_store.cpp src/core/conversation_store_format.cpp
     src/core/conversation_store_sha256.cpp)
   target_include_directories(conversation_publication_test PRIVATE include src/core)
+  target_compile_definitions(conversation_publication_test PRIVATE STRATA_STORE_TEST_HOOKS)
   target_link_libraries(conversation_publication_test PRIVATE OpenSSL::Crypto Threads::Threads)
   add_test(NAME conversation_publication_test COMMAND conversation_publication_test)
   set_tests_properties(conversation_publication_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
@@ -850,7 +851,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${output}.inc" "${text}\n")
       endfunction()
       shared_draft_fixture_piece(src/program/generate.cpp
-        "// A shared cut's draft state" "            conversations.limit_reuse("
+        "            const int64_t read_from = reread_to > 0 ? 0 : resume;" "            conversations.limit_reuse("
         shared_draft_horizon)
       shared_draft_fixture_piece(src/program/generate.cpp
         "        sp.on_chunk = " "            // progress for the server window:"

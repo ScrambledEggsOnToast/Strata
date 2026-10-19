@@ -18,6 +18,65 @@ void phase_notify(const ConversationPublicationSink& sink, const phase::Publicat
     try { sink.phase_event({publication, event, status, phase::now_ns(), head, attempts}); }
     catch (...) {}
 }
+
+PublicationHandle handle_of(const ConversationPublicationCapture& entry) {
+    return {entry.publication_id, entry.owner, entry.owner_generation, entry.capture_epoch};
+}
+
+PublicationHandle handle_of(const ConversationPublicationPending& entry) {
+    return {entry.request_id, entry.owner, entry.owner_generation, entry.capture_epoch};
+}
+
+PublicationStatus publication_status(strata::core::ConversationStorePublishStatus status) {
+    using Status = strata::core::ConversationStorePublishStatus;
+    switch (status) {
+    case Status::stored: return PublicationStatus::stored;
+    case Status::replaced: return PublicationStatus::replaced;
+    case Status::retained_branch: return PublicationStatus::retained_branch;
+    case Status::stale: return PublicationStatus::stale;
+    case Status::refused_quota: return PublicationStatus::refused_quota;
+    case Status::refused_floor: return PublicationStatus::refused_floor;
+    case Status::refused_limits: return PublicationStatus::refused_limits;
+    case Status::refused_busy: return PublicationStatus::refused_busy;
+    case Status::coalesced: return PublicationStatus::coalesced;
+    case Status::failed: return PublicationStatus::failed;
+    case Status::disabled: return PublicationStatus::disabled;
+    }
+    return PublicationStatus::failed;
+}
+
+void terminal(const ConversationPublicationSink& sink, const PublicationHandle& handle,
+              PublicationStatus status, const char* why) noexcept {
+    if (!sink.publication_terminal) return;
+    PublicationReceipt receipt;
+    receipt.handle = handle;
+    receipt.status = status;
+    receipt.epoch = handle.capture_epoch;
+    std::snprintf(receipt.detail.data(), receipt.detail.size(), "%s", why ? why : "");
+    sink.publication_terminal(sink.publication_context, receipt);
+}
+}
+
+const char* publication_status_name(PublicationStatus status) noexcept {
+    switch (status) {
+    case PublicationStatus::queued: return "queued";
+    case PublicationStatus::capture_refused: return "capture_refused";
+    case PublicationStatus::backpressure: return "backpressure";
+    case PublicationStatus::dropped: return "dropped";
+    case PublicationStatus::abandoned: return "abandoned";
+    case PublicationStatus::stored: return "stored";
+    case PublicationStatus::replaced: return "replaced";
+    case PublicationStatus::retained_branch: return "retained_branch";
+    case PublicationStatus::stale: return "stale";
+    case PublicationStatus::refused_quota: return "refused_quota";
+    case PublicationStatus::refused_floor: return "refused_floor";
+    case PublicationStatus::refused_limits: return "refused_limits";
+    case PublicationStatus::refused_busy: return "refused_busy";
+    case PublicationStatus::coalesced: return "coalesced";
+    case PublicationStatus::failed: return "failed";
+    case PublicationStatus::disabled: return "disabled";
+    }
+    return "unknown";
 }
 
 void ConversationPublicationOwner::borrow() {
@@ -65,11 +124,13 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
     ConversationPublicationCapture&& entry, size_t held, size_t held_entries,
     const ConversationPublicationSink& sink) {
     ConversationPublicationCaptureResult out;
+    const PublicationHandle handle = handle_of(entry);
     if (sink.phase_event) {
         entry.phase.capture_ticket = entry.image_ticket;
         entry.phase.owner = entry.owner;
         entry.phase.owner_generation = entry.owner_generation;
         entry.phase.epoch = entry.capture_epoch;
+        entry.phase.publication = entry.publication_id;
         entry.phase.shared_prefix_tokens = entry.shared_prefix ? uint64_t(image.live.ids.size()) : 0;
         if (!entry.phase.captured_ns) entry.phase.captured_ns = phase::now_ns();
     }
@@ -86,6 +147,7 @@ ConversationPublicationCaptureResult ConversationPublicationQueue::capture(
         ++counters_.refused;
         report(sink, "strata serve: conversation store: capture not queued for persistence (%s)\n", why);
         phase_notify(sink, entry.phase, "terminal", "capture_refused");
+        terminal(sink, handle, PublicationStatus::capture_refused, why);
     };
     if (image.publication_ticket != 0) {
         refuse("the candidate already owns a publication ticket");
@@ -153,6 +215,7 @@ void ConversationPublicationQueue::drop(size_t index, const char* why, const Con
            (unsigned long long) entry.capture_epoch, (unsigned long long) entry.image_ticket, why,
            entry.lease_bytes >> 20);
     phase_notify(sink, entry.phase, "terminal", "dropped", entry.attempts);
+    terminal(sink, handle_of(entry), PublicationStatus::dropped, why);
     queued_.erase(queued_.begin() + (std::ptrdiff_t) index);
 }
 
@@ -167,6 +230,7 @@ void ConversationPublicationQueue::abandon(const char* why, const ConversationPu
         report(sink, "strata serve: conversation store: queued publication of owner %llu dropped (%s)\n",
                (unsigned long long) entry.owner, why);
         phase_notify(sink, entry.phase, "terminal", "abandoned", entry.attempts);
+        terminal(sink, handle_of(entry), PublicationStatus::abandoned, why);
     }
     queued_.clear();
     forget_lineages();
@@ -297,9 +361,10 @@ size_t ConversationPublicationQueue::reconcile(strata::core::ConversationStore& 
         ++reaped;
         size_t at = pending_.size();
         for (size_t i = 0; i < pending_.size(); ++i)
-            if (pending_[i].request_id == result.request_id) { at = i; break; }
+            if (pending_[i].request_id == result.request_id && pending_[i].generation == result.generation &&
+                pending_[i].capture_epoch == result.epoch) { at = i; break; }
         if (at == pending_.size()) continue;   // already reaped (or a foreign result)
-        ConversationPublicationPending pending = pending_[at];
+        ConversationPublicationPending pending = std::move(pending_[at]);
         pending_.erase(pending_.begin() + (std::ptrdiff_t) at);
         pending.phase.applied_ns = result.applied_ns;
         pending.phase.catalog_version = result.catalog_version;
@@ -344,6 +409,18 @@ size_t ConversationPublicationQueue::reconcile(strata::core::ConversationStore& 
         }
         phase_notify(sink, pending.phase, "terminal",
                      strata::core::conversation_store_publish_status_name(result.status), 0, result.head_id);
+        if (sink.publication_terminal) {
+            PublicationReceipt receipt;
+            receipt.handle = handle_of(pending);
+            receipt.status = publication_status(result.status);
+            receipt.head = result.head_id;
+            receipt.epoch = result.epoch;
+            receipt.new_bytes = result.new_bytes;
+            receipt.reused_bytes = result.reused_bytes;
+            receipt.released = result.released;
+            std::snprintf(receipt.detail.data(), receipt.detail.size(), "%s", result.detail.c_str());
+            sink.publication_terminal(sink.publication_context, receipt);
+        }
         if (reaped >= pending_.size() + 4) break;
     }
     return reaped;
@@ -371,13 +448,13 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
         // that completion may have just retired: a completion that arrived in that window and was not reconciled
         // would needlessly lose this accepted capture to a terminal stale verdict.
         if (reconcile(store, sink, 0) != 0) continue;
-        uint64_t publication_id = 0;
-        if (!sink.next_publication_id || !sink.next_publication_id(publication_id)) {
+        ConversationPublicationCapture& entry = queued_.front();
+        if (!entry.publication_id &&
+            (!sink.next_publication_id || !sink.next_publication_id(entry.publication_id))) {
             drop(0, "the publication identifier namespace is exhausted", sink);
             continue;
         }
-        ConversationPublicationCapture& entry = queued_.front();
-        entry.publication_id = publication_id;
+        const uint64_t publication_id = entry.publication_id;
         if (sink.phase_event) entry.phase.publication = publication_id;
         std::string why;
         strata::core::ConversationStorePublishAdmission admission;
@@ -526,6 +603,129 @@ void ConversationPublicationQueue::flush(strata::core::ConversationStore& store,
                entry.attempts + 1, kMaxAttempts, (unsigned long long) entry.publication_id);
         break;
     }
+}
+
+void ContinuationPublisher::configure(strata::core::ConversationStore* store, ConversationPublicationSink sink,
+                                     const char* disabled_reason) {
+    store_ = store;
+    sink_ = std::move(sink);
+    sink_.publication_context = this;
+    sink_.publication_terminal = +[](void* context, const PublicationReceipt& receipt) noexcept {
+        static_cast<ContinuationPublisher*>(context)->complete(receipt);
+    };
+    std::snprintf(disabled_reason_.data(), disabled_reason_.size(), "%s", disabled_reason ? disabled_reason : "");
+}
+
+PublicationSubmission ContinuationPublisher::capture(strata::core::ConversationCache& cache,
+    strata::core::SavedConversation&& image, ConversationPublicationCapture&& entry,
+    size_t held, size_t held_entries) {
+    PublicationSubmission out;
+    Outcome* reserved = nullptr;
+    for (auto& outcome : outcomes_)
+        if (!outcome.occupied) { reserved = &outcome; break; }
+    uint64_t id = 0;
+    if (!reserved || !sink_.next_publication_id || !sink_.next_publication_id(id) || !id) {
+        out.status = reserved ? PublicationStatus::capture_refused : PublicationStatus::backpressure;
+        ++queue_.counters().refused;
+        std::snprintf(last_error_.data(), last_error_.size(), "%s", reserved ?
+            "the publication identifier namespace is unavailable" : "unconsumed publication receipts fill the bound");
+        if (sink_.report) sink_.report(reserved ?
+            "strata serve: conversation store: capture not queued for persistence (publication id unavailable)\n" :
+            "strata serve: conversation store: capture not queued for persistence (bounded receipts are full)\n");
+        // No publication ownership was taken. Keep ordinary parking on the same path as queue-capacity refusal.
+        if (!image.publication_ticket) {
+            try { out.parked = cache.put(std::move(image), held, held_entries); }
+            catch (const std::bad_alloc&) {}
+        }
+        return out;
+    }
+    entry.publication_id = id;
+    out.handle = handle_of(entry);
+    reserved->receipt = {};
+    reserved->receipt.handle = out.handle;
+    reserved->occupied = true;
+    reserved->terminal = false;
+    const auto captured = queue_.capture(cache, std::move(image), std::move(entry), held, held_entries, sink_);
+    out.parked = captured.parked;
+    out.queued = captured.queued;
+    out.status = captured.queued ? PublicationStatus::queued : PublicationStatus::capture_refused;
+    return out;
+}
+
+void ContinuationPublisher::complete(const PublicationReceipt& receipt) noexcept {
+    for (auto& outcome : outcomes_) {
+        if (!outcome.occupied || outcome.terminal || outcome.receipt.handle != receipt.handle) continue;
+        outcome.receipt = receipt;
+        outcome.terminal = true;
+        if (receipt.status != PublicationStatus::stored && receipt.status != PublicationStatus::replaced &&
+            receipt.status != PublicationStatus::retained_branch && receipt.status != PublicationStatus::coalesced)
+            std::snprintf(last_error_.data(), last_error_.size(), "%s",
+                receipt.detail[0] ? receipt.detail.data() : publication_status_name(receipt.status));
+        return;
+    }
+}
+
+void ContinuationPublisher::flush(uint64_t wait_ms) {
+    if (store_) queue_.flush(*store_, sink_, wait_ms);
+    else queue_.abandon(disabled_reason_.data(), sink_);
+}
+
+size_t ContinuationPublisher::reconcile(uint64_t wait_ms) {
+    return store_ ? queue_.reconcile(*store_, sink_, wait_ms) : 0;
+}
+
+void ContinuationPublisher::abandon(const char* why) { queue_.abandon(why, sink_); }
+
+bool ContinuationPublisher::cancel(const PublicationHandle& handle) {
+    if (!handle) return false;
+    for (size_t i = 0; i < queue_.queued().size(); ++i) {
+        if (handle_of(queue_.queued()[i]) != handle) continue;
+        queue_.drop(i, "publication cancelled before handover", sink_);
+        return true;
+    }
+    for (const auto& pending : queue_.pending()) {
+        if (handle_of(pending) != handle || !store_) continue;
+        store_->cancel_publication(pending.request_id, pending.generation);
+        return true;   // an active writer keeps ownership until its real terminal outcome
+    }
+    return false;
+}
+
+bool ContinuationPublisher::take_receipt(const PublicationHandle& handle, PublicationReceipt& out) noexcept {
+    if (!handle) return false;
+    for (auto& outcome : outcomes_) {
+        if (!outcome.occupied || !outcome.terminal || outcome.receipt.handle != handle) continue;
+        out = outcome.receipt;
+        outcome.occupied = outcome.terminal = false;
+        return true;
+    }
+    return false;
+}
+
+bool ContinuationPublisher::take_receipt(PublicationReceipt& out) noexcept {
+    for (auto& outcome : outcomes_)
+        if (outcome.occupied && outcome.terminal) return take_receipt(outcome.receipt.handle, out);
+    return false;
+}
+
+PersistenceReadiness ContinuationPublisher::readiness() const {
+    PersistenceReadiness out;
+    if (store_) {
+        const auto store = store_->readiness();
+        out.enabled = store.enabled;
+        out.healthy = store.healthy;
+        out.run_intent = store.run_intent;
+        out.epoch = store.epoch;
+        out.last_error = store.last_error;
+    } else out.last_error = disabled_reason_;
+    if (!out.last_error[0]) out.last_error = last_error_;
+    out.queued = queue_.queued().size();
+    out.pending = queue_.pending().size();
+    for (const auto& outcome : outcomes_) {
+        out.outstanding += outcome.occupied;
+        out.receipts += outcome.occupied && outcome.terminal;
+    }
+    return out;
 }
 
 } // namespace strata::program

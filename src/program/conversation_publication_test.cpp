@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <dirent.h>
 #include <memory>
 #include <new>
@@ -21,6 +22,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,10 @@ using strata::program::ConversationPublicationOwner;
 using strata::program::ConversationPublicationPending;
 using strata::program::ConversationPublicationQueue;
 using strata::program::ConversationPublicationSink;
+using strata::program::ContinuationPublisher;
+using strata::program::PublicationHandle;
+using strata::program::PublicationReceipt;
+using strata::program::PublicationStatus;
 using conversation_store_detail::images_equal;
 
 int failures = 0;
@@ -1680,6 +1686,291 @@ void check_cache_mutation_publication(const char* path = nullptr) {
     std::fclose(file);
 }
 
+strata::program::PublicationSubmission facade_capture(ContinuationPublisher& publisher, Sink& sink,
+    uint64_t owner, uint64_t generation, const SavedConversation& record, uint64_t supersedes = 0,
+    std::vector<ConversationStoreReuse> reuse = {}) {
+    auto image = record;
+    auto entry = capture_of(owner, generation, supersedes, true, record, sink.store.epoch(), ++sink.next_ticket);
+    entry.reuse = std::move(reuse);
+    const auto submission = publisher.capture(sink.cache, std::move(image), std::move(entry),
+                                              size_t(sink.store.ram_held_bytes()), 0);
+    sink.refresh_allowance();
+    return submission;
+}
+
+void settle(ContinuationPublisher& publisher) {
+    for (int waited = 0; waited < 1000 && publisher.holds_work(); ++waited)
+        publisher.flush(20);
+    check(!publisher.holds_work(), "facade work settles within the bounded CPU fixture");
+}
+
+void check_facade_receipts_and_identity() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    const auto ready = publisher.readiness();
+    check(ready.enabled && ready.healthy && ready.run_intent && ready.epoch == store.epoch() &&
+          !ready.outstanding && !ready.last_error[0], "persistence readiness observes only real store state");
+    auto first = stored_record(301, 512);
+    first.checkpoints.clear();
+    const auto a = facade_capture(publisher, sink, 0, 11, first);
+    check(a.queued && a.handle && a.status == PublicationStatus::queued,
+          "certified-image handoff returns a stable generation-bound handle");
+    check(a.handle.owner == 0 && a.handle.owner_generation == 11 &&
+          a.handle.capture_epoch == store.epoch(), "the handle retains the capture's own owner and epoch");
+    PublicationReceipt receipt;
+    check(!publisher.take_receipt(a.handle, receipt), "queued ownership is not a completed publication");
+    publisher.flush(0);
+    publisher.owner(0).borrow(); // an unrelated successor must not receive this completion's lineage
+    settle(publisher);
+    auto stale = a.handle;
+    ++stale.owner_generation;
+    check(!publisher.take_receipt(stale, receipt), "a mismatched generation cannot consume a terminal receipt");
+    stale = a.handle;
+    ++stale.owner;
+    check(!publisher.take_receipt(stale, receipt), "a mismatched physical owner cannot consume a terminal receipt");
+    stale = a.handle;
+    ++stale.capture_epoch;
+    check(!publisher.take_receipt(stale, receipt), "a mismatched epoch cannot consume a terminal receipt");
+    check(publisher.take_receipt(a.handle, receipt) && receipt.handle == a.handle &&
+          receipt.status == PublicationStatus::stored && receipt.head && receipt.epoch == a.handle.capture_epoch &&
+          receipt.new_bytes > 0 && !receipt.reused_bytes && receipt.released,
+          "the receipt names this publication's actual head, bytes and ownership release");
+    const uint64_t first_head = receipt.head;
+    check(!publisher.owner(0).lineage.valid, "receipt correlation never bypasses authoritative generation adoption");
+    check(!publisher.take_receipt(a.handle, receipt), "terminal receipts are consumed exactly once");
+
+    publisher.owner(0).mount(first_head, store.epoch(), first.live.ids, 512, first.scope, first.cvec);
+    const auto grown = turn_on(first, 544, 301);
+    // A whole aligned chunk of unchanged K is proven by this fixture's append-only construction.
+    ConversationStoreReuse reused{first_head, {0, uint16_t(ConversationStoreStreamKind::kv_k), 0, 0}, 0, 0, 4096};
+    const auto b = facade_capture(publisher, sink, 0, 20, grown, first_head, {reused});
+    const auto peer = facade_capture(publisher, sink, 1, 21, stored_record(303, 64));
+    settle(publisher);
+    check(publisher.take_receipt(peer.handle, receipt) && receipt.handle == peer.handle &&
+          receipt.status == PublicationStatus::stored && receipt.head != first_head,
+          "a peer result is selected by its identity, not by a global latest head");
+    check(publisher.take_receipt(b.handle, receipt) && receipt.handle == b.handle &&
+          receipt.status == PublicationStatus::retained_branch && receipt.reused_bytes == 4096,
+          "the facade preserves root retention and reports the real donor bytes");
+    check_eq(publisher.owner(0).lineage.head, receipt.head, "existing authoritative adoption still owns lineage");
+    check_eq(store.counters().heads, 3, "the unchanged pinned-root/latest rule retains root, latest and peer");
+    check_eq(publisher.readiness().outstanding, 0, "consuming every receipt reopens all bounded capacity");
+    store.close();
+    const auto closed = publisher.readiness();
+    check(!closed.enabled && !closed.healthy && !closed.run_intent,
+          "clean shutdown is not confused with live persistence readiness");
+    ConversationStore reopened(options_for(root.path));
+    check_record_restores(reopened, first, 3001, true);
+    check_record_restores(reopened, grown, 3002);
+    reopened.close();
+}
+
+void check_facade_cancel_with_consumers() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store, size_t(64) << 20, 3);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    const size_t fixed = size_t(1) << 20;
+    check(sink.cache.try_reserve_lease(fixed), "a peer retains its existing fixed consumer reservation");
+    auto record = stored_record(307, 64);
+    record.checkpoints.clear();
+    const auto cancelled = facade_capture(publisher, sink, 0, 1, record);
+    bool retained = false;
+    auto consumer = sink.cache.take(0, retained); // a real frozen alias of the protected owner
+    check(retained && sink.cache.has_publication(sink.next_ticket), "the consumer borrows without taking capture ownership");
+    auto wrong = cancelled.handle;
+    ++wrong.owner_generation;
+    check(!publisher.cancel(wrong), "stale cancellation does not release another generation's ticket");
+    check(publisher.cancel(cancelled.handle), "exact cancellation retires a not-yet-admitted capture");
+    PublicationReceipt receipt;
+    check(publisher.take_receipt(cancelled.handle, receipt) && receipt.status == PublicationStatus::dropped &&
+          receipt.released && !receipt.head, "queued cancellation has one ownership-complete receipt");
+    std::string why;
+    check(images_equal(consumer, record, why), "cancellation leaves outstanding immutable consumers intact");
+    check_eq(sink.cache.leased_bytes(), fixed, "cancellation refunds neither the peer nor a consumer lease");
+    check_eq(sink.ticket_releases, 1, "queued cancellation releases protection exactly once");
+    check(!publisher.cancel(cancelled.handle), "repeated cancellation releases nothing twice");
+    const auto peer = facade_capture(publisher, sink, 1, 2, stored_record(309, 64));
+    publisher.flush(0);
+    check(publisher.cancel(peer.handle), "admitted cancellation requests no premature buffer release");
+    check(!publisher.take_receipt(peer.handle, receipt), "admitted work remains outstanding until real reconciliation");
+    settle(publisher);
+    check(publisher.take_receipt(peer.handle, receipt) && receipt.released &&
+          (receipt.status == PublicationStatus::stored || receipt.status == PublicationStatus::stale),
+          "admitted cancellation reports the real writer outcome, not a fabricated interrupted write");
+    check(images_equal(consumer, record, why), "the outstanding consumer remains valid after peer settlement");
+    check_eq(sink.cache.leased_bytes(), fixed, "the fixed consumer reservation survives all publication terminals");
+    store.close();
+}
+
+void check_facade_optional_failure_and_peer() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    store.set_publish_fault_for_test("objects");
+    const auto failed = facade_capture(publisher, sink, 0, 1, stored_record(311, 64));
+    const auto peer = facade_capture(publisher, sink, 1, 2, stored_record(313, 64));
+    settle(publisher);
+    PublicationReceipt receipt;
+    check(publisher.take_receipt(failed.handle, receipt) && receipt.status == PublicationStatus::failed &&
+          !receipt.head && receipt.released, "a genuine optional object-write failure drops only its capture");
+    check(!publisher.owner(0).lineage.valid, "failed publication establishes no private lineage");
+    check(publisher.take_receipt(peer.handle, receipt) && receipt.status == PublicationStatus::stored && receipt.head &&
+          receipt.released, "the independently queued peer survives the failed optional write");
+    const auto ready = publisher.readiness();
+    check(ready.enabled && ready.healthy && ready.run_intent && ready.last_error[0] && !ready.outstanding,
+          "last optional error is visible without falsely faulting a healthy persistence module");
+    check_eq(sink.cache.leased_bytes(), 0, "ordinary failure and surviving peer release both transferred leases");
+    check_eq(publisher.counters().refused, 1, "the failed optional write has exactly one terminal verdict");
+    check_eq(publisher.counters().published, 1, "only the surviving peer counts as published");
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check_record_restores(reopened, stored_record(313, 64), 3101, true);
+    reopened.close();
+}
+
+void check_facade_bounded_receipts() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    std::vector<PublicationHandle> handles;
+    for (size_t i = 0; i < ContinuationPublisher::kMaxOutstanding; ++i) {
+        const auto submission = facade_capture(publisher, sink, 0, i + 1, stored_record(315, 64));
+        check(submission.queued, "the receipt bound accepts one protected capture at a time");
+        handles.push_back(submission.handle);
+        check(publisher.cancel(submission.handle), "cancellation fills one pre-reserved terminal slot");
+    }
+    const auto full = publisher.readiness();
+    check_eq(full.receipts, ContinuationPublisher::kMaxOutstanding, "unconsumed terminals count toward the outstanding bound");
+    const auto refused = facade_capture(publisher, sink, 0, 99, stored_record(317, 64));
+    check(!refused.handle && !refused.queued && refused.parked && refused.status == PublicationStatus::backpressure,
+          "completion pressure refuses ownership synchronously and preserves ordinary RAM parking");
+    PublicationReceipt receipt;
+    for (const auto& handle : handles)
+        check(publisher.take_receipt(handle, receipt) && receipt.handle == handle &&
+              receipt.status == PublicationStatus::dropped, "backpressure loses no existing terminal identity");
+    check_eq(publisher.readiness().outstanding, 0, "draining terminals releases the entire fixed outcome bound");
+
+    // Local interface overhead only: no disk I/O or model work inside these diagnostic loops.
+    constexpr size_t iterations = 10000;
+    uint64_t observed = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < iterations; ++i) observed += store.readiness().epoch;
+    const auto t1 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < iterations; ++i) observed += publisher.readiness().epoch;
+    const auto t2 = std::chrono::steady_clock::now();
+    check(observed == 2 * iterations * store.epoch(), "readiness overhead loop consumes every real observation");
+    std::fprintf(stderr, "publisher interface: queue_bytes=%zu facade_bytes=%zu fixed_delta=%zu outcomes=%zu "
+        "store_readiness_ns=%.1f facade_readiness_ns=%.1f dynamic_receipt_allocations=0 payload_copies=0\n",
+        sizeof(ConversationPublicationQueue), sizeof(ContinuationPublisher),
+        sizeof(ContinuationPublisher) - sizeof(ConversationPublicationQueue), ContinuationPublisher::kMaxOutstanding,
+        std::chrono::duration<double, std::nano>(t1 - t0).count() / iterations,
+        std::chrono::duration<double, std::nano>(t2 - t1).count() / iterations);
+    store.close();
+}
+
+void check_store_readiness_fault_reason() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    store.set_unhealthy("the owner observed poisoned shared state");
+    const auto faulted = store.readiness();
+    check(faulted.enabled && !faulted.healthy && faulted.run_intent,
+          "an explicitly latched fault remains distinct from a disabled or cleanly closed store");
+    check(std::strcmp(faulted.last_error.data(), "the owner observed poisoned shared state") == 0,
+          "store readiness exposes the authoritative set_unhealthy cause");
+    check(std::strcmp(publisher.readiness().last_error.data(), "the owner observed poisoned shared state") == 0,
+          "the facade forwards a latched owner fault without needing a failed publication receipt");
+    store.set_unhealthy("a later unrelated failure");
+    check(std::strcmp(store.readiness().last_error.data(), "the owner observed poisoned shared state") == 0,
+          "later observations cannot overwrite the first latched store fault");
+    store.close();
+}
+
+void check_facade_uncertain_publication() {
+    TempRoot root;
+    uint64_t epoch = 0;
+    const auto record = stored_record(319, 64);
+    {
+        ConversationStore store(options_for(root.path));
+        Sink sink(store);
+        ContinuationPublisher publisher;
+        publisher.configure(&store, std::move(sink.out));
+        epoch = store.epoch();
+        store.set_publish_fault_for_test("catalog-sync");
+        const auto submission = facade_capture(publisher, sink, 0, 1, record);
+        settle(publisher);
+        PublicationReceipt receipt;
+        check(publisher.take_receipt(submission.handle, receipt) && receipt.status == PublicationStatus::failed &&
+              !receipt.head && receipt.released, "uncertain catalog durability produces no successful receipt");
+        const auto ready = publisher.readiness();
+        check(!ready.healthy && ready.run_intent && ready.last_error[0],
+              "authority uncertainty is exposed as faulted persistence with armed intent");
+        const auto store_ready = store.readiness();
+        check(!store_ready.healthy && store_ready.run_intent &&
+              std::strstr(store_ready.last_error.data(), "durability is not confirmed") != nullptr,
+              "store readiness itself exposes catalog uncertainty, without the facade's last-error fallback");
+        store.close();
+        check(store.shutdown_state() == ConversationStoreShutdownState::quiescent_unclean,
+              "the facade cannot turn an uncertain publication into a clean shutdown");
+    }
+    ConversationStore reopened(options_for(root.path));
+    check_eq(reopened.epoch(), epoch + 1, "existing interrupted-run recovery advances the execution epoch");
+    const auto query = query_of(record, 3201, 1);
+    check(reopened.matches(query.selector, query.tokens, query.images).empty(),
+          "an uncertain publication cannot become an authorized continuation on restart");
+    reopened.close();
+}
+
+#ifdef STRATA_STORE_TEST_HOOKS
+void check_facade_interrupted_process() {
+    TempRoot root;
+    const auto record = stored_record(321, 64);
+    uint64_t epoch = 0;
+    {
+        ConversationStore seed(options_for(root.path));
+        epoch = seed.epoch();
+        seed.close();
+    }
+    const pid_t child = ::fork(); // no live store threads are inherited
+    check(child >= 0, "the deterministic interrupted-publication fixture creates its child");
+    if (child == 0) {
+        ConversationStore store(options_for(root.path));
+        Sink sink(store);
+        ContinuationPublisher publisher;
+        publisher.configure(&store, std::move(sink.out));
+        // The real writer reaches this only after payload/manifest emission. Exit while the catalog transaction
+        // is staged, before it can durably authorize the new head; no destructor or finalization may run.
+        store.set_catalog_gate_for_test(+[](void*, bool staged) { if (staged) ::_exit(73); }, nullptr);
+        const auto submission = facade_capture(publisher, sink, 0, 1, record);
+        if (!submission.queued) ::_exit(74);
+        settle(publisher);
+        ::_exit(75);
+    }
+    if (child < 0) return;
+    int status = 0;
+    check(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 73,
+          "the process really exits inside an outstanding publication, not before capture");
+    ConversationStore reopened(options_for(root.path));
+    check(reopened.enabled() && reopened.healthy(), "interrupted publication recovers through the existing store");
+    check_eq(reopened.epoch(), epoch + 1, "abrupt process death preserves the existing run-intent recovery rule");
+    const auto query = query_of(record, 3301, 1);
+    check(reopened.matches(query.selector, query.tokens, query.images).empty(),
+          "a manifest abandoned before catalog publication is never promoted into a stored history");
+    reopened.close();
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1697,6 +1988,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "conversation_publication_test: mutation fixture %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--persistence-readiness") {
+        check_store_readiness_fault_reason();
+        check_facade_uncertain_publication();
+        std::fprintf(stderr, "conversation_publication_test: readiness %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    check_store_readiness_fault_reason();
+    check_facade_receipts_and_identity();
+    check_facade_cancel_with_consumers();
+    check_facade_optional_failure_and_peer();
+    check_facade_bounded_receipts();
+    check_facade_uncertain_publication();
+#ifdef STRATA_STORE_TEST_HOOKS
+    check_facade_interrupted_process();
+#endif
     check_cache_mutation_publication();
     check_checkpoint_mount_preserves_the_longer_branch();
     check_checkpoint_mount_allows_a_whole_prefix_replacement();

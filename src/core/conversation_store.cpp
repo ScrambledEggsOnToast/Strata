@@ -5332,6 +5332,18 @@ void ConversationStore::set_unhealthy(const char* reason) {
     impl_->cv_work.notify_all();
 }
 
+ConversationStoreReadiness ConversationStore::readiness() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    ConversationStoreReadiness out;
+    out.enabled = impl_->on;
+    out.healthy = impl_->on && !impl_->faulted;
+    out.run_intent = impl_->intent_active;
+    out.epoch = impl_->epoch;
+    const auto& reason = impl_->faulted ? impl_->fault_reason : impl_->reason;
+    std::snprintf(out.last_error.data(), out.last_error.size(), "%s", reason.c_str());
+    return out;
+}
+
 uint64_t ConversationStore::epoch() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     return impl_->epoch;

@@ -17,6 +17,7 @@
 #include "strata/core/conversation_store.hpp"
 #include "strata/program/phase_receipts.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -58,6 +59,37 @@ struct ConversationPublicationOwner {
                const strata::core::ConversationScope& scope, bool cvec);
 };
 
+// A capture's identity, fixed before ownership leaves the caller. Physical owner slots may be reused; neither a
+// slot nor a "current head" identifies an outcome. The publication id shares the store's existing chronology.
+struct PublicationHandle {
+    uint64_t publication_id = 0;
+    uint64_t owner = 0;
+    uint64_t owner_generation = 0;
+    uint64_t capture_epoch = 0;
+
+    explicit operator bool() const noexcept { return publication_id != 0; }
+    bool operator==(const PublicationHandle&) const = default;
+};
+
+enum class PublicationStatus : uint8_t {
+    queued, capture_refused, backpressure, dropped, abandoned,
+    stored, replaced, retained_branch, stale, refused_quota, refused_floor, refused_limits, refused_busy,
+    coalesced, failed, disabled,
+};
+
+const char* publication_status_name(PublicationStatus status) noexcept;
+
+struct PublicationReceipt {
+    PublicationHandle handle;
+    PublicationStatus status = PublicationStatus::capture_refused;
+    uint64_t head = 0;
+    uint64_t epoch = 0;
+    uint64_t new_bytes = 0;
+    uint64_t reused_bytes = 0;
+    bool released = true;   // terminal publication ownership released; independent consumers keep their own leases
+    std::array<char, 192> detail{};
+};
+
 // A capture the engine already paid for (GPU copies included), waiting for the store's single bounded writer. Its
 // ticket protects the sole parked owner against eviction and supersession; a waiting entry owns no image alias or
 // extra lease. Only the queue head may transfer that owner from parked bytes to leased bytes while it retries.
@@ -65,7 +97,7 @@ struct ConversationPublicationCapture {
     uint64_t owner = 0;
     uint64_t owner_generation = 0;
     uint64_t capture_epoch = 0;
-    uint64_t publication_id = 0;       // assigned when it is handed to the store, so results can be matched
+    uint64_t publication_id = 0;       // fixed at facade capture; legacy queue callers mint it on first handoff
     uint64_t image_ticket = 0;         // unique nonzero capture generation; transient cache ownership, never on disk
     uint64_t supersedes_hint = 0;      // the owner's lineage head at capture (0: this capture starts a branch)
     bool continues = true;             // false: a one-shot borrow; never supersedes and never sets a lineage
@@ -159,6 +191,10 @@ struct ConversationPublicationSink {
     // The engine drains terminal receipts after each public queue operation,
     // outside ownership locks; intermediate traces may wait until terminal/idle.
     std::function<void(const phase::PublicationEvent&)> phase_event;
+    // Ownership completion, not a diagnostic observer. The facade reserves its bounded receipt slot BEFORE capture;
+    // this allocation-free, noexcept callback fills that reservation exactly once, including synchronous refusal.
+    void (*publication_terminal)(void*, const PublicationReceipt&) noexcept = nullptr;
+    void* publication_context = nullptr;
 };
 
 class ConversationPublicationQueue {
@@ -277,6 +313,80 @@ private:
     std::deque<ConversationPublicationCapture> queued_;
     std::deque<ConversationPublicationPending> pending_;
     ConversationPublicationCounters counters_;
+};
+
+struct PublicationSubmission {
+    PublicationHandle handle;
+    PublicationStatus status = PublicationStatus::capture_refused;
+    bool parked = false;
+    bool queued = false;
+};
+
+struct PersistenceReadiness {
+    bool enabled = false;
+    bool healthy = false;
+    bool run_intent = false;
+    uint64_t epoch = 0;
+    size_t queued = 0;
+    size_t pending = 0;
+    size_t receipts = 0;
+    size_t outstanding = 0;   // queued + pending + unconsumed terminal receipts, bounded by kMaxOutstanding
+    std::array<char, 192> last_error{};
+};
+
+// The serving core hands off one already-certified immutable image. Certification, authorization, execution
+// validity and capture/retention policy stay with their existing owners; this facade owns only the queue handover
+// and its outcomes. It adds no worker, catalog, request registry, payload alias or disk format.
+//
+// Own-thread only. Configure once before capture, and drain receipts at the existing safe seams. An accepted handle
+// reserves one terminal slot until take_receipt consumes it. Refusing because receipts are full still attempts
+// ordinary RAM parking, never consumes publication ownership and reports backpressure synchronously.
+class ContinuationPublisher {
+public:
+    static constexpr size_t kMaxOutstanding =
+        ConversationPublicationQueue::kMaxQueued + ConversationPublicationQueue::kMaxPending;
+
+    ContinuationPublisher() = default;
+    ContinuationPublisher(const ContinuationPublisher&) = delete;
+    ContinuationPublisher& operator=(const ContinuationPublisher&) = delete;
+    void configure(strata::core::ConversationStore* store, ConversationPublicationSink sink,
+                   const char* disabled_reason = "persistence is not configured");
+
+    ConversationPublicationOwner& owner(uint64_t id) { return queue_.owner(id); }
+    const auto& queued() const noexcept { return queue_.queued(); }
+    const auto& pending() const noexcept { return queue_.pending(); }
+    auto& counters() noexcept { return queue_.counters(); }
+    const auto& counters() const noexcept { return queue_.counters(); }
+    bool holds_work() const noexcept { return queue_.holds_work(); }
+    size_t size() const noexcept { return queue_.size(); }
+
+    PublicationSubmission capture(strata::core::ConversationCache& cache,
+        strata::core::SavedConversation&& image, ConversationPublicationCapture&& entry,
+        size_t held, size_t held_entries);
+    void flush(uint64_t wait_ms);
+    size_t reconcile(uint64_t wait_ms);
+    void abandon(const char* why);
+    // Cancelling queued work releases only its ticket/lease, not any independent consumer. Admitted work remains
+    // store-owned until settlement: cancellation never promises that an active writer can be interrupted.
+    bool cancel(const PublicationHandle& handle);
+    bool take_receipt(const PublicationHandle& handle, PublicationReceipt& out) noexcept;
+    bool take_receipt(PublicationReceipt& out) noexcept;
+    PersistenceReadiness readiness() const;
+
+private:
+    struct Outcome {
+        PublicationReceipt receipt;
+        bool occupied = false;
+        bool terminal = false;
+    };
+    void complete(const PublicationReceipt& receipt) noexcept;
+
+    ConversationPublicationQueue queue_;
+    strata::core::ConversationStore* store_ = nullptr;   // borrowed; never owns store lifecycle
+    ConversationPublicationSink sink_;
+    std::array<Outcome, kMaxOutstanding> outcomes_{};
+    std::array<char, 192> last_error_{};
+    std::array<char, 192> disabled_reason_{};
 };
 
 } // namespace strata::program
