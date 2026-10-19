@@ -23,6 +23,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -136,6 +137,27 @@ struct ConversationPublicationPending {
     size_t lease_bytes = 0;
     phase::Publication phase;
 };
+// Prospective owner-neutral export only. The caller proves the private pin before splitting its checkpoint chain;
+// this decision owns no image, publication identifier, receipt, ticket or lease. Unknown costs always publish.
+struct OptionalSharedExportInput {
+    bool enabled = false;
+    bool shared_prefix = false;
+    bool continues = true;
+    bool has_checkpoints = false;
+    bool has_images = false;
+    bool private_pin = false;
+    int64_t tokens = 0;
+    std::optional<double> restore_lower_bound_ms;
+    std::optional<double> recompute_ms;
+};
+
+struct OptionalSharedExportDecision {
+    bool publish = true;
+    const char* reason = "gate_off";
+};
+
+OptionalSharedExportDecision optional_shared_export(const OptionalSharedExportInput& input) noexcept;
+
 
 // The figures `strata serve` reports at shutdown for this module.  A deferral is deliberately not one of them: the
 // store counts the verdicts it returned (`ConversationStoreCounters::deferred_publishes`), and a second copy of that
@@ -145,6 +167,7 @@ struct ConversationPublicationCounters {
     uint64_t refused = 0;     // synchronous refusals, plus settled results that created no head
     uint64_t coalesced = 0;   // results a newer capture of the same lineage displaced while it was in flight
     uint64_t dropped = 0;     // queued captures abandoned before the store ever took them
+    uint64_t optional_skips = 0; // optional shared exports withheld before any publication ownership exists
 };
 
 // The one-shot verdict for a capture the store has just handed back.  `accepted` means the store owns the bytes from

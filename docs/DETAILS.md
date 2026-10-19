@@ -1838,6 +1838,17 @@ Ordinary private validation and SYCL signatures remain separate; this transport/
 Shared publication is owner-neutral, unpinned on disk, donor-free and suppressed when an equal-or-longer exact
 record already exists. Existing private capture behavior and disk field layout are unchanged; sharing does not make
 any private scope visible to another conversation.
+`--conversation-shared-export all|value` defaults to `all` (keep publication). The experimental `value` policy
+may withhold only a new shared export with no private checkpoints/images, after a complete private checkpoint
+is proven pinned at that exact cut. It still captures and parks the immutable image in RAM. Before minting any
+publication id, receipt, ticket or lease it requires known costs with `restore_lo >= recompute`; all other cases
+keep publication with a bounded reason. `restore_lo` is the best observed exact-path/extent RAM restore, not an
+average or a guarantee of future latency; recompute uses the existing same-route prefill estimate. Both need
+process-local `--prefix-selection cost` observations; absent calibration (including resident preparation) keeps.
+The shutdown counter `optional_skips` counts only withheld exports. Private latest/root/pin, continued and
+post-shared fresh one-shot publications, explicit SAVE, existing heads and store crash ordering are unchanged.
+Omit the option, or select `all`, to roll back without a migration. No policy/default or speedup is implied.
+
 
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations

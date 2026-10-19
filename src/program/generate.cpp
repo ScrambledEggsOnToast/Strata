@@ -978,6 +978,7 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    bool conversation_shared_export_value = false; // default all: keep every durable shared export
     /// --conversation-cache-dir PATH: a private directory on the cache device. Non-empty turns on the persistent
     /// NVMe store, which also needs --conversation-cache-model-id and --conversation-cache-engine-id (verified
     /// release identities); without them persistence stays off and parking stays RAM-only.
@@ -1180,6 +1181,8 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-shared-export all|value  --serve: optional shared durable exports (default all);\n"
+                 "                       value keeps RAM and private pins; unknown restore/recompute costs keep publication\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-cache-dir PATH  --serve: a private directory on the cache device.  With the two\n"
                  "                       verified identities below, completed histories persist there and are looked up\n"
@@ -3174,6 +3177,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.prefix_min_savings_ms = number;
+        }
+        else if (a == "--conversation-shared-export") {
+            const std::string value = next("--conversation-shared-export");
+            if (value != "all" && value != "value") {
+                std::fprintf(stderr, "--conversation-shared-export needs all or value\n");
+                return 2;
+            }
+            o.conversation_shared_export_value = value == "value";
         }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -13678,6 +13689,7 @@ int main(int argc, char** argv) {
         using strata::program::PrefixTransfer;
         using strata::program::PrefixWork;
         strata::program::PrefixCosts prefix_costs;
+        std::optional<uint64_t> current_prefill_route;
         // Transfer extent, not allocation capacity. All rates stay in this process
         // and are separated by operation and the actual resolved device/K/V paths.
         auto session_work = [&](int64_t tokens, bool capture, int64_t unchanged = 0) {
@@ -13834,6 +13846,9 @@ int main(int argc, char** argv) {
         auto park_source_body = [&](const ParkSource& source, size_t held,
                                     const strata::core::SavedConversation* held_image, size_t held_entries) -> bool {
             capture_device_fault = false;   // this capture's own class, never a previous request's
+            // Serial shared exports pass no_checks below: their proof comes from
+            // the real working chain, just as resident exports use their owner.
+            const auto& private_checks = source.resident ? source.resident->checkpoints : checks;
             const auto& live = source.tokens;
             const auto& live_imgs = source.images;
             auto& checks = source.checkpoints;
@@ -13965,6 +13980,24 @@ int main(int argc, char** argv) {
                     v.draft_boundary_position = -1; v.draft_boundary_owner = 0;
                 }
             };
+            strata::program::OptionalSharedExportInput optional_export{
+                .enabled = o.conversation_shared_export_value,
+                .shared_prefix = source.shared_prefix, .continues = source.continues,
+                .has_checkpoints = !checks.empty(), .has_images = !live_imgs.empty(),
+                .tokens = int64_t(live.size())};
+            // Prove the complete private cut BEFORE any stage split moves its
+            // parts. A requested pin (or failed serial pin_checkpoint) is not proof.
+            if (optional_export.enabled && source.shared_prefix && !source.continues && o.prompt_cache >= 3)
+                for (const auto& cut : private_checks) {
+                    if (!cut.pinned || cut.ids != live || !cut.imgs.empty() ||
+                        cut.stage_parts.size() != n_st) continue;
+                    std::string why;
+                    bool complete = strata::core::conversation_checkpoint_validate(cut, session_at(0), g, why);
+                    for (size_t k = 0; complete && k < n_st; ++k)
+                        complete = cut.stage_parts[k].ids == live && cut.stage_parts[k].imgs.empty() &&
+                            strata::core::conversation_checkpoint_validate(cut.stage_parts[k], session_at(k + 1), g, why);
+                    if (complete) { optional_export.private_pin = true; break; }
+                }
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st,
                 strata::core::ConversationCheckpointRetention::parked_history); // allocation failure leaves checks whole
@@ -14194,9 +14227,29 @@ int main(int argc, char** argv) {
                 bool stored = false;
                 bool publication_attempted = false;
                 publication_outside_bytes = image.bytes() <= UINT64_MAX - held ? held + image.bytes() : UINT64_MAX;
-                if (store_on && valid_image(image, source.shared_prefix ?
-                        strata::core::ConversationSnapshotExpectation::exact_cut :
-                        strata::core::ConversationSnapshotExpectation::ordinary)) {
+                const bool publication_valid = store_on && valid_image(image, source.shared_prefix ?
+                    strata::core::ConversationSnapshotExpectation::exact_cut :
+                    strata::core::ConversationSnapshotExpectation::ordinary);
+                strata::program::OptionalSharedExportDecision optional_decision;
+                if (publication_valid && source.shared_prefix) {
+                    if (optional_export.enabled && optional_export.private_pin && !source.resident &&
+                        o.prefix_cost_selection && current_prefill_route) {
+                        optional_export.restore_lower_bound_ms = prefix_costs.transfer_lower_bound_ms(
+                            PrefixTransfer::parked, session_work(int64_t(live.size()), false));
+                        optional_export.recompute_ms = prefix_costs.prefill_ms(
+                            0, int64_t(live.size()), false, *current_prefill_route);
+                    }
+                    optional_decision = strata::program::optional_shared_export(optional_export);
+                    if (!optional_decision.publish) ++publications.counters().optional_skips;
+                    std::fprintf(stderr, "strata serve: conversation store: optional shared export decision=%s "
+                        "reason=%s cut=%zu bytes=%zu private_pin=%d restore_lo_ms=%.6f recompute_ms=%.6f\n",
+                        optional_decision.publish ? "keep" : "skip", optional_decision.reason, live.size(), image.bytes(),
+                        int(optional_export.private_pin), optional_export.restore_lower_bound_ms.value_or(-1.0),
+                        optional_export.recompute_ms.value_or(-1.0));
+                }
+                // A skip must precede even the ticket mint: facade capture also
+                // reserves a receipt and publication id before queue admission.
+                if (publication_valid && optional_decision.publish) {
                     store_admission.publish(image.bytes());
                     flush_publishes(0);
                     const StoreOwner* owner = source.shared_prefix ? nullptr : &store_owner(source.owner);
@@ -15986,7 +16039,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "conversation_cache_persist=%d conversation_cache_disk_mib=%lld "
-                        "conversation_cache_disk_heads=%lld "
+                        "conversation_cache_disk_heads=%lld conversation_shared_export=%s "
                         "tail_role_token=%lld vram_elastic=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
@@ -16002,7 +16055,7 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         int(persistence_configured), (long long) o.conversation_cache_disk_mib,
-                        (long long) o.conversation_cache_disk_heads,
+                        (long long) o.conversation_cache_disk_heads, o.conversation_shared_export_value ? "value" : "all",
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
                         // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
@@ -20163,6 +20216,7 @@ int main(int argc, char** argv) {
                 (uint64_t(want_cvec) << 16) | (uint64_t(geni) << 17);
             const bool cost_observations = o.prefix_cost_selection &&
                 std::getenv("STRATA_CKPT_REREAD") == nullptr && pipe_dbg_env("STRATA_PIPELINE_SWITCH") == nullptr;
+            current_prefill_route = cost_observations ? std::optional<uint64_t>(prefill_route) : std::nullopt;
             const PrefixWork outgoing_work = yielded_source < 0 && live_ok && live_scope.valid() && conversations.enabled()
                 ? session_work((int64_t) live.size(), true, conversations.unchanged_tokens()) : PrefixWork{};
             int64_t cost_first_turn = -1, cost_previous_turn = -1, cost_last_turn = -1;
@@ -23891,7 +23945,7 @@ int main(int argc, char** argv) {
                                  "misses=%llu evictions=%llu bytes_written=%llu bytes_read=%llu orphan_bytes=%llu "
                                  "pending_delete_bytes=%llu corrupt_records=%llu epoch_advances=%llu; engine: restored=%llu "
                                  "prefetched=%llu suppressed_prefetches=%llu published_results=%llu skipped=%llu "
-                                 "coalesced_results=%llu cancelled=%llu abandoned=%llu\n",
+                                 "coalesced_results=%llu cancelled=%llu abandoned=%llu optional_skips=%llu\n",
                              int(conversation_store->enabled()), int(conversation_store->healthy()),
                              int(conversation_store->run_intent_active()),
                              (unsigned long long) c.heads, (unsigned long long) c.pinned_heads,
@@ -23912,7 +23966,8 @@ int main(int argc, char** argv) {
                              (unsigned long long) publications.counters().refused,
                              (unsigned long long) publications.counters().coalesced,
                              (unsigned long long) store_cancelled,
-                             (unsigned long long) publications.counters().dropped);
+                             (unsigned long long) publications.counters().dropped,
+                             (unsigned long long) publications.counters().optional_skips);
         }
         phase_drain();
         if (causal_requested && !strata::core::Verifier::causal_capture_complete()) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -317,6 +318,21 @@ bool ConversationPublicationQueue::shared_prefix_exists(strata::core::Conversati
     });
     return exists;
 }
+OptionalSharedExportDecision optional_shared_export(const OptionalSharedExportInput& input) noexcept {
+    if (!input.enabled) return {true, "gate_off"};
+    if (!input.shared_prefix || input.continues || input.has_checkpoints || input.has_images || input.tokens <= 0)
+        return {true, "not_optional_shared_export"};
+    if (!input.private_pin) return {true, "private_pin_not_proven"};
+    if (!input.restore_lower_bound_ms || !std::isfinite(*input.restore_lower_bound_ms) ||
+        *input.restore_lower_bound_ms < 0)
+        return {true, "unknown_restore_cost"};
+    if (!input.recompute_ms || !std::isfinite(*input.recompute_ms) || *input.recompute_ms <= 0)
+        return {true, "unknown_recompute_cost"};
+    return *input.restore_lower_bound_ms >= *input.recompute_ms
+        ? OptionalSharedExportDecision{false, "restore_not_cheaper"}
+        : OptionalSharedExportDecision{true, "reuse_pays"};
+}
+
 
 size_t ConversationPublicationQueue::retire(uint64_t retired_head, uint64_t epoch) {
     if (retired_head == 0) return 0;

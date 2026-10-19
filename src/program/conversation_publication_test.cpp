@@ -5,6 +5,7 @@
 // stand-in that would agree with whatever the handover happened to decide.
 #include "strata/program/conversation_publication.hpp"
 #include "strata/program/conversation_store_admission.hpp"
+#include "strata/program/prefix_selection.hpp"
 
 #include "conversation_store_format.hpp"
 #include "conversation_store_sha256.hpp"
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <dirent.h>
 #include <memory>
+#include <limits>
 #include <new>
 #include <optional>
 #include <string>
@@ -38,6 +40,8 @@ using strata::program::ContinuationPublisher;
 using strata::program::PublicationHandle;
 using strata::program::PublicationReceipt;
 using strata::program::PublicationStatus;
+using strata::program::OptionalSharedExportInput;
+using strata::program::optional_shared_export;
 using conversation_store_detail::images_equal;
 
 int failures = 0;
@@ -60,6 +64,52 @@ void check_eq(uint64_t got, uint64_t want, const char* what) {
         std::fprintf(stderr, "FAIL: %s (got %llu, want %llu)\n", what, (unsigned long long) got,
                      (unsigned long long) want);
     }
+}
+
+void check_optional_shared_export_predicate() {
+    const OptionalSharedExportInput eligible{
+        .enabled = true, .shared_prefix = true, .continues = false, .private_pin = true, .tokens = 64,
+        .restore_lower_bound_ms = 4.0, .recompute_ms = 2.0};
+    const auto expect = [](const OptionalSharedExportInput& input, bool publish, const char* reason) {
+        const auto result = optional_shared_export(input);
+        check(result.publish == publish && std::strcmp(result.reason, reason) == 0,
+              reason);
+    };
+    auto input = eligible;
+    input.enabled = false; expect(input, true, "gate_off");
+    input = eligible; input.shared_prefix = false; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.continues = true; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.has_checkpoints = true; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.has_images = true; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.tokens = 0; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.tokens = -1; expect(input, true, "not_optional_shared_export");
+    input = eligible; input.private_pin = false; expect(input, true, "private_pin_not_proven");
+    input = eligible; input.restore_lower_bound_ms.reset(); expect(input, true, "unknown_restore_cost");
+    input = eligible; input.recompute_ms.reset(); expect(input, true, "unknown_recompute_cost");
+    for (const double invalid : {-1.0, std::numeric_limits<double>::infinity(),
+                                 std::numeric_limits<double>::quiet_NaN()}) {
+        input = eligible; input.restore_lower_bound_ms = invalid; expect(input, true, "unknown_restore_cost");
+        input = eligible; input.recompute_ms = invalid; expect(input, true, "unknown_recompute_cost");
+    }
+    input = eligible; input.recompute_ms = 0.0; expect(input, true, "unknown_recompute_cost");
+    input = eligible; input.restore_lower_bound_ms = 0.0; expect(input, true, "reuse_pays");
+    input = eligible; input.restore_lower_bound_ms = 1.0; expect(input, true, "reuse_pays");
+    input = eligible; input.restore_lower_bound_ms = 2.0; expect(input, false, "restore_not_cheaper");
+    expect(eligible, false, "restore_not_cheaper");
+
+    using strata::program::PrefixCosts;
+    using strata::program::PrefixTransfer;
+    PrefixCosts costs;
+    const strata::program::PrefixWork work{1024, 7};
+    check(!costs.transfer_lower_bound_ms(PrefixTransfer::parked, work), "absent restore observation keeps unknown");
+    costs.transfer(PrefixTransfer::parked, work, 8.0);
+    costs.transfer(PrefixTransfer::parked, work, 2.0);
+    check(costs.transfer_lower_bound_ms(PrefixTransfer::parked, work) == 2.0,
+          "restore lower envelope is the best exact observation, not the average");
+    check(!costs.transfer_lower_bound_ms(PrefixTransfer::parked, {1024, 8}),
+          "restore route mismatch stays unknown");
+    check(!costs.transfer_lower_bound_ms(PrefixTransfer::parked, {2048, 7}),
+          "a scaled transfer estimate is not an observed restore lower envelope");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -965,6 +1015,9 @@ void check_bounded_capture_persists_the_newest_all_stage_frontier() {
              "the old refusal path loses the newest RAM-only cut under real cache pressure");
     check(old_admission.evictions() != 0, "the reproduction exercised actual cache eviction, not only an arithmetic helper");
 
+    check(optional_shared_export({.enabled=true, .continues=true, .private_pin=true,
+          .tokens=int64_t(newest.live.ids.size()), .restore_lower_bound_ms=4.0, .recompute_ms=2.0}).publish,
+          "value policy never withholds the continued private newest/root/pin publication");
     check(capture_image(publications, sink, 0, 2, root_head, true, newest, store.epoch()),
           "the repaired transition queues the newer complete frontier without the second image reservation");
     check_eq(publications.queued().size(), 1, "the newer frontier has a bounded metadata owner");
@@ -1187,6 +1240,9 @@ void check_shared_borrow_and_owner_neutral_publication() {
     auto after_entry = capture_of(0, publications.owner(0).generation + 1, private_head, true,
                                   after, store.epoch(), ++sink.next_ticket);
     after_entry.reuse.push_back({private_head, {0, uint16_t(ConversationStoreStreamKind::kv_k), 0, 0}, 0, 0, 64});
+    check(optional_shared_export({.enabled=true, .continues=false, .private_pin=true,
+          .tokens=int64_t(after.live.ids.size()), .restore_lower_bound_ms=4.0, .recompute_ms=2.0}).publish,
+          "post-shared force_fresh one-shot is private, never an optional shared export");
     check(publications.capture(sink.cache, std::move(after), std::move(after_entry),
                                size_t(store.ram_held_bytes()), 0, sink.out).queued,
           "the post-shared private state is captured even with a stale private donor hint");
@@ -1703,6 +1759,62 @@ void settle(ContinuationPublisher& publisher) {
         publisher.flush(20);
     check(!publisher.holds_work(), "facade work settles within the bounded CPU fixture");
 }
+void check_optional_shared_export_parks_without_capture() {
+    TempRoot root;
+    auto image = stored_record(321, 64);
+    image.checkpoints.clear();
+    image.freeze();
+    const size_t image_bytes = image.bytes();
+    ConversationStore store(options_for(root.path));
+    const size_t held = size_t(store.ram_held_bytes());
+    // Enough for the ordinary immutable image, deliberately not the production
+    // 64 MiB protected-publication headroom.
+    Sink sink(store, held + image_bytes + 4096, 2, size_t(64) << 20);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    const auto before = store.counters();
+    const auto decision = optional_shared_export({.enabled=true, .shared_prefix=true, .continues=false,
+        .private_pin=true, .tokens=64, .restore_lower_bound_ms=4.0, .recompute_ms=2.0});
+    bool parked = false;
+    if (decision.publish) {
+        auto entry = capture_of(UINT64_MAX, 1, 0, false, image, store.epoch(), ++sink.next_ticket);
+        entry.shared_prefix = true;
+        parked = publisher.capture(sink.cache, std::move(image), std::move(entry), held, 0).parked;
+    } else {
+        ++publisher.counters().optional_skips;
+        sink.refresh_allowance();
+        parked = sink.cache.put(std::move(image), held);
+    }
+    check(parked && sink.cache.size() == 1, "skipped durable export still takes the ordinary RAM park path");
+    check_eq(sink.cache.envelope_bytes(), image_bytes, "ordinary park charges only its image, not 64 MiB headroom");
+    check_eq(sink.cache.evictions(), 0, "ordinary optional park spends no other conversation");
+    check_eq(sink.next_id, 0, "skip never mints a publication id");
+    check_eq(sink.next_ticket, 0, "skip precedes capture ticket allocation");
+    check_eq(sink.acquisitions, 0, "skip never acquires an image lease");
+    check_eq(sink.cache.leased_bytes(), 0, "ordinary parked bytes are not leased publication bytes");
+    sink.cache.for_each_image([&](size_t, const auto& saved) {
+        check(saved.publication_ticket == 0, "RAM export has no protected publication ticket");
+        auto prompt = saved.live.ids;
+        prompt.push_back(98765);
+        const auto selected = sink.cache.best(prompt, {}, saved.cvec, saved.scope);
+        check(selected.tokens == 64, "shared selector still finds the RAM-only exact prefix");
+    });
+    const auto ready = publisher.readiness();
+    check(!publisher.holds_work() && !ready.outstanding && !ready.receipts,
+          "skip reserves neither facade ownership nor a terminal receipt");
+    const auto after = store.counters();
+    check(after.heads == before.heads && after.objects == before.objects && after.manifests == before.manifests &&
+          after.bytes_written == before.bytes_written, "skip creates no head, object, manifest or durable bytes");
+    check_eq(publisher.counters().optional_skips, 1, "only the explicit optional skip counter advances");
+    check(!publisher.counters().published && !publisher.counters().refused &&
+          !publisher.counters().coalesced && !publisher.counters().dropped,
+          "skip is neither a refusal, coalescing nor a durability drop");
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check(reopened.enabled() && reopened.counters().heads == 0, "clean reopen invents no skipped shared head");
+    reopened.close();
+}
+
 
 void check_facade_receipts_and_identity() {
     TempRoot root;
@@ -1994,6 +2106,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "conversation_publication_test: readiness %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
     }
+    check_optional_shared_export_predicate();
+    check_optional_shared_export_parks_without_capture();
     check_store_readiness_fault_reason();
     check_facade_receipts_and_identity();
     check_facade_cancel_with_consumers();

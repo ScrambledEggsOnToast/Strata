@@ -45,6 +45,17 @@ public:
         if (!count) return {};
         return rate / double(count) * double(work.bytes);
     }
+    // Empirical lower envelope, not the averaged/scaled selection estimate above.
+    // Only an exact observed extent/path qualifies; absent calibration stays unknown.
+    std::optional<double> transfer_lower_bound_ms(PrefixTransfer kind, PrefixWork work) const {
+        if (!work.bytes || work.bytes == UINT64_MAX) return {};
+        std::optional<double> best;
+        for (const auto& sample : transfers_[size_t(kind)].samples)
+            if (sample.work.bytes == work.bytes && sample.work.route == work.route &&
+                valid(sample.ms) && (!best || sample.ms < *best))
+                best = sample.ms;
+        return best;
+    }
     void prefill(int64_t begin, int64_t end, bool windows, double ms, uint64_t route = 0) {
         if (begin < 0 || end <= begin || !valid(ms)) return;
         auto& rate = prefill_[windows ? 1 : 0][bucket(end)];
