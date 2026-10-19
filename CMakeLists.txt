@@ -1585,6 +1585,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(decode_service_test tests/program/decode_service_test.cpp)
   target_include_directories(decode_service_test PRIVATE include)
   add_test(NAME decode_service_test COMMAND decode_service_test)
+  # one certified committed cut across token history, QSA/GDN/PLE/stages, with draft readiness separate
+  add_executable(continuation_test tests/program/continuation_test.cpp)
+  target_include_directories(continuation_test PRIVATE include)
+  add_test(NAME continuation_test COMMAND continuation_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

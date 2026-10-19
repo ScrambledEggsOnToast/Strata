@@ -196,6 +196,62 @@ bool ResidentSlots::owns(int slot, uint64_t request, uint64_t incarnation) const
     return identity(slot).owns(request, incarnation);
 }
 
+ContinuationCertificate ResidentSlots::certify_continuation(int slot, const core::ConversationCheckpoint* cut,
+        uint64_t expected_request, uint64_t expected_incarnation, std::string* error) const {
+    ContinuationInput in;
+    if (slot < 0 || (size_t) slot >= slots_.size() || stages_.empty()) {
+        if (error) *error = "continuation: unbound seat";
+        return {};
+    }
+    const auto& state = slots_[(size_t) slot];
+    in.request = state.request;
+    in.incarnation = state.incarnation;
+    in.expected_request = expected_request;
+    in.expected_incarnation = expected_incarnation;
+    in.committed_tokens = (int64_t) state.ids.size();
+    in.cut_tokens = cut ? (int64_t) cut->ids.size() : -1;
+    in.cut_is_live_prefix = !cut || (cut->ids.size() <= state.ids.size() &&
+        std::equal(cut->ids.begin(), cut->ids.end(), state.ids.begin()));
+    // Resident images are not parkable; text cuts are certified here.
+    in.live_images = 0;
+    in.cut_images = 0;
+    in.needs_qsa = geometry_.n_qsa_layers() > 0;
+    in.has_qsa = std::any_of(stages_.begin(), stages_.end(), [slot](const ResidentStage& stage) {
+        return (size_t) slot < stage.slots.size() && stage.slots[(size_t) slot] &&
+               stage.slots[(size_t) slot]->qsa_alloc > 0;
+    });
+    in.needs_gdn = geometry_.n_gdn_layers() > 0;
+    in.has_gdn = stages_[0].main && stages_[0].main->gdn_state != nullptr;
+    in.needs_ple = stages_[0].main && stages_[0].main->ple_hist != nullptr;
+    in.has_ple = in.needs_ple;
+    in.needs_stages = stages_.size() > 1;
+    in.has_stages = std::all_of(stages_.begin(), stages_.end(), [slot](const ResidentStage& stage) {
+        return (size_t) slot < stage.slots.size() && stage.slots[(size_t) slot] != nullptr;
+    });
+    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : nullptr;
+    if (draft) {
+        const int64_t frontier = draft_.slot_resume_frontier(slot, in.committed_tokens);
+        if (draft_.slot_covers(slot, frontier)) {
+            in.draft_present = true;
+            in.draft_begin = draft_.slot_begin(slot);
+            in.draft_end = std::max(frontier, in.draft_begin);
+            in.draft_frontier = frontier;
+            in.draft_boundary = draft_.slot_next_token(slot);
+            in.token_at_frontier = frontier < (int64_t) state.ids.size()
+                ? state.ids[(size_t) frontier] : in.draft_boundary;
+        }
+    }
+    ContinuationCertificate certificate = ::strata::program::certify_continuation(in);
+    if (std::getenv("STRATA_CONTINUATION_TRACE"))
+        std::fprintf(stderr, "CONTINUATION slot=%d certified=%d reason=%s request=%llu incarnation=%llu "
+                             "committed=%lld cut=%lld draft=%d\n", slot, int(certificate.certified),
+                     certificate.reason(), (unsigned long long) certificate.request,
+                     (unsigned long long) certificate.incarnation, (long long) certificate.committed_tokens,
+                     (long long) certificate.valid_end, int(certificate.draft_ready));
+    if (!certificate.certified && error) *error = std::string("continuation: ") + certificate.reason();
+    return certificate;
+}
+
 bool ResidentSlots::retained(int slot) const {
     return resources_ != Resources::failed && slot >= 0 && (size_t) slot < slots_.size() &&
            !slots_[(size_t) slot].active && !slots_[(size_t) slot].preparing && !slots_[(size_t) slot].failed &&
@@ -1067,8 +1123,12 @@ std::optional<ResidentSnapshotSource> ResidentSlots::completed_snapshot_source(i
     if (draft_.kv_state().max_cells > 0 && !draft) {
         error = "resident snapshot: missing draft state"; return std::nullopt;
     }
-    return ResidentSnapshotSource{source, stages_, draft, slot, draft ? draft_.slot_begin(slot) : 0,
+    const auto certificate = certify_continuation(slot, nullptr, 0, 0, &error);
+    if (!certificate.certified) return std::nullopt;
+    ResidentSnapshotSource result{source, stages_, draft, slot, draft ? draft_.slot_begin(slot) : 0,
         draft ? draft_.slots_[size_t(slot)].completed_cells : 0, draft ? draft_.slot_next_token(slot) : -1};
+    result.certificate = certificate;
+    return result;
 }
 
 std::optional<ResidentSnapshotSource> ResidentSlots::prepared_snapshot_source(
@@ -1096,9 +1156,13 @@ std::optional<ResidentSnapshotSource> ResidentSlots::prepared_snapshot_source(
             error = "resident prepared snapshot: incoherent draft owner or interval"; return std::nullopt;
         }
     }
-    return ResidentSnapshotSource{source, stages_, draft, lease.slot, draft ? draft_.slot_begin(lease.slot) : 0,
+    const auto certificate = certify_continuation(lease.slot, nullptr, lease.request, lease.incarnation, &error);
+    if (!certificate.certified) return std::nullopt;
+    ResidentSnapshotSource result{source, stages_, draft, lease.slot, draft ? draft_.slot_begin(lease.slot) : 0,
         draft ? draft_.slots_[(size_t) lease.slot].completed_cells : 0,
         draft ? draft_.slot_next_token(lease.slot) : -1};
+    result.certificate = certificate;
+    return result;
 }
 
 bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* checkpoint,

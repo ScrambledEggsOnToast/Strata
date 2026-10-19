@@ -3,6 +3,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/program/prefix_selection.hpp"
+#include "strata/program/continuation.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -111,6 +112,8 @@ public:
     const core::QsaState* draft;
     const int64_t draft_begin, draft_cells;
     const int32_t draft_next_token;
+    // The certified committed cut this source may publish. Speculative scratch is not part of it.
+    ContinuationCertificate certificate;
 
     const core::SessionState& session(size_t stage) const {
         return *stages_[stage].slots[(size_t) slot_];
@@ -198,6 +201,12 @@ public:
     // Read-only wire identity; nonexistent seats return an unbound identity.
     ResidentIdentity identity(int slot) const;
     bool owns(int slot, uint64_t request, uint64_t incarnation) const;
+    // One committed cut across token history and every required state family, with draft readiness separate.
+    // expected_* nonzero requires the cut to belong to that generation (a stale generation is refused).
+    ContinuationCertificate certify_continuation(int slot, const core::ConversationCheckpoint* cut = nullptr,
+                                                 uint64_t expected_request = 0,
+                                                 uint64_t expected_incarnation = 0,
+                                                 std::string* error = nullptr) const;
     // Diagnostic only: the next resume_work refuses as a stale generation. Used to exercise the
     // request-local continuation refusal and peer isolation on device; never set by a normal caller.
     void inject_stale_continuation() { stale_continuation_ = true; }
