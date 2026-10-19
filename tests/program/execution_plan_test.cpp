@@ -63,6 +63,16 @@ int main() {
         check(has(json, "\"suspension\":{\"mode\":\"resend\""), "the JSON report carries the suspension mode");
     }
     {
+        ep::ExecutionPlan p = ep::resolve_execution_plan(resident_batch());
+        p.memory_classes.push_back({"CUDA0", "expert_cache", "profile", 123456, false});
+        p.memory_classes.push_back({"host", "physical_host_snapshot", "unmeasured", 0, true});
+        const std::string json = p.to_json();
+        check(has(json, "\"memory_classes\":[{\"scope\":\"CUDA0\",\"name\":\"expert_cache\""),
+              "the report carries the priced device classes");
+        check(has(json, "\"bytes\":123456") && has(json, "\"unknown\":true"),
+              "unknown classes keep their name and no invented byte estimate");
+    }
+    {
         ep::ExecutionPlanInput in;
         in.serve = true;
         in.batch_requested = 2;

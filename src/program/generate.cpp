@@ -3956,7 +3956,7 @@ int main(int argc, char** argv) {
     // The selected execution contract, resolved once after the split is known. Its effective speculation widths
     // replace the later suffix/lookup sizing, its budget decision replaces the duplicate prerequisite gate, and the
     // same values are reported before READY. Slot fit and runtime source checks stay conditional by construction.
-    const strata::program::ExecutionPlan execution_plan =
+    strata::program::ExecutionPlan execution_plan =
         strata::program::resolve_execution_plan(plan_input(multi_gpu ? (int) split_devs.size() : 0));
     if (execution_plan.budget.support == strata::program::Support::refused) {
         std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
@@ -6461,6 +6461,15 @@ int main(int argc, char** argv) {
         }
         auto startup_admission = strata::plan::admit_configuration(devs, tels, startup, startup_host, policy, "cold");
         auto runtime_admission = strata::plan::admit_configuration(devs, tels, guest, host, policy, "cold");
+        // The plan carries the prices admission actually used: one device scope per stage, then the guest and host
+        // scopes. Unknown classes keep their name and no byte estimate; nothing here re-prices or infers a value.
+        for (size_t i = 0; i < devs.size(); ++i)
+            for (const auto& c : devs[i].vram.classes)
+                execution_plan.memory_classes.push_back({devs[i].name, c.name, c.source, c.bytes, c.unknown});
+        for (const auto& c : guest.classes)
+            execution_plan.memory_classes.push_back({"guest", c.name, c.source, c.bytes, c.unknown});
+        for (const auto& c : host.classes)
+            execution_plan.memory_classes.push_back({"host", c.name, c.source, c.bytes, c.unknown});
         // Both phases must fit. Preserve the first phase's root failure; otherwise report the larger guest envelope.
         admission = !startup_admission.admitted || (runtime_admission.admitted && startup_peak >= runtime_peak)
             ? std::move(startup_admission) : std::move(runtime_admission);

@@ -44,6 +44,16 @@ struct ExecutionPlanInput {
     bool judge_lane = false, spec_split = false, prefill_pipe = false;
 };
 
+// One admitted memory class, as priced by the admission decision's scope. `unknown` classes carry no byte
+// estimate and are never summed; `source` names where a price came from.
+struct PricedClass {
+    std::string scope;    ///< "CUDA0", "guest" or "host"
+    std::string name;
+    std::string source;
+    uint64_t bytes = 0;
+    bool unknown = false;
+};
+
 struct ExecutionPlan {
     bool refused = false;
     std::string refusal;             ///< the reason the engine must exit before allocating
@@ -61,6 +71,7 @@ struct ExecutionPlan {
     PlanDecision budget;
     PlanDecision concurrent_reader;
     PlanDecision suspension;         ///< on == the request keeps its seat without a resend
+    std::vector<PricedClass> memory_classes;  ///< filled after admission; empty before allocation
     std::vector<std::string> notes;
     std::string to_json() const;
 };
@@ -307,6 +318,17 @@ inline std::string ExecutionPlan::to_json() const {
     out += ",\"reason\":";
     out += detail::json_quote(suspension.reason);
     out += '}';
+    out += ",\"memory_classes\":[";
+    for (size_t i = 0; i < memory_classes.size(); ++i) {
+        const PricedClass& c = memory_classes[i];
+        if (i) out += ',';
+        out += "{\"scope\":" + detail::json_quote(c.scope) +
+               ",\"name\":" + detail::json_quote(c.name) +
+               ",\"bytes\":" + std::to_string(c.bytes) +
+               ",\"unknown\":" + (c.unknown ? "true" : "false") +
+               ",\"source\":" + detail::json_quote(c.source) + '}';
+    }
+    out += ']';
     out += ",\"refused\":" + std::string(refused ? "true" : "false");
     out += ",\"refusal\":" + detail::json_quote(refusal);
     out += ",\"notes\":[";
