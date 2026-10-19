@@ -31,6 +31,24 @@ int main() {
     auto check = [&](bool ok, const char* message) {
         if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
     };
+    check(slots.identity(0).request == 0 && slots.identity(0).incarnation == 0 &&
+          slots.identity(-1).request == 0 && slots.identity(2).request == 0,
+          "unbound and nonexistent seats expose no request identity");
+    check(!slots.owns(0, 0, 0) && !slots.owns(0, 17, 2) &&
+          !slots.owns(-1, 17, 2) && !slots.owns(2, 17, 2),
+          "an unbound or nonexistent seat cannot own a cancellation");
+    {
+        // The production accessor's value comparison is pure; binding a live verifier needs a device.
+        const program::ResidentIdentity first{17, 2}, continued{17, 3}, successor{18, 4};
+        check(first.owns(17, 2), "a bound identity recognizes its exact request and seat incarnation");
+        check(!first.owns(18, 2) && !first.owns(17, 3) && !first.owns(0, 2) && !first.owns(17, 0),
+              "request, incarnation and unbound controls cannot match another owner");
+        check(continued.owns(17, 3) && !continued.owns(17, 2) &&
+              successor.owns(18, 4) && !successor.owns(17, 3),
+              "rebind and slot reuse reject the old incarnation even when the request continues");
+        check(!program::ResidentIdentity{}.owns(0, 0) && !program::ResidentIdentity{0, 4}.owns(0, 4),
+              "request zero always means unbound, including after a seat has been retired");
+    }
     const core::GraphCaptureProbe disabled_probe({"resident-default", "no-observer"});
     for (const auto phase : {core::GraphCapturePhase::BeforeCapture, core::GraphCapturePhase::AfterCapture,
                             core::GraphCapturePhase::AfterInstantiate, core::GraphCapturePhase::AfterUpload,
@@ -182,6 +200,8 @@ int main() {
     check(slots.slots()[0].request == 0 && !slots.slots()[0].active &&
           slots.slots()[0].ids.empty() && dispatch.slot_requests[0] == 0,
           "refused admission publishes no request identity or history");
+    check(slots.identity(0).request == 0 && !slots.owns(0, 0, slots.identity(0).incarnation),
+          "refused admission cannot publish an identity or match an unbound cancellation");
     check(!slots.init_resources(error), "uninitialized verifier cannot create resident resources");
     check(!slots.admit(1, prefix, request, error) && slots.slots()[1].request == 0,
           "failed resource initialization cannot expose another ready slot");

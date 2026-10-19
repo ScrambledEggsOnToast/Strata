@@ -1109,12 +1109,14 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.resolved_plan = None        # EPLAN: the engine's resolved execution contract (requested vs effective)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
         self.last_err = None
+        self._ignored_bdone = collections.deque(maxlen=32)  # bounded stale-terminal diagnostics, never request results
         # Admission ownership is server-lifetime state. A restart must retain each
         # FIFO entry's identity and the condition/lock on which it is waiting.
         if "slot_cv" not in self.__dict__:
@@ -1216,6 +1218,8 @@ class StrataEngine:
                         self.info["admission_admitted"] = v == "1"
                     elif k == "limiting":
                         self.info["admission_limiting"] = v
+            if line.startswith("EPLAN "):                # the resolved execution contract (requested vs effective)
+                self._record_resolved_plan(line)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -1304,6 +1308,7 @@ class StrataEngine:
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        self._slot_identity: list[tuple[int, int] | None] = [None] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots synchronously draining their BDONE. A busy slot in neither has no owner
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
@@ -2001,6 +2006,7 @@ class StrataEngine:
                 self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
+                self._record_badm(f, slot)
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
@@ -2055,14 +2061,50 @@ class StrataEngine:
                 self._yielded = (int(fields[1]), int(fields[2]))
             if line.startswith("DONE"):
                 self._parse_done(line, slot=slot)
+            if line.startswith("BADM "):
+                self._record_badm(line.split(), slot)
             if line.startswith(("ERR", "REJECT")):
                 raise self._silent("engine refused while draining: " + line.strip())
             if line.startswith(until):
                 return line
         raise self._silent(f"the engine did not acknowledge {until} within {timeout:g} s")
 
-    def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms> [draft_accepted=N draft_offered=N]` for this slot's request."""
+    def _record_resolved_plan(self, line: str) -> None:
+        """EPLAN: the engine's resolved contract. A malformed report is ignored rather than failing readiness."""
+        try:
+            parsed = json.loads(line[len("EPLAN "):])
+        except ValueError:
+            return
+        if isinstance(parsed, dict):
+            self.resolved_plan = parsed
+
+    @staticmethod
+    def _resident_identity(fields: list[str]) -> tuple[int, int] | None:
+        values = dict(field.split("=", 1) for field in fields if "=" in field)
+        if "request" not in values or "incarnation" not in values:
+            return None  # older engines omit the identity entirely
+        return int(values["request"]), int(values["incarnation"])
+
+    def _record_badm(self, fields: list[str], slot: int | None) -> None:
+        if slot is not None and 0 <= slot < len(getattr(self, "_slot_identity", [])):
+            identity = self._resident_identity(fields[3:])
+            self._slot_identity[slot] = identity if identity and identity[0] else None
+
+    def _send_bstop(self, slot: int, identity: tuple[int, int] | None) -> None:
+        suffix = f" {identity[0]} {identity[1]}" if identity is not None else ""
+        self._send(f"BSTOP {slot}{suffix}")
+
+    def _bdone_matches(self, fields: list[str], expected: tuple[int, int] | None) -> bool:
+        identity = self._resident_identity(fields[5:])
+        if expected is not None and identity is not None and identity != expected:
+            self._ignored_bdone.append({"slot": int(fields[1]), "expected": expected, "received": identity})
+            return False
+        return True
+
+    def _apply_bdone(self, f: list[str], expected: tuple[int, int] | None) -> bool:
+        """Apply one matching legacy terminal; optional identity fields fence a reused physical slot."""
+        if not self._bdone_matches(f, expected):
+            return False
         if len(f) >= 5 and isinstance(self.last, dict):
             admission = _native_leg("admission", self.last, int(f[1]))
             counters = dict(field.split("=", 1) for field in f[5:] if "=" in field)
@@ -2074,15 +2116,17 @@ class StrataEngine:
             work = getattr(getattr(self, "_tl", None), "native_work", None)
             if work is not None:
                 work.batch_done(self.last)
+        return True
 
     def _bdone_after_eos(self, slot: int, owner, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window). Read it here, so the request's figures are the slot leg's (the synchronous release would eat it,
         and the request kept the admission's single token). None when it does not come in `wait_s`: then the bounded
         synchronous release drains it."""
-        born, queues, _, _, _, _ = owner
+        born, queues, _, _, _, _, identities = owner
         if slot >= len(queues):
             return None
+        expected = identities[slot]
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
             if self.gen != born or not self.alive():
@@ -2093,7 +2137,7 @@ class StrataEngine:
                 return None
             if line is None:
                 return None
-            if line.startswith("BDONE "):
+            if line.startswith("BDONE ") and self._bdone_matches(line.split(), expected):
                 return line
         return None
 
@@ -2106,15 +2150,16 @@ class StrataEngine:
         the last are what the slot holds then (the next turn of its conversation).  The slot is in slot_releasing
         while its BDONE is waited for here, so #1603's orphan reaping never takes it.
         """
-        born, queues, busy, held, claims, releasing = owner
+        born, queues, busy, held, claims, releasing, identities = owner
         if slot >= len(queues):
             return
         q = queues[slot]
+        expected = identities[slot]
         with self.slot_cv:
             releasing.add(slot)
         try:
             if self.gen == born and self.alive():
-                self._send(f"BSTOP {slot}")
+                self._send_bstop(slot, expected)
         except EngineDied:                              # it died between the check and the line
             pass
         end = time.monotonic() + 600.0
@@ -2139,7 +2184,8 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     tail = []
             if line.startswith("BDONE "):
-                self._apply_bdone(line.split())
+                if not self._apply_bdone(line.split(), expected):
+                    continue
                 if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                     tail = []
                 break
@@ -2158,7 +2204,7 @@ class StrataEngine:
     def _park_slot(self, slot: int, owner) -> None:
         """#1994: the engine refused a BGEN for `slot`.  Keep it busy here for SLOT_PARK_S (no request owns it), then
         give it back: the engine's view has caught up, or the next refusal parks it again."""
-        _, _, busy, _, claims, releasing = owner
+        _, _, busy, _, claims, releasing, _ = owner
         with self.slot_cv:
             claims.discard(slot)
             busy[slot] = True
@@ -2545,9 +2591,11 @@ class StrataEngine:
         slot_queues, slot_busy, slot_held = self.slot_q, self.slot_busy, self.slot_held
         slot_live, slot_used = self.slot_live, self.slot_used
         slot_claims, slot_releasing = self.slot_claims, self.slot_releasing
-        slot_owner = (born, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing)
+        slot_identities = self._slot_identity
+        slot_owner = (born, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing, slot_identities)
         btrace("ctl acquired")
         gen0, reserved = None, None
+        expected_identity = None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
@@ -2597,6 +2645,7 @@ class StrataEngine:
                                     slot_busy[reserved] = True
                                     self.slot_scope[reserved] = scope
                                     slot_claims.add(reserved)
+                                    slot_identities[reserved] = None  # solo BYIELD has no identity-bearing BADM
                             if reserved is not None:
                                 self._send(f"BYIELD {reserved}")
                     for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
@@ -2685,7 +2734,9 @@ class StrataEngine:
                                     slot_queues, slot_busy, slot_held = self.slot_q, self.slot_busy, self.slot_held
                                     slot_live, slot_used = self.slot_live, self.slot_used
                                     slot_claims, slot_releasing = self.slot_claims, self.slot_releasing
-                                    slot_owner = (self.gen, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing)
+                                    slot_identities = self._slot_identity
+                                    slot_owner = (self.gen, slot_queues, slot_busy, slot_held,
+                                                  slot_claims, slot_releasing, slot_identities)
                                 holding, born = True, self.gen
                                 control_started = time.monotonic()
                     if self._yielded is not None:           # it gave way: the others waiting then go first
@@ -2724,6 +2775,7 @@ class StrataEngine:
                     if policy is not None:
                         policy.begin("batch", len(prompt), slot, transition=bool(out))
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    slot_identities[slot] = expected_identity = None  # a new admission cannot inherit the old fence
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_scope[slot] = scope
                     if callable(on_submit):
@@ -2768,6 +2820,7 @@ class StrataEngine:
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    expected_identity = slot_identities[slot]
                     phase = "slot" if cont else "none"
                     if not cont and self._yielded is not None and self._yielded[0] == slot:
                         phase = "parked"
@@ -2799,7 +2852,7 @@ class StrataEngine:
                             phase = "none"
                             raise EngineDied("the engine stopped during this batch request")
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
+                            self._send_bstop(slot, expected_identity)
                             stop_sent = True
                         yield None
                         continue
@@ -2812,18 +2865,19 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}")
+                                self._send_bstop(slot, expected_identity)
                                 stop_sent = True
                             continue
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings, len(ids) + len(out)):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                            self._send_bstop(slot, expected_identity)  # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
-                        phase = "none"
                         f = line.split()
-                        self._apply_bdone(f)
+                        if not self._apply_bdone(f, expected_identity):
+                            continue
+                        phase = "none"
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
@@ -2861,6 +2915,7 @@ class StrataEngine:
                 elif phase == "admit":
                     self._send("STOP")
                     line = self._drain_control("BADM", born=born, slot=slot)
+                    expected_identity = slot_identities[slot]
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
                 # A parked slot is inactive: BSTOP invalidates its continuation,
@@ -2869,7 +2924,7 @@ class StrataEngine:
                 if holding and self._yielded is not None and self._yielded[0] in (slot, reserved):
                     parked = self._yielded[0]
                 if parked is not None and self.gen == born and self.alive():
-                    self._send(f"BSTOP {parked}")
+                    self._send_bstop(parked, slot_identities[parked])
             except EngineDied:
                 pass
             finally:
@@ -2877,8 +2932,7 @@ class StrataEngine:
                 if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                     bd = self._bdone_after_eos(slot, slot_owner)   # (#1869) the slot's figures, not the admission's
                     if bd is not None:
-                        self._apply_bdone(bd.split())
-                        bdone_in = True
+                        bdone_in = self._apply_bdone(bd.split(), expected_identity)
                 if holding:
                     self._release_control()
                 if admit_wait:
@@ -5531,6 +5585,7 @@ class Service:
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+                  "resolved_plan": getattr(self.engine, "resolved_plan", None),
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None),
@@ -5601,6 +5656,8 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            # the engine's own resolved contract: requested vs effective speculation/groups/budget/suspension
+            "resolved_plan": getattr(self.engine, "resolved_plan", None),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},

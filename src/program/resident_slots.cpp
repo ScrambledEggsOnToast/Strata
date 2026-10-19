@@ -186,6 +186,16 @@ bool ResidentSlots::available(int slot) const {
            !slots_[(size_t) slot].active && !slots_[(size_t) slot].preparing && !slots_[(size_t) slot].failed;
 }
 
+ResidentIdentity ResidentSlots::identity(int slot) const {
+    if (slot < 0 || (size_t) slot >= slots_.size()) return {};
+    const auto& state = slots_[(size_t) slot];
+    return {state.request, state.incarnation};
+}
+
+bool ResidentSlots::owns(int slot, uint64_t request, uint64_t incarnation) const {
+    return identity(slot).owns(request, incarnation);
+}
+
 bool ResidentSlots::retained(int slot) const {
     return resources_ != Resources::failed && slot >= 0 && (size_t) slot < slots_.size() &&
            !slots_[(size_t) slot].active && !slots_[(size_t) slot].preparing && !slots_[(size_t) slot].failed &&

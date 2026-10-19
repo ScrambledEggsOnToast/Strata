@@ -774,7 +774,8 @@ function assistantMessages(m) {
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
   if (!ran.length) {
     const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    // Keep completed reasoning too: dropping it rewrites the next prompt's token prefix (#272).
+    if (m.reasoning) msg.reasoning_content = m.reasoning;
     return [msg];
   }
   const out = [];

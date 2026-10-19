@@ -78,6 +78,18 @@ def reply(ids):            # the rest of the reply after what the prompt already
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
 stopped = set()      # BSTOPped slots: they end "cancel"
+legacy_identity = "--legacy-identity" in args
+legacy_serial, legacy_owners, legacy_terminals = 0, {}, {}
+legacy_seen = set()
+def legacy_done(slot, produced, finish, counts=""):
+    identity = legacy_owners.get(slot)
+    suffix = f" request={identity[0]} incarnation={identity[1]}" if legacy_identity and identity else ""
+    terminal = f"BDONE {slot} {produced} {finish} 1.0{counts}{suffix}"
+    print(terminal, flush=True)
+    if legacy_identity:
+        legacy_terminals[slot] = terminal
+        if log:
+            log.write("TERMINAL " + terminal + "\n"); log.flush()
 # #879: a prompt with NFSOLO / NFADMIT ends its first GEN / BGEN with DONE ... nonfinite (nothing emitted); one with
 # NFSLOT ends its slot with BDONE ... nonfinite after its second token
 fired, nf_slots = set(), set()
@@ -115,7 +127,7 @@ def window():        # one batch window: every active slot one token
         left, max_new, produced = active[b]
         if b in nf_slots and produced >= 2:
             nf_slots.discard(b)
-            print(f"BDONE {b} {produced} nonfinite 1.0", flush=True)
+            legacy_done(b, produced, "nonfinite")
             del active[b]
             continue
         t = left.pop(0) if left else 257
@@ -128,7 +140,7 @@ def window():        # one batch window: every active slot one token
             stopped.discard(b)
             accepted, offered = drafts[b % len(drafts)] if drafts else (None, None)
             counts = f" draft_accepted={accepted} draft_offered={offered}" if drafts else ""
-            print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
+            legacy_done(b, produced, fin, counts)
             del active[b]
         else:
             active[b] = [left, max_new, produced]
@@ -153,7 +165,17 @@ while True:
     if line.startswith("BYIELD "):
         continue                              # too late: the read it was for has ended
     if line.startswith("BSTOP "):
-        b = int(line.split()[1])
+        fields = line.split()
+        b = int(fields[1])
+        if legacy_identity:
+            assert len(fields) == 4, "identity-aware cancellation lost its fence: " + line
+            assert tuple(map(int, fields[2:])) in legacy_seen, line
+            if log:
+                log.write(line + "\n"); log.flush()
+            if tuple(map(int, fields[2:])) != legacy_owners.get(b):
+                if log:
+                    log.write("IGNORED " + line + "\n"); log.flush()
+                continue
         parked.pop(b, None)
         if b in active:
             active[b][1] = 0
@@ -355,11 +377,21 @@ while True:
               (f" 0 0 0 0 0.0 {len(ids) - read_reused}" if READF else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
+            previous_terminal = legacy_terminals.get(slot)
+            if cont and legacy_identity:
+                legacy_serial += 1
+                legacy_owners[slot] = (legacy_serial, legacy_owners.get(slot, (0, 0))[1] + 1)
+                legacy_seen.add(legacy_owners[slot])
             if cont:
                 active[slot] = [toks[1:], max_new, 1]
             while hold_badm and os.path.exists(hold_badm):
                 time.sleep(.005)
-            print(f"BADM {slot} {1 if cont else 0}", flush=True)
+            identity = legacy_owners.get(slot) if cont and legacy_identity else None
+            suffix = f" request={identity[0]} incarnation={identity[1]}" if identity else ""
+            print(f"BADM {slot} {1 if cont else 0}{suffix}", flush=True)
+            if cont and previous_terminal and "--legacy-stale-done" in args:
+                print(previous_terminal, flush=True)
+                print(previous_terminal, flush=True)
         continue
     if line:
         print("ERR unknown " + line[:20], flush=True)
@@ -2241,6 +2273,119 @@ class ParallelService(unittest.TestCase):
         t.join(60)
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["live"]["queued"], 0)
+
+
+class LegacyRequestIdentity(unittest.TestCase):
+    """#260: the real legacy consumer and cancellation lifecycle over the scripted engine pipe."""
+    start = ParallelService.start
+    tearDown = ParallelService.tearDown
+
+    def force_slot(self, more=()):
+        self.start(2, more=("--legacy-identity", *more))
+        self.engine.slot_busy[1] = True
+        self.engine.slot_claims.add(1)  # another owner keeps each request on BGEN, not the solo fast path
+
+    def wait_until(self, predicate):
+        until = time.monotonic() + 3
+        while time.monotonic() < until:
+            if predicate():
+                return
+            time.sleep(.005)
+        self.fail("legacy identity lifecycle did not reach its bounded condition")
+
+    def test_matching_terminal_completes_once(self):
+        self.force_slot()
+        engine = self.engine
+        with mock.patch.object(engine, "_apply_bdone", wraps=engine._apply_bdone) as apply:
+            tokens = list(engine.generate_batched([1, 2], 3, {}, threading.Event()))
+        self.assertEqual(tokens, list(b"ok,"))
+        self.assertEqual(engine._slot_identity[0], (1, 1))
+        self.assertEqual((engine.last["generated"], engine.last["finish"]), (3, "length"))
+        self.assertEqual(len(engine.last["legs"]), 1)
+        self.assertEqual(apply.call_count, 1)
+        self.assertFalse(engine.slot_busy[0])
+        self.assertNotIn(0, engine.slot_claims)
+        self.assertEqual(list(engine._ignored_bdone), [])
+
+    def test_solo_transition_stop_uses_the_admitted_identity(self):
+        self.force_slot(("--slotcache",))
+        engine = self.engine
+        output = engine.generate_batched([1, 2], 64, {}, threading.Event())
+        with mock.patch.object(engine, "_send", wraps=engine._send) as send:
+            tokens = [next(output), next(output)]
+            engine.slot_busy[1] = False
+            engine.slot_claims.discard(1)
+            tokens.extend(output)
+        stops = [call.args[0] for call in send.call_args_list if call.args[0].startswith("BSTOP ")]
+        self.assertEqual(stops, ["BSTOP 0 1 1"])
+        self.assertEqual(tokens, [*b"ok, done.", 257])
+        self.assertEqual(len(engine.last["legs"]), 2)
+        self.assertEqual([leg["finish"] for leg in engine.last["legs"]], ["cancel", "stop"])
+        self.assertFalse(any(engine.slot_busy))
+        self.assertEqual(engine.slot_claims, set())
+
+    def test_identity_cancel_is_ignored_after_slot_reuse_without_another_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "hold"
+            self.force_slot(("--hold-replies", str(gate)))
+            engine = self.engine
+            cancel = threading.Event()
+            output = engine.generate_batched([1, 2], 64, {}, cancel)
+            completed, errors = [], []
+            with mock.patch.object(engine, "_send", wraps=engine._send) as send:
+                self.assertEqual(next(output), ord("o"))  # admission token, BADM not read yet
+                self.assertEqual(next(output), ord("k"))  # resident token, admitted identity now known
+                cancel.set()
+                list(output)
+                self.assertEqual(engine.last["finish"], "cancel")
+                stops = [call.args[0] for call in send.call_args_list if call.args[0].startswith("BSTOP ")]
+                self.assertEqual(stops, ["BSTOP 0 1 1"])
+            gate.touch()
+            def successor():
+                try:
+                    tokens = list(engine.generate_batched([3, 4], 4, {}, threading.Event()))
+                    completed.append((tokens, dict(engine.last)))
+                except Exception as error:
+                    errors.append(error)
+            worker = threading.Thread(target=successor, daemon=True)
+            worker.start()
+            try:
+                self.wait_until(lambda: engine._slot_identity[0] == (2, 2))
+                engine._send(stops[0])  # replay the previous owner's actual cancel after the new BADM
+                self.wait_until(lambda: "IGNORED BSTOP 0 1 1" in self.log.read_text())
+                self.assertTrue(engine.slot_busy[0], "ignored stale cancellation released the successor")
+                self.assertIn(0, engine.slot_claims)
+                self.assertTrue(worker.is_alive())
+            finally:
+                gate.unlink(missing_ok=True)
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0][0], list(b"ok, "))
+            self.assertEqual((completed[0][1]["generated"], completed[0][1]["finish"]), (4, "length"))
+            self.assertEqual(self.log.read_text().count("TERMINAL BDONE "), 2)
+            self.assertFalse(engine.slot_busy[0])
+            self.assertNotIn(0, engine.slot_claims)
+
+    def test_stale_terminal_after_reuse_is_not_attributed_to_the_successor(self):
+        self.force_slot(("--legacy-stale-done",))
+        engine = self.engine
+        first = list(engine.generate_batched([1, 2], 3, {}, threading.Event()))
+        first_figures = dict(engine.last)
+        self.assertEqual(first, list(b"ok,"))
+        with mock.patch.object(engine, "_apply_bdone", wraps=engine._apply_bdone) as apply:
+            second = list(engine.generate_batched([3, 4], 5, {}, threading.Event()))
+        self.assertEqual(second, list(b"ok, d"))
+        self.assertEqual(engine._slot_identity[0], (2, 2))
+        self.assertEqual((first_figures["generated"], first_figures["finish"]), (3, "length"))
+        self.assertEqual((engine.last["generated"], engine.last["finish"]), (5, "length"))
+        self.assertEqual(len(engine.last["legs"]), 1)
+        self.assertEqual(len(engine._ignored_bdone), 2)
+        self.assertEqual(sum(call.args[0][2] == "5" for call in apply.call_args_list), 1)
+        self.assertEqual(self.log.read_text().count("TERMINAL BDONE "), 2)
+        self.assertFalse(engine.slot_busy[0])
+        self.assertNotIn(0, engine.slot_claims)
 
 
 class PackedTransport(unittest.TestCase):

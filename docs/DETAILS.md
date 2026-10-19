@@ -3616,6 +3616,28 @@ Kernel and sampling rules are unchanged, but a different owner composition can c
 partitioning; bitwise identity, responsiveness gains and throughput costs require matched runtime evidence.
 These controls do not change `STRATA_STORE_DRAIN_MS` or its existing 8-second default.
 
+**Resolved execution plan (#259).** Option-level decisions are resolved once into
+`include/strata/program/execution_plan.hpp`: requested and effective speculative widths, slot groups, proposal
+shape, lookup eligibility, the foreground budget, concurrent-reader exclusions and prompt-suspension mode.
+`--report-plan` prints the contract as one `EPLAN` JSON line before any model allocation and exits; a serving
+engine prints the same line before `READY`, and the frontend records it and exposes it at
+`/metrics.engine.resolved_plan` and `/v1/status.resolved_plan`. The engine consumes the resolved speculative
+widths and budget decision, so the report cannot disagree with execution on those fields. Facts that need the
+hardware or an allocation (the slots that actually fit, runtime source/helper state, automatic placement) are
+labelled conditional, never reported as observed capabilities. The line distinguishes requested from effective
+values and names the reason a capability is off; for example, the suffix drafter is reported as not consumed by
+a serving decode path even when its flags are configured.
+
+**Weighted decode service (#264, opt-in, off by default).** `STRATA_DECODE_SERVICE=1` selects ready resident
+requests by a 3:1 weighted service cycle instead of adding every active slot to each decode window. One ticket
+is one decode window, and a request is selected at most once per window, so overlapping work is not counted
+twice. With an interactive request ready, the window admits at most one row per interactive request: resident
+background work cannot enlarge it. With only background requests ready, all of them share the window normally.
+A background request keeps its seat, committed state and requested output (it is never truncated) but may skip
+windows; when one row is admitted, its wait is bounded by the cycle length. Measured on the two-slot synchronous
+MTP shape, the foreground's mixed completion improved 5.4% while the background's completion slowed 37%, below
+the predeclared benefit and delay guards, so the switch remains off and is not a daily-profile default.
+
 **Per-request packing eligibility (#249).** Each `BGENQ` record may carry `packing=eligible` (the default)
 or `packing=solo`. A solo owner is excluded from multi-owner prompt arithmetic: at the next scheduling
 boundary it is the only selected owner, so it executes a one-owner pack while an ordinary pack that was
@@ -3876,8 +3898,13 @@ Existing `queued` and native slot/control-wait metrics are unchanged. Queue capa
 plus depth. Streaming errors after HTTP 200 headers keep their existing SSE form, not an HTTP retry hint.
 
 Cancellation during admission sends `STOP` and consumes `DONE`/`BADM`; an active resident slot receives
-`BSTOP` and is not reusable until `BDONE`. The HTTP admission reservation and image embeddings remain owned
-through that drain. A `REJECT bounded=1 ...` followed by the exact `BADM <slot> 0` boundary releases only
+`BSTOP` and is not reusable until its matching `BDONE`. Successful legacy resident admissions (`BADM`) and
+resident completions (`BDONE`) carry trailing `request=<id> incarnation=<n>` fields. When that admitted
+identity is known, cancellation and solo-transition stops send `BSTOP <slot> <request> <incarnation>`:
+the engine ignores a mismatched identity, and the frontend ignores mismatched terminals without attributing
+or releasing a successor request. Engines and lines without identity fields retain slot-only behavior.
+Ignored terminal diagnostics are capped at 32 records. The HTTP admission reservation and image embeddings
+remain owned through the matching drain. A `REJECT bounded=1 ...` followed by the exact `BADM <slot> 0` boundary releases only
 the refused request with zero output. Missing acknowledgements or ambiguous native admission errors end the engine rather
 than return a potentially live slot to the queue. Existing consumers must retire before restart. This
 fail-closed path can fail other active requests; it must not silently mutate or complete them with another

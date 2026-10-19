@@ -23,6 +23,7 @@ for line in sys.stdin:
   if not state.exists():
    state.write_text('first request was attempted')
    if mode=='invalid':print('ERR prompt exceeds context',flush=True)
+   elif mode=='continuation':print('ERR restoring yielded prefix: resident resume: draft interval does not cover this prompt',flush=True)
    else:
     kind='verify batch' if mode=='batch' else 'verify'
     print(f'ERR {kind}: timed out at layer 18; its GPU waits were released and the GPU finished (#267)',flush=True)
@@ -104,6 +105,16 @@ class FatalRecovery(unittest.TestCase):
     def test_generate_batched_refuses_a_dead_engine(self):
         e=self.engine('fatal');e.close()
         with self.assertRaises(EngineDied):list(e.generate_batched([1],8,{},threading.Event()))
+
+    def test_refused_continuation_ends_one_request_and_keeps_the_engine(self):
+        # #265: the same class as the historical yielded-resume refusal. The native line is this request's
+        # terminal; the process stays alive and the next request is served (a refused continuation is not a
+        # device fault, poisoned shared ownership or an undrainable operation).
+        e=self.engine('continuation')
+        with self.assertRaises(ValueError):
+            list(e.generate([1],8,{},threading.Event()))
+        self.assertTrue(e.alive())
+        self.assertEqual(list(e.generate([1],8,{},threading.Event())),[90])
 
     def test_validation_error_does_not_kill_engine(self):
         e=self.engine('invalid')

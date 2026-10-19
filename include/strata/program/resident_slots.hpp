@@ -156,6 +156,13 @@ struct ResidentPrepareInput {
     core::ConversationSnapshotExpectation expectation = core::ConversationSnapshotExpectation::ordinary;
 };
 
+struct ResidentIdentity {
+    uint64_t request = 0, incarnation = 0; // request 0 means the seat is unbound
+    bool owns(uint64_t request_id, uint64_t seat_incarnation) const {
+        return request && incarnation && request == request_id && incarnation == seat_incarnation;
+    }
+};
+
 // Only these pre-write source refusals permit retrying the original reservation.
 enum class ResidentSourceRefusal { none, uncertified_interval, incoherent_boundary };
 
@@ -188,6 +195,9 @@ public:
     core::ConversationCheckpoint::PromptPlan take_prefill_plan() { return std::exchange(working_.prefill_plan, {}); }
     bool active() const;
     bool available(int slot) const;
+    // Read-only wire identity; nonexistent seats return an unbound identity.
+    ResidentIdentity identity(int slot) const;
+    bool owns(int slot, uint64_t request, uint64_t incarnation) const;
     void cancel(int slot);
     /// #879: the running slot's state may hold the poison: `complete` must not keep it as a cache when it ends.
     void taint(int slot);

@@ -7325,3 +7325,19 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+class ResolvedPlanReport(unittest.TestCase):
+    """EPLAN is a report, not a gate: it must be recorded and must never break serving readiness."""
+
+    def test_eplan_is_recorded_and_malformed_reports_are_ignored(self):
+        engine = type("Engine", (), {})()
+        engine.resolved_plan = None
+        StrataEngine._record_resolved_plan(
+            engine, 'EPLAN {"version": 1, "mode": "resident", "proposal": "batched_pipeline"}')
+        self.assertEqual(engine.resolved_plan["mode"], "resident")
+        self.assertEqual(engine.resolved_plan["proposal"], "batched_pipeline")
+        StrataEngine._record_resolved_plan(engine, "EPLAN {not json")
+        self.assertEqual(engine.resolved_plan["mode"], "resident")
+        StrataEngine._record_resolved_plan(engine, "EPLAN [1, 2]")
+        self.assertEqual(engine.resolved_plan["mode"], "resident")

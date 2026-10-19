@@ -101,6 +101,8 @@
 #include "strata/program/kv_residency_info.hpp"
 #include "strata/program/batch_residency.hpp"
 #include "strata/program/time_budget.hpp"
+#include "strata/program/execution_plan.hpp"
+#include "strata/program/decode_service.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -955,6 +957,9 @@ struct Options {
     bool split_skip_if_fits = false;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    /// --report-plan: print the resolved option-level execution contract as one JSON line and exit before any
+    /// model allocation. Hardware/allocation facts the contract cannot know yet stay labelled conditional.
+    bool report_plan = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -1199,6 +1204,8 @@ void usage() {
                  "                       kVerifyMaxT (8) caps rows per window; grouped windows shape the admitted slots\n"
                  "                       and may fit fewer. Packed prefill permits one slot; docs/BATCHING.md\n"
                  "                       assumes static expert residency; incomplete expert profiles refuse (no batch adaptation)\n"
+                 "  --report-plan        print the resolved option-level execution contract as one JSON line and exit\n"
+                 "                       before any model allocation (allocation-dependent facts stay conditional)\n"
                  "  --resident-multiplex --batch: alternate resident requests, one row per quantum (no compute batching)\n"
                  "  --foreground-budget-ms N  --serve --batch: measured-cost scheduling at existing chunk boundaries\n"
                  "                       (0 = legacy policy; positive N <= 60000 is a target, not a latency promise)\n"
@@ -3144,6 +3151,7 @@ int main(int argc, char** argv) {
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--report-plan") o.report_plan = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
@@ -3438,6 +3446,70 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: persistent conversation caching stays off: %s\n",
                      persistence_disabled_reason.c_str());
     const bool packed_prefill = strata::prefill::packed_prefill_enabled();
+    // Opt-in weighted decode service (#264). Off keeps the previous all-ready-rows schedule exactly; on, an
+    // interactive request is never enlarged by resident background work and every ready request takes its
+    // weighted 3:1 turn (one ticket = one decode window, so a request is never counted twice in a window).
+    const bool weighted_decode = [] {
+        const char* value = std::getenv("STRATA_DECODE_SERVICE");
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }();
+    // One option-level contract, resolved once. later_stages is the layer split's further stages, each on its own
+    // GPU; a same-GPU or absent split can pipeline nothing. Allocation-dependent facts (which slots fit, helper
+    // source state) remain conditional inputs and are never reported as observed capabilities.
+    auto plan_input = [&](int later_stages) {
+        strata::program::ExecutionPlanInput pin;
+        const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
+        const char* mtp_serial_env = std::getenv("STRATA_BATCH_MTP_SERIAL");
+        const char* retained_env2 = std::getenv("STRATA_PREFILL_RETAINED_LAYERS");
+        const char* piped_env = std::getenv("STRATA_PIPED_CONCURRENT");
+        pin.serve = o.serve;
+        pin.batch_requested = strata::program::batch_groups::normalized_slots(o.batch, strata::kernels::kVerifyMaxT);
+        pin.groups_set = o.batch_groups_set;
+        pin.groups_auto = o.batch_groups_auto;
+        pin.groups_given = o.batch_groups;
+        pin.later_stages = later_stages;
+        pin.batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+        pin.batch_mtp_pipeline = o.batch_mtp_pipeline;
+        pin.batch_mtp_third = o.batch_mtp_third;
+        pin.batch_mtp_floating = o.batch_mtp_floating;
+        pin.mtp_configured = !o.mtp.empty();
+        pin.spec_requested = o.spec;
+        pin.mtp_max_requested = o.mtp_max_t;
+        pin.suffix_draft = o.suffix_draft;
+        pin.lookup_chain = o.lookup_chain;
+        pin.adapt_async = o.adapt_async != 0;
+        pin.mtp_serial = mtp_serial_env != nullptr && mtp_serial_env[0] != '\0' && mtp_serial_env[0] != '0';
+        pin.resident_multiplex = o.resident_multiplex;
+        pin.prompt_cache = o.prompt_cache > 0;
+        pin.packed_prefill = packed_prefill;
+        pin.retained_prefill = retained_env2 && std::strcmp(retained_env2, "0") != 0;
+        pin.foreground_budget_ms = o.foreground_budget_ms;
+        pin.background_share = o.background_share;
+        pin.piped_concurrent = piped_env != nullptr && std::atoi(piped_env) != 0;
+        pin.judge_lane = o.judge_context > 0 || o.judge_overlap;
+        pin.spec_split = o.spec_split;
+        pin.prefill_pipe = pipe_active;
+        return pin;
+    };
+    if (o.report_plan) {
+        // No model allocation: only the split's GPU count is read, to report the requested stage ownership.
+        int later = 0;
+        if (!o.layer_split.empty()) {
+            if (o.layer_split == "auto") {
+                int n_dev = 1;
+                if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
+                cudaGetLastError();
+                later = n_dev - 1;
+            } else {
+                // K is the first layer of each later GPU: N values name N further stages, not N-1.
+                later = (int) std::count(o.layer_split.begin(), o.layer_split.end(), ',') + 1;
+            }
+        }
+        const strata::program::ExecutionPlan reported = strata::program::resolve_execution_plan(plan_input(later));
+        std::printf("EPLAN %s\n", reported.to_json().c_str());
+        std::fflush(stdout);
+        return reported.refused ? 1 : 0;
+    }
     const char* man2_setting = std::getenv("STRATA_STORE_MAN2");
     if (man2_setting && std::strcmp(man2_setting, "0") != 0 && std::strcmp(man2_setting, "1") != 0) {
         std::fprintf(stderr, "strata serve: STRATA_STORE_MAN2 must be unset, 0 or exactly 1\n");
@@ -3466,12 +3538,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata packed prefill: decoder slice requires at least two resident slots\n");
         return 2;
     }
-    if (!strata::program::TimeBudget::valid(o.foreground_budget_ms, o.background_share) ||
-        (o.foreground_budget_ms > 0 && (!o.serve || o.batch < (packed_prefill ? 1 : 2) || o.prompt_cache <= 0))) {
-        std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
-                             "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
-        return 2;
-    }
+    // The budget's range and prerequisites are resolved with the rest of the execution contract (below), so the
+    // same decision is reported to the frontend and enforced here once.
     constexpr size_t kPackedQueuedFrames = 8;
     if (packed_prefill && (o.max_context < 1 || o.max_context > INT32_MAX)) {
         std::fprintf(stderr, "strata packed prefill: requires a fixed positive int32 context bound\n");
@@ -3885,6 +3953,16 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // The selected execution contract, resolved once after the split is known. Its effective speculation widths
+    // replace the later suffix/lookup sizing, its budget decision replaces the duplicate prerequisite gate, and the
+    // same values are reported before READY. Slot fit and runtime source checks stay conditional by construction.
+    const strata::program::ExecutionPlan execution_plan =
+        strata::program::resolve_execution_plan(plan_input(multi_gpu ? (int) split_devs.size() : 0));
+    if (execution_plan.budget.support == strata::program::Support::refused) {
+        std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
+                             "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
+        return 2;
+    }
     // STRATA_PRIMARY_DEVICE: a later stage's list (`--split-device` values must be > 0) still assumes the
     // primary is device 0 - refuse the combination rather than mis-place a stage.  The peer tier takes the
     // primary into account (peer_experts.cpp).
@@ -4128,21 +4206,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
-    // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
-    // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
-    // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
-    if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
-        o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
-    }
-    // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
-    // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
-    // from mtp_max_t left K=1 and K=2 with a window identical to not passing the flag at all.
-    if (o.lookup_chain > 0 && o.spec >= 2) {
-        if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
-        const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyMaxT
-    }
+    // Prompt lookup (the suffix drafter, on by default) sizes the MTP's own windows and may make a lookup window up to
+    // 2 tokens longer; --lookup-chain may lengthen one further. The execution contract resolved both effective widths
+    // once, from the same rules, so execution and the reported plan cannot disagree. --suffix-draft 0 turns lookup off.
+    o.spec = execution_plan.spec;
+    o.mtp_max_t = execution_plan.mtp_max_t;
     // The finalized speculative width determines the existing dense-draft lookahead.
     // Reject an undersized slot ring here too, still before any device allocation.
     if (o.slot_kv_window && *o.slot_kv_window > 0 && !o.mtp.empty() && o.spec >= 2 && o.batch > 0) {
@@ -15699,6 +15767,8 @@ int main(int argc, char** argv) {
             if (o.foreground_budget_ms > 0)
                 std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
                             o.foreground_budget_ms, o.background_share);
+            std::printf("INFO decode_service=%d decode_weight_foreground=3 decode_weight_background=1\n",
+                        int(weighted_decode));
             // Opt-in status extension: owners may initialize resident when their context fits,
             // and the working draft can take its existing resident fallback.
             if (o.slot_kv_window) {
@@ -15810,6 +15880,9 @@ int main(int argc, char** argv) {
         if (packed_foreground_cap || packed_decoder_slice)
             std::printf("INFO packed_prefill_foreground_cap=%d packed_prefill_decoder_slice=%d\n",
                         packed_foreground_cap, int(packed_decoder_slice));
+        // The resolved contract, after allocation, so the frontend can compare what it requested with what the
+        // executor actually selected. One JSON payload after the tag; nothing here claims a measured capability.
+        std::printf("EPLAN %s\n", execution_plan.to_json().c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -16100,6 +16173,17 @@ int main(int argc, char** argv) {
         struct BatchDraftCounts { uint64_t request = 0; int64_t offered = 0, accepted = 0; };
         BatchDraftCounts batch_drafts[strata::kernels::kVerifyMaxT] = {};
         const bool batch_mtp_trace = split_batch_mtp && std::getenv("STRATA_STATE_HASH");
+        auto print_legacy_bdone = [&](int b, const char* reason, double ms, const BatchDraftCounts* counts = nullptr) {
+            const auto identity = resident.identity(b);
+            std::printf("BDONE %d %lld %s %.1f", b, (long long) bs[(size_t) b].produced, reason, ms);
+            if (counts)
+                std::printf(" draft_accepted=%lld draft_offered=%lld",
+                            (long long) counts->accepted, (long long) counts->offered);
+            if (identity.request)
+                std::printf(" request=%llu incarnation=%llu",
+                            (unsigned long long) identity.request, (unsigned long long) identity.incarnation);
+            std::putchar('\n');
+        };
         auto record_batch_proposal = [&](int b, int32_t proposal, int32_t target, int keep) {
             const BSlot& sl = bs[(size_t) b];
             auto& counts = batch_drafts[b];
@@ -16124,12 +16208,11 @@ int main(int argc, char** argv) {
             if (judge_lane) judge_lane->observe_generation();
             phase_resident_done(b, reason);
             if (!packed_done(b, reason))
-                std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
-                            b, (long long) sl.produced, reason, ms,
-                            (long long) counts.accepted, (long long) counts.offered);
+                print_legacy_bdone(b, reason, ms, &counts);
         };
         size_t resident_cursor = 0;
         unsigned resident_credit = 0;
+        strata::program::DecodeService decode_service(strata::kernels::kVerifyMaxT);
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -16198,7 +16281,7 @@ int main(int argc, char** argv) {
                     print_mtp_done(b, "cancel");
                 else
                     if (!packed_done(b, "cancel"))
-                        std::printf("BDONE %d %lld cancel %.1f\n", b, (long long) sl.produced, ms);
+                        print_legacy_bdone(b, "cancel", ms);
             }
             std::fflush(stdout);
             if (o.resident_multiplex) {
@@ -16213,6 +16296,17 @@ int main(int argc, char** argv) {
                     }
                     resident_credit = 0;
                     resident_cursor = (resident_cursor + 1) % bs.size();
+                }
+            } else if (weighted_decode) {
+                std::vector<strata::program::DecodeParticipant> ready;
+                for (int b = 0; b < (int) bs.size(); ++b)
+                    if (bs[(size_t) b].active && !bs[(size_t) b].failed && bs[(size_t) b].request)
+                        ready.push_back({bs[(size_t) b].request, bs[(size_t) b].foreground});
+                decode_service.set_capacity(strata::program::decode_window_capacity(
+                    ready, batch_mtp ? 4 : strata::kernels::kVerifyMaxT));
+                for (const uint64_t request : decode_service.select(ready)) {
+                    for (int b = 0; b < (int) bs.size(); ++b)
+                        if (bs[(size_t) b].request == request && bs[(size_t) b].active) { rows[S++] = b; break; }
                 }
             } else {
                 for (size_t scanned = 0; scanned < bs.size() && S < (batch_mtp ? 4 : strata::kernels::kVerifyMaxT); ++scanned) {
@@ -16347,7 +16441,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(b, "nonfinite");
                         if (!packed_done(b, "nonfinite"))
-                            std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                            print_legacy_bdone(b, "nonfinite", ms);
                     }
                     resident.taint(b);
                     if (!resident.finish(b, err, false)) {
@@ -16372,11 +16466,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(b, fin);
                         if (!packed_done(b, fin)) {
-                            if (split_batch_mtp)
-                                std::printf("BDONE %d %lld %s %.1f draft_accepted=%lld draft_offered=%lld\n",
-                                            b, (long long) sl.produced, fin, ms,
-                                            (long long) batch_drafts[b].accepted, (long long) batch_drafts[b].offered);
-                            else std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                            print_legacy_bdone(b, fin, ms, split_batch_mtp ? &batch_drafts[b] : nullptr);
                         }
                         if (!resident.finish(b, err)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
@@ -16581,7 +16671,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(G.rows[t], "nonfinite");
                         if (!packed_done(G.rows[t], "nonfinite"))
-                            std::printf("BDONE %d %lld nonfinite %.1f\n", G.rows[t], (long long) sl.produced, ms);
+                            print_legacy_bdone(G.rows[t], "nonfinite", ms);
                         resident.taint(G.rows[t]);
                         if (!resident.finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
@@ -16603,7 +16693,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         phase_resident_done(G.rows[t], fin);
                         if (!packed_done(G.rows[t], fin))
-                            std::printf("BDONE %d %lld %s %.1f\n", G.rows[t], (long long) sl.produced, fin, ms);
+                            print_legacy_bdone(G.rows[t], fin, ms);
                         if (!resident.finish(G.rows[t], err, false)) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
@@ -16825,16 +16915,34 @@ int main(int argc, char** argv) {
                             }
                             ready[n++] = b;
                         }
-                        // Oldest last service first, with deterministic seat-number ties.
-                        std::sort(ready, ready + n, [&](int a, int b) {
-                            return seat_served[a] != seat_served[b] ? seat_served[a] < seat_served[b] : a < b;
-                        });
+                        // Oldest last service first, with deterministic seat-number ties. Under the opt-in weighted
+                        // service, the ready seats take their 3:1 turn instead and a resident background seat cannot
+                        // enlarge the interactive window.
+                        int weighted_ready = n;
+                        if (weighted_decode) {
+                            std::vector<strata::program::DecodeParticipant> participants;
+                            for (int t = 0; t < n; ++t)
+                                participants.push_back({bs[(size_t) ready[t]].request, bs[(size_t) ready[t]].foreground});
+                            decode_service.set_capacity(strata::program::decode_window_capacity(
+                                participants, o.batch_mtp_third && pick != 0 ? 1 : 2));
+                            int ordered[4] = {}, k = 0;
+                            for (const uint64_t request : decode_service.select(participants))
+                                for (int t = 0; t < n; ++t)
+                                    if (bs[(size_t) ready[t]].request == request) { ordered[k++] = ready[t]; break; }
+                            std::copy(ordered, ordered + k, ready);
+                            weighted_ready = k;   // only this window's selected seats are eligible below
+                        } else {
+                            std::sort(ready, ready + n, [&](int a, int b) {
+                                return seat_served[a] != seat_served[b] ? seat_served[a] < seat_served[b] : a < b;
+                            });
+                        }
                         int idle = 1; // this owner has already consumed its round opportunity
                         for (int gi = 0; gi < (int)pg.size(); ++gi)
                             if (gi != pick && !pg[(size_t)gi].inflight &&
                                 (!bounded_round || !pg[(size_t)gi].round_started)) ++idle;
                         // Reserve one ready seat for each other idle owner, never wait to fill.
                         const int capacity = o.batch_mtp_third && pick != 0 ? 1 : 2;
+                        if (weighted_decode) n = weighted_ready;
                         const int take = n == 0 ? 0 : std::min(capacity, std::max(1, n - (idle - 1)));
                         // Canonical pairs keep all depth-one/two shapes within 32 graph keys.
                         std::sort(ready, ready + take);
@@ -16981,7 +17089,13 @@ int main(int argc, char** argv) {
         };
         auto resident_control = [&](const std::string& command) {
             if (command.rfind("BSTOP ", 0) == 0) {
-                resident.cancel(std::atoi(command.c_str() + 6));
+                int slot = std::atoi(command.c_str() + 6);
+                unsigned long long request = 0, incarnation = 0;
+                if (std::sscanf(command.c_str() + 6, "%d %llu %llu", &slot, &request, &incarnation) == 3 &&
+                    !resident.owns(slot, request, incarnation))
+                    std::fprintf(stderr, "strata serve: ignored BSTOP slot=%d request=%llu incarnation=%llu "
+                                         "(stale or unbound identity)\n", slot, request, incarnation);
+                else resident.cancel(slot); // old slot-only controls keep their existing semantics
                 return true;
             }
             if (command.rfind("BPRIORITY ", 0) == 0) {
@@ -17029,8 +17143,8 @@ int main(int argc, char** argv) {
                 phase_resident_done(b, "cancel");
                 if (split_batch_mtp || batch_mtp_pipeline) print_mtp_done(b, "cancel");
                 else if (!packed_done(b, "cancel"))
-                    std::printf("BDONE %d %lld cancel %.1f\n", b, (long long)sl.produced,
-                                std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+                    print_legacy_bdone(b, "cancel",
+                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
             }
             std::fflush(stdout);
             return true;
@@ -19247,7 +19361,13 @@ int main(int argc, char** argv) {
                 selected = {PrefixSource::resident, (int64_t) bs[(size_t) yielded_source].ids.size(), yielded_source};
                 selected.transfer = PrefixTransfer::resident_live;
                 if (!resident.resume_work(yielded_source, nullptr, selected.work, err)) {
-                    phase_error("ERR restoring yielded prefix: %s\n", err.c_str()); return 1;
+                    // #265: a refused continuation is request-local. `resume_work` is preflight (no destination
+                    // write), the parked seat keeps the state it already owns, and the peer requests are untouched.
+                    // The ERR line is this request's terminal; the engine stays alive and serves the next command.
+                    // Undrainable work, poisoned shared ownership and device failures still end the engine elsewhere.
+                    phase_error("ERR restoring yielded prefix: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    continue;
                 }
             }
             // A stored candidate is materialized here, at the request's own safe seam and before any GPU state is
@@ -20344,17 +20464,16 @@ int main(int argc, char** argv) {
                 // drafter), and no thread but the host's making CUDA allocations or frees while it runs (#31).
                 const bool conc_on = [&] {
                     if (!conc_env || o.batch <= 0) return false;
+                    // The option-level exclusions come from the one resolved execution contract. What remains is
+                    // the runtime source/helper state, which cannot be known before allocation.
+                    if (execution_plan.concurrent_reader.support != strata::program::Support::conditional &&
+                        execution_plan.concurrent_reader.support != strata::program::Support::on) {
+                        std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n",
+                                     execution_plan.concurrent_reader.reason.c_str());
+                        return false;
+                    }
                     const char* off = nullptr;
-                    if (packed_prefill) off = "packed prefill";
-                    else if (retained_prefill) off = "retained prefill";
-                    else if (batch_mtp || batch_mtp_pipeline) off = "batched MTP";
-                    else if (o.resident_multiplex) off = "--resident-multiplex";
-                    else if (o.judge_context > 0 || o.judge_overlap) off = "the judge lane";
-                    else if (o.adapt_async) off = "--adapt-async";
-                    else if (o.spec_split) off = "--spec-split";
-                    else if (strata::prefill::Prefill::pipe_setting() > 0) off = "STRATA_PREFILL_PIPE";
-                    else if (time_budget.enabled()) off = "the foreground budget";
-                    else {
+                    {
                         strata::program::ConcurrentReadSetup s;
                         auto env_on = [](const char* k) {
                             const char* x = std::getenv(k);
@@ -22399,7 +22518,12 @@ int main(int argc, char** argv) {
                 }
                 phase_finish(yielded_at >= 0 ? "yielded" : std::strcmp(finish, "cancel") == 0 ? "cancelled" :
                     std::strcmp(finish, "nonfinite") == 0 ? "error" : "completed", cont ? "resident" : "none");
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                const auto identity = resident.identity(admit_slot);
+                std::printf("BADM %d %d", admit_slot, cont ? 1 : 0);
+                if (identity.request && identity.request == resident.working().request)
+                    std::printf(" request=%llu incarnation=%llu",
+                                (unsigned long long) identity.request, (unsigned long long) identity.incarnation);
+                std::putchar('\n');
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
                     rows_wait_t = Clock::now();
