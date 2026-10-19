@@ -632,6 +632,11 @@ public:
         size_t remaining = bytes_, victims = 0;
         for (size_t i = 0; i < entries_.size() && remaining > limit; ++i) {
             if (i != keep && evictable(i)) {
+                // Name each victim, as evict_oldest does: the counter alone cannot say whether pressure spends the
+                // cache on short side conversations or discards a long one (2026-10-18).
+                std::fprintf(stderr, "strata serve: conversation cache: evicting the least recently active conversation "
+                                     "(%zu tokens, %zu bytes) to reserve %zu bytes\n",
+                             entries_[i].live.ids.size(), entries_[i].bytes(), incoming);
                 remaining -= entries_[i].bytes();
                 ++victims;
             }
