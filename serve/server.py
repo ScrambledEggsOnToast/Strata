@@ -18,9 +18,9 @@ converted to PNG first with Pillow.
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
-The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
-talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
+The client lifecycle seam is `LifecycleAdapter.submit/events/cancel/priority/terminal`. Its native transport and
+explicit legacy-seat fallback keep the existing `Engine.generate(prompt_ids, max_new, sampling, cancel)` token
+iterator. `StrataEngine` talks stdin/stdout to one resident `strata --serve` process; `MockEngine` scripts it for tests.
 """
 from __future__ import annotations
 
@@ -2662,22 +2662,36 @@ class StrataEngine:
             self.native_close(owner)
             raise
 
-    def _native_cancel(self, owner):
+    def _native_control(self, owner, command, *, identity=None, priority=None):
         if owner.get("closed"):
-            return
+            return False
         if owner.get("engine", self) is not self:
-            return owner["engine"]._native_cancel(owner)
-        event = None
+            return owner["engine"]._native_control(owner, command, identity=identity, priority=priority)
         with self.slot_cv:
-            if (not owner["stopped"] and not owner["terminal"] and self.gen == owner["born"] and self.alive()):
-                request, incarnation = owner["identity"] or (0, 0)
-                line = f"BQCANCEL {owner['tag']} {owner['slot']} {request} {incarnation}"
+            if (owner["stopped"] or owner["terminal"] or self.gen != owner["born"] or not self.alive() or
+                    owner["owners"].get(owner["tag"]) is not owner or
+                    (identity is not None and identity != LifecycleIdentity.of(owner))):
+                return False
+            request, incarnation = owner["identity"] or (0, 0)
+            line = f"{command} {owner['tag']} {owner['slot']} {request} {incarnation}"
+            if command == "BQCANCEL":
                 owner["stopped"] = True
                 owner["drain_until"] = time.monotonic() + min(owner["allow"], 300.0)
-                self._send(line)
-                event = self._retained_event(owner, line, "sent")
-        if event is not None:
-            self._publish_retained_event(owner, event)
+            else:
+                line += f" {priority}"
+                owner["priority"] = priority
+            self._send(line)
+            event = self._retained_event(owner, line, "sent")
+        self._publish_retained_event(owner, event)
+        return True
+
+    def _native_cancel(self, owner, *, identity=None):
+        return self._native_control(owner, "BQCANCEL", identity=identity)
+
+    def native_priority(self, owner, priority, identity):
+        if priority not in ("foreground", "background"):
+            raise ValueError("strata_priority must be foreground or background")
+        return self._native_control(owner, "BQPRIORITY", identity=identity, priority=priority)
 
     def _native_next(self, owner, cancel):
         if self.gen != owner["born"]:
@@ -4905,6 +4919,326 @@ def _frontend_phase(record, phase, now=None):
         record["frontend"]["counts"][phase] += 1
 
 
+@dataclasses.dataclass(frozen=True)
+class LifecycleIdentity:
+    """A control receipt, not a seat identity: a retired tag can never name its successor."""
+    tag: str
+    slot: int
+    request: int
+    incarnation: int
+
+    @classmethod
+    def of(cls, owner):
+        return cls(owner["tag"], owner["slot"], *(owner["identity"] or (0, 0)))
+
+
+class NativeLifecycleTransport:
+    """The retained-mode native lifecycle. Admission, seats and runnable policy stay in the engine."""
+
+    def __init__(self, service):
+        self.service = service
+
+    @staticmethod
+    def initialize(record):
+        record.update(_native_admission=True, lifecycle_transport="native-retained-v1",
+                      ingress_wait_s=record.get("queue_s", 0.0),
+                      retained_events=[], retained_events_dropped=0, retained_events_complete=True,
+                      native_registration_count=0, native_wait_receipts_missing={"admission": 0, "service": 0},
+                      _native_owners=[], _native_receipts={}, _reserved_solo_slot=False)
+        if "frontend" in record:
+            seconds, counts = record["frontend"]["seconds"], record["frontend"]["counts"]
+            seconds["ingress_wait"] += seconds["admission_wait"]
+            counts["ingress_wait"] += counts["admission_wait"]
+            seconds["admission_wait"], counts["admission_wait"] = 0.0, 0
+            if record.get("_frontend_phase") == "admission_wait":
+                record["_frontend_phase"] = "ingress_wait"
+
+    def register(self, record, capacity):
+        # Caller holds admission_cv: registration precedes every tokenization/publication worker.
+        svc = self.service
+        if "_native_owners" not in record:
+            self.initialize(record)
+        owner = svc.engine.native_register(record["priority"], record["_packing"], record["_deadline"], capacity,
+                                           lambda event: svc.retained_event(record, event))
+        record["_native_owners"].append(owner)
+        record["_native_owner"] = owner
+        record["native_registration_count"] = 1
+        record["native_wait_receipts_missing"] = {"admission": 1, "service": 1}
+
+    def sampling(self, record, sampling):
+        svc = self.service
+        merged = dict(sampling or {})
+        merged.pop("_strata_native_owner", None)  # A client body cannot manufacture a submitted owner.
+        merged.update(_strata_native_deadline=record["_deadline"],
+                      _strata_native_capacity=max(1, int(svc.engine.batch or 0)) + svc.request_queue_limit,
+                      _strata_request_id=record["id"],
+                      _strata_submission=lambda correlation: svc.native_submitted(record, correlation=correlation),
+                      _strata_frontend_phase=lambda phase: svc.frontend_phase(record, phase),
+                      _strata_native_event=lambda event: svc.retained_event(record, event),
+                      _strata_native_registered=lambda owner: svc._register_native_leg(record, owner),
+                      _strata_native_timeout=lambda: svc.lifecycle_note(record, "draining", cancel_reason="timeout"))
+        return merged
+
+    def submit(self, record, ids, max_new, sampling, cancel):
+        """Publish and await seating before a dialect emits headers; events consumes this exact owner."""
+        svc = self.service
+        if getattr(svc.embeddings, "path", None):
+            raise ValueError("native retained-prompt admission is text-only")
+        owner = record["_native_owner"]
+        with svc.status_lock:
+            svc.status["queued"] += 1
+        try:
+            svc.lifecycle_note(record, "engine_wait", prompt_tokens=len(ids), max_tokens=max_new,
+                               context_budget=len(ids) + max_new + CTX_SLACK, _executing=False)
+            try:
+                svc.engine.native_submit(ids, max_new, self.sampling(record, sampling), cancel, owner)
+            finally:
+                svc._release_ingress_preparation(record)
+            if not owner.get("seating_consumed"):
+                svc.engine.await_native_seating(owner, cancel)
+        except AdmissionError as error:
+            if error.status == 408:
+                with svc.status_lock:
+                    record["cancel_reason"] = "timeout"
+                    cancel.set()
+            raise
+        finally:
+            with svc.status_lock:
+                svc.status["queued"] -= 1
+        record["_staged_native_owner"] = owner
+        return LifecycleIdentity.of(owner)
+
+    def events(self, record, ids, max_new, sampling, cancel, embeddings=None):
+        if embeddings:
+            raise ValueError("native retained-prompt admission is text-only")
+        owner = record.pop("_staged_native_owner", None)
+        if owner is None:
+            self.service._check_ingress_cancel(record)
+            owner = record.get("_native_owner")
+        sampling = {**sampling, "strata_priority": record["priority"], "_strata_native_owner": owner}
+        return self.service.engine.generate(ids, max_new, sampling, cancel)
+
+    def cancel(self, record, identity=None):
+        sent = False
+        for owner in tuple(record.get("_native_owners", ())):
+            if identity is None or owner["tag"] == identity.tag:
+                sent = self.service.engine._native_cancel(owner, identity=identity) or sent
+        return sent
+
+    def priority(self, record, priority, identity):
+        for owner in tuple(record.get("_native_owners", ())):
+            if owner["tag"] == identity.tag:
+                return self.service.engine.native_priority(owner, priority, identity)
+        return False
+
+    def terminal(self, record):
+        svc = self.service
+        owners = tuple(record["_native_owners"])
+        try:
+            for owner in owners:
+                svc.engine.native_close(owner)
+        finally:
+            svc._release_ingress_preparation(record)
+            with svc.status_lock:
+                record["retained_events_complete"] &= all(
+                    owner["drained"] and (owner["accepted"] or owner.get("terminal_kind") == "BQREJECT")
+                    for owner in owners)
+
+
+class LegacySeatTransport:
+    """Explicit fallback for daily/legacy, packed-only and score-control modes; no native coverage is implied."""
+
+    def __init__(self, service):
+        self.service = service
+
+    def acquire(self, record, on_wait=None):
+        svc = self.service
+        while True:
+            if record.get("_native_admission"):
+                return svc.acquire_request(record, on_wait=on_wait)
+            admitted = False
+            with svc.admission_cv:
+                if record["_cancel"].is_set():
+                    raise AdmissionError(record.get("cancel_reason", "cancelled"),
+                                         408 if record.get("cancel_reason") == "timeout" else 409)
+                if time.perf_counter() >= record["_deadline"]:
+                    record["cancel_reason"] = "timeout"
+                    record["_cancel"].set()
+                    raise AdmissionError("request timed out while queued", 408)
+                score = bool(record.get("_score"))
+                order = svc.selector_order(score, svc.admission_waiters, svc.admission_foreground[score], 1,
+                                           svc.admission_solo[score])
+                chosen = order[0] if order else None
+                capacity = 1 if score else max(1, int(getattr(svc.engine, "batch", 0) or 0))
+                active = sum(bool(r.get("_score")) == score for r in svc.admission_active.values())
+                active_solo = sum(1 for r in svc.admission_active.values()
+                                  if not r.get("_score") and r["priority"] == "foreground" and
+                                  r.get("_packing") == "solo")
+                if chosen is record and svc._capacity_allows(record, active, active_solo, capacity):
+                    svc.admission_waiters.remove(record)
+                    svc.admission_active[record["id"]] = record
+                    svc.admission_foreground[score] = svc.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
+                    if record["priority"] == "foreground":
+                        svc.admission_solo[score] = (svc.admission_solo[score] + 1
+                                                   if record.get("_packing") == "solo" else 0)
+                    else:
+                        svc.admission_solo[score] = 0
+                    svc.status["queued"] -= 1
+                    record["_admitted_clock"] = time.perf_counter()
+                    record["queue_s"] = round(record["_admitted_clock"] - record["_clock"], 6)
+                    record["admission_wait_s"] = record["_admitted_clock"] - record["_clock"]
+                    record["admission_reason"] = ("foreground_quota" if record["priority"] == "background" and
+                                                  svc.admission_foreground[score] == 0 and
+                                                  any(r["priority"] == "foreground" for r in svc.admission_waiters)
+                                                  else "priority_fifo")
+                    _frontend_phase(record, "preparation", record["_admitted_clock"])
+                    svc.admission_cv.notify_all()
+                    admitted = True
+                else:
+                    svc.admission_cv.wait(timeout=0.25)
+            if admitted:
+                break
+            if on_wait is not None:
+                on_wait()
+        svc.lifecycle_note(record, "admitted")
+
+    def sampling(self, record, sampling):
+        svc = self.service
+        if record["_cancel"].is_set():
+            raise ValueError("request cancelled before generation")
+        if not isinstance(svc.engine, StrataEngine):
+            return sampling
+        trace = getattr(svc.request_trace, "record", None)
+        def control_ready(waited):
+            with svc.status_lock:
+                record["queue_s"] += waited
+                if trace is not None:
+                    trace["queue_s"] += waited
+        def submitted(slot):
+            svc.lifecycle_note(record, "prefill", slot=slot, _executing=True)
+            btrace("owner", record["id"], "slot", slot)
+        return {**(sampling or {}), "_strata_control_ready": control_ready,
+                "_strata_submission": lambda correlation: svc.native_submitted(record, correlation=correlation),
+                "_strata_frontend_phase": lambda phase: svc.frontend_phase(record, phase),
+                "_strata_slot": lambda slot: svc.lifecycle_note(record, "admitted", slot=slot),
+                "_strata_native_waiting": lambda: svc.lifecycle_note(record, "engine_wait", _executing=False),
+                "_strata_submitted": submitted, "_strata_request_id": record["id"],
+                "_strata_foreground_pending": lambda: svc._foreground_pending}
+
+    def events(self, record, ids, max_new, sampling, cancel, embeddings=None):
+        engine = self.service.engine
+        return (engine.generate(ids, max_new, sampling, cancel, embeddings=embeddings) if embeddings
+                else engine.generate(ids, max_new, sampling, cancel))
+
+
+class LifecycleAdapter:
+    """One in-process submit/events/cancel/priority/terminal seam; it never chooses native seats or retries work."""
+
+    def __init__(self, service):
+        self.service = service
+        self.native = NativeLifecycleTransport(service)
+        self.legacy = LegacySeatTransport(service)
+
+    @property
+    def native_supported(self):
+        return bool(getattr(self.service.engine, "native_admission", False))
+
+    def transport(self, record):
+        return self.native if record is not None and record.get("_native_admission") else self.legacy
+
+    def initialize(self, record):
+        if record.get("_native_admission"):
+            self.native.initialize(record)
+
+    def register(self, record, capacity):
+        if not record.get("_score") and self.native_supported:
+            self.native.register(record, capacity)
+
+    def acquire_fallback(self, record, on_wait=None):
+        return self.legacy.acquire(record, on_wait)
+
+    def resolve(self):
+        """Backfill lazy startup in arrival order. Caller holds admission_cv, including during terminal close."""
+        svc = self.service
+        if not svc.loaded() or not self.native_supported:
+            return
+        capacity = max(1, int(svc.engine.batch or 0)) + svc.request_queue_limit
+        pending = list(svc.admission_waiters) + list(svc.admission_active.values())
+        for record in sorted(pending, key=lambda item: item["_clock"]):
+            if (not record.get("_native_closing") and not record.get("_frontend_finished") and
+                    not record.get("_score") and "_native_owner" not in record):
+                self.native.register(record, capacity)
+        svc.admission_cv.notify_all()
+
+    def submit(self, record, ids, thinking, max_new, sampling, cancel):
+        # Legacy publication remains under its existing FIFO/control/seat owner in events.
+        if self.transport(record) is self.native:
+            return self.native.submit(record, ids, max_new, self.service.generation_sampling(sampling, thinking), cancel)
+
+    def sampling(self, record, sampling):
+        return self.transport(record).sampling(record, sampling) if record is not None else sampling
+
+    def events(self, record, ids, max_new, sampling, cancel, embeddings=None):
+        consumer = self.transport(record).events(record, ids, max_new, sampling, cancel, embeddings)
+        if record is not None:
+            record.setdefault("_generators", []).append(consumer)
+        try:
+            for token in consumer:
+                yield token
+        finally:
+            try:
+                consumer.close()
+            finally:
+                if record is not None and consumer in record.get("_generators", ()):
+                    record["_generators"].remove(consumer)
+
+    def cancel(self, record, identity=None):
+        if self.transport(record) is self.native:
+            if identity is None:
+                record["_cancel"].set()
+            sent = self.native.cancel(record, identity)
+            if sent:
+                record["_cancel"].set()
+            return sent
+        # Legacy STOP/BSTOP remains with the generator that owns its fenced identity.
+        if identity is not None:
+            return False  # A native control receipt cannot name a legacy/solo owner.
+        record["_cancel"].set()
+        return True
+
+    def priority(self, record, priority, identity):
+        if priority not in ("foreground", "background"):
+            raise ValueError("strata_priority must be foreground or background")
+        if self.transport(record) is not self.native:
+            raise ValueError("live priority updates require native lifecycle admission")
+        if not isinstance(identity, LifecycleIdentity):
+            raise ValueError("native priority updates require a lifecycle identity receipt")
+        return self.native.priority(record, priority, identity)
+
+    def terminal(self, record):
+        if record is None:
+            return
+        with self.service.admission_cv:
+            record["_native_closing"] = True
+            native = self.transport(record) is self.native
+            consumers = tuple(record.get("_generators", ()))
+        error = None
+        for consumer in consumers:
+            record["_cancel"].set()
+            try:
+                consumer.close()
+            except (EngineDied, ValueError) as failure:
+                error = error or failure
+        record["_generators"] = []
+        if native:
+            try:
+                self.native.terminal(record)
+            except (EngineDied, ValueError) as failure:
+                error = error or failure
+        if error is not None:
+            raise error
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -4997,6 +5331,7 @@ class Service:
         self.lifecycles = collections.deque(maxlen=500)
         self.lifecycle_boot = uuid.uuid4().hex
         self.lifecycle_local = threading.local()
+        self.lifecycle_adapter = LifecycleAdapter(self)
         self.frontend_totals = {p: {o: {"requests": 0, "seconds": dict.fromkeys(FRONTEND_PHASES, 0.0),
                                        "counts": dict.fromkeys(FRONTEND_PHASES, 0),
                                        "first_token_s": 0.0, "first_token_count": 0,
@@ -5238,8 +5573,9 @@ class Service:
                   "events": [{"state": "queued", "elapsed_s": 0.0}], "events_dropped": 0, "_clock": now,
                   "_deadline": now + timeout, "_cancel": cancel}
         record["_native_admission"] = not score and bool(getattr(self.engine, "native_admission", False))
+        record["lifecycle_transport"] = "score-control" if score else "legacy-seat"
         if record["_native_admission"]:
-            self._init_native_record(record)
+            self.lifecycle_adapter.initialize(record)
         record.update(boot_id=self.lifecycle_boot, first_content_s=None,
                       frontend={"seconds": dict.fromkeys(FRONTEND_PHASES, 0.0),
                                 "counts": dict.fromkeys(FRONTEND_PHASES, 0)},
@@ -5269,9 +5605,9 @@ class Service:
                 record["rejection_reason"] = "queue_full"
                 raise AdmissionError("request queue is full; retry after a request completes", lifecycle=record)
             if self.loaded() and bool(getattr(self.engine, "native_admission", False)):
-                self._resolve_native_admission_locked()
+                self.lifecycle_adapter.resolve()
                 if not score:
-                    self._register_native_record_locked(record, limit)
+                    self.lifecycle_adapter.register(record, limit)
             self.admission_waiters.append(record)
             self.lifecycles.append(record)
             self.status["queued"] += 1
@@ -5280,44 +5616,6 @@ class Service:
             self.admission_cv.notify_all()
         return record
 
-    @staticmethod
-    def _init_native_record(record):
-        record.update(_native_admission=True, ingress_wait_s=record.get("queue_s", 0.0),
-                      retained_events=[], retained_events_dropped=0, retained_events_complete=True,
-                      native_registration_count=0, native_wait_receipts_missing={"admission": 0, "service": 0},
-                      _native_owners=[], _native_receipts={}, _reserved_solo_slot=False)
-        if "frontend" in record:
-            # A lazy engine had no capability when ingress was accepted. Its pre-load wait
-            # was frontend ingress, not a native seating decision.
-            seconds, counts = record["frontend"]["seconds"], record["frontend"]["counts"]
-            seconds["ingress_wait"] += seconds["admission_wait"]
-            counts["ingress_wait"] += counts["admission_wait"]
-            seconds["admission_wait"], counts["admission_wait"] = 0.0, 0
-            if record.get("_frontend_phase") == "admission_wait":
-                record["_frontend_phase"] = "ingress_wait"
-
-    def _register_native_record_locked(self, record, capacity):
-        # admission_cv is the acceptance/publication linearization point. No tokenization
-        # worker can publish a later logical owner ahead of this registration.
-        if "_native_owners" not in record:
-            self._init_native_record(record)
-        owner = self.engine.native_register(record["priority"], record["_packing"], record["_deadline"], capacity,
-                                             lambda event: self.retained_event(record, event))
-        record["_native_owners"].append(owner)
-        record["_native_owner"] = owner
-        record["native_registration_count"] = 1
-        record["native_wait_receipts_missing"] = {"admission": 1, "service": 1}
-
-    def _resolve_native_admission_locked(self):
-        if not self.loaded() or not bool(getattr(self.engine, "native_admission", False)):
-            return
-        capacity = max(1, int(self.engine.batch or 0)) + self.request_queue_limit
-        pending = list(self.admission_waiters) + list(self.admission_active.values())
-        for record in sorted(pending, key=lambda item: item["_clock"]):
-            if (not record.get("_native_closing") and not record.get("_frontend_finished") and
-                    not record.get("_score") and "_native_owner" not in record):
-                self._register_native_record_locked(record, capacity)
-        self.admission_cv.notify_all()
 
     def retained_event(self, record, event):
         """Record real tagged wire receipts/controls independently of opt-in phase diagnostics."""
@@ -5369,6 +5667,9 @@ class Service:
                 record["state"] = "suspended"
             elif kind == "BQRESUMED":
                 record["state"] = "prefill"
+            elif kind == "BQPRIORITY" and event["monotonic_ns"] > record.get("_priority_stamp", -1):
+                record["priority"] = event["raw"].split()[5]
+                record["_priority_stamp"] = event["monotonic_ns"]
             self._refresh_foreground_pending()
 
     @staticmethod
@@ -5390,20 +5691,6 @@ class Service:
                           sum(key in item or "BQREJECT" in item for item in record["_native_receipts"].values()))
                 for name, key in (("admission", "native_admission_wait_s"), ("service", "native_service_wait_s"))}
 
-    def _native_sampling(self, record, sampling, thinking):
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
-        merged = {**defaults, **{key: value for key, value in (sampling or {}).items() if value is not None}}
-        merged.pop("_strata_native_owner", None)  # An HTTP body cannot manufacture a submitted owner.
-        if record is not None:
-            merged.update(_strata_native_deadline=record["_deadline"],
-                          _strata_native_capacity=max(1, int(self.engine.batch or 0)) + self.request_queue_limit,
-                          _strata_request_id=record["id"],
-                          _strata_submission=lambda correlation: self.native_submitted(record, correlation=correlation),
-                          _strata_frontend_phase=lambda phase: self.frontend_phase(record, phase),
-                          _strata_native_event=lambda event: self.retained_event(record, event),
-                          _strata_native_registered=lambda owner: self._register_native_leg(record, owner),
-                          _strata_native_timeout=lambda: self.lifecycle_note(record, "draining", cancel_reason="timeout"))
-        return merged
 
     def _release_ingress_preparation(self, record):
         if record is not None:
@@ -5411,55 +5698,6 @@ class Service:
                 self.ingress_preparing.discard(record["id"])
                 self.admission_cv.notify_all()
 
-    def stage_native(self, ids, thinking, max_new, sampling, cancel):
-        """Finish native submission and seating before any dialect emits headers or its preamble."""
-        record = getattr(self.lifecycle_local, "record", None)
-        if record is None or not record.get("_native_admission"):
-            return
-        if getattr(self.embeddings, "path", None):
-            raise ValueError("native retained-prompt admission is text-only")
-        owner = record["_native_owner"]
-        with self.status_lock:
-            self.status["queued"] += 1
-        try:
-            self.lifecycle_note(record, "engine_wait", prompt_tokens=len(ids), max_tokens=max_new,
-                                context_budget=len(ids) + max_new + CTX_SLACK, _executing=False)
-            try:
-                self.engine.native_submit(ids, max_new, self._native_sampling(record, sampling, thinking), cancel, owner)
-            finally:
-                # Native seat waits never retain a frontend preparation permit.
-                self._release_ingress_preparation(record)
-            self.engine.await_native_seating(owner, cancel)
-        except AdmissionError as error:
-            if error.status == 408:
-                with self.status_lock:
-                    record["cancel_reason"] = "timeout"
-                    cancel.set()
-            raise
-        finally:
-            with self.status_lock:
-                self.status["queued"] -= 1
-        record["_staged_native_owner"] = owner
-
-    def close_native(self, record):
-        if record is None:
-            return
-        with self.admission_cv:
-            # Terminal close and lazy-load backfill share this linearization point,
-            # even before this record has a capability or its first native owner.
-            record["_native_closing"] = True
-            if not record.get("_native_admission"):
-                return
-            owners = tuple(record["_native_owners"])
-        try:
-            for owner in owners:
-                self.engine.native_close(owner)
-        finally:
-            self._release_ingress_preparation(record)
-            with self.status_lock:
-                record["retained_events_complete"] &= all(
-                    owner["drained"] and (owner["accepted"] or owner.get("terminal_kind") == "BQREJECT")
-                    for owner in owners)
 
     def frontend_phase(self, record, phase):
         if record is not None:
@@ -5580,12 +5818,10 @@ class Service:
                 record["events_dropped"] += 1
 
     def acquire_request(self, record, on_wait=None):
-        """Wait for this server's admission decision: FIFO within a priority class, with a background admission after
-        at most three foreground ones.
+        """Bound frontend preparation; legacy seat admission is isolated in the explicit fallback transport.
 
-        `on_wait` runs once per wait, outside every admission lock, before the next decision: that is when a queued
-        request may prepare and offer itself (see prefetch_offer).  It never changes the decision below - a later,
-        warmer request cannot overtake the head - and it may not hold anything up but itself.
+        Native mode uses only CPU/memory ingress permits here, never a seat or priority prediction.
+        Legacy `on_wait` preparation stays outside the admission lock and cannot change selector order.
         """
         if record.get("_native_admission"):
             # This is an ingress CPU/memory permit, not a prediction of native seat or priority policy.
@@ -5615,54 +5851,7 @@ class Service:
                 self.admission_cv.notify_all()
             self.lifecycle_note(record, "preparing")
             return
-        while True:
-            if record.get("_native_admission"):
-                return self.acquire_request(record, on_wait=on_wait)
-            admitted = False
-            with self.admission_cv:
-                if record["_cancel"].is_set():
-                    raise AdmissionError(record.get("cancel_reason", "cancelled"),
-                                         408 if record.get("cancel_reason") == "timeout" else 409)
-                if time.perf_counter() >= record["_deadline"]:
-                    record["cancel_reason"] = "timeout"
-                    record["_cancel"].set()
-                    raise AdmissionError("request timed out while queued", 408)
-                score = bool(record.get("_score"))
-                order = self.selector_order(score, self.admission_waiters, self.admission_foreground[score], 1,
-                                            self.admission_solo[score])
-                chosen = order[0] if order else None
-                capacity = 1 if score else max(1, int(getattr(self.engine, "batch", 0) or 0))
-                active = sum(bool(r.get("_score")) == score for r in self.admission_active.values())
-                active_solo = sum(1 for r in self.admission_active.values()
-                                  if not r.get("_score") and r["priority"] == "foreground" and
-                                  r.get("_packing") == "solo")
-                if chosen is record and self._capacity_allows(record, active, active_solo, capacity):
-                    self.admission_waiters.remove(record)
-                    self.admission_active[record["id"]] = record
-                    self.admission_foreground[score] = self.admission_foreground[score] + 1 if record["priority"] == "foreground" else 0
-                    if record["priority"] == "foreground":
-                        self.admission_solo[score] = (self.admission_solo[score] + 1
-                                                     if record.get("_packing") == "solo" else 0)
-                    else:
-                        self.admission_solo[score] = 0
-                    self.status["queued"] -= 1
-                    record["_admitted_clock"] = time.perf_counter()
-                    record["queue_s"] = round(record["_admitted_clock"] - record["_clock"], 6)
-                    record["admission_wait_s"] = record["_admitted_clock"] - record["_clock"]
-                    record["admission_reason"] = ("foreground_quota" if record["priority"] == "background" and
-                                                  self.admission_foreground[score] == 0 and
-                                                  any(r["priority"] == "foreground" for r in self.admission_waiters)
-                                                  else "priority_fifo")
-                    _frontend_phase(record, "preparation", record["_admitted_clock"])
-                    self.admission_cv.notify_all()
-                    admitted = True
-                else:
-                    self.admission_cv.wait(timeout=0.25)
-            if admitted:
-                break
-            if on_wait is not None:
-                on_wait()
-        self.lifecycle_note(record, "admitted")
+        return self.lifecycle_adapter.acquire_fallback(record, on_wait=on_wait)
 
     def stop_admission(self) -> None:
         """Shut the door and cancel everything already accepted: the first thing a shutdown does.
@@ -5679,11 +5868,10 @@ class Service:
                 record["_cancel"].set()
             self.admission_cv.notify_all()
         for record in records:
-            for owner in record.get("_native_owners", []):
-                try:
-                    self.engine._native_cancel(owner)
-                except EngineDied:
-                    pass
+            try:
+                self.lifecycle_adapter.cancel(record)
+            except EngineDied:
+                pass
 
     @staticmethod
     def _check_ingress_cancel(record):
@@ -5696,6 +5884,9 @@ class Service:
 
     def finish_lifecycle(self, record):
         with self.admission_cv:
+            if record.get("_lifecycle_finished"):
+                return
+            record["_lifecycle_finished"] = True
             self.ingress_preparing.discard(record["id"])
             if record in self.admission_waiters:
                 self.admission_waiters.remove(record)
@@ -5755,12 +5946,10 @@ class Service:
             record["cancel_reason"] = "cancelled"
             record["_cancel"].set()
             self.admission_cv.notify_all()
-            owners = list(record.get("_native_owners", []))
-        for owner in owners:
-            try:
-                self.engine._native_cancel(owner)
-            except EngineDied:
-                pass
+        try:
+            self.lifecycle_adapter.cancel(record)
+        except EngineDied:
+            pass
         return True
 
     def score(self, request, cancel):
@@ -6058,7 +6247,7 @@ class Service:
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             with self.admission_cv:
-                self._resolve_native_admission_locked()
+                self.lifecycle_adapter.resolve()
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -6078,7 +6267,7 @@ class Service:
                 try:
                     self.ensure_loaded()
                     with self.admission_cv:
-                        self._resolve_native_admission_locked()
+                        self.lifecycle_adapter.resolve()
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -6965,7 +7154,7 @@ class Service:
         """
         if bool(getattr(self.engine, "native_admission", False)):
             with self.admission_cv:
-                self._resolve_native_admission_locked()
+                self.lifecycle_adapter.resolve()
             return
         if record.get("_native_admission"):
             return
@@ -7308,7 +7497,7 @@ class Service:
         record = getattr(self.lifecycle_local, "record", None)
         if record is not None and not record.get("_score") and bool(getattr(self.engine, "native_admission", False)):
             with self.admission_cv:
-                self._resolve_native_admission_locked()
+                self.lifecycle_adapter.resolve()
         if record is not None and record.get("_native_admission"):
             self.acquire_request(record)
         self.lifecycle_local.render_fallback = False
@@ -7685,6 +7874,11 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def generation_sampling(self, sampling, thinking):
+        """Model/template policy belongs to Service, not the lifecycle transport."""
+        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        return {**defaults, **{key: value for key, value in (sampling or {}).items() if value is not None}}
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
@@ -7708,42 +7902,10 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         lifecycle = getattr(self.lifecycle_local, "record", None)
         native = bool(lifecycle and lifecycle.get("_native_admission"))
-        if native:
-            sampling = self._native_sampling(lifecycle, sampling, thinking)
-            owner = lifecycle.pop("_staged_native_owner", None)
-            if owner is not None:
-                sampling["_strata_native_owner"] = owner
-            if owner is None:
-                self._check_ingress_cancel(lifecycle)
         if lifecycle is not None and not native:
             self.lifecycle_note(lifecycle, "preparing", prompt_tokens=len(ids), max_tokens=max_new,
                                 context_budget=len(ids) + max_new + CTX_SLACK, _executing=False)
-            if cancel.is_set():
-                raise ValueError("request cancelled before generation")
-            if isinstance(self.engine, StrataEngine):
-                def control_ready(waited):
-                    with self.status_lock:
-                        lifecycle["queue_s"] += waited
-                        if trace is not None:
-                            trace["queue_s"] += waited
-                def native_waiting():
-                    self.lifecycle_note(lifecycle, "engine_wait", _executing=False)
-                def submitted(slot):
-                    self.lifecycle_note(lifecycle, "prefill", slot=slot, _executing=True)
-                    btrace("owner", lifecycle["id"], "slot", slot)
-                def slot_assigned(slot):
-                    self.lifecycle_note(lifecycle, "admitted", slot=slot)
-                sampling = {**(sampling or {}), "_strata_control_ready": control_ready,
-                            "_strata_submission": lambda correlation: self.native_submitted(lifecycle, correlation=correlation),
-                            "_strata_frontend_phase": lambda phase: self.frontend_phase(lifecycle, phase),
-                            "_strata_slot": slot_assigned, "_strata_native_waiting": native_waiting,
-                            "_strata_submitted": submitted, "_strata_request_id": lifecycle["id"],
-                            "_strata_foreground_pending": lambda: self._foreground_pending}
-        # Model-card sampling, then the config block, then shared Chat settings; explicit request values win.
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
-            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
-            sampling = {**defaults, **req_values}
+        sampling = self.lifecycle_adapter.sampling(lifecycle, self.generation_sampling(sampling, thinking))
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -7888,10 +8050,7 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
-                        if lifecycle is not None:
-                            lifecycle.setdefault("_generators", []).append(gen)
+                        gen = self.lifecycle_adapter.events(lifecycle, prompt, max_new - n, sampling, cancel, emb)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -8011,9 +8170,6 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
-                            finally:
-                                if lifecycle is not None:
-                                    lifecycle["_generators"].remove(gen)
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
@@ -8321,6 +8477,7 @@ def _response_attribution(lifecycle: dict, path: str) -> dict:
         figures = request_stats([owner["result"] for owner in lifecycle.get("_native_owners", [])
                                  if "result" in owner])
     attribution = {"request_id": lifecycle["id"], "path": path, "outcome": lifecycle["state"],
+            "lifecycle_transport": lifecycle.get("lifecycle_transport", "legacy-seat"),
             "finish": figures.get("finish"),
             "committed_tokens": figures.get("generated"),
             "output_tokens": sum(part["output_tokens"] for part in work),
@@ -9494,18 +9651,9 @@ def make_handler(svc: Service):
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
-                # Explicitly close all engine consumers even if an outer dialect generator retained one.
-                if self.lifecycle is not None:
-                    for gen in list(self.lifecycle.get("_generators", [])):
-                        self.lifecycle["_cancel"].set()
-                        try:
-                            gen.close()
-                        except (EngineDied, ValueError) as e:
-                            self._note(error={"type": "drain_error", "message": str(e)})
-                    self.lifecycle["_generators"] = []
                 if self.lifecycle is not None:
                     try:
-                        svc.close_native(self.lifecycle)
+                        svc.lifecycle_adapter.terminal(self.lifecycle)
                     except (EngineDied, ValueError) as e:
                         self._note(error={"type": "drain_error", "message": str(e)})
                     svc.withdraw_offer(self.lifecycle)       # a prepared offer's lifetime is its request's
@@ -9783,7 +9931,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, resolved.max_new_requested, force=force, req=req,
                                                  cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            svc.stage_native(ids, thinking, max_new, req, cancel)
+            svc.lifecycle_adapter.submit(self.lifecycle, ids, thinking, max_new, req, cancel)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, resolved.max_new_requested,
                                req, cancel, resolved.mcp_extra) if resolved.mcp_use else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
@@ -9821,7 +9969,7 @@ def make_handler(svc: Service):
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
-            svc.close_native(self.lifecycle)  # This shortcut has no generation seat to await.
+            svc.lifecycle_adapter.terminal(self.lifecycle)  # No generation seat is needed for this shortcut.
             if not req.get("stream"):
                 return self._json(200, responses_api.collect(events))
             self._sse()
@@ -9855,7 +10003,7 @@ def make_handler(svc: Service):
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            svc.stage_native(ids, thinking, max_new, req, cancel)
+            svc.lifecycle_adapter.submit(self.lifecycle, ids, thinking, max_new, req, cancel)
 
 
             def check(text, finish):
@@ -9974,7 +10122,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, resolved.max_new_requested, force=force, req=req,
                                                  cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            svc.stage_native(ids, thinking, max_new, req, cancel)
+            svc.lifecycle_adapter.submit(self.lifecycle, ids, thinking, max_new, req, cancel)
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):

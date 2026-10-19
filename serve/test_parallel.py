@@ -4,6 +4,7 @@ A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / B
 real StrataEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
+import collections
 import contextlib
 import io
 import json
@@ -18,7 +19,8 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import (ByteTokenizer, Service, SpeculationPolicy, StrataEngine, engine_args, parallel_args, serve)
+from serve.server import (ATTRIBUTION_OUTCOMES, ByteTokenizer, LifecycleIdentity, Service, SpeculationPolicy,
+                          StrataEngine, engine_args, parallel_args, serve)
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -219,6 +221,12 @@ def native_tick():
         owner["service_clock"] = now
         if owner["cancelled"] or now >= owner["deadline"]:
             continue
+        marker = bytes(token & 255 for token in owner["ids"])
+        if b"ADAPTEREXIT" in marker:
+            sys.exit(7)
+        if b"REFUSEME" in marker:
+            native_finish(owner, "nonfinite")
+            continue
         prefix = f"{tag} {slot} {owner['identity'][0]} {owner['identity'][1]}"
         if len(owner["ids"]) > 33 and not owner["resumed"] and "--native-no-suspend" not in args:
             if owner["cursor"] is None:
@@ -301,7 +309,8 @@ def native_frame(line):
             return
         assert owner is not None and owner["ids"] is None, "unregistered or repeated input: " + line
         input_capacity = int(args[args.index("--native-input-capacity") + 1]) if "--native-input-capacity" in args else 264
-        if sum(o["ids"] is not None and o["slot"] < 0 for o in native_owners.values()) >= input_capacity:
+        if (b"ADMISSIONREFUSE" in bytes(int(token) & 255 for token in fields[-1].split(",")) or
+                sum(o["ids"] is not None and o["slot"] < 0 for o in native_owners.values()) >= input_capacity):
             native_terminals.add(tag)
             native_send(f"BQREJECT {tag} -1 transport_full")
             del native_owners[tag]
@@ -541,6 +550,10 @@ while True:
         slot = int(f[1]) if f[0] == "BGEN" else None
         max_new = int(f[2] if f[0] == "BGEN" else f[1])
         ids = f[-1].split(",")
+        if b"ADAPTEREXIT" in bytes(int(x) & 255 for x in ids):
+            if log:
+                log.write(f"{f[0]} {slot} {len(ids)} {len(active)}\n"); log.flush()
+            sys.exit(7)
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # #1059: refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
             continue
@@ -3280,6 +3293,185 @@ class NativeAdmissionTransport(NativeAdmissionHarness, unittest.TestCase):
             self.assertEqual(len(self.wire("BQDONE", tag=waiting_tag)), 1)
         finally:
             old.close()
+
+
+class LifecycleAdapterMatrix:
+    """The same client lifecycle across the native mode and its explicit legacy fallback; no GPU claims."""
+
+    def start_adapter(self, *, held=False):
+        if self.native_mode:
+            self.start_native(1)
+            if not held:
+                self.gate("service", held=False)
+        else:
+            self.gate_tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.gate_tmp.cleanup)
+            self.gates = Path(self.gate_tmp.name)
+            self.clients = []
+            if held:
+                self.gate("legacy-replies")
+            self.start(2, more=("--resident-multiplex", "--says-multiplex", "--legacy-identity",
+                                "--hold-replies", str(self.gates / "legacy-replies")))
+            self.svc.configure_admission({"lifecycle_api": True})
+
+    def release_adapter(self):
+        self.gate("service" if self.native_mode else "legacy-replies", held=False)
+
+    def wait_adapter_owner(self, client):
+        identity = self.client_identity(client)
+        if self.native_mode:
+            self.wait_until(lambda: self.client_record(client).get("native_request") is not None)
+        else:
+            self.wait_until(lambda: any(live and live.get("request_id") == identity and
+                                        self.engine._slot_identity[slot] is not None
+                                        for slot, live in enumerate(self.engine.slot_live)))
+
+    def final_record(self, client, outcome):
+        record = self.wait_until(lambda: (row if (row := self.client_record(client)).get("state") == outcome and
+                                         row.get("finished_monotonic_s") is not None else None))
+        self.assertEqual(record["lifecycle_transport"], "native-retained-v1" if self.native_mode else "legacy-seat")
+        terminals = [event for event in record["events"] if event["state"] in ATTRIBUTION_OUTCOMES]
+        self.assertEqual(len(terminals), 1, record["events"])
+        self.assertAlmostEqual(sum(record["frontend"]["seconds"].values()), record["completion_s"], places=5)
+        receipts = collections.Counter(event["tag"] for event in record.get("retained_events", [])
+                                       if event["direction"] == "received" and
+                                       event["event"] in ("BQDONE", "BQREJECT"))
+        self.assertTrue(all(count == 1 for count in receipts.values()), receipts)
+        body = client.get("body")
+        if isinstance(body, str):
+            self.assertLessEqual(body.count("data: [DONE]"), 1, body)
+            finishes = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+            self.assertLessEqual(sum(any(choice.get("finish_reason") is not None for choice in row.get("choices", []))
+                                     for row in finishes), 1, body)
+        return record
+
+    def test_adapter_completion_and_phase_partition(self):
+        self.start_adapter()
+        client = self.launch("adapter completion", stream=True, max_tokens=4)
+        response = self.finish_client(client)
+        self.assertEqual(response["body"].count("data: [DONE]"), 1)
+        record = self.final_record(client, "completed")
+        self.assertEqual(record["native_submission_count"], 1)
+        if self.native_mode:
+            self.assertEqual(record["frontend"]["counts"]["control_selector_wait"], 0)
+            self.assertEqual(record["frontend"]["counts"]["physical_slot_wait"], 0)
+
+    def test_adapter_cancel_is_one_terminal_without_resubmission(self):
+        self.start_adapter(held=True)
+        client = self.launch("adapter cancel", stream=True, max_tokens=8)
+        self.wait_adapter_owner(client)
+        self.cancel_client(client)
+        if not self.native_mode:
+            self.wait_until(lambda: "BSTOP " in self.log.read_text())
+        self.release_adapter()
+        self.finish_client(client)
+        record = self.final_record(client, "cancelled")
+        self.assertEqual(record["native_submission_count"], 1)
+
+    def test_adapter_disconnect_drains_without_rerun(self):
+        import socket
+        self.start_adapter(held=True)
+        body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "adapter disconnect"}],
+                           "reasoning_effort": "none", "stream": True, "max_tokens": 8}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=5)
+        try:
+            sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n" +
+                         f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            self.wait_until(lambda: any(row.get("slot") is not None for row in self.svc.lifecycle_records()))
+            identity = self.svc.lifecycle_records()[0]["id"]
+            self.wait_adapter_owner({"id": identity})
+            sock.shutdown(socket.SHUT_RDWR)
+        finally:
+            sock.close()
+        self.wait_until(lambda: self.svc.lifecycle_records(identity).get("cancel_reason") == "disconnected")
+        self.release_adapter()
+        client = {"id": identity}
+        record = self.final_record(client, "disconnected")
+        self.assertEqual(record["native_submission_count"], 1)
+        successor = self.launch("peer after disconnect")
+        self.finish_client(successor)
+        self.final_record(successor, "completed")
+
+    def test_adapter_refusal_is_request_local(self):
+        self.start_adapter()
+        client = self.launch("ADMISSIONREFUSE", stream=True)
+        self.finish_client(client, 429 if self.native_mode else 200)
+        record = self.final_record(client, "rejected" if self.native_mode else "error")
+        self.assertEqual(record.get("output_tokens", 0), 0)
+        self.assertTrue(self.engine.alive())
+        successor = self.launch("peer after refusal")
+        self.finish_client(successor)
+        self.final_record(successor, "completed")
+
+    def test_adapter_recoverable_engine_error_keeps_successor_usable(self):
+        self.start_adapter()
+        client = self.launch("REFUSEME", stream=True)
+        self.finish_client(client, None)  # Native reports its drained nonfinite terminal after the SSE preamble.
+        record = self.final_record(client, "error")
+        self.assertEqual(record.get("output_tokens", 0), 0)
+        if self.native_mode:
+            self.assertEqual(record["native_registration_count"], 2)
+        self.assertTrue(self.engine.alive())
+        successor = self.launch("peer after recoverable error")
+        self.finish_client(successor)
+        self.final_record(successor, "completed")
+
+    def test_adapter_engine_exit_never_replays_accepted_input(self):
+        self.start_adapter()
+        client = self.launch("ADAPTEREXIT", stream=True)
+        self.finish_client(client, None)
+        record = self.final_record(client, "error")
+        self.assertEqual(record["native_submission_count"], 1)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.engine.exit_code(), 7)
+        if self.native_mode:
+            self.assertEqual(len(self.wire("BQREGISTER", direction="sent")), 1)
+        else:
+            self.assertEqual(sum(line.startswith(("GEN ", "BGEN ")) for line in self.log.read_text().splitlines()), 1)
+
+
+class LegacyLifecycleAdapterMatrix(LifecycleAdapterMatrix, NativeAdmissionHarness, unittest.TestCase):
+    native_mode = False
+
+
+class NativeLifecycleAdapterMatrix(LifecycleAdapterMatrix, NativeAdmissionHarness, unittest.TestCase):
+    native_mode = True
+
+    def test_priority_and_cancel_use_tag_and_incarnation_not_reused_seat(self):
+        self.start_native(1, admission_held=True)
+        client = self.launch("fenced native controls", stream=True)
+        tag = self.registered_tag(1)
+        self.wait_wire("BGENQ1", tag=tag, direction="sent")
+        record = self.svc.admission_active[self.client_identity(client)]
+        with self.engine.slot_cv:
+            queued = LifecycleIdentity.of(record["_native_owner"])
+        adapter = self.svc.lifecycle_adapter
+        self.assertTrue(adapter.priority(record, "background", queued))
+        self.wait_wire("BQPRIORITY", tag=tag, direction="sent")
+        self.gate("admission", held=False)
+        self.wait_wire("BACK", tag=tag)
+        with self.engine.slot_cv:
+            seated = LifecycleIdentity.of(record["_native_owner"])
+        self.assertNotEqual(queued, seated)
+        self.assertFalse(adapter.priority(record, "foreground", queued))
+        wrong = LifecycleIdentity(tag, seated.slot, seated.request + 1, seated.incarnation)
+        self.assertFalse(adapter.cancel(record, wrong))
+        self.assertFalse(record["_cancel"].is_set())
+        self.assertTrue(adapter.priority(record, "foreground", seated))
+        self.cancel_client(client)
+        self.finish_client(client)
+        self.final_record(client, "cancelled")
+        successor = self.launch("same seat with a different owner")
+        new_tag = self.registered_tag(2)
+        self.wait_wire("BACK", tag=new_tag)
+        new_record = self.svc.admission_active[self.client_identity(successor)]
+        self.assertFalse(adapter.priority(new_record, "background", seated))
+        self.assertFalse(adapter.cancel(new_record, seated))
+        self.assertFalse(new_record["_cancel"].is_set())
+        self.assertEqual(len(self.wire("BQPRIORITY", tag=tag, direction="sent")), 2)
+        self.gate("service", held=False)
+        self.finish_client(successor)
+        self.final_record(successor, "completed")
 
 
 class ScoreTransport(unittest.TestCase):

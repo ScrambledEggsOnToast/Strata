@@ -268,6 +268,64 @@ class RequestAdmission(unittest.TestCase):
         tok = ByteTokenizer()
         return Service(MockEngine(tok, "ok"), tok, None)
 
+    def test_lifecycle_terminal_and_frontend_totals_are_idempotent(self):
+        svc = self.service()
+        record = svc.register_lifecycle({}, threading.Event())
+        svc.acquire_request(record)
+        svc.lifecycle_adapter.terminal(record)
+        svc.finish_lifecycle(record)
+        snapshot = svc.lifecycle_records(record["id"])
+        svc.lifecycle_adapter.terminal(record)
+        svc.finish_lifecycle(record)
+        self.assertEqual(svc.lifecycle_records(record["id"]), snapshot)
+        self.assertEqual(svc.frontend_totals["foreground"]["completed"]["requests"], 1)
+        self.assertEqual(sum(event["state"] == "completed" for event in record["events"]), 1)
+
+    def test_adapter_terminal_drains_a_retained_legacy_consumer_once(self):
+        svc = self.service()
+        cancel = threading.Event()
+        record = svc.register_lifecycle({}, cancel)
+        svc.acquire_request(record)
+        events = svc.lifecycle_adapter.events(record, [1], 8, {}, cancel)
+        next(events)
+        self.assertEqual(len(record["_generators"]), 1)
+        svc.cancel_request(record["id"])
+        svc.lifecycle_adapter.terminal(record)
+        events.close()  # A dialect may release its outer iterator after terminal drain.
+        self.assertEqual(record["_generators"], [])
+        self.assertTrue(cancel.is_set())
+        svc.finish_lifecycle(record)
+        svc.lifecycle_adapter.terminal(record)
+        svc.finish_lifecycle(record)
+        self.assertEqual(svc.frontend_totals["foreground"]["cancelled"]["requests"], 1)
+
+    def test_legacy_queue_keeps_timeout_message_and_existing_cancel_reason(self):
+        for disconnected in (False, True):
+            with self.subTest(disconnected=disconnected):
+                svc = self.service()
+                cancel = threading.Event()
+                record = svc.register_lifecycle({}, cancel)
+                record["_deadline"] = time.perf_counter() - 1
+                if disconnected:
+                    record["cancel_reason"] = "disconnected"
+                    cancel.set()
+                with self.assertRaises(AdmissionError) as failed:
+                    svc.acquire_request(record)
+                self.assertEqual(failed.exception.status, 409 if disconnected else 408)
+                self.assertEqual(str(failed.exception), "disconnected" if disconnected else
+                                 "request timed out while queued")
+                self.assertTrue(cancel.is_set())
+                svc.finish_lifecycle(record)
+
+    def test_legacy_fallback_does_not_issue_unfenced_live_priority_controls(self):
+        svc = self.service()
+        record = svc.register_lifecycle({}, threading.Event())
+        self.assertEqual(record["lifecycle_transport"], "legacy-seat")
+        with self.assertRaisesRegex(ValueError, "require native lifecycle"):
+            svc.lifecycle_adapter.priority(record, "background", None)
+        self.assertFalse(record["_cancel"].is_set())
+        svc.finish_lifecycle(record)
+
     def test_frontend_partition_survives_trace_overflow_and_cancelled_reacquisition(self):
         svc = self.service()
         clock = [100.0]
@@ -886,7 +944,7 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
                         self.assertEqual(error.status, 409)
                     else:
                         raise AssertionError("deferred request bypassed the occupied preparation permit")
-                self.svc.close_native(record)
+                self.svc.lifecycle_adapter.terminal(record)
                 closed.set()
                 if not finish.wait(5):
                     raise AssertionError("lifecycle retirement barrier timed out")
@@ -911,7 +969,7 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
             self.assertFalse(worker.is_alive())
             self.assertEqual(errors, [])
             if blocker is not None:
-                self.svc.close_native(blocker)
+                self.svc.lifecycle_adapter.terminal(blocker)
                 self.svc.finish_lifecycle(blocker)
             self.assertEqual(record.get("native_registration_count", 0), 0,
                              "backfill registered a lifecycle after its last terminal close")
@@ -926,7 +984,7 @@ class NativeAdmissionLifecycle(parallel_tests.NativeAdmissionHarness, unittest.T
         finally:
             finish.set()
             worker.join(2)
-            self.svc.close_native(record)  # drain the orphan as well if a red assertion found one
+            self.svc.lifecycle_adapter.terminal(record)  # Drain any owner found by a red backfill assertion.
 
     def test_deferred_ingress_cancel_cannot_be_registered_after_close_during_reload(self):
         self.assert_deferred_close_excludes_load_backfill(cancel=True, lazy=False)

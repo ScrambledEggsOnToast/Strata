@@ -131,6 +131,30 @@ native leg; `admission.executing` counts submitted request legs through their dr
 does not claim simultaneous GPU kernels or overlapping prefill and decode. Active slot metrics include the
 stable frontend `request_id`, matching `X-Strata-Request-Id` across solo/resident transitions and slot reuse.
 
+### Client lifecycle adapter
+
+`Service` renders/tokenizes requests and owns authentication, model/template selection, output dialects,
+socket backpressure and deadlines. Generation crosses one in-process `LifecycleAdapter`:
+`submit`, `events`, `cancel`, identity-fenced `priority`, and terminal drain. It uses the existing
+stdin/stdout frames, with the logical native tag plus `(request, incarnation)` rather than a reusable seat.
+Submission is not replayed after disconnect or engine exit; an accepted native leg has at most one terminal.
+The existing bounded nonfinite-before-output retry remains a separate, explicit frontend recovery rule.
+
+Only resolved retained-prompt **and** native-admission v1 capabilities select `native-retained-v1`.
+That transport registers before preparation and delegates admission, seats and runnable policy to native code.
+HTTP ingress remains bounded by effective slots plus queue depth, with separate bounded preparation permits
+and the original request deadline. `LegacySeatTransport` is the explicit `legacy-seat` fallback for daily,
+legacy and packed-only generation: its existing FIFO/seat policy, solo/image paths and fenced resident stops
+remain in use. This extraction does **not** migrate daily traffic. Legacy live priority changes are refused
+rather than sending an unfenced slot-only control; the per-request priority at admission is unchanged.
+Score requests retain their separate bounded control lane.
+
+Lifecycle/response attribution names the selected transport. Existing exclusive `frontend.seconds` and
+`frontend.counts`, `native_phase`, `ingress_wait_s`, `native_admission_wait_s` and `native_service_wait_s`
+remain the timing surfaces. Report preparation/cleanup and complete-call time separately from waits and
+native-active time; preparation/cleanup include rendering and protocol work, so they are not an isolated
+measurement of adapter dispatch cost. Mock-engine timings establish the partition, not GPU or installed-client speed.
+
 For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complete native stdout frames as
 `wire<` lines in the frontend log. Count only those trace lines' `T` and `BT` token IDs once; `ADMIT`, `BADM`,
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
