@@ -75,6 +75,7 @@ struct ExecutionPlan {
     Suspension suspension_mode = Suspension::none;
     PlanDecision concurrent_reader;
     PlanDecision suspension;         ///< on == the request keeps its seat without a resend
+    PlanDecision admission;          ///< native only for the explicitly selected retained-prompt lifecycle
     std::vector<PricedClass> memory_classes;  ///< filled after admission; empty before allocation
     std::vector<std::string> notes;
     std::string to_json() const;
@@ -241,6 +242,8 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
             p.suspension.support = Support::conditional;
             p.suspension.reason = "serial private preparation retains its plan without resending input; "
                                   "pending stage allocation and complete residency validation";
+            p.admission.support = Support::conditional;
+            p.admission.reason = "retained lifecycle pending allocation and residency validation";
         }
     } else if (in.packed_prefill) {
         p.suspension.support = Support::on;
@@ -347,6 +350,11 @@ inline std::string ExecutionPlan::to_json() const {
     out += ",\"reason\":";
     out += detail::json_quote(suspension.reason);
     out += '}';
+    out += ",\"admission\":{\"authority\":";
+    out += detail::json_quote(admission.support == Support::on || admission.support == Support::conditional
+        ? "native" : "frontend");
+    out += ",\"support\":" + detail::json_quote(support_name(admission.support)) +
+           ",\"reason\":" + detail::json_quote(admission.reason) + '}';
     out += ",\"memory_classes\":[";
     for (size_t i = 0; i < memory_classes.size(); ++i) {
         const PricedClass& c = memory_classes[i];

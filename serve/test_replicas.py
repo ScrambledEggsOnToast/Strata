@@ -54,6 +54,15 @@ class Config(unittest.TestCase):
         self.assertIsNone(cpu_sets(2, enabled=False))
         self.assertIsNone(cpu_sets(1))
 
+    def test_native_startup_refusal_closes_all_created_replicas(self):
+        from serve.server import start_replicas
+        engines = [mock.Mock(native_admission=True), mock.Mock(native_admission=True)]
+        with mock.patch("serve.server.StrataEngine", side_effect=engines):
+            with self.assertRaisesRegex(SystemExit, "native admission.*replicas"):
+                start_replicas({"args": [], "replica_cpus": False}, [[0], [1]], "unused", [], False)
+        for engine in engines:
+            engine.close.assert_called_once_with()
+
 
 class Routing(unittest.TestCase):
     def test_matched_prefix_per_replica(self):
@@ -85,6 +94,30 @@ class FakeEngine:
 
 
 class RouteChoice(unittest.TestCase):
+    def test_native_admission_is_refused_before_replica_routing(self):
+        for index in (0, 1):
+            with self.subTest(index=index):
+                engines = [FakeEngine(), FakeEngine()]
+                engines[index].native_admission = True
+                with self.assertRaisesRegex(ReplicaConfigError, "native admission.*replicas"):
+                    ReplicaEngine(engines)
+
+    def test_lazy_native_capability_refusal_closes_every_restarted_replica(self):
+        class Lazy(FakeEngine):
+            native_admission = False
+            def __init__(self):
+                super().__init__()
+                self.up = False
+            def restart(self, tries=3):
+                self.native_admission = self.up = True
+            def close(self, timeout_s=None):
+                self.up = False
+        engines = [Lazy(), Lazy()]
+        replicas = ReplicaEngine(engines)
+        with self.assertRaisesRegex(ReplicaConfigError, "native admission.*replicas"):
+            replicas.restart()
+        self.assertFalse(any(engine.alive() for engine in engines))
+
     def test_least_loaded_then_affinity(self):
         e = ReplicaEngine([FakeEngine(), FakeEngine()], load_tokens=3000)
         picks = [e.route([i] * 100) for i in range(4)]             # nothing cached: spread

@@ -8,6 +8,8 @@
 //   6. the concurrent reader names the first option-level reason it is off;
 //   7. the JSON report is a single machine-readable line carrying those values.
 #include "strata/program/execution_plan.hpp"
+#include "strata/program/native_admission.hpp"
+#include <array>
 
 #include <cstdio>
 #include <string>
@@ -136,6 +138,13 @@ int main() {
         check(!p.refused && !in.packed_prefill && !in.retained_prefill && p.suspension.support == ep::Support::conditional &&
               has(p.suspension.reason, "without resending") && has(p.suspension.reason, "pending stage allocation"),
               "serial retained prompt reports allocation-conditional capability without packing or layer yields");
+        check(p.admission.support == ep::Support::conditional &&
+              has(p.to_json(), "\"admission\":{\"authority\":\"native\",\"support\":\"conditional\""),
+              "native admission is conditional until retained allocations and residency validate");
+        auto resolved = p;
+        resolved.admission.support = ep::Support::on;
+        check(has(resolved.to_json(), "\"admission\":{\"authority\":\"native\",\"support\":\"on\""),
+              "resolved native admission advertises the exact cohort capability");
         check(p.concurrent_reader.support == ep::Support::off && has(p.concurrent_reader.reason, "retained prompt"),
               "retained prompt keeps the independent reader disabled");
         in.serve = false;
@@ -194,6 +203,41 @@ int main() {
         in.batch_requested = 3;
         const ep::ExecutionPlan r = ep::resolve_execution_plan(in);
         check(r.refused, "the third owner without four slots is refused");
+    }
+    {
+        int hint = -2;
+        check(ep::native_control_slot("-1", hint) && hint == -1,
+              "an unseated logical control carries no physical-seat claim");
+        check(ep::native_control_slot("7", hint) && hint == 7,
+              "a stale well-formed seat hint is fenced by logical lease matching, not parser fatal");
+        check(!ep::native_control_slot("-2", hint) && !ep::native_control_slot("seat", hint) &&
+              !ep::native_control_slot("2147483648", hint),
+              "malformed or overflowing seat hints remain protocol refusals");
+        ep::NativeAdmissionPolicy policy;
+        std::array<ep::AdmissionCandidate, 3> waiting{{
+            {0, 2, true, false, true}, {1, 1, true, false, true}, {2, 3, false, false, true}}};
+        check(policy.select(waiting)->index == 1, "native admission is FIFO within a priority class");
+        for (int i = 0; i < 3; ++i) policy.granted(true, false);
+        check(policy.select(waiting)->index == 2, "background bypass occurs after three successful foreground grants");
+        policy.granted(false, false);
+        waiting[1].ready = false;
+        check(!policy.select(waiting), "an earlier registered unready input cannot be bypassed by tokenization completion");
+        waiting[1].ready = true;
+        waiting[0].solo = true;
+        check(policy.select(waiting)->index == 0, "foreground solo preference precedes ordinary FIFO");
+        for (int i = 0; i < 4; ++i) policy.granted(true, true);
+        waiting[2].foreground = true;
+        check(policy.select(waiting)->index == 1, "eligible foreground bypass occurs after four solo grants");
+        policy = {};
+        policy.short_first = 8;
+        waiting[0] = {0, 1, true, false, true, 100, 0};
+        waiting[1] = {1, 2, true, false, true, 4, 0};
+        waiting[2] = {2, 3, true, false, true, 100, 0};
+        check(policy.select(waiting)->index == 1, "optional short-first orders only the chosen admission class");
+        waiting[0].wait_s = 30;
+        check(policy.select(waiting)->index == 0, "aged native input retains its FIFO admission opportunity");
+        check(ep::resolve_execution_plan(resident_batch()).admission.support == ep::Support::off,
+              "legacy resident and daily plans do not claim native admission");
     }
     std::printf("%s\n", g_fail == 0 ? "execution_plan_test: all passed" : "execution_plan_test: FAILED");
     return g_fail == 0 ? 0 : 1;

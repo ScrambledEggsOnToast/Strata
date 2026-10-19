@@ -28,6 +28,8 @@ args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args
+native_admission = "--native-admission" in args and "--retained" in args
+native_gates = args[args.index("--native-gates") + 1] if "--native-gates" in args else None
 groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
 STEP = 0.02
 hold = args[args.index("--hold-replies") + 1] if "--hold-replies" in args else None
@@ -51,7 +53,7 @@ def reader():
             lines.put(l)
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
-print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 or ("--packed" in args and fit == 1) else "") +
+print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 or (("--packed" in args or native_admission) and fit == 1) else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 if "--says-multiplex" in args:
     print("INFO resident_multiplex=1", flush=True)
@@ -60,6 +62,9 @@ if "--packed" in args:
     print("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4", flush=True)
 if "--retained" in args:
     print("INFO retained_prompt=1 retained_prompt_version=1 retained_prompt_owners=4", flush=True)
+if native_admission:
+    print("INFO native_admission=1 native_admission_version=1", flush=True)
+    print("EPLAN " + json.dumps({"admission": {"authority": "native", "support": "on"}}), flush=True)
 if "--says-budget" in args:
     print("INFO foreground_budget_ms=100 background_share=0.25", flush=True)
 if "--says-spec" in args:
@@ -76,6 +81,9 @@ def continued(ids):        # (the whole reply, how much of it the prompt already
     R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
     return R, max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
 def reply(ids):            # the rest of the reply after what the prompt already ends with
+    if native_admission and "--native-reply" in args:
+        with open(args[args.index("--native-reply") + 1], "rb") as source:
+            return list(source.read()) + [257]
     R, k = continued(ids)
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
@@ -97,6 +105,192 @@ def legacy_done(slot, produced, finish, counts=""):
 fired, nf_slots = set(), set()
 packed, packed_cache, packed_serial = {}, {}, 0
 retained_positions, retained_waiting, retained_resumed = {}, {}, set()
+# Opt-in #263 peer: registrations own logical tags; only BACK grants a dynamic seat.
+# These gates delay work, never the reader, so a saturated queue still accepts controls.
+native_owners, native_terminals = {}, set()
+native_foreground, native_solo = 0, 0
+def native_gate(name, tag=None):
+    return bool(native_gates and any(os.path.exists(os.path.join(native_gates, gate))
+                                    for gate in (name, f"{name}-{tag}") if tag or gate == name))
+def native_log(direction, raw):
+    if log:
+        log.write("NATIVE " + json.dumps({"monotonic_s": time.monotonic(),
+                  "direction": direction, "raw": raw}) + "\n")
+        log.flush()
+def native_send(raw):
+    native_log("received", raw)
+    print(raw, flush=True)
+def native_accept(owner, force=False):
+    if not owner["accepted"] and (force or not native_gate("accept", owner["tag"])):
+        native_send(f"BQACCEPT {owner['tag']} -1 0 0")
+        owner["accepted"] = True
+def native_finish(owner, reason):
+    tag, slot = owner["tag"], owner["slot"]
+    assert tag not in native_terminals, "duplicate native terminal: " + tag
+    native_accept(owner, force=True)
+    native_terminals.add(tag)
+    prompt = len(owner["ids"] or [])
+    generated = len(owner["generated"])
+    request, incarnation = owner["identity"] or (0, 0)
+    admission_wait = owner["admission_wait"]
+    if admission_wait is None:
+        admission_wait = max(0.0, time.monotonic() - owner["registered"])
+    fresh = owner["position"] - owner["reuse"] if slot >= 0 else 0
+    native_send(f"BQDONE {tag} {slot} {request} {incarnation} {generated} {prompt} "
+                f"{5 if fresh else 0} {1 if generated else 0} {reason} 0 0 {owner['reuse']} "
+                f"prompt_read={fresh} native_admission_wait_s={admission_wait:.9f} "
+                f"native_service_wait_s={owner['service_wait']:.9f}")
+    if slot >= 0:
+        if generated:
+            packed_cache[slot] = (owner["scope"], owner["ids"] + owner["generated"][:-1])
+        del packed[slot]
+    del native_owners[tag]
+def native_choose():
+    waiting = [owner for owner in native_owners.values() if owner["slot"] < 0]
+    foreground = [owner for owner in waiting if owner["priority"] == "foreground"]
+    background = next((owner for owner in waiting if owner["priority"] == "background"), None)
+    solo = next((owner for owner in foreground if owner["packing"] == "solo"), None)
+    eligible = next((owner for owner in foreground if owner["packing"] == "eligible"), None)
+    if background is not None and (not foreground or native_foreground >= 3):
+        return background
+    if solo is not None and (eligible is None or native_solo < 4):
+        return solo
+    return eligible or next(iter(foreground), None)
+def native_seat():
+    global packed_serial, native_foreground, native_solo
+    while not native_gate("admission"):
+        free = next((slot for slot in range(max(1, fit)) if slot not in packed), None)
+        if free is None:
+            return
+        owner = native_choose()
+        # Metadata is the FIFO linearization point, not completion of tokenization.
+        if owner is None or owner["ids"] is None or not owner["accepted"]:
+            return
+        packed_serial += 1
+        owner["slot"], owner["identity"] = free, (packed_serial, packed_serial)
+        owner["admission_wait"] = max(0.0, time.monotonic() - owner["registered"])
+        owner["service_clock"] = time.monotonic()
+        old_scope, cached = packed_cache.get(free, ("", []))
+        if owner["scope"] and owner["scope"] == old_scope:
+            while (owner["reuse"] < min(len(owner["ids"]) - 1, len(cached)) and
+                   owner["ids"][owner["reuse"]] == cached[owner["reuse"]]):
+                owner["reuse"] += 1
+        owner["position"] = owner["reuse"]
+        packed[free] = owner
+        native_foreground = native_foreground + 1 if owner["priority"] == "foreground" else 0
+        native_solo = native_solo + 1 if owner["priority"] == "foreground" and owner["packing"] == "solo" else 0
+        native_send(f"BACK {owner['tag']} {free} {packed_serial} {packed_serial} "
+                    f"native_admission_wait_s={owner['admission_wait']:.9f}")
+def native_tick():
+    now = time.monotonic()
+    for owner in list(native_owners.values()):
+        native_accept(owner)
+        reason = "cancel" if owner["cancelled"] else "timeout" if now >= owner["deadline"] else None
+        if reason and not (owner["slot"] >= 0 and native_gate("drain", owner["tag"])):
+            native_finish(owner, reason)
+    native_seat()
+    for slot, owner in list(packed.items()):
+        tag = owner["tag"]
+        now = time.monotonic()
+        if native_gate("service", tag):
+            owner["service_wait"] += max(0.0, now - owner["service_clock"])
+            owner["service_clock"] = now
+            observed = os.path.join(native_gates, f"observed-service-{tag}")
+            if not os.path.exists(observed):
+                open(observed, "w").close()
+            continue
+        owner["service_clock"] = now
+        if owner["cancelled"] or now >= owner["deadline"]:
+            continue
+        prefix = f"{tag} {slot} {owner['identity'][0]} {owner['identity'][1]}"
+        if len(owner["ids"]) > 33 and not owner["resumed"]:
+            if owner["cursor"] is None:
+                count = int(args[args.index("--native-progress-count") + 1]) if "--native-progress-count" in args else 1
+                position = min(len(owner["ids"]) - 1, ((max(32, owner["reuse"], count) + 31) // 32) * 32)
+                begin = owner.get("progress_next", max(owner["reuse"] + 1, position - count + 1))
+                end = min(position + 1, begin + 32)
+                for progress in range(begin, end):
+                    native_send(f"BQPP {prefix} {progress} {len(owner['ids'])} {progress - owner['reuse']}")
+                owner["position"], owner["progress_next"] = end - 1, end
+                if end <= position:
+                    continue
+                owner["cursor"] = f"{prefix} {position} 1 1 0 {len(owner['ids']) - 1} 32 0"
+                native_send(f"BQSUSPEND {owner['cursor']} chunk")
+            continue
+        owner["position"] = len(owner["ids"])
+        token = owner["tokens"].pop(0) if owner["tokens"] else 257
+        owner["generated"].append(token)
+        native_send(f"BQT {prefix} {token}")
+        if token == 257 or len(owner["generated"]) >= owner["limit"]:
+            native_finish(owner, "stop" if token == 257 else "length")
+    # Terminal publication precedes autonomous reuse, even if the old HTTP consumer stalls.
+    native_seat()
+def native_control(line):
+    fields = line.split()
+    tag, slot, request, incarnation = fields[1], *map(int, fields[2:5])
+    owner = native_owners.get(tag)
+    if (owner is None or slot < -1 or (slot >= 0 and slot != owner["slot"]) or
+            ((request, incarnation) != (0, 0) and (request, incarnation) != owner["identity"])):
+        native_log("ignored", line)
+        return
+    if fields[0] == "BQCANCEL":
+        owner["cancelled"] = True
+    elif fields[0] == "BQPRIORITY":
+        assert fields[5] in ("foreground", "background"), line
+        owner["priority"] = fields[5]
+    elif fields[0] == "BQRESUME":
+        cursor = owner["cursor"]
+        expected = cursor.split() if cursor else []
+        if not expected or fields[1:] != expected[:7] + [expected[10]]:
+            native_log("ignored", line)
+            return
+        if not owner["resumed"] and not native_gate("resume", tag):
+            native_send(f"BQRESUMED {cursor} client")
+            owner["resumed"] = True
+def native_frame(line):
+    native_log("sent", line)
+    fields = line.split()
+    if fields[0] == "BQREGISTER":
+        assert len(fields) == 6, line
+        tag, priority, packing = fields[1:4]
+        remaining_ns, capacity = map(int, fields[4:])
+        assert tag not in native_owners and tag not in native_terminals, "tag reused: " + line
+        assert priority in ("foreground", "background") and packing in ("eligible", "solo"), line
+        if capacity < max(1, fit) or capacity > max(1, fit) + 256:
+            native_terminals.add(tag)
+            native_send(f"BQREJECT {tag} -1 invalid_capacity")
+        elif len(native_owners) >= capacity:
+            native_terminals.add(tag)
+            native_send(f"BQREJECT {tag} -1 queue_full")
+        else:
+            now = time.monotonic()
+            native_owners[tag] = {"tag": tag, "priority": priority, "packing": packing,
+                "registered": now, "deadline": now + max(0, remaining_ns) / 1e9,
+                "ids": None, "slot": -1, "identity": None, "accepted": False,
+                "limit": 0, "tokens": [], "generated": [], "cancelled": False,
+                "scope": "", "reuse": 0, "position": 0, "cursor": None, "resumed": False,
+                "admission_wait": None, "service_wait": 0.0, "service_clock": now}
+    elif fields[0] == "BGENQ1":
+        tag, slot, limit = fields[1], int(fields[2]), int(fields[3])
+        assert slot == -1, "frontend selected a native seat: " + line
+        owner = native_owners.get(tag)
+        # An original deadline can expire during rendering; a late publication cannot resurrect it.
+        if owner is None and tag in native_terminals:
+            native_log("ignored", line)
+            return
+        assert owner is not None and owner["ids"] is None, "unregistered or repeated input: " + line
+        input_capacity = int(args[args.index("--native-input-capacity") + 1]) if "--native-input-capacity" in args else 264
+        if sum(o["ids"] is not None and o["slot"] < 0 for o in native_owners.values()) >= input_capacity:
+            native_terminals.add(tag)
+            native_send(f"BQREJECT {tag} -1 transport_full")
+            del native_owners[tag]
+        else:
+            owner["ids"] = list(map(int, fields[-1].split(",")))
+            owner["limit"], owner["tokens"] = limit, reply(owner["ids"])
+            owner["scope"] = next((field[6:] for field in fields[4:-1] if field.startswith("scope=")), "")
+    else:
+        native_control(line)
+    native_tick()
 def packed_window():
     for b, owner in list(packed.items()):
         tag, request, incarnation, ids, limit, tokens, generated, cancelled, scope, reuse = owner
@@ -129,6 +323,9 @@ def packed_window():
                 log.write(f"BQDONE {tag} {b} {finish}\n"); log.flush()
             del packed[b]
 def window():        # one batch window: every active slot one token
+    if native_admission:
+        native_tick()
+        return
     packed_window()
     if hold and os.path.exists(hold):
         return
@@ -167,11 +364,14 @@ def score_done(request_id, status, result):
 parked = {}
 while True:
     try:
-        line = lines.get(timeout=STEP if active or packed else None)
+        line = lines.get(timeout=STEP if active or packed or (native_admission and native_owners) else None)
     except queue.Empty:
         line = ""
     if line is None or line == "QUIT":
         break
+    if native_admission and line.startswith(("BQREGISTER ", "BGENQ1 ", "BQCANCEL ", "BQPRIORITY ", "BQRESUME ")):
+        native_frame(line)
+        continue
     if line.startswith("BPRIORITY "):
         continue
     if line.startswith("BYIELD "):
@@ -427,6 +627,8 @@ while True:
         print("ERR unknown " + line[:20], flush=True)
         continue
     window()
+if "--exit-code" in args:
+    sys.exit(int(args[args.index("--exit-code") + 1]))
 '''
 
 
@@ -920,7 +1122,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=(), lazy=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -935,7 +1137,7 @@ class ParallelService(unittest.TestCase):
         extra += list(more)
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
-            self.engine = StrataEngine("strata", extra)
+            self.engine = StrataEngine("strata", extra, lazy=lazy)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -2543,6 +2745,15 @@ class PackedTransport(unittest.TestCase):
         self.assertFalse(any(self.engine.slot_busy))
         self.assertFalse(self.engine.packed_q)
 
+    def test_native_admission_flag_does_not_migrate_packed_only_capability(self):
+        self.start(1, more=("--packed", "--native-admission"))
+        reply = self.chat("packed-only remains frontend-seated", max_tokens=1)
+        self.assertEqual(reply["usage"]["completion_tokens"], 1)
+        self.assertNotEqual(self.engine.info.get("native_admission"), 1)
+        self.assertEqual(self.log.read_text().count("BGENQ "), 1)
+        self.assertNotIn("BQREGISTER", self.log.read_text())
+        self.assertFalse(self.engine.packed_q)
+
     def test_packing_policy_is_per_request_and_reaches_the_wire(self):
         self.start(2, more=("--packed",))
         self.chat("ordinary request", max_tokens=1)
@@ -2664,6 +2875,390 @@ class PackedTransport(unittest.TestCase):
         self.assertFalse(self.engine.ctl.locked())
         record = self.svc.lifecycle_records(request_id)
         self.assertEqual(record.get("output_tokens", 0), 0)
+
+
+class NativeAdmissionHarness:
+    """HTTP clients plus raw wire receipts; gates never stand in for frontend admission decisions."""
+    start = ParallelService.start
+    get = ParallelService.get
+
+    def start_native(self, slots=2, *, fit=None, depth=8, admission_held=False, more=(), lazy=False):
+        self.gate_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.gate_tmp.cleanup)
+        self.gates = Path(self.gate_tmp.name)
+        self.clients = []
+        self.gate("service")
+        if admission_held:
+            self.gate("admission")
+        self.start(slots, fit=fit, lazy=lazy, more=("--retained", "--native-admission",
+                                                   "--native-gates", str(self.gates), *more))
+        self.svc.configure_admission({"request_queue_limit": depth, "lifecycle_api": True})
+
+    def tearDown(self):
+        try:
+            if hasattr(self, "gates"):
+                for gate in self.gates.iterdir():
+                    gate.unlink(missing_ok=True)
+            for client in getattr(self, "clients", []):
+                client["thread"].join(5)
+                self.assertFalse(client["thread"].is_alive(), client["text"])
+                self.assertNotIn("exception", client, repr(client.get("exception")))
+        finally:
+            ParallelService.tearDown(self)
+
+    def gate(self, name, tag=None, *, held=True):
+        path = self.gates / (f"{name}-{tag}" if tag is not None else name)
+        if held:
+            path.touch()
+        else:
+            path.unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def tokenization_gate(self, marker):
+        entered, release = threading.Event(), threading.Event()
+        encode, encode_within = self.svc.tok.encode, self.svc.tok.encode_within
+        prompt_encoder = self.svc.prompts
+        prompt_encode = prompt_encoder.encode if prompt_encoder is not None else None
+        def pause(text):
+            if marker in text:
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("tokenizer gate was not released: " + marker)
+        def delayed_encode(text, *args, **kwargs):
+            pause(text)
+            return encode(text, *args, **kwargs)
+        def delayed_within(text, *args, **kwargs):
+            pause(text)
+            return encode_within(text, *args, **kwargs)
+        def delayed_prompt(text, *args, **kwargs):
+            pause(text)
+            return prompt_encode(text, *args, **kwargs)
+        try:
+            # Demand tokenization normally uses the incremental encoder, which
+            # captured the tokenizer method when Service was constructed.
+            with mock.patch.object(self.svc.tok, "encode", side_effect=delayed_encode), \
+                    mock.patch.object(self.svc.tok, "encode_within", side_effect=delayed_within), \
+                    (mock.patch.object(prompt_encoder, "encode", side_effect=delayed_prompt)
+                     if prompt_encoder is not None else contextlib.nullcontext()):
+                yield entered, release
+        finally:
+            release.set()
+
+    def wait_until(self, predicate, seconds=5):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            result = predicate()
+            if result:
+                return result
+            time.sleep(.005)
+        raw = self.log.read_text() if self.log.exists() else ""
+        self.fail("native admission did not reach its finite gate:\n" + raw)
+
+    def wire(self, event, *, tag=None, direction="received"):
+        raw = self.log.read_text() if self.log.exists() else ""
+        lines = raw.splitlines()
+        if raw and not raw.endswith("\n"):
+            lines = lines[:-1]  # A concurrent append has not published its complete receipt yet.
+        receipts = [json.loads(line[7:]) for line in lines if line.startswith("NATIVE ")]
+        return [receipt for receipt in receipts if receipt["direction"] == direction and
+                receipt["raw"].split()[0] == event and
+                (tag is None or receipt["raw"].split()[1] == tag)]
+
+    def wait_wire(self, event, *, count=1, tag=None, direction="received"):
+        self.wait_until(lambda: len(self.wire(event, tag=tag, direction=direction)) >= count)
+        return self.wire(event, tag=tag, direction=direction)
+
+    def registered_tag(self, number):
+        return self.wait_wire("BQREGISTER", count=number, direction="sent")[number - 1]["raw"].split()[1]
+
+    def launch(self, text, *, stream=False, path="/v1/chat/completions", priority="foreground",
+               packing="eligible", timeout=None, max_tokens=1, body_updates=None):
+        before = {record["id"] for record in self.get("/api/lifecycle")}
+        body = {"model": "m", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
+                "reasoning_effort": "none", "stream": stream,
+                "strata_priority": priority, "strata_packing": packing}
+        if path == "/v1/responses":
+            body["input"] = text
+            body["max_output_tokens"] = body.pop("max_tokens")
+            del body["messages"]
+        if timeout is not None:
+            body["strata_timeout_s"] = timeout
+        body.update(body_updates or {})
+        client = {"text": text, "before": before, "headers_ready": threading.Event(), "done": threading.Event()}
+        def request():
+            try:
+                req = urllib.request.Request(self.base + path, json.dumps(body).encode(),
+                                             {"Content-Type": "application/json"})
+                try:
+                    response = urllib.request.urlopen(req, timeout=10)
+                except urllib.error.HTTPError as error:
+                    response = error
+                with response:
+                    client.update(status=response.status, headers=dict(response.headers),
+                                  id=response.headers.get("X-Strata-Request-Id"))
+                    client["headers_ready"].set()
+                    raw = response.read().decode()
+                    client["body"] = raw if "event-stream" in response.headers.get("Content-Type", "") else json.loads(raw)
+            except Exception as error:
+                client["exception"] = error
+            finally:
+                client["done"].set()
+        client["thread"] = threading.Thread(target=request, daemon=True)
+        self.clients.append(client)
+        client["thread"].start()
+        return client
+
+    def client_identity(self, client):
+        if client.get("id"):
+            return client["id"]
+        def find():
+            added = [record["id"] for record in self.get("/api/lifecycle")
+                     if record["id"] not in client["before"]]
+            return added[0] if len(added) == 1 else None
+        client["id"] = self.wait_until(find)
+        return client["id"]
+
+    def client_record(self, client):
+        return self.get("/api/lifecycle?id=" + self.client_identity(client))
+
+    def cancel_client(self, client):
+        identity = self.client_identity(client)
+        req = urllib.request.Request(self.base + "/api/lifecycle/cancel",
+                                     json.dumps({"id": identity}).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            self.assertEqual(response.status, 202)
+            self.assertEqual(json.load(response), {"id": identity, "cancel_requested": True})
+
+    def finish_client(self, client, status=200):
+        self.assertTrue(client["done"].wait(5), client["text"])
+        client["thread"].join(1)
+        self.assertNotIn("exception", client, repr(client.get("exception")))
+        if status is not None:
+            self.assertEqual(client["status"], status, client.get("body"))
+        return client
+
+    def assert_queued_terminal(self, tag, reason=None):
+        terminals = self.wait_wire("BQDONE", tag=tag)
+        self.assertEqual(len(terminals), 1)
+        fields = terminals[0]["raw"].split()
+        self.assertEqual(fields[2:6], ["-1", "0", "0", "0"])
+        self.assertEqual(fields[7:9], ["0", "0"])
+        self.assertEqual(fields[10:14], ["0", "0", "0", "prompt_read=0"])
+        if reason is not None:
+            self.assertEqual(fields[9], reason)
+        self.assertGreaterEqual(float(fields[14].split("=")[1]), 0)
+        self.assertEqual(fields[15], "native_service_wait_s=0.000000000")
+        for event in ("BACK", "BQT", "BQPP", "BQSUSPEND", "BQRESUMED"):
+            self.assertEqual(self.wire(event, tag=tag), [], event)
+        return terminals[0]
+
+
+class NativeAdmissionTransport(NativeAdmissionHarness, unittest.TestCase):
+    def test_same_unseated_input_takes_only_the_cancelled_seat_while_peer_remains(self):
+        self.start_native(depth=1)
+        first = self.launch("A holds a seat")
+        tag_a = self.registered_tag(1)
+        self.client_identity(first)
+        seat_a = self.wait_wire("BACK", tag=tag_a)[0]["raw"].split()
+        peer = self.launch("B must stay resident")
+        tag_b = self.registered_tag(2)
+        self.client_identity(peer)
+        self.wait_wire("BACK", tag=tag_b)
+        waiting = self.launch("C is submitted exactly once")
+        tag_c = self.registered_tag(3)
+        self.client_identity(waiting)
+        self.wait_wire("BQACCEPT", tag=tag_c)
+        self.wait_wire("BGENQ1", tag=tag_c, direction="sent")
+        self.assertEqual(self.wire("BACK", tag=tag_c), [])
+        self.assertFalse(waiting["headers_ready"].is_set())
+        self.cancel_client(first)
+        seat_c = self.wait_wire("BACK", tag=tag_c)[0]["raw"].split()
+        self.assertEqual(seat_c[2], seat_a[2])
+        self.assertNotEqual(seat_c[3:5], seat_a[3:5])
+        self.assertEqual(len(self.wire("BGENQ1", tag=tag_c, direction="sent")), 1)
+        self.assertEqual(self.wire("BQDONE", tag=tag_b), [])
+        self.assertEqual(self.wire("BQT", tag=tag_b), [])
+        self.gate("service", tag_b)
+        self.gate("service", held=False)
+        result = self.finish_client(waiting)
+        self.assertEqual(result["body"]["usage"]["completion_tokens"], 1)
+        self.assertFalse(peer["done"].is_set())
+        self.assertEqual(self.wire("BQDONE", tag=tag_b), [])
+        self.cancel_client(peer)
+        self.finish_client(first, status=None)
+        self.finish_client(peer, status=None)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag_a)), 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag_b)), 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag_c)), 1)
+
+    def test_full_queue_cancellation_before_accept_receipt_has_no_seat_or_work(self):
+        self.start_native(depth=1)
+        residents = []
+        for index in range(2):
+            client = self.launch(f"resident {index}")
+            tag = self.registered_tag(index + 1)
+            self.client_identity(client)
+            self.wait_wire("BACK", tag=tag)
+            residents.append(client)
+        self.gate("accept")
+        queued = self.launch("cancel before BQACCEPT can be consumed")
+        tag = self.registered_tag(3)
+        self.client_identity(queued)
+        self.wait_wire("BGENQ1", tag=tag, direction="sent")
+        self.assertEqual(self.wire("BQACCEPT", tag=tag), [])
+        overflow = self.launch("full even with an unacknowledged logical owner")
+        self.finish_client(overflow, 429)
+        self.assertIn("Retry-After", overflow["headers"])
+        self.cancel_client(queued)
+        self.finish_client(queued, 409)
+        terminal = self.assert_queued_terminal(tag, "cancel")
+        self.assertGreater(int(terminal["raw"].split()[6]), 0)
+        self.assertEqual(len(self.wire("BQACCEPT", tag=tag)), 1)
+        self.assertTrue(all(not client["done"].is_set() for client in residents))
+        # Late logical controls cannot resurrect a terminal or mutate either resident.
+        self.engine._send(f"BQCANCEL {tag} -1 0 0")
+        self.engine._send(f"BQPRIORITY {tag} -1 0 0 background")
+        self.wait_wire("BQPRIORITY", tag=tag, direction="ignored")
+        self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+        self.assertEqual(len(self.wire("BACK")), 2)
+        self.gate("accept", held=False)
+        successor = self.launch("freed unfinished allowance")
+        successor_tag = self.registered_tag(4)
+        self.client_identity(successor)
+        self.wait_wire("BGENQ1", tag=successor_tag, direction="sent")
+        self.assertEqual(self.wire("BACK", tag=successor_tag), [])
+        self.gate("service", held=False)
+        for client in (*residents, successor):
+            self.assertEqual(self.finish_client(client)["body"]["usage"]["completion_tokens"], 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=successor_tag)), 1)
+
+    def native_queue_boundary(self, depth):
+        self.start_native(4, fit=2, depth=depth, admission_held=True)
+        accepted = []
+        for index in range(2 + depth):
+            client = self.launch(f"bounded owner {index}")
+            tag = self.registered_tag(index + 1)
+            self.client_identity(client)
+            self.wait_wire("BQACCEPT", tag=tag)
+            self.wait_wire("BGENQ1", tag=tag, direction="sent")
+            accepted.append(client)
+        self.assertEqual(self.wire("BACK"), [])
+        self.assertEqual(self.engine.batch, 2)
+        for receipt in self.wire("BQREGISTER", direction="sent"):
+            self.assertEqual(int(receipt["raw"].split()[5]), 2 + depth)
+        rejected = self.launch("one beyond the one total allowance")
+        self.finish_client(rejected, 429)
+        self.assertIn(int(rejected["headers"]["Retry-After"]), range(1, 31))
+        self.assertEqual(len(self.wire("BQREGISTER", direction="sent")), 2 + depth)
+        self.gate("admission", held=False)
+        self.wait_wire("BACK", count=2)
+        self.assertTrue(all(not client["done"].is_set() for client in accepted))
+        self.gate("service", held=False)
+        for client in accepted:
+            self.assertEqual(self.finish_client(client)["body"]["usage"]["completion_tokens"], 1)
+        self.assertEqual(len(self.wire("BGENQ1", direction="sent")), 2 + depth)
+        terminals = self.wait_wire("BQDONE", count=2 + depth)
+        self.assertEqual(len({receipt["raw"].split()[1] for receipt in terminals}), 2 + depth)
+
+    def test_total_allowance_uses_effective_slots_plus_depth(self):
+        self.native_queue_boundary(2)
+
+    def test_zero_depth_still_accepts_effective_slots_before_native_seating(self):
+        self.native_queue_boundary(0)
+
+    def test_native_timeout_is_408_before_any_stream_headers_or_dialect_preamble(self):
+        self.start_native()
+        for index in range(2):
+            client = self.launch(f"deadline blocker {index}")
+            tag = self.registered_tag(index + 1)
+            self.client_identity(client)
+            self.wait_wire("BACK", tag=tag)
+        routes = (("/v1/chat/completions", False), ("/v1/chat/completions", True),
+                  ("/v1/messages", True), ("/v1/responses", True))
+        for number, (path, stream) in enumerate(routes, 3):
+            with self.subTest(path=path, stream=stream):
+                queued = self.launch("deadline in native admission", path=path, stream=stream, timeout=.37)
+                tag = self.registered_tag(number)
+                self.client_identity(queued)
+                self.wait_wire("BGENQ1", tag=tag, direction="sent")
+                self.assertFalse(queued["headers_ready"].is_set())
+                response = self.finish_client(queued, 408)
+                self.assertNotIn("Retry-After", response["headers"])
+                self.assertIn("error", response["body"])
+                self.assertNotIn("event-stream", response["headers"]["Content-Type"])
+                self.assert_queued_terminal(tag)
+                registration = self.wire("BQREGISTER", tag=tag, direction="sent")
+                self.assertEqual(len(registration), 1)
+                self.assertIn(int(registration[0]["raw"].split()[4]), range(1, 370000001))
+
+    def test_transport_refusal_does_not_block_logical_cancellation_or_successor(self):
+        self.start_native(1, depth=2, admission_held=True, more=("--native-input-capacity", "1"))
+        queued = self.launch("fills bounded native input transport")
+        tag = self.registered_tag(1)
+        self.client_identity(queued)
+        self.wait_wire("BGENQ1", tag=tag, direction="sent")
+        refused = self.launch("input transport is full")
+        refused_tag = self.registered_tag(2)
+        self.client_identity(refused)
+        self.finish_client(refused, 429)
+        self.assertEqual([receipt["raw"] for receipt in self.wire("BQREJECT", tag=refused_tag)],
+                         [f"BQREJECT {refused_tag} -1 transport_full"])
+        self.cancel_client(queued)
+        self.finish_client(queued, 409)
+        self.assert_queued_terminal(tag, "cancel")
+        successor = self.launch("transport capacity was released")
+        successor_tag = self.registered_tag(3)
+        self.client_identity(successor)
+        self.wait_wire("BGENQ1", tag=successor_tag, direction="sent")
+        self.gate("admission", held=False)
+        self.gate("service", held=False)
+        self.assertEqual(self.finish_client(successor)["body"]["usage"]["completion_tokens"], 1)
+        self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+        self.assertEqual(self.wire("BQDONE", tag=refused_tag), [])
+
+    def test_delayed_old_output_finalizer_and_stale_controls_cannot_clear_http_successor(self):
+        self.start_native(1, depth=1)
+        self.gate("service", held=False)
+        old = self.engine.generate_batched([65, 66, 67], 1, {}, threading.Event())
+        try:
+            self.assertIsInstance(next(old), int)
+            old_seat = self.wait_wire("BACK")[0]["raw"].split()
+            old_tag = old_seat[1]
+            self.wait_wire("BQDONE", tag=old_tag)
+            # Leave the old generator suspended after its token, before its terminal/finally.
+            self.gate("service")
+            successor = self.launch("HTTP successor owns the autonomously reused seat")
+            tag = self.registered_tag(2)
+            self.client_identity(successor)
+            seat = self.wait_wire("BACK", tag=tag)[0]["raw"].split()
+            self.assertEqual(old_seat[2], seat[2])
+            self.assertNotEqual(old_seat[3:5], seat[3:5])
+            self.wait_until(lambda: any(event["event"] == "BACK"
+                                       for event in self.client_record(successor)["retained_events"]))
+            old.close()
+            self.engine._send(f"BQCANCEL {old_tag} {' '.join(old_seat[2:5])}")
+            self.engine._send(f"BQPRIORITY {old_tag} {' '.join(old_seat[2:5])} background")
+            self.engine._send(f"BQRESUME {old_tag} {' '.join(old_seat[2:5])} 0 1 1 32")
+            self.engine._send(f"BQCANCEL {tag} {seat[2]} {int(seat[3]) + 1} {seat[4]}")
+            self.engine._send(f"BQCANCEL {tag} {int(seat[2]) + 1} 0 0")
+            self.wait_wire("BQCANCEL", tag=tag, count=2, direction="ignored")
+            self.assertEqual(len(self.wire("BQDONE", tag=old_tag)), 1)
+            self.assertEqual(self.wire("BQDONE", tag=tag), [])
+            self.assertTrue(self.get("/slots")[0]["is_processing"])
+            self.assertFalse(successor["done"].is_set())
+            waiting = self.launch("new waiter cannot steal successor's seat")
+            waiting_tag = self.registered_tag(3)
+            self.client_identity(waiting)
+            self.wait_wire("BGENQ1", tag=waiting_tag, direction="sent")
+            self.assertEqual(self.wire("BACK", tag=waiting_tag), [])
+            self.gate("service", held=False)
+            for client in (successor, waiting):
+                self.assertEqual(self.finish_client(client)["body"]["usage"]["completion_tokens"], 1)
+            self.assertEqual(len(self.wire("BQDONE", tag=tag)), 1)
+            self.assertEqual(len(self.wire("BQDONE", tag=waiting_tag)), 1)
+        finally:
+            old.close()
 
 
 class ScoreTransport(unittest.TestCase):

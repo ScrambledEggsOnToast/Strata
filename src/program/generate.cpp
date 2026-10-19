@@ -103,6 +103,7 @@
 #include "strata/program/time_budget.hpp"
 #include "strata/program/execution_plan.hpp"
 #include "strata/program/decode_service.hpp"
+#include "strata/program/native_admission.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -5995,8 +5996,13 @@ int main(int argc, char** argv) {
                 "per-stage bounded owner witness staging/readback");
             ram("packed_prefill_command_queue", byte_mul(kPackedQueuedFrames + 4, packed_frame_bytes + 4096),
                 "eight queued frames, reader/current-command/parse staging and descriptor-read slack");
-            ram("packed_prefill_request_tokens", byte_mul(4, byte_mul(o.max_context, sizeof(int64_t))),
-                "four immutable native prompt vectors; resident int32 histories are charged separately");
+            ram("packed_prefill_request_tokens", byte_mul(retained_prompt
+                ? strata::program::native_submission_limit : 4, byte_mul(o.max_context, sizeof(int64_t))),
+                "bounded native submission prompts; unseated owners allocate no model/checkpoint payload");
+            if (retained_prompt)
+                ram("native_admission_metadata", byte_mul(strata::program::native_submission_limit + 4,
+                    strata::program::native_owner_metadata_bytes),
+                    "submission descriptors, bounded transport registration/control intentions and routing");
             ram("packed_prefill_handoff_metadata", byte_mul(stage_count,
                 2 * (2048 * sizeof(int64_t) + 4 * sizeof(strata::prefill::OwnerSegment))),
                 "two fixed host handoff token arrays and four owner descriptors; existing device tokens stay 8192 B");
@@ -12330,6 +12336,8 @@ int main(int argc, char** argv) {
         }
         if (retained_prompt) {
             execution_plan.suspension.support = strata::program::Support::on;
+            execution_plan.admission.support = strata::program::Support::on;
+            execution_plan.admission.reason = "retained lifecycle: bounded native submissions and autonomous seat grants";
             execution_plan.suspension.reason =
                 "serial private preparation retains the admitted plan and drained cursor without resending input";
         }
@@ -15532,6 +15540,10 @@ int main(int argc, char** argv) {
             bool eof = false;
             std::atomic<uint64_t> command_epoch{0};
             strata::program::score::Pending score_pending;
+            // Transport registration fences only: no model state or admission policy
+            // lives on the reader. Entries retire after the owner's terminal write.
+            std::array<std::string, strata::program::native_submission_limit> native_tags;
+            std::array<bool, strata::program::native_submission_limit> native_input{};
         };
         const auto in_shared = std::make_shared<StdinShared>();
         std::atomic<bool>& stop_req = in_shared->stop_req;
@@ -15552,7 +15564,7 @@ int main(int argc, char** argv) {
             score_write(strata::program::score::terminal(id, status, request, values, error));
             score_pending.complete(id);            // ownership ends only after terminal publication
         };
-        std::thread([st = in_shared, private_preparation, packed_frame_bytes, score_write] {
+        std::thread([st = in_shared, private_preparation, retained_prompt, packed_frame_bytes, score_write] {
             auto& stop_req = st->stop_req;
             auto& in_mu = st->mu;
             auto& in_cv = st->cv;
@@ -15625,8 +15637,75 @@ int main(int argc, char** argv) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::unique_lock<std::mutex> lk(in_mu);
-                while (private_preparation && in_lines.size() >= kPackedQueuedFrames)
-                    in_cv.wait_for(lk, std::chrono::milliseconds(100));
+                if (retained_prompt) {
+                    const auto text = std::string_view(l);
+                    const auto tag_at = text.find(' ');
+                    const auto tag_end = tag_at == text.npos ? text.npos : text.find(' ', tag_at + 1);
+                    const auto tag = tag_at == text.npos ? std::string_view{} :
+                        text.substr(tag_at + 1, tag_end == text.npos ? text.npos : tag_end - tag_at - 1);
+                    const bool registration = text.starts_with("BQREGISTER ");
+                    const bool input = text.starts_with("BGENQ");
+                    const bool control = text.starts_with("BQCANCEL ") || text.starts_with("BQPRIORITY ") ||
+                                         text.starts_with("BQRESUME ");
+                    if (registration || input || control) {
+                        if (!phase::valid_request(tag)) {
+                            score_write("FATAL malformed native submission tag\n"); std::_Exit(1);
+                        }
+                        size_t found = st->native_tags.size(), empty = found;
+                        for (size_t i = 0; i < st->native_tags.size(); ++i) {
+                            if (st->native_tags[i] == tag) found = i;
+                            if (st->native_tags[i].empty()) empty = i;
+                        }
+                        if (registration) {
+                            if (found != st->native_tags.size()) {
+                                score_write("FATAL duplicate native submission tag\n"); std::_Exit(1);
+                            }
+                            if (empty == st->native_tags.size()) {
+                                score_write("BQREJECT " + std::string(tag) + " -1 queue_full\n");
+                                continue;
+                            }
+                            st->native_tags[empty].assign(tag);
+                            st->native_input[empty] = false;
+                            // Native receipt time, not an assumed Python/C++ epoch.
+                            l += " " + std::to_string(phase::now_ns());
+                        } else if (found == st->native_tags.size()) {
+                            continue; // retired generations cannot create another terminal
+                        } else if (input) {
+                            if (st->native_input[found]) {
+                                score_write("FATAL duplicate native submission input\n"); std::_Exit(1);
+                            }
+                            st->native_input[found] = true;
+                            const auto frames = std::count_if(in_lines.begin(), in_lines.end(),
+                                [](const auto& frame) { return frame.rfind("BGENQ", 0) == 0; });
+                            if (size_t(frames) >= kPackedQueuedFrames)
+                                l = "BQINPUTREFUSED " + std::string(tag);
+                        } else {
+                            // At most one unconsumed intention per identical fence.
+                            // A stale seat/incarnation/cursor must not erase a valid control.
+                            const bool reprioritize = text.starts_with("BQPRIORITY ");
+                            size_t fence_end = tag_end;
+                            for (int field = 0; reprioritize && field < 3; ++field) {
+                                const size_t begin = text.find_first_not_of(" \t", fence_end);
+                                fence_end = begin == text.npos ? text.npos : text.find_first_of(" \t", begin);
+                                if (fence_end == text.npos) break;
+                            }
+                            const auto prefix = text.substr(0, fence_end);
+                            for (auto it = in_lines.begin(); it != in_lines.end(); ++it) {
+                                const bool same = reprioritize ?
+                                    it->compare(0, prefix.size(), prefix) == 0 && it->size() > prefix.size() &&
+                                        ((*it)[prefix.size()] == ' ' || (*it)[prefix.size()] == '\t') :
+                                    *it == text;
+                                if (same) { in_lines.erase(it); break; }
+                            }
+                        }
+                    }
+                    if (in_lines.size() >= strata::program::native_submission_limit * 5 + kPackedQueuedFrames) {
+                        score_write("FATAL native transport metadata bound exceeded\n"); std::_Exit(1);
+                    }
+                } else {
+                    while (private_preparation && in_lines.size() >= kPackedQueuedFrames)
+                        in_cv.wait_for(lk, std::chrono::milliseconds(100));
+                }
                 if (l.rfind("SCANCEL ", 0) == 0) {
                     const std::string_view id(l.data() + 8, l.size() - 8);
                     if (strata::program::score::valid_id(id)) score_pending.cancel(id);
@@ -15936,7 +16015,8 @@ int main(int argc, char** argv) {
         // Advertise before readiness, including replicas that have not received work yet.
         if (report_throughput) std::printf("INFO throughput_progress=1\n");
         if (packed_prefill) std::printf("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4\n");
-        if (retained_prompt) std::printf("INFO retained_prompt=1 retained_prompt_version=1 retained_prompt_owners=4\n");
+        if (retained_prompt) std::printf("INFO retained_prompt=1 retained_prompt_version=1 retained_prompt_owners=4 "
+                                        "native_admission=1 native_admission_version=1\n");
         if (packed_foreground_cap || packed_decoder_slice)
             std::printf("INFO packed_prefill_foreground_cap=%d packed_prefill_decoder_slice=%d\n",
                         packed_foreground_cap, int(packed_decoder_slice));
@@ -16096,6 +16176,14 @@ int main(int argc, char** argv) {
             strata::program::ResidentPreparation lease;
             uint64_t cache_offer = 0, cache_generation = 0, deadline_ns = 0;
             bool pending = false, prepared = false, first = false, final_issued = false;
+            bool input_ready = false, foreground = true;
+            const char* cancel_reason = nullptr;
+            uint64_t submission_sequence = 0;
+            Clock::time_point accepted{}, deadline{}, service_ready{};
+            double admission_wait_s = 0, service_wait_s = 0;
+            Clock::time_point service_started{};
+            bool service_prompt = false;
+            double decode_ms = 0;
             // #249: an explicit per-request composition policy.  Solo owners never share a pack.
             bool solo = false;
             uint64_t admit_sequence = 0;   // earliest waiting solo owner is selected first
@@ -16121,23 +16209,75 @@ int main(int argc, char** argv) {
             phase::Input phase_input;
             std::optional<phase::Leg> phase_leg;
         };
-        std::array<PackedOwner, 4> packed_owners;
+        static_assert(sizeof(PackedOwner) + 2048 <= strata::program::native_owner_metadata_bytes);
+        // One submission table: its first physical-seat entries are the sole
+        // seat->submission association. Waiting entries move only at owner-loop
+        // safe points, after the old caller, consumers and terminal have retired.
+        const size_t packed_seats = std::min<size_t>(4, bs.size());
+        std::vector<PackedOwner> packed_submissions(retained_prompt
+            ? packed_seats + strata::program::native_submission_limit : 4);
+        std::span<PackedOwner> packed_owners(packed_submissions.data(), packed_seats);
+        strata::program::NativeAdmissionPolicy native_policy;
+        if (const auto* value = std::getenv("STRATA_ADMIT_SHORT_FIRST"))
+            native_policy.short_first = size_t(std::max(0, std::atoi(value)));
+        if (const auto* value = std::getenv("STRATA_ADMIT_MAX_WAIT_S"))
+            native_policy.max_short_wait_s = std::max(0.0, std::atof(value));
+        uint64_t native_submission_sequence = 0;
+        auto native_find = [&](std::string_view tag) -> PackedOwner* {
+            for (auto& owner : packed_submissions) if (owner.tag == tag) return &owner;
+            return nullptr;
+        };
+        auto native_retire_transport = [&](const std::string& tag) {
+            if (!retained_prompt) return;
+            std::lock_guard<std::mutex> lock(in_mu);
+            for (auto& known : in_shared->native_tags) if (known == tag) { known.clear(); break; }
+        };
+        auto native_service_begin = [&](int slot) {
+            if (!retained_prompt || slot < 0 || size_t(slot) >= packed_owners.size()) return;
+            auto& owner = packed_owners[size_t(slot)];
+            if (owner.tag.empty() || owner.service_started != Clock::time_point{}) return;
+            const auto now = Clock::now();
+            if (owner.service_ready != Clock::time_point{})
+                owner.service_wait_s += std::chrono::duration<double>(now - owner.service_ready).count();
+            owner.service_ready = {};
+            owner.service_started = now;
+            owner.service_prompt = owner.pending;
+        };
+        auto native_service_end = [&](int slot) {
+            if (!retained_prompt || slot < 0 || size_t(slot) >= packed_owners.size()) return;
+            auto& owner = packed_owners[size_t(slot)];
+            if (owner.tag.empty()) return;
+            const auto now = Clock::now();
+            if (owner.service_started != Clock::time_point{}) {
+                const double ms = std::chrono::duration<double, std::milli>(now - owner.service_started).count();
+                (owner.service_prompt ? owner.prompt_ms : owner.decode_ms) += ms;
+                owner.service_started = {};
+            }
+            owner.service_ready = (bs[size_t(slot)].stop || bs[size_t(slot)].prompt_cursor.suspended ||
+                (!bs[size_t(slot)].active && !bs[size_t(slot)].preparing)) ? Clock::time_point{} : now;
+        };
         // #249: consecutive one-owner packs, so sustained priority traffic cannot starve ordinary prompt work.
         unsigned packed_solo_streak = 0;
         uint64_t packed_admit_sequence = 0;
         std::atomic<bool> packed_first_ready{false};
-        auto packed_done = [&](int slot, const char* reason) {
-            if (!private_preparation || slot < 0 || size_t(slot) >= packed_owners.size()) return false;
-            auto& owner = packed_owners[size_t(slot)];
-            if (owner.tag.empty()) return false;
-            const auto& state = bs[size_t(slot)];
-            if (state.active) {
-                // Existing decode paths name the finish before finish() drains
-                // diagnostics/consumers. Never publish a tagged terminal early.
-                owner.terminal_reason = reason;
-                return true;
+        std::array<Clock::time_point, 4> native_seat_used{};
+        auto packed_terminal = [&](PackedOwner& owner, int slot, const char* reason) {
+            if (owner.cancel_reason && std::strcmp(reason, "cancel") == 0) reason = owner.cancel_reason;
+            const auto* state = slot >= 0 ? &bs[size_t(slot)] : nullptr;
+            const auto now = Clock::now();
+            if (retained_prompt && owner.service_started != Clock::time_point{}) {
+                const double ms = std::chrono::duration<double, std::milli>(now - owner.service_started).count();
+                (owner.service_prompt ? owner.prompt_ms : owner.decode_ms) += ms;
+                owner.service_started = {};
             }
-            const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+            if (retained_prompt && owner.service_ready != Clock::time_point{}) {
+                owner.service_wait_s += std::chrono::duration<double>(now - owner.service_ready).count();
+                owner.service_ready = {};
+            }
+            if (retained_prompt && !state)
+                owner.admission_wait_s = std::chrono::duration<double>(now - owner.accepted).count();
+            const double elapsed = state
+                ? std::chrono::duration<double, std::milli>(now - owner.started).count() : 0;
             const int64_t read = std::max<int64_t>(0, owner.frontier - owner.resume);
             if (owner.phase_leg && !owner.phase_leg->terminal) {
                 phase_receipts->request(*owner.phase_leg,
@@ -16150,16 +16290,34 @@ int main(int argc, char** argv) {
                                  "produced=%lld frontier=%lld fresh=%lld reason=%s\n",
                          owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
                          (unsigned long long)owner.lease.incarnation,
-                         (long long)(owner.first ? state.produced : 0), (long long)owner.frontier,
+                         (long long)(owner.first && state ? state->produced : 0), (long long)owner.frontier,
                          (long long)read, reason);
-            std::printf("BQDONE %s %d %llu %llu %lld %zu %.1f %.1f %s %lld %lld %lld prompt_read=%lld\n",
+            char waits[160]{};
+            if (retained_prompt)
+                std::snprintf(waits, sizeof(waits), " native_admission_wait_s=%.9f native_service_wait_s=%.9f",
+                              owner.admission_wait_s, owner.service_wait_s);
+            std::printf("BQDONE %s %d %llu %llu %lld %zu %.1f %.1f %s %lld %lld %lld prompt_read=%lld%s\n",
                         owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
-                        (unsigned long long)owner.lease.incarnation, (long long)(owner.first ? state.produced : 0),
-                        owner.tokens.size(), owner.prompt_ms, std::max(0.0, elapsed - owner.prompt_ms), reason,
+                        (unsigned long long)owner.lease.incarnation,
+                        (long long)(owner.first && state ? state->produced : 0),
+                        owner.tokens.size(), owner.prompt_ms,
+                        retained_prompt ? owner.decode_ms : std::max(0.0, elapsed - owner.prompt_ms), reason,
                         (long long)owner.draft_accepted, (long long)owner.draft_offered,
-                        (long long)owner.resume, (long long)read);
+                        (long long)owner.resume, (long long)read, waits);
             std::fflush(stdout);
+            if (slot >= 0) native_seat_used[size_t(slot)] = now;
+            native_retire_transport(owner.tag);
             owner = {};
+        };
+        auto packed_done = [&](int slot, const char* reason) {
+            if (!private_preparation || slot < 0 || size_t(slot) >= packed_owners.size()) return false;
+            auto& owner = packed_owners[size_t(slot)];
+            if (owner.tag.empty()) return false;
+            if (bs[size_t(slot)].active || bs[size_t(slot)].preparing || owner.final_issued) {
+                owner.terminal_reason = reason; // consumers/resource transition still own the old seat
+                return true;
+            }
+            packed_terminal(owner, slot, reason);
             return true;
         };
         auto packed_flush = [&] {
@@ -16392,6 +16550,7 @@ int main(int argc, char** argv) {
                 std::copy(expanded, expanded + S, rows);
             }
             if (S == 0) return true;
+            for (int t = 0; t < S; ++t) native_service_begin(rows[t]);
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -16538,6 +16697,7 @@ int main(int argc, char** argv) {
                 if (batch_mtp && sl.active && !resident.propose(b, last_residual, err)) {
                     phase_error("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
                 }
+                native_service_end(b);
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
@@ -16925,6 +17085,7 @@ int main(int argc, char** argv) {
                     if (sl.active && !resident.propose(b, residual, err)) {
                         phase_error("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false;
                     }
+                    native_service_end(b);
                 }
                 std::fflush(stdout);
                 ++bt_windows;
@@ -17062,6 +17223,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!G.count) continue;
+                    for (int t = 0; t < G.count; ++t) native_service_begin(G.rows[t]);
                     G.inflight = true;
                     G.stage = 0;
                     drive.d.failed = false;
@@ -17324,6 +17486,78 @@ int main(int argc, char** argv) {
         strata::program::score::Request score_request; // retain bounded host staging across scoring requests
         std::vector<float> score_values;
         bool packed_control_failed = false;
+        size_t native_capacity = 0;
+        auto native_reject = [&](PackedOwner& owner, const char* reason) {
+            std::printf("BQREJECT %s -1 %s\n", owner.tag.c_str(), reason);
+            std::fflush(stdout);
+            native_retire_transport(owner.tag);
+            owner = {};
+        };
+        auto native_registration = [&](const std::string& command) {
+            if (!retained_prompt) return false;
+            if (command.rfind("BQINPUTREFUSED ", 0) == 0) {
+                if (auto* owner = native_find(std::string_view(command).substr(15)))
+                    native_reject(*owner, "transport_full");
+                return true;
+            }
+            if (command.rfind("BQREGISTER ", 0) != 0) return false;
+            char tag[97]{}, priority[16]{}, packing[16]{}, extra = 0;
+            unsigned long long remaining = 0, capacity = 0, received = 0;
+            if (std::sscanf(command.c_str(), "BQREGISTER %96s %15s %15s %llu %llu %llu %c",
+                tag, priority, packing, &remaining, &capacity, &received, &extra) != 6 ||
+                !phase::valid_request(tag) || (std::strcmp(priority, "foreground") &&
+                std::strcmp(priority, "background")) || (std::strcmp(packing, "eligible") &&
+                std::strcmp(packing, "solo")) || !received || received > uint64_t(INT64_MAX) ||
+                remaining > uint64_t(INT64_MAX) - received) {
+                std::printf("FATAL malformed native registration\n"); std::fflush(stdout);
+                packed_control_failed = true; return true;
+            }
+            if (native_find(tag)) {
+                std::printf("FATAL duplicate native registration\n"); std::fflush(stdout);
+                packed_control_failed = true; return true;
+            }
+            const size_t active = size_t(std::count_if(packed_submissions.begin(), packed_submissions.end(),
+                [](const auto& owner) { return !owner.tag.empty(); }));
+            PackedOwner registration;
+            registration.tag = tag;
+            registration.foreground = std::strcmp(priority, "foreground") == 0;
+            registration.solo = std::strcmp(packing, "solo") == 0;
+            registration.accepted = Clock::time_point(std::chrono::duration_cast<Clock::duration>(
+                std::chrono::nanoseconds(received)));
+            registration.started = registration.accepted;
+            registration.deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(
+                std::chrono::nanoseconds(received + remaining)));
+            if (capacity < bs.size() || capacity > bs.size() + strata::program::native_queue_limit ||
+                (active && native_capacity != capacity)) {
+                native_reject(registration, "invalid_capacity"); return true;
+            }
+            if (active >= capacity) { native_reject(registration, "queue_full"); return true; }
+            native_capacity = size_t(capacity);
+            auto destination = std::find_if(packed_submissions.begin() + packed_seats, packed_submissions.end(),
+                [](const auto& owner) { return owner.tag.empty(); });
+            if (destination == packed_submissions.end() || native_submission_sequence == UINT64_MAX) {
+                native_reject(registration, "queue_full"); return true;
+            }
+            registration.submission_sequence = ++native_submission_sequence;
+            *destination = std::move(registration);
+            std::printf("BQACCEPT %s -1 0 0\n", destination->tag.c_str());
+            std::fflush(stdout);
+            return true;
+        };
+        auto native_intentions = [&] {
+            if (!retained_prompt) return;
+            const auto now = Clock::now();
+            bool eof = false;
+            { std::lock_guard<std::mutex> lock(in_mu); eof = in_eof; }
+            for (auto& owner : packed_submissions) {
+                if (owner.tag.empty()) continue;
+                if (!owner.cancel_reason && (eof || now >= owner.deadline))
+                    owner.cancel_reason = eof ? "cancel" : "timeout";
+                if (!owner.cancel_reason) continue;
+                if (owner.lease.slot < 0) packed_terminal(owner, -1, owner.cancel_reason);
+                else resident.cancel(owner.lease.slot);
+            }
+        };
         auto retained_receipt = [&](const char* event, const auto& owner, const char* reason) {
             const auto& cursor = bs[size_t(owner.lease.slot)].prompt_cursor;
             std::printf("%s %s %d %llu %llu %lld %llu %llu %lld %lld %lld %lld %s\n",
@@ -17351,14 +17585,20 @@ int main(int argc, char** argv) {
             uint64_t req = 0, inc = 0;
             const bool identity = (request == "0" && incarnation == "0") ||
                 (phase::positive_u64(request, req) && phase::positive_u64(incarnation, inc));
-            if (!phase::valid_request(tag) || seat.size() != 1 || seat[0] < '0' ||
-                seat[0] >= '0' + int(bs.size()) || !identity) {
+            int requested_slot = -1;
+            const bool valid_seat = retained_prompt ? strata::program::native_control_slot(seat, requested_slot) :
+                seat.size() == 1 && seat[0] >= '0' && seat[0] < '0' + int(bs.size());
+            if (!phase::valid_request(tag) || !valid_seat || !identity) {
                 std::printf("FATAL malformed packed owner control\n"); std::fflush(stdout); std::_Exit(1);
             }
-            const int slot = seat[0] - '0';
-            auto& owner = packed_owners[size_t(slot)];
-            const bool matches = owner.tag == tag && (!req ||
+            if (!retained_prompt) requested_slot = seat[0] - '0';
+            auto* found = retained_prompt ? native_find(tag) : &packed_owners[size_t(requested_slot)];
+            if (!found) return true; // late logical controls never name a successor
+            auto& owner = *found;
+            const int slot = owner.lease.slot;
+            const bool matches = owner.tag == tag && (requested_slot < 0 || requested_slot == slot) && (!req ||
                 (req == owner.lease.request && inc == owner.lease.incarnation));
+            if (resume && slot < 0) return true;
             if (resume) {
                 auto cursor = bs[size_t(slot)].prompt_cursor;
                 const auto next = field(), plan = field(), operation = field(), split = field();
@@ -17393,18 +17633,27 @@ int main(int argc, char** argv) {
                                  valid && matches ? err.c_str() : "stale_identity_or_cursor");
                     if (!resident.abort_preparation(owner.lease, err)) packed_control_failed = true;
                     else packed_done(slot, "refused");
-                } else retained_receipt("BQRESUMED", owner, "client");
+                } else {
+                    native_service_end(slot);
+                    retained_receipt("BQRESUMED", owner, "client");
+                }
             } else if (cancel) {
                 if (!field().empty()) {
                     std::printf("FATAL trailing packed cancellation fields\n"); std::fflush(stdout); std::_Exit(1);
                 }
-                if (matches) resident.cancel(slot);
+                if (matches) {
+                    if (retained_prompt && !owner.cancel_reason) owner.cancel_reason = "cancel";
+                    if (slot >= 0) resident.cancel(slot);
+                }
             } else {
                 const auto value = field();
                 if ((value != "foreground" && value != "background") || !field().empty()) {
                     std::printf("FATAL malformed packed priority\n"); std::fflush(stdout); std::_Exit(1);
                 }
-                if (matches) resident.priority(slot, value == "foreground");
+                if (matches) {
+                    owner.foreground = value == "foreground";
+                    if (slot >= 0) resident.priority(slot, owner.foreground);
+                }
             }
             return true;
         };
@@ -17447,13 +17696,14 @@ int main(int argc, char** argv) {
                 };
                 auto& owner = parsed[size_t(index)];
                 const auto tag = field(), seat = field(), budget = field();
-                if (!phase::valid_request(tag) || seat.size() != 1 || seat[0] < '0' ||
-                    seat[0] >= '0' + int(bs.size())) {
+                if (!phase::valid_request(tag) || (retained_prompt ? seat != "-1" :
+                    (seat.size() != 1 || seat[0] < '0' || seat[0] >= '0' + int(bs.size())))) {
                     std::printf("FATAL packed record lacks a routeable tag and slot\n");
                     std::fflush(stdout); return false;
                 }
                 owner.tag.assign(tag);
-                const int slot = seats[size_t(index)] = seat[0] - '0';
+                const int slot = seats[size_t(index)] = retained_prompt ? -1 : seat[0] - '0';
+                if (retained_prompt && !native_find(tag)) return true; // a queued terminal already won
                 uint64_t max_new = 0;
                 if (!phase::positive_u64(budget, max_new) || max_new > INT64_MAX)
                     why = "invalid generated-token budget";
@@ -17530,11 +17780,14 @@ int main(int argc, char** argv) {
                 demand.state_bytes_per_sequence = resident_capacity;
                 const auto admission = strata::plan::admit_request(demand, o.max_context);
                 if (!admission.admitted) why = admission.reason;
-                if (!resident.available(slot) || !packed_owners[size_t(slot)].tag.empty()) why = "physical slot is not free";
-                for (const auto& active : packed_owners)
-                    if (!active.tag.empty() && active.tag == owner.tag) {
-                        std::printf("FATAL duplicate packed request tag\n"); std::fflush(stdout); return false;
-                    }
+                if (!retained_prompt) {
+                    if (!resident.available(slot) || !packed_owners[size_t(slot)].tag.empty())
+                        why = "physical slot is not free";
+                    for (const auto& active : packed_owners)
+                        if (!active.tag.empty() && active.tag == owner.tag) {
+                            std::printf("FATAL duplicate packed request tag\n"); std::fflush(stdout); return false;
+                        }
+                }
                 for (int prior = 0; prior < index; ++prior)
                     if (seats[size_t(prior)] == slot || parsed[size_t(prior)].tag == owner.tag) {
                         std::printf("FATAL duplicate packed frame destination or tag\n"); std::fflush(stdout); return false;
@@ -17543,6 +17796,7 @@ int main(int argc, char** argv) {
                 owner.pending = true;
                 owner.admit_sequence = ++packed_admit_sequence;
                 owner.started = Clock::now();
+                owner.foreground = foreground;
                 owner.seams[0] = foreground ? 1 : 0;
                 if ((index + 1 < count) != (tab != std::string::npos)) {
                     std::printf("FATAL packed frame record count mismatch\n"); std::fflush(stdout); return false;
@@ -17555,6 +17809,28 @@ int main(int argc, char** argv) {
                                 seats[size_t(index)], why.c_str());
                 std::fflush(stdout);
             };
+            if (retained_prompt) {
+                auto& input = parsed[0];
+                auto* registered = native_find(input.tag);
+                if (!registered) return true;
+                if (registered->input_ready || registered->lease.slot >= 0) {
+                    std::printf("FATAL native input was already published\n"); std::fflush(stdout); return false;
+                }
+                if (!why.empty()) { native_reject(*registered, why.c_str()); return true; }
+                input.submission_sequence = registered->submission_sequence;
+                input.accepted = registered->accepted;
+                input.deadline = registered->deadline;
+                input.cancel_reason = registered->cancel_reason;
+                // Registered policy is authoritative even if a later control
+                // raced preparation/publication of the sampling record.
+                input.foreground = registered->foreground;
+                input.solo = registered->solo;
+                input.input_ready = true;
+                input.pending = false;
+                input.started = input.accepted;
+                *registered = std::move(input);
+                return true;
+            }
             if (!why.empty()) { reject(); return true; }
             for (int index = 0; index < count; ++index) {
                 const int slot = seats[size_t(index)];
@@ -17610,22 +17886,169 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             return true;
         };
+        auto native_select = [&]() -> bool {
+            if (!retained_prompt) return true;
+            // Reservation copies its retained source: invalidating only at prepare
+            // would be too late, and affinity/capture must not inspect poisoned state.
+            packed_poison_reset();
+            for (;;) {
+                std::array<strata::program::AdmissionCandidate, strata::program::native_submission_limit> candidates;
+                size_t count = 0;
+                const auto now = Clock::now();
+                for (size_t i = packed_seats; i < packed_submissions.size(); ++i) {
+                    const auto& owner = packed_submissions[i];
+                    if (!owner.tag.empty())
+                        candidates[count++] = {i, owner.submission_sequence, owner.foreground, owner.solo,
+                            owner.input_ready, owner.tokens.size(),
+                            std::chrono::duration<double>(now - owner.accepted).count()};
+                }
+                const auto* chosen = native_policy.select(
+                    std::span<const strata::program::AdmissionCandidate>(candidates.data(), count));
+                if (!chosen) return true;
+                auto& next = packed_submissions[chosen->index];
+                const int groups = piped ? std::max(1, o.batch_groups) : 1;
+                const int width = std::max(1, int(bs.size()) / groups);
+                int destination = -1;
+                size_t affinity = 0;
+                const auto full_prefix = [&](int slot, bool turn) {
+                    const auto& old = bs[size_t(slot)];
+                    if (!old.reusable(next.input.scope, next.input.steering)) return size_t(0);
+                    size_t prefix = old.ids.size();
+                    if (turn) {
+                        prefix = 0;
+                        for (size_t i = 0; i < old.ids.size(); ++i)
+                            if (old.ids[i] == o.turn_token) prefix = i;
+                    }
+                    return prefix && prefix < next.tokens.size() &&
+                        std::equal(old.ids.begin(), old.ids.begin() + prefix, next.tokens.begin()) ? prefix : size_t(0);
+                };
+                const auto hole = [&](int slot) {
+                    if (width <= 1) return false;
+                    const int end = (slot / width + 1) * width;
+                    for (int i = slot + 1; i < end; ++i)
+                        if (!resident.available(i)) return true;
+                    return false;
+                };
+                const auto busy = [&](int slot) {
+                    int n = 0;
+                    for (int i = slot / width * width; i < (slot / width + 1) * width; ++i)
+                        n += !resident.available(i);
+                    return n;
+                };
+                // The same spread order as the old frontend, after policy has
+                // selected the logical request. Affinity never waits on a busy seat.
+                std::array<int, 4> free{};
+                size_t available = 0;
+                for (int t = 0; t < width; ++t) for (int group = 0; group < groups; ++group) {
+                    const int slot = group * width + t;
+                    if (resident.available(slot) && packed_owners[size_t(slot)].tag.empty())
+                        free[available++] = slot;
+                }
+                if (!available) return true;
+                for (size_t i = 0; i < available; ++i) {
+                    const int slot = free[i];
+                    const size_t prefix = full_prefix(slot, false);
+                    if (destination < 0 || prefix > affinity) { destination = slot; affinity = prefix; }
+                }
+                const size_t useful = groups > 1 ? 512 : 1;
+                if (affinity < useful) {
+                    destination = free[0];
+                    if (width > 1 && groups > 1) {
+                        for (size_t i = 1; i < available; ++i)
+                            if (hole(free[i]) && !hole(destination)) destination = free[i];
+                    } else {
+                        affinity = 0;
+                        for (size_t i = 0; i < available; ++i) {
+                            const size_t prefix = full_prefix(free[i], true);
+                            if (prefix > affinity) { destination = free[i]; affinity = prefix; }
+                        }
+                        if (affinity < useful) for (size_t i = 1; i < available; ++i) {
+                            const int slot = free[i];
+                            if (busy(slot) < busy(destination) ||
+                                (busy(slot) == busy(destination) &&
+                                (bs[size_t(slot)].ids.empty() != bs[size_t(destination)].ids.empty()
+                                    ? bs[size_t(slot)].ids.empty()
+                                    : native_seat_used[size_t(slot)] < native_seat_used[size_t(destination)])))
+                                destination = slot;
+                        }
+                    }
+                }
+                if (!full_prefix(destination, false) && !park_completed(destination, 0, nullptr)) {
+                    if (strata::program::preservation_ends_serving(capture_failure())) return false;
+                    drop_capture("a replaced native resident conversation");
+                }
+                if (Clock::now() >= next.deadline || next.cancel_reason) {
+                    packed_terminal(next, -1, next.cancel_reason ? next.cancel_reason : "timeout");
+                    continue;
+                }
+                // Nothing may select a new owner from finish/abort or while a
+                // caller still borrows the old entry. This move occurs only here.
+                auto& owner = packed_owners[size_t(destination)];
+                owner = std::move(next);
+                next = {};
+                strata::program::ResidentPrepareInput input;
+                input.slot = destination;
+                input.tokens = &owner.tokens;
+                input.request = owner.input;
+                strata::program::ResidentPreparation lease;
+                std::string why;
+                if (!resident.reserve(&input, 1, &lease, why)) {
+                    std::fprintf(stderr, "NATIVE_ADMISSION event=refused tag=%s reason=%s\n",
+                                 owner.tag.c_str(), why.c_str());
+                    packed_terminal(owner, -1, "refused");
+                    continue;
+                }
+                owner.lease = lease;
+                owner.pending = true;
+                owner.seams = {};
+                owner.admit_sequence = ++packed_admit_sequence;
+                owner.started = Clock::now();
+                owner.admission_wait_s = std::chrono::duration<double>(owner.started - owner.accepted).count();
+                owner.service_ready = owner.started;
+                if (phase_receipts) {
+                    uint64_t sequence = 0;
+                    (void)phase::next_sequence(phase_sequence, sequence);
+                    owner.phase_leg.emplace(owner.phase_input, sequence, phase::now_ns());
+                    owner.phase_leg->slot = destination;
+                    if (owner.input.shared_scope.valid())
+                        owner.phase_leg->shared_prefix_tokens = uint64_t(owner.input.pin);
+                }
+                resident.priority(destination, owner.foreground);
+                native_policy.granted(owner.foreground, owner.solo);
+                std::printf("BACK %s %d %llu %llu native_admission_wait_s=%.9f\n",
+                            owner.tag.c_str(), destination, (unsigned long long)lease.request,
+                            (unsigned long long)lease.incarnation, owner.admission_wait_s);
+                std::fflush(stdout); // seating is public before any destination preparation
+            }
+        };
+        const auto packed_command = [&](const std::string& command) {
+            return command.rfind("BGENQ", 0) == 0 || command.rfind("BQCANCEL ", 0) == 0 ||
+                command.rfind("BQPRIORITY ", 0) == 0 || (retained_prompt &&
+                (command.rfind("BQRESUME ", 0) == 0 || command.rfind("BQREGISTER ", 0) == 0 ||
+                 command.rfind("BQINPUTREFUSED ", 0) == 0));
+        };
         auto packed_collect = [&]() -> bool {
+            native_intentions();
+            if (!retire_stopped()) return false;
             packed_flush();
             for (;;) {
                 std::string command;
                 {
                     std::lock_guard<std::mutex> lock(in_mu);
-                    if (in_lines.empty()) return true;
-                    const auto& front = in_lines.front();
-                    if (front.rfind("BGENQ", 0) != 0 && front.rfind("BQCANCEL ", 0) != 0 &&
-                        front.rfind("BQPRIORITY ", 0) != 0 &&
-                        !(retained_prompt && front.rfind("BQRESUME ", 0) == 0)) return true;
-                    command = std::move(in_lines.front());
-                    in_lines.pop_front();
+                    auto command_at = in_lines.begin();
+                    if (retained_prompt) {
+                        // Identity controls can pass slot-number controls, but
+                        // all tagged records retain submit-before-control order.
+                        command_at = std::find_if(in_lines.begin(), in_lines.end(), packed_command);
+                    }
+                    if (command_at == in_lines.end() || !packed_command(*command_at)) return true;
+                    command = std::move(*command_at);
+                    in_lines.erase(command_at);
                     in_cv.notify_all();
                 }
-                if (!packed_control(command) && !packed_admit_frame(command)) return false;
+                if (!native_registration(command) && !packed_control(command) && !packed_admit_frame(command))
+                    return false;
+                native_intentions();
                 if (packed_control_failed) return false;
                 if (!retire_stopped()) return false;
                 packed_flush();
@@ -17650,6 +18073,13 @@ int main(int argc, char** argv) {
         };
         auto packed_cancelled = [&](int slot) {
             std::lock_guard<std::mutex> lock(in_mu);
+            if (retained_prompt && !packed_owners[size_t(slot)].tag.empty()) {
+                auto& owner = packed_owners[size_t(slot)];
+                if (!owner.cancel_reason && (in_eof || Clock::now() >= owner.deadline)) {
+                    owner.cancel_reason = in_eof ? "cancel" : "timeout";
+                    resident.cancel(slot);
+                }
+            }
             return in_eof || bs[size_t(slot)].stop;
         };
         auto packed_prepare = [&](PackedOwner& owner) -> bool {
@@ -17969,12 +18399,16 @@ int main(int argc, char** argv) {
             if (!packed_collect()) return false;
             packed_poison_reset();
             for (auto& owner : packed_owners) if (owner.pending && !owner.prepared) {
-                if (!packed_cancelled(owner.lease.slot) && !packed_prepare(owner)) return false;
+                const int slot = owner.lease.slot;
+                native_service_begin(slot);
+                if (!packed_cancelled(slot) && !packed_prepare(owner)) return false;
+                native_service_end(slot);
                 if (!packed_collect()) return false;
             }
             for (auto& owner : packed_owners) if (owner.pending && packed_cancelled(owner.lease.slot)) {
                 const int slot = owner.lease.slot;
-                owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                if (!retained_prompt)
+                    owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
                 if (!resident.abort_preparation(owner.lease, err)) return false;
                 packed_done(slot, "cancel");
             }
@@ -18069,6 +18503,7 @@ int main(int argc, char** argv) {
                         // read in its physical seat. No sampled picks are emitted
                         // and no final_R borrow survives the draft/commit drain.
                         const auto started = Clock::now();
+                        native_service_begin(slot);
                         struct Sampling {
                             strata::core::Verifier& verifier;
                             explicit Sampling(strata::core::Verifier& v) : verifier(v) { verifier.set_head_sampling(false); }
@@ -18116,7 +18551,8 @@ int main(int argc, char** argv) {
                             packed_done(slot, "cancel");
                             continue;
                         }
-                        owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                        if (!retained_prompt)
+                            owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
                         span.rows = owner.boundary - begin;
                         for (size_t stage = 0; stage <= stages.size(); ++stage)
                             if (!sp.on_segment_stage(span, stage, 0, owner.frontier, err)) return false;
@@ -18134,6 +18570,7 @@ int main(int argc, char** argv) {
                                     owner.tokens.size(), (long long)(owner.frontier - owner.resume));
                         std::fflush(stdout);
                         if (owner.frontier == endpoint) final_ready = true;
+                        native_service_end(slot);
                         continue;
                     }
                     const auto* split = std::getenv("STRATA_PREFILL_SPLIT_OVER_BUDGET");
@@ -18148,6 +18585,7 @@ int main(int argc, char** argv) {
                 span_slots[size_t(count++)] = slot;
             }
             if (count && !final_ready) {
+                for (int index = 0; index < count; ++index) native_service_begin(span_slots[size_t(index)]);
                 packed_first_ready.store(false, std::memory_order_release);
                 const uint64_t epoch = command_epoch.load();
                 const auto begin = Clock::now();
@@ -18208,11 +18646,15 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 for (int index = 0; index < count; ++index) {
-                    if (!(result.touched & (1u << index))) continue;
+                    if (!(result.touched & (1u << index))) {
+                        native_service_end(span_slots[size_t(index)]);
+                        continue;
+                    }
                     auto& owner = packed_owners[size_t(span_slots[size_t(index)])];
                     if (!resident.prefilled(owner.lease, result.frontier[size_t(index)], err)) return false;
                     owner.frontier = result.frontier[size_t(index)];
-                    owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                    if (!retained_prompt)
+                        owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
                     if (owner.phase_leg) owner.phase_leg->add(phase::Stage::prefill_run, wall);
                     if (!packed_checkpoint(owner)) return false;
                     std::printf("BQPP %s %d %llu %llu %lld %zu %lld\n", owner.tag.c_str(), owner.lease.slot,
@@ -18226,6 +18668,7 @@ int main(int argc, char** argv) {
                         retained_receipt("BQSUSPEND", owner, yield_trigger ? yield_trigger : "chunk");
                         owner.admit_sequence = ++packed_admit_sequence;
                     }
+                    native_service_end(owner.lease.slot);
                 }
                 std::fflush(stdout);
                 if (!packed_collect()) return false; // certified frontiers are public before reselection
@@ -18289,8 +18732,11 @@ int main(int argc, char** argv) {
             if (!final_count) return decoder_slice();
             int32_t output[4] = {};
             drive.d.failed = false;
-            for (int index = 0; index < final_count; ++index)
-                packed_owners[size_t(final_slots[size_t(index)])].final_issued = true;
+            for (int index = 0; index < final_count; ++index) {
+                const int slot = final_slots[size_t(index)];
+                packed_owners[size_t(slot)].final_issued = true;
+                native_service_begin(slot);
+            }
             if (!ver.run_slot_rows(final_rows.data(), final_count, win_pool_fn, win_pool_user, output, err) ||
                 !ver.commit_slots(err) || !ver.wait_commit(err)) {
                 for (int index = 0; index < final_count; ++index) resident.taint(final_slots[size_t(index)]);
@@ -18330,9 +18776,11 @@ int main(int argc, char** argv) {
                 owner.first = true;
                 owner.pending = false;
                 owner.frontier = int64_t(owner.tokens.size());
-                owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
+                if (!retained_prompt)
+                    owner.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - owner.started).count();
                 emit_batch_token(slot, output[index]);
                 std::fflush(stdout);
+                native_service_end(slot);
                 const auto& state = bs[size_t(slot)];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), int64_t(output[index])) != o.eos_ids.end();
                 const char* finish = eos ? "stop" : state.stop ? "cancel" :
@@ -18358,15 +18806,11 @@ int main(int argc, char** argv) {
         };
         auto packed_front = [&] {
             std::lock_guard<std::mutex> lock(in_mu);
-            return !in_lines.empty() && (in_lines.front().rfind("BGENQ", 0) == 0 ||
-                in_lines.front().rfind("BQCANCEL ", 0) == 0 || in_lines.front().rfind("BQPRIORITY ", 0) == 0 ||
-                (retained_prompt && in_lines.front().rfind("BQRESUME ", 0) == 0));
+            return !in_lines.empty() && packed_command(in_lines.front());
         };
         auto retained_other_command = [&] {
             std::lock_guard<std::mutex> lock(in_mu);
-            return retained_prompt && !in_lines.empty() && in_lines.front().rfind("BGENQ", 0) != 0 &&
-                in_lines.front().rfind("BQCANCEL ", 0) != 0 && in_lines.front().rfind("BQPRIORITY ", 0) != 0 &&
-                in_lines.front().rfind("BQRESUME ", 0) != 0;
+            return retained_prompt && !in_lines.empty() && !packed_command(in_lines.front());
         };
         auto restore_alias_head = [&](std::string& error, const char* next_phase) -> bool {
             if (!o.prefill_head_alias || native_head.loaded()) return true;
@@ -18387,6 +18831,37 @@ int main(int argc, char** argv) {
         bool reference_pending = !o.score_reference.empty();
         for (;;) {
             line_drain_ms = 0.0;
+            if (retained_prompt) {
+                // Intentions -> drain -> resource finish -> terminal/retire ->
+                // selection. Neither finish nor abort calls admission reentrantly.
+                if (!packed_collect() || !retire_stopped()) return 1;
+                const bool waiting = std::any_of(packed_submissions.begin() + packed_seats, packed_submissions.end(),
+                    [](const auto& owner) { return !owner.tag.empty() && owner.input_ready; });
+                const bool free_seat = std::any_of(packed_owners.begin(), packed_owners.end(),
+                    [](const auto& owner) { return owner.tag.empty(); });
+                const bool aborting = std::any_of(packed_owners.begin(), packed_owners.end(), [&](const auto& owner) {
+                    return owner.pending && bs[size_t(owner.lease.slot)].stop;
+                });
+                if (((waiting && free_seat) || aborting) && !pipe_drain()) return 1;
+                packed_flush();
+                for (auto& owner : packed_owners) {
+                    if (!owner.pending || !bs[size_t(owner.lease.slot)].stop || owner.final_issued) continue;
+                    const int slot = owner.lease.slot;
+                    if (!resident.abort_preparation(owner.lease, err)) return 1;
+                    packed_done(slot, "cancel");
+                }
+                if (!native_select()) return 1;
+                if (!packed_pending() && !packed_decoding() && !retained_other_command()) {
+                    auto deadline = Clock::time_point::max();
+                    for (const auto& owner : packed_submissions)
+                        if (!owner.tag.empty()) deadline = std::min(deadline, owner.deadline);
+                    if (deadline != Clock::time_point::max()) {
+                        std::unique_lock<std::mutex> lock(in_mu);
+                        in_cv.wait_until(lock, deadline, [&] { return !in_lines.empty() || in_eof; });
+                        continue;
+                    }
+                }
+            }
             if (private_preparation) packed_flush();
             if (private_preparation && ((packed_pending() && !retained_other_command()) || packed_front())) {
                 if (!pipe_drain() || !packed_collect() || (packed_pending() && !packed_step())) {
@@ -18453,9 +18928,8 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
-            if (private_preparation && (line.rfind("BGENQ", 0) == 0 || line.rfind("BQCANCEL ", 0) == 0 ||
-                line.rfind("BQPRIORITY ", 0) == 0 || (retained_prompt && line.rfind("BQRESUME ", 0) == 0))) {
-                if (!pipe_drain() || (!packed_control(line) && !packed_admit_frame(line)) ||
+            if (private_preparation && packed_command(line)) {
+                if (!pipe_drain() || (!native_registration(line) && !packed_control(line) && !packed_admit_frame(line)) ||
                     packed_control_failed || !retire_stopped()) {
                     std::printf("FATAL packed admission failed: %s\n", err.c_str());
                     std::fflush(stdout); return 1;

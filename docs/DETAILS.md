@@ -3515,9 +3515,9 @@ for interleaving prefill and decode. No per-token state swapping is introduced b
 
 All three generation endpoints also accept `"strata_packing": "eligible"` (default) or `"solo"` (#249), an
 independent per-request packing policy validated before admission and forwarded as the packed owner's
-`packing=` key. It does not change `strata_priority`, control/admission order or decode quanta, and it has no
-effect while packed prefill is off. A gateway that preserves unknown request fields (the Koko route does)
-passes it through unchanged; it is not inferred from the model name.
+`packing=` key. It does not change the `strata_priority` class or decode quanta. It applies to the tagged
+private-preparation paths (packed or retained); the ordinary legacy path ignores it. A gateway that preserves
+unknown request fields (the Koko route does) passes it through unchanged; it is not inferred from the model name.
 
 #### Experimental retained resident prompt
 
@@ -3527,14 +3527,58 @@ allocation; unsupported compositions refuse rather than reclaiming expert slots.
 reports allocation-conditional in-place suspension, and `EPLAN`/`INFO retained_prompt=1 retained_prompt_version=1`
 after allocation report the validated capability. The default and legacy `GEN`/`BGEN` route are unchanged.
 
-The frontend serializes and submits the input once, releases admission control at `BACK`, and retains its
-generator, request deadline, output budget and physical-seat claim until one tagged `BQDONE`. After an arithmetic
-chunk and all stage/residual/MTP consumers drain, `BQSUSPEND` names the request/incarnation, physical owner,
-committed cursor, original plan/grid, pending split and operation generation. `BQRESUME` returns only that cursor;
-successful preflight emits nonterminal `BQRESUMED`. This cursor echo adds a frontend round trip per suspended
-chunk; it is not a zero-cost or independent-reader claim. No `YIELDED`, `DONE cancel`, `BADM`, prompt resend or
-seat-to-working restoration is part of this lifecycle. Native token histories, allocation generations and
-checkpoint seams remain with the preparing seat; operation scratch and events stay with their existing owners.
+In this mode only, `INFO native_admission=1 native_admission_version=1` and
+`EPLAN admission={"authority":"native","support":"on",...}` select native admission. The legacy/daily
+resident path and the packed-only experiment still use their existing frontend admission rules.
+The frontend retains authentication, the single effective-slots-plus-queue-depth unfinished-request bound,
+bounded preparation, tokenization, context/output validation, the original deadline and disconnect/shutdown drain.
+It does not select physical seats, acquire the Python control scheduler, or predict the admission frontier.
+Native admission with data-parallel replicas is explicitly unsupported and refused at startup/load;
+pre-routing registrations must never be forwarded implicitly to replica zero. An unloaded engine retains
+only HTTP ingress records: their native metadata is registered in ingress order after successful reload.
+Terminal cleanup marks every lifecycle closing under the same admission lock used by lazy-load backfill,
+including ownerless records whose native capability is not yet known. Closing/finished records are never
+backfilled; draining occurs outside that lock so receipt callbacks cannot deadlock terminal cleanup.
+
+`BQREGISTER <tag> <foreground|background> <eligible|solo> <remaining_ns> <capacity>` registers metadata in
+HTTP acceptance order, before concurrent tokenization. The relative remaining deadline is converted to the native
+steady clock at reader receipt; Python and C++ clock epochs are not assumed equal. `BQACCEPT <tag> -1 0 0`
+means accepted, not seated. `BGENQ1 <tag> -1 <max_new> [sampling/cache/phase keys] <ids>` publishes the same
+owner's validated input exactly once. Its FIFO position does not change when tokenization finishes. A selected
+unready head retains that position, rather than silently ordering by tokenization completion.
+
+The existing packed owner table covers unseated and seated submissions; unseated entries allocate no model or
+checkpoint payload. Priority/FIFO, a background opportunity after at most three successful foreground grants,
+and an eligible foreground opportunity after four solo grants govern seating. Optional short-first/aging remains
+within the selected class. Authorized full/turn prefix affinity, padded-group hole filling and group spreading
+choose only among free destinations after selecting the request. Queue depth zero still accepts the effective
+seat count. Full submission/input transport refuses without blocking subsequent logical cancellation.
+
+Only the native owner loop grants a seat. It applies intentions, drains consumers, finishes/aborts the old
+resource, snapshots terminal accounting, publishes one terminal, retires the association, then selects a waiter.
+Neither finish nor abort admits reentrantly. `BACK <tag> <slot> <request> <incarnation>
+native_admission_wait_s=<seconds>` precedes destination preparation. A waiter needs no resubmission or new input
+when one seat is freed. Tagged, incarnation-fenced frontend slot observations are not admission authority;
+a delayed old consumer/finalizer cannot clear a newly seated successor.
+After a non-finite result the poisoned domain is invalidated before any next affinity lookup, capture or
+reservation: reservation already copies its selected retained source, so reset at preparation alone is too late.
+
+`BQCANCEL` and `BQPRIORITY` accept the logical tag with slot `-1` and identity `0 0` before seating, or the exact
+seat lease afterward. An unseated cancelled/expired owner emits one `BQDONE` with slot `-1`, identity `0 0`,
+zero committed output/work and `cancel`/`timeout`; it emits no seating/progress/token receipt. Late retired input
+and controls cannot resurrect it. Native seating is awaited before HTTP stream headers or dialect preambles,
+so queued expiry remains HTTP 408 without `Retry-After`.
+After headers, including a later MCP continuation waiting for preparation, cancellation/expiry instead follows
+the dialect's existing SSE error/termination path; it must not insert a second HTTP response into the stream.
+Transport coalescing preserves different lease/hint/cursor fences. Only identical cancel/resume frames or
+same-fence priority updates can replace an unconsumed intention, under the existing total metadata bound.
+
+After an arithmetic chunk and all stage/residual/MTP consumers drain, `BQSUSPEND` names the request/incarnation,
+physical owner, committed cursor, original plan/grid, pending split and operation generation. `BQRESUME` returns
+only that cursor; successful preflight emits nonterminal `BQRESUMED`. This cursor echo adds a frontend round trip
+per suspended chunk; it is not a zero-cost or independent-reader claim. No `YIELDED`, `DONE cancel`, `BADM`,
+prompt resend or seat-to-working restoration is part of this lifecycle. Native token histories, allocation
+generations and checkpoint seams remain with the preparing seat; scratch/events stay with their existing owners.
 
 Resumption checks identity, exact frontier/plan/split, stage/session/allocation ownership, last drained operation
 and draft readiness before mutation. Stale identities/tags and late duplicate echoes cannot cancel a successor
@@ -3547,6 +3591,19 @@ Admission explicitly prices retained prompt vectors, cursor/allocation descripto
 command/handoff storage and checkpoint staging. There is no second device prompt arena or suspension snapshot.
 `RETAINED_PROMPT event=stage` reports executed per-stage intervals; ordinary token uploads/checkpoints are
 distinct from admission/restore movement counted by `STRATA_ADMISSION_COPY_BYTES`.
+
+Native `BQDONE` appends `native_admission_wait_s` (acceptance to seat or unseated terminal) and
+`native_service_wait_s` (accumulated ready-but-not-selected intervals, excluding restoration/prefill/decode and
+suspended cursor-echo time). These work with optional phase diagnostics disabled. Lifecycle and attribution
+retain `ingress_wait_s` separately from actual frontend preparation and native waits; absent native receipts
+remain explicitly missing, never invented zero work. Early native registration means its admission counter
+can overlap frontend preparation. Native `queue_s` preserves the compatibility total of frontend ingress
+resource wait plus post-input-publication seat wait; it excludes preparation and native service wait.
+`metrics.engine.protocol_startup` contains the raw received INFO/EPLAN/READY frames. Lifecycle
+`retained_events` stores monotonic-stamped tagged receipts and sent cancellation, including physical slot and
+native request/incarnation, with explicit completeness/drop counters. A reaped owned engine logs exactly one
+`[strata] engine_exit: {"pid":...,"exit_code":...}` with its actual exit code, never a synthetic clean exit.
+
 
 #### Experimental segmented packed prefill
 

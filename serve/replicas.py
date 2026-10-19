@@ -194,6 +194,17 @@ class ReplicaEngine:
         d["heal_at"] = [0.0] * len(engines)
         d["routed"] = [0] * len(engines)
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
+        self._validate_admission()
+
+    def _validate_admission(self):
+        if any(bool(getattr(engine, "native_admission", False)) for engine in self.engines):
+            raise ReplicaConfigError("native admission is not supported with replicas")
+
+    @property
+    def native_admission(self):
+        # Never forward a pre-routing registration to replica zero.
+        self._validate_admission()
+        return False
 
     # ---- attribute plumbing
     @property
@@ -334,6 +345,11 @@ class ReplicaEngine:
             t.start()
         for t in ts:
             t.join()
+        try:
+            self._validate_admission()
+        except ReplicaConfigError:
+            self.close()
+            raise
         if errors and not self.alive():
             raise next(iter(errors.values()))
         for k, e in errors.items():
