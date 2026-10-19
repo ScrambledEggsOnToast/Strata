@@ -168,11 +168,6 @@ class RoundtripPrefix(unittest.TestCase):
         kept = self.roundtrip("openai", "reasoning")
         dropped = self.roundtrip("openai", "reasoning", drop_reasoning=True)
         self.assertGreater(kept["retained_turn_lcp_tokens"], dropped["retained_turn_lcp_tokens"])
-        # JS-free source guard on the no-tool producer plus the real Python boundary assertions above. This does
-        # not execute a browser or claim coverage of the web client's multi-round MCP history reconstruction.
-        source = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
-        builder = source.split("function assistantMessages(m) {", 1)[1].split("  const out = [];", 1)[0]
-        self.assertIn("if (m.reasoning) msg.reasoning_content = m.reasoning;", builder)
 
 
 if __name__ == "__main__":

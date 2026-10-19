@@ -7750,7 +7750,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    first = {"role": "assistant", "content": ""}
+    if thinking:
+        first["reasoning_content_is_continuation"] = True   # this generation had the template's thinking prefill
+    yield chunk(first)
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -7809,12 +7812,14 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    continuation = False
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
         d = c["choices"][0]["delta"]
+        continuation = continuation or d.get("reasoning_content_is_continuation") is True
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
@@ -7829,8 +7834,9 @@ def openai_collect(chunks) -> dict:
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
-    if "".join(reasoning):
+    if "".join(reasoning) or continuation:
         msg["reasoning_content"] = "".join(reasoning)
+        msg["reasoning_content_is_continuation"] = True
     if calls:
         msg["tool_calls"] = calls
     if mcp:

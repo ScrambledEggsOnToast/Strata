@@ -52,11 +52,60 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # Seed detection must not run inside _detect_caps: that probes the template through render(), which restores
+        # the seed. Keep it empty for the capability probes, then detect it once.
+        self.thinking_seed = ""
         self.caps = self._detect_caps()
+        # The installed template may put a literal after `<think>` in its generation prompt (the Swift pack uses
+        # "Let me"). The model's reasoning then starts after that seed, but the collector returns only the
+        # continuation; replaying history without the seed rewrites the next prompt's prefix (#272). The seed is
+        # restored to user-preceded assistant reasoning below. Templates with no such literal are unchanged.
+        self.thinking_seed = self._detect_thinking_seed()
+
+    def _detect_thinking_seed(self) -> str:
+        probe = [{"role": "user", "content": "x"}]
+        try:
+            generated = self.template.render(messages=self._examples(probe), tools=None,
+                                             add_generation_prompt=True)
+            history = self.template.render(messages=self._examples(probe), tools=None,
+                                           add_generation_prompt=False)
+        except Exception:  # noqa: BLE001 - a template that refuses the probe has no detectable seed
+            return ""
+        if not generated.startswith(history):
+            return ""   # the template did not append a generation suffix: no isolable seed
+        suffix = generated[len(history):]
+        marker = suffix.rfind("<think>")
+        if marker < 0:
+            return ""
+        # Everything after the open thinking tag is the seed, byte for byte (the format's one newline is removed).
+        after = suffix[marker + len("<think>"):]
+        if "</think>" in after:
+            return ""   # a closed/empty thinking block, not an open seeded prompt
+        return after[1:] if after.startswith("\n") else after
+
+    def _seed_history(self, messages: list[dict]) -> list[dict]:
+        if not self.thinking_seed:
+            return messages
+        out: list[dict] = []
+        previous_role = None
+        for message in messages:
+            # A tool-result continuation is generated from a different prompt (the active template deliberately
+            # omits the seed there), so only a user-preceded assistant turn gets the seed restored.
+            if (previous_role == "user" and isinstance(message, dict) and message.get("role") == "assistant"
+                    and message.get("reasoning_content_is_continuation") is True
+                    and isinstance(message.get("reasoning_content"), str)):
+                # The seed is part of the generation prompt, not the generated continuation. Prepend it even when
+                # the continuation itself begins with the same text (the prompt then contains both), and even when
+                # the model immediately closed thinking and the collected continuation is empty.
+                message = {**message, "reasoning_content": self.thinking_seed + message["reasoning_content"]}
+            out.append(message)
+            if isinstance(message, dict):
+                previous_role = message.get("role")
+        return out
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
-        return self.template.render(messages=self._examples(messages), tools=tools,
+        return self.template.render(messages=self._examples(self._seed_history(messages)), tools=tools,
                                     add_generation_prompt=add_generation_prompt, **kwargs)
 
     @staticmethod
@@ -82,7 +131,7 @@ class ChatTemplate:
         """
         if limit is None:
             return self.render(messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
-        stream = self.template.generate(messages=self._examples(messages), tools=tools,
+        stream = self.template.generate(messages=self._examples(self._seed_history(messages)), tools=tools,
                                         add_generation_prompt=add_generation_prompt, **kwargs)
         out: list[str] = []
         total = 0
@@ -573,8 +622,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         content = _check_parts(m.get("content"), f"messages[{i}].content",
                                TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
-        if m.get("reasoning_content"):
-            out["reasoning_content"] = m["reasoning_content"]
+        if "reasoning_content" in m or m.get("reasoning_content_is_continuation") is True:
+            out["reasoning_content"] = m.get("reasoning_content") or ""
+            if m.get("reasoning_content_is_continuation") is True:
+                out["reasoning_content_is_continuation"] = True
         if m.get("tool_calls"):
             calls = []
             for c in _object_list(m["tool_calls"], "tool_calls"):
@@ -670,6 +721,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
+            if m.get("reasoning_content_is_continuation") is True:
+                out["reasoning_content"] = out.get("reasoning_content", "")
+                out["reasoning_content_is_continuation"] = True
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)

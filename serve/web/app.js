@@ -774,8 +774,13 @@ function assistantMessages(m) {
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
   if (!ran.length) {
     const msg = {role: "assistant", content: m.text || ""};
-    // Keep completed reasoning too: dropping it rewrites the next prompt's token prefix (#272).
-    if (m.reasoning) msg.reasoning_content = m.reasoning;
+    // Keep completed reasoning too: dropping it rewrites the next prompt's token prefix (#272). This is the
+    // server's raw continuation, so mark it: the active template's generation seed is restored only for declared
+    // continuations, never for imported/complete assistant reasoning (#272).
+    if (m.thinking) {
+      msg.reasoning_content = m.reasoning || "";
+      msg.reasoning_content_is_continuation = true;
+    }
     return [msg];
   }
   const out = [];
@@ -808,7 +813,7 @@ async function send() {
   renderAttachments();
   $("input").value = "";
   autosize();
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  const m = {role: "assistant", text: "", reasoning: "", thinking: settings.thinking !== "none", time: Date.now()};
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
