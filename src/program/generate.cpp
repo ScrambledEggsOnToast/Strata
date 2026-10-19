@@ -19369,7 +19369,20 @@ int main(int argc, char** argv) {
                 // Exact resend of a yielded request is an ownership continuation, never an economic choice.
                 selected = {PrefixSource::resident, (int64_t) bs[(size_t) yielded_source].ids.size(), yielded_source};
                 selected.transfer = PrefixTransfer::resident_live;
-                if (!resident.resume_work(yielded_source, nullptr, selected.work, err)) {
+                // Diagnostic refusal (#265): STRATA_REFUSE_YIELDED_RESUME=<count> refuses that many exact-resend
+                // continuations before preflight. Off unless set; it exists to exercise the containment branch and
+                // the peer-isolation contract on device, and never changes a successful continuation.
+                static int refuse_yielded_resume = [] {
+                    const char* value = std::getenv("STRATA_REFUSE_YIELDED_RESUME");
+                    return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+                }();
+                bool refused_by_injection = false;
+                if (refuse_yielded_resume > 0) {
+                    --refuse_yielded_resume;
+                    err = "fault injection: refused yielded continuation";
+                    refused_by_injection = true;
+                }
+                if (refused_by_injection || !resident.resume_work(yielded_source, nullptr, selected.work, err)) {
                     // #265: a refused continuation is request-local. `resume_work` is preflight (no destination
                     // write), the parked seat keeps the state it already owns, and the peer requests are untouched.
                     // The ERR line is this request's terminal; the engine stays alive and serves the next command.

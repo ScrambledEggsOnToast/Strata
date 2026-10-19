@@ -3910,6 +3910,16 @@ than return a potentially live slot to the queue. Existing consumers must retire
 fail-closed path can fail other active requests; it must not silently mutate or complete them with another
 request's output. Qualification must exercise both successful isolated cancellation and failure/retry.
 
+A refused exact-resend continuation is request-local: `ResidentSlots::resume_work` is preflight and writes no
+destination, the parked seat keeps the state it already owns, the refused request receives an `ERR` terminal,
+and the engine continues serving its peers. Undrainable work, poisoned shared ownership and CUDA/device
+failures still end the engine; there is no transparent replay of already streamed output. The diagnostic
+`STRATA_REFUSE_YIELDED_RESUME=<n>` refuses that many exact resends before preflight, so the containment branch
+and peer isolation can be exercised on device; it is off unless set and does not change a successful
+continuation. A device check yielded an 8,001-token prompt at 4,096 tokens, admitted a peer while it was
+parked, refused the resend with the diagnostic `ERR`, and saw the peer commit all 64 requested tokens before
+a clean exit.
+
 Protected smoke scenarios (not results): use the same pinned full model/tokenizer and supervisor as HET-035,
 an explicit two-slot configuration, `lifecycle_api: true`, queue limit 2 and finite output/context budgets.
 Keep all raw HTTP bodies, lifecycle snapshots, native scheduler traces and exact configuration:
