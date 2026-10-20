@@ -2052,7 +2052,7 @@ void check_facade_uncertain_publication() {
 #ifdef STRATA_STORE_TEST_HOOKS
 namespace phase = strata::program::phase;
 
-// Explicit diagnostic only, never part of the default test run. The nine inputs approximate the retained
+// Explicit diagnostic only, never part of the default test run. The inputs approximate the retained
 // recurrent-state sizes, not its model state, exact K/V shape, alias topology or arrival schedule.
 struct WriterDiagnostic {
     struct Row {
@@ -2063,8 +2063,9 @@ struct WriterDiagnostic {
         uint64_t terminal_ns = 0, receipt_ns = 0;
         bool writer_seen = false, receipt_seen = false;
     };
+    explicit WriterDiagnostic(size_t publications) : rows(publications) {}
     std::mutex mutex;
-    std::array<Row, 9> rows;
+    std::vector<Row> rows;
     size_t omitted = 0;
 
     void observe(const phase::PublicationEvent& event) noexcept {
@@ -2098,8 +2099,7 @@ struct WriterDiagnostic {
     }
 };
 
-void diagnostic_recurrent(CheckpointBytes& target, uint64_t salt) {
-    constexpr size_t bytes = 39223296; // one third of the retained 117669888-byte live GDN total
+void diagnostic_payload(CheckpointBytes& target, size_t bytes, uint64_t salt) {
     auto& payload = target.write();
     payload.resize(bytes, uint8_t(salt));
     for (size_t at = 0; at < payload.size(); at += size_t(1) << 20) {
@@ -2109,19 +2109,22 @@ void diagnostic_recurrent(CheckpointBytes& target, uint64_t salt) {
     }
 }
 
-SavedConversation writer_diagnostic_record(size_t index) {
-    constexpr int64_t tokens[] = {374, 389, 442, 395, 457, 463, 389, 395, 457};
-    constexpr size_t checkpoints[] = {0, 2, 0, 2, 2, 2, 1, 1, 1};
-    SavedConversation image = all_stage_record(41 + 2 * index, tokens[index]);
+void diagnostic_recurrent(CheckpointBytes& target, uint64_t salt) {
+    constexpr size_t bytes = 39223296; // one third of the retained 117669888-byte live GDN total
+    diagnostic_payload(target, bytes, salt);
+}
+
+SavedConversation diagnostic_record(size_t index, int64_t tokens, size_t checkpoints, size_t stage_bytes) {
+    SavedConversation image = all_stage_record(41 + 2 * index, tokens);
     const auto fill = [&](SavedConversation& stage, size_t ordinal) {
         const uint64_t salt = (index + 1) * 100 + ordinal * 8;
-        diagnostic_recurrent(stage.live.gdn, salt);
-        for (size_t cut = 0; cut < checkpoints[index]; ++cut) {
+        diagnostic_payload(stage.live.gdn, stage_bytes, salt);
+        for (size_t cut = 0; cut < checkpoints; ++cut) {
             ConversationCheckpoint checkpoint;
             checkpoint.ids.assign(stage.live.ids.begin(), stage.live.ids.end() - long(7 * (cut + 1)));
             checkpoint.used = cut + 1;
             checkpoint.pinned = true;
-            diagnostic_recurrent(checkpoint.gdn, salt + cut + 1);
+            diagnostic_payload(checkpoint.gdn, stage_bytes, salt + cut + 1);
             checkpoint.ple.assign(checkpoint.ids.size() / 2, uint8_t(salt + cut));
             checkpoint.tails.assign(2, uint8_t(salt + cut));
             stage.checkpoints.push_back(std::move(checkpoint));
@@ -2134,100 +2137,45 @@ SavedConversation writer_diagnostic_record(size_t index) {
     return image;
 }
 
-int writer_phase_diagnostic(const char* parent, const char* output_path) {
-    // Create an exclusive raw record, and a fresh private child of the requested disposable-store parent.
-    // No preserved store is opened. Preparation precedes acceptance; no publication can run before the fixed clock.
-    FILE* output = std::fopen(output_path, "wx");
-    if (!output) {
-        std::fprintf(stderr, "writer diagnostic: cannot exclusively create the output file\n");
-        return 1;
-    }
-    TempRoot root(parent);
-    const char* batching = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
-    if (root.path.empty() || !immutable_checkpoints_enabled() || !batching || std::strcmp(batching, "1") != 0) {
-        std::fputs("{\"kind\":\"not_started\",\"reason\":\"private_root_immutable_or_batching_prerequisite\"}\n", output);
-        std::fclose(output);
-        return 1;
-    }
-    // mkdtemp's final component contains only the fixed prefix and its generated safe suffix.
-    const char* leaf = std::strrchr(root.path.c_str(), '/') + 1;
-    std::fprintf(output, "{\"kind\":\"configuration\",\"issue\":309,\"publications\":9,\"drain_ms\":8000,"
-               "\"stages\":3,\"chunk_bytes\":1048576,\"quota_bytes\":4294967296,"
-               "\"ram_envelope_bytes\":12884901888,\"dir_fsync_batch\":true,\"store_leaf\":\"%s\","
-               "\"original_workload_reproduction\":false}\n", leaf);
-    std::fflush(output);
-    const uint64_t prepare_started = phase::now_ns();
-    std::array<SavedConversation, 9> inputs;
-    uint64_t input_bytes = 0;
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        inputs[i] = writer_diagnostic_record(i);
-        input_bytes += inputs[i].bytes();
-    }
-    const uint64_t prepare_ns = phase::now_ns() - prepare_started;
-    check(input_bytes <= (uint64_t(3) << 30), "the prepared nine-publication inputs stay within their frozen 3 GiB cap");
-    if (input_bytes > (uint64_t(3) << 30)) { std::fclose(output); return 1; }
-    WriterDiagnostic diagnostic; // observer context outlives the store's real writer
-    auto options = options_for(root.path);
-    options.chunk_bytes = uint64_t(1) << 20;
-    options.quota_bytes = uint64_t(4) << 30;
-    options.min_free_bytes = uint64_t(1) << 30;
-    options.metadata_bytes = uint64_t(64) << 20;
-    options.head_limit = 128;
-    ConversationStore store(options);
-    if (!store.enabled() || !store.healthy()) {
-        std::fputs("{\"kind\":\"not_started\",\"reason\":\"disposable_store_unavailable\"}\n", output);
-        std::fclose(output);
-        return 1;
-    }
-    Sink sink(store, size_t(12) << 30, 17, size_t(64) << 20);
-    sink.out.phase_event = [&](const phase::PublicationEvent& event) { diagnostic.observe(event); };
-    ContinuationPublisher publisher;
-    publisher.configure(&store, std::move(sink.out));
-    store.set_publish_trace_for_test(+[](void* context, const ConversationStorePublishTrace& trace) noexcept {
-        static_cast<WriterDiagnostic*>(context)->observe(trace);
-    }, &diagnostic);
-    const uint64_t started_ns = phase::now_ns();
-    const uint64_t deadline = started_ns / 1000000 + 8000; // fixed before the first capture/handoff
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        if (phase::now_ns() / 1000000 >= deadline) {
-            check(false, "all nine captures must fit the original fixed admission deadline");
-            break;
-        }
-        diagnostic.rows[i].capture_started_ns = phase::now_ns();
-        const auto submission = facade_capture(publisher, sink, i % 2, i + 1, inputs[i]);
-        diagnostic.rows[i].capture_finished_ns = phase::now_ns();
-        check(submission.queued && submission.handle.publication_id == i + 1,
-              "the diagnostic accepts each separately identified publication obligation");
-        inputs[i] = {}; // drop the preparation alias, never retain an unaccounted independent payload
-        if (phase::now_ns() / 1000000 < deadline) publisher.flush(0);
-        diagnostic.drain(publisher);
-    }
-    while (publisher.holds_work()) {
-        const uint64_t now = phase::now_ns() / 1000000;
-        if (now >= deadline) break;
-        sink.refresh_allowance();
-        publisher.flush(std::min<uint64_t>(250, deadline - now));
-        diagnostic.drain(publisher);
-    }
-    const uint64_t drain_finished_ns = phase::now_ns();
-    const size_t queued_at_fence = publisher.queued().size(), pending_at_fence = publisher.pending().size();
-    if (!publisher.queued().empty()) publisher.abandon("the bounded shutdown capture/drain ended");
-    // No output, wait or deadline adjustment between drain and this fence; disabled remains a terminal consequence.
-    store.request_shutdown(deadline);
-    const auto terminal = store.finish_shutdown();
-    publisher.reconcile(0);
-    diagnostic.drain(publisher);
-    store.set_publish_trace_for_test(nullptr, nullptr);
-    check(diagnostic.omitted == 0, "the bounded phase collector loses no publication identities");
-    check(!publisher.holds_work(), "quiescence settles the diagnostic's publication ownership");
-    std::fprintf(output, "{\"kind\":\"shutdown\",\"started_ns\":%llu,\"finalize_before_ms\":%llu,"
-        "\"drain_finished_ns\":%llu,\"finished_ns\":%llu,\"queued_at_fence\":%zu,\"pending_at_fence\":%zu,"
-        "\"state\":\"%s\",\"run_intent\":%s,\"fixture_prepare_ns\":%llu,\"input_accounted_bytes\":%llu,"
-        "\"omitted\":%zu,\"disabled_is_latency_cause\":false}\n",
-        (unsigned long long) started_ns, (unsigned long long) deadline, (unsigned long long) drain_finished_ns,
-        (unsigned long long) phase::now_ns(), queued_at_fence, pending_at_fence,
-        conversation_store_shutdown_state_name(terminal), store.run_intent_active() ? "true" : "false",
-        (unsigned long long) prepare_ns, (unsigned long long) input_bytes, diagnostic.omitted);
+SavedConversation writer_diagnostic_record(size_t index) {
+    constexpr int64_t tokens[] = {374, 389, 442, 395, 457, 463, 389, 395, 457};
+    constexpr size_t checkpoints[] = {0, 2, 0, 2, 2, 2, 1, 1, 1};
+    return diagnostic_record(index, tokens[index], checkpoints[index], 39223296);
+}
+
+// The sixteen publication obligations the retained #276 control actually captured: token counts, owner/generation,
+// checkpoint counts inferred from its accounted snapshot sizes, and the two captures that arrived during shutdown.
+// Sizes are that control's own `snapshot_accounted_bytes`; the exact MAN2/KV/alias/donor graph is not recoverable, so
+// the payload is the same synthetic recurrent shape the nine-input diagnostic uses, scaled to the retained sizes.
+struct RetainedTopologyEntry {
+    int64_t tokens;
+    size_t checkpoints;        // per stage
+    uint64_t accounted_bytes;  // the retained snapshot accounting for this publication
+    uint64_t owner;
+    bool during_shutdown;
+};
+
+constexpr std::array<RetainedTopologyEntry, 16> kRetainedTopology{{
+    {374, 0, 123514764, 0, false}, {389, 2, 361286640, 0, false}, {442, 0, 124358812, 0, false},
+    {395, 2, 361336248, 1, false}, {457, 2, 362132160, 0, false}, {463, 2, 362181768, 1, false},
+    {389, 1, 242480112, 0, false}, {395, 1, 242529720, 1, false}, {457, 1, 243324816, 0, false},
+    {374, 0, 123514764, 0, false}, {463, 1, 243374424, 1, false}, {389, 2, 361286640, 0, false},
+    {442, 0, 124358812, 0, false}, {395, 2, 361336248, 1, false}, {457, 2, 362132160, 0, true},
+    {463, 2, 362181768, 1, true},
+}};
+
+SavedConversation retained_topology_record(size_t index) {
+    const RetainedTopologyEntry& entry = kRetainedTopology[index];
+    // Three stage images, each with one live record and the inferred number of immutable checkpoints, split the
+    // retained accounted bytes evenly. The small id/KV/PLE remainder is deliberately not tuned: the record reports
+    // its actual accounted bytes.
+    const size_t units = 3 * (1 + entry.checkpoints);
+    return diagnostic_record(index, entry.tokens, entry.checkpoints, size_t(entry.accounted_bytes / units));
+}
+
+// One row per publication identity, shared by the nine-input and retained-topology diagnostics. Absent clocks stay
+// null rather than zero: a missing phase is unobserved, not instant.
+void write_publication_rows(FILE* output, const WriterDiagnostic& diagnostic) {
     for (size_t i = 0; i < diagnostic.rows.size(); ++i) {
         const auto& row = diagnostic.rows[i];
         check(row.receipt_seen && row.receipt.released, "each accepted diagnostic handle has one ownership-complete receipt");
@@ -2298,6 +2246,103 @@ int writer_phase_diagnostic(const char* parent, const char* output_path) {
         number("writer_thread_cpu_ns", row.writer.thread_cpu_ns, row.writer.thread_cpu_known);
         std::fputs("}\n", output);
     }
+}
+
+int writer_phase_diagnostic(const char* parent, const char* output_path) {
+    // Create an exclusive raw record, and a fresh private child of the requested disposable-store parent.
+    // No preserved store is opened. Preparation precedes acceptance; no publication can run before the fixed clock.
+    FILE* output = std::fopen(output_path, "wx");
+    if (!output) {
+        std::fprintf(stderr, "writer diagnostic: cannot exclusively create the output file\n");
+        return 1;
+    }
+    TempRoot root(parent);
+    const char* batching = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    if (root.path.empty() || !immutable_checkpoints_enabled() || !batching || std::strcmp(batching, "1") != 0) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"private_root_immutable_or_batching_prerequisite\"}\n", output);
+        std::fclose(output);
+        return 1;
+    }
+    // mkdtemp's final component contains only the fixed prefix and its generated safe suffix.
+    const char* leaf = std::strrchr(root.path.c_str(), '/') + 1;
+    std::fprintf(output, "{\"kind\":\"configuration\",\"issue\":309,\"publications\":9,\"drain_ms\":8000,"
+               "\"stages\":3,\"chunk_bytes\":1048576,\"quota_bytes\":4294967296,"
+               "\"ram_envelope_bytes\":12884901888,\"dir_fsync_batch\":true,\"store_leaf\":\"%s\","
+               "\"original_workload_reproduction\":false}\n", leaf);
+    std::fflush(output);
+    const uint64_t prepare_started = phase::now_ns();
+    std::array<SavedConversation, 9> inputs;
+    uint64_t input_bytes = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        inputs[i] = writer_diagnostic_record(i);
+        input_bytes += inputs[i].bytes();
+    }
+    const uint64_t prepare_ns = phase::now_ns() - prepare_started;
+    check(input_bytes <= (uint64_t(3) << 30), "the prepared nine-publication inputs stay within their frozen 3 GiB cap");
+    if (input_bytes > (uint64_t(3) << 30)) { std::fclose(output); return 1; }
+    WriterDiagnostic diagnostic(9); // observer context outlives the store's real writer
+    auto options = options_for(root.path);
+    options.chunk_bytes = uint64_t(1) << 20;
+    options.quota_bytes = uint64_t(4) << 30;
+    options.min_free_bytes = uint64_t(1) << 30;
+    options.metadata_bytes = uint64_t(64) << 20;
+    options.head_limit = 128;
+    ConversationStore store(options);
+    if (!store.enabled() || !store.healthy()) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"disposable_store_unavailable\"}\n", output);
+        std::fclose(output);
+        return 1;
+    }
+    Sink sink(store, size_t(12) << 30, 17, size_t(64) << 20);
+    sink.out.phase_event = [&](const phase::PublicationEvent& event) { diagnostic.observe(event); };
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    store.set_publish_trace_for_test(+[](void* context, const ConversationStorePublishTrace& trace) noexcept {
+        static_cast<WriterDiagnostic*>(context)->observe(trace);
+    }, &diagnostic);
+    const uint64_t started_ns = phase::now_ns();
+    const uint64_t deadline = started_ns / 1000000 + 8000; // fixed before the first capture/handoff
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (phase::now_ns() / 1000000 >= deadline) {
+            check(false, "all nine captures must fit the original fixed admission deadline");
+            break;
+        }
+        diagnostic.rows[i].capture_started_ns = phase::now_ns();
+        const auto submission = facade_capture(publisher, sink, i % 2, i + 1, inputs[i]);
+        diagnostic.rows[i].capture_finished_ns = phase::now_ns();
+        check(submission.queued && submission.handle.publication_id == i + 1,
+              "the diagnostic accepts each separately identified publication obligation");
+        inputs[i] = {}; // drop the preparation alias, never retain an unaccounted independent payload
+        if (phase::now_ns() / 1000000 < deadline) publisher.flush(0);
+        diagnostic.drain(publisher);
+    }
+    while (publisher.holds_work()) {
+        const uint64_t now = phase::now_ns() / 1000000;
+        if (now >= deadline) break;
+        sink.refresh_allowance();
+        publisher.flush(std::min<uint64_t>(250, deadline - now));
+        diagnostic.drain(publisher);
+    }
+    const uint64_t drain_finished_ns = phase::now_ns();
+    const size_t queued_at_fence = publisher.queued().size(), pending_at_fence = publisher.pending().size();
+    if (!publisher.queued().empty()) publisher.abandon("the bounded shutdown capture/drain ended");
+    // No output, wait or deadline adjustment between drain and this fence; disabled remains a terminal consequence.
+    store.request_shutdown(deadline);
+    const auto terminal = store.finish_shutdown();
+    publisher.reconcile(0);
+    diagnostic.drain(publisher);
+    store.set_publish_trace_for_test(nullptr, nullptr);
+    check(diagnostic.omitted == 0, "the bounded phase collector loses no publication identities");
+    check(!publisher.holds_work(), "quiescence settles the diagnostic's publication ownership");
+    std::fprintf(output, "{\"kind\":\"shutdown\",\"started_ns\":%llu,\"finalize_before_ms\":%llu,"
+        "\"drain_finished_ns\":%llu,\"finished_ns\":%llu,\"queued_at_fence\":%zu,\"pending_at_fence\":%zu,"
+        "\"state\":\"%s\",\"run_intent\":%s,\"fixture_prepare_ns\":%llu,\"input_accounted_bytes\":%llu,"
+        "\"omitted\":%zu,\"disabled_is_latency_cause\":false}\n",
+        (unsigned long long) started_ns, (unsigned long long) deadline, (unsigned long long) drain_finished_ns,
+        (unsigned long long) phase::now_ns(), queued_at_fence, pending_at_fence,
+        conversation_store_shutdown_state_name(terminal), store.run_intent_active() ? "true" : "false",
+        (unsigned long long) prepare_ns, (unsigned long long) input_bytes, diagnostic.omitted);
+    write_publication_rows(output, diagnostic);
     std::fputs("{\"kind\":\"limits\",\"timings\":\"inclusive; fsync/syncfs/write counters are nested, not additive\","
         "\"missing_phases\":null,\"shape\":\"synthetic three-stage recurrent workload, not original MAN2/model/KV topology\","
         "\"claim\":\"CPU/store diagnostic only; disabled is shutdown fencing, not an attributed latency cause\"}\n", output);
@@ -2306,6 +2351,190 @@ int writer_phase_diagnostic(const char* parent, const char* output_path) {
     check(output_ok && closed, "the exclusive diagnostic record is written completely");
     std::fprintf(stderr, "conversation_publication_test: writer diagnostic %d checks, %d failures; shutdown=%s\n",
                  checks, failures, conversation_store_shutdown_state_name(terminal));
+    return failures == 0 ? 0 : 1;
+}
+
+// Reproduce the retained #276 topology on the caller's real store filesystem: sixteen publication obligations with
+// their token counts, owners, checkpoint counts and accounted sizes; fourteen captured before shutdown and two while
+// the store is already shutting down; the unchanged 8000 ms deadline fixed at shutdown start and passed through.
+// This diagnostic does not move the deadline, add a pre-drain wait, or require either batching mode.
+int retained_topology_diagnostic(const char* parent, const char* output_path) {
+    FILE* output = std::fopen(output_path, "wx");
+    if (!output) {
+        std::fprintf(stderr, "retained-topology diagnostic: cannot exclusively create the output file\n");
+        return 1;
+    }
+    TempRoot root(parent);
+    const char* batching = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    const bool batching_on = batching && std::strcmp(batching, "1") == 0;
+    const bool batching_off = batching && std::strcmp(batching, "0") == 0;
+    if (root.path.empty() || !immutable_checkpoints_enabled() || (!batching_on && !batching_off)) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"private_root_immutable_or_explicit_batching_mode_prerequisite\"}\n",
+                   output);
+        std::fclose(output);
+        return 1;
+    }
+    const char* leaf = std::strrchr(root.path.c_str(), '/') + 1;
+    std::fprintf(output, "{\"kind\":\"configuration\",\"issue\":309,\"diagnostic\":\"retained-topology\","
+               "\"publications\":16,\"captures_before_shutdown\":14,\"captures_during_shutdown\":2,\"drain_ms\":8000,"
+               "\"deadline_origin\":\"shutdown_started_ns/1000000+8000\",\"stages\":3,"
+               "\"chunk_bytes\":1048576,\"quota_bytes\":8589934592,\"min_free_bytes\":1073741824,"
+               "\"metadata_bytes\":67108864,\"head_limit\":128,\"ram_envelope_bytes\":12884901888,"
+               "\"dir_fsync_batch\":%s,\"store_parent\":\"%s\",\"store_leaf\":\"%s\","
+               "\"original_workload_reproduction\":false}\n",
+               batching_on ? "true" : "false", parent, leaf);
+    std::fflush(output);
+
+    const uint64_t prepare_started = phase::now_ns();
+    std::array<SavedConversation, kRetainedTopology.size()> inputs;
+    uint64_t input_bytes = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        inputs[i] = retained_topology_record(i);
+        input_bytes += inputs[i].bytes();
+    }
+    const uint64_t prepare_ns = phase::now_ns() - prepare_started;
+    // A synthetic topology cannot reproduce the retained donor/alias dedup, so its payloads are written as distinct
+    // objects: the whole retained accounted volume becomes real I/O, never less.
+    check(input_bytes <= (uint64_t(6) << 30), "the prepared sixteen-publication inputs stay within their frozen 6 GiB cap");
+    if (input_bytes > (uint64_t(6) << 30)) { std::fclose(output); return 1; }
+
+    WriterDiagnostic diagnostic(inputs.size());
+    auto options = options_for(root.path);
+    options.chunk_bytes = uint64_t(1) << 20;
+    options.quota_bytes = uint64_t(8) << 30;
+    options.min_free_bytes = uint64_t(1) << 30;
+    options.metadata_bytes = uint64_t(64) << 20;
+    options.head_limit = 128;
+    ConversationStore store(options);
+    if (!store.enabled() || !store.healthy()) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"disposable_store_unavailable\"}\n", output);
+        std::fclose(output);
+        return 1;
+    }
+    Sink sink(store, size_t(12) << 30, 17, size_t(64) << 20);
+    sink.out.phase_event = [&](const phase::PublicationEvent& event) { diagnostic.observe(event); };
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    store.set_publish_trace_for_test(+[](void* context, const ConversationStorePublishTrace& trace) noexcept {
+        static_cast<WriterDiagnostic*>(context)->observe(trace);
+    }, &diagnostic);
+
+    size_t next = 0;
+    const size_t before_shutdown = 14;
+    for (; next < before_shutdown; ++next) {
+        diagnostic.rows[next].capture_started_ns = phase::now_ns();
+        const auto submission = facade_capture(publisher, sink, kRetainedTopology[next].owner, next + 1, inputs[next]);
+        diagnostic.rows[next].capture_finished_ns = phase::now_ns();
+        check(submission.queued && submission.handle.publication_id == next + 1,
+              "the diagnostic accepts each separately identified publication obligation");
+        inputs[next] = {}; // drop the preparation alias, never retain an unaccounted independent payload
+        publisher.flush(0);
+        diagnostic.drain(publisher);
+    }
+
+    // The deadline origin is the retained one: shutdown start + the unchanged 8000 ms, decided once.
+    const uint64_t shutdown_started_ns = phase::now_ns();
+    const uint64_t deadline = shutdown_started_ns / 1000000 + 8000;
+    const auto bounded_drain = [&] {
+        // The production owner drain: bounded by the fixed deadline and by progress, never by new work.
+        int stalled = 0;
+        while (publisher.holds_work() && phase::now_ns() / 1000000 < deadline && stalled < 3) {
+            const size_t before = publisher.queued().size() + publisher.pending().size();
+            sink.refresh_allowance();
+            const uint64_t now = phase::now_ns() / 1000000;
+            const uint64_t remaining = deadline - std::min(deadline, now);
+            if (!remaining) break;
+            publisher.flush(std::min<uint64_t>(250, remaining));
+            diagnostic.drain(publisher);
+            stalled = publisher.queued().size() + publisher.pending().size() < before ? 0 : stalled + 1;
+        }
+    };
+    // The two shutdown captures arrive while the store is already closing, exactly as the retained control captured
+    // its last two owners; each is followed by its own bounded owner drain.
+    for (; next < inputs.size(); ++next) {
+        diagnostic.rows[next].capture_started_ns = phase::now_ns();
+        const auto submission = facade_capture(publisher, sink, kRetainedTopology[next].owner, next + 1, inputs[next]);
+        diagnostic.rows[next].capture_finished_ns = phase::now_ns();
+        check(submission.queued && submission.handle.publication_id == next + 1,
+              "a shutdown capture is still one separately identified publication obligation");
+        inputs[next] = {};
+        bounded_drain();
+    }
+    // There is no next owner: finish the outstanding publications with the remaining allowance, no added pre-drain.
+    while (publisher.holds_work() && phase::now_ns() / 1000000 < deadline) {
+        sink.refresh_allowance();
+        const uint64_t now = phase::now_ns() / 1000000;
+        const uint64_t remaining = deadline - std::min(deadline, now);
+        if (!remaining) break;
+        publisher.flush(std::min<uint64_t>(250, remaining));
+        diagnostic.drain(publisher);
+    }
+    const uint64_t drain_finished_ns = phase::now_ns();
+    const size_t queued_at_fence = publisher.queued().size(), pending_at_fence = publisher.pending().size();
+    if (!publisher.queued().empty()) publisher.abandon("the bounded shutdown capture/drain ended");
+    // No output, wait or deadline adjustment between drain and this fence.
+    store.request_shutdown(deadline);
+    const auto terminal = store.finish_shutdown();
+    publisher.reconcile(0);
+    diagnostic.drain(publisher);
+    store.set_publish_trace_for_test(nullptr, nullptr);
+    const auto counters = store.counters();
+
+    check(diagnostic.omitted == 0, "the bounded phase collector loses no publication identities");
+    check(!publisher.holds_work(), "quiescence settles the diagnostic's publication ownership");
+    for (size_t i = 0; i < diagnostic.rows.size(); ++i) {
+        const bool during = kRetainedTopology[i].during_shutdown;
+        check(during == (i >= before_shutdown), "the retained capture segment is the frozen fourteen-plus-two split");
+        check(during ? diagnostic.rows[i].capture_started_ns >= shutdown_started_ns
+                     : diagnostic.rows[i].capture_started_ns < shutdown_started_ns,
+              "each capture segment is ordered around the shutdown start that fixes its deadline");
+    }
+    size_t stored = 0, abandoned = 0, disabled = 0;
+    for (const auto& row : diagnostic.rows) {
+        if (!row.receipt_seen) continue;
+        if (row.receipt.status == PublicationStatus::stored) ++stored;
+        if (row.receipt.status == PublicationStatus::abandoned) ++abandoned;
+        if (row.receipt.status == PublicationStatus::disabled) ++disabled;
+    }
+    if (terminal == ConversationStoreShutdownState::durable_clean) {
+        check_eq(stored, diagnostic.rows.size(), "a durable-clean terminal means every accepted publication stored");
+        check(queued_at_fence == 0 && pending_at_fence == 0,
+              "a durable-clean terminal left nothing queued or outstanding at its fence");
+        check(!store.run_intent_active(), "a durable-clean terminal removed the run intent");
+    } else {
+        check(store.run_intent_active(), "an unclean terminal leaves the run intent armed for restart distrust");
+    }
+    std::fprintf(output, "{\"kind\":\"shutdown\",\"started_ns\":%llu,\"finalize_before_ms\":%llu,"
+        "\"drain_finished_ns\":%llu,\"finished_ns\":%llu,\"queued_at_fence\":%zu,\"pending_at_fence\":%zu,"
+        "\"state\":\"%s\",\"run_intent\":%s,\"fixture_prepare_ns\":%llu,\"input_accounted_bytes\":%llu,"
+        "\"stored\":%zu,\"abandoned\":%zu,\"disabled\":%zu,\"omitted\":%zu}\n",
+        (unsigned long long) shutdown_started_ns, (unsigned long long) deadline,
+        (unsigned long long) drain_finished_ns, (unsigned long long) phase::now_ns(), queued_at_fence,
+        pending_at_fence, conversation_store_shutdown_state_name(terminal),
+        store.run_intent_active() ? "true" : "false", (unsigned long long) prepare_ns,
+        (unsigned long long) input_bytes, stored, abandoned, disabled, diagnostic.omitted);
+    std::fprintf(output, "{\"kind\":\"store\",\"heads\":%llu,\"pinned_heads\":%llu,\"objects\":%llu,"
+        "\"object_bytes\":%llu,\"manifests\":%llu,\"published\":%llu,\"replaced\":%llu,\"retained_branches\":%llu,"
+        "\"refused_quota\":%llu,\"refusals_quota\":%llu,\"evictions\":%llu,\"bytes_written\":%llu,\"orphan_bytes\":%llu,"
+        "\"pending_delete_bytes\":%llu,\"epoch_advances\":%llu}\n",
+        (unsigned long long) counters.heads, (unsigned long long) counters.pinned_heads,
+        (unsigned long long) counters.objects, (unsigned long long) counters.object_bytes,
+        (unsigned long long) counters.manifests, (unsigned long long) counters.published,
+        (unsigned long long) counters.replaced, (unsigned long long) counters.retained_branches,
+        (unsigned long long) counters.refused_quota, (unsigned long long) counters.refusals_quota,
+        (unsigned long long) counters.evictions, (unsigned long long) counters.bytes_written,
+        (unsigned long long) counters.orphan_bytes, (unsigned long long) counters.pending_delete_bytes,
+        (unsigned long long) counters.epoch_advances);
+    write_publication_rows(output, diagnostic);
+    std::fputs("{\"kind\":\"limits\",\"timings\":\"inclusive; fsync/syncfs/write counters are nested, not additive\","
+        "\"shape\":\"retained sixteen-publication topology with synthetic three-stage recurrent payloads\","
+        "\"not_recovered\":\"exact MAN2/KV/alias/donor topology, arrival clocks and pressure history\","
+        "\"claim\":\"CPU/store diagnostic only; no GPU, model or preserved-store access\"}\n", output);
+    const bool output_ok = !std::ferror(output);
+    const bool closed = std::fclose(output) == 0;
+    check(output_ok && closed, "the exclusive diagnostic record is written completely");
+    std::fprintf(stderr, "conversation_publication_test: retained topology %d checks, %d failures; shutdown=%s stored=%zu\n",
+                 checks, failures, conversation_store_shutdown_state_name(terminal), stored);
     return failures == 0 ? 0 : 1;
 }
 
@@ -2478,6 +2707,8 @@ int main(int argc, char** argv) {
 #ifdef STRATA_STORE_TEST_HOOKS
     if (argc == 4 && std::string_view(argv[1]) == "--writer-phase-diagnostic")
         return writer_phase_diagnostic(argv[2], argv[3]);
+    if (argc == 4 && std::string_view(argv[1]) == "--retained-topology-diagnostic")
+        return retained_topology_diagnostic(argv[2], argv[3]);
     if (argc == 2 && std::string_view(argv[1]) == "--shutdown-backlog") {
         check_facade_shutdown_backlog_deadline();
         std::fprintf(stderr, "conversation_publication_test: shutdown backlog %d checks, %d failures\n", checks, failures);
