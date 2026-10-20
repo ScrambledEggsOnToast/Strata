@@ -608,6 +608,7 @@ void check_draft_reader_floor_failures();
 void check_profile_recovery();
 void check_full_catalog_profile_restart();
 void check_per_domain_head_limit();
+void check_protected_cap_per_domain();
 void check_retirement_receipts();
 void check_bounded_candidate_rejections();
 void check_split_pinned_restart();
@@ -718,6 +719,7 @@ int main() {
     }
     if (::getenv("STRATA_STORE_RETENTION_ONLY")) {
         check_per_domain_head_limit();
+        check_protected_cap_per_domain();
         check_retirement_receipts();
         check_bounded_candidate_rejections();
         check_quota_credit();
@@ -793,6 +795,7 @@ int main() {
     check_profile_recovery();
     check_full_catalog_profile_restart();
     check_per_domain_head_limit();
+    check_protected_cap_per_domain();
     check_retirement_receipts();
     check_bounded_candidate_rejections();
     check_split_pinned_restart();
@@ -8394,8 +8397,9 @@ void check_object_data_batch() {
 // #243: the retained-head ceiling belongs to one execution domain, never to the shared catalog.  A pair profile and a
 // triple profile publish into the same root in both directions.  The pair's heads are older than every triple head, so
 // a global ceiling would retire them first; the per-domain ceiling must keep each profile's completed head while each
-// still retires its own oldest history at its own allowance.  Startup trims by the same rule, and the byte quota,
-// filesystem floor and metadata ceiling stay global.
+// still retires its own oldest history at its own allowance.  A queued selected lease keeps its own head through a
+// publication, both directions restore their retained head byte-identically, and startup trims by the same rule.  The
+// byte quota, filesystem floor and metadata ceiling stay global.
 void check_per_domain_head_limit() {
     const auto history = [](uint64_t seed, bool pinned) {
         auto image = fixture(seed, 128);
@@ -8410,6 +8414,7 @@ void check_per_domain_head_limit() {
     auto triple_options = pair_options;
     triple_options.domain = bytes_from("domain:triple");
     const auto fallback = history(901, true), latest = history(903, false);
+    const auto one = history(911, false), two = history(913, false), three = history(915, false);
     check(!latest.pinned(), "the latest pair history is an ordinary unpinned branch");
     ConversationStorePublishResult pair_fallback, pair_latest, triple_one, triple_two, triple_three, pair_fresh;
     uint64_t pair_epoch = 0;
@@ -8431,21 +8436,34 @@ void check_per_domain_head_limit() {
         check(triple.enabled(), "the triple profile opens the same root as its own execution domain");
         check(triple.retains_head(pair_fallback.head_id) && triple.retains_head(pair_latest.head_id),
               "a clean profile switch retains both completed pair heads");
-        check(publish_and_wait(triple, history(911, false), 11, 1, triple_one) &&
+        check(publish_and_wait(triple, one, 11, 1, triple_one) &&
                   triple_one.status == ConversationStorePublishStatus::stored &&
-                  publish_and_wait(triple, history(913, false), 12, 2, triple_two) &&
+                  publish_and_wait(triple, two, 12, 2, triple_two) &&
                   triple_two.status == ConversationStorePublishStatus::stored,
               "the triple profile fills its own allowance beside the pair's");
-        check(publish_and_wait(triple, history(915, false), 13, 3, triple_three) &&
+        const auto selected = query_of(two, 20, 2);
+        triple.suspend_read_admission();
+        check(triple.prefetch(selected, why),
+              "a returning request selects its own retained head before materialization");
+        check(publish_and_wait(triple, three, 13, 3, triple_three) &&
                   triple_three.status == ConversationStorePublishStatus::stored &&
                   triple.retains_head(pair_fallback.head_id) && triple.retains_head(pair_latest.head_id),
               "the publication past the triple allowance takes its own slot, never the older pair's");
         check(!triple.retains_head(triple_one.head_id) && triple.retains_head(triple_two.head_id),
-              "the victim is the triple domain's own oldest history");
+              "the victim is this domain's own oldest history, spared for the queued selected lease");
         check_eq(triple.counters().evictions, 1, "only the one over-allowance triple head is retired");
         check_eq(triple.counters().refused_quota, 0, "per-domain head pressure is not a byte-quota refusal");
         check_eq(triple.counters().corrupt_records, 0, "per-domain head pressure is not checkpoint corruption");
         check_eq(triple.counters().heads, 4, "the catalog holds one allowance per execution domain");
+        triple.publish_read_allowance(uint64_t(64) << 20);
+        check(await_status(triple, 20, 2, ConversationStoreReadStatus::ready), "the queued selection materializes");
+        check(triple.demand(selected, why), "the returning demand adopts its materialized prefetch");
+        ConversationStoreRead read;
+        check(triple.wait_ready(20, 2, read, 5000) && read.image && read.head_id == triple_two.head_id &&
+                  read.tokens == 128 && images_equal(*read.image, two, why),
+              "the leased triple head restores byte-identically after the publication beside it");
+        read.image.reset();
+        triple.release_read(20, 2);
         triple.close();
         const auto heads = trace.records("store_head ");
         const auto* retired = read_trace(heads, "retired", 13, "head_limit");
@@ -8459,14 +8477,14 @@ void check_per_domain_head_limit() {
     {
         ConversationStore pair(pair_options);
         check_eq(pair.epoch(), pair_epoch, "a clean domain switch preserves this domain's own epoch");
-        check(pair.demand(query_of(latest, 20, 1), why), "the retained pair head is demandable after the switch");
+        check(pair.demand(query_of(latest, 30, 1), why), "the retained pair head is demandable after the switch");
         ConversationStoreRead read;
-        check(pair.wait_ready(20, 1, read, 5000) && read.image && read.head_id == pair_latest.head_id &&
+        check(pair.wait_ready(30, 1, read, 5000) && read.image && read.head_id == pair_latest.head_id &&
                   read.tokens == 128 && images_equal(*read.image, latest, why),
               "the pair's completed head still restores after the triple profile's head pressure");
         read.image.reset();
-        pair.release_read(20, 1);
-        check(publish_and_wait(pair, history(917, false), 30, 3, pair_fresh) &&
+        pair.release_read(30, 1);
+        check(publish_and_wait(pair, history(917, false), 31, 3, pair_fresh) &&
                   pair_fresh.status == ConversationStorePublishStatus::stored,
               "the returning pair publishes past its own allowance");
         check(pair.retains_head(triple_two.head_id) && pair.retains_head(triple_three.head_id),
@@ -8476,6 +8494,17 @@ void check_per_domain_head_limit() {
         check_eq(pair.counters().evictions, 1, "one over-allowance pair publication retires one pair head");
         check_eq(pair.counters().heads, 4, "both domains keep their full allowance after the pair's pressure");
         pair.close();
+    }
+    {
+        ConversationStore triple(triple_options);
+        check(triple.demand(query_of(three, 40, 3), why), "the triple profile returns to its retained newest head");
+        ConversationStoreRead read;
+        check(triple.wait_ready(40, 3, read, 5000) && read.image && read.head_id == triple_three.head_id &&
+                  read.tokens == 128 && images_equal(*read.image, three, why),
+              "the triple's completed head still restores after the pair profile's head pressure");
+        read.image.reset();
+        triple.release_read(40, 3);
+        triple.close();
     }
     {
         auto reduced = pair_options;
@@ -8499,6 +8528,56 @@ void check_per_domain_head_limit() {
                   "each startup retirement is one domain's own over-allowance head");
         }
         check_eq(trimmed, 2, "startup reports one authoritative retirement per trimmed domain");
+    }
+}
+
+// The protected segment is three quarters of *one* domain's allowance.  A promoted head in a later domain must be
+// demoted once that domain exceeds its own share, even while an earlier domain sits exactly at its share: protection
+// enforcement cannot stop at the first domain, or a later profile's restored heads stay protected and global byte
+// pressure then evicts its newer unprotected history instead of the older restored head that should have been demoted.
+void check_protected_cap_per_domain() {
+    const auto history = [](uint64_t seed) {
+        auto image = fixture(seed, 128);
+        for (auto& checkpoint : image.checkpoints) checkpoint.pinned = false;
+        return image;
+    };
+    TempRoot root;
+    auto pair_options = options_for(root.path, uint64_t(1) << 30, 0);
+    pair_options.domain = bytes_from("domain:pair");
+    pair_options.head_limit = 2;   // one protected head per domain
+    pair_options.publication_timing = true;
+    auto triple_options = pair_options;
+    triple_options.domain = bytes_from("domain:triple");
+    ConversationStorePublishResult pair_one, pair_two, triple_one, triple_two, triple_three;
+    {
+        ConversationStore pair(pair_options);
+        check(publish_and_wait(pair, history(921), 1, 1, pair_one) &&
+                  publish_and_wait(pair, history(923), 2, 2, pair_two),
+              "the first domain stores two ordinary histories");
+        pair.confirmed_restore(pair_one.head_id);   // this domain now sits exactly at its own protected share
+        pair.close();
+    }
+    {
+        StoreReadTraceCapture trace;
+        ConversationStore triple(triple_options);
+        check(publish_and_wait(triple, history(931), 11, 1, triple_one) &&
+                  publish_and_wait(triple, history(933), 12, 2, triple_two),
+              "the second domain stores two ordinary histories");
+        triple.confirmed_restore(triple_one.head_id);
+        triple.confirmed_restore(triple_two.head_id);   // over this domain's share: its older promotion is demoted
+        check(publish_and_wait(triple, history(935), 13, 3, triple_three) &&
+                  triple_three.status == ConversationStorePublishStatus::stored,
+              "the over-allowance publication still obtains this domain's own head slot");
+        check(!triple.retains_head(triple_one.head_id) && triple.retains_head(triple_two.head_id),
+              "the demoted older promotion is the ordinary victim, so the newer promotion survives");
+        check(triple.retains_head(pair_one.head_id) && triple.retains_head(pair_two.head_id),
+              "the first domain's protected head and its sibling are untouched by the second domain's cap");
+        check_eq(triple.counters().evictions, 1, "one committed removal serves the second domain's own pressure");
+        triple.close();
+        const auto heads = trace.records("store_head ");
+        const auto* retired = read_trace(heads, "retired", 13, "head_limit");
+        check(retired && retired->number("head") == triple_one.head_id && retired->number("protected") == 0,
+              "the per-domain protected cap demoted in the later domain before the victim was chosen");
     }
 }
 

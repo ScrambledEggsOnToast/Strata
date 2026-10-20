@@ -2209,7 +2209,7 @@ void ConversationStore::Impl::cap_protected_locked(Catalog& candidate) {
                     oldest = recency;
                 }
             }
-            if (count <= limit || demote == 0) return;
+            if (count <= limit || demote == 0) break;   // this domain is within its share; the next still needs capping
             for (auto& head : candidate.heads)
                 if (head.head_id == demote) head.protected_seg = false;
         }
