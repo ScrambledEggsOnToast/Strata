@@ -1122,6 +1122,8 @@ Verifier::~Verifier() {
     if (row_trace_ && std::fclose(row_trace_) != 0) std::terminate();
     if (h_route_trace_) cudaFreeHost(h_route_trace_);
     if (causal_x_h_) cudaFreeHost(causal_x_h_);
+    for (float* host : dflash2_h_) if (host) cudaFreeHost(host);
+    if (dflash2_on_h_) cudaFreeHost(dflash2_on_h_);
     if (residency_) {
         if (residency_->host) cudaFreeHost(residency_->host);
         delete residency_;
@@ -1265,6 +1267,43 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
+bool Verifier::enable_dflash2_capture(std::string& err) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+    err = "dflash2 capture: only the CUDA target staging path is implemented";
+    return false;
+#else
+    if (g_ || max_t_ || dflash2_enabled_) {
+        err = "dflash2 capture: enable once before verifier init/graph preparation"; return false;
+    }
+    dflash2_enabled_ = true;
+    return true;
+#endif
+}
+
+bool Verifier::arm_dflash2_capture(dflash2::CaptureOwner owner, int64_t frontier, int64_t start, int count,
+                                  std::string& err) {
+    if (!dflash2_enabled_ || !dflash2_on_h_ || owner.request != request_id_ || !context_idle(err)) {
+        if (err.empty()) err = "dflash2 capture: initialized, bound serial verifier required";
+        return false;
+    }
+    return dflash2_capture_.arm(owner, frontier, start, count, err);
+}
+
+bool Verifier::dflash2_tap(dflash2::CaptureOwner owner, int tap_layer, dflash2::TapView& out,
+                          std::string& err) const {
+    if (released_.load()) { err = "dflash2 capture: verifier scratch is poisoned"; return false; }
+    for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
+        if (tap_layer == dflash2::tap_layers[i])
+            return dflash2_capture_.view(owner, int(i), dflash2_h_[i], out, err);
+    err = "dflash2 capture: unknown tap layer"; return false;
+}
+
+bool Verifier::release_dflash2_capture(dflash2::CaptureOwner owner, std::string& err) {
+    if (!dflash2_capture_.release(owner, err)) return false;
+    *dflash2_on_h_ = 0;
+    return true;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
@@ -1329,6 +1368,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         (le_ < g.n_layers && hand_out_ == nullptr)) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
+    }
+    if (dflash2_enabled_) {
+        if (!dflash2_capture_.configure(dflash2::CapturePhase::verify, dflash2::block_size, lb_, le_,
+                                        g.n_embd, g.hc, g.n_layers, err)) return false;
+        for (int64_t layer = 0; layer < g.n_layers; ++layer)
+            if (strata::kernels::cvec().covers(layer)) {
+                err = "dflash2 capture: control-vector steering is unsupported"; return false;
+            }
+        if (!mapped(sizeof(uint32_t), (void**) &dflash2_on_h_, (void**) &dflash2_on_m_)) {
+            err = "dflash2 capture: mapped replay flag allocation failed"; return false;
+        }
+        *dflash2_on_h_ = 0;
+        for (size_t i = 0; i < dflash2_h_.size(); ++i)
+            if (dflash2_capture_.owns_tap(int(i)) &&
+                !mapped(dflash2::block_size * dflash2::residual_row_bytes,
+                        (void**) &dflash2_h_[i], (void**) &dflash2_m_[i])) {
+                err = "dflash2 capture: mapped verifier tap allocation failed"; return false;
+            }
     }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
@@ -2023,6 +2080,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+#if !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
+        // This first read has JUST folded layer l-1's deferred FFN write into R.
+        // Publish unmixed FP32 R, before this layer's attention can write it.
+        if (dflash2_enabled_ && !batch_rec_ && T <= dflash2::block_size)
+            for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
+                if (l == dflash2::tap_layers[i] + 1 && dflash2_m_[i])
+                    tap_publish(Rt(tb), dflash2_m_[i] + size_t(tb) * HC * N,
+                                int64_t(n) * HC * N, dflash2_on_m_, cs);
+#endif
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -3467,6 +3533,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
 
 Verifier::ScratchGuard::~ScratchGuard() {
     if (keep) return;
+    v.dflash2_capture_.poison();
     if (launched) {
         v.release_gpu_waits(5000); // partial state is never reusable, even if draining succeeds
     } else {
@@ -3489,6 +3556,9 @@ bool Verifier::context_idle(std::string& err) {
     if (!wait_commit(err)) return false;
     if (released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle) {
         err = "verify: request context requires idle, unpoisoned operation scratch"; return false;
+    }
+    if (!dflash2_capture_.idle()) {
+        err = "dflash2 capture: release the owned capture before request rebind"; return false;
     }
     return true;
 }
@@ -3681,6 +3751,7 @@ bool Verifier::chain_overlap() const {
 
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    if (dflash2_enabled_) { err = "dflash2 capture: prelaunched windows are unsupported"; return false; }
     prelaunched_ = 0;
     if (T < 1 || T > max_t_) { err = "verify: prelaunch window size out of range"; return false; }
     cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
@@ -3735,6 +3806,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (pos0 < 0 || pos0 > ss.qsa_states[ss.qsa_primary()].max_cells - T) {
         err = "verify: the window runs past the context"; return false;
     }
+    if (dflash2_enabled_ && (T > dflash2::block_size || chain_overlap() || ext_stream_)) {
+        err = "dflash2 capture: serial windows of at most four rows without overlapped stage launches required";
+        return false;
+    }
+    if (dflash2_enabled_)
+        for (int64_t layer = 0; layer < g.n_layers; ++layer)
+            if (cvec().covers(layer)) { err = "dflash2 capture: control-vector steering is unsupported"; return false; }
     const bool pre = prelaunched_ == T;
     prelaunched_ = 0;
     if (observe_next) {
@@ -3767,6 +3845,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     if (!causal_begin(T, err)) return false;
     CausalScope causal_scope(causal_ && causal_->selected && !causal_->written ? this : nullptr);
+    if (dflash2_enabled_) {
+        if (!dflash2_capture_.begin_run(request_id_, pos0, T, err)) return false;
+        *dflash2_on_h_ = dflash2_capture_.copying() ? 1u : 0u;
+    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     const int64_t stage_start = causal_now();
@@ -4102,6 +4184,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
         if (!causal_write_window(err)) return false;
+        if (!dflash2_capture_.finish_run(err)) return false;
         guard.keep = true;
         return true;
     }
@@ -4168,6 +4251,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_beat();
     if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
     if (!causal_write_window(err)) return false;
+    if (!dflash2_capture_.finish_run(err)) return false;
     guard.keep = true;
     return true;
 }
@@ -4405,6 +4489,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     ms_commit += ms_since(t0);
     if (next_ && !next_->commit(n_keep, err)) return false;
     if (!commit_pending_ && !scratch_.finish()) { err = "verify: commit ownership was poisoned"; return false; }
+    if (!dflash2_capture_.committed(n_keep, err)) return false;
     guard.keep = true;
     return true;
 }
@@ -4435,6 +4520,7 @@ bool Verifier::wait_commit(std::string& err) {
         commit_pending_ = false;
     }
     if (next_ && !next_->wait_commit(err)) return fail_operation(err);
+    if (!dflash2_capture_.waited(err)) return false;
     return true;
 }
 
@@ -4443,6 +4529,7 @@ bool Verifier::wait_commit(std::string& err) {
 
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     const OnDevice on_device(device_);
+    if (dflash2_enabled_) { err = "dflash2 capture: batch/resident verifier rows are unsupported"; return false; }
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (!context_idle(err)) return false;
     if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: release batch resources before rebinding slots"; return false; }
@@ -5462,6 +5549,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    if (dflash2_enabled_) { err = "dflash2 capture: pipelined windows are unsupported"; return false; }
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }

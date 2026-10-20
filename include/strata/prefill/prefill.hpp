@@ -10,6 +10,7 @@
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
 
+#include "strata/core/dflash2_capture.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -148,6 +149,17 @@ public:
     /// Resolved allocation ownership, not permission to borrow. False before successful init.
     bool owns_work_buffers() const;
     bool bind_request(uint64_t request, std::string& err);
+    /// Capture-only, enabled before init. Arm EVERY split stage with the same
+    /// owner and whole run interval. Retains the final <=2047 absolute rows across
+    /// chunks in owned mapped staging; no mixed/normed activations are exposed.
+    /// Views are host-complete after successful run + chain drain, and borrowed
+    /// until release/reset/destruction. No proposal or CaptureStore publication.
+    bool enable_dflash2_capture(std::string& err);
+    bool arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t frontier, int64_t start, int64_t count,
+                            std::string& err);
+    bool dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core::dflash2::TapView& out,
+                     std::string& err) const;
+    bool release_dflash2_capture(core::dflash2::CaptureOwner owner, std::string& err);
     bool context_idle(std::string& err) const;
 
     /// Serial, allocation-free session lease. The caller stops all generation submitters first.
@@ -447,6 +459,7 @@ private:
     friend struct PrefillDrainFixture;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
+    bool dflash2_enabled_ = false;
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.

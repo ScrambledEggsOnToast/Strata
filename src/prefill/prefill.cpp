@@ -18,6 +18,7 @@
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -930,6 +931,10 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false, initialized = false, borrow_spill = false;
+    core::dflash2::TapCaptureState dflash2_capture;
+    std::array<float*, core::dflash2::tap_layers.size()> dflash2_host{}, dflash2_mapped{};
+    uint32_t* dflash2_on_host = nullptr;
+    uint32_t* dflash2_on_mapped = nullptr;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     core::OperationCanary canary;
@@ -1267,6 +1272,48 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 
+bool Prefill::enable_dflash2_capture(std::string& err) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+    err = "dflash2 capture: only the CUDA target staging path is implemented"; return false;
+#else
+    if (impl_->g || dflash2_enabled_) {
+        err = "dflash2 capture: enable once before prefill init"; return false;
+    }
+    dflash2_enabled_ = true;
+    return true;
+#endif
+}
+
+bool Prefill::arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t frontier, int64_t start,
+                                 int64_t count, std::string& err) {
+    Impl& m = *impl_;
+    if (!dflash2_enabled_ || !m.initialized || owner.request != m.bound_request || public_running_.load() ||
+        next_packet_ || !local_idle(err)) {
+        if (err.empty()) err = "dflash2 capture: initialized, bound serial prefill required";
+        return false;
+    }
+    return m.dflash2_capture.arm(owner, frontier, start, count, err);
+}
+
+bool Prefill::dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core::dflash2::TapView& out,
+                         std::string& err) const {
+    const Impl& m = *impl_;
+    if (public_running_.load() || m.running.load() || m.poisoned || next_packet_) {
+        err = "dflash2 capture: prefill has not drained successfully"; return false;
+    }
+    for (size_t i = 0; i < core::dflash2::tap_layers.size(); ++i)
+        if (tap_layer == core::dflash2::tap_layers[i])
+            return m.dflash2_capture.view(owner, int(i), m.dflash2_host[i], out, err);
+    err = "dflash2 capture: unknown tap layer"; return false;
+}
+
+bool Prefill::release_dflash2_capture(core::dflash2::CaptureOwner owner, std::string& err) {
+    if (public_running_.load() || impl_->running.load() || next_packet_) {
+        err = "dflash2 capture: prefill still in flight"; return false;
+    }
+    return impl_->dflash2_capture.release(owner, err);
+}
+
 int Prefill::device() const { return impl_ != nullptr ? impl_->device : -1; }
 
 void Prefill::reset() {
@@ -1287,6 +1334,8 @@ void Prefill::release() {
     if (impl_->cs && cudaStreamSynchronize(impl_->cs) != cudaSuccess) std::terminate();
     if (impl_->copy && cudaStreamSynchronize(impl_->copy) != cudaSuccess) std::terminate();
     if (impl_->kv_copy && cudaStreamSynchronize(impl_->kv_copy) != cudaSuccess) std::terminate();
+    for (float* host : impl_->dflash2_host) if (host) cudaFreeHost(host);
+    if (impl_->dflash2_on_host) cudaFreeHost(impl_->dflash2_on_host);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1514,6 +1563,24 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
+    }
+    if (dflash2_enabled_) {
+        if (!m.dflash2_capture.configure(core::dflash2::CapturePhase::prefill, core::dflash2::context_rows,
+                stage_lb_, stage_le_, g.n_embd, g.hc, g.n_layers, err)) return false;
+        auto mapped_tap = [&](size_t bytes, void** host, void** device) {
+            return cudaHostAlloc(host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                   cudaHostGetDevicePointer(device, *host, 0) == cudaSuccess;
+        };
+        if (!mapped_tap(sizeof(uint32_t), (void**) &m.dflash2_on_host, (void**) &m.dflash2_on_mapped)) {
+            err = "dflash2 capture: mapped prefill replay flag allocation failed"; return false;
+        }
+        *m.dflash2_on_host = 1;
+        for (size_t i = 0; i < m.dflash2_host.size(); ++i)
+            if (m.dflash2_capture.owns_tap(int(i)) &&
+                !mapped_tap(core::dflash2::context_rows * core::dflash2::residual_row_bytes,
+                            (void**) &m.dflash2_host[i], (void**) &m.dflash2_mapped[i])) {
+                err = "dflash2 capture: mapped prefill tap allocation failed"; return false;
+            }
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
@@ -1855,6 +1922,9 @@ bool Prefill::local_idle(std::string& err) const {
     const Impl& m = *impl_;
     if (m.running.load() || m.poisoned) {
         err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
+    }
+    if (!m.dflash2_capture.idle()) {
+        err = "dflash2 capture: release the owned capture before request rebind"; return false;
     }
     if (m.device >= 0) {
         const core::OnDevice on(m.device);
@@ -3348,6 +3418,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool complete = false;
         bool canary_started = false, groups_started = false;
         ~RunLease() {
+            if (!complete || m.dflash2_capture.running()) m.dflash2_capture.poison();
             if (!complete) {
                 const core::OnDevice owner(m.device);
                 auto drain_helper = [&](PeerPrefill& helper) {
@@ -3390,6 +3461,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     } lease{m, err};
     if (m.poisoned) { err = "prefill: scratch poisoned by failed work"; return false; }
+    if (dflash2_enabled_) {
+        if (segmented || retained_step_ || stop_at_chunk) {
+            err = "dflash2 capture: packed, retained or yieldable prefill is unsupported"; return false;
+        }
+        for (int64_t layer = 0; layer < m.g->n_layers; ++layer)
+            if (strata::kernels::cvec().covers(layer)) {
+                err = "dflash2 capture: control-vector steering is unsupported"; return false;
+            }
+        if (!m.dflash2_capture.begin_run(m.bound_request, pos0, n, err)) return false;
+    }
     m.pe_last = nullptr;
     for (auto& helper : m.pps) {
         helper->layers = helper->experts = helper->rows = helper->over_cap = helper->ps_experts = helper->engaged = 0;
@@ -6011,6 +6092,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs,
                                                 segmented ? m.src_dev : nullptr);
                 }
+#if !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
+                // Half 1's completed residual write, not the fused next norm's
+                // image. Copy only this chunk's intersection with the retained
+                // absolute tail, keeping every stage/chunk in position order.
+                if (dflash2_enabled_ && half == 1 && m.dflash2_capture.copying()) {
+                    const auto part = m.dflash2_capture.slice(p0, T);
+                    if (part.count)
+                        for (size_t tap = 0; tap < core::dflash2::tap_layers.size(); ++tap)
+                            if (l == core::dflash2::tap_layers[tap] && m.dflash2_mapped[tap]) {
+                                strata::kernels::tap_publish(m.R + size_t(part.source_row) * D,
+                                    m.dflash2_mapped[tap] + size_t(part.staging_row) * D,
+                                    int64_t(part.count) * D, m.dflash2_on_mapped, m.cs);
+                                if (!m.dflash2_capture.record(int(tap), part, err)) return false;
+                            }
+                }
+#endif
             }
             // Do not manufacture a shorter layer range: normed, grs, xn16 and
             // xn16_lo are the fused NEXT layer's inputs and remain in this arena.
@@ -6322,6 +6419,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
+    if (!m.dflash2_capture.finish_run(err)) return false;
     return true;
 }
 
@@ -6603,6 +6701,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const bool drain_ok = drain_pipeline(drain_err) == StagePacket::Outcome::complete;
     for (Prefill* owner = this; owner; owner = owner->next_)
         owner->impl_->gemm.flush_native_profile(body_ok && drain_ok);
+    if (!body_ok || !drain_ok)
+        for (Prefill* owner = this; owner; owner = owner->next_)
+            owner->impl_->dflash2_capture.poison();
     if (prefill_attribution_requested())
         std::fprintf(stderr, "strata prefill attribution: {\"kind\":\"run\",\"pos\":%lld,\"tokens\":%lld,"
                      "\"begin_ns\":%lld,\"end_ns\":%lld,\"complete\":%s}\n",

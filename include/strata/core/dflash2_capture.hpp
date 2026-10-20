@@ -1,0 +1,166 @@
+// DFlash2 target tap staging contract; no proposal or CaptureStore publication.
+#pragma once
+
+#include "strata/core/dflash2_bridge.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <span>
+#include <string>
+
+namespace strata::core::dflash2 {
+inline constexpr int residual_width = 4 * hidden_size;
+inline constexpr size_t residual_row_bytes = residual_width * sizeof(float);
+
+// Numeric engine identity, translated to Operation by the eventual host sequencer.
+struct CaptureOwner {
+    uint64_t request = 0, incarnation = 0, generation = 0;
+    bool operator==(const CaptureOwner&) const = default;
+};
+struct TapView {
+    int start = 0, count = 0, keep = 0, tap_layer = 0, materialized_layer = 0;
+    CapturePhase phase = CapturePhase::prefill;
+    CapturePoint point = CapturePoint::completed_second_residual_write;
+    std::span<const float> residuals; // immutable [row, four streams, 2560]
+};
+struct CaptureSlice {
+    int source_row = 0, staging_row = 0, count = 0;
+};
+
+// One host submitter, one fixed stage, no allocation. The device-owning verifier /
+// prefill owns the mapped payload; this state fences its reuse and host exposure.
+// Views remain borrowed until release(owner), reset or destruction. All stages of
+// a split must be armed separately with the SAME owner and absolute run interval.
+class TapCaptureState {
+public:
+    bool configure(CapturePhase phase, int capacity, int64_t lb, int64_t le,
+                   int64_t hidden, int64_t streams, int64_t layers, std::string& err) {
+        if (configured_ || hidden != hidden_size || streams != 4 || layers != 48 ||
+            lb < 0 || lb >= le || le > layers || capacity < 1 ||
+            capacity > (phase == CapturePhase::verify ? block_size : context_rows))
+            return refuse(err, "invalid or already configured capture geometry");
+        unsigned mask = 0;
+        for (size_t i = 0; i < tap_layers.size(); ++i) {
+            const int tap = tap_layers[i];
+            if (tap < lb || tap >= le) continue;
+            if (phase == CapturePhase::verify && tap + 1 >= le)
+                return refuse(err, "a verifier tap crosses a stage hand-off");
+            mask |= 1u << i;
+        }
+        phase_ = phase; capacity_ = capacity; mask_ = mask; configured_ = true;
+        return true;
+    }
+
+    // Prefill retains the final <=2047 rows of this exact run, even across chunks.
+    // Verification starts at frontier. The bootstrap p=frontier-1,T=1 is allowed
+    // but deliberately has NO taps: prompt capture already owns that position.
+    bool arm(CaptureOwner owner, int64_t frontier, int64_t start, int64_t count, std::string& err) {
+        if (!configured_ || status_ != Status::idle || !owner.request || !owner.generation ||
+            (owner.request == owner_.request && owner.incarnation == owner_.incarnation &&
+             owner.generation <= owner_.generation) || start < 0 || count < 1 ||
+            start > max_position - count || frontier < 0 || frontier > max_position)
+            return refuse(err, "invalid, stale or overlapping capture owner/range");
+        const bool bootstrap = phase_ == CapturePhase::verify && start == frontier - 1 && count == 1;
+        if (phase_ == CapturePhase::verify ?
+                (count > capacity_ || (start != frontier && !bootstrap)) : start + count != frontier)
+            return refuse(err, "capture does not match the committed frontier");
+        owner_ = owner; run_start_ = int(start); run_end_ = int(start + count); next_run_ = run_start_;
+        count_ = bootstrap ? 0 : int(std::min<int64_t>(count, capacity_));
+        start_ = phase_ == CapturePhase::prefill ? run_end_ - count_ : run_start_;
+        written_.fill(0); keep_ = 0; status_ = Status::armed;
+        return true;
+    }
+
+    // A split prefill successor sees successive sub-runs, not the whole prompt.
+    bool begin_run(uint64_t request, int64_t start, int64_t count, std::string& err) {
+        if (status_ == Status::idle) return true; // enabled, but not armed: observer off
+        if (status_ != Status::armed || request != owner_.request || start != next_run_ ||
+            count < 1 || count > run_end_ - start ||
+            (phase_ == CapturePhase::verify && start + count != run_end_))
+            return refuse(err, "run does not own the armed capture interval");
+        active_end_ = int(start + count); status_ = Status::running;
+        return true;
+    }
+    CaptureSlice slice(int64_t start, int64_t count) const {
+        if (!running() || count_ == 0) return {};
+        const int64_t first = std::max<int64_t>(start, start_);
+        const int64_t end = std::min<int64_t>(start + count, start_ + count_);
+        if (end <= first) return {};
+        return {int(first - start), int(first - start_), int(end - first)};
+    }
+    // Prefill's actual, ordered copy submissions, recorded after each tap write.
+    bool record(int tap, CaptureSlice part, std::string& err) {
+        if (!running() || !owns_tap(tap) || part.count < 1 || part.staging_row != written_[size_t(tap)] ||
+            part.count > count_ - part.staging_row)
+            return refuse(err, "duplicate, missing or unordered prefill tap rows");
+        written_[size_t(tap)] += part.count;
+        return true;
+    }
+    bool finish_run(std::string& err) {
+        if (status_ == Status::idle) return true;
+        if (!running()) return refuse(err, "capture run is not in flight");
+        next_run_ = active_end_;
+        // Verifier taps are fixed graph nodes for every owned tap/group. They are
+        // not published here: target commit + wait_commit must succeed first.
+        if (phase_ == CapturePhase::verify) { status_ = Status::verified; return true; }
+        if (next_run_ < run_end_) { status_ = Status::armed; return true; }
+        for (size_t i = 0; i < written_.size(); ++i)
+            if (owns_tap(int(i)) && written_[i] != count_)
+                return refuse(err, "prefill finished without every retained tap row");
+        keep_ = count_; status_ = Status::ready;
+        return true;
+    }
+    bool committed(int keep, std::string& err) {
+        if (status_ == Status::idle) return true;
+        if (phase_ != CapturePhase::verify || status_ != Status::verified || keep < 1 ||
+            keep > run_end_ - run_start_)
+            return refuse(err, "capture commit does not own a verified prefix");
+        keep_ = count_ ? keep : 0; status_ = Status::committing;
+        return true;
+    }
+    bool waited(std::string& err) {
+        if (status_ == Status::committing) status_ = Status::ready;
+        else if (status_ != Status::idle && status_ != Status::armed && status_ != Status::ready)
+            return refuse(err, "capture requires a successful target commit before publication");
+        return true;
+    }
+    bool view(CaptureOwner owner, int tap, const float* host, TapView& out, std::string& err) const {
+        if (status_ != Status::ready || owner != owner_ || !owns_tap(tap) || count_ == 0 || !host)
+            return refuse(err, "tap is absent, stale or not host-complete");
+        const int layer = tap_layers[size_t(tap)];
+        out = {start_, count_, keep_, layer, layer + (phase_ == CapturePhase::verify ? 1 : 0), phase_,
+               phase_ == CapturePhase::verify ? CapturePoint::next_layer_first_gr_read_group :
+                                               CapturePoint::completed_second_residual_write,
+               {host, size_t(count_) * residual_width}};
+        return true;
+    }
+    bool release(CaptureOwner owner, std::string& err) {
+        if (status_ != Status::ready || owner != owner_)
+            return refuse(err, "capture release requires its completed owner");
+        status_ = Status::idle;
+        return true;
+    }
+    void poison() { if (status_ != Status::idle) status_ = Status::poisoned; }
+    bool idle() const { return status_ == Status::idle; }
+    bool running() const { return status_ == Status::running; }
+    bool copying() const { return running() && count_ != 0; }
+    bool owns_tap(int tap) const { return tap >= 0 && tap < int(tap_layers.size()) && (mask_ & (1u << tap)); }
+    size_t staging_bytes() const {
+        size_t taps = 0;
+        for (size_t i = 0; i < tap_layers.size(); ++i) taps += owns_tap(int(i));
+        return taps * size_t(capacity_) * residual_row_bytes;
+    }
+private:
+    static bool refuse(std::string& err, const char* why) { err = std::string("dflash2 capture: ") + why; return false; }
+    enum class Status { idle, armed, running, verified, committing, ready, poisoned };
+    Status status_ = Status::idle;
+    bool configured_ = false;
+    CapturePhase phase_ = CapturePhase::prefill;
+    int capacity_ = 0, start_ = 0, count_ = 0, keep_ = 0;
+    int run_start_ = 0, run_end_ = 0, next_run_ = 0, active_end_ = 0;
+    unsigned mask_ = 0;
+    CaptureOwner owner_;
+    std::array<int, tap_layers.size()> written_{};
+};
+} // namespace strata::core::dflash2

@@ -308,6 +308,29 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+__global__ void tap_publish_kernel(const float4* __restrict__ src, float4* __restrict__ dst,
+                                   int64_t n4, const volatile uint32_t* enabled) {
+    if (*enabled == 0) return;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+    // Publication is certified by the caller's completed stream/event, not by
+    // another mapped flag. Every block flushes its host stores before completion.
+    __threadfence_system();
+}
+void tap_publish(const float* src, float* dst, int64_t n, const uint32_t* enabled, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0 || !enabled) {
+        std::fprintf(stderr, "tap_publish: aligned payload and replay enable word required\n");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    tap_publish_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+        (const float4*) src, (float4*) dst, n4, enabled);
+    check_launch("tap_publish");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

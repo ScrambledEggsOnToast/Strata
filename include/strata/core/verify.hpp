@@ -25,6 +25,7 @@
 #include <array>
 
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/dflash2_capture.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -163,6 +164,17 @@ public:
     /// Legacy non-serving callers may leave it zero: staging is still checked,
     /// but diagnostics label that identity unbound, never a request-ID proof.
     bool set_request_id(uint64_t request_id, std::string& err);
+
+    /// Capture-only opt-in BEFORE init/prepare_graphs. No proposer or store publication.
+    /// Arm each split stage separately; taps crossing a stage hand-off are refused.
+    /// The first p=frontier-1,T=1 bootstrap window deliberately captures nothing.
+    /// Views require commit + wait_commit and remain borrowed until release; a
+    /// completed capture blocks scratch reuse/request rebinding until released.
+    bool enable_dflash2_capture(std::string& err);
+    bool arm_dflash2_capture(dflash2::CaptureOwner owner, int64_t frontier, int64_t start, int count,
+                            std::string& err);
+    bool dflash2_tap(dflash2::CaptureOwner owner, int tap_layer, dflash2::TapView& out, std::string& err) const;
+    bool release_dflash2_capture(dflash2::CaptureOwner owner, std::string& err);
     /// One window: tokens[0..T) at consecutive positions, out[t] = head pick.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
@@ -692,6 +704,11 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     cudaGraphExec_t commit_exec_ = nullptr;
 
+    bool dflash2_enabled_ = false;
+    dflash2::TapCaptureState dflash2_capture_;
+    std::array<float*, dflash2::tap_layers.size()> dflash2_h_{}, dflash2_m_{};
+    uint32_t* dflash2_on_h_ = nullptr;
+    uint32_t* dflash2_on_m_ = nullptr;
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
