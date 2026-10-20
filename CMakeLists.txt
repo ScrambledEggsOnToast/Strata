@@ -110,6 +110,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
+option(STRATA_BUILD_DFLASH2_BRIDGE "Build the Linux host-only DFlash2 capture/reference bridge and CPU tests" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
@@ -287,6 +288,56 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 add_library(strata_streaming STATIC src/program/streaming_executor.cpp)
 target_include_directories(strata_streaming PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_streaming PRIVATE strata_warnings)
+
+# Native verified loads and the host-only DFlash2 contract share the existing
+# vetted content-address primitive, without duplicate definitions in archives.
+if(STRATA_BUILD_DFLASH2_BRIDGE OR STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  add_library(strata_native_identity STATIC src/core/native_weight_identity.cpp src/core/conversation_store_sha256.cpp)
+  target_include_directories(strata_native_identity PUBLIC include)
+  target_link_libraries(strata_native_identity PRIVATE strata_warnings OpenSSL::Crypto)
+endif()
+
+# Opt-in CPU enabler only: no device runtime, serving flags or target kernels.
+# Reuse the vendored JSON parser; the bridge refuses duplicate keys itself.
+if(STRATA_BUILD_DFLASH2_BRIDGE)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "STRATA_BUILD_DFLASH2_BRIDGE requires Linux anonymous AF_UNIX socketpairs")
+  endif()
+  find_package(Threads REQUIRED)
+  add_library(strata_dflash2_bridge STATIC src/core/dflash2_bridge.cpp src/core/dflash2_target.cpp)
+  target_include_directories(strata_dflash2_bridge PUBLIC include PRIVATE third_party/llama.cpp/vendor)
+  target_link_libraries(strata_dflash2_bridge PRIVATE strata_warnings Threads::Threads strata_native_identity)
+  target_compile_options(strata_dflash2_bridge PRIVATE
+    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math;-ffp-contract=off>")
+  add_executable(dflash2_bridge_test tests/core/dflash2_bridge_test.cpp)
+  target_link_libraries(dflash2_bridge_test PRIVATE strata_dflash2_bridge strata_warnings Threads::Threads)
+  target_compile_options(dflash2_bridge_test PRIVATE
+    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math;-ffp-contract=off>")
+  enable_testing()
+  add_test(NAME dflash2_bridge_test COMMAND dflash2_bridge_test)
+  set_tests_properties(dflash2_bridge_test PROPERTIES TIMEOUT 30)
+  add_executable(dflash2_target_test tests/core/dflash2_target_test.cpp)
+  target_include_directories(dflash2_target_test PRIVATE src/core)
+  target_link_libraries(dflash2_target_test PRIVATE strata_dflash2_bridge strata_native_identity strata_warnings)
+  target_compile_options(dflash2_target_test PRIVATE
+    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math;-ffp-contract=off>")
+  add_test(NAME dflash2_target_test COMMAND dflash2_target_test)
+  set_tests_properties(dflash2_target_test PROPERTIES TIMEOUT 30)
+  set(STRATA_DFLASH2_TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH
+      "Project root containing the DFlash2 Python reference and bridge interoperability tests")
+  if(NOT EXISTS "${STRATA_DFLASH2_TEST_ROOT}/tests/test_dflash2_strata_bridge.py")
+    message(FATAL_ERROR "STRATA_BUILD_DFLASH2_BRIDGE requires STRATA_DFLASH2_TEST_ROOT with Python interoperability tests")
+  endif()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME dflash2_bridge_interop_test
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DFLASH2_STRATA_BRIDGE_TEST_BINARY=$<TARGET_FILE:dflash2_bridge_test>"
+      "CUDA_VISIBLE_DEVICES="
+      ${Python3_EXECUTABLE} -m unittest discover -s tests -p test_dflash2_strata_bridge.py -v)
+  set_tests_properties(dflash2_bridge_interop_test PROPERTIES
+    WORKING_DIRECTORY "${STRATA_DFLASH2_TEST_ROOT}" TIMEOUT 60 RUN_SERIAL TRUE)
+endif()
 
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
@@ -714,6 +765,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # dependency reaches consumers only as a link-only requirement of this static library.
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
   target_link_libraries(strata_engine PRIVATE OpenSSL::Crypto)
+  if(STRATA_BUILD_DFLASH2_BRIDGE)
+    target_sources(strata_engine PRIVATE src/core/dflash2_native_target.cpp)
+    target_include_directories(strata_engine PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(strata_engine PRIVATE strata_dflash2_bridge)
+  endif()
   if(STRATA_BUILD_TESTS)
     add_executable(session_owner_test tests/core/session_owner_test.cpp)
     target_link_libraries(session_owner_test PRIVATE strata_engine)

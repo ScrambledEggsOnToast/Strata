@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strata/core/native_weight_identity.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -19,9 +21,17 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    // Verification is opt-in; ordinary target loads retain their existing I/O.
+    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
+              bool verify_identity = false);
     void unload();
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+    // Same unchanged projection, but with genuinely caller-owned activation
+    // scratch. No target mixer/final norm, allocation or synchronization.
+    bool run_with_scratch(const float* hidden, float* logits, void* scratch, size_t scratch_bytes,
+                          void* stream, std::string& err) const;
+    size_t projection_scratch_bytes() const;
+    const NativeTensorIdentity& identity() const { return identity_; }
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
@@ -39,6 +49,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    NativeTensorIdentity identity_;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
@@ -50,7 +61,11 @@ public:
     ~NativeEmbed();
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
-    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err);
+    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err,
+              bool verify_identity = false);
+    bool loaded() const { return dev_ != nullptr; }
+    int device() const { return identity_.device; }
+    const NativeTensorIdentity& identity() const { return identity_; }
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.
@@ -65,6 +80,7 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    NativeTensorIdentity identity_;
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();
