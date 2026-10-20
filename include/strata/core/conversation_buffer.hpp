@@ -187,6 +187,12 @@ public:
         for (const auto& segment : segments_) if (!segment.frozen()) return false;
         return true;
     }
+    size_t freeze_growth_bytes() const {
+        size_t bytes = 0;
+        for (const auto& segment : segments_)
+            if (!segment.frozen()) bytes += Segment::owner_bytes;
+        return bytes;
+    }
     // A cheap alias: every payload is shared with `source`, which must be frozen
     // (a segment that is not frozen yet is copied - still correct, just not free).
     // Neither side may be mutated without the detach that mutation performs.

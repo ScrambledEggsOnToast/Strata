@@ -10,9 +10,33 @@
 #include <limits>
 #include <string>
 #include <cstring>
+#include <new>
+#include <atomic>
 #if defined(__linux__)
 #include <unistd.h>
 #endif
+
+namespace test_allocation_failure {
+thread_local long after = -1;
+std::atomic<long> live{0};
+}
+void* operator new(std::size_t bytes) {
+    if (test_allocation_failure::after == 0) {
+        test_allocation_failure::after = -1;
+        throw std::bad_alloc();
+    }
+    if (test_allocation_failure::after > 0) --test_allocation_failure::after;
+    if (void* memory = std::malloc(bytes ? bytes : 1)) {
+        test_allocation_failure::live.fetch_add(1, std::memory_order_relaxed);
+        return memory;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void* memory) noexcept {
+    if (memory) test_allocation_failure::live.fetch_sub(1, std::memory_order_relaxed);
+    std::free(memory);
+}
+void operator delete(void* memory, std::size_t) noexcept { ::operator delete(memory); }
 
 using namespace strata::core;
 
@@ -491,9 +515,84 @@ void check_mutation_trace() {
     }
     std::fclose(file);
 }
+void check_restore_charge_traces(const char* prefix) {
+    // Two actual allocation failures: after one owner seals, and after all
+    // owners seal and the first alias metadata allocation succeeds.
+    for (int failure : {-1, 1, 5}) {
+        const char* label = failure < 0 ? "success" : failure == 1 ? "partial" : "alias";
+        const std::string path = prefix ? std::string(prefix) + "-" + label + ".jsonl" : "";
+        FILE* file = prefix ? std::fopen(path.c_str(), "w+x") : std::tmpfile();
+        check(file != nullptr, "open bounded restore charge trace");
+        {
+            ConversationCacheTrace trace(file);
+            trace.set_sample(nullptr, +[](void*, ConversationCacheTrace::External& external) {
+                external.checkpoint_lease = 128;
+            });
+            ConversationCache cache(1 << 20, 2, 0, nullptr);
+            cache.set_mutation_trace(&trace);
+            check(cache.try_reserve_lease(128), "trace fixture owns its fixed checkpoint lease");
+            auto donor = image({1, 2, 3, 4, 5, 6});
+            donor.live.ple.assign(32, 11);
+            for (const auto& ids : {std::vector<int32_t>{1, 2}, std::vector<int32_t>{1, 2, 3, 4}}) {
+                ConversationCheckpoint cut;
+                cut.ids = ids;
+                cut.gdn.assign(32, 12);
+                donor.checkpoints.push_back(std::move(cut));
+            }
+            const size_t before = donor.bytes(), growth = donor.freeze_growth_bytes();
+            check(growth == 4 * CheckpointBytes::owner_bytes, "fixture has exactly four unsealed payload owners");
+            check(cache.put(std::move(donor)), "park traced shallow-restore donor");
+            const auto match = cache.best(std::vector<int32_t>{1, 2, 9}, {}, true, test_scope);
+            bool failed = false;
+            const long allocations_before = test_allocation_failure::live.load(std::memory_order_relaxed);
+            {
+                ConversationCache::Restore restore(cache);
+                test_allocation_failure::after = failure;
+                try {
+                    check(restore.select(match), "traced shallow restore selects its validated image");
+                } catch (const std::bad_alloc&) {
+                    failed = true;
+                }
+                test_allocation_failure::after = -1;
+                const size_t charged = failure == 1 ? CheckpointBytes::owner_bytes : growth;
+                const auto* retained = cache.find(match.serial);
+                check(failed == (failure >= 0) && retained &&
+                      retained->live.ids == std::vector<int32_t>({1, 2, 3, 4, 5, 6}) &&
+                      cache.bytes() == before + charged,
+                      "successful and partially failed freezes preserve the donor and charge every new owner");
+                check(retained && retained->live.gdn.sealed() &&
+                      retained->live.ple.sealed() == (failure != 1),
+                      "injection reaches partial freezing or the post-freeze alias allocation");
+                check(cache.leased_bytes() == 128 + (restore.image() ? restore.image()->bytes() : 0) &&
+                      cache.envelope_bytes() <= (1 << 20),
+                      "alias failure gives back only its own reservation, never frozen donor or fixed ownership");
+            }
+            check(test_allocation_failure::live.load(std::memory_order_relaxed) == allocations_before +
+                      long((failure == 1 ? CheckpointBytes::owner_bytes : growth) / CheckpointBytes::owner_bytes),
+                  "failed partial aliases free their metadata; only the donor's completed freeze owners remain");
+            check(cache.leased_bytes() == 128 && cache.find(match.serial) != nullptr &&
+                  cache.envelope_bytes() == cache.bytes() + 128,
+                  "restore completion and failure both preserve fixed ownership without undercharge");
+            cache.clear();
+            check(cache.leased_bytes() == 128, "poison clear cannot refund the fixed checkpoint lease");
+            trace.finish();
+            const auto text = trace_text(file);
+            const auto transfer = trace_event(text, "restore", "freeze_charge");
+            check(transfer.find("\"subject_serial\":1,") != std::string::npos &&
+                  transfer.find("\"incoming\":" + std::to_string(failure == 1 ?
+                      CheckpointBytes::owner_bytes : growth) + ",") != std::string::npos,
+                  "freeze growth is an explicit same-owner lease-to-parked charge transfer");
+            check(text.find("\"limited\":false,\"hash_limited\":false") != std::string::npos,
+                  "all three bounded native restore traces close without truncation");
+        }
+        std::fclose(file);
+    }
+}
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 1 && (argc != 3 || std::strcmp(argv[1], "--restore-traces") != 0)) return 2;
+    check_restore_charge_traces(argc == 3 ? argv[2] : nullptr);
     check_victim_process_contract();
     check_mutation_work_trace();
     check_mutation_trace();
@@ -1798,6 +1897,152 @@ int main() {
         check(cache.size() == size_before && cache.bytes() == bytes && cache.evictions() == evictions_before &&
               cache.best(std::vector<int32_t>{1,2,3,4,5}, {}, true, test_scope).tokens == 4,
               "economic ranking leaves parked history, byte accounting and lifecycle state unchanged");
+    }
+    {
+        // The real restore seam must preserve a shallow sibling's deeper donor
+        // for the next economic choice, held-out continuation and rollback.
+        auto deep = image({1, 2, 3, 4, 5, 6, 7, 8});
+        for (const auto& ids : {std::vector<int32_t>{1, 2, 3, 4},
+                                std::vector<int32_t>{1, 2, 3, 4, 5, 6}}) {
+            ConversationCheckpoint cut;
+            cut.ids = ids;
+            cut.gdn.resize(32, 7);
+            deep.checkpoints.push_back(std::move(cut));
+        }
+        deep.live.gdn.assign(64, 9);
+        deep.kv.emplace_back();
+        deep.kv.back().k.resize(128, 11);
+        deep.stage_images.push_back(image({1, 2, 3, 4, 5, 6, 7, 8}));
+        deep.stage_images.back().live.gdn.assign(32, 12);
+        const size_t frozen_bytes = deep.bytes() + deep.freeze_growth_bytes();
+        ConversationCache cache(1 << 20, 2);
+        check(cache.try_reserve_lease(128), "reserve the fixed checkpoint ownership before restore");
+        check(cache.put(std::move(deep)), "seed divergent-choice donor");
+        const std::vector<int32_t> shallow{1, 2, 3, 4, 20};
+        const auto match = cache.best(shallow, {}, true, test_scope);
+        const auto serial = match.serial;
+        {
+            ConversationCache::Restore restore(cache);
+            check(restore.select(match) && restore.image() &&
+                  restore.image()->live.ids.size() == 8,
+                  "restore acquires the validated shallow checkpoint's whole image");
+            check(restore.retained_in_cache() && cache.find(serial) != nullptr,
+                  "a shallow restore preserves its deeper parked candidate");
+            const auto* donor = cache.find(serial);
+            check(donor && donor->bytes() == frozen_bytes &&
+                  cache.leased_bytes() == 128 + restore.image()->bytes() &&
+                  restore.outside_bytes() == 0 && cache.borrowed() == 1,
+                  "freeze owners and the full alias are charged exactly once inside the cache envelope");
+            check(donor && donor->live.gdn.data() == restore.image()->live.gdn.data() &&
+                  donor->kv.front().k.frozen() && restore.image()->kv.front().k.frozen() &&
+                  donor->stage_images.front().live.gdn.data() ==
+                      restore.image()->stage_images.front().live.gdn.data(),
+                  "ordinary borrowing shares immutable all-stage payloads without copying them");
+            restore.image()->live.gdn.write()[0] = 13;
+            check(donor && donor->live.gdn.read()[0] == 9,
+                  "a sibling write detaches and cannot mutate the parked continuation");
+            check(cache.put(image({9, 9, 9})) && cache.put(image({8, 8, 8})) &&
+                  cache.find(serial) != nullptr,
+                  "outgoing slot pressure cannot spend a borrowed donor");
+        }
+        check(cache.leased_bytes() == 128 && cache.envelope_bytes() <= (1 << 20),
+              "completed or cancelled restore releases only its alias lease, never the fixed checkpoint lease");
+        const auto choose = [&](bool cost, const std::vector<int32_t>& continuation, double parked_ms) {
+            strata::program::PrefixChoice choice(cost);
+            choice.consider(0, 0, 1000);
+            choice.consider(1, 4, 10); // already-certified shallow resident source
+            cache.for_each_match(continuation, {}, true, test_scope, [&](auto candidate, const auto&, const auto&) {
+                choice.consider(2, candidate.tokens, parked_ms);
+            });
+            return choice.selected();
+        };
+        const std::vector<int32_t> continuation{1, 2, 3, 4, 5, 6, 7, 8, 30};
+        const std::vector<int32_t> held_out{1, 2, 3, 4, 5, 6, 7, 8, 40};
+        check(cache.best(continuation, {}, true, test_scope).tokens == 8 &&
+              choose(true, continuation, 100) == 1 && choose(true, held_out, 100) == 1,
+              "public and held-out choices still compare resident shallow against parked deep");
+        check(choose(true, continuation, 1) == 2 && choose(false, held_out, 100) == 2,
+              "worthwhile deeper restore and longest rollback still select the retained donor");
+        const auto rollback_match = cache.best(held_out, {}, true, test_scope);
+        {
+            ConversationCache::Restore rollback(cache);
+            check(rollback.select(rollback_match) && !rollback.retained_in_cache() &&
+                  rollback.image()->live.ids.size() == 8 && !cache.find(serial) &&
+                  rollback.outside_bytes() == rollback.image()->bytes(),
+                  "longest rollback consumes the whole valid live donor with explicit outside ownership");
+        }
+        check(cache.leased_bytes() == 128, "rollback cannot refund fixed checkpoint storage");
+    }
+    {
+        auto donor = image({1, 2, 3, 4, 5, 6});
+        ConversationCheckpoint shallow, deepest;
+        shallow.ids = {1, 2}; deepest.ids = {1, 2, 3, 4};
+        donor.checkpoints = {shallow, deepest};
+        const size_t bytes = donor.bytes();
+        ConversationCache tight(bytes, 1);
+        check(tight.put(std::move(donor)), "seed a donor with no extra alias headroom");
+        const auto match = tight.best(std::vector<int32_t>{1, 2, 9}, {}, true, test_scope);
+        tight.guard(match.serial);
+        {
+            ConversationCache::Restore guarded(tight);
+            check(!guarded.select(match) && !guarded.image() && tight.find(match.serial) != nullptr &&
+                  tight.leased_bytes() == 0,
+                  "low-headroom restore cannot consume a donor guarded by another owner");
+        }
+        tight.unguard();
+        {
+            ConversationCache::Restore restore(tight);
+            check(restore.select(match) && !restore.retained_in_cache() && tight.size() == 0 &&
+                  restore.outside_bytes() == bytes && tight.leased_bytes() == 0,
+                  "insufficient alias headroom preserves the bounded original consuming restore");
+        }
+        ConversationCache::Restore stale(tight);
+        check(!stale.select(match) && !stale.image() && tight.leased_bytes() == 0,
+              "a stale serial cannot acquire a different image or a reservation");
+    }
+    {
+        auto pending = image({1, 2, 3});
+        pending.publication_ticket = 77;
+        ConversationCache cache(1 << 20, 2);
+        check(cache.put(std::move(pending)), "seed a protected pending publication for restore");
+        const auto match = cache.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true, test_scope);
+        {
+            ConversationCache::Restore restore(cache);
+            check(restore.select(match) && restore.retained_in_cache() &&
+                  restore.image()->publication_ticket == 0 && cache.has_publication(77) &&
+                  cache.leased_bytes() == 0,
+                  "restore preserves pending publication ownership and its existing alias accounting");
+        }
+        check(cache.has_publication(77) && cache.size() == 1,
+              "ending a read alias neither cancels nor consumes a pending writer");
+    }
+    {
+        auto donor = image({1, 2, 3, 4, 5, 6});
+        ConversationCheckpoint shallow, deepest;
+        shallow.ids = {1, 2}; deepest.ids = {1, 2, 3, 4};
+        donor.checkpoints = {shallow, deepest};
+        ConversationCache cache(1 << 20, 2);
+        check(cache.try_reserve_lease(128) && cache.put(std::move(donor)),
+              "seed inherited guard and poison-clear ownership");
+        const auto match = cache.best(std::vector<int32_t>{1, 2, 9}, {}, true, test_scope);
+        cache.guard(match.serial);
+        {
+            ConversationCache::Restore restore(cache);
+            check(restore.select(match) && restore.retained_in_cache(),
+                  "a restore may share an existing same-donor guard");
+        }
+        check(!cache.evict_oldest() && cache.find(match.serial) != nullptr && cache.leased_bytes() == 128,
+              "restore cleanup cannot release another owner's guard or fixed lease");
+        cache.unguard();
+        {
+            ConversationCache::Restore restore(cache);
+            check(restore.select(match) && cache.clear() == 1 &&
+                  restore.image()->live.ids == std::vector<int32_t>({1, 2, 3, 4, 5, 6}) &&
+                  cache.leased_bytes() == 128 + restore.image()->bytes(),
+                  "poison clear removes parked protection but not an acquired immutable image or its charge");
+        }
+        check(cache.size() == 0 && cache.leased_bytes() == 128,
+              "cancelled or cleared restore releases its own bytes without resurrecting a donor");
     }
     {
         // Freezing for an immutable publication lease: payloads are shared, not copied, and the alias never observes

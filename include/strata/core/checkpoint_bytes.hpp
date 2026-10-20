@@ -63,6 +63,7 @@ public:
     // As with existing vector accounting this excludes allocator bookkeeping.
     static constexpr size_t owner_bytes = sizeof(std::vector<uint8_t>) + sizeof(std::shared_ptr<const void>);
     size_t bytes() const { return capacity() + (sealed_ ? owner_bytes : 0); }
+    size_t freeze_growth_bytes() const { return !sealed_ && !empty() ? owner_bytes : 0; }
     bool operator==(const CheckpointBytes& b) const { return read() == b.read(); }
     friend bool operator==(const std::vector<uint8_t>& a, const CheckpointBytes& b) { return a == b.read(); }
     friend bool operator==(const CheckpointBytes& a, const std::vector<uint8_t>& b) { return a.read() == b; }

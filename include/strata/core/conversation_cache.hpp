@@ -120,6 +120,12 @@ struct ConversationCheckpoint {
         for (const auto& part : stage_parts) n += part.bytes();
         return n;
     }
+    size_t freeze_growth_bytes() const {
+        size_t n = gdn.freeze_growth_bytes() + ple.freeze_growth_bytes() +
+                   tails.freeze_growth_bytes() + dead.freeze_growth_bytes() + block_pos.freeze_growth_bytes();
+        for (const auto& part : stage_parts) n += part.freeze_growth_bytes();
+        return n;
+    }
 };
 
 // Identity-layout K/V pages and completed indexer rows. For streamed layers the
@@ -144,6 +150,10 @@ struct ConversationKv {
     }
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
+    }
+    size_t freeze_growth_bytes() const {
+        return k.freeze_growth_bytes() + v.freeze_growth_bytes() + k_scale.freeze_growth_bytes() +
+               v_scale.freeze_growth_bytes() + pooled.freeze_growth_bytes();
     }
 };
 
@@ -318,6 +328,13 @@ struct SavedConversation {
         draft_boundary_residual.freeze();
         for (auto& stage : stage_images) stage.freeze();
     }
+    size_t freeze_growth_bytes() const {
+        size_t n = live.freeze_growth_bytes() + draft_boundary_residual.freeze_growth_bytes();
+        for (const auto& c : checkpoints) n += c.freeze_growth_bytes();
+        for (const auto& layer : kv) n += layer.freeze_growth_bytes();
+        for (const auto& stage : stage_images) n += stage.freeze_growth_bytes();
+        return n;
+    }
     /// Cheap alias: metadata is copied, every payload is shared with this image
     /// (which must be frozen for the alias to be free). Publication ownership is not copied.
     SavedConversation frozen_alias() const {
@@ -397,6 +414,93 @@ public:
         int64_t tokens = 0;
         bool live = false;
         uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
+    };
+
+    // Request-local incoming image. Ordinary shallow siblings retain their
+    // donor under a guard and a full conservative alias lease. The image dies
+    // before either protection is released, including exceptional exits.
+    class Restore {
+    public:
+        explicit Restore(ConversationCache& cache) : cache_(cache) {}
+        Restore(const Restore&) = delete;
+        Restore& operator=(const Restore&) = delete;
+        ~Restore() {
+            image_.reset();
+            release();
+        }
+        std::optional<SavedConversation>& image() { return image_; }
+        bool retained_in_cache() const { return retained_; }
+        size_t outside_bytes() const { return image_ && !leased_ ? image_->bytes() : 0; }
+        bool select(Match match) {
+            if (image_ || leased_ || match.tokens <= 0 || !match.serial) return false;
+            match.index = cache_.index_of(match.serial);
+            if (match.index == SIZE_MAX) return false;
+            auto& entry = cache_.entries_[match.index];
+            // Publications keep their established sole-owner alias path.
+            if (!entry.publication_ticket && cache_.borrows(match) &&
+                (!cache_.guarded_ || cache_.guarded_ == match.serial)) {
+                const size_t before = entry.bytes(), growth = entry.freeze_growth_bytes();
+                if (growth <= SIZE_MAX - before && before + growth <= SIZE_MAX - growth &&
+                    cache_.try_reserve_lease(before + 2 * growth)) {
+                    leased_ = before + 2 * growth;
+                    own_guard_ = cache_.guarded_ == 0;
+                    if (own_guard_) cache_.guard(match.serial);
+                    try {
+                        entry.freeze(); // immutable aliases share payloads, never copy them
+                        charge_freeze(entry.bytes() - before, match.serial);
+                        image_.emplace(entry.frozen_alias());
+                        assert(image_->bytes() <= leased_);
+                        const size_t unused = leased_ - image_->bytes();
+                        cache_.release_lease(unused);
+                        leased_ -= unused;
+                        retained_ = true;
+                        cache_.count_borrow();
+                        cache_.trace_observation({.site="restore", .action="borrowed",
+                            .subject_serial=match.serial}, &entry);
+                        return true;
+                    } catch (...) {
+                        // Freeze may have sealed only some payloads before an
+                        // allocation failed. Their owners remain cache-charged.
+                        charge_freeze(entry.bytes() - before - frozen_growth_, match.serial);
+                        image_.reset();
+                        release();
+                        throw;
+                    }
+                }
+            }
+            // A caller that already protects this donor never delegates
+            // permission to consume it merely because another alias cannot fit.
+            if (!entry.publication_ticket && cache_.guarded_ == match.serial) return false;
+            // If a bounded alias cannot fit, retain the original consuming
+            // restore instead of exceeding admission or inventing a cheap path.
+            image_.emplace(cache_.take(match.index, retained_));
+            return true;
+        }
+    private:
+        void charge_freeze(size_t bytes, uint64_t serial) {
+            if (!bytes) return;
+            assert(bytes <= leased_ && bytes <= cache_.held_bytes_);
+            // One ownership transfer, including a partially completed freeze:
+            // no intermediate lease/release record may expose a changed parked
+            // image as though its owner identity had changed without cause.
+            cache_.bytes_ += bytes;
+            cache_.held_bytes_ -= bytes;
+            leased_ -= bytes;
+            frozen_growth_ += bytes;
+            if (cache_.trace_)
+                cache_.trace_observation({.site="restore", .action="freeze_charge", .subject_required=true,
+                    .incoming=bytes, .subject_serial=serial}, cache_.find(serial));
+        }
+        void release() {
+            if (own_guard_) cache_.unguard();
+            if (leased_) cache_.release_lease(leased_);
+            leased_ = frozen_growth_ = 0;
+            own_guard_ = false;
+        }
+        ConversationCache& cache_;
+        std::optional<SavedConversation> image_;
+        size_t leased_ = 0, frozen_growth_ = 0;
+        bool retained_ = false, own_guard_ = false;
     };
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0,

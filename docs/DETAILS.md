@@ -1802,6 +1802,21 @@ Authorization, token/image equality, steering, snapshot validation, admission an
 are not scores and cannot be overridden by a saving. Exact resends of yielded requests still resume
 their own slot, request identity and sampling sequence without an economic choice.
 
+Restoring an unpinned shallow sibling checkpoint keeps its deeper parked donor available for
+later selection and longest rollback. A request-local restore owner guards that donor through
+outgoing capture and restore, shares frozen payloads, and reserves the full alias plus any new
+freeze-owner metadata inside the existing cache budget. Ending the restore releases only that
+alias reservation; resident-checkpoint and publication ownership remain independent. If the
+bounded alias cannot fit, the existing consuming restore is retained unless another owner already
+guards that donor; that optional mount is refused without spending its protection. This changes
+neither candidate certification nor the cost arithmetic: an MTP checkpoint without its required
+certified draft interval/window is still ineligible, even when its target token prefix matches.
+The cache trace records each completed allocation of freeze-owner metadata as
+`restore/freeze_charge`: `incoming` bytes move from the restore lease into the same parked serial's
+charge, with no envelope change or fixed-lease giveback. This also records partial freezing when
+an allocation fails; failure of alias construction returns only the remaining alias reservation.
+The replay checker validates that explicit transfer rather than treating it as an owner replacement.
+
 The process learns from its own completed operations on the resolved placement, not a fixed
 tokens-per-millisecond rule or a new benchmark. Eight recent wall-time observations per copy path
 cover checkpoint restores, resident live/checkpoint host-bounced copies, whole parked restores and

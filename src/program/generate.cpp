@@ -20517,7 +20517,8 @@ int main(int argc, char** argv) {
                     store = nullptr; request_id = 0; generation = 0;
                 }
             } store_demand_lease;
-            std::optional<strata::core::SavedConversation> incoming;
+            strata::core::ConversationCache::Restore incoming_owner(conversations);
+            auto& incoming = incoming_owner.image();
             // A shared borrow cannot consume the private offer's descriptor. The
             // demand path mints a fresh request-local ID even without any offer.
             if (req_cache_deadline_ns == 0 && req_cache_offer != 0) {
@@ -20600,7 +20601,8 @@ int main(int argc, char** argv) {
             bool incoming_retained_in_cache = false;
             if (selected.source == PrefixSource::parked) {
                 try {
-                    incoming.emplace(conversations.take(selected.parked.index, incoming_retained_in_cache));
+                    if (!incoming_owner.select(selected.parked)) selected = PrefixCandidate{};
+                    incoming_retained_in_cache = incoming_owner.retained_in_cache();
                 } catch (const std::bad_alloc&) {
                     // A pending publication keeps its sole owner; an optional restore alias may fail safely.
                     incoming_retained_in_cache = false;
@@ -20741,7 +20743,7 @@ int main(int argc, char** argv) {
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                 (int64_t) live.size() - (int64_t) park_held >= o.conversation_cache_park_gain;
             if ((!from_live || incoming || slot_source >= 0 || !req_ckpt) && !pin_sibling && park_worth &&
-                !park_current(incoming && !restored_from_store ? incoming->bytes() : 0,
+                !park_current(incoming && !restored_from_store ? incoming_owner.outside_bytes() : 0,
                               incoming ? &*incoming : nullptr,
                               incoming && !restored_from_store && !incoming_retained_in_cache && !req_ckpt ? 1 : 0,
                               // A one-shot borrow (ckpt=0) leaves its donor alone: its capture is a branch of its

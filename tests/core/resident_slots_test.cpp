@@ -116,6 +116,18 @@ struct ResidentDraftReadinessFixture {
         const auto rewind = slots.certify_continuation(0, &cut, 17, 3);
         check(rewind.certified && rewind.draft_frontier == 12 && rewind.draft_end == 16,
               "a checkpoint rewind validates at its own frontier, not the live draft endpoint");
+        check(decide_draft_readiness(rewind, 48, 40, 40960).ready,
+              "a checkpoint with the certified draft window and matching boundary remains selectable");
+        chain.begin = 13;
+        const auto before_draft = decide_draft_readiness(slots.certify_continuation(0, &cut, 17, 3), 48, 40, 40960);
+        check(!before_draft.ready && before_draft.refusal == ContinuationRefusal::draft_interval && unchanged(),
+              "a target checkpoint before the retained draft interval is correctly refused without mutation");
+        chain.begin = 9;
+        const auto missing_window = decide_draft_readiness(slots.certify_continuation(0, &cut, 17, 3), 48, 40, 40960);
+        check(slots.certify_continuation(0, &cut, 17, 3).certified && !missing_window.ready &&
+              missing_window.refusal == ContinuationRefusal::draft_window && unchanged(),
+              "target certification alone cannot bypass missing preceding draft-window history");
+        chain.begin = 8;
         source.preparing = source.stop = true; source.cached = false;
         ResidentPreparation lease;
         lease.slot = 0; lease.request = 17; lease.incarnation = 3; lease.endpoint = 47;
