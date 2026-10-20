@@ -431,6 +431,11 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// This stage's residual row, not the last stage reached through next_.
+    /// Same operation lifetime as final_R; diagnostics must drain commit first.
+    const float* stage_R(int t) const {
+        return !g_ || t < 0 || t >= max_t_ ? nullptr : R_ + size_t(t) * size_t(g_->hc * g_->n_embd);
+    }
 
     /// The head's vocabulary size (the row width `read_logits_rows` copies).  The window graph computes the
     /// head's FULL rows for every one of its T positions (`head_logits_`, T x n_vocab); the decode path reads

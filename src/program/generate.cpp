@@ -12178,9 +12178,49 @@ int main(int argc, char** argv) {
                 kind == strata::core::dflash2::CapturePhase::prefill ? "prefill" : "verify",
                 feature_capture->frontier(), feature_capture->store().retained_start(),
                 (long long) feature_capture->committed_rows(), (long long) feature_capture->rejected_rows());
+            if (std::getenv("STRATA_STATE_HASH")) {
+                const auto rows = feature_capture->store().committed_since(feature_capture->store().retained_start());
+                uint64_t payload = strata::program::SessionFingerprint::basis;
+                uint64_t tags = strata::program::SessionFingerprint::basis;
+                for (size_t part = 0; part < rows.segments.size(); ++part) {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(rows.segments[part].data());
+                    for (size_t i = 0; i < rows.segments[part].size_bytes(); ++i) {
+                        payload ^= bytes[i]; payload *= 1099511628211ull;
+                    }
+                    for (int64_t generation : rows.generations[part])
+                        tags = strata::program::fingerprint_word(tags, uint64_t(generation));
+                }
+                std::fprintf(stderr, "DFLASH2_FEATURES request=%llu incarnation=%llu generation=%llu "
+                    "start=%d count=%d payload_bytes=%zu payload=%016llx tags=%016llx\n",
+                    (unsigned long long) owner.request, (unsigned long long) owner.incarnation,
+                    (unsigned long long) owner.generation, rows.start, rows.count,
+                    size_t(rows.count) * strata::core::dflash2::feature_row_bytes,
+                    (unsigned long long) payload, (unsigned long long) tags);
+            }
             return true;
         };
 #endif
+        // The existing primary-only fingerprint cannot certify a split observer.
+        // Keep this bounded diagnostic off the ordinary serving path, and hash
+        // authoritative target cells on every owning device after full drain.
+        auto report_stage_state = [&](const char* phase, uint64_t request, int64_t cells,
+                                      int residual_row, std::string& e) -> bool {
+            if (!std::getenv("STRATA_STATE_HASH")) return true;
+            if (!ver.wait_commit(e)) return false;
+            const strata::core::QsaState no_draft{};
+            for (int st = 0; st < n_stages; ++st) {
+                const auto& state = st == 0 || split_same ? ss : stages[size_t(st - 1)]->ss;
+                strata::program::SessionFingerprint h;
+                const float* residual = residual_row < 0 ? nullptr : stage_ver(st).stage_R(residual_row);
+                if (!strata::program::session_fingerprint(state, no_draft, g, cells, h, e, residual)) return false;
+                std::fprintf(stderr, "STATE_STAGE phase=%s request=%llu stage=%d device=%d cells=%lld "
+                    "gdn=%016llx ple=%016llx kv=%016llx residual=%016llx\n",
+                    phase, (unsigned long long) request, st, state.allocation_device, (long long) cells,
+                    (unsigned long long) h.gdn, (unsigned long long) strata::program::fingerprint_ple(h, state),
+                    (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.residual);
+            }
+            return true;
+        };
         if (o.retire_resident_source) {
             const auto refuse = [](const char* reason) {
                 std::fprintf(stderr, "strata serve: source retirement refused: %s\n", reason);
@@ -20935,6 +20975,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_DFLASH2_CAPTURE)
                     if (!capture_finish(strata::core::dflash2::CapturePhase::verify, e)) return false;
 #endif
+                    if (!report_stage_state("prompt-verify", drive.d.request_generation, q + T, T - 1, e)) return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -21230,6 +21271,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_DFLASH2_CAPTURE)
                     if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
 #endif
+                    if (!report_stage_state("prefill", drive.d.request_generation, r, -1, e)) return false;
                     return true;
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
@@ -23147,6 +23189,9 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 last_committed_residual = ver.final_R(keep - 1);
+                if (!report_stage_state("decode", drive.d.request_generation, p + keep, keep - 1, err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
                 if (T > keep && std::getenv("STRATA_STATE_HASH")) {
                     strata::program::SessionFingerprint h;
                     if (!ver.wait_commit(err) || !strata::program::session_fingerprint(ss, mtp.kv_state(), g, p + keep, h, err)) {

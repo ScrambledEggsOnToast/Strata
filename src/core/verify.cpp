@@ -1286,7 +1286,15 @@ bool Verifier::arm_dflash2_capture(dflash2::CaptureOwner owner, int64_t frontier
         if (err.empty()) err = "dflash2 capture: initialized, bound serial verifier required";
         return false;
     }
-    return dflash2_capture_.arm(owner, frontier, start, count, err);
+    if (!dflash2_capture_.arm(owner, frontier, start, count, err)) return false;
+    // Acceptance diagnostics poison only idle observer storage. A missing device
+    // write then fails the producer's finite-value check instead of reusing a
+    // previous generation's apparently valid payload.
+    if (std::getenv("STRATA_STATE_HASH"))
+        for (float* host : dflash2_h_)
+            if (host) std::fill_n(host, size_t(count) * dflash2::residual_width,
+                                 std::numeric_limits<float>::quiet_NaN());
+    return true;
 }
 
 bool Verifier::dflash2_tap(dflash2::CaptureOwner owner, int tap_layer, dflash2::TapView& out,
@@ -1386,6 +1394,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                         (void**) &dflash2_h_[i], (void**) &dflash2_m_[i])) {
                 err = "dflash2 capture: mapped verifier tap allocation failed"; return false;
             }
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "DFLASH2_STAGE_ALLOCATION phase=verify device=%d layers=%lld:%lld "
+                "payload_bytes=%zu flag_bytes=%zu\n", device_, (long long) lb_, (long long) le_,
+                dflash2_capture_.staging_bytes(), sizeof(uint32_t));
     }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }

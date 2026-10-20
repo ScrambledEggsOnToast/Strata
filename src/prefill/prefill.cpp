@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -1290,7 +1291,14 @@ bool Prefill::arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t fro
         if (err.empty()) err = "dflash2 capture: initialized, bound serial prefill required";
         return false;
     }
-    return m.dflash2_capture.arm(owner, frontier, start, count, err);
+    if (!m.dflash2_capture.arm(owner, frontier, start, count, err)) return false;
+    // Idle, owned observer storage only; finite committed rows must subsequently
+    // come from this operation's completed device writes, not an older payload.
+    if (std::getenv("STRATA_STATE_HASH"))
+        for (float* host : m.dflash2_host)
+            if (host) std::fill_n(host, size_t(std::min<int64_t>(count, core::dflash2::context_rows)) *
+                                 core::dflash2::residual_width, std::numeric_limits<float>::quiet_NaN());
+    return true;
 }
 
 bool Prefill::dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core::dflash2::TapView& out,
@@ -1579,6 +1587,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                             (void**) &m.dflash2_host[i], (void**) &m.dflash2_mapped[i])) {
                 err = "dflash2 capture: mapped prefill tap allocation failed"; return false;
             }
+        if (std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "DFLASH2_STAGE_ALLOCATION phase=prefill device=%d layers=%lld:%lld "
+                "payload_bytes=%zu flag_bytes=%zu\n", m.device, (long long) stage_lb_, (long long) stage_le_,
+                m.dflash2_capture.staging_bytes(), sizeof(uint32_t));
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
