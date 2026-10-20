@@ -144,7 +144,7 @@ void reduction_and_capture_tests() {
         store.commit(op, keep);
         check(store.frontier() == 37 + keep, "rejected suffix published");
         check_features(store.committed_since(37));
-        check(store.storage_bytes() == (size_t(d::context_rows) + 4) * d::feature_row_bytes,
+        check(store.storage_bytes() == d::CaptureStore::planned_bytes(4),
               "unexpected observer allocation bound");
     }
     d::CaptureStore store("request-A", 7, 37, 1);
@@ -172,7 +172,7 @@ void reduction_and_capture_tests() {
 }
 void ring_and_refusal_tests() {
     d::CaptureStore ring("request-A", 7, 37);
-    check(ring.storage_bytes() == 2 * size_t(d::context_rows) * d::feature_row_bytes,
+    check(ring.storage_bytes() == d::CaptureStore::planned_bytes(),
           "default capacity must support a full prefill chunk");
     prefill(ring, 37, 8, 1); // prefill chunks are not limited to the four-row draft block
     prefill(ring, 45, d::context_rows - 9, 2);

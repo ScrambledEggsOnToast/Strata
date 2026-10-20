@@ -11,6 +11,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace strata::core::dflash2 {
 inline constexpr int hidden_size = 2560;
@@ -45,11 +46,14 @@ struct Operation {
 enum class CapturePhase { prefill, verify };
 enum class CapturePoint { completed_second_residual_write, next_layer_first_gr_read_group };
 
-// Borrowed ring views, valid only until the next successful capture commit. Both
+// Borrowed ring views, valid only until the next capture commit or reset. Both
 // segments are in increasing absolute-position order, never stage arrival order.
 struct FeatureView {
     int start = 0, count = 0;
     std::array<std::span<const uint16_t>, 2> segments;
+    std::string_view request_id;
+    int64_t incarnation = 0;
+    std::array<std::span<const int64_t>, 2> generations;
 };
 
 // One serial request/incarnation. Allocates a 2047-row committed ring and exactly
@@ -67,6 +71,8 @@ public:
     CaptureStore(const CaptureStore&) = delete;
     CaptureStore& operator=(const CaptureStore&) = delete;
 
+    // Rebind only a drained, unattached store with a newer buffer incarnation.
+    void reset(std::string request_id, int64_t incarnation, int origin = 0);
     void begin(const Operation&, int start, int count, CapturePhase);
     // materialized_layer is the tap itself in prefill, tap+1 in verification.
     // Verification must read the previous layer's completed R, not mixed, after
@@ -87,6 +93,10 @@ public:
     bool poisoned() const noexcept { return poisoned_; }
     bool capturing() const noexcept { return active_; }
     size_t storage_bytes() const noexcept;
+    static constexpr size_t planned_bytes(int capacity = context_rows) {
+        return (size_t(context_rows) + size_t(capacity)) * feature_row_bytes +
+               size_t(context_rows) * sizeof(int64_t);
+    }
 
 private:
     friend class Bridge;
@@ -97,6 +107,7 @@ private:
     int64_t incarnation_, generation_ = 0;
     int origin_, capacity_, end_, retained_ = 0, head_ = 0;
     std::unique_ptr<uint16_t[]> ring_, tentative_;
+    std::unique_ptr<int64_t[]> ring_generations_;
     Operation operation_;
     int start_ = 0, count_ = 0;
     CapturePhase phase_ = CapturePhase::prefill;

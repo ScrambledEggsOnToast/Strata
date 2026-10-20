@@ -1,9 +1,13 @@
 #include "strata/core/dflash2_capture.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 
 #include <array>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace d = strata::core::dflash2;
 namespace {
@@ -64,7 +68,7 @@ void frontier() {
     auto capture = state(d::CapturePhase::verify);
     std::string err;
     d::TapView view;
-    float unused = 0;
+    std::array<float, d::residual_width> residuals{};
     check(!capture.arm(owner(), 100, 99, 2, err), "bootstrap cannot offer a proposal suffix");
     check(!capture.arm(owner(), 100, 98, 1, err), "no capture before bootstrap");
     check(!capture.arm(owner(), 100, 101, 1, err), "no capture beyond frontier");
@@ -72,11 +76,13 @@ void frontier() {
     check(!capture.arm({0, 9, 1}, 100, 100, 4, err), "unbound identity refused");
     check(!capture.arm({7, 9, 0}, 100, 100, 4, err), "zero generation refused");
     check(!capture.arm(owner(), d::max_position, d::max_position, 1, err), "position overflow refused");
-    check(capture.arm(owner(), 100, 99, 1, err), "p=n-1 bootstrap is legal");
-    check(capture.begin_run(7, 99, 1, err) && !capture.copying(), "bootstrap disables all copy nodes");
-    check(capture.slice(99, 1).count == 0, "bootstrap has no tentative tap range");
+    check(!capture.arm(owner(), 100, 99, 1, err), "reject prompt-length frontier that would drop bootstrap");
+    check(capture.arm(owner(), 99, 99, 1, err), "bootstrap owns the next unread input row");
+    check(capture.begin_run(7, 99, 1, err) && capture.copying(), "bootstrap enables all owned tap copy nodes");
+    check(capture.slice(99, 1).count == 1, "bootstrap has exactly one tentative row");
     check(capture.finish_run(err) && capture.committed(1, err) && capture.waited(err), "bootstrap target commit");
-    check(!capture.view(owner(), 0, &unused, view, err), "prompt row cannot be recaptured at bootstrap");
+    check(capture.view(owner(), 0, residuals.data(), view, err) && view.start == 99 && view.keep == 1,
+          "bootstrap is captured exactly once after target commit");
     check(capture.release(owner(), err), "release bootstrap ticket");
     check(capture.arm(owner(2), 100, 100, 4, err) && capture.begin_run(7, 100, 4, err) && capture.copying(),
           "first proposal capture begins at p=n");
@@ -162,11 +168,152 @@ void split_stages() {
     auto unarmed = state(d::CapturePhase::verify);
     check(unarmed.begin_run(7, 99, 8, err) && !unarmed.copying() && unarmed.finish_run(err), "unarmed observer stays off");
 }
+
+float feature_value(int position, int tap) { return float(position % 97 + tap * 128 + 3); }
+void producer_split_tail() {
+    std::string err;
+    d::CaptureProducer producer;
+    check(producer.reset(7, 9, 0, err), "bind reusable owned feature storage");
+    const size_t storage = producer.store().storage_bytes();
+    check(storage == 2 * d::max_feature_bytes + d::context_rows * sizeof(int64_t),
+          "feature payload is exactly 25600 bytes/token plus separately priced generation tags");
+    std::array<d::TapCaptureState, 3> pf, vr;
+    constexpr std::array<std::array<int, 2>, 3> bounds{{{0, 20}, {20, 39}, {39, 48}}};
+    for (size_t stage = 0; stage < bounds.size(); ++stage) {
+        pf[stage] = state(d::CapturePhase::prefill, bounds[stage][0], bounds[stage][1]);
+        vr[stage] = state(d::CapturePhase::verify, bounds[stage][0], bounds[stage][1]);
+    }
+    std::vector<int64_t> generations;
+    auto complete = [&](d::CapturePhase phase, int start, int rows, int keep) {
+        check(producer.begin(phase, start, rows, err), "begin contiguous actual target operation");
+        const auto ticket = producer.owner();
+        auto& stages = phase == d::CapturePhase::prefill ? pf : vr;
+        const int frontier = phase == d::CapturePhase::prefill ? start + rows : start;
+        for (auto& stage : stages) {
+            check(stage.arm(ticket, frontier, start, rows, err), "same owner on every split stage");
+            for (int offset = 0; offset < rows;) {
+                const int n = phase == d::CapturePhase::prefill ? std::min(rows - offset, 2048) : rows;
+                check(stage.begin_run(ticket.request, start + offset, n, err), "actual split sub-run");
+                if (phase == d::CapturePhase::prefill) {
+                    const auto slice = stage.slice(start + offset, n);
+                    if (slice.count) for (int tap = 0; tap < 5; ++tap)
+                        if (stage.owns_tap(tap)) check(stage.record(tap, slice, err), "copy each retained absolute row once");
+                }
+                check(stage.finish_run(err), "sub-run completes on owning stage");
+                offset += n;
+            }
+            if (phase == d::CapturePhase::verify)
+                check(stage.committed(keep, err) && stage.waited(err), "real target keep/drain determines publication");
+        }
+        const int captured = phase == d::CapturePhase::prefill ? std::min(rows, d::context_rows) : rows;
+        const int first = phase == d::CapturePhase::prefill ? start + rows - captured : start;
+        for (int tap : {4, 0, 3, 1, 2}) { // stage completions intentionally out of order
+            int stage = 0;
+            while (d::tap_layers[size_t(tap)] >= bounds[size_t(stage)][1]) ++stage;
+            std::vector<float> residuals(size_t(captured) * d::residual_width);
+            for (int row = 0; row < captured; ++row) for (int stream = 0; stream < 4; ++stream) {
+                const float value = phase == d::CapturePhase::verify && row >= keep
+                    ? std::numeric_limits<float>::quiet_NaN() // rejected rows must NEVER be reduced
+                    : feature_value(first + row, tap) - 3.0f + float(2 * stream);
+                std::fill_n(residuals.data() + size_t(row * 4 + stream) * d::hidden_size, d::hidden_size, value);
+            }
+            const auto before = residuals;
+            d::TapView view;
+            check(stages[size_t(stage)].view(ticket, tap, residuals.data(), view, err), "completed stage-owned tap");
+            check(view.owner == ticket && producer.consume(view, err), "assemble by global layer/absolute position");
+            check(std::memcmp(residuals.data(), before.data(), residuals.size() * sizeof(float)) == 0,
+                  "observer preserves target local state including rejected rows");
+            // Reuse/destroy the operation's raw buffer immediately. Publication
+            // below must depend only on its owned BF16 copy, never this pointer.
+            std::fill(residuals.begin(), residuals.end(), -1000.0f);
+        }
+        check(producer.publish(err), "publish all and only committed target input rows");
+        for (auto& stage : stages) check(stage.release(ticket, err), "release every raw stage lease after owned copy");
+        const int committed = phase == d::CapturePhase::prefill ? rows : keep;
+        generations.insert(generations.end(), size_t(committed), int64_t(ticket.generation));
+        check(producer.frontier() == start + committed && producer.store().frontier() == producer.frontier(),
+              "committed frontier does not count evaluated/rejected rows");
+        const auto features = producer.store().committed_since(producer.store().retained_start());
+        check(features.request_id == "7" && features.incarnation == 9, "persistent row request/incarnation tags");
+        int position = features.start;
+        for (size_t segment = 0; segment < features.segments.size(); ++segment) {
+            check(features.generations[segment].size() * d::feature_width == features.segments[segment].size(),
+                  "generation tags follow exactly the same wrapped row extents");
+            for (size_t row = 0; row < features.generations[segment].size(); ++row, ++position) {
+                check(features.generations[segment][row] == generations[size_t(position)], "row generation survives ring wrap");
+                for (int tap = 0; tap < 5; ++tap) {
+                    const auto expected = strata::kernels::bf16_from_f32(feature_value(position, tap));
+                    const auto values = features.segments[segment].subspan(row * d::feature_width +
+                        size_t(tap) * d::hidden_size, d::hidden_size);
+                    check(std::all_of(values.begin(), values.end(), [=](uint16_t bits) { return bits == expected; }),
+                          "every retained position has exactly one correct feature for every global tap");
+                }
+            }
+        }
+        check(position == producer.frontier(), "no missing or duplicated committed positions");
+        check(producer.store().storage_bytes() == storage, "no per-window store growth");
+    };
+    // A 4102-token prompt: batched tail, verifier prompt tail, and its previously
+    // UNREAD bootstrap at n-1. The old prompt-length frontier skipped that row.
+    complete(d::CapturePhase::prefill, 0, 4097, 4097);
+    complete(d::CapturePhase::verify, 4097, 4, 4);
+    complete(d::CapturePhase::verify, 4101, 1, 1);
+    int start = 4102, rejected = 0;
+    for (int keep : {2, 1, 3, 4}) {
+        complete(d::CapturePhase::verify, start, 4, keep);
+        start += keep; rejected += 4 - keep;
+    }
+    check(producer.committed_rows() == start && producer.rejected_rows() == rejected,
+          "bootstrap and every accepted decode row counted once, rejected suffixes counted separately");
+    // A later long segment replaces all old retained context, not a persistent gap.
+    complete(d::CapturePhase::prefill, start, 2048, 2048);
+    check(producer.reset(8, 10, 37, err) && producer.store().storage_bytes() == storage &&
+          producer.store().committed_since(37).count == 0, "drained newer incarnation reuses allocations with no old rows");
+    check(!producer.reset(7, 9, 0, err), "stale request completion cannot rebind recycled storage");
+}
+
+void producer_refusals() {
+    for (int fault = 0; fault < 9; ++fault) {
+        d::CaptureProducer producer;
+        std::string err;
+        check(producer.reset(7, 9, 37, err) && producer.begin(d::CapturePhase::verify, 37, 4, err),
+              "owned refusal fixture");
+        std::vector<float> residuals(4 * d::residual_width, 1.0f);
+        d::TapView view{37, 4, 2, 5, 6, d::CapturePhase::verify,
+            d::CapturePoint::next_layer_first_gr_read_group, residuals, producer.owner()};
+        if (fault == 0) { check(!producer.publish(err), "missing taps refuse publication"); continue; }
+        if (fault == 1) ++view.owner.request;
+        if (fault == 2) ++view.owner.incarnation;
+        if (fault == 3) ++view.owner.generation;
+        if (fault == 4) ++view.start;
+        if (fault == 5) view.materialized_layer = 5;
+        if (fault == 6) view.keep = 0;
+        if (fault <= 6) check(!producer.consume(view, err), "wrong tags/position/seam/commit refuse");
+        if (fault >= 7) {
+            check(producer.consume(view, err), "first correct global tap");
+            if (fault == 8) { view.tap_layer = 15; view.materialized_layer = 16; view.keep = 3; }
+            check(!producer.consume(view, err), "duplicate tap or disagreeing stage commit count refuses");
+        }
+        check(producer.store().poisoned() && producer.frontier() == 37, "failure publishes no partial persistent context");
+    }
+    d::CaptureProducer gap;
+    std::string err;
+    check(gap.reset(7, 9, 0, err) && !gap.begin(d::CapturePhase::verify, 1, 1, err),
+          "cannot skip a committed input or use prompt length for bootstrap frontier");
+    size_t pf = 0, vr = 0, flags = 0;
+    for (const auto bounds : {std::array{0, 20}, std::array{20, 39}, std::array{39, 48}}) {
+        d::CaptureAllocation allocation;
+        check(d::CaptureAllocation::stage(bounds[0], bounds[1], allocation, err), "allocator-derived stage quote");
+        pf += allocation.prefill; vr += allocation.verify; flags += allocation.flags;
+    }
+    check(d::feature_row_bytes == 25600 && pf == 419225600 && vr == 819200 && flags == 24576,
+          "admission separates 50MiB BF16 context, 400MiB raw taps and per-stage mapped flags");
+}
 } // namespace
 
 int main() {
     try {
-        verification(); frontier(); prefill_tail(); split_stages();
+        verification(); frontier(); prefill_tail(); split_stages(); producer_split_tail(); producer_refusals();
         std::printf("dflash2 capture: %d CPU checks passed\n", checks);
         return 0;
     } catch (const std::exception& error) {

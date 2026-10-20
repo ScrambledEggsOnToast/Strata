@@ -673,6 +673,7 @@ struct Options {
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
+    bool dflash2_capture = false;     // opt-in committed feature producer; no drafter/proposal cutover
     /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
     /// the finite allowances the operator commits for the two classes that have no size API.
     /// The declared caps and outside-client allowance are explicit. Opaque-class allowances
@@ -1093,6 +1094,7 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --dflash2-capture   own the five committed target taps (opt-in CUDA build; serial fresh serve only)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -2983,6 +2985,7 @@ int main(int argc, char** argv) {
             o.expert_cache_remote[r] = v == "auto" ? std::numeric_limits<int>::max() : std::atoi(v.c_str());
         }
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
+        else if (a == "--dflash2-capture") o.dflash2_capture = true;
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
@@ -4304,6 +4307,31 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
+    if (o.dflash2_capture) {
+#if !defined(STRATA_DFLASH2_CAPTURE) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+        std::fprintf(stderr, "strata dflash2 capture: requires the CUDA STRATA_BUILD_DFLASH2_BRIDGE build\n");
+        return 2;
+#endif
+        const auto env_on = [](const char* key) {
+            const char* value = std::getenv(key);
+            return value && std::strcmp(value, "0") != 0;
+        };
+        if (!o.serve || o.spec < 1 || o.spec > strata::core::dflash2::block_size ||
+            o.batch || o.pipeline_windows != 0 || o.spec_split || o.suffix_draft || o.lookup_chain ||
+            o.prompt_cache || o.conversation_cache_mib || !o.conversation_cache_dir.empty() ||
+            o.prefill_chunk < 1 || o.prefill_auto || !o.no_prefill_borrow || o.prefill_head_alias ||
+            o.adapt_swaps || o.adapt_async || o.peer_device >= 0 || remote_caches || o.prefill_helpers ||
+            o.kv_grow || o.vram_elastic || o.vision || !o.cvec_files.empty() || o.foreground_budget_ms > 0 ||
+            o.no_capture || o.no_token_graph || o.no_pool || o.expert_profile.empty() ||
+            split_auto || split_same || o.split_skip_if_fits || packed_prefill || retained_prompt ||
+            env_on("STRATA_SPLIT_OVERLAP") || env_on("STRATA_PREFILL_RETAINED_LAYERS") ||
+            env_on("STRATA_PIPELINE_SWITCH")) {
+            std::fprintf(stderr, "strata dflash2 capture: requires fresh serial --serve --spec 1..4, explicit "
+                "--pipeline-windows 0 --prompt-cache 0, fixed owned prefill and a complete static expert profile; "
+                "no reuse, resident/pipeline/lookup/elastic/steering/helper/retained execution or placement changes\n");
+            return 2;
+        }
+    }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
@@ -4956,6 +4984,23 @@ int main(int argc, char** argv) {
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> admitted_slot_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> full_generation_cache_bytes{};
+    strata::core::dflash2::CaptureAllocation capture_allocation;
+    if (o.dflash2_capture) {
+        if (g.n_embd != strata::core::dflash2::hidden_size || g.hc != 4 || g.n_layers != 48 ||
+            o.max_context > strata::core::dflash2::max_position) {
+            std::fprintf(stderr, "strata dflash2 capture: incompatible target geometry/context\n"); return 2;
+        }
+        for (size_t st = 0; st <= split_devs.size(); ++st) {
+            strata::core::dflash2::CaptureAllocation part;
+            if (!strata::core::dflash2::CaptureAllocation::stage(
+                    st ? split_at[st - 1] : 0, st < split_at.size() ? split_at[st] : g.n_layers, part, err)) {
+                std::fprintf(stderr, "strata dflash2 capture: %s\n", err.c_str()); return 2;
+            }
+            capture_allocation.prefill += part.prefill;
+            capture_allocation.verify += part.verify;
+            capture_allocation.flags += part.flags;
+        }
+    }
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -5736,6 +5781,27 @@ int main(int argc, char** argv) {
             v0.add("expert_cache", admitted_cache_bytes,
                    "auto: floor((min(driver total, free) - fixed classes - headroom)/max_blob) slots");
         }
+        if (o.dflash2_capture) {
+            // The observer may refuse admission; it may NEVER buy its buffers by
+            // displacing experts, changing placement or silently enabling CPU misses.
+            const auto& layout = strata::kernels::cpu::expert_layout();
+            for (size_t st = 0; st <= split_devs.size(); ++st) {
+                const int64_t lo = st ? split_at[st - 1] : 0;
+                const int64_t hi = st < split_at.size() ? split_at[st] : g.n_layers;
+                uint64_t full = 0;
+                for (int64_t l = lo; l < hi; ++l)
+                    full = byte_add(full, byte_mul((uint64_t) g.n_expert,
+                        (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) layout.blob_bytes(l), slot_guard)));
+                const auto& demand = devs[st].vram;
+                const char* name = st ? "split_expert_caches" : "expert_cache";
+                const auto cache = std::find_if(demand.classes.begin(), demand.classes.end(),
+                    [&](const auto& row) { return row.name == name; });
+                if (!layout.native || cache == demand.classes.end() || cache->bytes < full) {
+                    std::fprintf(stderr, "strata dflash2 capture: BLOCKED full expert residency does not fit "
+                        "on stage %zu; no spill or placement fallback\n", st); return 1;
+                }
+            }
+        }
 
         // Retain the already committed cache budgets for the third replay owner.
         // Price their concrete all-pair allocations without spending the residual
@@ -5786,6 +5852,17 @@ int main(int argc, char** argv) {
             uploads.add(name, bytes, source, ByteMeaning::clean_file);
         };
         const uint64_t stage_count = split_real ? split_devs.size() + 1 : 1;
+        if (o.dflash2_capture) {
+            ram("dflash2_raw_prefill", capture_allocation.prefill,
+                "five stage-owned FP32 four-stream 2047-row tap buffers; not BF16 features");
+            ram("dflash2_raw_verify", capture_allocation.verify,
+                "five stage-owned FP32 four-stream four-row tap buffers");
+            ram("dflash2_replay_flags", capture_allocation.flags,
+                "two mapped replay words per stage, each page-rounded");
+            ram("dflash2_committed_features", strata::core::dflash2::CaptureStore::planned_bytes() +
+                sizeof(strata::core::dflash2::CaptureProducer) + 4096,
+                "2047 committed + 2047 tentative BF16 rows at 25600 B/row, generation tags and fixed producer metadata");
+        }
         ram("session_host_pinned", session_host_pinned,
             "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
         if (!o.mtp.empty() && o.spec >= 2) {
@@ -6419,6 +6496,18 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+#if defined(STRATA_DFLASH2_CAPTURE)
+    // Owned BF16 storage is allocated once after admission and BEFORE expert sizing.
+    std::unique_ptr<strata::core::dflash2::CaptureProducer> feature_capture;
+    if (o.dflash2_capture) {
+        feature_capture = std::make_unique<strata::core::dflash2::CaptureProducer>();
+        std::fprintf(stderr, "DFLASH2_ALLOCATION feature_row_bytes=%zu committed_payload_bytes=%zu "
+            "store_bytes=%zu raw_prefill_planned_bytes=%zu raw_verify_planned_bytes=%zu replay_flag_planned_bytes=%zu\n",
+            strata::core::dflash2::feature_row_bytes, strata::core::dflash2::max_feature_bytes,
+            feature_capture->store().storage_bytes(), capture_allocation.prefill,
+            capture_allocation.verify, capture_allocation.flags);
+    }
+#endif
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
@@ -8698,7 +8787,7 @@ int main(int argc, char** argv) {
         constexpr int kSmallReserveMib = 300;
         const int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
             ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
-        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
+        if (!o.dflash2_capture && o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
@@ -8745,6 +8834,9 @@ int main(int argc, char** argv) {
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
+            if (o.dflash2_capture) {
+                std::fprintf(stderr, "strata dflash2 capture: BLOCKED fixed expert allocation/reserve does not fit\n"); return 1;
+            }
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
             std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
                                  "prompt path's buffers (%lld MiB) and the %d MiB reserve on CUDA0: %lld slots instead "
@@ -8925,7 +9017,7 @@ int main(int argc, char** argv) {
                     std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
                                   (double) ms.ullAvailPageFile / 1073741824.0);
 #endif
-                if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
+                if (!o.dflash2_capture && auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
                     std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
                                  commit, o.expert_cache);
@@ -8946,6 +9038,10 @@ int main(int argc, char** argv) {
             free_b = strata::core::device_free_bytes(); (void) total_b;
             const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
+            if (o.dflash2_capture) {
+                std::fprintf(stderr, "strata dflash2 capture: BLOCKED reserve would require expert-cache shrink\n");
+                return 1;
+            }
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
             int64_t give = want - (int64_t) free_b + (64ll << 20);
@@ -9240,6 +9336,9 @@ int main(int argc, char** argv) {
         // gives slot i the capacity of the pair at order[i].  Truncating before the loop resized the order to the
         // empty vector it had not filled yet, so every stage admitted no slots and the start failed.
         if (order.size() > sized.size()) {
+            if (o.dflash2_capture) {
+                std::fprintf(stderr, "strata dflash2 capture: BLOCKED stage expert allocation would be truncated\n"); return 1;
+            }
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the profile ranks %zu pairs, this stage "
                                  "admits %zu slots; keeping the %zu hottest and streaming the rest\n",
                          st.dev, order.size(), sized.size(), sized.size());
@@ -9262,7 +9361,7 @@ int main(int argc, char** argv) {
         for (int attempt = 0; !sized.empty(); ++attempt) {
             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
-            if (stage_open || attempt >= 3) break;
+            if (stage_open || o.dflash2_capture || attempt >= 3) break;
             (void) cudaGetLastError();
             const size_t keep = sized.size() * 9 / 10;
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s; trying %zu of %zu slots "
@@ -9431,6 +9530,15 @@ int main(int argc, char** argv) {
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
+    }
+    if (o.dflash2_capture) {
+        for (int64_t l = 0; l < g.n_layers; ++l) for (int64_t e = 0; e < g.n_expert; ++e) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            const auto& cache = st ? stages[size_t(st - 1)]->cache : xcache;
+            if (cache.slot_of(l, e) < 0) {
+                std::fprintf(stderr, "strata dflash2 capture: BLOCKED incomplete concrete expert residency\n"); return 1;
+            }
+        }
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
@@ -11183,6 +11291,11 @@ int main(int argc, char** argv) {
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
         strata::prefill::Prefill sp;
+        if (o.dflash2_capture) {
+            if (!sp.enable_dflash2_capture(err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            for (auto& stage : stages)
+                if (!stage->sp.enable_dflash2_capture(err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        }
         // The admitted choice remains fixed even if batching/split eligibility fell back during setup.
         const bool share_pool = prefill_share_pool;
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
@@ -11562,7 +11675,7 @@ int main(int argc, char** argv) {
             int dev = 0;
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
-                if (o.batch_mtp_third) {
+                if (o.batch_mtp_third || o.dflash2_capture) {
                     std::fprintf(stderr, "strata fixed-capacity mode: generation prefill geometry does not fit; refusing, never resizing it\n");
                     return 1;
                 }
@@ -11584,7 +11697,7 @@ int main(int argc, char** argv) {
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
-            if (o.batch_mtp_third) {
+            if (o.batch_mtp_third || o.dflash2_capture) {
                 std::fprintf(stderr, "strata fixed-capacity mode: %s; refusing, never retrying with reduced generation capacity\n", err.c_str());
                 return 1;
             }
@@ -11755,6 +11868,11 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        if (o.dflash2_capture)
+            for (int st = 0; st < n_stages; ++st)
+                if (!stage_ver(st).enable_dflash2_capture(err)) {
+                    std::fprintf(stderr, "%s\n", err.c_str()); return 1;
+                }
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
@@ -12012,6 +12130,57 @@ int main(int argc, char** argv) {
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+#if defined(STRATA_DFLASH2_CAPTURE)
+        auto capture_prompt_stage = [&](int st) -> strata::prefill::Prefill& {
+            return st ? stages[size_t(st - 1)]->sp : sp;
+        };
+        auto capture_begin = [&](strata::core::dflash2::CapturePhase kind, int64_t start, int64_t count,
+                                 std::string& e) -> bool {
+            if (!feature_capture) return true;
+            if (!feature_capture->begin(kind, start, count, e)) return false;
+            const auto owner = feature_capture->owner();
+            const int64_t frontier = kind == strata::core::dflash2::CapturePhase::prefill ? start + count : start;
+            for (int st = 0; st < n_stages; ++st) {
+                const bool okay = kind == strata::core::dflash2::CapturePhase::prefill
+                    ? capture_prompt_stage(st).arm_dflash2_capture(owner, frontier, start, count, e)
+                    : stage_ver(st).arm_dflash2_capture(owner, frontier, start, int(count), e);
+                if (!okay) { feature_capture->abort(); return false; }
+            }
+            return true;
+        };
+        auto capture_finish = [&](strata::core::dflash2::CapturePhase kind, std::string& e) -> bool {
+            if (!feature_capture) return true;
+            // commit() propagates its actual keep to every stage. This recursive
+            // wait must drain ALL of them before a single borrowed payload is read.
+            if (kind == strata::core::dflash2::CapturePhase::verify && !ver.wait_commit(e)) {
+                feature_capture->abort(); return false;
+            }
+            const auto owner = feature_capture->owner();
+            for (int tap : strata::core::dflash2::tap_layers) {
+                const int st = multi_gpu ? stage_of(tap) : 0; // global layer, NEVER device ordinal/arrival
+                strata::core::dflash2::TapView view;
+                const bool okay = kind == strata::core::dflash2::CapturePhase::prefill
+                    ? capture_prompt_stage(st).dflash2_tap(owner, tap, view, e)
+                    : stage_ver(st).dflash2_tap(owner, tap, view, e);
+                if (!okay || !feature_capture->consume(view, e)) { feature_capture->abort(); return false; }
+            }
+            if (!feature_capture->publish(e)) return false;
+            for (int st = 0; st < n_stages; ++st) {
+                const bool okay = kind == strata::core::dflash2::CapturePhase::prefill
+                    ? capture_prompt_stage(st).release_dflash2_capture(owner, e)
+                    : stage_ver(st).release_dflash2_capture(owner, e);
+                if (!okay) { feature_capture->abort(); return false; }
+            }
+            std::fprintf(stderr, "DFLASH2_COMMITTED request=%llu incarnation=%llu generation=%llu "
+                "phase=%s frontier=%d retained_start=%d committed_rows=%lld rejected_rows=%lld taps=5\n",
+                (unsigned long long) owner.request, (unsigned long long) owner.incarnation,
+                (unsigned long long) owner.generation,
+                kind == strata::core::dflash2::CapturePhase::prefill ? "prefill" : "verify",
+                feature_capture->frontier(), feature_capture->store().retained_start(),
+                (long long) feature_capture->committed_rows(), (long long) feature_capture->rejected_rows());
+            return true;
+        };
+#endif
         if (o.retire_resident_source) {
             const auto refuse = [](const char* reason) {
                 std::fprintf(stderr, "strata serve: source retirement refused: %s\n", reason);
@@ -20517,6 +20686,12 @@ int main(int argc, char** argv) {
             // skip prefix rows based on this request's longer private suffix.
             req_times = ReqTimes{};
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (feature_capture && (read_from != 0 ||
+                !feature_capture->reset(resident.working().request, resident.working().request, 0, err))) {
+                phase_error("ERR dflash2 capture requires a fresh request: %s\n", err.c_str()); return 1;
+            }
+#endif
             if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && read_from < req_pin ? req_pin + 1 : n);
             if (use_mtp) mtp.set_boundary_capture(store_man2 && req_shared_scope.valid() && read_from < req_pin
                                                    ? req_pin - 1 : -1);
@@ -20699,6 +20874,9 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (!capture_begin(strata::core::dflash2::CapturePhase::verify, q, T, e)) return false;
+#endif
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -20754,6 +20932,9 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (!capture_finish(strata::core::dflash2::CapturePhase::verify, e)) return false;
+#endif
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -21042,7 +21223,14 @@ int main(int argc, char** argv) {
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     phase::Span phase_span(phase_current, phase::Stage::prefill_run);
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    return sp.run(ids.data() + q, r - q, q, e);
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (!capture_begin(strata::core::dflash2::CapturePhase::prefill, q, r - q, e)) return false;
+#endif
+                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
+#endif
+                    return true;
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
@@ -22767,6 +22955,13 @@ int main(int argc, char** argv) {
                 // Unchanged MTP q must never judge a modified draft token.
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1 && o.spec_corrupt <= 0)
                     ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+#if defined(STRATA_DFLASH2_CAPTURE)
+                // Prefill stops at n-1 EXCLUSIVE. Bootstrap at n-1 is a new
+                // committed INPUT row, not a duplicate of the prompt capture.
+                if (!capture_begin(strata::core::dflash2::CapturePhase::verify, p, T, err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+#endif
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     phase_error("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -22831,6 +23026,12 @@ int main(int argc, char** argv) {
                     finish = "nonfinite";
                     break;
                 }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (!capture_finish(strata::core::dflash2::CapturePhase::verify, err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+#endif
                 if (committed_logit_prefix != nullptr) {
                     // Commit leaves the verified head rows intact. Read the final
                     // stage before MTP can overwrite it, and only the emitted prefix.

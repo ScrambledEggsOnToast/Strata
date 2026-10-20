@@ -110,7 +110,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
-option(STRATA_BUILD_DFLASH2_BRIDGE "Build the Linux host-only DFlash2 capture/reference bridge and CPU tests" OFF)
+option(STRATA_BUILD_DFLASH2_BRIDGE "Build the Linux DFlash2 owned capture/reference bridge and CPU tests" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
@@ -298,14 +298,14 @@ if(STRATA_BUILD_DFLASH2_BRIDGE OR STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_native_identity PRIVATE strata_warnings OpenSSL::Crypto)
 endif()
 
-# Opt-in CPU enabler only: no device runtime, serving flags or target kernels.
+# Opt-in owned capture and CPU reference bridge; serving capture is CUDA-only.
 # Reuse the vendored JSON parser; the bridge refuses duplicate keys itself.
 if(STRATA_BUILD_DFLASH2_BRIDGE)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "STRATA_BUILD_DFLASH2_BRIDGE requires Linux anonymous AF_UNIX socketpairs")
   endif()
   find_package(Threads REQUIRED)
-  add_library(strata_dflash2_bridge STATIC src/core/dflash2_bridge.cpp src/core/dflash2_target.cpp)
+  add_library(strata_dflash2_bridge STATIC src/core/dflash2_bridge.cpp src/core/dflash2_target.cpp src/core/dflash2_capture.cpp)
   target_include_directories(strata_dflash2_bridge PUBLIC include PRIVATE third_party/llama.cpp/vendor)
   target_link_libraries(strata_dflash2_bridge PRIVATE strata_warnings Threads::Threads strata_native_identity)
   target_compile_options(strata_dflash2_bridge PRIVATE
@@ -326,7 +326,7 @@ if(STRATA_BUILD_DFLASH2_BRIDGE)
   set_tests_properties(dflash2_target_test PROPERTIES TIMEOUT 30)
   add_executable(dflash2_capture_test tests/core/dflash2_capture_test.cpp)
   target_include_directories(dflash2_capture_test PRIVATE include)
-  target_link_libraries(dflash2_capture_test PRIVATE strata_warnings)
+  target_link_libraries(dflash2_capture_test PRIVATE strata_dflash2_bridge strata_warnings)
   add_test(NAME dflash2_capture_test COMMAND dflash2_capture_test)
   set_tests_properties(dflash2_capture_test PROPERTIES TIMEOUT 30)
   set(STRATA_DFLASH2_TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH
@@ -771,6 +771,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_sources(strata_engine PRIVATE src/core/dflash2_native_target.cpp)
     target_include_directories(strata_engine PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(strata_engine PRIVATE strata_dflash2_bridge)
+    target_compile_definitions(strata_engine PUBLIC STRATA_DFLASH2_CAPTURE=1)
   endif()
   if(STRATA_BUILD_TESTS)
     add_executable(session_owner_test tests/core/session_owner_test.cpp)

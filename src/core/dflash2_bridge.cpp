@@ -219,10 +219,18 @@ CaptureStore::CaptureStore(std::string request_id, int64_t incarnation, int orig
     require(capacity > 0 && capacity <= context_rows, "capture capacity must be in [1,2047]");
     ring_ = std::make_unique_for_overwrite<uint16_t[]>(size_t(context_rows) * feature_width);
     tentative_ = std::make_unique_for_overwrite<uint16_t[]>(size_t(capacity) * feature_width);
+    ring_generations_ = std::make_unique_for_overwrite<int64_t[]>(context_rows);
 }
 CaptureStore::~CaptureStore() = default;
 size_t CaptureStore::storage_bytes() const noexcept {
-    return (size_t(context_rows) + size_t(capacity_)) * feature_row_bytes;
+    return planned_bytes(capacity_);
+}
+void CaptureStore::reset(std::string request_id, int64_t incarnation, int origin) {
+    validate_operation({request_id, incarnation, 1, origin});
+    require(!poisoned_ && !active_ && !bridge_attached_ && incarnation > incarnation_,
+            "cannot rebind a stale/poisoned/busy/attached feature store");
+    request_id_ = std::move(request_id); incarnation_ = incarnation; origin_ = origin;
+    generation_ = 0; end_ = origin; retained_ = 0; head_ = 0; seen_ = 0;
 }
 bool CaptureStore::owns(const Operation& op) const {
     return op.request_id == request_id_ && op.incarnation == incarnation_;
@@ -234,9 +242,12 @@ void CaptureStore::begin(const Operation& op, int start, int count, CapturePhase
         validate_operation(op);
         require(!poisoned_ && !active_ && owns(op) && op.generation > generation_,
                 "stale/unowned or busy capture");
+        // A full retained prefill tail may replace all prior context atomically.
+        // A shorter interval cannot skip even one committed input position.
+        const bool replaces_context = phase == CapturePhase::prefill && count == context_rows && start > end_;
         require((phase == CapturePhase::prefill || phase == CapturePhase::verify) &&
-                count > 0 && count <= capacity_ && start == end_ && start <= max_position - count,
-                "noncontiguous or oversized capture extent");
+                count > 0 && count <= capacity_ && (start == end_ || replaces_context) &&
+                start <= max_position - count, "noncontiguous or oversized capture extent");
         require(phase == CapturePhase::prefill ? start + count == op.frontier :
                 (start == op.frontier && count <= block_size), "capture phase/frontier mismatch");
         operation_ = op;
@@ -295,6 +306,7 @@ void CaptureStore::commit(const Operation& op, int keep) {
         const int slot = (head_ + retained_) % context_rows;
         std::memcpy(ring_.get() + size_t(slot) * feature_width,
                     tentative_.get() + size_t(row) * feature_width, feature_row_bytes);
+        ring_generations_[size_t(slot)] = op.generation;
         if (retained_ == context_rows) head_ = (head_ + 1) % context_rows;
         else ++retained_;
     }
@@ -310,10 +322,13 @@ FeatureView CaptureStore::committed_since(int start) const {
             "committed feature coverage is unavailable or capture is still tentative");
     FeatureView result;
     result.start = start; result.count = end_ - start;
+    result.request_id = request_id_; result.incarnation = incarnation_;
     const int slot = (head_ + start - retained_start()) % context_rows;
     const int first = std::min(result.count, context_rows - slot);
     result.segments[0] = {ring_.get() + size_t(slot) * feature_width, size_t(first) * feature_width};
     result.segments[1] = {ring_.get(), size_t(result.count - first) * feature_width};
+    result.generations[0] = {ring_generations_.get() + slot, size_t(first)};
+    result.generations[1] = {ring_generations_.get(), size_t(result.count - first)};
     return result;
 }
 

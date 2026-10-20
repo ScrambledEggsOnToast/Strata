@@ -167,7 +167,7 @@ public:
 
     /// Capture-only opt-in BEFORE init/prepare_graphs. No proposer or store publication.
     /// Arm each split stage separately; taps crossing a stage hand-off are refused.
-    /// The first p=frontier-1,T=1 bootstrap window deliberately captures nothing.
+    /// Frontier is committed INPUT count: the unread p=n-1 bootstrap is captured.
     /// Views require commit + wait_commit and remain borrowed until release; a
     /// completed capture blocks scratch reuse/request rebinding until released.
     bool enable_dflash2_capture(std::string& err);

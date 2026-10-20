@@ -1,4 +1,4 @@
-// DFlash2 target tap staging contract; no proposal or CaptureStore publication.
+// Owned DFlash2 capture admission and operation-scoped target tap staging.
 #pragma once
 
 #include "strata/core/dflash2_bridge.hpp"
@@ -23,6 +23,7 @@ struct TapView {
     CapturePhase phase = CapturePhase::prefill;
     CapturePoint point = CapturePoint::completed_second_residual_write;
     std::span<const float> residuals; // immutable [row, four streams, 2560]
+    CaptureOwner owner;
 };
 struct CaptureSlice {
     int source_row = 0, staging_row = 0, count = 0;
@@ -53,20 +54,19 @@ public:
     }
 
     // Prefill retains the final <=2047 rows of this exact run, even across chunks.
-    // Verification starts at frontier. The bootstrap p=frontier-1,T=1 is allowed
-    // but deliberately has NO taps: prompt capture already owns that position.
+    // Verification starts at the committed INPUT frontier, including bootstrap.
+    // A prompt-length frontier would silently omit the unread final prompt row.
     bool arm(CaptureOwner owner, int64_t frontier, int64_t start, int64_t count, std::string& err) {
         if (!configured_ || status_ != Status::idle || !owner.request || !owner.generation ||
             (owner.request == owner_.request && owner.incarnation == owner_.incarnation &&
              owner.generation <= owner_.generation) || start < 0 || count < 1 ||
             start > max_position - count || frontier < 0 || frontier > max_position)
             return refuse(err, "invalid, stale or overlapping capture owner/range");
-        const bool bootstrap = phase_ == CapturePhase::verify && start == frontier - 1 && count == 1;
         if (phase_ == CapturePhase::verify ?
-                (count > capacity_ || (start != frontier && !bootstrap)) : start + count != frontier)
+                (count > capacity_ || start != frontier) : start + count != frontier)
             return refuse(err, "capture does not match the committed frontier");
         owner_ = owner; run_start_ = int(start); run_end_ = int(start + count); next_run_ = run_start_;
-        count_ = bootstrap ? 0 : int(std::min<int64_t>(count, capacity_));
+        count_ = int(std::min<int64_t>(count, capacity_));
         start_ = phase_ == CapturePhase::prefill ? run_end_ - count_ : run_start_;
         written_.fill(0); keep_ = 0; status_ = Status::armed;
         return true;
@@ -83,7 +83,7 @@ public:
         return true;
     }
     CaptureSlice slice(int64_t start, int64_t count) const {
-        if (!running() || count_ == 0) return {};
+        if (!running()) return {};
         const int64_t first = std::max<int64_t>(start, start_);
         const int64_t end = std::min<int64_t>(start + count, start_ + count_);
         if (end <= first) return {};
@@ -116,7 +116,7 @@ public:
         if (phase_ != CapturePhase::verify || status_ != Status::verified || keep < 1 ||
             keep > run_end_ - run_start_)
             return refuse(err, "capture commit does not own a verified prefix");
-        keep_ = count_ ? keep : 0; status_ = Status::committing;
+        keep_ = keep; status_ = Status::committing;
         return true;
     }
     bool waited(std::string& err) {
@@ -132,7 +132,7 @@ public:
         out = {start_, count_, keep_, layer, layer + (phase_ == CapturePhase::verify ? 1 : 0), phase_,
                phase_ == CapturePhase::verify ? CapturePoint::next_layer_first_gr_read_group :
                                                CapturePoint::completed_second_residual_write,
-               {host, size_t(count_) * residual_width}};
+               {host, size_t(count_) * residual_width}, owner_};
         return true;
     }
     bool release(CaptureOwner owner, std::string& err) {
@@ -162,5 +162,54 @@ private:
     unsigned mask_ = 0;
     CaptureOwner owner_;
     std::array<int, tap_layers.size()> written_{};
+};
+
+// Mapped raw staging is NOT the BF16 feature bound. Quote each owning layer range
+// once; CUDA host allocations are charged at page granularity, including flags.
+struct CaptureAllocation {
+    size_t prefill = 0, verify = 0, flags = 0;
+    size_t mapped_bytes() const { return prefill + verify + flags; }
+    static bool stage(int64_t lb, int64_t le, CaptureAllocation& out, std::string& err) {
+        TapCaptureState pf, vr;
+        if (!pf.configure(CapturePhase::prefill, context_rows, lb, le, hidden_size, 4, 48, err) ||
+            !vr.configure(CapturePhase::verify, block_size, lb, le, hidden_size, 4, 48, err)) return false;
+        auto pages = [](size_t n) { return (n + 4095) / 4096 * 4096; };
+        out = {};
+        for (size_t i = 0; i < tap_layers.size(); ++i) {
+            if (pf.owns_tap(int(i))) out.prefill += pages(size_t(context_rows) * residual_row_bytes);
+            if (vr.owns_tap(int(i))) out.verify += pages(size_t(block_size) * residual_row_bytes);
+        }
+        out.flags = 2 * pages(sizeof(uint32_t));
+        return true;
+    }
+};
+
+// One serial committed-input frontier, not prompt length or emitted-token count.
+// begin() fences the target operation; consume() copies/reduces only host-complete
+// committed prefixes and NEVER retains a TapView/pointer. publish() has no caller
+// keep argument: the target's completed views are the authoritative commit count.
+class CaptureProducer {
+public:
+    CaptureProducer();
+    bool reset(uint64_t request, uint64_t incarnation, int origin, std::string& err);
+    bool begin(CapturePhase, int64_t start, int64_t count, std::string& err);
+    bool consume(const TapView&, std::string& err);
+    bool publish(std::string& err);
+    CaptureOwner owner() const { return owner_; }
+    const CaptureStore& store() const { return store_; }
+    int frontier() const { return frontier_; }
+    int64_t committed_rows() const { return committed_rows_; }
+    int64_t rejected_rows() const { return rejected_rows_; }
+    void abort() noexcept { poisoned_ = true; active_ = false; store_.abort(); }
+private:
+    CaptureStore store_;
+    CaptureOwner owner_;
+    Operation operation_;
+    CapturePhase phase_ = CapturePhase::prefill;
+    int frontier_ = 0, run_start_ = 0, run_count_ = 0, start_ = 0, count_ = 0, keep_ = 0;
+    int64_t committed_rows_ = 0, rejected_rows_ = 0;
+    unsigned seen_ = 0;
+    bool active_ = false, poisoned_ = false;
+    std::array<int, context_rows> positions_{};
 };
 } // namespace strata::core::dflash2
