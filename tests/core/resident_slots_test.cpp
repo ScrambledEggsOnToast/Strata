@@ -53,6 +53,22 @@ struct ResidentDraftReadinessFixture {
         std::string error;
         check(decide_draft_readiness(slots.certify_continuation(0), 48, 40, 40960).ready,
               "a certified target and a nonzero valid draft interval are ready without reconstruction");
+        // #257: parked rows may extend past their independently completed draft frontier.
+        chain.completed_cells = 12; chain.tail_token = 112;
+        const auto parked = slots.certify_continuation(0);
+        check(chain.begin < chain.completed_cells && chain.completed_cells < chain.cells &&
+              parked.certified && parked.refusal == ContinuationRefusal::none &&
+              parked.draft_frontier == 12 && parked.draft_end == 12 && parked.valid_end == 16 &&
+              parked.draft_ready,
+              "a partial parked certificate is ready at its frontier inside the parked interval");
+        check(decide_draft_readiness(parked, 48, 40, 40960).ready,
+              "the retained window is covered at the completed frontier, not the parked extent");
+        chain.tail_token = 116;
+        const auto wrong_boundary = slots.certify_continuation(0);
+        check(!wrong_boundary.certified && !wrong_boundary.draft_ready &&
+              wrong_boundary.refusal == ContinuationRefusal::draft_boundary,
+              "the boundary token must match ids[12], not the token at the parked extent");
+        chain.completed_cells = 16; chain.tail_token = 116;
         const auto unchanged = [&] {
             return source.request == 17 && source.incarnation == 3 && source.partial && !source.failed &&
                 source.ids.size() == 16 && source.ids.front() == 100 && source.ids.back() == 115 &&
