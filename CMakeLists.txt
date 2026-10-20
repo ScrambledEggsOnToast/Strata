@@ -481,6 +481,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/router_top10.cu
                           src/kernels/cuda/quantize_act.cu
                           src/kernels/cuda/rope.cu
+                          src/kernels/rope_table.cpp
                           src/kernels/cuda/sampler.cu
                           src/kernels/cuda/s2_gemv_q8.cu
     src/kernels/cuda/s2_expert_grouped.cu
@@ -710,6 +711,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_options(session_owner_test PRIVATE
         -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost
         -Wl,--wrap=cudaHostGetDevicePointer -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize)
+      if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+        # Actual SessionOwner init/teardown, with no GPU calls forwarded. This is an
+        # allocation/lifetime contract, not a device, kernel or model execution test.
+        # HIP aliases use different runtime symbols, so CUDA wrappers cannot cover them.
+        add_executable(session_owner_no_load_test tests/core/session_owner_no_load_test.cpp)
+        target_link_libraries(session_owner_no_load_test PRIVATE strata_engine)
+        target_link_options(session_owner_no_load_test PRIVATE
+          -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree
+          -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost -Wl,--wrap=cudaHostGetDevicePointer
+          -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetErrorString)
+        add_test(NAME session_owner_no_load_shared COMMAND session_owner_no_load_test)
+        set_tests_properties(session_owner_no_load_shared PROPERTIES
+          ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;STRATA_SHARED_ROPE=1;STRATA_ROPE_TABLE=1" TIMEOUT 60)
+        add_test(NAME session_owner_no_load_dedicated COMMAND session_owner_no_load_test)
+        set_tests_properties(session_owner_no_load_dedicated PROPERTIES
+          ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;STRATA_SHARED_ROPE=0;STRATA_ROPE_TABLE=1" TIMEOUT 60)
+      endif()
     endif()
   endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -920,6 +938,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(serial_judge_test PRIVATE strata_resident)
     add_test(NAME serial_judge_pricing COMMAND serial_judge_test)
     set_tests_properties(serial_judge_pricing PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
+    add_test(NAME serial_judge_pricing_shared COMMAND serial_judge_test)
+    set_tests_properties(serial_judge_pricing_shared PROPERTIES
+      ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;STRATA_SHARED_ROPE=1" TIMEOUT 60)
   endif()
   add_executable(prefill_allocation_test tests/core/prefill_allocation_test.cpp)
   target_link_libraries(prefill_allocation_test PRIVATE strata_prefill)
@@ -1594,6 +1615,11 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(score_protocol_test tests/program/score_protocol_test.cpp)
   target_include_directories(score_protocol_test PRIVATE include)
   add_test(NAME score_protocol_test COMMAND score_protocol_test)
+  add_executable(shared_rope_test tests/core/shared_rope_test.cpp src/kernels/rope_table.cpp)
+  target_include_directories(shared_rope_test PRIVATE include)
+  target_link_libraries(shared_rope_test PRIVATE strata_warnings)
+  add_test(NAME shared_rope_test COMMAND shared_rope_test)
+  set_tests_properties(shared_rope_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)

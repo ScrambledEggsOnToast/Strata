@@ -162,6 +162,29 @@ int main() {
               "one private retained owner consistently satisfies both MTP and foreground-budget minimums");
     }
     {
+        auto in = resident_batch();
+        in.retained_prompt = true;
+        in.judge_lane = true;
+        const auto p = ep::resolve_execution_plan(in);
+        check(p.refused && p.refusal ==
+              "retained prompt excludes the judge lane: private preparation ownership is not ported",
+              "retained prompt and short judge ownership refuse explicitly, even with otherwise static owners");
+        in.retained_prompt = false;
+        in.batch_mtp = in.batch_mtp_pipeline = false;
+        const auto q = ep::resolve_execution_plan(in);
+        check(!q.refused && q.concurrent_reader.support == ep::Support::off &&
+              q.concurrent_reader.reason == "the judge lane",
+              "a short judge lane does not silently enable the independent concurrent reader");
+        ep::ExecutionPlanInput pair;
+        pair.serve = pair.judge_lane = true;
+        pair.later_stages = 1;
+        pair.prefill_chunk = 1024;
+        const auto serial = ep::resolve_execution_plan(pair);
+        check(!serial.refused && serial.stages == 2 && serial.batch_slots == 0 &&
+              serial.proposal == ep::ProposalShape::none,
+              "the two-V100 one-generation-owner shape composes serially, without invented peers or MTP slots");
+    }
+    {
         ep::ExecutionPlanInput in;
         in.spec_requested = 4;
         in.suffix_draft = 12;

@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
 #include "strata/core/kv_shared_pool.hpp"
+#include "strata/core/shared_rope.hpp"
 #include <array>
 #include <stdexcept>
 #include "strata/core/native_dense.hpp"
@@ -725,34 +726,29 @@ namespace {
 // Bounded process ownership, deliberately not session ownership. No CUDA calls in a static
 // destructor: CUDA tears this storage down with the process, AFTER every possible graph borrower.
 // Never replace an entry, including after a failed session init. Device reset is unsupported.
-struct SharedRope {
-    float* data = nullptr;
-    int64_t cells = 0, n_rot = 0;
-    strata::kernels::RopeScaling scaling;
-};
 constexpr int kSharedRopeDevices = 64;
-SharedRope shared_rope[kSharedRopeDevices];
+SharedRopeTable shared_rope[kSharedRopeDevices];
 std::mutex shared_rope_mutex;
-bool same_rope_scaling(const strata::kernels::RopeScaling& a, const strata::kernels::RopeScaling& b) {
-    return a.type == b.type && a.freq_base == b.freq_base && a.factor == b.factor &&
-           a.freq_scale_in == b.freq_scale_in && a.orig_ctx == b.orig_ctx &&
-           a.ext_factor == b.ext_factor && a.attn_factor == b.attn_factor &&
-           a.beta_fast == b.beta_fast && a.beta_slow == b.beta_slow;
-}
 bool acquire_shared_rope(const ModelGeometry& g, int64_t cells, float*& cosine, float*& sine) {
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kSharedRopeDevices) return false;
     const auto shape = qsa_shapes(g);
+    if (const char* why = SharedRopeTable::invalid_geometry(cells, shape.n_rot)) {
+        std::fprintf(stderr, "strata: %s on device %d\n", why, device);
+        return false;
+    }
     const auto scaling = strata::kernels::rope_scaling();
     const std::lock_guard<std::mutex> lock(shared_rope_mutex);
     auto& entry = shared_rope[device];
-    const size_t count = (size_t) cells * (shape.n_rot / 2);
+    SharedRopeView view;
     if (entry.data) {
-        if (entry.cells != cells || entry.n_rot != shape.n_rot || !same_rope_scaling(entry.scaling, scaling)) {
-            std::fprintf(stderr, "strata: shared RoPE refuses a second geometry/scaling on device %d\n", device);
+        if (const char* why = entry.borrow(device, device, cells, shape.n_rot, scaling, view)) {
+            std::fprintf(stderr, "strata: %s on device %d (requested=%lld capacity=%lld)\n",
+                         why, device, (long long)cells, (long long)entry.cells);
             return false;
         }
     } else {
+        const size_t count = (size_t) cells * (shape.n_rot / 2);
         std::vector<float> hc(count), hs(count);
         strata::kernels::build_rope_table((int) shape.n_rot, scaling, (int) cells, hc.data(), hs.data());
         float* data = nullptr;
@@ -762,14 +758,15 @@ bool acquire_shared_rope(const ModelGeometry& g, int64_t cells, float*& cosine, 
             if (cudaFree(data) != cudaSuccess) std::terminate();
             return false; // never publish a partly uploaded table
         }
-        entry = SharedRope{data, cells, shape.n_rot, scaling};
+        entry = SharedRopeTable{data, cells, shape.n_rot, scaling};
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "STATE_SHARED_ROPE device=%d bytes=%llu cells=%lld n_rot=%lld lifetime=process\n",
                          device, (unsigned long long) shared_rope_device_bytes(g, cells),
                          (long long) cells, (long long) shape.n_rot);
+        if (entry.borrow(device, device, cells, shape.n_rot, scaling, view)) std::terminate();
     }
-    cosine = entry.data;
-    sine = entry.data + count;
+    cosine = view.cosine;
+    sine = view.sine;
     return true;
 }
 } // namespace
@@ -787,6 +784,18 @@ uint64_t shared_rope_device_bytes(const ModelGeometry& g, int64_t cells) {
 }
 uint64_t shared_rope_host_bytes() {
     return shared_rope_enabled() ? sizeof(shared_rope) + sizeof(shared_rope_mutex) : 0;
+}
+const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device,
+                                      bool require_existing) {
+    if (!shared_rope_enabled()) return nullptr;
+    if (device < 0 || device >= kSharedRopeDevices) return "shared RoPE: allocation device is outside the registry";
+    const auto shape = qsa_shapes(g);
+    if (const char* why = SharedRopeTable::invalid_geometry(cells, shape.n_rot)) return why;
+    const std::lock_guard<std::mutex> lock(shared_rope_mutex);
+    const auto& entry = shared_rope[device];
+    if (!entry.data && !require_existing) return nullptr; // first generation owner will publish
+    SharedRopeView view;
+    return entry.borrow(device, device, cells, shape.n_rot, strata::kernels::rope_scaling(), view);
 }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
@@ -863,6 +872,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (!a.valid || a.extent != priced) {
         std::fprintf(stderr, "strata: QSA placement/pricing/carving extent mismatch\n");
         return 0; // before any secondary allocation or device write
+    }
+    if (!share_rope && shared_rope_enabled()) {
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) return 0;
+        if (const char* why = shared_rope_session_invalid(g, max_cells, device)) {
+            std::fprintf(stderr, "strata: %s on device %d\n", why, device);
+            return 0;
+        }
     }
     uint8_t* b = static_cast<uint8_t*>(base);
     static std::atomic<uint64_t> next_id{0};

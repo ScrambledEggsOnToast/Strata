@@ -13,11 +13,13 @@ No scheduling, session binding, model, routing or sampling code was changed.
 
 ## Ownership and pricing
 
-The table lives outside QSA/session arenas. A fixed 64-device registry admits one
-exact `(device, max_cells, n_rot, all RopeScaling fields)` key per device. A second
-incompatible key refuses initialization instead of replacing captured addresses.
-Different judge context is refused early by generate when the switch is enabled.
-This deliberately bounded candidate does not implement a multi-model table cache.
+The original candidate admitted one exact
+`(device, max_cells, n_rot, all RopeScaling fields)` key per device and refused
+a different judge context early. The checked short-state extension in
+[Serial judge execution ownership](../DETAILS.md#serial-judge-execution-ownership)
+now permits a compatible shorter view of the same immutable capacity. A larger
+capacity or different rotary geometry/scaling still refuses rather than
+replacing captured addresses. This is not a multi-model table cache.
 
 Published tables remain allocated until process exit, including after all sessions
 are released or an initialization fails later. No static destructor calls CUDA.

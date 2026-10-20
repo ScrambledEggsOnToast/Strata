@@ -232,6 +232,8 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
             refusal = "retained prompt needs batch MTP and --spec >= 2";
         else if (in.packed_prefill || in.retained_prefill)
             refusal = "retained prompt excludes packed and retained-layer execution";
+        else if (in.judge_lane)
+            refusal = "retained prompt excludes the judge lane: private preparation ownership is not ported";
         else if (in.prefill_chunk != 2048 || !in.private_preparation_static)
             refusal = "retained prompt needs fixed 2048 scratch and static text owners";
         if (!refusal.empty()) {

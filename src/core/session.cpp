@@ -152,7 +152,6 @@ bool SessionOwner::init(const ModelGeometry& g, int64_t max_cells, int64_t k, st
     err.clear();
     if (arena_) { err = "session: owner already initialized"; return false; }
     static std::atomic<uint64_t> next_id{0};
-    allocation_id_ = ++next_id;
     SessionAllocationBytes bytes;
     const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
     if (!session_allocation_bytes(g, max_cells, k, bytes, layer_lo, layer_hi, &resolved)) {
@@ -164,6 +163,12 @@ bool SessionOwner::init(const ModelGeometry& g, int64_t max_cells, int64_t k, st
         err = "session: cannot identify allocation device";
         return false;
     }
+    if (const char* why = shared_rope_session_invalid(g, max_cells, device_)) {
+        device_ = -1;
+        err = why;
+        return false; // no arena, QSA state or registry mutation on an incompatible borrow
+    }
+    allocation_id_ = ++next_id;
     const cudaError_t allocated = cudaMalloc(&arena_, (size_t) bytes.device);
     if (allocated != cudaSuccess) {
         if (std::getenv("STRATA_STATE_HASH"))
@@ -230,7 +235,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     const auto resolved = placement ? *placement : qsa_state_placement(g, max_cells);
     const uint64_t priced = session_bytes(g, max_cells, k, layer_lo, layer_hi, &resolved);
     if (!priced || (arena_bytes && arena_bytes < priced)) return 0;
-    if (cudaGetDevice(&s.allocation_device) != cudaSuccess) { s.allocation_device = -1; return 0; }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    if (const char* why = shared_rope_session_invalid(g, max_cells, device)) {
+        std::fprintf(stderr, "strata session: %s\n", why);
+        return 0;
+    }
+    s.allocation_device = device;
     struct InitGuard {
         SessionState& state;
         bool complete = false;

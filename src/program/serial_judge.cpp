@@ -125,7 +125,7 @@ bool judge_stage_bytes(const core::ModelGeometry& g, int64_t cells, int64_t k,
                        int64_t lo, int64_t hi, int64_t vocab, bool head_stage,
                        const plan::QsaPlacement& placement, JudgeStageBytes& out) {
     out = {};
-    if (cells < 1 || cells > 4096 || vocab < 1 || vocab > INT32_MAX || placement.kv.mode != 0 ||
+    if (cells < 1 || cells > 4096 || vocab < 1 || vocab > INT32_MAX || placement.kv.mode != 0 || placement.elastic ||
         lo < 0 || hi <= lo || hi > g.n_layers) return false;
     JudgeStageBytes bytes;
     if (!core::session_allocation_bytes(g, cells, k, bytes.session, lo, hi, &placement)) return false;
@@ -172,6 +172,18 @@ bool SerialJudgeLane::init(const core::ModelGeometry& g, int64_t cells, int64_t 
     if (m.initialized || !m.stages.empty() || bindings.empty() || !head.loaded() ||
         !admission.admitted || !admission.verified || !admission.unknown_classes.empty()) {
         error = "judge: requires verified complete admission and existing native execution owners"; return false;
+    }
+    // Generation publishes the process tables first. Check every stage before
+    // changing lane state or allocating any short owner; a judge only borrows.
+    if (core::shared_rope_enabled()) {
+        for (const auto& binding : bindings) {
+            if (!binding.generation) {
+                error = "judge: missing generation owner for shared RoPE borrow"; return false;
+            }
+            if (const char* why = core::shared_rope_session_invalid(g, cells, binding.generation->device(), true)) {
+                error = std::string("judge: ") + why; return false;
+            }
+        }
     }
     m.geometry = g; m.cells = cells; m.vocabulary = vocab; m.head = &head; m.draft = draft;
     const char* cache = std::getenv("STRATA_JUDGE_PREFIX_CACHE");

@@ -263,7 +263,7 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
-    bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
+    bool owns_rope = false;          ///< arena-owned table: releases its registration; process-shared tables never do
     float* sin_tab = nullptr;
 
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
@@ -296,12 +296,18 @@ strata::plan::QsaPlacement qsa_state_placement(const ModelGeometry& g, int64_t m
                                              bool draft = false);
 strata::plan::QsaRolePlacements qsa_role_placements(const ModelGeometry& g, int64_t max_cells,
                                                    int64_t slot_window, int64_t draft_window, int64_t max_t);
-/// Opt-in process-lifetime immutable table: one exact geometry/scaling per device.
+/// Opt-in process-lifetime immutable table: one rotary geometry/scaling and capacity per device.
+/// Compatible shorter sessions borrow only their own row bound; no entry is replaced or grown.
 /// Retained through session destruction because captured graphs can still borrow its addresses.
 /// Pricing is separate from every session arena; callers admit it once per device.
 bool shared_rope_enabled();
 uint64_t shared_rope_device_bytes(const ModelGeometry& g, int64_t max_cells);
 uint64_t shared_rope_host_bytes();
+/// Preallocation compatibility check, without publishing or changing registrations.
+/// require_existing is used by the short lane: it may borrow, never build a second table.
+/// Returns a precise static refusal reason, or nullptr (also when process sharing is off).
+const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device,
+                                      bool require_existing = false);
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
                          const strata::plan::QsaPlacement* placement = nullptr);

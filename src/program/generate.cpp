@@ -5062,9 +5062,9 @@ int main(int argc, char** argv) {
     // One startup resolution for every owner role. Captured graph keys omit residency;
     // these values feed both admission prices and fresh-owner carves, never live rebinding.
     const int draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
-    if (strata::core::shared_rope_enabled() && o.judge_context && o.judge_context != o.max_context) {
-        std::fprintf(stderr, "strata generate: STRATA_SHARED_ROPE requires one context geometry per device; "
-                             "a different --judge-context is unsupported\n");
+    if (strata::core::shared_rope_enabled() && o.judge_context > o.max_context) {
+        std::fprintf(stderr, "strata generate: --judge-context exceeds the generation table capacity; "
+                             "STRATA_SHARED_ROPE borrows compatible shorter tables without growing them\n");
         return 1;
     }
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
@@ -5979,7 +5979,7 @@ int main(int argc, char** argv) {
                 ram("judge_metadata_host", bytes.host_metadata, "derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated");
             }
             startup_only.add("judge_session_init_transient", judge_host_init_peak,
-                "derived maximum serial short-owner RoPE/page-table construction payload, in addition to retained branch storage");
+                "conservative maximum serial short-owner RoPE/page-table payload; shared-RoPE borrow builds no table, retained bound includes a hypothetical short build");
             if (o.judge_runtime_allowance_bytes)
                 ram("judge_opaque_runtime_host", o.judge_runtime_allowance_bytes,
                     "additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling");

@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
             fail_copy = 0; // reused shared table, first page-table upload fails
             check(!failed.init(g, cells, 10, error), "post-publication session failure propagated");
             fail_copy = -1;
-            check(!failed.init(g, cells + 1, 10, error), "second context geometry refused without replacement");
+            check(!failed.init(g, cells + 1, 10, error), "immutable table capacity growth refused without replacement");
         }
         ok(cudaGraphLaunch(exec, stream));
         ok(cudaStreamSynchronize(stream));

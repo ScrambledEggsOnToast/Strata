@@ -1146,6 +1146,89 @@ Omitting either leaves an unknown class and refuses admission. These are
 declared bounds, not measured costs; they supplement, never replace, the
 existing generation allowances and measured ceilings.
 
+**Checked short-state/shared-RoPE composition (#300).** With
+`STRATA_SHARED_ROPE=1`, generation publishes one immutable process-owned table
+per device before the lane is created. A short owner may borrow its first N
+rows only when the device, rotary width, RoPE type, frequency base and every
+scaling field match, and N does not exceed the published capacity. The sine
+plane still starts after the *full-capacity* cosine plane, not after N rows.
+The short session's KV/indexer arena and native registration remain bounded by
+N (at most 4096); its arena is never enlarged to the generation context.
+Each stage is checked before lane state or short allocations change, and
+SessionOwner/raw-session/QSA initialization also checks before mutation.
+Missing stage tables, growth, rotary-width changes and individual scaling
+changes return specific refusal reasons. No table is replaced or resized.
+
+Both plain and YaRN builders compute each row independently of the table's
+loop bound. The CPU contract test compares all first-4096 cosine/sine bytes
+against a 262144-row table using the production float64 builder. A Linux
+no-load allocation-adapter test exercises real SessionOwner initialization,
+short teardown, failed initialization and generation rebind with device
+calls redirected to host storage; it is not CUDA execution or graph proof.
+Dedicated table ownership/release remains separate. Shared short teardown
+never clears or frees the process table, even after every original owner retires.
+
+At rotary width 64, the retained generation table costs 67,108,864 bytes per
+device at 262144 rows; borrowing adds **zero** table allocations or bytes.
+A hypothetical separate 4096-row table would cost 1,048,576 bytes, not a new
+judge charge. The existing 1,048,576-byte maximum short-owner host construction
+bound is deliberately retained as a conservative RoPE/page-table bound:
+an actual shared borrow builds no table and only constructs its page table.
+The generation startup transient and fixed process registry remain charged.
+This immutable-table reuse earns no mutable-KV sharing credit or extra slot.
+
+The no-load ledger prices the two modes independently:
+
+| Mode | Short stage ranges | Unchanged generation owners | Process tables |
+|---|---|---|---|
+| Three GPU | [0,20), [20,39), [39,48) | four resident slots; existing MTP/group geometry | three times 67,108,864 bytes |
+| Two V100, serial | [0,25), [25,48) | one generation owner, no invented resident peers/MTP | two times 67,108,864 bytes |
+
+These are allocation/composition contracts, **not qualified hardware modes**.
+Neither mode is supported for a new binary/profile until separately launched,
+priced against its actual first-use/host bounds and exercised in an exclusive
+window with all 24,576 pairs and original generation capacity retained.
+The pair's four-slot/incomplete-residency counterfactual stays unsupported.
+`--prefill-head-alias` plus judge still refuses because the score-lane head
+ownership port is absent. Retained prompt plus judge refuses with
+`retained prompt excludes the judge lane: private preparation ownership is not ported`;
+the independent concurrent reader remains off with reason `the judge lane`
+when that is its first conflict. Streamed/elastic placement and all existing
+packed/helper/vision/adaptive/peer refusals remain unchanged.
+
+**Minimal later decision attribution (no launch implied).** Pin source,
+binary, tokenizer/template, profile and the ordered compiled plans. Use one
+compact complete search-shaped group (filename, sketch, then passage
+verification) and one staging-shaped group (three-level Score unit calls,
+then the conditional up-to-eight-candidates-plus-none Choice). Preserve
+question/branch identities and wave dependencies. Inventory every plan's
+engine tokens, prompt/result/wire bytes and work before issue; require
+each plan to fit 4096 and explicitly refuse an oversized group without
+truncating or dropping questions. The client's 64 filename questions,
+46 sketch questions, three nominal 8 KiB passages and 16/64 dispatch caps
+are source shapes, not proof of 4K fit, active GPU states or queue capacity.
+Reduced compact groups do not qualify stock maximum-size client requests.
+
+| Phase | Existing timing seam | Interpretation |
+|---|---|---|
+| Compile | client monotonic interval around complete group compilation | Include all plans/branches before issue, not engine time |
+| Queue | frontend request arrival, queue/admission wait and control-turn ownership | Retain actual timestamps; SADMIT is after the lease, not arrival |
+| Prefix restore / fresh zero | `JUDGE_TIMING init_us`, `reused` | Includes preflight, bind/canary and restore-or-zero plus synchronization, not just checkpoint copy |
+| Fresh / suffix | `span_us`, `JUDGE_SPAN` intervals and fresh/reused token counts | Bulk prefill includes the final head row |
+| Head / readback | `head_in_span_us` | A subset of span_us; never add it a second time |
+| Handoff / generation peer | `handoff_us`, `peer_us`, yields | Binding restoration/reacquisition versus the generation round; the serial pair has no resident peer round |
+| Drain / unassigned | engine total minus init/span/peer/handoff, plus observed terminal completion | Includes final restore, checkpoint save and bookkeeping; it is not an isolated device-drain measurement |
+
+Time the containing complete group through validated matching SDONEs and
+answer publication, not an average successful subrequest. Keep nested terms
+and cross-clock timestamps separate; missing queue/terminal observations
+remain missing, never inferred from init_us. Run one cold fresh decision and,
+only in a single-trust-domain process, one warm reused diagnostic (or record
+safe reuse blocked). Retain a fresh/serial rollback. No latency, throughput,
+quality, current-profile launch or daily-promotion claim follows from CPU
+equivalence, no-load lifetime or static prices alone.
+
+
 **Experimental scheduling controls.** The default `--judge-quantum 0` keeps
 whole-request serial scoring. A positive quantum (at most the admitted judge
 context) divides scoring into bounded token spans. Between spans, including the
