@@ -3,8 +3,8 @@
 //   1. `auto` picks the most groups, at most one per stage, that divide the slots;
 //   2. a layer split with --batch >= 2 and no --batch-groups means `auto` (0.1.41);
 //   3. --adapt-async 1 or STRATA_BATCH_MTP_SERIAL turns an unspecified default into one group;
-//   4. a number or `auto` given explicitly is honoured, with or without those features;
-//   5. no layer split: the number given (1) stays.
+//   4. explicit counts divide the slots on a layer split, or fall back loudly to the existing serial schedule;
+//   5. slot fit reselects auto, but never resurrects a pre-fit explicit fallback.
 #include "strata/program/batch_groups.hpp"
 
 #include <cstdio>
@@ -101,8 +101,8 @@ int main() {
         check(r.groups == 2 && !r.from_auto && r.serial == bg::Serial::None, "--batch-groups 2 with --batch-mtp: 2");
         i.given = 1;
         check(bg::resolve(i).groups == 1, "--batch-groups 1: 1 (the opt-out)");
-        i.given = 4;   // not checked here: generate.cpp refuses what does not divide
-        check(bg::resolve(i).groups == 4, "--batch-groups 4 is returned as given");
+        i.given = 4;
+        check(bg::resolve(i).groups == 4, "--batch-groups 4 divides four slots and is returned as given");
     }
     {
         bg::Input i = in(2, 1);
@@ -117,7 +117,91 @@ int main() {
         bg::Input i = in(2, 0);
         i.set = true;
         i.given = 2;
-        check(bg::resolve(i).groups == 2, "an explicit number without a split is returned (the engine warns)");
+        const auto r = bg::resolve(i);
+        check(r.groups == 1 && r.requested == 2 && r.fallback == bg::Fallback::NoSplit,
+              "an explicit count without a split retains the request and resolves one group");
+        check(bg::fallback_message(r, 2) ==
+              "--batch-groups requested=2 -> effective=1; slots=2: 1 group of 2 slots (no group pipeline; no layer split)",
+              "no-split fallback names the requested and actual schedule in one line");
+    }
+    {
+        bg::Input i = in(6, 2);
+        i.set = true;
+        i.given = 4;
+        const auto r = bg::resolve(i);
+        check(r.groups == 1 && r.requested == 4 && r.fallback == bg::Fallback::NonDividing,
+              "an explicit non-divisor keeps requested four and runs one group");
+        check(bg::fallback_message(r, 6) ==
+              "--batch-groups requested=4 -> effective=1; slots=6: 1 group of 6 slots (no group pipeline; requested groups do not divide slots)",
+              "non-dividing fallback names requested groups, fitted slots and the serial schedule");
+        i.batch = 4;
+        const auto fit = bg::resolve_after_fit(i, r);
+        check(fit.groups == 1 && fit.requested == 4 && fit.fallback == bg::Fallback::NonDividing,
+              "a pre-fit fallback is not resurrected when the fitted count happens to divide");
+        check(bg::fallback_message(fit, 4).find("pre-fit slots=6") != std::string::npos,
+              "a sticky fallback reports the original incompatible count, not a false claim about fitted slots");
+    }
+    {
+        bg::Input i = in(8, 2);
+        i.set = true;
+        i.given = 4;
+        const auto before = bg::resolve(i);
+        i.batch = 6;
+        const auto fit = bg::resolve_after_fit(i, before);
+        check(before.groups == 4 && fit.groups == 1 && fit.requested == 4 && fit.after_fit,
+              "post-fit shrink from eight slots to six retains requested four and selects one group");
+        check(bg::fallback_message(fit, 6) ==
+              "--batch-groups requested=4 -> effective=1; slots=6: 1 group of 6 slots (no group pipeline; after slot fit; requested groups do not divide slots)",
+              "post-fit fallback is explicitly reported rather than silently clamped");
+        i.batch = 4;
+        const auto dividing = bg::resolve_after_fit(i, before);
+        check(dividing.groups == 4 && dividing.requested == 4 && bg::fallback_message(dividing, 4).empty(),
+              "dividing post-fit shape keeps four one-slot pipeline groups without a fallback warning");
+    }
+    for (int slots = 2; slots <= 8; ++slots) {
+        for (int groups = 1; groups <= 8; ++groups) {
+            bg::Input i = in(slots, 2);
+            i.set = true;
+            i.given = groups;
+            const auto r = bg::resolve(i);
+            check(r.groups == (slots % groups == 0 ? groups : 1) && r.requested == groups &&
+                  (bg::fallback_message(r, slots).empty() == (slots % groups == 0)),
+                  "explicit count preserves every dividing schedule; every non-divisor reports fallback");
+        }
+        bg::Input i = in(slots, 2);
+        i.set = i.auto_given = true;
+        const auto r = bg::resolve(i);
+        check(slots % r.groups == 0 && r.fallback == bg::Fallback::None && bg::fallback_message(r, slots).empty(),
+              "auto always selects a divisor and never reports an explicit fallback");
+    }
+    {
+        bg::Input i = in(8, 2);
+        const auto before = bg::resolve(i);
+        i.batch = 6;
+        const auto fit = bg::resolve_after_fit(i, before);
+        check(before.groups == 2 && fit.groups == 3 && fit.requested == 2 && fit.from_auto,
+              "post-fit auto reselects the divisor while retaining the initial requested shape");
+        i.batch = 0;
+        const auto off = bg::resolve_after_fit(i, before);
+        check(off.groups == 1 && off.from_auto && off.requested == 2,
+              "no fitted slots selects one group and retains the auto request attribution");
+    }
+    for (const bool mtp_serial : {false, true}) {
+        bg::Input i = in(8, 2);
+        i.batch_mtp = mtp_serial;
+        i.mtp_serial = mtp_serial;
+        i.adapt_async = !mtp_serial;
+        const auto before = bg::resolve(i);
+        i.batch = 6;
+        const auto fit = bg::resolve_after_fit(i, before);
+        check(before.groups == 1 && fit.groups == 1 && fit.from_auto && fit.requested == 2 &&
+              fit.would_be == 3 && fit.serial == (mtp_serial ? bg::Serial::BatchMtp : bg::Serial::AdaptAsync) &&
+              bg::fallback_message(fit, 6).empty(),
+              "post-fit default retains the MTP-serial/adapt-async override while reselecting the auto divisor");
+        i.set = i.auto_given = true;
+        const auto explicit_auto = bg::resolve_after_fit(i, bg::resolve(i));
+        check(explicit_auto.groups == 3 && explicit_auto.serial == bg::Serial::None,
+              "explicit auto still overrides serial defaults after fit");
     }
 
     std::printf("%s\n", g_fail == 0 ? "batch_groups_test: all passed" : "batch_groups_test: FAILED");

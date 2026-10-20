@@ -3922,6 +3922,17 @@ labelled conditional, never reported as observed capabilities. The line distingu
 values and names the reason a capability is off; for example, the suffix drafter is reported as conditional: a solo
 serial serving window can execute it after its first window, while a resident decode window and the BGEN
 single admission window do not.
+Batch groups use the same resolver for runtime admission and `--report-plan`, including the one-group
+fallback before the synchronous `--batch-mtp` gate. A same-device split (`--split-device 0`) has no group
+pipeline in the no-load report, but remains a split for composition checks: resident multiplex and batch
+MTP still refuse it, matching runtime admission. The serving plan is finalized after slot fit: `batch.requested` retains
+the normalized pre-fit count, `batch.slots` is the effective count, `batch.resolved=true` and
+`batch.groups_conditional=false`. The raw explicit `batch.groups_requested` remains visible; for auto
+it is the initial divisor and `groups_requested_auto=true`, while `groups` is reselected for fitted slots.
+Every resident `INFO` line reports the same requested/effective groups (and the auto flag). A fallback
+adds one explicit requested → effective startup warning and the same schedule/reason to `EPLAN.notes`;
+this is schedule reporting, not a numerical or token-equivalence claim.
+
 
 **Weighted decode service (#264, opt-in, off by default).** `STRATA_DECODE_SERVICE=1` selects ready resident
 requests by a 3:1 weighted service cycle instead of adding every active slot to each decode window. One ticket

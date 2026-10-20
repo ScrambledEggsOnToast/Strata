@@ -10,6 +10,7 @@
 #include "strata/program/time_budget.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct ExecutionPlanInput {
     bool groups_set = false, groups_auto = false;
     int groups_given = 1;
     int later_stages = 0;   ///< layer-split stages after the primary (each on its own GPU)
+    bool same_device_split = false; ///< a split exists, but owns no distinct-device group pipeline
     bool batch_mtp = false, batch_mtp_pipeline = false, batch_mtp_third = false, batch_mtp_floating = false;
     bool mtp_configured = false;
     int spec_requested = 0, mtp_max_requested = 0;
@@ -62,7 +64,8 @@ struct ExecutionPlan {
     std::string refusal;             ///< the reason the engine must exit before allocating
     ServeMode mode = ServeMode::streaming;
     int stages = 1;
-    int batch_slots = 0;             ///< requested logical slots (normalized to the verify window); fit is conditional
+    int batch_slots = 0;             ///< effective logical slots (normalized to the verify window; fit conditional)
+    int batch_slots_requested = 0;   ///< normalized pre-fit slot request, retained after allocation
     bool batch_slots_resolved = true;
     int groups_requested = 1, groups = 1;
     bool groups_requested_auto = false; ///< `--batch-groups auto` (or the layer-split default) asked for a resolved count
@@ -79,7 +82,25 @@ struct ExecutionPlan {
     std::vector<PricedClass> memory_classes;  ///< filled after admission; empty before allocation
     std::vector<std::string> notes;
     std::string to_json() const;
+    std::string batch_group_info() const;
 };
+
+// No-load report: explicit boundaries name later stages; auto alone needs the visible device count.
+// These are option-level facts, not a claim that the requested devices or slot allocations fit.
+inline bool report_plan_same_device_split(const std::string& split, const std::string& device) {
+    return !split.empty() && device == "0";
+}
+inline int report_plan_later_stages(const std::string& split, const std::string& device, int visible_devices) {
+    if (split.empty() || report_plan_same_device_split(split, device)) return 0;
+    if (split == "auto") return std::max(0, visible_devices - 1);
+    return int(std::count(split.begin(), split.end(), ',')) + 1;
+}
+
+inline int report_execution_plan(FILE* out, const ExecutionPlan& plan) {
+    std::fprintf(out, "EPLAN %s\n", plan.to_json().c_str());
+    std::fflush(out);
+    return plan.refused ? 1 : 0;
+}
 
 inline const char* serve_mode_name(ServeMode m) { return m == ServeMode::resident ? "resident" : "streaming"; }
 
@@ -121,6 +142,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     p.mode = in.serve && in.batch_requested > 0 ? ServeMode::resident : ServeMode::streaming;
     p.stages = 1 + std::max(0, in.later_stages);
     p.batch_slots = batch_groups::normalized_slots(in.batch_requested, 8);
+    p.batch_slots_requested = p.batch_slots;
     // A slot's session must fit before the count is effective; keep the request and label the fit conditional.
     p.batch_slots_resolved = in.batch_requested <= 0;
     p.spec_requested = in.spec_requested;
@@ -153,14 +175,9 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     p.groups = groups.groups;
     p.groups_from_auto = groups.from_auto;
     p.groups_requested_auto = groups.from_auto;
-    p.groups_requested = groups.from_auto ? groups.would_be : in.groups_given;
-    // A requested number that a layer split cannot divide, or that has no split to pipeline through, resolves to one
-    // group with a warning rather than a fractional schedule.
-    if (p.batch_slots > 0 && p.groups > 1 &&
-        (in.later_stages <= 0 || p.batch_slots % p.groups != 0))
-        p.groups = 1;
-    if (p.groups != p.groups_requested && !p.groups_from_auto)
-        p.notes.push_back("--batch-groups does not divide the requested slots or has no layer split; one group");
+    p.groups_requested = groups.requested;
+    const auto group_note = batch_groups::fallback_message(groups, p.batch_slots);
+    if (!group_note.empty()) p.notes.push_back(group_note);
     p.groups_conditional = p.batch_slots > 0 && !p.batch_slots_resolved;
 
     // ---- proposal shape -----------------------------------------------------------------------------------
@@ -263,7 +280,8 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     if (!p.refused && in.resident_multiplex) {
         if (!in.serve) p.refusal = "--resident-multiplex needs --serve";
         else if (p.batch_slots < 2) p.refusal = "--resident-multiplex needs --batch >= 2";
-        else if (in.later_stages > 0) p.refusal = "--resident-multiplex needs a single device";
+        else if (in.later_stages > 0 || in.same_device_split)
+            p.refusal = "--resident-multiplex needs a single device without a layer split";
         else if (p.groups != 1) p.refusal = "--resident-multiplex needs one group";
         if (!p.refusal.empty()) { p.refused = true; p.concurrent_reader.support = Support::off; }
     }
@@ -272,6 +290,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         if (p.batch_slots < min_slots) p.refusal = "--batch-mtp needs --batch " + std::to_string(min_slots) + " or more";
         else if (!in.mtp_configured) p.refusal = "--batch-mtp needs --mtp";
         else if (p.spec < 2) p.refusal = "--batch-mtp needs --spec T (T >= 2)";
+        else if (in.same_device_split) p.refusal = "--batch-mtp needs each layer-split stage on its own GPU";
         else if (!in.serve) p.refusal = "--batch-mtp needs --serve";
         else if (in.later_stages > 0 && !in.batch_mtp_pipeline && p.groups > 1)
             p.refusal = groups.mtp_dropped
@@ -300,6 +319,31 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         if (!p.refusal.empty()) p.refused = true;
     }
     return p;
+}
+
+// Complete the same contract after the allocator has chosen the slots and actual split stages.
+// Do not rebuild the plan: admission prices and resolved capabilities already belong to it.
+inline void resolve_batch_fit(ExecutionPlan& p, int slots, int later_stages, const batch_groups::Result& groups) {
+    p.batch_slots = slots;
+    p.batch_slots_resolved = true;
+    p.stages = 1 + std::max(0, later_stages);
+    if (slots == 0 && p.mode == ServeMode::resident) p.mode = ServeMode::streaming;
+    p.groups = groups.groups;
+    p.groups_requested = groups.requested;
+    p.groups_requested_auto = p.groups_from_auto = groups.from_auto;
+    p.groups_conditional = false;
+    p.notes.erase(std::remove_if(p.notes.begin(), p.notes.end(), [](const std::string& note) {
+        return note.find("--batch-groups requested=") == 0;
+    }), p.notes.end());
+    const auto note = batch_groups::fallback_message(groups, slots);
+    if (!note.empty()) p.notes.push_back(note);
+}
+
+inline std::string ExecutionPlan::batch_group_info() const {
+    return " batch_slots=" + std::to_string(batch_slots) +
+        " batch_groups=" + std::to_string(groups) +
+        " batch_groups_requested=" + std::to_string(groups_requested) +
+        " batch_groups_requested_auto=" + std::to_string(int(groups_requested_auto));
 }
 
 namespace detail {
@@ -332,7 +376,8 @@ inline std::string ExecutionPlan::to_json() const {
     std::string out = "{\"version\":1,\"mode\":";
     out += detail::json_quote(serve_mode_name(mode));
     out += ",\"stages\":" + std::to_string(stages);
-    out += ",\"batch\":{\"requested\":" + std::to_string(batch_slots) +
+    out += ",\"batch\":{\"requested\":" + std::to_string(batch_slots_requested) +
+           ",\"slots\":" + std::to_string(batch_slots) +
            ",\"resolved\":" + (batch_slots_resolved ? "true" : "false") +
            ",\"groups_requested\":" + std::to_string(groups_requested) +
            ",\"groups_requested_auto\":" + (groups_requested_auto ? "true" : "false") +

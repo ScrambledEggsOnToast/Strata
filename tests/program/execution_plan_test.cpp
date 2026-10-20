@@ -24,6 +24,32 @@ void check(bool ok, const char* what) {
 }
 bool has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
 
+std::string report(const ep::ExecutionPlan& p, int expected_status) {
+    FILE* out = std::tmpfile();
+    check(out != nullptr, "the no-load report capture opens");
+    if (!out) return {};
+    check(ep::report_execution_plan(out, p) == expected_status, "report-plan exit status matches the effective contract");
+    std::rewind(out);
+    std::string text;
+    char buf[1024];
+    while (const size_t n = std::fread(buf, 1, sizeof(buf), out)) text.append(buf, n);
+    std::fclose(out);
+    check(text == "EPLAN " + p.to_json() + "\n", "report-plan emits exactly one tagged JSON line");
+    return text;
+}
+
+ep::batch_groups::Input group_input(const ep::ExecutionPlanInput& in) {
+    ep::batch_groups::Input bin;
+    bin.set = in.groups_set;
+    bin.auto_given = in.groups_auto;
+    bin.given = in.groups_given;
+    bin.batch = ep::batch_groups::normalized_slots(in.batch_requested, 8);
+    bin.later_stages = in.later_stages;
+    bin.batch_mtp = in.batch_mtp;
+    bin.adapt_async = in.adapt_async;
+    bin.mtp_serial = in.mtp_serial;
+    return bin;
+}
 ep::ExecutionPlanInput resident_batch() {
     ep::ExecutionPlanInput in;
     in.serve = true;
@@ -109,8 +135,162 @@ int main() {
         in.groups_given = 4;
         in.later_stages = 2;
         const ep::ExecutionPlan p = ep::resolve_execution_plan(in);
-        check(p.groups_requested == 4 && p.groups == 1 && !p.notes.empty(),
-              "a group count that does not divide the slots resolves to one group with a note");
+        check(p.groups_requested == 4 && p.groups == 1 && p.notes.size() == 1 &&
+              p.notes.front() == "--batch-groups requested=4 -> effective=1; slots=6: 1 group of 6 slots (no group pipeline; requested groups do not divide slots)",
+              "a non-dividing group count reports the exact requested-to-effective schedule");
+        const auto text = report(p, 0);
+        check(has(text, "\"groups_requested\":4") && has(text, "\"groups\":1") &&
+              has(text, "\"resolved\":false") && has(text, "\"groups_conditional\":true") &&
+              has(text, "no group pipeline"),
+              "no-load report-plan keeps requested groups visible and fit explicitly conditional");
+        check(p.batch_group_info() ==
+              " batch_slots=6 batch_groups=1 batch_groups_requested=4 batch_groups_requested_auto=0",
+              "INFO uses the same raw request and effective count as EPLAN without needing MTP");
+        in.batch_mtp = in.mtp_configured = true;
+        in.spec_requested = 4;
+        const auto mtp = ep::resolve_execution_plan(in);
+        check(!mtp.refused && mtp.groups == ep::batch_groups::resolve(group_input(in)).groups &&
+              mtp.proposal == ep::ProposalShape::batched_single_draft,
+              "report-plan and runtime MTP gate both use the effective serial fallback, not raw four");
+        report(mtp, 0);
+        in.groups_given = 3;
+        const auto dividing_mtp = ep::resolve_execution_plan(in);
+        check(dividing_mtp.refused && ep::batch_groups::resolve(group_input(in)).groups == 3,
+              "a genuinely dividing pipeline still refuses synchronous MTP");
+        report(dividing_mtp, 1);
+    }
+    {
+        auto in = resident_batch();
+        in.batch_mtp = in.batch_mtp_pipeline = false;
+        in.groups_auto = false;
+        in.groups_given = 4;
+        in.batch_requested = 8;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        p.memory_classes.push_back({"CUDA0", "expert_cache", "admission", 1234, false});
+        bin.batch = 6;
+        const auto fitted = ep::batch_groups::resolve_after_fit(bin, before);
+        ep::resolve_batch_fit(p, bin.batch, bin.later_stages, fitted);
+        check(p.batch_slots_requested == 8 && p.batch_slots == 6 && p.batch_slots_resolved &&
+              p.groups_requested == 4 && p.groups == 1 && !p.groups_conditional,
+              "post-fit plan retains the request and finalizes actual slots and groups");
+        check(p.notes.size() == 1 && has(p.notes.front(), "after slot fit") &&
+              has(p.notes.front(), "requested=4 -> effective=1; slots=6"),
+              "post-fit fallback records one explicit actual schedule note");
+        check(p.memory_classes.size() == 1 && p.memory_classes.front().bytes == 1234,
+              "finalizing fit preserves the admitted memory classes");
+        check(p.batch_group_info() ==
+              " batch_slots=6 batch_groups=1 batch_groups_requested=4 batch_groups_requested_auto=0",
+              "post-fit INFO cannot print the post-clamp value as the request");
+        const auto text = report(p, 0);
+        check(has(text, "\"batch\":{\"requested\":8,\"slots\":6,\"resolved\":true") &&
+              has(text, "\"groups_requested\":4") && has(text, "\"groups\":1") &&
+              has(text, "\"groups_conditional\":false"),
+              "post-fit EPLAN and INFO agree on effective slots/groups without stale conditional fields");
+        bin.batch = 4;
+        auto control = ep::resolve_execution_plan(in);
+        ep::resolve_batch_fit(control, 4, 2, ep::batch_groups::resolve_after_fit(bin, before));
+        check(control.groups == 4 && control.batch_slots / control.groups == 1 && control.notes.empty(),
+              "dividing fit preserves the same four-group/one-slot schedule with no fallback note");
+    }
+    {
+        auto in = resident_batch();
+        in.batch_mtp = in.batch_mtp_pipeline = false;
+        in.batch_requested = 8;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.batch = 6;
+        ep::resolve_batch_fit(p, 6, 2, ep::batch_groups::resolve_after_fit(bin, before));
+        check(p.groups_requested_auto && p.groups_requested == 2 && p.groups == 3 &&
+              p.batch_slots % p.groups == 0 && p.notes.empty(),
+              "auto fit keeps its initial attribution and reselects a divisor without a fallback");
+        check(has(p.batch_group_info(), "batch_groups=3 batch_groups_requested=2 batch_groups_requested_auto=1") &&
+              has(p.to_json(), "\"groups_requested_auto\":true,\"groups\":3"),
+              "auto INFO/EPLAN distinguish initial and fitted divisor counts");
+    }
+    {
+        auto in = resident_batch();
+        in.batch_mtp = in.batch_mtp_pipeline = false;
+        in.groups_auto = false;
+        in.groups_given = 2;
+        check(ep::report_plan_later_stages("20,39", "", 1) == 2 &&
+              ep::report_plan_later_stages("auto", "", 3) == 2,
+              "report-plan derives explicit and auto requested split stages without model allocation");
+        in.later_stages = ep::report_plan_later_stages("20", "0", 3);
+        in.same_device_split = ep::report_plan_same_device_split("20", "0");
+        const auto p = ep::resolve_execution_plan(in);
+        check(in.later_stages == 0 && p.stages == 1 && p.groups == 1 && p.groups_requested == 2 &&
+              p.notes.size() == 1 && has(p.notes.front(), "no layer split"),
+              "report-plan same-device split reports the effective one-group schedule");
+        report(p, 0);
+        in.groups_given = 1;
+        in.resident_multiplex = true;
+        const auto multiplex = ep::resolve_execution_plan(in);
+        check(multiplex.refused && has(multiplex.refusal, "without a layer split"),
+              "report-plan refuses resident multiplex on a same-device split even with one effective group");
+        report(multiplex, 1);
+        in.resident_multiplex = false;
+        in.batch_mtp = in.mtp_configured = true;
+        in.spec_requested = 4;
+        const auto synchronous_mtp = ep::resolve_execution_plan(in);
+        check(synchronous_mtp.refused && has(synchronous_mtp.refusal, "each layer-split stage on its own GPU"),
+              "report-plan refuses synchronous MTP on a same-device split despite one effective group");
+        report(synchronous_mtp, 1);
+        in.batch_mtp = false;
+        in.groups_given = 2;
+        in.same_device_split = ep::report_plan_same_device_split("", "");
+        in.later_stages = ep::report_plan_later_stages("", "", 3);
+        const auto no_split = ep::resolve_execution_plan(in);
+        check(no_split.groups == 1 && no_split.groups_requested == 2 &&
+              has(no_split.to_json(), "no layer split"),
+              "no-layer-split report retains the raw explicit count and fallback reason");
+        report(no_split, 0);
+        auto bin = group_input(in);
+        auto finalized = no_split;
+        ep::resolve_batch_fit(finalized, 4, 0,
+            ep::batch_groups::resolve_after_fit(bin, ep::batch_groups::resolve(bin)));
+        check(finalized.notes.size() == 1 && finalized.batch_slots_resolved && !finalized.groups_conditional,
+              "finalization replaces the pre-fit fallback note rather than duplicating it");
+    }
+    {
+        auto in = resident_batch();
+        in.batch_mtp = in.batch_mtp_pipeline = false;
+        in.batch_requested = 8;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.batch = 0;
+        ep::resolve_batch_fit(p, 0, 2, ep::batch_groups::resolve_after_fit(bin, before));
+        check(p.mode == ep::ServeMode::streaming && p.batch_slots_requested == 8 && p.batch_slots == 0 &&
+              p.batch_slots_resolved && p.groups == 1 && p.groups_requested == 2 &&
+              p.groups_requested_auto && !p.groups_conditional,
+              "zero fitted slots finalizes streaming mode while retaining initial slot/group requests");
+        check(has(p.batch_group_info(), "batch_slots=0 batch_groups=1 batch_groups_requested=2") &&
+              has(p.to_json(), "\"batch\":{\"requested\":8,\"slots\":0,\"resolved\":true") &&
+              has(p.to_json(), "\"groups_conditional\":false"),
+              "zero-fit INFO/EPLAN helpers have no stale effective slot count or conditional group flag");
+        report(p, 0);
+    }
+    for (const bool mtp_serial : {false, true}) {
+        auto in = resident_batch();
+        in.groups_set = in.groups_auto = false;
+        in.batch_mtp_pipeline = false;
+        in.batch_mtp = in.mtp_serial = mtp_serial;
+        in.adapt_async = !mtp_serial;
+        in.batch_requested = 8;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.batch = 6;
+        ep::resolve_batch_fit(p, 6, 2, ep::batch_groups::resolve_after_fit(bin, before));
+        check(!p.refused && p.groups == 1 && p.groups_requested == 2 && p.groups_requested_auto &&
+              p.batch_slots == 6 && p.batch_slots_resolved && !p.groups_conditional && p.notes.empty(),
+              "post-fit serial MTP/adapt-async plans keep their serial override and initial auto attribution");
+        check(has(p.batch_group_info(), "batch_groups=1 batch_groups_requested=2 batch_groups_requested_auto=1"),
+              "post-fit serial override INFO retains the requested auto count rather than the clamped count");
+        report(p, 0);
     }
     {
         ep::ExecutionPlanInput in;

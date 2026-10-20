@@ -3483,7 +3483,8 @@ int main(int argc, char** argv) {
     // One option-level contract, resolved once. later_stages is the layer split's further stages, each on its own
     // GPU; a same-GPU or absent split can pipeline nothing. Allocation-dependent facts (which slots fit, helper
     // source state) remain conditional inputs and are never reported as observed capabilities.
-    auto plan_input = [&](int later_stages) {
+    const int batch_groups_requested = o.batch_groups; // preserve the explicit request before any clamp
+    auto plan_input = [&](int later_stages, bool same_device_split) {
         strata::program::ExecutionPlanInput pin;
         const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
         const char* mtp_serial_env = std::getenv("STRATA_BATCH_MTP_SERIAL");
@@ -3493,8 +3494,9 @@ int main(int argc, char** argv) {
         pin.batch_requested = strata::program::batch_groups::normalized_slots(o.batch, strata::kernels::kVerifyMaxT);
         pin.groups_set = o.batch_groups_set;
         pin.groups_auto = o.batch_groups_auto;
-        pin.groups_given = o.batch_groups;
+        pin.groups_given = batch_groups_requested;
         pin.later_stages = later_stages;
+        pin.same_device_split = same_device_split;
         pin.batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
         pin.batch_mtp_pipeline = o.batch_mtp_pipeline;
         pin.batch_mtp_third = o.batch_mtp_third;
@@ -3524,23 +3526,16 @@ int main(int argc, char** argv) {
         return pin;
     };
     if (o.report_plan) {
-        // No model allocation: only the split's GPU count is read, to report the requested stage ownership.
-        int later = 0;
-        if (!o.layer_split.empty()) {
-            if (o.layer_split == "auto") {
-                int n_dev = 1;
-                if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
-                cudaGetLastError();
-                later = n_dev - 1;
-            } else {
-                // K is the first layer of each later GPU: N values name N further stages, not N-1.
-                later = (int) std::count(o.layer_split.begin(), o.layer_split.end(), ',') + 1;
-            }
+        // No model allocation. Only auto needs device discovery; explicit split counts stay conditional.
+        int n_dev = 1;
+        if (o.layer_split == "auto") {
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
+            cudaGetLastError();
         }
-        const strata::program::ExecutionPlan reported = strata::program::resolve_execution_plan(plan_input(later));
-        std::printf("EPLAN %s\n", reported.to_json().c_str());
-        std::fflush(stdout);
-        return reported.refused ? 1 : 0;
+        const int later = strata::program::report_plan_later_stages(o.layer_split, o.split_device, n_dev);
+        return strata::program::report_execution_plan(stdout,
+            strata::program::resolve_execution_plan(plan_input(later,
+                strata::program::report_plan_same_device_split(o.layer_split, o.split_device))));
     }
     const char* man2_setting = std::getenv("STRATA_STORE_MAN2");
     if (man2_setting && std::strcmp(man2_setting, "0") != 0 && std::strcmp(man2_setting, "1") != 0) {
@@ -3989,7 +3984,7 @@ int main(int argc, char** argv) {
     // replace the later suffix/lookup sizing, its budget decision replaces the duplicate prerequisite gate, and the
     // same values are reported before READY. Slot fit and runtime source checks stay conditional by construction.
     strata::program::ExecutionPlan execution_plan =
-        strata::program::resolve_execution_plan(plan_input(multi_gpu ? (int) split_devs.size() : 0));
+        strata::program::resolve_execution_plan(plan_input(multi_gpu ? (int) split_devs.size() : 0, split_same));
     if (execution_plan.budget.support == strata::program::Support::refused) {
         std::fprintf(stderr, "strata scheduling: require budget 0..60000 ms, share 0.01..0.99; "
                              "a positive budget needs --serve --batch >= 2 --prompt-cache > 0\n");
@@ -8096,17 +8091,20 @@ int main(int argc, char** argv) {
     // --batch-mtp-pipeline (this fork) is the one shape the gate below exempts: it KEEPS --batch-mtp with the
     // pipelined slot groups (two group-owned replay chains, --batch-groups 2), which upstream's slot-drafter gate has
     // no equivalent of.
-    auto batch_groups_for = [&](bool mtp_on) {
+    auto batch_group_input = [&](bool mtp_on) {
         strata::program::batch_groups::Input bin;
         bin.set = o.batch_groups_set;
         bin.auto_given = o.batch_groups_auto;
-        bin.given = o.batch_groups;
+        bin.given = batch_groups_requested;
         bin.batch = o.batch;
         bin.later_stages = (int) stages.size();
         bin.batch_mtp = mtp_on;
         bin.adapt_async = o.adapt_async != 0;
         { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL"); bin.mtp_serial = ms != nullptr && ms[0] != '\0' && ms[0] != '0'; }
-        return strata::program::batch_groups::resolve(bin);
+        return bin;
+    };
+    auto batch_groups_for = [&](bool mtp_on) {
+        return strata::program::batch_groups::resolve(batch_group_input(mtp_on));
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
@@ -8175,10 +8173,11 @@ int main(int argc, char** argv) {
     // The layer-split default pipelines groups. Synchronous MTP must explicitly select one group;
     // --adapt-async 1 still resolves an unspecified group count to one.
     int groups_said = 0;
+    auto resolved_groups = batch_groups_for(batch_mtp);
     auto resolve_groups_auto = [&] {
-        const auto r = batch_groups_for(batch_mtp);
-        if (!r.from_auto) return;
+        const auto& r = resolved_groups;
         o.batch_groups = r.groups;
+        if (!r.from_auto) return;
         if (groups_said == r.groups) return;   // (the second call, once the slots that fit are known, says nothing new)
         groups_said = r.groups;
         if (r.serial != strata::program::batch_groups::Serial::None)
@@ -8201,11 +8200,6 @@ int main(int argc, char** argv) {
     if (o.batch_mtp_floating && (!batch_mtp_pipeline || o.batch != 4 || o.batch_groups != 2)) {
         std::fprintf(stderr, "strata generate: --batch-mtp-floating needs --batch-mtp-pipeline --batch 4 --batch-groups 2\n");
         return 1;
-    }
-    if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group\n", o.batch_groups, o.batch);
-        o.batch_groups = 1;
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
@@ -8265,14 +8259,22 @@ int main(int argc, char** argv) {
                 fit = n;
             }
             o.batch = fit;
-            resolve_groups_auto();   // (the slots that fit may not be the ones asked for)
-            if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
+            resolved_groups = strata::program::batch_groups::resolve_after_fit(batch_group_input(batch_mtp), resolved_groups);
+            resolve_groups_auto();   // explicit fallback stays serial; auto is reselected for the fitted slots
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch,
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+    if (o.batch <= 0) {
+        resolved_groups = strata::program::batch_groups::resolve_after_fit(batch_group_input(batch_mtp), resolved_groups);
+        o.batch_groups = resolved_groups.groups;
+    }
+    strata::program::resolve_batch_fit(execution_plan, o.batch, (int) stages.size(), resolved_groups);
+    const auto group_fallback = strata::program::batch_groups::fallback_message(resolved_groups, o.batch);
+    if (!group_fallback.empty())
+        std::fprintf(stderr, "strata generate: WARNING: %s\n", group_fallback.c_str());
     if (batch_mtp_pipeline && (!strata::program::batch_groups::pipeline_slots_supported(o.batch, strata::kernels::kVerifyMaxT) ||
                                o.batch_groups != 2)) {
         std::fprintf(stderr, "strata generate: --batch-mtp-pipeline refused: two supported resident groups did not fit\n");
@@ -16094,13 +16096,11 @@ int main(int argc, char** argv) {
                         (long long) o.prefill_chunk, sp.stage_count(),
                         (long long) strata::prefill::Prefill::stream_all_min_tokens(),
                         strata::prefill::Prefill::pipe_setting(),
-                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                        o.batch > 0 ? (execution_plan.batch_group_info() +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(synchronous_batch_mtp ? 1 : o.batch_groups) +
                                        " resident_multiplex=" + std::to_string(o.resident_multiplex ? 1 : 0) +
                                        (split_batch_mtp ? " batch_mtp=1 batch_schedule=" +
-                                           std::string(batch_mtp_pipeline ? "pipelined" : "synchronous") +
-                                           " batch_groups_requested=" + std::to_string(o.batch_groups) : "")).c_str() : "");
+                                           std::string(batch_mtp_pipeline ? "pipelined" : "synchronous") : "")).c_str() : "");
             if (phase_receipts) std::printf("INFO phase_timing=1 phase_timing_version=1\n");
             if (o.foreground_budget_ms > 0)
                 std::printf("INFO foreground_budget_ms=%.17g background_share=%.17g\n",
@@ -16222,7 +16222,7 @@ int main(int argc, char** argv) {
                         packed_foreground_cap, int(packed_decoder_slice));
         // The resolved contract, after allocation, so the frontend can compare what it requested with what the
         // executor actually selected. One JSON payload after the tag; nothing here claims a measured capability.
-        std::printf("EPLAN %s\n", execution_plan.to_json().c_str());
+        strata::program::report_execution_plan(stdout, execution_plan);
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -17049,8 +17049,8 @@ int main(int argc, char** argv) {
         }
         if (synchronous_batch_mtp)
             std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
-                                 "one eight-row quantum retained through target acceptance and prefix commit; "
-                                 "--batch-groups %d requested, effective groups=1 (no group pipeline).\n", o.batch_groups);
+                                 "one eight-row quantum retained through target acceptance and prefix commit "
+                                 "(effective groups=1; no group pipeline).\n");
         if (o.batch_mtp_third)
             std::fprintf(stderr, "strata generate: --batch-mtp-third: three independent replay chains, "
                                  "four stationary states, packet seats 2/1/1, handoff bases 0/4/6\n");
