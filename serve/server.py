@@ -1542,22 +1542,22 @@ class StrataEngine:
     SCORE_TIMEOUT_S = 300.0
     SCORE_DRAIN_S = 30.0
 
-    def _read_score(self, request_id, owner, born, prompt, selected, cancel):
-        deadline = time.monotonic() + self.SCORE_TIMEOUT_S
-        stopped = False
+    def _read_score(self, request_id, owner, born, prompt, selected, cancel, deadline=None):
+        deadline = deadline if deadline is not None else time.monotonic() + self.SCORE_TIMEOUT_S
         while True:
             if self.gen != born:
                 raise EngineDied("the engine restarted during scoring")
             now = time.monotonic()
-            if not stopped and (cancel.is_set() or now >= deadline):
+            if "drain_deadline" not in owner and (cancel.is_set() or now >= deadline):
                 cancel.set()
+                owner["timed_out"] = now >= deadline
+                owner["drain_deadline"] = now + self.SCORE_DRAIN_S
                 self._send(f"SCANCEL {request_id}")
-                stopped = True
-                deadline = now + self.SCORE_DRAIN_S
-            if now >= deadline:
+            drain_deadline = owner.get("drain_deadline", deadline)
+            if now >= drain_deadline:
                 raise self._silent("missing matching SDONE score terminal")
             try:
-                line = owner["queue"].get(timeout=min(.1, max(.001, deadline - now)))
+                line = owner["queue"].get(timeout=min(.1, max(.001, drain_deadline - now)))
             except queue.Empty:
                 if not self.alive():
                     raise EngineDied(self.death_note())
@@ -1575,20 +1575,22 @@ class StrataEngine:
                 if len(fields) != 4 or fields[:2] != ["SDONE", request_id]:
                     raise ValueError("wrong score terminal")
                 result = score_api.validate_terminal(fields[2], json.loads(fields[3]), request_id, prompt, selected)
-                if fields[2] == "CANCELLED" and not stopped:
+                if fields[2] == "CANCELLED" and "drain_deadline" not in owner:
                     raise ValueError("unsolicited score cancellation")
             except (ValueError, TypeError, OverflowError) as error:
                 raise self._silent(str(error)) from None
             owner["drained"] = True
             if fields[2] == "ERROR":
                 raise self._silent("fatal score engine/state error: " + result["error"])
+            if fields[2] == "CANCELLED" or cancel.is_set() or time.monotonic() >= deadline:
+                timed_out = owner.get("timed_out", time.monotonic() >= deadline)
+                raise AdmissionError("score timed out after matching terminal drained" if timed_out else
+                                     "score cancelled after matching terminal drained", 408 if timed_out else 409)
             if fields[2] == "REJECT":
                 raise ValueError(result["error"])
-            if fields[2] == "CANCELLED" or cancel.is_set():
-                raise AdmissionError("score cancelled after matching terminal drained", 409)
             return result
 
-    def score(self, request, cancel, request_id=None, on_wait=None, on_submit=None, on_phase=None):
+    def score(self, request, cancel, request_id=None, on_wait=None, on_submit=None, on_phase=None, deadline=None):
         """One bounded score owner on the existing control FIFO and stdout pump.
 
         SCANCEL never releases ownership: only the matching, validated SDONE does.
@@ -1597,6 +1599,9 @@ class StrataEngine:
         if not score_api.capabilities(self)["available"]:
             raise ValueError("this engine does not support SCORE v1")
         prompt, selected, payload = score_api.prepare(request, self)
+        timeout, _ = score_api.validate_controls(request)
+        deadline = min(deadline if deadline is not None else time.monotonic() + timeout,
+                       time.monotonic() + self.SCORE_TIMEOUT_S)
         request_id = request_id or uuid.uuid4().hex
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
             raise ValueError("invalid score request ID")
@@ -1607,6 +1612,13 @@ class StrataEngine:
         acquired, sent = False, False
         owner = {"queue": queue.Queue(maxsize=2), "terminal": False, "admitted": False, "drained": False}
         born, queues, control = self.gen, self.score_q, self.score_control
+        def expire():
+            cancel.set()
+            with self.slot_cv:
+                self.slot_cv.notify_all()
+        timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
+        timer.daemon = True
+        timer.start()
         try:
             turn = self._take_control(cancel, len(prompt), on_wait=on_wait,
                                       priority=request.get("strata_priority", "foreground"), on_phase=on_phase)
@@ -1616,8 +1628,11 @@ class StrataEngine:
                 except StopIteration as finished:
                     acquired = bool(finished.value)
                     break
-            if not acquired:
-                raise AdmissionError("score cancelled before submission", 409)
+            if not acquired or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
+                    cancel.set()
+                raise AdmissionError("score timed out before submission" if time.monotonic() >= deadline else
+                                     "score cancelled before submission", 408 if time.monotonic() >= deadline else 409)
             if self.gen != born:
                 raise EngineDied("the engine restarted while scoring waited")
             with self.slot_cv:
@@ -1629,15 +1644,16 @@ class StrataEngine:
             self._send(f"SCORE {request_id} {payload}")
             if callable(on_submit):
                 on_submit()
-            return self._read_score(request_id, owner, born, prompt, selected, cancel)
+            return self._read_score(request_id, owner, born, prompt, selected, cancel, deadline)
         finally:
+            timer.cancel()
             if callable(on_phase):
                 on_phase("cleanup")
             try:
                 if sent and not owner["drained"] and self.gen == born and self.alive():
                     cancel.set()
                     try:
-                        self._read_score(request_id, owner, born, prompt, selected, cancel)
+                        self._read_score(request_id, owner, born, prompt, selected, cancel, deadline)
                     except (ValueError, AdmissionError):
                         pass                    # the matching terminal was validated and drained
             finally:
@@ -5066,11 +5082,13 @@ class LegacySeatTransport:
                     record["_cancel"].set()
                     raise AdmissionError("request timed out while queued", 408)
                 score = bool(record.get("_score"))
-                order = svc.selector_order(score, svc.admission_waiters, svc.admission_foreground[score], 1,
+                waiters = [r for r in svc.admission_waiters if not score or not r.get("_score_group")]
+                order = svc.selector_order(score, waiters, svc.admission_foreground[score], 1,
                                            svc.admission_solo[score])
                 chosen = order[0] if order else None
                 capacity = 1 if score else max(1, int(getattr(svc.engine, "batch", 0) or 0))
-                active = sum(bool(r.get("_score")) == score for r in svc.admission_active.values())
+                active = sum(bool(r.get("_score")) == score and (not score or not r.get("_score_group"))
+                             for r in svc.admission_active.values())
                 active_solo = sum(1 for r in svc.admission_active.values()
                                   if not r.get("_score") and r["priority"] == "foreground" and
                                   r.get("_packing") == "solo")
@@ -5329,6 +5347,15 @@ class Service:
         self.request_context_tokens = None
         self.lifecycle_api = False
         self.lifecycles = collections.deque(maxlen=500)
+        self.score_groups = {}
+        self.score_group_history = {}  # Expiry-bound terminal identities; admission reserves retirement capacity.
+        self.score_identity_owners = {}
+        self.score_group_precancel = {}  # Never evict an unexpired pre-cancel to make room.
+        self.score_caller_work = {}
+        self.score_ready = []
+        self.score_ready_callers = {p: collections.deque() for p in ("foreground", "background")}
+        self.score_child_owner = None
+        self.score_foreground_children = 0
         self.lifecycle_boot = uuid.uuid4().hex
         self.lifecycle_local = threading.local()
         self.lifecycle_adapter = LifecycleAdapter(self)
@@ -5525,6 +5552,10 @@ class Service:
                 "score_slots": 1,
                 "score_active": sum(bool(r.get("_score")) for r in self.admission_active.values()),
                 "score_waiting": sum(bool(r.get("_score")) for r in self.admission_waiters),
+                "score_ready_children": len(self.score_ready),
+                "score_executing_children": int(self.score_child_owner is not None),
+                "score_pending_work": {key: sum(w[key] for w in self.score_caller_work.values())
+                                       for key in ("groups", "children", "prompt_tokens", "selected_tokens", "compiled_bytes")},
                 "executing": sum(bool(r.get("_executing")) for r in self.admission_active.values()),
                 "native_waiting": sum(r["state"] in ("engine_wait", "native_queued")
                                       for r in self.admission_active.values()),
@@ -5556,7 +5587,8 @@ class Service:
             return True
         return active - active_solo < capacity - 1
 
-    def register_lifecycle(self, req, cancel, *, score=False):
+    def register_lifecycle(self, req, cancel, *, score=False, score_scope=None, score_correlation=None):
+        now, wall = time.perf_counter(), time.time()
         priority = req.get("strata_priority", "foreground")
         if priority not in ("foreground", "background"):
             raise ValueError("strata_priority must be foreground or background")
@@ -5566,7 +5598,10 @@ class Service:
         timeout = req.get("strata_timeout_s", self.request_timeout_s)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= self.request_timeout_s:
             raise ValueError("strata_timeout_s must be positive and no greater than request_timeout_s")
-        now = time.perf_counter()
+        group = None
+        if score and "group" in req:
+            group, _, _ = score_api.prepare_group(req, self.engine)
+            timeout = min(timeout, 300.0, max(0.0, group["deadline_unix_s"] - wall))
         record: dict[str, Any] = {"id": uuid.uuid4().hex, "_score": score, "_packing": packing,
                   "priority": priority, "state": "queued", "started_at": time.time(),
                   "timeout_s": timeout, "queue_s": 0.0, "first_token_s": None, "completion_s": None,
@@ -5574,6 +5609,10 @@ class Service:
                   "_deadline": now + timeout, "_cancel": cancel}
         record["_native_admission"] = not score and bool(getattr(self.engine, "native_admission", False))
         record["lifecycle_transport"] = "score-control" if score else "legacy-seat"
+        if score:
+            record["_score_scope"] = score_scope or self.score_scope()
+            record["score_caller_scope"] = record["_score_scope"]
+            record["score_correlation"] = score_correlation or {"caller": "anonymous", "operation_id": None}
         if record["_native_admission"]:
             self.lifecycle_adapter.initialize(record)
         record.update(boot_id=self.lifecycle_boot, first_content_s=None,
@@ -5582,6 +5621,18 @@ class Service:
                       native_submissions=[], native_submissions_dropped=0, native_submission_count=0)
         _frontend_phase(record, "ingress_wait" if record["_native_admission"] else "admission_wait", now)
         with self.admission_cv:
+            self._prune_score_identities()
+            if group is not None:
+                group_id = group["id"]
+                group_key = (record["_score_scope"], group_id)
+                if group_key in self.score_identity_owners or group_key in self.score_group_history or group_key in self.score_group_precancel:
+                    raise AdmissionError("duplicate or retired score group identity", 409)
+                record["_score_group_key"] = group_key
+                record["_score_group"] = group
+                record["score_group_id"] = group_id
+                record["_score_finished"] = threading.Event()
+                record["score_completed_children"] = 0
+                record["score_drained"] = True
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
             record["_active_at_enqueue"] = len(self.admission_active)
             record["_active_packing_at_enqueue"] = {
@@ -5594,6 +5645,8 @@ class Service:
                 record["rejection_reason"] = "shutdown"
                 raise AdmissionError("the server is shutting down; no new request is accepted", 503,
                                      lifecycle=record)
+            if group is not None:
+                self._reserve_score_identity(record)
             # SCORE uses its own bounded control lane, not a generation reservation.
             limit = score_api.capabilities(self.engine)["max_pending"] if score else capacity + self.request_queue_limit
             pending = (sum(bool(r.get("_score")) == score for r in self.admission_active.values()) +
@@ -5604,6 +5657,9 @@ class Service:
                 self.lifecycles.append(record)
                 record["rejection_reason"] = "queue_full"
                 raise AdmissionError("request queue is full; retry after a request completes", lifecycle=record)
+            if group is not None:
+                self._reserve_score_group(record, score_api.group_work(req))
+                self.score_groups[group_key] = record
             if self.loaded() and bool(getattr(self.engine, "native_admission", False)):
                 self.lifecycle_adapter.resolve()
                 if not score:
@@ -5823,6 +5879,23 @@ class Service:
         Native mode uses only CPU/memory ingress permits here, never a seat or priority prediction.
         Legacy `on_wait` preparation stays outside the admission lock and cannot change selector order.
         """
+        if record.get("_score_group") is not None:
+            # Ownership covers the complete decision; only one bounded child enters the control selector at a time.
+            with self.admission_cv:
+                self._check_ingress_cancel(record)
+                if record in self.admission_waiters:
+                    self.admission_waiters.remove(record)
+                    self.status["queued"] -= 1
+                self.admission_active[record["id"]] = record
+                now = time.perf_counter()
+                record["_admitted_clock"] = now
+                record["queue_s"] = now - record["_clock"]
+                record["admission_wait_s"] = record["queue_s"]
+                record["admission_reason"] = "group_child_round_robin"
+                _frontend_phase(record, "preparation", now)
+                self.admission_cv.notify_all()
+            self.lifecycle_note(record, "admitted")
+            return
         if record.get("_native_admission"):
             # This is an ingress CPU/memory permit, not a prediction of native seat or priority policy.
             capacity = max(1, int(getattr(self.engine, "batch", 0) or 0))
@@ -5891,6 +5964,10 @@ class Service:
             if record in self.admission_waiters:
                 self.admission_waiters.remove(record)
                 self.status["queued"] -= 1
+            if (record.get("_score_group") and not record.get("cancel_reason") and
+                    not record.get("error") and not record.get("rejection_reason") and
+                    record.get("score_completed_children", 0) != record.get("score_work", {}).get("children")):
+                record["error"] = "score group ended without a complete child result set"
             self.admission_active.pop(record["id"], None)
             self._refresh_foreground_pending()
             record["completion_s"] = round(time.perf_counter() - record["_clock"], 6)
@@ -5902,6 +5979,18 @@ class Service:
         self.lifecycle_note(record, outcome)
         with self.status_lock:
             self._finish_frontend(record)
+            if record.get("_score_group") is not None:
+                outcome = self.score_group_outcome(record)
+                key = record["_score_group_key"]
+                if self.score_groups.get(key) is record:
+                    self.score_groups.pop(key)
+                if self.score_identity_owners.get(key) is record:
+                    self.score_identity_owners.pop(key)
+                    deadline = record["_score_group"]["deadline_unix_s"]
+                    self._remember_score_group(key, {"deadline_unix_s": deadline,
+                        "retain_until": deadline + score_api.GROUP_DRAIN_S, "outcome": outcome})
+                self._release_score_group(record)
+                record["_score_finished"].set()
         self.lifecycle_local.record = None
 
     def lifecycle_records(self, request_id=None):
@@ -5937,14 +6026,19 @@ class Service:
         return {"boot_id": self.lifecycle_boot, "truncated": len(active) + len(done) > len(chosen),
                 "records": [item(r) for r in chosen]}
 
-    def cancel_request(self, request_id):
+    def cancel_request(self, request_id, *, score_scope=None):
         with self.admission_cv:
             record = self.admission_active.get(request_id) or next(
                 (r for r in self.admission_waiters if r["id"] == request_id), None)
             if record is None:
                 return False
-            record["cancel_reason"] = "cancelled"
-            record["_cancel"].set()
+            if record.get("_score") and score_scope is not None and score_scope != record.get("_score_scope"):
+                raise AdmissionError("score request is not owned by this caller", 403)
+            if not record.get("_score") or not record["_cancel"].is_set():
+                record["cancel_reason"] = "cancelled"
+                if record.get("_score"):
+                    record["_score_stop_clock"] = time.perf_counter()
+                record["_cancel"].set()
             self.admission_cv.notify_all()
         try:
             self.lifecycle_adapter.cancel(record)
@@ -5952,43 +6046,309 @@ class Service:
             pass
         return True
 
+    def score_scope(self, tenant="", *, gateway=False, credential=""):
+        """Only transport-authenticated values enter this process-local owner identity, never request state."""
+        identity = ["score-owner-v1", "gateway" if gateway else "principal" if credential else "anonymous",
+                    tenant, credential_fingerprint(credential)]
+        return hmac.new(self.cache_secret, json.dumps(identity, separators=(",", ":")).encode(), "sha256").hexdigest()
+
+    def _prune_score_identities(self):
+        now = time.time()
+        self.score_group_history = {key: value for key, value in self.score_group_history.items() if value["retain_until"] > now}
+        self.score_group_precancel = {key: end for key, end in self.score_group_precancel.items() if end > now}
+
+    def _reserve_score_identity(self, record):
+        scope = record["_score_scope"]
+        tables = (self.score_identity_owners, self.score_group_history)
+        owned = sum(key[0] == scope for table in tables for key in table)
+        if (sum(map(len, tables)) >= score_api.MAX_RETIRED_IDENTITIES or
+                owned >= score_api.MAX_CALLER_RETIRED_IDENTITIES):
+            record.update(state="rejected", error="score identity retention budget is full", rejection_reason="score_identity_full")
+            record["events"].append({"state": "rejected", "elapsed_s": time.perf_counter() - record["_clock"]})
+            self.lifecycles.append(record)
+            raise AdmissionError("score identity retention budget is full", lifecycle=record)
+        self.score_identity_owners[record["_score_group_key"]] = record
+
+    def _reserve_score_group(self, record, work):
+        scope = record["_score_scope"]
+        caller = self.score_caller_work.get(scope, dict.fromkeys(work, 0))
+        caller_limits = {"groups": score_api.MAX_CALLER_GROUPS, "children": 2 * score_api.MAX_GROUP_CHILDREN,
+                         "prompt_tokens": score_api.MAX_CALLER_PROMPT_TOKENS,
+                         "selected_tokens": 2 * score_api.MAX_GROUP_SELECTED_TOKENS,
+                         "compiled_bytes": score_api.MAX_CALLER_GROUP_BYTES}
+        global_limits = {"groups": score_api.MAX_PENDING, "children": 4 * score_api.MAX_GROUP_CHILDREN,
+                         "prompt_tokens": score_api.MAX_PENDING_PROMPT_TOKENS,
+                         "selected_tokens": 4 * score_api.MAX_GROUP_SELECTED_TOKENS,
+                         "compiled_bytes": score_api.MAX_PENDING_GROUP_BYTES}
+        total = {key: sum(value[key] for value in self.score_caller_work.values()) for key in work}
+        if any(caller[key] + work[key] > caller_limits[key] or total[key] + work[key] > global_limits[key] for key in work):
+            record.update(state="rejected", error="score caller/work budget is full", rejection_reason="score_work_full")
+            record["events"].append({"state": "rejected", "elapsed_s": time.perf_counter() - record["_clock"]})
+            self.lifecycles.append(record)
+            raise AdmissionError("score caller/work budget is full", lifecycle=record)
+        self.score_caller_work[scope] = {key: caller[key] + work[key] for key in work}
+        record["score_work"] = work
+        record["_score_work_reserved"] = True
+        record.update(score_issued_work=0, score_drained_children=0, score_service_turns=0, score_child_wait_s=0.0)
+
+    def _release_score_group(self, record):
+        if not record.pop("_score_work_reserved", False):
+            return
+        scope, work = record["_score_scope"], record["score_work"]
+        caller = self.score_caller_work[scope]
+        for key in work:
+            caller[key] -= work[key]
+        if caller["groups"] == 0:
+            self.score_caller_work.pop(scope)
+
+    @contextlib.contextmanager
+    def score_child_turn(self, record, prompt_tokens, selected_tokens):
+        """One drained native child per caller turn; foreground has a bounded three-child burst."""
+        if record is None:
+            yield
+            return
+        scope, priority = record["_score_scope"], record["priority"]
+        entry = {"record": record, "scope": scope, "priority": priority, "ready_at": time.perf_counter(),
+                 "work": prompt_tokens + selected_tokens}
+        acquired = False
+        with self.admission_cv:
+            self._check_ingress_cancel(record)
+            self.score_ready.append(entry)
+            callers = self.score_ready_callers[priority]
+            if scope not in callers:
+                callers.append(scope)
+            self.admission_cv.notify_all()
+        try:
+            while not acquired:
+                with self.admission_cv:
+                    self._check_ingress_cancel(record)
+                    foreground, background = self.score_ready_callers["foreground"], self.score_ready_callers["background"]
+                    selected_priority = ("background" if background and (
+                        not foreground or self.score_foreground_children >= score_api.FOREGROUND_CHILD_BURST) else "foreground")
+                    selected_callers = self.score_ready_callers[selected_priority]
+                    chosen = next((item for item in self.score_ready if selected_callers and
+                                   item["priority"] == selected_priority and item["scope"] == selected_callers[0]), None)
+                    if self.score_child_owner is None and chosen is entry:
+                        self.score_ready.remove(entry)
+                        selected_callers.popleft()
+                        if any(item["priority"] == priority and item["scope"] == scope for item in self.score_ready):
+                            selected_callers.append(scope)
+                        self.score_child_owner = entry
+                        self.score_foreground_children = (min(score_api.FOREGROUND_CHILD_BURST,
+                            self.score_foreground_children + 1) if priority == "foreground" else 0)
+                        record["score_service_turns"] = record.get("score_service_turns", 0) + 1
+                        record["score_child_wait_s"] = record.get("score_child_wait_s", 0.0) + time.perf_counter() - entry["ready_at"]
+                        acquired = True
+                    else:
+                        _frontend_phase(record, "control_selector_wait")
+                        self.admission_cv.wait(timeout=min(.1, max(.001, record["_deadline"] - time.perf_counter())))
+            yield entry
+        finally:
+            with self.admission_cv:
+                if entry in self.score_ready:
+                    self.score_ready.remove(entry)
+                callers = self.score_ready_callers[priority]
+                if not any(item["priority"] == priority and item["scope"] == scope for item in self.score_ready):
+                    if scope in callers:
+                        callers.remove(scope)
+                if self.score_child_owner is entry:
+                    if scope in callers:
+                        callers.remove(scope)
+                        callers.append(scope)
+                    self.score_child_owner = None
+                self.admission_cv.notify_all()
+
+    def _remember_score_group(self, key, terminal):
+        if key not in self.score_group_history and len(self.score_group_history) >= score_api.MAX_RETIRED_IDENTITIES:
+            raise RuntimeError("score retirement had no reserved identity capacity")
+        self.score_group_history[key] = terminal
+
+    def score_group_outcome(self, record, kind=None):
+        now = time.perf_counter()
+        reason = record.get("cancel_reason")
+        kind = kind or record.get("score_outcome", {}).get("kind") or (
+            "deadline" if reason == "timeout" else "cancelled" if reason else
+            "refused" if record.get("error") or record.get("rejection_reason") else "completed")
+        if kind == "completed" and record.get("score_completed_children", 0) != record.get("score_work", {}).get("children"):
+            kind = "protocol" if record.get("score_issued_work") else "refused"
+        stopped = record.get("_score_stop_clock", min(now, record["_deadline"]) if kind == "deadline" else now)
+        outcome = {"kind": kind, "completed_children": record.get("score_completed_children", 0),
+                   "failed_child": record.get("score_failed_child"), "drained": record.get("score_drained", True),
+                   "caller_elapsed_s": max(0, stopped - record["_clock"]), "cleanup_s": max(0, now - stopped)}
+        record["score_outcome"] = outcome
+        return outcome
+
+    def cancel_score_group(self, request, *, scope=None):
+        if (set(request) - {"version", "group_id", "deadline_unix_s", "reason", "pre_registration"} or
+                not {"version", "group_id", "deadline_unix_s"} <= set(request) or
+                type(request["version"]) is not int or request["version"] != 1):
+            raise ValueError("score cancellation requires version 1, group_id and deadline_unix_s")
+        group_id = score_api.validate_group_id(request["group_id"])
+        expires = request["deadline_unix_s"]
+        if type(expires) not in (int, float) or not math.isfinite(expires) or expires > time.time() + 300:
+            raise ValueError("invalid score cancellation deadline")
+        reason = request.get("reason", "cancelled")
+        if reason not in ("cancelled", "deadline"):
+            raise ValueError("invalid score cancellation reason")
+        pre_registration = request.get("pre_registration", False)
+        if type(pre_registration) is not bool:
+            raise ValueError("pre_registration must be a boolean")
+        scope = scope or self.score_scope()
+        key = (scope, group_id)
+        with self.admission_cv:
+            self._prune_score_identities()
+            record = self.score_identity_owners.get(key)
+            retained = self.score_group_history.get(key)
+            precancel = self.score_group_precancel.get(key)
+            if record is None:
+                if retained is not None:
+                    if expires != retained["deadline_unix_s"]:
+                        raise AdmissionError("stale score group cancellation identity", 409)
+                    return {"version": 1, "group_id": group_id, "outcome": retained["outcome"]}
+                if precancel is not None and expires != precancel:
+                    raise AdmissionError("stale score pre-cancel identity", 409)
+                if precancel is None and not pre_registration:
+                    foreign = any(other[1] == group_id and other[0] != scope for table in (
+                        self.score_identity_owners, self.score_group_history, self.score_group_precancel) for other in table)
+                    raise AdmissionError("score group is not owned by this caller" if foreign else "unknown score group",
+                                         403 if foreign else 404)
+                if expires > time.time():
+                    caller_pending = sum(other[0] == scope for other in self.score_group_precancel)
+                    if precancel is None and (len(self.score_group_precancel) >= score_api.MAX_PRE_CANCELS or
+                                               caller_pending >= score_api.MAX_CALLER_PRE_CANCELS):
+                        raise AdmissionError("score pre-cancel queue is full")
+                    self.score_group_precancel[key] = expires
+                outcome = {"kind": "cancelled", "completed_children": 0, "failed_child": None,
+                           "drained": True, "caller_elapsed_s": 0.0, "cleanup_s": 0.0}
+                return {"version": 1, "group_id": group_id, "outcome": outcome}
+            if expires != record["_score_group"]["deadline_unix_s"]:
+                raise AdmissionError("stale score group cancellation identity", 409)
+            if not record["_cancel"].is_set():
+                record["cancel_reason"] = "timeout" if reason == "deadline" else "cancelled"
+                record["_score_stop_clock"] = (min(time.perf_counter(), record["_deadline"])
+                                               if reason == "deadline" else time.perf_counter())
+                record["_cancel"].set()
+            self.admission_cv.notify_all()
+        finished = record["_score_finished"].wait(score_api.GROUP_DRAIN_S)
+        with self.status_lock:
+            outcome = dict(record.get("score_outcome") or self.score_group_outcome(record, "cancelled"))
+            outcome["drained"] = finished and outcome["drained"]
+        return {"version": 1, "group_id": group_id, "outcome": outcome}
+
     def score(self, request, cancel):
         """The same HTTP admission owner as generation, retained through native drain."""
         if not isinstance(self.engine, StrataEngine):
             raise ValueError("this engine does not support SCORE v1")
         record = getattr(self.lifecycle_local, "record", None)
         with contextlib.ExitStack() as turn:
+            startup_barrier = False
             self.frontend_phase(record, "control_occupied_wait" if not getattr(self.engine, "batch", 0) else "preparation")
-            if not getattr(self.engine, "batch", 0):
+            if not self.loaded():
                 while not self.fifo.acquire(timeout=.1):
-                    if cancel.is_set():
+                    if record is not None:
+                        self._check_ingress_cancel(record)
+                    elif cancel.is_set():
                         raise AdmissionError("score cancelled while queued", 409)
-                turn.callback(self.fifo.release)
-                self.frontend_phase(record, "preparation")
-                self.ensure_loaded()
-            elif not self.loaded():
-                with self.fifo:
+                    if self.loaded():
+                        startup_barrier = True
+                        break
+                else:
+                    turn.callback(self.fifo.release)
+                    self.frontend_phase(record, "preparation")
                     self.ensure_loaded()
-            prompt, _, _ = score_api.prepare(request, self.engine)
+            else:
+                startup_barrier = bool(getattr(self.engine, "starting", False))
+            grouped = "group" in request
+            if grouped:
+                group, children, plans = score_api.prepare_group(request, self.engine)
+            else:
+                group, children, plans = None, None, [request]
+            prompt, _, _ = score_api.prepare(plans[0], self.engine)
+            turn.close()  # Loaded serial peers enter the child selector before waiting on the FIFO.
             if record is not None:
-                self.lifecycle_note(record, "preparing", prompt_tokens=len(prompt), output_tokens=0, _executing=False)
+                self.lifecycle_note(record, "preparing", prompt_tokens=sum(len(p["prompt_token_ids"]) for p in plans),
+                                    output_tokens=0, _executing=False)
             def waiting():
                 if record is not None:
                     self.lifecycle_note(record, "engine_wait", _executing=False)
             def submitted():
                 if record is not None:
+                    record["score_drained"] = False
+                    record["score_issued_work"] = record.get("score_issued_work", 0) + len(plan["prompt_token_ids"]) + len(plan["selected_token_ids"])
                     self.lifecycle_note(record, "scoring", _executing=True)
                     self.native_submitted(record)
             try:
-                result = self.engine.score(request, cancel, request_id=record["id"] if record else None,
-                                           on_wait=waiting, on_submit=submitted,
-                                           on_phase=lambda phase: self.frontend_phase(record, phase))
+                results = []
+                owner_id = record["id"] if record else uuid.uuid4().hex
+                if record is None:
+                    deadline = time.monotonic() + score_api.validate_controls(request)[0]
+                    if grouped:
+                        deadline = min(deadline, time.monotonic() + max(0, group["deadline_unix_s"] - time.time()))
+                else:
+                    deadline = time.monotonic() + max(0, record["_deadline"] - time.perf_counter())
+                deadline = min(deadline, time.monotonic() + self.engine.SCORE_TIMEOUT_S)
+                for index, plan in enumerate(plans):
+                    if record is not None:
+                        if grouped:
+                            record["score_failed_child"] = children[index]["id"]
+                        self._check_ingress_cancel(record)
+                    child_request = plan | {"strata_priority": request.get("strata_priority", "foreground"),
+                                            "strata_timeout_s": max(.000001, deadline - time.monotonic())}
+                    child_id = f"{owner_id}_{index}" if grouped else owner_id
+                    with contextlib.ExitStack() as child_turn:
+                        child_turn.enter_context(self.score_child_turn(record, len(plan["prompt_token_ids"]),
+                                                                      len(plan["selected_token_ids"])))
+                        if startup_barrier or not getattr(self.engine, "batch", 0):
+                            while not self.fifo.acquire(timeout=.1):
+                                if record is not None:
+                                    self._check_ingress_cancel(record)
+                                elif cancel.is_set() or time.monotonic() >= deadline:
+                                    raise AdmissionError("score cancelled while queued", 409)
+                            child_turn.callback(self.fifo.release)
+                        if startup_barrier:
+                            # A cold peer joins child selection as soon as loading is
+                            # visible, but the loader may still be finishing under FIFO.
+                            # Validate every child against the fully initialized engine.
+                            self.ensure_loaded()
+                            if grouped:
+                                score_api.prepare_group(request, self.engine)
+                            else:
+                                score_api.prepare(request, self.engine)
+                            startup_barrier = False
+                        result = self.engine.score(child_request, cancel, request_id=child_id,
+                                                   on_wait=waiting, on_submit=submitted, deadline=deadline,
+                                                   on_phase=lambda phase: self.frontend_phase(record, phase))
+                    results.append(result)
+                    if record is not None:
+                        record["score_drained"] = True
+                        record["score_drained_children"] = record.get("score_drained_children", 0) + 1
+                        record["score_completed_children"] = len(results)
+                        self.lifecycle_note(record, "drained", _executing=False, score_receipt=result["receipt"])
+                if not grouped:
+                    return results[0]
                 if record is not None:
-                    self.lifecycle_note(record, "drained", _executing=False, score_receipt=result["receipt"])
-                return result
+                    record["score_failed_child"] = None
+                    self._check_ingress_cancel(record)
+                    outcome = self.score_group_outcome(record, "completed")
+                else:
+                    outcome = {"kind": "completed", "completed_children": len(results), "failed_child": None,
+                               "drained": True, "caller_elapsed_s": 0.0, "cleanup_s": 0.0}
+                return {"version": 1, "request_id": owner_id,
+                        "group": group, "outcome": outcome,
+                        "correlation": ({"caller_scope": record["score_caller_scope"], **record["score_correlation"]}
+                                        if record else {"caller": "internal", "operation_id": None}),
+                        "children": [{"id": child["id"], "plan_sha256": child["plan_sha256"], "result": row}
+                                     for child, row in zip(children, results)]}
             except (ValueError, EngineDied, AdmissionError) as error:
                 if record is not None:
+                    if not record.get("score_drained", True) and not isinstance(error, EngineDied):
+                        record["score_drained_children"] = record.get("score_drained_children", 0) + 1
+                    record["score_drained"] = not isinstance(error, EngineDied)
                     record["error"] = str(error)
+                    if isinstance(error, AdmissionError) and error.status == 408:
+                        record["cancel_reason"] = "timeout"
+                    if record.get("_score_group") is not None:
+                        self.score_group_outcome(record, "protocol" if isinstance(error, EngineDied) else None)
                 raise
             finally:
                 self.frontend_phase(record, "preparation")
@@ -9004,6 +9364,9 @@ def make_handler(svc: Service):
         def _body(self) -> bytes:
             self.body_read = True
             limit = body_limit()
+            score_body = self.path.split("?", 1)[0].rstrip("/") in ("/v1/score", "/v1/score/cancel")
+            if score_body:
+                limit = min(limit, score_api.MAX_GROUP_BYTES)
             if self._chunked():
                 return self._read_chunked(min(limit, svc.request_body_bytes))
             try:
@@ -9014,8 +9377,8 @@ def make_handler(svc: Service):
                 raise BadBody(400, "invalid Content-Length")
             if length > limit:
                 self.close_connection = True               # the body is not read: the connection ends with the answer
-                raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                   "(STRATA_MAX_BODY_MIB raises the limit)")
+                hint = "(fixed score body bound)" if score_body else "(STRATA_MAX_BODY_MIB raises the limit)"
+                raise BadBody(413, f"the request body is larger than {limit >> 20} MiB {hint}")
             if length > svc.request_body_bytes:
                 raise AdmissionError("request body exceeds request_body_bytes", 413)
             timeout = self.connection.gettimeout()
@@ -9150,6 +9513,8 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     if values.get("outcome") == "disconnected":
                         self.lifecycle["cancel_reason"] = "disconnected"
+                        if self.lifecycle.get("_score"):
+                            self.lifecycle.setdefault("_score_stop_clock", time.perf_counter())
                     if "error" in values:
                         self.lifecycle["error"] = values["error"]
 
@@ -9400,6 +9765,22 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _caller(self):
+            """The existing authenticated principal/gateway rule, shared by score and lifecycle cancellation."""
+            auth = self.headers.get("Authorization", "")
+            given = (auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", ""))
+            accepted = accepted_key(given, svc.api_key) if svc.api_key else None
+            tenant, gateway = accepted or "", False
+            gateway_credential = accepted_key(given, svc.tenant_token)
+            gateway_authorized = gateway_credential is not None and (not svc.api_key or gateway_credential == accepted)
+            # Only the configured gateway may attest a tenant. Canonical credentials, never their wire encodings,
+            # bind the identity; ordinary clients' tenant headers are ignored rather than trusted.
+            if gateway_authorized:
+                attested = self.headers.get(TENANT_HEADER, "").strip()
+                if attested:
+                    tenant, gateway = attested, True
+            return accepted, tenant, gateway, gateway_credential, gateway_authorized
+
         def _lifecycle_allowed(self):
             # Deliberately not a public monitoring/cancellation API; proxy forwarding headers confer no trust.
             if not svc.lifecycle_api or self.client_address[0] not in ("127.0.0.1", "::1"):
@@ -9474,7 +9855,10 @@ def make_handler(svc: Service):
                         request_id = req.get("id")
                         if not isinstance(request_id, str):
                             raise ValueError("id must be a request id")
-                        found = svc.cancel_request(request_id)
+                        accepted, tenant, gateway, gateway_credential, gateway_authorized = self._caller()
+                        scope = svc.score_scope(tenant, gateway=gateway_authorized,
+                                                credential=gateway_credential if gateway_authorized else accepted or "")
+                        found = svc.cancel_request(request_id, score_scope=scope)
                         self._json(202 if found else 404, {"id": request_id, "cancel_requested": found})
                     return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
@@ -9518,26 +9902,23 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/score"):
-                    auth = self.headers.get("Authorization", "")
-                    given = (auth[7:].strip() if auth.lower().startswith("bearer ") else
-                             self.headers.get("x-api-key", ""))
-                    accepted = accepted_key(given, svc.api_key) if svc.api_key else None
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/score", "/v1/score/cancel"):
+                    accepted, tenant, gateway, gateway_credential, gateway_authorized = self._caller()
                     principal = accepted or ""
-                    credential = principal
-                    # A tenant is a key. The label a gateway attests is trusted only from the token
-                    # only the gateway holds; a header from anyone else is ignored, not rejected, so
-                    # one request shape serves trusted and direct callers alike. Cache identity binds
-                    # the canonical configured credential that actually authorized the request,
-                    # never an unauthenticated header or one of its accepted wire encodings.
-                    tenant, gateway = principal, False
-                    gateway_credential = accepted_key(given, svc.tenant_token)
-                    gateway_authorized = gateway_credential is not None and (
-                        not svc.api_key or gateway_credential == accepted)
-                    if gateway_authorized:
-                        attested = self.headers.get(TENANT_HEADER, "").strip()
-                        if attested:
-                            tenant, gateway, credential = attested, True, gateway_credential
+                    credential = gateway_credential if gateway else principal
+                    score_scope = correlation = None
+                    if path in ("/v1/score", "/v1/score/cancel"):
+                        score_credential = gateway_credential if gateway_authorized else credential
+                        score_scope = svc.score_scope(tenant, gateway=gateway_authorized, credential=score_credential)
+                        operation = (score_api.validate_operation_id(self.headers.get("X-Strata-Operation"))
+                                     if accepted or gateway_authorized else None)
+                        correlation = {"caller": "gateway_tenant" if gateway else "authenticated" if score_credential else "anonymous",
+                                       "operation_id": operation,
+                                       "operation_source": ("gateway_attested" if gateway else "authenticated_caller")
+                                                           if operation else "unavailable"}
+                    if path == "/v1/score/cancel":
+                        self._json(200, svc.cancel_score_group(req, scope=score_scope))
+                        return
                     # Never trust a client-supplied internal scope or cache grouping key.
                     req.pop("_strata_cache_shared_scope", None)
                     if path != "/v1/score":        # scores never reuse a conversation prefix
@@ -9545,7 +9926,8 @@ def make_handler(svc: Service):
                             req, tenant, gateway=gateway, credential=credential)
                     self.record = svc.begin_request(path, req)
                     self.request_cancel = threading.Event()
-                    self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score")
+                    self.lifecycle = svc.register_lifecycle(req, self.request_cancel, score=path == "/v1/score",
+                        score_scope=score_scope, score_correlation=correlation)
                     if path != "/v1/score" and (accepted or (gateway and gateway_credential)):
                         self.lifecycle["_cache_principal"] = (
                             "gateway" if gateway else "principal", tenant, credential_fingerprint(credential))
@@ -9556,7 +9938,7 @@ def make_handler(svc: Service):
                         # lifecycle deadline (the record above); it just never exports one to the cache.
                         req["_strata_cache_deadline_ns"] = int(self.lifecycle["_deadline"] * 1_000_000_000)
                     # A client that stops consuming must not hold a resident slot forever in a socket write.
-                    self.connection.settimeout(min(10.0, self.lifecycle["timeout_s"]))
+                    self.connection.settimeout(min(10.0, max(.001, self.lifecycle["timeout_s"])))
                     self._watch_client(self.request_cancel)
                     # A queued text request may prepare and offer itself to the store while it waits (only while it
                     # is on the queue frontier: see Service.prefetch_offer).  A client's own fields of those internal
@@ -9603,11 +9985,20 @@ def make_handler(svc: Service):
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
                 else:
-                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    body = {"error": {"type": "invalid_request_error", "message": str(e)}}
+                    if path == "/v1/score" and self.lifecycle is not None and self.lifecycle.get("_score_group"):
+                        body.update(version=1, group=self.lifecycle["_score_group"],
+                                    outcome=svc.score_group_outcome(self.lifecycle, "refused"))
+                    self._json(400, body)
             except AdmissionError as e:
                 if self.lifecycle is None:
                     self.lifecycle = e.lifecycle
-                self._json(e.status, {"error": {"type": "admission_error", "message": str(e)}})
+                body = {"error": {"type": "admission_error", "message": str(e)}}
+                if path == "/v1/score" and self.lifecycle is not None and self.lifecycle.get("_score_group"):
+                    body.update(version=1, group=self.lifecycle["_score_group"],
+                                outcome=svc.score_group_outcome(self.lifecycle,
+                                    "deadline" if e.status == 408 else "overload" if e.status == 429 else "cancelled"))
+                self._json(e.status, body)
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:

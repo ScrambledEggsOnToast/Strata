@@ -2864,6 +2864,75 @@ cancellation or expiry allows at most another 30 s to drain. Ordinary `REJECT` i
 An unknown, wrong, duplicate, missing or mismatched terminal, incomplete result, or device/state
 `ERROR` retires the process; ambiguous state is never reused.
 
+**Grouped HTTP decisions (SCORE v1, additive).** A body with `version:1`, `group` and
+`children` uses one complete decision lifecycle. The server validates every child and
+aggregate bound before issuing any native command. `group` contains `id`, the SHA-256
+fields `scoring_identity_sha256`, `bundle_sha256`, `request_sha256`, `token_plan_sha256`
+and `manifest_sha256`, plus `readout_family`, positive finite `temperature`,
+`question_count` and absolute `deadline_unix_s`. Each child contains `id`,
+`question_index`, `branch_index`, `plan_sha256`, `prompt_token_ids` and `selected_token_ids`.
+Indices are contiguous in declared question/branch order and IDs are unique within a group.
+`token_plan_sha256` hashes the ordered question/branch plan digests; `manifest_sha256`
+hashes canonical compact, sorted-key UTF-8 JSON of group metadata without that field,
+plus its `children`. The service validates this manifest and echoes the pin; it does not
+claim to possess or independently attest the caller's scoring bundle.
+
+Group IDs and child IDs use the same 1–64-character alphabet as native IDs. Group limits
+are 64 questions, 512 children, 262,144 total prompt tokens, 16,384 selected-token results
+and 4 MiB of HTTP body/compiled transport. Existing per-child limits remain. Pending groups
+reserve their complete declared work, not just a request count: at most four groups,
+1,024 children, 524,288 prompt tokens, 32,768 selected tokens and 8 MiB per authenticated
+caller; globally at most eight pending score requests, 2,048 group children, 1,048,576
+prompt tokens, 65,536 selected tokens and 16 MiB. Overflow is an ordinary refusal.
+
+The complete group owns its lifecycle and work reservation until terminal cleanup. Only
+one bounded child at a time is eligible for native score control. Ready callers rotate
+round-robin within each priority; their children use FIFO order, with at most three
+foreground child turns before a waiting background child. The control/FIFO lease is
+released after each matching native terminal, including in serial mode. Large groups
+therefore cannot monopolize the score lane for all their siblings. Cold-start waiters
+enter child selection once loading is visible. New arrivals observing an alive engine
+whose restart is still in progress use the same protection. Their first selected turn
+crosses the startup FIFO and revalidates every child before issue. This is a frontend transport
+selector, not native scheduling or GPU batching. Generation keeps its own reservations
+and existing native execution policy.
+
+`strata_priority` must be `foreground` or `background`; `strata_timeout_s` must be finite,
+positive and no greater than the service/native bound. One caller deadline covers group
+validation, queueing and every child: the minimum of remaining budget, absolute Unix
+deadline and the 300 s work bound is retained, never reset between children. An active
+deadline, like queued expiry, returns **408 after matching drain**; explicit cancellation
+returns **409**. Group outcomes distinguish caller time from `cleanup_s`, report
+`completed_children`, `failed_child` and `drained`, and never include partial child results
+on failure. A success contains the echoed group identity and every ordered child result,
+each bound to a unique server-owned native request ID.
+
+`POST /v1/score/cancel` takes `version:1`, `group_id`, the matching `deadline_unix_s`
+and optional `reason:"cancelled"|"deadline"`. Normal cancellation refuses unknown/foreign
+identities with 404/403. Explicit `pre_registration:true` atomically cancels the caller's
+own not-yet-registered identity, independently of an identically named foreign group.
+It sets the existing cancellation event and waits at most 32 s for retirement; native
+drain itself remains bounded at 30 s. Cancellation never releases an issued owner early.
+Registration, cancellation, pre-cancellation and terminal identities are keyed by a
+server-derived authenticated credential/gateway-tenant scope, never group ID alone.
+A foreign tenant or rotated credential cannot cancel the group, including through the
+opt-in private lifecycle-cancel route. Pre-cancels live until the absolute deadline,
+at most 32 per caller and 128 globally, without eviction under overload.
+
+Admission reserves terminal-identity capacity before queue/work refusal: at most 128
+identity owners/terminals globally and 64 per caller. Terminals remain through the
+original absolute deadline plus the 32 s cleanup envelope; saturation refuses admission,
+never evicts an unexpired tombstone. Retirement verifies the registered record's identity
+before removing it, so delayed cleanup of a rejected request cannot erase a newer owner.
+These are bounded process-local guards, not permanent replay/operation deduplication.
+
+Only a configured gateway may attest `X-Strata-Tenant`; an ordinary caller's tenant header
+is ignored. Optional `X-Strata-Operation` is a bounded, authenticated caller-scoped
+correlation label, with provenance returned in the group result and lifecycle record.
+Anonymous requests share an anonymous scope and cannot invent per-agent identity from
+request state. The single-plan body and native `SCORE`/`SCANCEL`/`SDONE` grammar stay
+unchanged for rollback; an older frontend ordinarily refuses the additive group body.
+
 With `--judge-context N`, prompts that fit the admitted short lane use its bulk
 prefill and final-row native head. Every generation binding is restored before
 the reply; scoring does not clear the generation conversation cache. Without an
