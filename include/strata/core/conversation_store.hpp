@@ -503,6 +503,29 @@ struct ConversationStorePublishResult {
     std::string detail;
 };
 
+#ifdef STRATA_STORE_TEST_HOOKS
+// One bounded, metadata-only summary of a started writer. Missing phase clocks remain zero (not measured).
+// Durations are inclusive/nested: file fsync is part of payload/manifest/catalog, never an additional cost.
+// calls_complete=false means an exception interrupted per-call timing; the outer writer clocks remain usable.
+// The observer is copied at admission and called only after settlement, outside the store mutex. It must be
+// noexcept, bounded, and perform no I/O; its context must outlive finish_shutdown(). No production instrumentation.
+struct ConversationStorePublishTrace {
+    uint64_t request_id = 0, generation = 0, epoch = 0;
+    uint64_t admitted_ns = 0, writer_started_ns = 0, body_finished_ns = 0, result_ready_ns = 0;
+    uint64_t payload_started_ns = 0, payload_finished_ns = 0;
+    uint64_t manifest_started_ns = 0, manifest_finished_ns = 0;
+    uint64_t catalog_started_ns = 0, catalog_finished_ns = 0, catalog_applied_ns = 0;
+    uint64_t logical_payload_bytes = 0, source_bytes = 0, source_chunks = 0, hashed_bytes = 0;
+    uint64_t source_read_ns = 0, hash_ns = 0;
+    uint64_t file_write_ns = 0, file_write_bytes = 0, file_fsync_ns = 0, file_fsync_calls = 0;
+    uint64_t dir_fsync_ns = 0, dir_fsync_calls = 0;
+    uint64_t thread_cpu_ns = 0;
+    bool thread_cpu_known = false;
+    bool calls_complete = true;
+    ConversationStorePublishStatus status = ConversationStorePublishStatus::disabled;
+};
+#endif
+
 // ---------------------------------------------------------------------------------------------------------------
 // Accounting
 // ---------------------------------------------------------------------------------------------------------------
@@ -848,6 +871,10 @@ public:
     // Pause a nonempty object-directory batch after payload emission/revalidation, before opening any shard.
     // Outside the mutex; absent from production. Context must outlive the publication using it.
     void set_object_batch_gate_for_test(void (*gate)(void*), void* context);
+    // Pause after payload emission, before the serving/shutdown fence and before any manifest. Outside the mutex.
+    void set_publish_payload_gate_for_test(void (*gate)(void*), void* context);
+    void set_publish_trace_for_test(
+        void (*observer)(void*, const ConversationStorePublishTrace&) noexcept, void* context);
 #endif
 
 private:

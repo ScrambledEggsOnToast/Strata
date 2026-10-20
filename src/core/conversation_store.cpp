@@ -50,6 +50,9 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#ifdef STRATA_STORE_TEST_HOOKS
+#include <time.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -142,6 +145,41 @@ uint64_t store_timing_ns() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+#ifdef STRATA_STORE_TEST_HOOKS
+thread_local ConversationStorePublishTrace* active_publish_trace = nullptr;
+
+struct PublishTraceScope {
+    ConversationStorePublishTrace* previous;
+    explicit PublishTraceScope(ConversationStorePublishTrace* trace) : previous(active_publish_trace) {
+        active_publish_trace = trace;
+    }
+    ~PublishTraceScope() { active_publish_trace = previous; }
+};
+
+uint64_t publish_thread_cpu_ns() {
+    timespec sample{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &sample) != 0) return 0;
+    return uint64_t(sample.tv_sec) * 1000000000 + uint64_t(sample.tv_nsec);
+}
+
+int publish_trace_fsync(int fd, bool directory) {
+    if (!active_publish_trace) return ::fsync(fd);
+    const uint64_t started = store_timing_ns();
+    const int result = ::fsync(fd);
+    const int saved_errno = errno;
+    const uint64_t elapsed = store_timing_ns() - started;
+    if (directory) {
+        active_publish_trace->dir_fsync_ns += elapsed;
+        ++active_publish_trace->dir_fsync_calls;
+    } else {
+        active_publish_trace->file_fsync_ns += elapsed;
+        ++active_publish_trace->file_fsync_calls;
+    }
+    errno = saved_errno;
+    return result;
+}
+#endif
 
 // A read's existing catalog lock, with opt-in acquisition wait accounting. The counter is updated only after the
 // mutex is held. This introduces neither another lock nor a diagnostic clock call on the disabled path.
@@ -457,7 +495,11 @@ bool make_child_dir(int parent, const char* name, bool& created, std::string& wh
 }
 
 bool fsync_dir(int fd, const char* label, std::string& why) {
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (publish_trace_fsync(fd, true) != 0) {
+#else
     if (::fsync(fd) != 0) {
+#endif
         why = std::string("directory fsync failed for ") + label + ": " + std::strerror(errno);
         return false;
     }
@@ -472,8 +514,23 @@ bool write_new_file(int dir, const std::string& name, const void* data, size_t s
         why = std::string("cannot create ") + name + ": " + std::strerror(errno);
         return false;
     }
+#ifdef STRATA_STORE_TEST_HOOKS
+    const uint64_t write_started = active_publish_trace ? store_timing_ns() : 0;
+#endif
     bool ok = write_all(fd, data, size, why);
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (active_publish_trace) {
+        const int saved_errno = errno;
+        active_publish_trace->file_write_ns += store_timing_ns() - write_started;
+        if (ok) active_publish_trace->file_write_bytes += size; // completed writes only, not partial-error bytes
+        errno = saved_errno;
+    }
+#endif
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (ok && publish_trace_fsync(fd, false) != 0) {
+#else
     if (ok && ::fsync(fd) != 0) {
+#endif
         why = std::string("fsync failed for ") + name + ": " + std::strerror(errno);
         ok = false;
     }
@@ -917,6 +974,10 @@ struct ConversationStore::Impl {
     void* catalog_gate_context = nullptr;
     void (*object_batch_gate)(void*) = nullptr;
     void* object_batch_gate_context = nullptr;
+    void (*publish_payload_gate)(void*) = nullptr;
+    void* publish_payload_gate_context = nullptr;
+    void (*publish_trace_observer)(void*, const ConversationStorePublishTrace&) noexcept = nullptr;
+    void* publish_trace_context = nullptr;
 #endif
 
     // ---- publication ----
@@ -942,7 +1003,16 @@ struct ConversationStore::Impl {
         // The objects this attempt references without creating, in the order it took their leases: released once the
         // transaction settles, so an abandoned attempt's objects become reclaimable again.
         std::vector<Digest> leased_objects;
+#ifdef STRATA_STORE_TEST_HOOKS
+        ConversationStorePublishTrace trace;
+        void (*trace_observer)(void*, const ConversationStorePublishTrace&) noexcept = nullptr;
+        void* trace_context = nullptr;
+#endif
     };
+#ifdef STRATA_STORE_TEST_HOOKS
+    static_assert(sizeof(PublishJob) + kAllocSlackBytes <= kJobFixedOverhead,
+                  "test writer instrumentation must fit the already admitted fixed job workspace");
+#endif
     std::shared_ptr<PublishJob> publishing;
     // publish() reserves one result slot per admitted job, including a coalesced predecessor. Finished results plus
     // the active writer never exceed max_pending_publishes * 4 + 4; only harvesting frees a slot.
@@ -4376,6 +4446,11 @@ void ConversationStore::Impl::writer_body() {
             job->started = true;
             ConversationStorePublishResult result;
             lock.unlock();
+#ifdef STRATA_STORE_TEST_HOOKS
+            PublishTraceScope trace_scope(job->trace_observer ? &job->trace : nullptr);
+            const uint64_t cpu_started = job->trace_observer ? publish_thread_cpu_ns() : 0;
+            if (job->trace_observer) job->trace.writer_started_ns = store_timing_ns();
+#endif
             bool escaped = false;
             std::string escape_detail;
             try {
@@ -4385,10 +4460,19 @@ void ConversationStore::Impl::writer_body() {
                 result.status = ConversationStorePublishStatus::failed;
                 result.detail = "the publication could not allocate within the published allowance";
                 escaped = false;
+#ifdef STRATA_STORE_TEST_HOOKS
+                if (job->trace_observer) job->trace.calls_complete = false;
+#endif
             } catch (...) {
                 escaped = true;
                 escape_detail = "the publication aborted unexpectedly; the authority is not trusted";
+#ifdef STRATA_STORE_TEST_HOOKS
+                if (job->trace_observer) job->trace.calls_complete = false;
+#endif
             }
+#ifdef STRATA_STORE_TEST_HOOKS
+            if (job->trace_observer) job->trace.body_finished_ns = store_timing_ns();
+#endif
             // The attempt's in-flight object leases end here, whatever it settled as: an object it named but did not
             // create becomes reclaimable again only if no retained head and no other publication still names it (and
             // a faulted store queues nothing at all, because no file may be deleted against an unreadable catalog).
@@ -4443,9 +4527,26 @@ void ConversationStore::Impl::writer_body() {
             result.request_id = job->request.request_id;
             result.generation = job->request.generation;
             if (result.epoch == 0) result.epoch = job->epoch;
+#ifdef STRATA_STORE_TEST_HOOKS
+            if (job->trace_observer) {
+                job->trace.status = result.status;
+                job->trace.catalog_applied_ns = result.applied_ns;
+                const uint64_t cpu_finished = publish_thread_cpu_ns();
+                job->trace.thread_cpu_known = cpu_started && cpu_finished >= cpu_started;
+                if (job->trace.thread_cpu_known) job->trace.thread_cpu_ns = cpu_finished - cpu_started;
+                job->trace.result_ready_ns = store_timing_ns();
+            }
+#endif
             push_publish_result_locked(std::move(result));
             if (publishing == job) publishing.reset();
             cv_work.notify_all();
+#ifdef STRATA_STORE_TEST_HOOKS
+            if (job->trace_observer) {
+                lock.unlock();
+                job->trace_observer(job->trace_context, job->trace);
+                lock.lock();
+            }
+#endif
             continue;
         }
         if (stop.load()) break;
@@ -4657,6 +4758,12 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     job->orphans.reserve(size_t(peak_chunks));
     job->leased_objects.reserve(size_t(peak_chunks));
 
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) {
+        job->trace.logical_payload_bytes = layout.payload_bytes;
+        job->trace.payload_started_ns = store_timing_ns();
+    }
+#endif
     for (const auto& stream : layout.streams) {
         const ConversationStoreStreamId id = stream.info.id;
         StreamRecord record;
@@ -4678,10 +4785,29 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                 if (element > 1) size -= size % element;
                 size = std::min(size, to - from);
                 std::vector<uint8_t> buffer(static_cast<size_t>(size));
+#ifdef STRATA_STORE_TEST_HOOKS
+                if (job->trace_observer) {
+                    const uint64_t started = store_timing_ns();
+                    const bool read = stream.read(from, buffer.data(), size_t(size), why);
+                    job->trace.source_read_ns += store_timing_ns() - started;
+                    if (!read) return false;
+                    job->trace.source_bytes += size;
+                    ++job->trace.source_chunks;
+                } else
+#endif
                 if (!stream.read(from, buffer.data(), size_t(size), why)) return false;
                 source_bytes_read += size;
+#ifdef STRATA_STORE_TEST_HOOKS
+                const uint64_t hash_started = job->trace_observer ? store_timing_ns() : 0;
+#endif
                 const Digest object = conversation_store_detail::object_digest(identity_scope, id.kind,
                                                                               identity_ordinal, size, buffer.data());
+#ifdef STRATA_STORE_TEST_HOOKS
+                if (job->trace_observer) {
+                    job->trace.hash_ns += store_timing_ns() - hash_started;
+                    job->trace.hashed_bytes += size;
+                }
+#endif
                 bool known = false, revived = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex);
@@ -4868,6 +4994,9 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         if (!emit(covered_until, stream.info.bytes)) break;
         streams.push_back(std::move(record));
     }
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) job->trace.payload_finished_ns = store_timing_ns();
+#endif
     if (!aborted) {
         std::lock_guard<std::mutex> guard(mutex);
         counters.reused_chunks += adopted_chunks;
@@ -4878,6 +5007,16 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         return;
     }
 
+#ifdef STRATA_STORE_TEST_HOOKS
+    void (*payload_gate)(void*) = nullptr;
+    void* payload_context = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        payload_gate = publish_payload_gate;
+        payload_context = publish_payload_gate_context;
+    }
+    if (payload_gate) payload_gate(payload_context);
+#endif
     conversation_store_detail::ManifestMeta meta;
     uint64_t published_order = 0;
     {
@@ -4965,6 +5104,9 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             return;
         }
     }
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) job->trace.manifest_started_ns = store_timing_ns();
+#endif
     if (std::getenv("STRATA_STORE_TIMING")) {
         uint64_t b0 = 0, d0 = 0, e0 = 0, m0 = 0;
         std::memcpy(&b0, bucket.data(), sizeof b0);
@@ -5060,6 +5202,9 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         }
     }
 
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) job->trace.manifest_finished_ns = store_timing_ns();
+#endif
     // ---- the commit: plan under the lock, write the catalog without it, then apply ----
     CommitPlan plan;
     ConversationStorePublishStatus status = ConversationStorePublishStatus::stored;
@@ -5185,7 +5330,13 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         return;
     }
     std::string commit_why;
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) job->trace.catalog_started_ns = store_timing_ns();
+#endif
     const CommitOutcome outcome = commit_plan(plan, commit_why);
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (job->trace_observer) job->trace.catalog_finished_ns = store_timing_ns();
+#endif
     if (outcome == CommitOutcome::unchanged) {
         // The durable catalog is unchanged, so nothing was authorized.  Files this attempt wrote stay accounted
         // orphans whose bytes stay charged until they are confirmed gone, and the predecessor's authority is intact.
@@ -5861,6 +6012,16 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
     self.ram_held += job->ram_bytes + needed;
     self.ram_lease += job->ram_bytes;
     self.counters.peak_bytes = std::max(self.counters.peak_bytes, self.resident_locked());
+#ifdef STRATA_STORE_TEST_HOOKS
+    job->trace_observer = self.publish_trace_observer;
+    job->trace_context = self.publish_trace_context;
+    if (job->trace_observer) {
+        job->trace.request_id = request.request_id;
+        job->trace.generation = request.generation;
+        job->trace.epoch = job->epoch;
+        job->trace.admitted_ns = store_timing_ns();
+    }
+#endif
     self.publishing = job;
     self.cv_work.notify_all();
     self.cv_publish.notify_all();
@@ -6306,6 +6467,19 @@ void ConversationStore::set_object_batch_gate_for_test(void (*gate)(void*), void
     std::lock_guard<std::mutex> guard(impl_->mutex);
     impl_->object_batch_gate = gate;
     impl_->object_batch_gate_context = context;
+}
+
+void ConversationStore::set_publish_payload_gate_for_test(void (*gate)(void*), void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->publish_payload_gate = gate;
+    impl_->publish_payload_gate_context = context;
+}
+
+void ConversationStore::set_publish_trace_for_test(
+    void (*observer)(void*, const ConversationStorePublishTrace&) noexcept, void* context) {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->publish_trace_observer = observer;
+    impl_->publish_trace_context = context;
 }
 #endif
 

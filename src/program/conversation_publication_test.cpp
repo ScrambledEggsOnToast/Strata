@@ -13,9 +13,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <dirent.h>
 #include <memory>
 #include <limits>
@@ -137,9 +141,10 @@ void remove_tree(const std::string& root) {
 
 struct TempRoot {
     std::string path;
-    TempRoot() {
-        char pattern[] = "/tmp/strata-publication-test-XXXXXX";
-        const char* made = ::mkdtemp(pattern);
+    TempRoot() : TempRoot("/tmp") {}
+    explicit TempRoot(const char* parent) {
+        std::string pattern = std::string(parent) + "/strata-publication-test-XXXXXX";
+        const char* made = ::mkdtemp(pattern.data());
         if (made) path = made;
     }
     ~TempRoot() { remove_tree(path); }
@@ -2045,6 +2050,366 @@ void check_facade_uncertain_publication() {
 }
 
 #ifdef STRATA_STORE_TEST_HOOKS
+namespace phase = strata::program::phase;
+
+// Explicit diagnostic only, never part of the default test run. The nine inputs approximate the retained
+// recurrent-state sizes, not its model state, exact K/V shape, alias topology or arrival schedule.
+struct WriterDiagnostic {
+    struct Row {
+        phase::Publication publication;
+        ConversationStorePublishTrace writer;
+        PublicationReceipt receipt;
+        uint64_t capture_started_ns = 0, capture_finished_ns = 0, admitted_observed_ns = 0;
+        uint64_t terminal_ns = 0, receipt_ns = 0;
+        bool writer_seen = false, receipt_seen = false;
+    };
+    std::mutex mutex;
+    std::array<Row, 9> rows;
+    size_t omitted = 0;
+
+    void observe(const phase::PublicationEvent& event) noexcept {
+        std::lock_guard<std::mutex> guard(mutex);
+        const uint64_t id = event.publication.publication;
+        if (!id || id > rows.size()) { ++omitted; return; }
+        auto& row = rows[size_t(id - 1)];
+        row.publication = event.publication;
+        if (std::strcmp(event.event, "admitted") == 0) row.admitted_observed_ns = event.observed_ns;
+        if (std::strcmp(event.event, "terminal") == 0) row.terminal_ns = event.observed_ns;
+    }
+    void observe(const ConversationStorePublishTrace& trace) noexcept {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!trace.request_id || trace.request_id > rows.size()) { ++omitted; return; }
+        auto& row = rows[size_t(trace.request_id - 1)];
+        row.writer = trace;
+        row.writer_seen = true;
+    }
+    void drain(ContinuationPublisher& publisher) {
+        PublicationReceipt receipt;
+        while (publisher.take_receipt(receipt)) {
+            std::lock_guard<std::mutex> guard(mutex);
+            const uint64_t id = receipt.handle.publication_id;
+            if (!id || id > rows.size()) { ++omitted; continue; }
+            auto& row = rows[size_t(id - 1)];
+            if (row.receipt_seen) { ++omitted; continue; }
+            row.receipt = receipt;
+            row.receipt_seen = true;
+            row.receipt_ns = phase::now_ns();
+        }
+    }
+};
+
+void diagnostic_recurrent(CheckpointBytes& target, uint64_t salt) {
+    constexpr size_t bytes = 39223296; // one third of the retained 117669888-byte live GDN total
+    auto& payload = target.write();
+    payload.resize(bytes, uint8_t(salt));
+    for (size_t at = 0; at < payload.size(); at += size_t(1) << 20) {
+        // Distinct chunks avoid the unrealistic one-object dedup of a uniform synthetic recurrent stream.
+        const uint64_t marker = salt * 0x9e3779b97f4a7c15ull ^ uint64_t(at);
+        std::memcpy(payload.data() + at, &marker, std::min(sizeof marker, payload.size() - at));
+    }
+}
+
+SavedConversation writer_diagnostic_record(size_t index) {
+    constexpr int64_t tokens[] = {374, 389, 442, 395, 457, 463, 389, 395, 457};
+    constexpr size_t checkpoints[] = {0, 2, 0, 2, 2, 2, 1, 1, 1};
+    SavedConversation image = all_stage_record(41 + 2 * index, tokens[index]);
+    const auto fill = [&](SavedConversation& stage, size_t ordinal) {
+        const uint64_t salt = (index + 1) * 100 + ordinal * 8;
+        diagnostic_recurrent(stage.live.gdn, salt);
+        for (size_t cut = 0; cut < checkpoints[index]; ++cut) {
+            ConversationCheckpoint checkpoint;
+            checkpoint.ids.assign(stage.live.ids.begin(), stage.live.ids.end() - long(7 * (cut + 1)));
+            checkpoint.used = cut + 1;
+            checkpoint.pinned = true;
+            diagnostic_recurrent(checkpoint.gdn, salt + cut + 1);
+            checkpoint.ple.assign(checkpoint.ids.size() / 2, uint8_t(salt + cut));
+            checkpoint.tails.assign(2, uint8_t(salt + cut));
+            stage.checkpoints.push_back(std::move(checkpoint));
+        }
+    };
+    fill(image, 0);
+    for (size_t stage = 0; stage < image.stage_images.size(); ++stage)
+        fill(image.stage_images[stage], stage + 1);
+    image.freeze();
+    return image;
+}
+
+int writer_phase_diagnostic(const char* parent, const char* output_path) {
+    // Create an exclusive raw record, and a fresh private child of the requested disposable-store parent.
+    // No preserved store is opened. Preparation precedes acceptance; no publication can run before the fixed clock.
+    FILE* output = std::fopen(output_path, "wx");
+    if (!output) {
+        std::fprintf(stderr, "writer diagnostic: cannot exclusively create the output file\n");
+        return 1;
+    }
+    TempRoot root(parent);
+    const char* batching = std::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    if (root.path.empty() || !immutable_checkpoints_enabled() || !batching || std::strcmp(batching, "1") != 0) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"private_root_immutable_or_batching_prerequisite\"}\n", output);
+        std::fclose(output);
+        return 1;
+    }
+    // mkdtemp's final component contains only the fixed prefix and its generated safe suffix.
+    const char* leaf = std::strrchr(root.path.c_str(), '/') + 1;
+    std::fprintf(output, "{\"kind\":\"configuration\",\"issue\":309,\"publications\":9,\"drain_ms\":8000,"
+               "\"stages\":3,\"chunk_bytes\":1048576,\"quota_bytes\":4294967296,"
+               "\"ram_envelope_bytes\":12884901888,\"dir_fsync_batch\":true,\"store_leaf\":\"%s\","
+               "\"original_workload_reproduction\":false}\n", leaf);
+    std::fflush(output);
+    const uint64_t prepare_started = phase::now_ns();
+    std::array<SavedConversation, 9> inputs;
+    uint64_t input_bytes = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        inputs[i] = writer_diagnostic_record(i);
+        input_bytes += inputs[i].bytes();
+    }
+    const uint64_t prepare_ns = phase::now_ns() - prepare_started;
+    check(input_bytes <= (uint64_t(3) << 30), "the prepared nine-publication inputs stay within their frozen 3 GiB cap");
+    if (input_bytes > (uint64_t(3) << 30)) { std::fclose(output); return 1; }
+    WriterDiagnostic diagnostic; // observer context outlives the store's real writer
+    auto options = options_for(root.path);
+    options.chunk_bytes = uint64_t(1) << 20;
+    options.quota_bytes = uint64_t(4) << 30;
+    options.min_free_bytes = uint64_t(1) << 30;
+    options.metadata_bytes = uint64_t(64) << 20;
+    options.head_limit = 128;
+    ConversationStore store(options);
+    if (!store.enabled() || !store.healthy()) {
+        std::fputs("{\"kind\":\"not_started\",\"reason\":\"disposable_store_unavailable\"}\n", output);
+        std::fclose(output);
+        return 1;
+    }
+    Sink sink(store, size_t(12) << 30, 17, size_t(64) << 20);
+    sink.out.phase_event = [&](const phase::PublicationEvent& event) { diagnostic.observe(event); };
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    store.set_publish_trace_for_test(+[](void* context, const ConversationStorePublishTrace& trace) noexcept {
+        static_cast<WriterDiagnostic*>(context)->observe(trace);
+    }, &diagnostic);
+    const uint64_t started_ns = phase::now_ns();
+    const uint64_t deadline = started_ns / 1000000 + 8000; // fixed before the first capture/handoff
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (phase::now_ns() / 1000000 >= deadline) {
+            check(false, "all nine captures must fit the original fixed admission deadline");
+            break;
+        }
+        diagnostic.rows[i].capture_started_ns = phase::now_ns();
+        const auto submission = facade_capture(publisher, sink, i % 2, i + 1, inputs[i]);
+        diagnostic.rows[i].capture_finished_ns = phase::now_ns();
+        check(submission.queued && submission.handle.publication_id == i + 1,
+              "the diagnostic accepts each separately identified publication obligation");
+        inputs[i] = {}; // drop the preparation alias, never retain an unaccounted independent payload
+        if (phase::now_ns() / 1000000 < deadline) publisher.flush(0);
+        diagnostic.drain(publisher);
+    }
+    while (publisher.holds_work()) {
+        const uint64_t now = phase::now_ns() / 1000000;
+        if (now >= deadline) break;
+        sink.refresh_allowance();
+        publisher.flush(std::min<uint64_t>(250, deadline - now));
+        diagnostic.drain(publisher);
+    }
+    const uint64_t drain_finished_ns = phase::now_ns();
+    const size_t queued_at_fence = publisher.queued().size(), pending_at_fence = publisher.pending().size();
+    if (!publisher.queued().empty()) publisher.abandon("the bounded shutdown capture/drain ended");
+    // No output, wait or deadline adjustment between drain and this fence; disabled remains a terminal consequence.
+    store.request_shutdown(deadline);
+    const auto terminal = store.finish_shutdown();
+    publisher.reconcile(0);
+    diagnostic.drain(publisher);
+    store.set_publish_trace_for_test(nullptr, nullptr);
+    check(diagnostic.omitted == 0, "the bounded phase collector loses no publication identities");
+    check(!publisher.holds_work(), "quiescence settles the diagnostic's publication ownership");
+    std::fprintf(output, "{\"kind\":\"shutdown\",\"started_ns\":%llu,\"finalize_before_ms\":%llu,"
+        "\"drain_finished_ns\":%llu,\"finished_ns\":%llu,\"queued_at_fence\":%zu,\"pending_at_fence\":%zu,"
+        "\"state\":\"%s\",\"run_intent\":%s,\"fixture_prepare_ns\":%llu,\"input_accounted_bytes\":%llu,"
+        "\"omitted\":%zu,\"disabled_is_latency_cause\":false}\n",
+        (unsigned long long) started_ns, (unsigned long long) deadline, (unsigned long long) drain_finished_ns,
+        (unsigned long long) phase::now_ns(), queued_at_fence, pending_at_fence,
+        conversation_store_shutdown_state_name(terminal), store.run_intent_active() ? "true" : "false",
+        (unsigned long long) prepare_ns, (unsigned long long) input_bytes, diagnostic.omitted);
+    for (size_t i = 0; i < diagnostic.rows.size(); ++i) {
+        const auto& row = diagnostic.rows[i];
+        check(row.receipt_seen && row.receipt.released, "each accepted diagnostic handle has one ownership-complete receipt");
+        if (row.writer_seen)
+            check(row.writer.request_id == i + 1 && row.writer.generation == i + 1,
+                  "writer summaries bind to the exact publication id and store generation");
+        std::fprintf(output, "{\"kind\":\"publication\",\"publication_id\":%zu,\"owner_generation\":%llu,"
+            "\"status\":\"%s\",\"writer_seen\":%s", i + 1,
+            (unsigned long long) row.receipt.handle.owner_generation,
+            row.receipt_seen ? publication_status_name(row.receipt.status) : "unavailable",
+            row.writer_seen ? "true" : "false");
+        const auto number = [&](const char* name, uint64_t value, bool known) {
+            std::fprintf(output, ",\"%s\":", name);
+            if (known) std::fprintf(output, "%llu", (unsigned long long) value);
+            else std::fputs("null", output);
+        };
+        const auto clock = [&](const char* name, uint64_t value) { number(name, value, value != 0); };
+        const auto span = [&](const char* name, uint64_t begin, uint64_t end) {
+            number(name, end >= begin ? end - begin : 0, begin && end && end >= begin);
+        };
+        clock("capture_started_ns", row.capture_started_ns);
+        clock("capture_finished_ns", row.capture_finished_ns);
+        clock("handoff_started_ns", row.publication.admitted_ns);
+        clock("admitted_observed_ns", row.admitted_observed_ns);
+        clock("store_admitted_ns", row.writer.admitted_ns);
+        clock("writer_started_ns", row.writer.writer_started_ns);
+        clock("payload_started_ns", row.writer.payload_started_ns);
+        clock("payload_finished_ns", row.writer.payload_finished_ns);
+        clock("manifest_started_ns", row.writer.manifest_started_ns);
+        clock("manifest_finished_ns", row.writer.manifest_finished_ns);
+        clock("catalog_started_ns", row.writer.catalog_started_ns);
+        clock("catalog_finished_ns", row.writer.catalog_finished_ns);
+        clock("catalog_applied_ns", row.writer.catalog_applied_ns);
+        clock("body_finished_ns", row.writer.body_finished_ns);
+        clock("result_ready_ns", row.writer.result_ready_ns);
+        clock("terminal_observed_ns", row.terminal_ns);
+        clock("receipt_consumed_ns", row.receipt_ns);
+        span("capture_ns", row.capture_started_ns, row.capture_finished_ns);
+        span("capture_to_admission_ns", row.capture_finished_ns, row.writer.admitted_ns);
+        span("handoff_ns", row.publication.admitted_ns, row.admitted_observed_ns);
+        span("admission_to_writer_ns", row.writer.admitted_ns, row.writer.writer_started_ns);
+        span("payload_ns", row.writer.payload_started_ns, row.writer.payload_finished_ns);
+        span("manifest_ns", row.writer.manifest_started_ns, row.writer.manifest_finished_ns);
+        span("catalog_ns", row.writer.catalog_started_ns, row.writer.catalog_finished_ns);
+        span("cleanup_and_settlement_ns", row.writer.body_finished_ns, row.writer.result_ready_ns);
+        span("result_to_receipt_ns", row.writer.result_ready_ns, row.receipt_ns);
+        number("store_generation", row.writer.generation, row.writer_seen);
+        number("epoch", row.receipt.epoch, row.receipt_seen);
+        number("logical_payload_bytes", row.writer.logical_payload_bytes, row.writer.payload_started_ns != 0);
+        number("source_bytes", row.writer.source_bytes, row.writer_seen);
+        number("source_chunks", row.writer.source_chunks, row.writer_seen);
+        number("hashed_bytes", row.writer.hashed_bytes, row.writer_seen);
+        std::fprintf(output, ",\"timing_calls_complete\":%s",
+            row.writer_seen ? (row.writer.calls_complete ? "true" : "false") : "null");
+        const bool calls_known = row.writer_seen && row.writer.calls_complete;
+        number("source_read_ns", row.writer.source_read_ns, calls_known);
+        number("hash_ns", row.writer.hash_ns, calls_known);
+        number("file_write_ns", row.writer.file_write_ns, calls_known);
+        number("completed_file_write_bytes", row.writer.file_write_bytes, row.writer_seen);
+        number("file_fsync_ns", row.writer.file_fsync_ns, calls_known);
+        number("file_fsync_calls", row.writer.file_fsync_calls, row.writer_seen);
+        number("dir_fsync_ns", row.writer.dir_fsync_ns, calls_known);
+        number("dir_fsync_calls", row.writer.dir_fsync_calls, row.writer_seen);
+        number("writer_thread_cpu_ns", row.writer.thread_cpu_ns, row.writer.thread_cpu_known);
+        std::fputs("}\n", output);
+    }
+    std::fputs("{\"kind\":\"limits\",\"timings\":\"inclusive; fsync/write counters are nested, not additive\","
+        "\"missing_phases\":null,\"shape\":\"synthetic three-stage recurrent workload, not original MAN2/model/KV topology\","
+        "\"claim\":\"CPU/store diagnostic only; disabled is shutdown fencing, not an attributed latency cause\"}\n", output);
+    const bool output_ok = !std::ferror(output);
+    const bool closed = std::fclose(output) == 0;
+    check(output_ok && closed, "the exclusive diagnostic record is written completely");
+    std::fprintf(stderr, "conversation_publication_test: writer diagnostic %d checks, %d failures; shutdown=%s\n",
+                 checks, failures, conversation_store_shutdown_state_name(terminal));
+    return failures == 0 ? 0 : 1;
+}
+
+// Diagnostic contract fixture only: a forced late writer reproduces the retained terminal shape, not its latency
+// cause. The real publisher, payload writer, shutdown fence, receipt ownership and restart recovery all run.
+struct PublicationPayloadGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false, open = false, timed_out = false;
+
+    void pause() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(5), [&] { return open; })) timed_out = true;
+    }
+    void await() {
+        std::unique_lock<std::mutex> lock(mutex);
+        check(cv.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }),
+              "the backlog fixture reaches the real post-payload, pre-manifest shutdown fence");
+    }
+    void release() {
+        std::lock_guard<std::mutex> guard(mutex);
+        open = true;
+        cv.notify_all();
+    }
+};
+
+void check_facade_shutdown_backlog_deadline() {
+    for (const bool expired : {false, true}) {
+        TempRoot root;
+        PublicationPayloadGate gate; // outlives the store and its real worker frame
+        auto options = options_for(root.path);
+        options.head_limit = 16; // all nine promised fresh roots fit in both cases
+        ConversationStore store(options);
+        const uint64_t epoch = store.epoch();
+        Sink sink(store);
+        ContinuationPublisher publisher;
+        publisher.configure(&store, std::move(sink.out));
+        store.set_publish_payload_gate_for_test(+[](void* p) {
+            static_cast<PublicationPayloadGate*>(p)->pause();
+        }, &gate);
+        std::array<PublicationHandle, 9> handles;
+        const auto now_ms = [] {
+            return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        };
+        // Fixed once, before work; no retry, legacy close or finalization may move this deadline.
+        const uint64_t deadline = now_ms() + (expired ? 20 : 10000);
+        for (size_t i = 0; i < handles.size(); ++i) {
+            auto record = stored_record(341 + 2 * i, 64);
+            record.checkpoints.clear();
+            const auto submission = facade_capture(publisher, sink, i % 2, i + 1, record);
+            check(submission.queued && submission.handle, "the backlog fixture accepts every publication obligation");
+            handles[i] = submission.handle;
+            publisher.flush(0);
+            if (i == 0) gate.await();
+        }
+        const auto blocked = publisher.readiness();
+        check(blocked.queued == 8 && blocked.pending == 1 && blocked.outstanding == 9 && !blocked.receipts,
+              "one real writer holds eight accepted FIFO captures without hiding terminal receipts");
+        check(store.writer_busy() && store.ram_lease_bytes() > 0,
+              "the started payload owns the real writer slot and its RAM lease");
+        if (expired) {
+            std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+                std::chrono::milliseconds(deadline + 1)));
+            publisher.abandon("the bounded shutdown capture/drain ended");
+            check(publisher.queued().empty() && publisher.pending().size() == 1,
+                  "deadline abandonment returns only queued ownership, never the active store lease");
+            check(store.ram_lease_bytes() > 0, "queued abandonment cannot refund the active writer image");
+            store.request_shutdown(deadline);
+        }
+        gate.release();
+        if (!expired) {
+            settle(publisher);
+            store.request_shutdown(deadline);
+        }
+        // This is not a deadline relaxation: a repeated request is required to retain the original stricter value.
+        store.request_shutdown(UINT64_MAX);
+        const auto terminal = store.finish_shutdown();
+        store.set_publish_payload_gate_for_test(nullptr, nullptr);
+        publisher.reconcile(0);
+        check(!gate.timed_out, "the backlog fixture releases the real writer explicitly");
+        check(terminal == (expired ? ConversationStoreShutdownState::quiescent_unclean
+                                  : ConversationStoreShutdownState::durable_clean),
+              "only work settled before the fixed finalization decision can end durable clean");
+        check(store.run_intent_active() == expired, "a late publication keeps the real run-intent armed");
+        check_eq(store.ram_lease_bytes(), 0, "writer settlement, not queued abandonment, releases its final lease");
+        check(!publisher.holds_work(), "the final reconcile settles every accepted publication exactly once");
+        for (size_t i = 0; i < handles.size(); ++i) {
+            PublicationReceipt receipt;
+            const auto expected = !expired ? PublicationStatus::stored :
+                (i == 0 ? PublicationStatus::disabled : PublicationStatus::abandoned);
+            check(publisher.take_receipt(handles[i], receipt) && receipt.status == expected && receipt.released,
+                  "each generation-bound handle has the actual stored, abandoned or disabled receipt");
+            check(bool(receipt.head) == !expired, "no abandoned or disabled receipt invents durable authority");
+            check(!publisher.take_receipt(handles[i], receipt), "no publication obligation is refunded twice");
+        }
+        check_eq(publisher.readiness().outstanding, 0, "all bounded receipt slots reopen only after consumption");
+        check_eq(store.counters().published, expired ? 0 : 9, "abandonment and disabled work never count as published");
+        ConversationStore reopened(options);
+        check_eq(reopened.epoch(), epoch + (expired ? 1 : 0), "the unchanged finalization verdict controls restart trust");
+        check_eq(reopened.counters().heads, expired ? 0 : 9,
+                 "only the nine completed obligations can remain reusable after restart");
+        reopened.close();
+    }
+}
+
 void check_facade_interrupted_process() {
     TempRoot root;
     const auto record = stored_record(321, 64);
@@ -2106,6 +2471,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "conversation_publication_test: readiness %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
     }
+#ifdef STRATA_STORE_TEST_HOOKS
+    if (argc == 4 && std::string_view(argv[1]) == "--writer-phase-diagnostic")
+        return writer_phase_diagnostic(argv[2], argv[3]);
+    if (argc == 2 && std::string_view(argv[1]) == "--shutdown-backlog") {
+        check_facade_shutdown_backlog_deadline();
+        std::fprintf(stderr, "conversation_publication_test: shutdown backlog %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+#endif
     check_optional_shared_export_predicate();
     check_optional_shared_export_parks_without_capture();
     check_store_readiness_fault_reason();
@@ -2115,6 +2489,7 @@ int main(int argc, char** argv) {
     check_facade_bounded_receipts();
     check_facade_uncertain_publication();
 #ifdef STRATA_STORE_TEST_HOOKS
+    check_facade_shutdown_backlog_deadline();
     check_facade_interrupted_process();
 #endif
     check_cache_mutation_publication();
