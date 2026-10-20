@@ -305,8 +305,12 @@ if(STRATA_BUILD_DFLASH2_BRIDGE)
     message(FATAL_ERROR "STRATA_BUILD_DFLASH2_BRIDGE requires Linux anonymous AF_UNIX socketpairs")
   endif()
   find_package(Threads REQUIRED)
+  find_path(STRATA_DFLASH2_JSON_INCLUDE_DIR nlohmann/json.hpp
+    HINTS "${STRATA_GGML_DIR}/vendor" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor"
+    DOC "Directory containing the DFlash2 bridge's nlohmann/json.hpp dependency"
+    REQUIRED)
   add_library(strata_dflash2_bridge STATIC src/core/dflash2_bridge.cpp src/core/dflash2_target.cpp src/core/dflash2_capture.cpp)
-  target_include_directories(strata_dflash2_bridge PUBLIC include PRIVATE third_party/llama.cpp/vendor)
+  target_include_directories(strata_dflash2_bridge PUBLIC include PRIVATE "${STRATA_DFLASH2_JSON_INCLUDE_DIR}")
   target_link_libraries(strata_dflash2_bridge PRIVATE strata_warnings Threads::Threads strata_native_identity)
   target_compile_options(strata_dflash2_bridge PRIVATE
     "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math;-ffp-contract=off>")

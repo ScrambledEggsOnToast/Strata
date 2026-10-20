@@ -431,10 +431,16 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
-    /// This stage's residual row, not the last stage reached through next_.
-    /// Same operation lifetime as final_R; diagnostics must drain commit first.
-    const float* stage_R(int t) const {
-        return !g_ || t < 0 || t >= max_t_ ? nullptr : R_ + size_t(t) * size_t(g_->hc * g_->n_embd);
+    /// This stage's actual output representation, not a recursively final R.
+    /// The residual, deferred FFN output and injection coefficients together
+    /// describe a split handoff without materializing a new target operation.
+    /// Borrowed until the next run; diagnostics must drain commit first.
+    std::array<std::span<const float>, 3> stage_output(int t) const {
+        if (!g_ || t < 0 || t >= max_t_) return {};
+        const size_t n = size_t(g_->n_embd), hc = size_t(g_->hc);
+        return {std::span<const float>(R_ + size_t(t) * hc * n, hc * n),
+                std::span<const float>(bo_ + size_t(t) * n, n),
+                std::span<const float>(inj2_ + size_t(t) * hc, hc)};
     }
 
     /// The head's vocabulary size (the row width `read_logits_rows` copies).  The window graph computes the

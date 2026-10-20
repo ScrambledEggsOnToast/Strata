@@ -163,6 +163,9 @@ public:
     bool context_idle(std::string& err) const;
 
     void* stream() const;
+    /// Last chunk's complete local residual output. Borrowed device storage,
+    /// valid only after a successful full run/drain and until the next run.
+    std::span<const float> stage_output() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.

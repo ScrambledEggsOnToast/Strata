@@ -12211,10 +12211,29 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 const auto& state = st == 0 || split_same ? ss : stages[size_t(st - 1)]->ss;
                 strata::program::SessionFingerprint h;
-                const float* residual = residual_row < 0 ? nullptr : stage_ver(st).stage_R(residual_row);
-                if (!strata::program::session_fingerprint(state, no_draft, g, cells, h, e, residual)) return false;
-                std::fprintf(stderr, "STATE_STAGE phase=%s request=%llu stage=%d device=%d cells=%lld "
-                    "gdn=%016llx ple=%016llx kv=%016llx residual=%016llx\n",
+                if (!strata::program::session_fingerprint(state, no_draft, g, cells, h, e)) return false;
+                const strata::core::OnDevice on(state.allocation_device);
+                std::array<std::span<const float>, 3> outputs{};
+                if (residual_row < 0)
+                    outputs[0] = (st == 0 ? sp : stages[size_t(st - 1)]->sp).stage_output();
+                else
+                    outputs = stage_ver(st).stage_output(residual_row);
+                if (outputs[0].empty()) { e = "stage fingerprint: no completed output"; return false; }
+                std::array<uint8_t, 65536> buffer;
+                for (const auto output : outputs)
+                    for (size_t offset = 0; offset < output.size_bytes();) {
+                        const size_t count = std::min(buffer.size(), output.size_bytes() - offset);
+                        if (cudaMemcpy(buffer.data(), reinterpret_cast<const uint8_t*>(output.data()) + offset,
+                                       count, cudaMemcpyDefault) != cudaSuccess) {
+                            e = "stage fingerprint: output read failed"; return false;
+                        }
+                        for (size_t i = 0; i < count; ++i) {
+                            h.residual ^= buffer[i]; h.residual *= 1099511628211ull;
+                        }
+                        offset += count;
+                    }
+                std::fprintf(stderr, "DFLASH2_TARGET_STATE phase=%s request=%llu stage=%d device=%d cells=%lld "
+                    "gdn=%016llx ple=%016llx kv=%016llx output=%016llx\n",
                     phase, (unsigned long long) request, st, state.allocation_device, (long long) cells,
                     (unsigned long long) h.gdn, (unsigned long long) strata::program::fingerprint_ple(h, state),
                     (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.residual);

@@ -1065,6 +1065,7 @@ struct Prefill::Impl {
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    int64_t last_output_rows = 0;
     float* grs = nullptr;                    // F-1: the hyper-connection read's row scales (T x 4)
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
@@ -1321,6 +1322,12 @@ bool Prefill::release_dflash2_capture(core::dflash2::CaptureOwner owner, std::st
 }
 
 int Prefill::device() const { return impl_ != nullptr ? impl_->device : -1; }
+std::span<const float> Prefill::stage_output() const {
+    const Impl& m = *impl_;
+    if (!m.g || !m.initialized || m.poisoned || public_running_.load() || m.running.load() || next_packet_)
+        return {};
+    return {m.R, size_t(m.last_output_rows) * size_t(m.g->hc * m.g->n_embd)};
+}
 
 void Prefill::reset() {
     if (public_running_.load() || (impl_ && impl_->running.load())) std::terminate();
@@ -6043,6 +6050,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+        m.last_output_rows = T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.layer = -1;
         pt.mark(kPfStart, cs);
