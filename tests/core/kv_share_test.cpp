@@ -1,7 +1,9 @@
 #include "strata/core/kv_alias.hpp"
 #include "strata/core/logical_kv.hpp"
+#include "strata/core/kv_reclaim.hpp"
 #include <cstdio>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 using namespace strata;
@@ -225,10 +227,124 @@ void acquire_rollback() {
     require(state.acquire(1, b, 0, a, 16, cut(a, 16), true) && state.bind(1, b, true) &&
         state.terminal(1, b, true) && state.terminal(0, a, true), "valid acquire failed after rollback");
 }
+void deferred_charge() {
+    using namespace plan;
+    KvShareBudget b{KvShareMode::alias, 262144, 4, 12, 3, kKvShareChunk, 12ull << 30, 3299132688};
+    const auto base = kv_share_quote(kernels::qsa_real_shapes(), kernels::kKvHybrid, b, 65539);
+    b.deferred_reclaim = true;
+    const auto q = kv_share_quote(kernels::qsa_real_shapes(), kernels::kKvHybrid, b, 65539);
+    require(q.admitted && q.host_metadata == base.host_metadata + b.layers * kKvShareReclaimHostBytes &&
+        q.rounded_release == base.rounded_release && q.cow_device == base.cow_device &&
+        q.net_cow_peak == base.net_cow_peak - int64_t(b.layers * kKvShareReclaimHostBytes),
+        "deferred worker stack/control was not charged without changing K/V credit");
+    require(!kv_share_quote(kernels::qsa_real_shapes(), kernels::kKvHybrid, b, 32768).admitted,
+        "deferred reclamation weakened 32K refusal");
+    core::KvReclaimLedger ledger;
+    require(ledger.mapped(3) && ledger.mapped(8) && !ledger.mapped(3), "physical backing charged twice");
+    const auto ticket = ledger.begin();
+    require(ticket && ledger.queue(ticket, 3) && ledger.queue(ticket, 8) &&
+        !ledger.queue(ticket, 3) && !ledger.begin(), "pending reclaim enqueued twice");
+    auto status = ledger.snapshot();
+    require(status.charged_bytes == 2 * kKvShareChunk && status.pending_bytes == status.charged_bytes &&
+        status.released_chunks == 0 && status.peak_pending_bytes == 2 * kKvShareChunk &&
+        !ledger.can_reserve(2 * kKvShareChunk, 0, kKvShareChunk),
+        "enqueue credited unavailable physical memory");
+    require(!ledger.complete(ticket + 1, 3) && !ledger.complete(ticket, 4) &&
+        ledger.complete(ticket, 3) && !ledger.complete(ticket, 3), "stale/duplicate physical completion credited bytes");
+    status = ledger.snapshot();
+    require(status.charged_bytes == kKvShareChunk && status.pending_bytes == kKvShareChunk &&
+        status.released_chunks == 1 && ledger.can_reserve(2 * kKvShareChunk, 0, kKvShareChunk) &&
+        !ledger.can_reserve(2 * kKvShareChunk, kKvShareChunk, kKvShareChunk),
+        "admission double-counted pending or already committed headroom");
+    require(ledger.complete(ticket, 8) && !ledger.complete(ticket, 8) &&
+        ledger.snapshot().charged_bytes == 0 && ledger.snapshot().released_chunks == 2,
+        "final physical release was not exactly once");
+    require(ledger.mapped(3), "released chunk could not be reused");
+    const auto replacement = ledger.begin();
+    require(replacement > ticket && ledger.queue(replacement, 3) && !ledger.complete(ticket, 3) &&
+        ledger.snapshot().charged_bytes == kKvShareChunk && ledger.complete(replacement, 3),
+        "stale completion consumed replacement backing");
+    require(!ledger.can_reserve(UINT64_MAX, UINT64_MAX, 1) &&
+        !ledger.mapped(core::KvReclaimLedger::chunk_limit), "capacity overflow or unpriced directory accepted");
+    std::printf("KV_SHARE_DEFERRED_POLICY worker_host_bytes=%llu prefix64_host=%llu prefix64_net_cow=%lld\n",
+        (unsigned long long) (b.layers * kKvShareReclaimHostBytes), (unsigned long long) q.host_metadata,
+        (long long) q.net_cow_peak);
+}
+void concurrent_reclaim_observer() {
+    core::KvReclaimLedger ledger;
+    constexpr uint64_t chunks = 32, bytes = chunks * plan::kKvShareChunk;
+    for (uint64_t chunk = 0; chunk < chunks; ++chunk) require(ledger.mapped(chunk), "observer mapping failed");
+    const auto ticket = ledger.begin();
+    for (uint64_t chunk = 0; chunk < chunks; ++chunk) require(ledger.queue(ticket, chunk), "observer queue failed");
+    std::atomic<bool> release{false};
+    bool worker_ok = true, consistent = true;
+    std::thread worker([&] {
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk) worker_ok &= ledger.complete(ticket, chunk);
+    });
+    consistent &= !ledger.can_reserve(bytes, 0, bytes);
+    release.store(true, std::memory_order_release);
+    for (;;) {
+        const auto status = ledger.snapshot();
+        consistent &= status.charged_bytes == status.pending_bytes &&
+            status.charged_bytes + status.released_chunks * plan::kKvShareChunk == bytes &&
+            status.peak_pending_bytes == bytes;
+        if (!status.pending_bytes) break;
+    }
+    worker.join();
+    require(worker_ok && consistent && ledger.can_reserve(bytes, 0, bytes),
+        "concurrent admission observer saw early credit or an inconsistent physical ledger");
+}
+void failed_worker_startup() {
+    struct Counts {
+        int starts = 0, destroys = 0, joins = 0;
+        std::atomic<int> exits{0};
+        bool destroyed_poisoned = false;
+    };
+    struct CpuWorker {
+        Counts& counts;
+        bool& poisoned;
+        const int outcome; // 0: creation fails, 1: thread startup fails, 2: ready
+        std::thread thread;
+        CpuWorker(Counts& c, bool& p, int value) : counts(c), poisoned(p), outcome(value) {}
+        ~CpuWorker() {
+            if (thread.joinable()) { thread.join(); ++counts.joins; }
+            counts.destroyed_poisoned = poisoned; ++counts.destroys;
+        }
+        bool start(std::string& error) {
+            ++counts.starts;
+            if (outcome) thread = std::thread([this] { ++counts.exits; });
+            if (outcome == 2) return true;
+            poisoned = true; error = "injected pre-job worker startup failure"; return false;
+        }
+    };
+    for (int outcome : {0, 1, 2}) {
+        Counts counts;
+        bool poisoned = false;
+        core::KvReclaimLedger backing;
+        require(backing.mapped(3), "startup test backing charge failed");
+        auto worker = std::make_unique<CpuWorker>(counts, poisoned, outcome);
+        std::string error;
+        const bool started = core::kv_reclaim_start_worker(worker, error);
+        const bool retained = bool(worker);
+        const int destroyed_at_return = counts.destroys;
+        worker.reset(); worker.reset();
+        require(started == (outcome == 2) && retained == started &&
+            destroyed_at_return == int(!started) && counts.starts == 1 && counts.destroys == 1 &&
+            counts.joins == int(outcome != 0) && counts.exits.load() == int(outcome != 0),
+            "failed startup retained poisoned worker or hung/double-joined its thread");
+        require(poisoned == !started && counts.destroyed_poisoned == !started &&
+            (started ? error.empty() : error == "injected pre-job worker startup failure") &&
+            backing.snapshot().charged_bytes == plan::kKvShareChunk &&
+            backing.snapshot().pending_bytes == 0 && backing.snapshot().released_chunks == 0,
+            "startup failure changed backing credit or refused safe poisoned-worker cleanup");
+    }
+    std::puts("KV_SHARE_WORKER_STARTUP create_failure=no_thread thread_failure=joined_once ready=retained poison_cleanup=safe release_credit=0");
+}
 }
 int main() {
-    try { policy(); ownership(); cancelled_preparation(); retention(); logical_images(); borrowed_sources(); acquire_rollback(); }
+    try { policy(); ownership(); cancelled_preparation(); retention(); logical_images(); borrowed_sources(); acquire_rollback(); deferred_charge(); concurrent_reclaim_observer(); failed_worker_startup(); }
     catch (const std::exception& e) { std::fprintf(stderr, "kv_share_test: %s\n", e.what()); return 1; }
-    std::printf("kv_share_test: policy, eligibility, carve, refcount, generation, COW and drained cancellation passed\n");
+    std::printf("kv_share_test: policy, eligibility, carve, refcount, generation, COW, drained cancellation and concurrent physical charging passed\n");
     return 0;
 }

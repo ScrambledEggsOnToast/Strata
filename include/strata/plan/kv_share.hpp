@@ -21,11 +21,15 @@ inline constexpr uint64_t kKvShareOwnerBytes = 128;
 inline constexpr uint64_t kKvSharePoolBytes = 512;
 // Process-wide driver entry/once caches and bounded streamed-read control blocks.
 inline constexpr uint64_t kKvShareBackendHostBytes = 16ull << 10;
+// Experimental owned worker: fixed stack and bounded control/guard allocation.
+inline constexpr uint64_t kKvShareReclaimStackBytes = 256ull << 10;
+inline constexpr uint64_t kKvShareReclaimHostBytes = kKvShareReclaimStackBytes + (8ull << 10);
 
 struct KvShareBudget {
     KvShareMode mode = KvShareMode::off;
     uint64_t cells = 0, owners = 0, layers = 0, stages = 0;
     uint64_t granularity = 0, cache_bytes = 0, cache_leases = 0;
+    bool deferred_reclaim = false;
 };
 struct KvShareQuote {
     bool known = false, admitted = false;
@@ -79,6 +83,8 @@ inline KvShareQuote kv_share_quote(const strata::kernels::QsaShapes& s, int form
         n.product({b.layers, kKvSharePoolBytes}),
         n.product({b.owners, b.layers, kKvShareOwnerBytes + uint64_t{32}}),
         n.product({b.owners, uint64_t{128}}), kKvShareBackendHostBytes});
+    if (b.deferred_reclaim)
+        q.host_metadata = n.sum({q.host_metadata, n.product({b.layers, kKvShareReclaimHostBytes})});
     q.cow_host = n.product({2, b.layers, kKvShareExtentBytes + kKvShareBindingBytes});
     const uint64_t charged_host = n.sum({q.host_metadata, q.cow_host});
     const uint64_t host_used = n.sum({charged_host, b.cache_leases});

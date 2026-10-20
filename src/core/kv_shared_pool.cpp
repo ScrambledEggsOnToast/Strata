@@ -4,6 +4,11 @@
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 namespace strata::core {
 static_assert(sizeof(KvSharedPool) <= plan::kKvSharePoolBytes);
@@ -17,6 +22,75 @@ uint64_t checked_pages(const plan::KvShareBudget& b) {
     return b.cells / 4;
 }
 }
+// A single owned worker per layer. Only zero-user chunks enter a batch after
+// publication and old consumers have drained. While it runs the controller may
+// read/issue already-private work, but joins before any mapping/ref mutation.
+struct KvSharedPool::ReclaimWorker {
+    explicit ReclaimWorker(KvSharedPool& value) : pool(value) {}
+    ~ReclaimWorker() {
+#if defined(__linux__)
+        if (!created) return;
+        { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
+        changed.notify_one();
+        if (pthread_join(thread, nullptr) != 0) std::terminate();
+#endif
+    }
+    bool start(std::string& error) {
+#if defined(__linux__)
+        pthread_attr_t attributes;
+        if (pthread_attr_init(&attributes) != 0) return KvSharedPool::fail(error, "worker attributes unavailable");
+        const bool bounded = pthread_attr_setstacksize(&attributes, plan::kKvShareReclaimStackBytes) == 0 &&
+            pthread_attr_setguardsize(&attributes, 4096) == 0;
+        const int result = bounded ? pthread_create(&thread, &attributes, run, this) : -1;
+        pthread_attr_destroy(&attributes);
+        if (result) return KvSharedPool::fail(error, "bounded owned worker creation failed");
+        created = true;
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!changed.wait_for(lock, std::chrono::seconds(10), [&] { return started; }) || !startup_ok)
+            return KvSharedPool::fail(error, "owned worker device startup failed");
+        return true;
+#else
+        return KvSharedPool::fail(error, "deferred reclamation requires the qualified Linux worker");
+#endif
+    }
+    static void* run(void* opaque) {
+        auto& worker = *static_cast<ReclaimWorker*>(opaque);
+        const bool device_ok = cudaSetDevice(worker.pool.device_) == cudaSuccess;
+        std::unique_lock<std::mutex> lock(worker.mutex);
+        worker.started = true; worker.startup_ok = device_ok;
+        worker.changed.notify_all();
+        if (!device_ok) return nullptr;
+        for (;;) {
+            worker.changed.wait(lock, [&] { return worker.requested || worker.stopping; });
+            if (!worker.requested) return nullptr;
+            const uint64_t ticket = worker.ticket;
+            const auto origin = worker.origin;
+            worker.requested = false;
+            lock.unlock();
+            KvAliasReceipt receipt;
+            std::string error;
+            const bool ok = worker.pool.reclaim(error, &receipt, ticket);
+            receipt.available_us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - origin).count();
+            lock.lock();
+            worker.receipt = receipt; worker.error = std::move(error); worker.ok = ok; worker.busy = false;
+            worker.changed.notify_all();
+        }
+    }
+    KvSharedPool& pool;
+    KvReclaimLedger ledger;
+    std::mutex mutex;
+    std::condition_variable changed;
+    KvAliasReceipt receipt;
+    std::string error;
+    std::chrono::steady_clock::time_point origin;
+    uint64_t ticket = 0;
+    bool created = false, started = false, startup_ok = false, stopping = false;
+    bool busy = false, requested = false, ok = true;
+#if defined(__linux__)
+    pthread_t thread{};
+#endif
+};
 KvSharedPool::KvSharedPool(const plan::KvShareBudget& budget)
     : budget_(budget), state_(budget.owners, checked_pages(budget)),
       tables_((size_t) budget.owners), device_tables_((size_t) budget.owners, nullptr) {}
@@ -26,6 +100,14 @@ KvSharedPool::~KvSharedPool() {
         std::terminate();
     }
     if (device_ < 0) return;
+    if (worker_) {
+        std::string error;
+        if (!wait_reclaim(error)) {
+            std::fprintf(stderr, "%s; teardown cannot reuse pending backing\n", error.c_str());
+            std::terminate();
+        }
+        worker_.reset(); // joins the owned thread before range_ or any directory dies
+    }
     int previous = -1;
     if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device_) != cudaSuccess ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -86,6 +168,13 @@ bool KvSharedPool::init(std::string& error) {
         }
         slot = event;
     }
+    if (budget_.deferred_reclaim) {
+        static_assert(sizeof(ReclaimWorker) + 4096 <= plan::kKvShareReclaimHostBytes - plan::kKvShareReclaimStackBytes);
+        if ((uint64_t) range_.chunks() > KvReclaimLedger::chunk_limit)
+            return fail(error, "unpriced deferred chunk directory");
+        worker_ = std::make_unique<ReclaimWorker>(*this);
+        if (!kv_reclaim_start_worker(worker_, error)) { poisoned_ = true; return false; }
+    }
     return true;
 }
 bool KvSharedPool::retain_extent(uint64_t extent, std::string& error) {
@@ -100,6 +189,9 @@ bool KvSharedPool::retain_extent(uint64_t extent, std::string& error) {
                 // clear unrelated, currently unbound bytes in a 2 MiB chunk.
                 if (!range_.map_range((int64_t) chunk, (int64_t) chunk + 1, [] { return VmmChunk{0}; })) {
                     poisoned_ = true; return fail(error, "map private capacity failed");
+                }
+                if (worker_ && !worker_->ledger.mapped(chunk)) {
+                    poisoned_ = true; return fail(error, "private physical backing charged twice");
                 }
             }
             ++chunk_users_[(size_t) chunk];
@@ -116,9 +208,41 @@ void KvSharedPool::release_extent(uint64_t extent) {
         for (uint64_t chunk = first; chunk < end; ++chunk) --chunk_users_[(size_t) chunk];
     }
 }
-bool KvSharedPool::reclaim(std::string& error, KvAliasReceipt* receipt) {
+bool KvSharedPool::wait_reclaim(std::string& error, KvAliasReceipt* receipt) {
+    if (!worker_) return !poisoned_;
+    std::unique_lock<std::mutex> lock(worker_->mutex);
+    if (!worker_->changed.wait_for(lock, std::chrono::seconds(10), [&] { return !worker_->busy; })) {
+        poisoned_ = true; return fail(error, "owned reclaim completion deadline expired");
+    }
+    if (!worker_->ok || poisoned_) {
+        error = worker_->error.empty() ? "KV shared pool: reclaim failed, backing remains charged" : worker_->error;
+        return false;
+    }
+    if (receipt) {
+        receipt->unmap_us = worker_->receipt.unmap_us; receipt->free_us = worker_->receipt.free_us;
+        receipt->unmaps = worker_->receipt.unmaps; receipt->releases = worker_->receipt.releases;
+        receipt->available_us = worker_->receipt.available_us;
+    }
+    return true;
+}
+uint64_t KvSharedPool::prepare_reclaim(std::string& error) {
+    const uint64_t ticket = worker_->ledger.begin();
+    if (!ticket) { poisoned_ = true; fail(error, "overlapping reclaim batch"); return 0; }
+    for (int64_t chunk = 0; chunk < range_.chunks(); ++chunk) {
+        if (chunk_users_[(size_t) chunk] || !range_.mapped(chunk)) continue;
+        if (!worker_->ledger.queue(ticket, (uint64_t) chunk)) {
+            poisoned_ = true; fail(error, "duplicate physical reclaim enqueue"); return 0;
+        }
+    }
+    return ticket;
+}
+bool KvSharedPool::reclaim(std::string& error, KvAliasReceipt* receipt, uint64_t ticket) {
     // The caller has drained both page-table publication and old consumers. Only
     // a successful unmap plus physical release contributes a measured chunk.
+    if (worker_ && !ticket && !(ticket = prepare_reclaim(error))) return false;
+    if (receipt && !worker_)
+        for (int64_t chunk = 0; chunk < range_.chunks(); ++chunk)
+            if (!chunk_users_[(size_t) chunk] && range_.mapped(chunk)) receipt->reclaim_peak_bytes += budget_.granularity;
     for (int64_t chunk = 0; chunk < range_.chunks(); ++chunk) {
         if (chunk_users_[(size_t) chunk] || !range_.mapped(chunk)) continue;
         const auto unmap_start = receipt ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -134,7 +258,11 @@ bool KvSharedPool::reclaim(std::string& error, KvAliasReceipt* receipt) {
             receipt->free_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - free_start).count();
             ++receipt->releases;
         }
-        ++released_chunks_;
+        if (worker_) {
+            if (!worker_->ledger.complete(ticket, (uint64_t) chunk)) {
+                poisoned_ = true; return fail(error, "stale or duplicate physical completion");
+            }
+        } else ++released_chunks_;
     }
     return true;
 }
@@ -148,7 +276,7 @@ bool KvSharedPool::publish(uint64_t owner, std::string& error) {
 }
 bool KvSharedPool::begin(uint64_t owner, const KvOwnerKey& key, int32_t* page_table, std::string& error) {
     if (!page_table || readers_.pinned(owner) || readers_.generation(owner) == UINT64_MAX ||
-        !drain(error) || !state_.begin(owner, key)) return fail(error, "owner begin refused");
+        !wait_reclaim(error) || !drain(error) || !state_.begin(owner, key)) return fail(error, "owner begin refused");
     if (!readers_.advance(owner)) { poisoned_ = true; return fail(error, "owner lifetime advance failed"); }
     device_tables_[(size_t) owner] = page_table;
     for (uint64_t page = 0; page < state_.pages(); ++page) {
@@ -162,7 +290,7 @@ bool KvSharedPool::alias(uint64_t target, const KvOwnerKey& key, uint64_t source
                          int64_t prefix, const program::ContinuationCertificate& cut, std::string& error,
                          KvAliasReceipt* receipt, void* source_stream, void* target_stream) {
     using Clock = std::chrono::steady_clock;
-    const auto started = receipt ? Clock::now() : Clock::time_point{};
+    const auto started = receipt || worker_ ? Clock::now() : Clock::time_point{};
     auto mark = started;
     auto phase = [&](double& field) {
         const auto now = Clock::now(); field += std::chrono::duration<double, std::micro>(now - mark).count();
@@ -172,6 +300,7 @@ bool KvSharedPool::alias(uint64_t target, const KvOwnerKey& key, uint64_t source
     const auto quote = plan::kv_share_quote(kernels::qsa_real_shapes(), kernels::kKvHybrid, budget_, prefix);
     if (budget_.mode != plan::KvShareMode::alias || !quote.admitted) return fail(error, quote.refusal);
     if (readers_.pinned(target)) return fail(error, "alias target is borrowed by a streamed source");
+    if (!wait_reclaim(error)) return false;
     if (receipt) phase(receipt->quote_us);
     if (!fence(source_stream, target_stream, false, error, receipt)) return false;
     if (receipt) phase(receipt->entry_drain_us);
@@ -195,9 +324,25 @@ bool KvSharedPool::alias(uint64_t target, const KvOwnerKey& key, uint64_t source
     for (size_t page = 0; page < count; ++page) release_extent((uint64_t) tables_[(size_t) target][page]);
     std::memcpy(tables_[(size_t) target].data(), tables_[(size_t) source].data(), count * sizeof(int32_t));
     if (receipt) phase(receipt->directory_us);
-    const bool complete = reclaim(error, receipt);
-    if (receipt) receipt->total_us = std::chrono::duration<double, std::micro>(Clock::now() - started).count();
-    return complete;
+    if (receipt) receipt->ready_us = std::chrono::duration<double, std::micro>(Clock::now() - started).count();
+    if (worker_) {
+        const uint64_t ticket = prepare_reclaim(error);
+        if (!ticket) return false;
+        if (receipt) receipt->reclaim_peak_bytes = worker_->ledger.snapshot().pending_bytes;
+        {
+            std::lock_guard<std::mutex> lock(worker_->mutex);
+            worker_->ticket = ticket; worker_->origin = started;
+            worker_->receipt = {}; worker_->error.clear();
+            worker_->busy = worker_->requested = true;
+        }
+        worker_->changed.notify_one();
+        if (receipt) phase(receipt->queue_us);
+    } else if (!reclaim(error, receipt)) return false;
+    if (receipt) {
+        receipt->total_us = std::chrono::duration<double, std::micro>(Clock::now() - started).count();
+        if (!worker_) receipt->available_us = receipt->total_us;
+    }
+    return true;
 }
 bool KvSharedPool::writable(uint64_t owner, const KvOwnerKey& key, uint64_t page, std::string& error) {
     int current = -1;
@@ -205,7 +350,7 @@ bool KvSharedPool::writable(uint64_t owner, const KvOwnerKey& key, uint64_t page
         return fail(error, "stale, foreign or borrowed write owner");
     const auto decision = state_.cow(owner, key, page, true); // pure permission, not a drain claim
     if (decision == plan::KvCowDecision::private_write) return true;
-    if (!drain(error)) return false;
+    if (!wait_reclaim(error) || !drain(error)) return false;
     if (decision != plan::KvCowDecision::detach || !state_.detach(owner, key, page, true))
         return fail(error, "unpriced, pinned or stale COW refused");
     const uint64_t old = state_.binding(owner, page).extent;
@@ -228,7 +373,8 @@ bool KvSharedPool::writable(uint64_t owner, const KvOwnerKey& key, uint64_t page
     return reclaim(error);
 }
 bool KvSharedPool::terminal(uint64_t owner, const KvOwnerKey& key, std::string& error) {
-    if (readers_.pinned(owner) || !drain(error) || !state_.terminal(owner, key, true))
+    if (!state_.owns(owner, key) || readers_.pinned(owner) || !wait_reclaim(error) ||
+        !drain(error) || !state_.terminal(owner, key, true))
         return fail(error, "stale, borrowed, pinned or duplicate terminal refused");
     for (const int32_t extent : tables_[(size_t) owner]) release_extent((uint64_t) extent);
     return reclaim(error);
@@ -298,12 +444,23 @@ kernels::QsaAttnPools KvSharedPool::pools(uint64_t owner) const {
     p.page_table = device_tables_[(size_t) owner];
     return p;
 }
-uint64_t KvSharedPool::mapped_bytes() const { return (uint64_t) range_.mapped_count() * budget_.granularity; }
+KvReclaimStatus KvSharedPool::reclaim_status() const {
+    if (worker_) return worker_->ledger.snapshot();
+    return {(uint64_t) range_.mapped_count() * budget_.granularity, 0, released_chunks_, 0};
+}
+uint64_t KvSharedPool::mapped_bytes() const { return reclaim_status().charged_bytes; }
+bool KvSharedPool::can_reserve(uint64_t limit, uint64_t other_charged, uint64_t incoming) const {
+    if (poisoned_) return false;
+    if (worker_) return worker_->ledger.can_reserve(limit, other_charged, incoming);
+    const auto charged = mapped_bytes();
+    return charged <= limit && other_charged <= limit - charged && incoming <= limit - charged - other_charged;
+}
 uint64_t KvSharedPool::host_bytes() const {
     uint64_t bytes = sizeof(*this) + state_.host_bytes() - sizeof(state_) +
         chunk_users_.capacity() * sizeof(uint32_t) + (uint64_t) range_.chunks() * sizeof(VmmChunk) +
         tables_.capacity() * sizeof(std::vector<int32_t>) + device_tables_.capacity() * sizeof(int32_t*);
     for (const auto& table : tables_) bytes += table.capacity() * sizeof(int32_t);
+    if (worker_) bytes += plan::kKvShareReclaimHostBytes;
     return bytes;
 }
 } // namespace strata::core

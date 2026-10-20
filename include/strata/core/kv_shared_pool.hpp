@@ -3,6 +3,7 @@
 #include "strata/core/kv_alias.hpp"
 #include "strata/core/vmm.hpp"
 #include "strata/core/logical_kv.hpp"
+#include "strata/core/kv_reclaim.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include <array>
 #include <memory>
@@ -14,6 +15,8 @@ struct KvAliasReceipt {
     double publication_drain_us = 0, bind_us = 0, directory_us = 0, unmap_us = 0, free_us = 0, total_us = 0;
     uint64_t table_bytes = 0, unmaps = 0, releases = 0;
     uint64_t table_calls = 0, incoming_events = 0, publication_events = 0;
+    double ready_us = 0, queue_us = 0, available_us = 0;
+    uint64_t reclaim_peak_bytes = 0;
 };
 struct QsaState;
 class KvSharedPool {
@@ -33,6 +36,11 @@ public:
     bool alias(uint64_t target, const KvOwnerKey& key, uint64_t source, const KvOwnerKey& source_key,
                int64_t prefix, const program::ContinuationCertificate& cut, std::string& error,
                KvAliasReceipt* receipt = nullptr, void* source_stream = nullptr, void* target_stream = nullptr);
+    // Deferred aliases return after publication; old backing remains charged.
+    // Mapping, COW and drained retirement join the owned worker before reuse.
+    bool wait_reclaim(std::string& error, KvAliasReceipt* receipt = nullptr);
+    KvReclaimStatus reclaim_status() const;
+    bool can_reserve(uint64_t limit, uint64_t other_charged, uint64_t incoming) const;
     // A caller must ask before issuing ANY write, including captured appends.
     // Zero/multi-page rewrites are not silently converted into a wider COW plan.
     bool writable(uint64_t owner, const KvOwnerKey& key, uint64_t page, std::string& error);
@@ -46,7 +54,7 @@ public:
     bool usable(uint64_t owner, const KvOwnerKey& key) const { return !poisoned_ && state_.owns(owner, key); }
     strata::kernels::QsaAttnPools pools(uint64_t owner) const;
     uint64_t mapped_bytes() const;
-    uint64_t released_chunks() const { return released_chunks_; }
+    uint64_t released_chunks() const { return reclaim_status().released_chunks; }
     uint64_t host_bytes() const;
     const KvAliasState& ownership() const { return state_; }
     const std::vector<int32_t>& table(uint64_t owner) const { return tables_[(size_t) owner]; }
@@ -57,7 +65,8 @@ private:
     bool publish(uint64_t owner, std::string& error);
     bool retain_extent(uint64_t extent, std::string& error);
     void release_extent(uint64_t extent);
-    bool reclaim(std::string& error, KvAliasReceipt* receipt = nullptr);
+    uint64_t prepare_reclaim(std::string& error);
+    bool reclaim(std::string& error, KvAliasReceipt* receipt = nullptr, uint64_t ticket = 0);
     static bool fail(std::string& error, const char* operation);
     const plan::KvShareBudget budget_;
     KvAliasState state_;
@@ -72,6 +81,8 @@ private:
     uint64_t released_chunks_ = 0;
     int device_ = -1;
     std::atomic<bool> poisoned_{false};
+    struct ReclaimWorker;
+    std::unique_ptr<ReclaimWorker> worker_;
 };
 bool kv_shared_valid(const QsaState& state);
 KvLogicalPages kv_logical_pages(const QsaState& state);

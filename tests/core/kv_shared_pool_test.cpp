@@ -69,11 +69,13 @@ uint64_t output_hash(const std::vector<float>& values) {
     }
     return hash;
 }
-void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
+void screen(int device, int layer, bool chain, bool aliases, PairStats& stats, bool deferred = false, bool overlap = false) {
     check(cudaSetDevice(device), "select stage device");
     const auto s = kernels::qsa_real_shapes();
+    const char* arm = aliases ? (deferred ? "deferred" : "immediate") : "private";
     plan::KvShareBudget budget{aliases ? plan::KvShareMode::alias : plan::KvShareMode::pool, 262144, 4, 12, 3,
         plan::kKvShareChunk, 12ull << 30, 3299132688};
+    budget.deferred_reclaim = deferred;
     core::KvSharedPool pool(budget);
     std::string error;
     require(pool.init(error), error.c_str());
@@ -189,6 +191,36 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
             layer % 2 ? producer_stream : stream, stream), error.c_str());
     }
     else private_copy();
+    const double return_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    constexpr uint64_t incoming_bytes = 25 * plan::kKvShareChunk;
+    bool admission_ready = false, admission_after_graph = false;
+    core::KvReclaimStatus at_return{}, after_graph{};
+    double graph_enqueue_us = 0, graph_complete_us = 0, wait_us = 0;
+    float overlap_kernel_ms = 0;
+    if (overlap) {
+        admission_ready = pool.can_reserve(before_bytes, 0, incoming_bytes);
+        at_return = pool.reclaim_status();
+        require(at_return.charged_bytes + (at_return.released_chunks - before_chunks) * plan::kKvShareChunk == before_bytes &&
+            (!admission_ready || before_bytes - at_return.charged_bytes >= incoming_bytes),
+            "ready admission credited pending or unmeasured bytes");
+        require(pool.writable(1, b, 16384, error), error.c_str());
+        const auto enqueue_start = std::chrono::steady_clock::now();
+        check(cudaEventRecord(kernel_start, stream), "overlap attention event");
+        check(cudaGraphLaunch(exec, stream), "one unchanged captured attention during reclaim");
+        graph_enqueue_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - enqueue_start).count();
+        check(cudaEventRecord(kernel_stop, stream), "overlap attention end event");
+        check(cudaEventSynchronize(kernel_stop), "overlap attention completion");
+        check(cudaEventElapsedTime(&overlap_kernel_ms, kernel_start, kernel_stop), "overlap attention GPU time");
+        graph_complete_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        admission_after_graph = pool.can_reserve(before_bytes, 0, incoming_bytes);
+        after_graph = pool.reclaim_status();
+        require(after_graph.charged_bytes + (after_graph.released_chunks - before_chunks) * plan::kKvShareChunk == before_bytes &&
+            (!admission_after_graph || before_bytes - after_graph.charged_bytes >= incoming_bytes),
+            "post-graph admission double-counted unreclaimed backing");
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    require(pool.wait_reclaim(error, deferred ? &trace : nullptr), error.c_str());
+    wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - wait_start).count();
     const double handoff_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     check(cudaMemGetInfo(&free_after, &total), "after handoff memory");
     check(cudaMemcpy(readback.data(), tb.p, readback.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "target identities");
@@ -200,6 +232,38 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
     require(released == (aliases ? 25u : 0u) && before_bytes - pool.mapped_bytes() == released * plan::kKvShareChunk &&
         int64_t(free_after) - int64_t(free_before) == int64_t(released * plan::kKvShareChunk),
         "handoff release not independently measured in successful 2MiB chunks");
+    if (overlap) {
+        const bool admission_available = pool.can_reserve(before_bytes, 0, incoming_bytes);
+        require(admission_available == aliases && pool.reclaim_status().pending_bytes == 0 &&
+            (!deferred || pool.reclaim_status().peak_pending_bytes == incoming_bytes),
+            "availability admission differs from actual completed chunk credit");
+        std::printf("KV_SHARE_RECLAIM arm=%s layer=%d device=%d binding_ready_us=%.3f return_us=%.3f publication_return_us=%.3f available_us=%.3f peak_unreclaimed_bytes=%llu pending_on_return=%llu completed_on_return=%llu admission_ready=%d graph_enqueue_us=%.3f graph_gpu_ms=%.6f graph_complete_us=%.3f pending_after_graph=%llu admission_after_graph=%d wait_us=%.3f service_with_graph_us=%.3f admission_available=%d enqueue_credit_chunks=0\n",
+            arm, layer, device, trace.ready_us, return_us, trace.total_us, trace.available_us,
+            (unsigned long long) trace.reclaim_peak_bytes,
+            (unsigned long long) at_return.pending_bytes, (unsigned long long) (at_return.released_chunks - before_chunks),
+            int(admission_ready), graph_enqueue_us, double(overlap_kernel_ms), graph_complete_us,
+            (unsigned long long) after_graph.pending_bytes, int(admission_after_graph), wait_us, handoff_ms * 1000,
+            int(admission_available));
+        if (admission_available) {
+            core::VmmRange incoming;
+            require(incoming.reserve(incoming_bytes), "admitted incoming VA reservation");
+            size_t incoming_before = 0, incoming_after = 0, incoming_retired = 0;
+            check(cudaMemGetInfo(&incoming_before, &total), "incoming allocation before");
+            const auto incoming_start = std::chrono::steady_clock::now();
+            require(incoming.map_range(0, 25, [] { return core::VmmChunk{0}; }), "admitted incoming physical allocation");
+            const double map_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - incoming_start).count();
+            check(cudaMemGetInfo(&incoming_after, &total), "incoming allocation after");
+            require(incoming.mapped_count() == 25 && incoming_before - incoming_after == incoming_bytes &&
+                !pool.can_reserve(before_bytes, incoming_bytes, plan::kKvShareChunk),
+                "incoming physical allocation was undercharged or admitted twice");
+            incoming.release();
+            check(cudaMemGetInfo(&incoming_retired, &total), "incoming physical retirement");
+            require(incoming_retired == incoming_before && pool.can_reserve(before_bytes, 0, incoming_bytes),
+                "incoming retirement failed or headroom counted twice");
+            std::printf("KV_SHARE_INCOMING arm=%s layer=%d device=%d actual_chunks=25 bytes=%llu map_us=%.3f no_double_admit=1 physical_retired=1\n",
+                arm, layer, device, (unsigned long long) incoming_bytes, map_us);
+        }
+    }
     const double candidate_kernel_ms = kernel_time();
     check(cudaGraphLaunch(exec, stream), "handoff graph replay");
     check(cudaStreamSynchronize(stream), "handoff graph drain");
@@ -219,7 +283,7 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
         require(std::all_of(shared.begin(), shared.end(), [=](float x) { return std::isfinite(x) && x == expected; }),
             "committed QSA output differs from independent one-cell constant-value oracle");
         std::printf("KV_SHARE_COMMITTED arm=%s layer=%d phase=%s position=%lld float_count=%zu value=%.6f fnv64=%llu scope=qsa_activation_not_model_tokens\n",
-            aliases ? "alias" : "private", layer, phase, (long long) position, shared.size(), expected,
+            arm, layer, phase, (long long) position, shared.size(), expected,
             (unsigned long long) output_hash(shared));
     };
     auto append = [&](uint64_t owner, const core::KvOwnerKey& owner_key,
@@ -241,7 +305,7 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
         float append_ms = 0;
         check(cudaEventElapsedTime(&append_ms, kernel_start, kernel_stop), "append kernel time");
         std::printf("KV_SHARE_APPEND arm=%s layer=%d phase=%s captured=1 writable_before_graph=1 permission_us=%.3f kernel_ms=%.6f\n",
-            aliases ? "alias" : "private", layer, phase, permission_us, double(append_ms));
+            arm, layer, phase, permission_us, double(append_ms));
     };
     append(0, a, peer_exec, 65539, 0.5f, "source_tail");
     append(1, b, exec, 65539, -0.25f, "divergent_tail");
@@ -277,18 +341,18 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
     const double ready_us = trace.quote_us + trace.entry_drain_us + trace.acquire_us +
         trace.table_copy_us + trace.publication_drain_us + trace.bind_us;
     std::printf("KV_SHARE_PHASES arm=%s layer=%d device=%d quote_us=%.3f entry_drain_us=%.3f acquire_us=%.3f table_copy_us=%.3f publication_drain_us=%.3f bind_us=%.3f alias_ready_us=%.3f directory_us=%.3f unmap_us=%.3f physical_release_us=%.3f alias_total_us=%.3f boundary_us=%.3f cow_us=%.3f table_bytes=%llu unmaps=%llu releases=%llu kernel_private_ms=%.6f kernel_candidate_ms=%.6f\n",
-        aliases ? "alias" : "private", layer, device, trace.quote_us, trace.entry_drain_us, trace.acquire_us,
+        arm, layer, device, trace.quote_us, trace.entry_drain_us, trace.acquire_us,
         trace.table_copy_us, trace.publication_drain_us, trace.bind_us, ready_us, trace.directory_us, trace.unmap_us, trace.free_us,
         trace.total_us, boundary_us, cow_us, (unsigned long long) trace.table_bytes,
         (unsigned long long) trace.unmaps, (unsigned long long) trace.releases, private_kernel_ms, candidate_kernel_ms);
     std::printf("KV_SHARE_PUBLICATION layer=%d arm=%s table_kind=device_to_device table_calls=%llu incoming_events=%llu publication_events=%llu\n",
-        layer, aliases ? "alias" : "private", (unsigned long long) trace.table_calls,
+        layer, arm, (unsigned long long) trace.table_calls,
         (unsigned long long) trace.incoming_events, (unsigned long long) trace.publication_events);
     std::printf("KV_SHARE_IDENTITIES arm=%s layer=%d device=%d request_a=101 request_b=102 common_k=%p common_v=%p source_first=%d target_first_before_cow=%d target_first_after_cow=%d shared_last=%d boundary_a=%d boundary_b=%d measured_release_chunks=%llu measured_cow_chunks=%llu handoff_ms=%.6f\n",
-        aliases ? "alias" : "private", layer, device, (const void*) pa.k_q, (const void*) pa.v_q4,
+        arm, layer, device, (const void*) pa.k_q, (const void*) pa.v_q4,
         source_table[0], readback[0], pool.table(1)[0], readback[16383], source_table[16384], boundary,
         (unsigned long long) released, (unsigned long long) (cow_bytes / plan::kKvShareChunk), handoff_ms);
-    if (chain && layer + 1 < 12) screen((layer + 1) / 4, layer + 1, true, aliases, stats);
+    if (chain && layer + 1 < 12) screen((layer + 1) / 4, layer + 1, true, aliases, stats, deferred, overlap);
     check(cudaSetDevice(device), "restore recursive stage device");
     const auto held = pool.ownership().binding(1, 1);
     const uint32_t references = pool.ownership().extent(held.extent).references;
@@ -320,14 +384,15 @@ void screen(int device, int layer, bool chain, bool aliases, PairStats& stats) {
     check(cudaEventDestroy(kernel_start), "destroy kernel start event"); check(cudaEventDestroy(kernel_stop), "destroy kernel stop event");
     require(pool.terminal(0, a, error) && pool.mapped_bytes() == 0, error.c_str());
     std::printf("KV_SHARE_DEVICE arm=%s layer=%d device=%d captured=4 instantiated=4 captured_append=1 writable_before_graph=1 attention_exact=1 divergent_tails=1 cow_exact=1 cancel_no_release=1 terminal_once=1 survivor=1 image_reuse=1 measured_release_chunks=%llu measured_release_bytes=%llu measured_cow_bytes=%llu cancel_terminal_chunks=%llu host_metadata_bytes=%llu\n",
-        aliases ? "alias" : "private", layer, device, (unsigned long long) released,
+        arm, layer, device, (unsigned long long) released,
         (unsigned long long) (released * plan::kKvShareChunk), (unsigned long long) cow_bytes,
         (unsigned long long) retired, (unsigned long long) pool.host_bytes());
 }
-void image_contract() {
+void image_contract(bool deferred = false) {
     check(cudaSetDevice(0), "select image-contract device");
     plan::KvShareBudget budget{plan::KvShareMode::alias, 262144, 4, 12, 3,
         plan::kKvShareChunk, 12ull << 30, 3299132688};
+    budget.deferred_reclaim = deferred;
     core::KvSharedPool pool(budget);
     std::string error;
     if (!pool.init(error)) throw std::runtime_error(error);
@@ -462,16 +527,61 @@ void image_contract() {
     if (!pool.terminal(1, replacement, error) || !pool.terminal(2, c, error) || !pool.terminal(0, a, error))
         throw std::runtime_error(error);
 }
+void pending_retirement(int device, bool destroy_pending) {
+    check(cudaSetDevice(device), "select pending-retirement device");
+    Device<int32_t> ta(65536), tb(65536);
+    size_t free_before = 0, total = 0, free_after = 0;
+    check(cudaMemGetInfo(&free_before, &total), "before pending owner lifetime");
+    uint64_t pending_on_return = 0, initial_bytes = 0;
+    {
+        plan::KvShareBudget budget{plan::KvShareMode::alias, 262144, 4, 12, 3,
+            plan::kKvShareChunk, 12ull << 30, 3299132688};
+        budget.deferred_reclaim = true;
+        core::KvSharedPool pool(budget);
+        std::string error;
+        const core::KvOwnerKey a{201, 1, 31}, b{202, 1, 32};
+        require(pool.init(error) && pool.begin(0, a, ta.p, error) &&
+            pool.begin(1, b, tb.p, error) && pool.ready(0, a), error.c_str());
+        initialize(pool.pools(0), uint64_t(pool.table(0)[0]), 16385);
+        initial_bytes = pool.mapped_bytes();
+        auto borrowed = pool.borrow(0, a, error);
+        require(bool(borrowed), error.c_str());
+        require(pool.alias(1, b, 0, a, 65539, certificate(a, 65539), error), error.c_str());
+        pending_on_return = pool.reclaim_status().pending_bytes;
+        require(pending_on_return != 0, "pending cancellation/teardown exposure was not exercised");
+        const auto held = pool.ownership().binding(1, 0);
+        require(pool.cancel(1, b) && pool.ownership().extent(held.extent).references == 2,
+            "cancel released an alias reference while previously queued physical reclamation ran");
+        require(!pool.reset(0, a, error) && !pool.terminal(0, a, error),
+            "pending physical reclamation bypassed the borrowed-source lease");
+        borrowed.reset();
+        if (!destroy_pending) {
+            require(pool.terminal(1, b, error) && !pool.terminal(1, b, error) &&
+                pool.ownership().extent(held.extent).references == 1 &&
+                pool.terminal(0, a, error) && pool.mapped_bytes() == 0 &&
+                pool.reclaim_status().pending_bytes == 0 &&
+                pool.released_chunks() * plan::kKvShareChunk == initial_bytes,
+                "pending worker/drained terminal leaked or released physical chunks twice");
+        }
+    } // destruction joins any owned work before releasing directories/backing
+    check(cudaMemGetInfo(&free_after, &total), "after owned pending teardown");
+    require(free_after == free_before, "pending owner lifetime leaked physical memory");
+    std::printf("KV_SHARE_PENDING_RETIRE device=%d mode=%s pending_on_return=%llu initial_physical_bytes=%llu cancel_reference_drop=0 borrowed_reset_terminal=refused worker_joined=1 physical_restored=1 terminal_once=%d\n",
+        device, destroy_pending ? "destructor" : "drained_terminal", (unsigned long long) pending_on_return,
+        (unsigned long long) initial_bytes, int(!destroy_pending));
+    std::fflush(stdout);
+}
 }
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--help") == 0) {
-        std::puts("kv_shared_pool_test [--preflight|--image-contract|--pair-contract]: selected devices; no model loaded; exit78=required VMM unavailable");
+        std::puts("kv_shared_pool_test [--preflight|--image-contract|--pair-contract|--deferred-contract]: selected devices; no model loaded; exit78=required VMM unavailable");
         return 0;
     }
     int count = 0;
     try {
         require(argc <= 2 && (argc == 1 || std::strcmp(argv[1], "--preflight") == 0 ||
-            std::strcmp(argv[1], "--image-contract") == 0 || std::strcmp(argv[1], "--pair-contract") == 0),
+            std::strcmp(argv[1], "--image-contract") == 0 || std::strcmp(argv[1], "--pair-contract") == 0 ||
+            std::strcmp(argv[1], "--deferred-contract") == 0),
             "unknown fixture option");
         const char* window_ticket = std::getenv("STRATA_KV_SHARE_TEST_WINDOW");
         if (!window_ticket || !*window_ticket) {
@@ -496,6 +606,37 @@ int main(int argc, char** argv) {
         if (!available) { std::puts("KV_SHARE_BLOCKED required stage-local VMM/2MiB backing unavailable; no aliases issued"); return 78; }
         if (argc > 1 && std::strcmp(argv[1], "--preflight") == 0) return 0;
         if (argc > 1 && std::strcmp(argv[1], "--image-contract") == 0) { image_contract(); return 0; }
+        if (argc > 1 && std::strcmp(argv[1], "--deferred-contract") == 0) {
+            for (int device = 0; device < count; ++device) {
+                PairStats warm; screen(device, device * 4, false, false, warm);
+            }
+            constexpr int order[] = {0, 1, 2, 2, 1, 0};
+            for (int cohort = 0; cohort < 6; ++cohort) {
+                const bool aliases = order[cohort] != 0, deferred = order[cohort] == 2;
+                const char* arm = aliases ? (deferred ? "deferred" : "immediate") : "private";
+                std::printf("KV_SHARE_COHORT_BEGIN cohort=%d arm=%s\n", cohort, arm);
+                PairStats stats;
+                const auto started = std::chrono::steady_clock::now();
+                screen(0, 0, true, aliases, stats, deferred, true);
+                const double complete_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                require(stats.layers == 12 && stats.reused_images == 12 && stats.host_bytes <= plan::kKvShareHostLimit &&
+                    stats.release_chunks == (aliases ? 300u : 0u) && stats.cow_chunks == (aliases ? 36u : 0u),
+                    "matched deferred-reclamation physical/correctness coverage incomplete");
+                std::printf("KV_SHARE_DEFERRED_SUMMARY cohort=%d arm=%s layers=12 stages=3 simultaneous_owner_pairs=12 release_chunks=%llu measured_release_bytes=%llu cow_chunks=%llu measured_cow_bytes=%llu charged_host_metadata_bytes=%llu live_pool_bytes=%llu images_reused=%llu handoff_plus_graph_ms=%.6f kernel_private_sum_ms=%.6f kernel_candidate_sum_ms=%.6f complete_fixture_call_ms=%.6f scope=target_kv_fixture_not_full_model_client\n",
+                    cohort, arm, (unsigned long long) stats.release_chunks,
+                    (unsigned long long) (stats.release_chunks * plan::kKvShareChunk), (unsigned long long) stats.cow_chunks,
+                    (unsigned long long) (stats.cow_chunks * plan::kKvShareChunk), (unsigned long long) stats.host_bytes,
+                    (unsigned long long) stats.live_bytes, (unsigned long long) stats.reused_images,
+                    stats.handoff_ms, stats.kernel_private_ms, stats.kernel_candidate_ms, complete_ms);
+                std::fflush(stdout);
+            }
+            for (int device = 0; device < count; ++device) {
+                pending_retirement(device, false); pending_retirement(device, true);
+            }
+            image_contract(); image_contract(true);
+            return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--pair-contract") == 0) {
             for (int device = 0; device < count; ++device) {
                 PairStats warm; screen(device, device * 4, false, false, warm);
