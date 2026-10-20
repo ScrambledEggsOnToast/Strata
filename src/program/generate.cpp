@@ -948,8 +948,9 @@ struct Options {
     int64_t conversation_cache_disk_mib = 131072;
     /// --conversation-cache-disk-min-free-mib N: filesystem space a new reservation must leave free (default 131072).
     int64_t conversation_cache_disk_min_free_mib = 131072;
-    /// --conversation-cache-disk-heads N: retained branch heads across the whole store, independent of the RAM slots
-    /// (default 128).
+    /// --conversation-cache-disk-heads N: retained branch heads per execution domain, independent of the RAM slots
+    /// (default 128).  One profile's publications never retire another profile's heads; the byte quota and floor stay
+    /// global.
     int64_t conversation_cache_disk_heads = 128;
     /// Verified identities (64 hex digits each) from the release artifacts, never a profile name, an alias or a
     /// sampled fingerprint: --conversation-cache-model-id is the common model/pack identity (draft and layout
@@ -1145,8 +1146,9 @@ void usage() {
                  "                       (default 131072 = 128 GiB), lazily allocated and never split per profile\n"
                  "  --conversation-cache-disk-min-free-mib N  --serve persistence: filesystem space a new reservation\n"
                  "                       must leave free (default 131072); a refusal is an ordinary cache miss\n"
-                 "  --conversation-cache-disk-heads N  --serve persistence: retained branch heads across the whole\n"
-                 "                       store (default 128), independent of --conversation-cache-slots\n"
+                 "  --conversation-cache-disk-heads N  --serve persistence: retained branch heads per execution domain\n"
+                 "                       (default 128), independent of --conversation-cache-slots; one profile's\n"
+                 "                       publications never retire another profile's heads\n"
                  "  --conversation-cache-model-id HEX64  --serve persistence: the verified common model/pack identity\n"
                  "                       (64 hex digits) from the release artifacts, never a profile name or alias\n"
                  "  --conversation-cache-engine-id HEX64  --serve persistence: the verified execution domain (state\n"

@@ -2061,8 +2061,10 @@ an inactive run intent alone is not evidence that a shutdown completed.
 Capacity is **one shared physical quota** for every layout: `--conversation-cache-disk-mib` (default 131072 = 128 GiB),
 lazily allocated, with `--conversation-cache-disk-min-free-mib` (default 131072) as the filesystem floor a new
 reservation must leave free, and `--conversation-cache-disk-heads` (default 128) as the retained branch-head ceiling
-across the whole store - independent of the RAM `--conversation-cache-slots`. Neither quota nor head limit is part of
-an image's identity, so both layouts borrow the same capacity. Refused publications do not persist their capture;
+**per execution domain**, independent of the RAM `--conversation-cache-slots`. Neither quota nor head limit is part of
+an image's identity, so both layouts borrow the same capacity. A publication retires only its own execution domain's
+heads, so one profile's writes can never evict another profile's completed history; the byte quota and the filesystem
+floor stay global because they describe the one shared device. Refused publications do not persist their capture;
 the request can still complete normally without persistence. The store distinguishes an image that exceeds its
 admission limits from resources temporarily occupied by other work. Temporary pressure defers the capture without
 transferring its image or lease or spending a retry. It stays queued for a later safe seam, subject to the existing
