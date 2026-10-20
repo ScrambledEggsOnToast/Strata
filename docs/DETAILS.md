@@ -2159,39 +2159,53 @@ again. Successful catalog apply carries the existing lease charge into the objec
 returns it exactly once. Refused revival returns ownership to reclamation; uncertain catalog commits retain the files
 and charges under the existing fault/epoch-distrust rules.
 
-*Object-directory flush batching (bounded CPU-storage qualification; default off).* Set
+*Object data/directory flush batching (bounded CPU-storage qualification; default off).* Set
 `STRATA_STORE_DIR_FSYNC_BATCH=1` in the native engine environment before opening
 the store. Unset it (or use any other value) for the repaired per-object path
-above. Both modes retain its publication-local lease deduplication and transfer
-the original revived-object charge into the live index without charging again.
-Batching changes only when object directory entries are flushed: each immutable
-payload is still written, file-fsynced, closed and renamed before reuse.
+above. Both modes retain publication-local lease deduplication and transfer the
+original revived-object charge into the live index without charging again.
 
-The enabled writer initializes a fixed 256-bit tracker and marks every shard
-containing a newly renamed object or a revived accounted orphan. Before encoding
-or creating any manifest it opens, flushes and closes each marked shard
-sequentially, then flushes `objects/` once, including existing shards left by a
-failed earlier parent flush. Entirely authorized donor/dedup reuse needs no batch.
-The tracker, three-byte stack shard name and one transient descriptor (39 bytes)
-are counted in admission and actual writer workspace against the shared RAM allowance and
-preparation ceiling. Shard names and transparent fault lookup allocate no heap
-storage. The existing descriptor owner is reused; no per-object/shard descriptor
-collection or additional RAII owner is introduced.
+The enabled writer writes and closes new objects in `tmp/` without per-object
+file fsync, using each object's existing single charged orphan record. It marks a
+fixed 256-bit tracker for new objects and revived accounted orphans. After the
+unchanged serving/epoch/cancellation fence, one Linux `syncfs(objects_fd)` waits
+for filesystem data durability. Only then are the new files renamed to their
+content-addressed names; a cross-filesystem rename refuses before any manifest.
+Thus even a data-sync error leaves only temporary files, never unproved named
+objects that a later publication could revive. A named orphan's data was already
+durable before its rename in either mode.
 
-A refused drain precedes manifest creation and leaves catalog authority unchanged.
-Abandoned objects are credited only after confirmed deletion; undeletable orphans
-remain charged in the stable orphan ledger. Revival must traverse the flush
-boundary again, not infer durability from file/directory existence. Generic
-`object-shard-sync` and `object-parent-sync` faults refuse the actual flush in both
-modes. The default parent fault occurs before writing; the batch parent fault
-occurs after payload renames, so their cleanup assertions distinguish that timing.
-Candidate-specific faults and the batch gate exist only in test-hook builds.
+Before encoding or creating any manifest, the writer then opens, flushes and
+closes each marked shard sequentially and flushes `objects/` once, including
+existing shards left by a failed parent flush. Entirely authorized donor/dedup
+reuse needs no batch. The tracker, three-byte stack shard name and one transient
+descriptor (39 bytes) retain their admission/actual-workspace charge against the
+shared RAM allowance and preparation ceiling. Existing orphan records follow
+their one file from temporary to object; no per-object descriptor collection or
+additional reservation is introduced. The writer remains single-lease.
+
+Directory fsync alone does not establish file-data durability. Linux `syncfs`
+waits for data and metadata for the **whole containing filesystem**, not only this
+store; unrelated dirty files can add latency or make the publication fail. This
+mode requires Linux 5.8 or newer for filesystem writeback-error reporting.
+Manifest/catalog file fsyncs, the publication fence, finalization deadline and
+run-intent/epoch recovery are unchanged.
+
+A refused batch precedes manifest creation and leaves catalog authority
+unchanged. Abandoned files are credited only after confirmed deletion;
+undeletable temporary/object orphans stay charged exactly once. Revival traverses
+the directory boundary again, never inferring directory durability from
+existence. Generic `object-shard-sync` and `object-parent-sync` faults refuse the
+actual directory flush in both modes. Test-hook builds additionally exercise data
+EIO, failures after data durability, and process exits on either side of the
+data sweep, before any manifest is created.
 
 This opt-in is not adopted for daily use. With N new objects, R revived objects
-and S touched shards, directory flushes change from 2(N+R) on the repaired default
-path to S+1 for a nonempty batch; file, manifest and catalog fsyncs are unchanged.
-Sequential reopening adds work and small batches can regress. The bounded
-observations below are CPU-storage evidence, not serving-throughput qualification.
+and S touched shards, object file fsyncs change from N to zero plus one
+filesystem data sweep for a nonempty batch; directory flushes change from
+2(N+R) to S+1. Manifest/catalog durability is unchanged. Small batches or unrelated
+filesystem writeback can regress. CPU-storage observations are not
+serving-throughput or shutdown-deadline qualification.
 
 *Three separate identities.* The **authorized scope** is the frontend's 32-byte per-tenant/per-conversation value
 derived from the store's private issuer key; it is never logged and a scope change discards reuse exactly as it does

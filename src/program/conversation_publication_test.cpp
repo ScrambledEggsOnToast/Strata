@@ -2256,6 +2256,8 @@ int writer_phase_diagnostic(const char* parent, const char* output_path) {
         clock("writer_started_ns", row.writer.writer_started_ns);
         clock("payload_started_ns", row.writer.payload_started_ns);
         clock("payload_finished_ns", row.writer.payload_finished_ns);
+        clock("data_sync_started_ns", row.writer.data_sync_started_ns);
+        clock("data_sync_finished_ns", row.writer.data_sync_finished_ns);
         clock("manifest_started_ns", row.writer.manifest_started_ns);
         clock("manifest_finished_ns", row.writer.manifest_finished_ns);
         clock("catalog_started_ns", row.writer.catalog_started_ns);
@@ -2270,6 +2272,7 @@ int writer_phase_diagnostic(const char* parent, const char* output_path) {
         span("handoff_ns", row.publication.admitted_ns, row.admitted_observed_ns);
         span("admission_to_writer_ns", row.writer.admitted_ns, row.writer.writer_started_ns);
         span("payload_ns", row.writer.payload_started_ns, row.writer.payload_finished_ns);
+        span("data_sync_ns", row.writer.data_sync_started_ns, row.writer.data_sync_finished_ns);
         span("manifest_ns", row.writer.manifest_started_ns, row.writer.manifest_finished_ns);
         span("catalog_ns", row.writer.catalog_started_ns, row.writer.catalog_finished_ns);
         span("cleanup_and_settlement_ns", row.writer.body_finished_ns, row.writer.result_ready_ns);
@@ -2289,12 +2292,13 @@ int writer_phase_diagnostic(const char* parent, const char* output_path) {
         number("completed_file_write_bytes", row.writer.file_write_bytes, row.writer_seen);
         number("file_fsync_ns", row.writer.file_fsync_ns, calls_known);
         number("file_fsync_calls", row.writer.file_fsync_calls, row.writer_seen);
+        number("data_sync_calls", row.writer.data_sync_calls, row.writer_seen);
         number("dir_fsync_ns", row.writer.dir_fsync_ns, calls_known);
         number("dir_fsync_calls", row.writer.dir_fsync_calls, row.writer_seen);
         number("writer_thread_cpu_ns", row.writer.thread_cpu_ns, row.writer.thread_cpu_known);
         std::fputs("}\n", output);
     }
-    std::fputs("{\"kind\":\"limits\",\"timings\":\"inclusive; fsync/write counters are nested, not additive\","
+    std::fputs("{\"kind\":\"limits\",\"timings\":\"inclusive; fsync/syncfs/write counters are nested, not additive\","
         "\"missing_phases\":null,\"shape\":\"synthetic three-stage recurrent workload, not original MAN2/model/KV topology\","
         "\"claim\":\"CPU/store diagnostic only; disabled is shutdown fencing, not an attributed latency cause\"}\n", output);
     const bool output_ok = !std::ferror(output);

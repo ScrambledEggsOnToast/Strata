@@ -505,7 +505,7 @@ struct ConversationStorePublishResult {
 
 #ifdef STRATA_STORE_TEST_HOOKS
 // One bounded, metadata-only summary of a started writer. Missing phase clocks remain zero (not measured).
-// Durations are inclusive/nested: file fsync is part of payload/manifest/catalog, never an additional cost.
+// Durations are inclusive/nested: fsync/syncfs is part of the writer, never an additional cost.
 // calls_complete=false means an exception interrupted per-call timing; the outer writer clocks remain usable.
 // The observer is copied at admission and called only after settlement, outside the store mutex. It must be
 // noexcept, bounded, and perform no I/O; its context must outlive finish_shutdown(). No production instrumentation.
@@ -519,6 +519,7 @@ struct ConversationStorePublishTrace {
     uint64_t source_read_ns = 0, hash_ns = 0;
     uint64_t file_write_ns = 0, file_write_bytes = 0, file_fsync_ns = 0, file_fsync_calls = 0;
     uint64_t dir_fsync_ns = 0, dir_fsync_calls = 0;
+    uint64_t data_sync_started_ns = 0, data_sync_finished_ns = 0, data_sync_calls = 0;
     uint64_t thread_cpu_ns = 0;
     bool thread_cpu_known = false;
     bool calls_complete = true;
@@ -858,6 +859,7 @@ public:
     //   "batch-shard-sync"     fail before flushing the next opened shard
     //   "batch-shard-partial"  fail before a second touched shard, after at least one was flushed
     //   "batch-parent-sync"    fail before the final objects-parent flush, including existing shards
+    //   "batch-data-sync"      simulate EIO from the filesystem data sweep, before any object rename
     //   "batch-shard-allocate" throw bad_alloc while owning the opened shard
     // Arm these through set_publish_fault_for_test(); generic object flush faults work in either mode.
 #endif
@@ -868,7 +870,7 @@ public:
     void set_read_progress_gate_for_test(void (*gate)(void*), void* context);
     // Pause a real catalog transaction outside the mutex, before staging (false) or after staging (true).
     void set_catalog_gate_for_test(void (*gate)(void*, bool staged), void* context);
-    // Pause a nonempty object-directory batch after payload emission/revalidation, before opening any shard.
+    // Pause a nonempty object batch after data durability and renames, before opening any shard for directory fsync.
     // Outside the mutex; absent from production. Context must outlive the publication using it.
     void set_object_batch_gate_for_test(void (*gate)(void*), void* context);
     // Pause after payload emission, before the serving/shutdown fence and before any manifest. Outside the mutex.

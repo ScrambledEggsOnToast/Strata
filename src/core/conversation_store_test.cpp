@@ -10,6 +10,7 @@
 #include "conversation_store_sha256.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <stdexcept>
 #include <unistd.h>
 #include <thread>
@@ -690,6 +692,7 @@ void check_failed_write_charges_once();
 void check_orphan_revival();
 void check_object_directory_retry();
 void check_object_directory_batch();
+void check_object_data_batch();
 void check_postcommit_reclamation_cannot_undo_commit();
 void check_read_object_boundaries();
 
@@ -700,6 +703,12 @@ int main() {
     std::printf("conversation_store_test: the store is POSIX-only, skipped here\n");
     return 77;
 #else
+    if (::getenv("STRATA_STORE_OBJECT_BATCH_ONLY")) {
+        check_object_data_batch();
+        check_object_directory_batch();
+        std::printf("conversation_store_test object batch: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_DRAFT_CERTIFICATION_ONLY")) {
         check_draft_certification_codec();
         check_draft_certification_store();
@@ -869,6 +878,7 @@ int main() {
     check_orphan_revival();
     check_object_directory_retry();
     check_object_directory_batch();
+    check_object_data_batch();
     check_postcommit_reclamation_cannot_undo_commit();
     check_shared_scope_payload_separation();
     std::printf("conversation_store_test: %d checks, %d failures\n", checks, failures);
@@ -7578,7 +7588,7 @@ void check_failed_write_charges_once() {
     const bool had_batch = old_batch != nullptr;
     const std::string saved_batch = old_batch ? old_batch : "";
     for (const char* step : {"objects", "batch-shard-open", "batch-shard-sync", "batch-shard-partial",
-                             "batch-parent-sync", "batch-shard-allocate", "manifest", "catalog"}) {
+                             "batch-parent-sync", "batch-data-sync", "batch-shard-allocate", "manifest", "catalog"}) {
         // Preserve the caller's mode for legacy phases; only the new fault cases force the candidate on.
         ::setenv("STRATA_STORE_DIR_FSYNC_BATCH",
                  std::strncmp(step, "batch-", 6) == 0 ? "1" : (had_batch ? saved_batch.c_str() : "0"), 1);
@@ -7876,7 +7886,7 @@ void check_object_directory_batch() {
               !publication_is_admitted(shape, hollow, fresh, batch_floor - 1),
           "batch publication fits exactly its counted allowance and refuses one byte less");
 
-    // Real unlink permission failures retain renamed objects. Revival must prove directory durability again,
+    // Real unlink permission failures retain renamed objects. Revival must prove data/directory durability again,
     // without rewriting or double-charging them. The third attempt succeeds using those very same files.
     for (const char* boundary : {"batch-shard-sync", "batch-parent-sync"}) {
         if (::geteuid() == 0) continue; // Retained-orphan assertions require real unlink permission denial.
@@ -8134,6 +8144,248 @@ void check_object_directory_batch() {
         check(directory_names(root.path + "/manifests").empty(),
               "unclean recovery finds no manifest authority from an interrupted batch");
         reopened.close();
+    }
+    if (had) ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved.c_str(), 1);
+    else ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");
+}
+
+void check_object_data_batch() {
+    const char* old = ::getenv("STRATA_STORE_DIR_FSYNC_BATCH");
+    const bool had = old != nullptr;
+    const std::string saved = old ? old : "";
+    const SavedConversation image = fixture(397, 1025);
+    ConversationStorePublishTrace traces[2];
+    ConversationStoreCounters counts[2];
+    uint64_t charges[2]{};
+    std::map<std::string, std::string> payloads[2];
+    for (unsigned batching = 0; batching < 2; ++batching) {
+        ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", batching ? "1" : "0", 1);
+        TempRoot root;
+        auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        options.publication_timing = true;
+        {
+            ConversationStore store(options);
+            store.set_publish_trace_for_test(
+                +[](void* context, const ConversationStorePublishTrace& trace) noexcept {
+                    *static_cast<ConversationStorePublishTrace*>(context) = trace;
+                }, &traces[batching]);
+            ConversationStorePublishResult result;
+            check(publish_and_wait(store, image, 1, 1, result) &&
+                      result.status == ConversationStorePublishStatus::stored,
+                  "both durability modes publish the same complete image");
+            counts[batching] = store.counters();
+            charges[batching] = store.disk_charged_bytes();
+            for (const auto& file : file_inventory(root.path + "/objects"))
+                payloads[batching][file] = file_digest(root.path + "/objects" + file);
+            store.close(); // Join the trace observer before reading its summary.
+            check(store.shutdown_state() == ConversationStoreShutdownState::durable_clean,
+                  "both durability modes complete a clean durable close");
+        }
+        {
+            ConversationStore reopened(options);
+            ConversationStoreRead read;
+            std::string why;
+            check(reopened.demand(query_of(image, 2, 1), why) &&
+                      reopened.wait_ready(2, 1, read, 5000) && read.image &&
+                      images_equal(*read.image, image, why),
+                  "the stored image restores byte for byte after reopening in either mode");
+            read.image.reset();
+            reopened.release_read(2, 1);
+            reopened.close();
+        }
+    }
+    check(counts[0].published_chunks > 2, "the durability fixture writes multiple distinct immutable objects");
+    check_eq(traces[0].file_fsync_calls, counts[0].published_chunks + 2,
+             "the default writer fsyncs each object, manifest and catalog");
+    check_eq(traces[1].file_fsync_calls, 2,
+             "the batched writer retains only the manifest and catalog file fsyncs");
+    check_eq(traces[0].data_sync_calls, 0, "the default writer does not sweep the filesystem");
+    check_eq(traces[1].data_sync_calls, 1, "one data sweep replaces all per-object data fsyncs");
+    check(traces[1].payload_finished_ns <= traces[1].data_sync_started_ns &&
+              traces[1].data_sync_started_ns <= traces[1].data_sync_finished_ns &&
+              traces[1].data_sync_finished_ns <= traces[1].manifest_started_ns &&
+              traces[1].manifest_started_ns < traces[1].manifest_finished_ns &&
+              traces[1].manifest_finished_ns <= traces[1].catalog_started_ns &&
+              traces[1].catalog_started_ns <= traces[1].catalog_applied_ns &&
+              traces[1].catalog_applied_ns <= traces[1].catalog_finished_ns,
+          "payload data is durable before manifest creation, manifest before catalog write and apply");
+    check(payloads[0] == payloads[1], "both modes create byte-identical content-addressed payload files");
+    check_eq(counts[1].objects, counts[0].objects, "batching preserves the exact physical object count");
+    check_eq(counts[1].object_bytes, counts[0].object_bytes, "batching preserves every rounded object charge");
+    check_eq(counts[1].published_chunks, counts[0].published_chunks, "batching preserves per-object publication counts");
+    check_eq(counts[1].bytes_written, counts[0].bytes_written, "batching preserves the exact completed byte count");
+    check_eq(traces[1].file_write_bytes, traces[0].file_write_bytes, "batching changes no encoded payload bytes");
+    check_eq(charges[1], charges[0], "batching changes no total disk accounting");
+
+    ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", "1", 1);
+    for (const char* boundary : {"objects", "batch-data-sync", "batch-shard-sync", "batch-parent-sync", "manifest", "catalog"}) {
+        TempRoot root;
+        ConversationStorePublishTrace trace;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const uint64_t charge = store.disk_charged_bytes();
+        const std::string catalog = file_digest(root.path + "/catalog");
+        store.set_publish_trace_for_test(
+            +[](void* context, const ConversationStorePublishTrace& value) noexcept {
+                *static_cast<ConversationStorePublishTrace*>(context) = value;
+            }, &trace);
+        store.set_publish_fault_for_test(boundary);
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, image, 1, 1, result) && result.status == ConversationStorePublishStatus::failed,
+              "a refused pre/post-data-sweep boundary fails the publication");
+        check(file_digest(root.path + "/catalog") == catalog && store.counters().heads == 0,
+              "a refused sweep or later staging step cannot authorize the image");
+        check(file_inventory(root.path + "/objects").empty() && directory_names(root.path + "/manifests").empty() &&
+                  directory_names(root.path + "/tmp").empty(),
+              "a refused boundary reclaims its actual files without creating a retained manifest");
+        check_eq(store.disk_charged_bytes(), charge, "failed sweep/staging refunds exactly the files confirmed gone");
+        check(store.healthy() && result.released && store.ram_lease_bytes() == 0 && !store.writer_busy(),
+              "pre-catalog failure preserves trust and releases the single writer and image lease");
+        store.close();
+        const bool before_data = std::strcmp(boundary, "objects") == 0;
+        const bool after_data = std::strcmp(boundary, "manifest") == 0 || std::strcmp(boundary, "catalog") == 0;
+        check_eq(trace.data_sync_calls, before_data ? 0 : 1,
+                 "new objects fail before any sweep, otherwise data durability is attempted exactly once");
+        check((trace.manifest_started_ns != 0) == after_data,
+              "only a successful data sweep can reach manifest staging");
+        if (std::strcmp(boundary, "batch-data-sync") == 0)
+            check(result.detail.find("syncfs failed:") != std::string::npos,
+                  "a filesystem EIO is propagated through the real data-sweep error path");
+    }
+
+    // Authorized dedup requires no data sweep; the one-shot fault must remain armed until genuinely new data.
+    {
+        TempRoot root;
+        std::atomic<uint64_t> sweeps{UINT64_MAX};
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        ConversationStorePublishResult result;
+        check(publish_and_wait(store, image, 1, 1, result), "dedup starts with a durably authorized image");
+        store.set_publish_trace_for_test(
+            +[](void* context, const ConversationStorePublishTrace& value) noexcept {
+                static_cast<std::atomic<uint64_t>*>(context)->store(value.data_sync_calls);
+            }, &sweeps);
+        store.set_publish_fault_for_test("batch-data-sync");
+        check(publish_and_wait(store, image, 2, 2, result) &&
+                  result.status == ConversationStorePublishStatus::stored && result.new_bytes == 0,
+              "wholly authorized dedup publishes without touching the data-sweep fault");
+        check(await_store_progress([&] { return sweeps.load() != UINT64_MAX; }),
+              "the bounded observer delivers the dedup syscall summary");
+        check_eq(sweeps.load(), 0, "authorized dedup needs no filesystem-wide data sweep");
+        check(publish_and_wait(store, fixture(399, 1025), 3, 3, result) &&
+                  result.status == ConversationStorePublishStatus::failed,
+              "new payload, unlike authorized dedup, must pass the armed data-sweep boundary");
+        store.close();
+    }
+
+    // The existing shutdown fence is still before the filesystem sweep, not after durability work.
+    {
+        TempRoot root;
+        SelectedHoldGate gate;
+        ConversationStorePublishTrace trace;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        store.set_publish_trace_for_test(
+            +[](void* context, const ConversationStorePublishTrace& value) noexcept {
+                *static_cast<ConversationStorePublishTrace*>(context) = value;
+            }, &trace);
+        store.set_publish_payload_gate_for_test(
+            +[](void* context) { static_cast<SelectedHoldGate*>(context)->pause(); }, &gate);
+        ConversationStorePublish request;
+        request.request_id = request.generation = 1;
+        std::string why;
+        check(store.publish(std::make_shared<SavedConversation>(image), request, why) == kAccepted,
+              "the fence fixture starts the real payload writer");
+        gate.await();
+        const uint64_t deadline = shutdown_now_ms() + 8000;
+        store.request_shutdown(deadline);
+        gate.resume();
+        store.finish_shutdown(); // Join the observer; do not upgrade the selected deadline.
+        ConversationStorePublishResult result;
+        check(store.take_publish(result) && result.status == ConversationStorePublishStatus::disabled,
+              "the unchanged pre-manifest fence refuses payload completed after shutdown was requested");
+        check_eq(trace.data_sync_calls, 0, "a fenced publication never enters the deferred data sweep");
+        check_eq(trace.manifest_started_ns, 0, "the shutdown fence still precedes every manifest byte");
+        check(directory_names(root.path + "/manifests").empty() && !gate.timed_out,
+              "the fence leaves no manifest and the scheduling seam was explicitly released");
+    }
+
+    // Process exits on both sides of the data sweep leave no manifest or authority, without finalization.
+    for (const bool before_data : {true, false}) {
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        uint64_t epoch = 0;
+        {
+            ConversationStore seed(options);
+            epoch = seed.epoch();
+            seed.close();
+        }
+        const std::string catalog = file_digest(root.path + "/catalog");
+        const pid_t child = ::fork(); // no live store threads are inherited
+        check(child >= 0, "the pre-manifest crash fixture creates its child process");
+        if (child == 0) {
+            ::alarm(15);
+            ConversationStore store(options);
+            if (before_data)
+                store.set_publish_payload_gate_for_test(+[](void*) { ::_exit(81); }, nullptr);
+            else
+                store.set_object_batch_gate_for_test(+[](void*) { ::_exit(81); }, nullptr);
+            ConversationStorePublishResult result;
+            publish_and_wait(store, image, 1, 1, result);
+            ::_exit(82); // Reaching settlement would miss the intended process-crash boundary.
+        }
+        if (child > 0) {
+            int status = 0;
+            check(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 81,
+                  "the child exits from the real writer seam, without running shutdown/destructors");
+            check(directory_names(root.path + "/manifests").empty() &&
+                      (before_data ? !directory_names(root.path + "/tmp").empty() &&
+                                         file_inventory(root.path + "/objects").empty()
+                                   : directory_names(root.path + "/tmp").empty() &&
+                                         !file_inventory(root.path + "/objects").empty()),
+                  "a crash leaves only tmp before data durability, only named objects after it, and never a manifest");
+            check(file_digest(root.path + "/catalog") == catalog && intent_names(root.path).size() == 1,
+                  "the crash leaves the prior catalog authority unchanged and the actual intent armed");
+            ConversationStore reopened(options);
+            check_eq(reopened.epoch(), epoch + 1, "the armed intent invalidates the interrupted epoch");
+            check_eq(reopened.counters().heads, 0, "restart never authorizes the crash's unswept payload");
+            check_eq(reopened.counters().object_bytes, 0, "restart credits crash orphans only after reclaiming them");
+            reopened.close();
+        }
+    }
+    if (::geteuid() != 0) {
+        TempRoot root;
+        SelectedHoldGate gate;
+        ConversationStore store(options_for(root.path, uint64_t(1) << 30, 0));
+        const uint64_t base = store.disk_charged_bytes();
+        store.set_publish_payload_gate_for_test(
+            +[](void* context) { static_cast<SelectedHoldGate*>(context)->pause(); }, &gate);
+        store.set_publish_fault_for_test("batch-data-sync");
+        ConversationStorePublish request;
+        request.request_id = request.generation = 1;
+        std::string why;
+        check(store.publish(std::make_shared<SavedConversation>(image), request, why) == kAccepted,
+              "the failed-data fixture starts its sole writer");
+        gate.await();
+        check(::chmod((root.path + "/tmp").c_str(), 0500) == 0,
+              "data-sweep failure uses real permission denial to retain its unrenamed files");
+        gate.resume();
+        ConversationStorePublishResult result;
+        check(store.wait_publish(result, 5000) && result.status == ConversationStorePublishStatus::failed,
+              "the data EIO settles before any content-addressed object rename");
+        const uint64_t written = store.counters().bytes_written;
+        check(file_inventory(root.path + "/objects").empty() &&
+                  !directory_names(root.path + "/tmp").empty() && directory_names(root.path + "/manifests").empty(),
+              "a failed data sweep cannot leave digest-named objects eligible for later revival");
+        check_eq(store.disk_charged_bytes() - base, store.counters().orphan_bytes,
+                 "every undeletable data-sweep temporary stays charged exactly once");
+        check(::chmod((root.path + "/tmp").c_str(), 0700) == 0,
+              "normal permissions are restored before retrying the actual source");
+        store.set_publish_payload_gate_for_test(nullptr, nullptr);
+        check(publish_and_wait(store, image, 2, 2, result) &&
+                  result.status == ConversationStorePublishStatus::stored && result.new_bytes == written &&
+                  result.new_bytes > 0,
+              "retry rewrites failed-data payload instead of reviving an unproved inode");
+        store.close();
+        check(store.counters().orphan_bytes == 0 && !gate.timed_out,
+              "confirmed cleanup refunds the failed-data temporaries once and the gate never times out");
     }
     if (had) ::setenv("STRATA_STORE_DIR_FSYNC_BATCH", saved.c_str(), 1);
     else ::unsetenv("STRATA_STORE_DIR_FSYNC_BATCH");

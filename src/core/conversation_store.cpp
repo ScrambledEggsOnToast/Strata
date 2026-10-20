@@ -506,9 +506,10 @@ bool fsync_dir(int fd, const char* label, std::string& why) {
     return true;
 }
 
-// Creates a fresh file exclusively (O_EXCL), so a name collision can never truncate another file, and flushes its
-// data before it can be renamed into place.
-bool write_new_file(int dir, const std::string& name, const void* data, size_t size, std::string& why) {
+// Creates a fresh file exclusively (O_EXCL), so a name collision can never truncate another file. Only batched
+// objects may defer data durability: they stay in tmp until the pre-manifest filesystem sweep succeeds.
+bool write_new_file(int dir, const std::string& name, const void* data, size_t size, std::string& why,
+                    bool sync_data = true) {
     const int fd = ::openat(dir, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
         why = std::string("cannot create ") + name + ": " + std::strerror(errno);
@@ -527,9 +528,9 @@ bool write_new_file(int dir, const std::string& name, const void* data, size_t s
     }
 #endif
 #ifdef STRATA_STORE_TEST_HOOKS
-    if (ok && publish_trace_fsync(fd, false) != 0) {
+    if (ok && sync_data && publish_trace_fsync(fd, false) != 0) {
 #else
-    if (ok && ::fsync(fd) != 0) {
+    if (ok && sync_data && ::fsync(fd) != 0) {
 #endif
         why = std::string("fsync failed for ") + name + ": " + std::strerror(errno);
         ok = false;
@@ -1296,23 +1297,26 @@ bool ConversationStore::Impl::take_fault(const char* step) {
     return true;
 }
 
-// An object is durable before any manifest names it. Default writes flush here; the opt-in caller marks every
-// renamed object's shard and drains its shards and objects/ before encoding or creating a manifest.
+// An object is durable before it receives its content-addressed name. The opt-in path stages only in tmp;
+// the fenced pre-manifest batch proves data durability once, then renames objects and flushes their directories.
 bool ConversationStore::Impl::write_object_file(const std::string& temp, const Digest& id, const uint8_t* data,
                                                size_t size, PendingFile& orphan, std::string& why) {
+    if (dir_fsync_batch) {
+        orphan.where = Where::tmp;
+        orphan.name = temp;
+        return write_new_file(dirs.tmp, temp, data, size, why, false);
+    }
     const std::string hex = sha256_hex(id);
     const char shard[] = {hex[0], hex[1], '\0'};
     bool created = false;
     if (!make_child_dir(dirs.objects, shard, created, why)) return false;
     // An existing shard can be the residue of mkdir followed by a failed parent flush. Existence alone is not a
     // durability proof, so even that retry must flush objects/ before the new object can be published.
-    if (!dir_fsync_batch) {
-        if (take_fault("object-parent-sync")) {
-            why = "injected fault: the objects directory flush";
-            return false;
-        }
-        if (!fsync_dir(dirs.objects, "objects", why)) return false;
+    if (take_fault("object-parent-sync")) {
+        why = "injected fault: the objects directory flush";
+        return false;
     }
+    if (!fsync_dir(dirs.objects, "objects", why)) return false;
     const ShardFd shard_fd(open_child_dir(dirs.objects, shard, why));
     if (shard_fd.fd < 0) return false;
     // The scratch name is reported to the caller before it is created, so a failure here can always account for the
@@ -1325,7 +1329,6 @@ bool ConversationStore::Impl::write_object_file(const std::string& temp, const D
         return false;
     }
     orphan = PendingFile{};
-    if (dir_fsync_batch) return true; // The caller marks this shard before any subsequent payload is emitted.
     if (take_fault("object-shard-sync")) {
         why = "injected fault: an object shard flush";
         return false;
@@ -4868,10 +4871,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
                         std::lock_guard<std::mutex> guard(mutex);
                         charged += charge;
                     }
-                    const std::string object_name = sha256_hex(object);
-                    const size_t object_slot =
-                        note_file(Where::objects, object_name, charge, object, object_name.substr(0, 2));
                     const std::string scratch_name = "ob-" + temp_name();
+                    const std::string object_name = dir_fsync_batch ? std::string() : sha256_hex(object);
+                    const size_t object_slot = note_file(dir_fsync_batch ? Where::tmp : Where::objects,
+                        dir_fsync_batch ? scratch_name : object_name, charge, object, object_name.substr(0, 2));
                     PendingFile scratch;
                     if (!write_object_file(scratch_name, object, buffer.data(), size_t(size), scratch, why)) {
                         // The object is charged once, so the attempt carries exactly one record for the file that
@@ -5039,6 +5042,51 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     }
     // All storage work stays outside the catalog mutex. No manifest may name an object until this drain completes.
     if (dir_fsync_batch && (dirty_shards[0] || dirty_shards[1] || dirty_shards[2] || dirty_shards[3])) {
+        // Directory fsync alone does not prove payload data durability. Linux syncfs waits for all data and
+        // metadata on this filesystem, including every newly written or revived object. It can also wait for,
+        // or report writeback errors from, unrelated files; either way no manifest exists until it succeeds.
+#ifdef STRATA_STORE_TEST_HOOKS
+        const bool inject_data_error = take_fault("batch-data-sync");
+        if (job->trace_observer) {
+            job->trace.data_sync_started_ns = store_timing_ns();
+            ++job->trace.data_sync_calls;
+        }
+        const int synced = inject_data_error ? (errno = EIO, -1) : ::syncfs(dirs.objects);
+        const int sync_error = errno;
+        if (job->trace_observer) job->trace.data_sync_finished_ns = store_timing_ns();
+#else
+        const int synced = ::syncfs(dirs.objects);
+        const int sync_error = errno;
+#endif
+        if (synced != 0) {
+            fail(ConversationStorePublishStatus::failed,
+                 std::string("object data batch syncfs failed: ") + std::strerror(sync_error));
+            return;
+        }
+        // Reuse each object's existing single charged record; no descriptor/name collection is added. A refused
+        // data sweep leaves only tmp files, never digest-named orphans that could be revived after an I/O error.
+        for (auto& file : job->orphans) {
+            if (file.where != Where::tmp || !digest_nonzero(file.object)) continue;
+            std::string name = sha256_hex(file.object);
+            file.shard.assign(name.data(), 2);
+            bool created = false;
+            if (!make_child_dir(dirs.objects, file.shard.c_str(), created, why)) {
+                fail(ConversationStorePublishStatus::failed, why);
+                return;
+            }
+            const ShardFd shard(open_child_dir(dirs.objects, file.shard.c_str(), why));
+            if (shard.fd < 0) {
+                fail(ConversationStorePublishStatus::failed, why);
+                return;
+            }
+            if (::renameat(dirs.tmp, file.name.c_str(), shard.fd, name.c_str()) != 0) {
+                fail(ConversationStorePublishStatus::failed,
+                     std::string("cannot publish an object: ") + std::strerror(errno));
+                return;
+            }
+            file.name = std::move(name);
+            file.where = Where::objects;
+        }
 #ifdef STRATA_STORE_TEST_HOOKS
         void (*gate)(void*) = nullptr;
         void* context = nullptr;
