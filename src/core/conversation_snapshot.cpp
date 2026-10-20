@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/kv_shared_pool.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "strata/core/admission_copy_observer.hpp"
@@ -72,9 +73,14 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
 }
 
 bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
+    if (st.shared_pool && (!kv_shared_valid(st) ||
+        !kv_logical_pages(st).valid((uint64_t) l.cells / (uint64_t) l.page_size))) {
+        error = "conversation snapshot: stale or invalid logical page ownership";
+        return false;
+    }
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
-        (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
+        (st.kv_mode == 0 && (st.n_slots < st.n_pages || (!st.shared_pool && st.n_slots != st.n_pages))) ||
         l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
@@ -121,6 +127,19 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error, admissio
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
+}
+
+size_t page_bytes(const Layout& l, size_t part) {
+    const std::array<size_t, 4> sizes = {l.data, l.value_data, l.scales, l.value_scales};
+    return part < 4 && l.cells ? sizes[part] / size_t(l.cells / l.page_size) : 0;
+}
+template<class Fn>
+bool visit_pool(const QsaState& st, size_t part, size_t per_page, size_t offset, size_t bytes, Fn fn) {
+    const auto buffers = pools(st);
+    return kv_logical_pages(st).visit(part < 4 ? per_page : 0, offset, bytes,
+        [&](size_t physical, size_t count, size_t logical) {
+            return fn(static_cast<uint8_t*>(buffers[part]) + physical, count, logical);
+        });
 }
 bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error,
                        bool queued = false) {
@@ -169,8 +188,24 @@ bool copy_layout(const QsaState& from, const QsaState& to, const ModelGeometry& 
     return true;
 }
 
+struct SharedWrite {
+    const QsaState& state;
+    bool complete = false;
+    ~SharedWrite() {
+        if (state.shared_pool && !complete) state.shared_pool->cancel(state.shared_owner,
+            {state.shared_request, state.shared_incarnation, state.allocation_id});
+    }
+};
 bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                   int64_t upto, const Layout& l, std::string& error, bool queued = false) {
+    const bool same_owner = from.shared_pool && from.shared_pool == to.shared_pool &&
+                            from.shared_owner == to.shared_owner;
+    if (same_owner) {
+        if (from.idx_pooled == to.idx_pooled) return true; // no write, including to borrowed shared pages
+        error = "resident direct copy: duplicate shared owner with a foreign private indexer"; return false;
+    }
+    if (to.shared_pool && !kv_shared_reset(to, error)) return false;
+    SharedWrite writing{to};
     const auto src = pools(from), dst = pools(to);
     const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     for (size_t i = 0; i < sizes.size(); ++i) {
@@ -178,9 +213,22 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
         // allocating its segments. The destination is always the real owner.
         for (size_t at = 0; at < sizes[i];) {
             const size_t bytes = std::min(ConversationBuffer::segment_bytes, sizes[i] - at);
-            if (!transfer(static_cast<uint8_t*>(dst[i]) + at, static_cast<const uint8_t*>(src[i]) + at,
-                          bytes, error, static_cast<admission_copy::Part>(admission_copy::key + i),
-                          admission_copy::direct, queued)) return false;
+            if (!from.shared_pool && !to.shared_pool) {
+                if (!transfer(static_cast<uint8_t*>(dst[i]) + at, static_cast<const uint8_t*>(src[i]) + at,
+                              bytes, error, static_cast<admission_copy::Part>(admission_copy::key + i),
+                              admission_copy::direct, queued)) return false;
+                at += bytes;
+                continue;
+            }
+            if (!visit_pool(from, i, page_bytes(l, i), at, bytes,
+                [&](const uint8_t* source, size_t count, size_t logical) {
+                    return visit_pool(to, i, page_bytes(l, i), logical, count,
+                        [&](uint8_t* target, size_t n, size_t target_logical) {
+                            return transfer(target, source + target_logical - logical, n, error,
+                                static_cast<admission_copy::Part>(admission_copy::key + i),
+                                admission_copy::direct, queued);
+                        });
+                })) return false;
             at += bytes;
         }
     }
@@ -190,7 +238,8 @@ bool copy_payload(const QsaState& from, const QsaState& to, const ModelGeometry&
             error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false;
         }
     }
-    return restore_residency(to, g, upto, error, queued);
+    writing.complete = restore_residency(to, g, upto, error, queued);
+    return writing.complete;
 }
 
 } // namespace
@@ -279,7 +328,13 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::capture);
+                if (!st.shared_pool) return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr,
+                    n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::capture);
+                return visit_pool(st, i, page_bytes(l, i), at, n,
+                    [&](const uint8_t* source, size_t count, size_t logical) {
+                        return transfer(p + logical - at, source, count, error,
+                            static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::capture);
+                    });
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
         // Exactly the bytes this capture did not write: at this point they are still the retained image's own bytes
@@ -392,11 +447,20 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     const std::array<size_t, 5> sizes = {cut.data, cut.value_data, cut.scales, cut.value_scales, cut.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
+    if (st.shared_pool && !kv_shared_reset(st, error)) return false;
+    SharedWrite writing{st};
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::restore);
+                if (!st.shared_pool) return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error,
+                    static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::restore);
+                return visit_pool(st, i, page_bytes(cut, i), at, n,
+                    [&](uint8_t* target, size_t count, size_t logical) {
+                        return transfer(target, p + logical - at, count, error,
+                            static_cast<admission_copy::Part>(admission_copy::key + i), admission_copy::restore);
+                    });
             })) return false;
-    return restore_residency(st, g, upto, error);
+    writing.complete = restore_residency(st, g, upto, error);
+    return writing.complete;
 }
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -423,9 +487,24 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     const auto src = pools(st);
     const auto sizes = s.sizes;
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
-        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why, static_cast<admission_copy::Part>(admission_copy::key + part), admission_copy::capture);
+    const QsaState* owner = &st;
+    const bool mapped = st.shared_pool != nullptr;
+    const KvOwnerKey expected{st.shared_request, st.shared_incarnation, st.allocation_id};
+    auto borrow = mapped ? st.shared_pool->borrow(st.shared_owner, expected, error) : std::shared_ptr<KvSharedPool>{};
+    if (mapped && !borrow) return false;
+    s.read = [owner, mapped, expected, borrow, src, sizes, l, why](size_t part, size_t offset, void* dst, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset || (mapped &&
+            (!(KvOwnerKey{owner->shared_request, owner->shared_incarnation, owner->allocation_id} == expected) ||
+             !kv_shared_valid(*owner)))) {
+            *why = "K/V read out of range or stale owner"; return false;
+        }
+        if (!mapped) return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr,
+            n, *why, static_cast<admission_copy::Part>(admission_copy::key + part), admission_copy::capture);
+        return visit_pool(*owner, part, page_bytes(l, part), offset, n,
+            [&](const uint8_t* source, size_t count, size_t logical) {
+                return transfer(static_cast<uint8_t*>(dst) + logical - offset, source, count, *why,
+                    static_cast<admission_copy::Part>(admission_copy::key + part), admission_copy::capture);
+            });
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -460,7 +539,11 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
         if (!saved[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                if (!st.shared_pool) return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                return visit_pool(st, i, page_bytes(cut, i), at, n,
+                    [&](const uint8_t* device, size_t count, size_t logical) {
+                        return compare(device, p + logical - at, count, true);
+                    });
             })) return false;
     if (st.kv_mode == 2 && cut.cells > 0) {
         const auto resident = pools(st, true);

@@ -16,9 +16,18 @@ using VmmChunk = unsigned long long;
 bool vmm_available();
 /// The chunk size (0 when not available).
 uint64_t vmm_granularity();
+struct VmmStatus {
+    bool available = false;
+    uint64_t granularity = 0;
+    int device = -1;
+    const char* phase = "unavailable";
+    int result = 0, capability = 0;
+};
+/// Read-only initialization receipt; result is the CUDA result for the named phase.
+VmmStatus vmm_status();
 /// A new physical chunk on the current device (0: out of memory), and its release.
 VmmChunk vmm_chunk_new();
-void vmm_chunk_free(VmmChunk h);
+bool vmm_chunk_free(VmmChunk h);
 
 class VmmRange {
 public:

@@ -1,6 +1,9 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/kv_shared_pool.hpp"
+#include <array>
+#include <stdexcept>
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/plan/qsa_memory.hpp"
@@ -811,6 +814,14 @@ void qsa_release_check(cudaError_t result, const char* operation) noexcept {
 }
 
 void qsa_state_release(QsaState& st) noexcept {
+    if (st.shared_pool) {
+        std::string error;
+        if (!kv_shared_valid(st) || !st.shared_pool->terminal(st.shared_owner,
+                {st.shared_request, st.shared_incarnation, st.allocation_id}, error)) {
+            std::fprintf(stderr, "strata QSA teardown: common-pool release refused: %s\n", error.c_str());
+            std::terminate();
+        }
+    }
     if (st.owns_rope) strata::kernels::rope_table_release(st.cos_tab);
     if (st.host_step) qsa_release_check(cudaFreeHost(st.host_step), "free step staging");
     if (st.host_pos) qsa_release_check(cudaFreeHost(st.host_pos), "free position staging");
@@ -1055,7 +1066,22 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
-    if (st.kv_hybrid) {
+    if (st.shared_pool) {
+        std::string error;
+        if (!kv_shared_reset(st, error)) throw std::runtime_error(error);
+        const std::array<uint8_t*, 3> parts = {reinterpret_cast<uint8_t*>(st.k_q),
+            reinterpret_cast<uint8_t*>(st.k_scale), st.v_q4};
+        constexpr size_t widths[] = {2048, 64, 1152};
+        const auto pages = kv_logical_pages(st);
+        for (size_t part = 0; part < parts.size(); ++part)
+            if (!pages.visit(widths[part], 0, size_t(st.n_pages) * widths[part],
+                    [&](size_t physical, size_t bytes, size_t) {
+                        return cudaMemsetAsync(parts[part] + physical, 0, bytes, cs) == cudaSuccess;
+                    })) {
+                st.shared_pool->cancel(st.shared_owner, {st.shared_request, st.shared_incarnation, st.allocation_id});
+                throw std::runtime_error("common-pool logical reset failed");
+            }
+    } else if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
@@ -1075,6 +1101,16 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.shared_pool) {
+        const std::array<std::pair<void*, size_t>, 4> private_parts{{
+            {st.idx_tail, size_t(s.idx_block - 1) * s.idx_dim * 4}, {st.idx_dead, size_t(s.idx_dim) * 4},
+            {st.idx_pooled, size_t(st.idx_pooled_rows) * s.idx_dim * 4}, {st.idx_block_pos, sizeof(int32_t)}}};
+        for (const auto& part : private_parts) if (cudaMemsetAsync(part.first, 0, part.second, cs) != cudaSuccess) {
+            st.shared_pool->cancel(st.shared_owner, {st.shared_request, st.shared_incarnation, st.allocation_id});
+            throw std::runtime_error("common-pool private indexer reset failed");
+        }
+        return;
+    }
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);

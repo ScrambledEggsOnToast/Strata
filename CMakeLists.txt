@@ -668,7 +668,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
+    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/kv_shared_pool.cpp src/core/conversation_file.cpp
     src/core/conversation_store.cpp src/core/conversation_store_format.cpp src/core/conversation_store_sha256.cpp
     src/program/conversation_offers.cpp src/program/conversation_publication.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -746,6 +746,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    add_executable(kv_shared_pool_test tests/core/kv_shared_pool_test.cpp)
+    target_link_libraries(kv_shared_pool_test PRIVATE strata_engine)
+    add_test(NAME kv_shared_pool_test COMMAND kv_shared_pool_test)
+    set_tests_properties(kv_shared_pool_test PROPERTIES SKIP_RETURN_CODE 78 TIMEOUT 120)
     # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
     # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
     # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
@@ -2298,6 +2302,10 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(qsa_placement_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qsa_placement_test PRIVATE strata_warnings)
   add_test(NAME qsa_placement_test COMMAND qsa_placement_test)
+  add_executable(kv_share_test tests/core/kv_share_test.cpp)
+  target_include_directories(kv_share_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(kv_share_test PRIVATE strata_warnings)
+  add_test(NAME kv_share_test COMMAND kv_share_test)
   add_executable(kv_residency_info_test tests/core/kv_residency_info_test.cpp)
   target_include_directories(kv_residency_info_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(kv_residency_info_test PRIVATE strata_warnings)

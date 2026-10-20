@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/kv_shared_pool.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -62,18 +63,25 @@ inline bool session_fingerprint(const core::SessionState& session, const core::Q
         }
         return h;
     };
-    auto pool_cells = [&](const void* pool, int64_t width, int64_t first, int64_t end, uint64_t h) {
+    auto pool_cells = [&](const void* pool, int64_t width, int64_t first, int64_t end, uint64_t h,
+                          const core::KvLogicalPages& logical) {
         const int64_t page = shape.page_size;
         for (int64_t pg = first / page; pg * page < end; ++pg)
             for (int64_t head = 0; head < g.n_head_kv; ++head) {
                 const int64_t a = std::max(first, pg * page) - pg * page;
                 const int64_t b = std::min(end, (pg + 1) * page) - pg * page;
-                const size_t off = (size_t) (((pg * g.n_head_kv + head) * page + a) * width);
+                const int64_t physical = logical.pages ? logical.pages[pg] : pg;
+                const size_t off = (size_t) (((physical * g.n_head_kv + head) * page + a) * width);
                 h = bytes(static_cast<const uint8_t*>(pool) + off, (size_t) ((b - a) * width), h);
             }
         return h;
     };
     auto kv = [&](const core::QsaState& state, int64_t first, int64_t end, uint64_t h) {
+        if (state.shared_pool && !core::kv_shared_valid(state)) { ok = false; return h; }
+        const auto logical = state.shared_pool ? core::kv_logical_pages(state) : core::KvLogicalPages{};
+        if (state.shared_pool && !logical.valid(uint64_t((end + shape.page_size - 1) / shape.page_size))) {
+            ok = false; return h;
+        }
         const bool host = state.kv_mode != 0;
         struct Pool { const void* p; int64_t width; };
         std::array<Pool, 4> pools{};
@@ -98,7 +106,7 @@ inline bool session_fingerprint(const core::SessionState& session, const core::Q
         }
         for (int i = 0; i < n; ++i) {
             if (!pools[i].p && end > first) { ok = false; break; }
-            h = pool_cells(pools[i].p, pools[i].width, first, end, h);
+            h = pool_cells(pools[i].p, pools[i].width, first, end, h, logical);
         }
         return h;
     };

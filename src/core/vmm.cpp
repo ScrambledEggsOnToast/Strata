@@ -4,6 +4,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <mutex>
 
 namespace strata::core {
@@ -13,6 +14,8 @@ struct Api {
     bool ok = false;
     uint64_t gran = 0;
     int dev = -1;
+    const char* phase = "uninitialized";
+    int result = 0, capability = 0;
     decltype(&cuMemAddressReserve) reserve = nullptr;
     decltype(&cuMemAddressFree) free_va = nullptr;
     decltype(&cuMemCreate) create = nullptr;
@@ -38,30 +41,45 @@ template <class F> bool resolve(const char* name, F& f) {
     return true;
 }
 
-// never destroyed: the K/V pools and the cache release their chunks from static destructors at exit
+// Entry points and allocation properties are resolved independently for each
+// device. A layer-local pool must never allocate every stage on the first card
+// that happened to query VMM (the former process-wide singleton did that).
 const Api& api() {
-    static Api& a = *new Api;
-    static std::once_flag once;
-    std::call_once(once, [] {
+    static std::array<Api, 64> devices;
+    static std::array<std::once_flag, 64> once;
+    static const Api unavailable;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= (int) devices.size()) return unavailable;
+    Api& a = devices[(size_t) device];
+    std::call_once(once[(size_t) device], [&a, device] {
         decltype(&cuDeviceGetAttribute) attr = nullptr;
         decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
-        if (cudaGetDevice(&a.dev) != cudaSuccess) return;
-        if (!resolve("cuDeviceGetAttribute", attr) || !resolve("cuMemGetAllocationGranularity", granularity) ||
-            !resolve("cuMemAddressReserve", a.reserve) || !resolve("cuMemAddressFree", a.free_va) ||
-            !resolve("cuMemCreate", a.create) || !resolve("cuMemRelease", a.release) || !resolve("cuMemMap", a.map) ||
-            !resolve("cuMemUnmap", a.unmap) || !resolve("cuMemSetAccess", a.access))
+        a.dev = device;
+        const auto entry = [&](const char* name, auto& function) {
+            a.phase = name;
+            const bool found = resolve(name, function);
+            if (!found) a.result = -1; // entry query failed; no driver function was called
+            return found;
+        };
+        if (!entry("cuDeviceGetAttribute", attr) || !entry("cuMemGetAllocationGranularity", granularity) ||
+            !entry("cuMemAddressReserve", a.reserve) || !entry("cuMemAddressFree", a.free_va) ||
+            !entry("cuMemCreate", a.create) || !entry("cuMemRelease", a.release) || !entry("cuMemMap", a.map) ||
+            !entry("cuMemUnmap", a.unmap) || !entry("cuMemSetAccess", a.access))
             return;
-        int vmm = 0;
-        if (attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev) != CUDA_SUCCESS || !vmm)
-            return;
+        a.phase = "cuDeviceGetAttribute(VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)";
+        a.result = (int) attr(&a.capability, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+        if (a.result != CUDA_SUCCESS || !a.capability) return;
         CUmemAllocationProp prop{};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         prop.location.id = a.dev;
         size_t g = 0;
-        if (granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || g == 0) return;
+        a.phase = "cuMemGetAllocationGranularity(MINIMUM)";
+        a.result = (int) granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (a.result != CUDA_SUCCESS || g == 0) return;
         a.gran = g;
         a.ok = true;
+        a.phase = "ready";
     });
     return a;
 }
@@ -70,6 +88,10 @@ const Api& api() {
 
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
+VmmStatus vmm_status() {
+    const auto& a = api();
+    return {a.ok, a.gran, a.dev, a.phase, a.result, a.capability};
+}
 
 VmmChunk vmm_chunk_new() {
     const Api& a = api();
@@ -83,8 +105,9 @@ VmmChunk vmm_chunk_new() {
     return (VmmChunk) h;
 }
 
-void vmm_chunk_free(VmmChunk h) {
-    if (h != 0 && api().ok) api().release((CUmemGenericAllocationHandle) h);
+bool vmm_chunk_free(VmmChunk h) {
+    const Api& a = api();
+    return h == 0 || (a.ok && a.release((CUmemGenericAllocationHandle) h) == CUDA_SUCCESS);
 }
 
 bool VmmRange::reserve(uint64_t bytes) {
@@ -156,8 +179,9 @@ VmmChunk VmmRange::unmap(int64_t i) {
 namespace strata::core {
 bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
+VmmStatus vmm_status() { return {}; }
 VmmChunk vmm_chunk_new() { return 0; }
-void vmm_chunk_free(VmmChunk) {}
+bool vmm_chunk_free(VmmChunk h) { return h == 0; }
 bool VmmRange::reserve(uint64_t) { return false; }
 void VmmRange::release() {}
 int64_t VmmRange::mapped_count() const { return 0; }

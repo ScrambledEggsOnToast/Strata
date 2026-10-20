@@ -50,6 +50,7 @@
 #include <string>
 
 namespace strata::core {
+class KvSharedPool;
 
 /// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
 /// Configure before session capture; captured graphs retain the selected implementation.
@@ -237,6 +238,11 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
+    // Opt-in common-pool owner. Its host mirror is the controller's exact image
+    // of page_table; kernels never mutate resident-mode tables. Null is the
+    // historical identity/authoritative-host path with no new copies or storage.
+    KvSharedPool* shared_pool = nullptr;
+    uint64_t shared_owner = 0, shared_request = 0, shared_incarnation = 0;
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
