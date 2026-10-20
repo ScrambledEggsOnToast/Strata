@@ -379,7 +379,7 @@ bool ResidentSlots::slot_idle(int slot, std::string& error) {
     }
     // A pipelined operation for other rows may continue. Its snapshots don't
     // borrow this slot's history and its stage reports no consumer for this row.
-    return draft_.context_idle(error);
+    return draft_.scratch_idle(error, true);
 }
 
 bool ResidentSlots::init_resources(std::string& error) {
@@ -840,6 +840,7 @@ bool ResidentSlots::prepare(const ResidentPreparation& lease, const core::SavedC
                     ? state.prompt[size_t(position)] : -1; // token identity was proven by source preflight
                 target.prompt_len = (int64_t) state.prompt.size();
                 target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
+                operation.reset(); // final restored-state reads are done; catchup takes its own scratch lease
                 // The immutable prefix never stores tokenN. Advance exactly its
                 // missing cell with this destination's tokenN, using the existing
                 // Rin_ arena and KV-only front, before advertising full coverage.

@@ -24,6 +24,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/operation_canary.hpp"
+#include "strata/core/operation_lease.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -252,8 +253,8 @@ private:
     friend struct MtpDrafterCertificationFixture;
     friend struct MtpDraftFrontierFixture;
     friend struct MtpResumedParkFixture;
-    // One host submitter; a failed operation poisons the lease until teardown.
-    // A successful operation releases it only after the device stream drains.
+    // Prompt and resident operations serialize shared scratch with a bounded wait.
+    // Failed work stays poisoned; only a successfully drained operation releases it.
     class Operation {
     public:
         Operation(MtpDrafter& owner, std::string& err, int slot = 8, cudaStream_t external = nullptr,
@@ -263,14 +264,17 @@ private:
         bool finish(std::string& err);
         void writes(int64_t begin, int64_t end, int32_t next_token);
         bool boundary(const float* rows, int64_t begin, int64_t count, std::string& err);
-        void detach() { finished_ = true; owner_.async_owned_ = true; }
+        void detach() { finished_ = true; owner_.async_owned_ = true; lease_.complete(); }
     private:
         MtpDrafter& owner_;
+        OperationLease::Guard lease_;
         bool acquired_ = false, finished_ = false;
         int slot_ = 8;
         cudaStream_t external_ = nullptr;
     };
-    std::atomic_flag scratch_owned_ = ATOMIC_FLAG_INIT;
+    OperationLease scratch_;
+    bool idle_owned(std::string& err); // caller holds scratch_, including detached-work completion
+    bool scratch_idle(std::string& err, bool wait); // resident preflight may wait; lifecycle checks may not
     OperationCanary canary_;
     bool draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                     float* probs, float min_p, int* n_drafts);

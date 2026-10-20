@@ -2108,7 +2108,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) cudaStreamSynchronize(m.cs);
     const auto ti0 = Clock::now();
-    if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
+    if (!mtp.idle_owned(err)) return false; // Operation above already owns the drafter's scratch/stream boundary
     const double ms_idle = ms_since(ti0);
     const auto tl0 = Clock::now();
     strata::kernels::QsaShapes s = core::qsa_shapes(g);

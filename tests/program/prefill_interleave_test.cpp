@@ -6,7 +6,6 @@
 #include "strata/program/phase_receipts.hpp"
 #include "strata/program/checkpoint_preservation.hpp"
 #include "strata/program/execution_plan.hpp"
-#include "strata/core/expert_source.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -30,8 +29,8 @@ namespace phase = strata::program::phase;
 
 struct Clock {
     using time_point = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
-    static inline int64_t ms = 0;
-    static time_point now() { return time_point(std::chrono::milliseconds(ms)); }
+    static inline std::atomic<int64_t> ms{0};
+    static time_point now() { return time_point(std::chrono::milliseconds(ms.load())); }
 };
 
 struct ConvCheckpoint {
@@ -106,6 +105,51 @@ struct Result {
     std::vector<int64_t> checkpoint_positions;
     bool prefill_phase_observed = false, copyin_phase_observed = false;
     bool decode_phase_unavailable = false, parked_identity_preserved = false;
+    int concurrent_pumps = 0, concurrent_starts = 0, plain_pumps = 0, mtp_reservations = 0;
+    int concurrent_chunks = 0, credit_after_overlap = 0;
+    double request_scope_credit_ms = 0, credit_after_exit = 0;
+    std::array<int, 3> doorbell_served{}, external_on{}, external_off{};
+    bool external_balanced = false;
+    int uncredited_starts = 0;
+    int64_t first_concurrent_start_ms = -1;
+    int doorbell_context_errors = 0, starts_after_retirement = 0;
+    double retirement_decode_ms = 0;
+};
+
+struct ConcurrentSchedule {
+    bool enabled = true, mtp = true, pipeline = true, third = false, source_refused = false;
+    bool yield = false, cancel = false, fail_read = false, fail_pump = false, fail_retire = false;
+    bool cancel_resident = false;
+};
+struct ReaderVerifier {
+    int64_t windows = 0;
+    double ms_host = 0;
+    std::atomic<bool> busy{false}, external{false};
+    std::atomic<int> served{0}, on{0}, off{0};
+    void* expected_pool = nullptr;
+    std::atomic<int> wrong_pool{0};
+    bool batch_busy() const { return busy.load(); }
+    int batch_serve(int, void* pool) {
+        if (!external.load()) return -1;
+        if (busy.exchange(false)) {
+            if (pool != expected_pool) { ++wrong_pool; return -1; }
+            ++served;
+        }
+        return 0;
+    }
+    void set_external_serve(bool value) {
+        external.store(value);
+        if (value) ++on; else ++off;
+    }
+};
+struct ConcurrentState {
+    std::array<ReaderVerifier, 3> verifier;
+    std::atomic<int> chunks{0}, polls{0};
+    bool inflight = false;
+    std::array<int, 3> pool{};
+    bool cancel_pending = false, retirement_done = false;
+    std::mutex mu;
+    std::condition_variable cv;
 };
 
 struct RetainedSchedule {
@@ -139,11 +183,14 @@ struct Prefill {
     std::function<bool()> consumers_live;
     std::vector<int64_t>* checkpoint_next = nullptr;
     int64_t* next_checkpoint = nullptr;
+    const ConcurrentSchedule* concurrent = nullptr;
+    ConcurrentState* concurrent_state = nullptr;
+    std::mutex* control_mu = nullptr;
+    int64_t stopped = -1;
     int64_t chunk() const { return 2048; }
-    // #255: the concurrent read's stop/park seam.  The harness never takes it (conc_env is false), but the extracted
-    // read_part compiles against the real interface.
+    // The real reader sets this hook only while its helper thread owns Prefill.
     std::function<bool()> stop_at_chunk;
-    int64_t stopped_at() const { return -1; }
+    int64_t stopped_at() const { return stopped; }
     bool reserve_uploads(int64_t) { return true; }
     // --prefill-pipe stays off in this harness: the extracted read_part takes the unplanned path, which is what the
     // BYIELD and retained-read assertions are about.
@@ -156,6 +203,34 @@ struct Prefill {
     bool run(const int64_t* data, int64_t count, int64_t pos, std::string& e) {
         if (data != begin + pos || pos != position || count <= 0) { e = "invalid prefill range"; return false; }
         result.reads.emplace_back(pos, count);
+        if (concurrent && stop_at_chunk) {
+            stopped = -1;
+            for (int64_t offset = 0; offset < count;) {
+                if (stop && stop->load()) { e = "cancelled"; return false; }
+                if (stop_at_chunk()) { stopped = offset; return true; }
+                const int polls = concurrent_state->polls.load();
+                const int64_t rows = std::min(chunk(), count - offset);
+                position += rows;
+                offset += rows;
+                Clock::ms += 20;
+                const int chunks = ++concurrent_state->chunks;
+                if (concurrent->yield && chunks == 1) {
+                    std::lock_guard<std::mutex> lock(*control_mu);
+                    controls->push_back("BYIELD 0");
+                }
+                if (concurrent->cancel_resident && chunks == 1) {
+                    std::lock_guard<std::mutex> lock(*control_mu);
+                    controls->push_back("BSTOP 0");
+                }
+                if (concurrent->cancel && chunks == 1) stop->store(true);
+                if (concurrent->fail_read) { e = "injected reader failure"; return false; }
+                std::unique_lock<std::mutex> lock(concurrent_state->mu);
+                concurrent_state->cv.wait_for(lock, std::chrono::milliseconds(5), [&] {
+                    return concurrent_state->polls.load() > polls || (stop && stop->load());
+                });
+            }
+            return true;
+        }
         position += count;
         const int64_t chunks = count / chunk() + (count % chunk() != 0);
         Clock::ms += count == 1024 ? 125 : 250 * chunks - (pipelined ? 150 * (chunks - 1) : 0);
@@ -227,6 +302,9 @@ struct Progress { struct Busy { void store(bool) {} } busy; };
 inline Progress& progress() { static Progress p; return p; }
 inline void progress_at(const char*) {}
 }
+namespace strata::aux_cpus {
+inline void place_off_host() {} // placement itself is covered by aux_cpus_test, not this scheduler fixture
+}
 
 static void split_setting(const char* value) {
     constexpr const char* name = "STRATA_PREFILL_SPLIT_OVER_BUDGET";
@@ -248,7 +326,8 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
                           double prior_chunk_ms = 0, bool inject_yield = false, int64_t yield_on_decode_at = -1,
                           bool empty_decode_credit = false, bool cancel_first_launch = false,
                           int64_t prior_chunk_tokens = 2048, int64_t begin_at = 0, int64_t pending_split_until = 0,
-                          const RetainedSchedule* retained_schedule = nullptr) {
+                          const RetainedSchedule* retained_schedule = nullptr,
+                          const ConcurrentSchedule* concurrent = nullptr) {
     // Compile Phase0's real diagnostic scopes, not a second fixture-only API.
     // Their host clock is deliberately independent of the synthetic scheduler.
     phase::Leg phase_leg(phase::parse_input(
@@ -258,7 +337,10 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const bool phase_receipts = true;
     Clock::ms = 0;
     Result result;
-    const bool expects_yield = inject_yield || yield_on_decode_at >= 0;
+    const bool expects_yield = inject_yield || yield_on_decode_at >= 0 || (concurrent && concurrent->yield);
+    ConcurrentState concurrent_state;
+    for (size_t owner = 0; owner < concurrent_state.verifier.size(); ++owner)
+        concurrent_state.verifier[owner].expected_pool = &concurrent_state.pool[owner];
     struct Options {
         int batch;
         int prompt_cache = 6;
@@ -270,8 +352,10 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         int expert_cache_remote[3] = {0, 0, 0};
         bool resident_multiplex = false, judge_context = false, judge_overlap = false;
         bool adapt_async = false, spec_split = false;
+        bool batch_mtp_third = false;
     };
-    const Options o{batch, 6, 32, budget_ms, retained_schedule ? retained_schedule->checkpoint_every : 0};
+    const Options o{batch, 6, 32, budget_ms, retained_schedule ? retained_schedule->checkpoint_every : 0,
+                    "pinned", {0, 0, 0}, false, false, false, false, false, concurrent && concurrent->third};
     std::vector<int64_t> ids((size_t) n);
     for (int64_t i = 0; i < n; ++i) ids[(size_t)i] = i;
     struct Stage { strata::prefill::Prefill sp; };
@@ -286,8 +370,22 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     auto last_decode = Clock::now();
     double credited_prefill_ms = 0, resident_round_ms = 0;
     std::atomic<bool> stop_req{false};
-    const auto credit_service = [] {};
-    const auto retire_stopped = [] { return true; };
+    bool budget_service = time_budget.enabled();
+    auto service_at = Clock::now();
+    double prefill_mark = 0, resident_mark = 0;
+    const auto credit_service = [&] {
+        if (!concurrent || !budget_service) return;
+        const auto now = Clock::now();
+        const double elapsed = std::chrono::duration<double, std::milli>(now - service_at).count();
+        const double wall = std::max(0.0, elapsed - (credited_prefill_ms - prefill_mark) -
+                                                  (resident_round_ms - resident_mark));
+        time_budget.background_work(wall);
+        result.request_scope_credit_ms += wall;
+        service_at = now;
+        prefill_mark = credited_prefill_ms;
+        resident_mark = resident_round_ms;
+    };
+    std::function<bool()> retire_stopped;
     // One active resident slot per two-slot group; cancelling slot 0 must not
     // disable slot 2. The real resident authority, not this adapter, owns reuse.
     std::array<bool, 4> slot_active{{active, false, active, false}};
@@ -298,6 +396,9 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     strata::prefill::Prefill sp{ids.data(), result, retained_error};
     sp.pipelined = piped;
     sp.position = begin_at;
+    sp.concurrent = concurrent;
+    sp.concurrent_state = &concurrent_state;
+    sp.stop = &stop_req;
     if (cancel_first_launch) sp.cancel_after_run = &stop_req;
     const bool retained_prefill = retained_error != nullptr, retained_layer_yields = budget_ms <= 0;
     bool retained_running = false, bounded_round = false;
@@ -311,10 +412,51 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         return retained_schedule ? slot_active[(size_t)group * 2] || slot_active[(size_t)group * 2 + 1] : active;
     };
     const auto pipe_inflight = [&] {
+        if (concurrent && concurrent_state.inflight) return true;
         return std::any_of(pg.begin(), pg.end(), [](const Group& group) { return group.inflight; });
     };
     std::string err;
+    int64_t bt_tokens = 0, bt_rows = 0;
+    uint64_t batch_commit_epoch = 0;
+    const auto concurrent_pump = [&](bool may_start, bool mtp) {
+        ++result.concurrent_pumps;
+        if (!mtp) ++result.plain_pumps;
+        if (concurrent_state.inflight) {
+            concurrent_state.inflight = false;
+            ++bt_rows;
+            bt_tokens += 2;
+            batch_commit_epoch += concurrent->mtp ? 2 : 1;
+        }
+        if (may_start && active) {
+            if (time_budget.enabled() && !time_budget.decode_allowed(0)) ++result.uncredited_starts;
+            if (concurrent_state.retirement_done) ++result.starts_after_retirement;
+            if (result.first_concurrent_start_ms < 0) result.first_concurrent_start_ms = Clock::ms;
+            ++result.concurrent_starts;
+            concurrent_state.inflight = true;
+            const int owners = concurrent->pipeline ? (concurrent->third ? 3 : 2) : 1;
+            for (int owner = 0; owner < owners; ++owner)
+                concurrent_state.verifier[(size_t)owner].busy.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            for (;;) {
+                bool busy = false;
+                for (int owner = 0; owner < owners; ++owner)
+                    busy |= concurrent_state.verifier[(size_t)owner].batch_busy();
+                if (!busy) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    err = "a group-owned doorbell was not served";
+                    return false;
+                }
+                std::this_thread::yield();
+            }
+        }
+        Clock::ms += 5;
+        ++concurrent_state.polls;
+        concurrent_state.cv.notify_all();
+        if (concurrent->fail_pump && may_start) { err = "injected pump failure"; return false; }
+        return true;
+    };
     const auto pump_mtp = [&](bool may_start) -> bool {
+        if (concurrent) return concurrent_pump(may_start, true);
         if (!retained_schedule) throw std::logic_error("unexpected retained callback");
         ++result.pump_calls;
         if (result.pump_calls > 4096) throw std::logic_error("synthetic pump failed to converge");
@@ -377,8 +519,25 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         draining = false;
         return true;
     };
+    retire_stopped = [&] {
+        if (!concurrent) return true;
+        if (concurrent_state.cancel_pending) {
+            const auto begin = Clock::now();
+            const bool drained = pipe_drain();
+            Clock::ms += 1000; // an indivisible cancellation drain must consume, not mint, credit
+            const double wall = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+            resident_round_ms += wall;
+            result.retirement_decode_ms += wall;
+            concurrent_state.cancel_pending = false;
+            concurrent_state.retirement_done = true;
+            if (!drained) return false;
+        }
+        return !concurrent->fail_retire || concurrent_state.chunks == 0;
+    };
     std::mutex in_mu;
     std::deque<std::string> in_lines;
+    sp.control_mu = &in_mu;
+    if (concurrent) sp.controls = &in_lines;
     if (retained_schedule) {
         sp.schedule = retained_schedule;
         sp.owners.push_back(&sp);
@@ -437,7 +596,9 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     const auto resident_control = [&](const std::string& command) {
         if (command.rfind("BSTOP ", 0) == 0) {
             const int slot = std::atoi(command.c_str() + 6);
-            if (!retained_schedule) {
+            if (concurrent) {
+                concurrent_state.cancel_pending = true;
+            } else if (!retained_schedule) {
                 resident.cancel(slot);
                 active = false;
             } else if (slot >= 0 && slot < (int)slot_active.size()) {
@@ -456,6 +617,10 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
             }
             resident_control(control);
         }
+    };
+    const auto executor_retire = [&](int) {
+        if (in_prompt_read || pipe_inflight() || !result.drain_observed) ++result.fence_violations;
+        return true;
     };
     const auto park_replaced = [&](int) {
         if (retained_running || pipe_inflight() || bounded_round) ++result.fence_violations;
@@ -494,35 +659,39 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     int64_t resume_plan_at = -1, resume_plan_end = -1;
     int64_t seg_lend = 0;
     bool capture_device_fault = false;   // #252: the park source's own class, set by a failed device sync
-    // #255 ambient names: the concurrent reader is off here, but its code is part of the extracted read_part.
-    const bool conc_env = false;
-    const bool private_preparation = false, batch_mtp = false, batch_mtp_pipeline = false;
-    const strata::program::ExecutionPlan execution_plan;
+    const bool conc_env = concurrent && concurrent->enabled;
+    const bool private_preparation = false;
+    const bool batch_mtp = concurrent && concurrent->mtp;
+    const bool batch_mtp_pipeline = batch_mtp && concurrent->pipeline;
+    strata::program::ExecutionPlanInput plan_input;
+    plan_input.serve = plan_input.prompt_cache = true;
+    plan_input.batch_requested = batch;
+    plan_input.piped_concurrent = conc_env;
+    plan_input.batch_mtp = batch_mtp;
+    plan_input.batch_mtp_pipeline = batch_mtp_pipeline;
+    plan_input.mtp_configured = batch_mtp;
+    plan_input.foreground_budget_ms = budget_ms;
+    const auto execution_plan = strata::program::resolve_execution_plan(plan_input);
+    strata::program::ConcurrentReadSetup concurrent_read_setup;
+    concurrent_read_setup.other_source = concurrent && concurrent->source_refused;
     std::condition_variable in_cv;
-    bool use_mtp = false;
-    struct MtpStub { bool reserve_prefill(int64_t, std::string&) { return true; } } mtp;
-    // The gate reads these only after conc_env passes (never here); storage only, so the harness links without the
-    // expert-source translation units and never constructs a real source.
-    alignas(strata::core::FileExpertSource) unsigned char src_storage[sizeof(strata::core::FileExpertSource)];
-    alignas(strata::core::FileExpertSource) unsigned char arena_storage[sizeof(strata::core::FileExpertSource)];
-    auto& src = *reinterpret_cast<strata::core::FileExpertSource*>(src_storage);
-    auto& arena_src = *reinterpret_cast<strata::core::FileExpertSource*>(arena_storage);
-    strata::core::ExpertSource* srcp = &src;
-    strata::core::ExpertSource* prefill_src = srcp;
+    bool use_mtp = batch_mtp;
+    struct MtpStub {
+        Result& result;
+        bool reserve_prefill(int64_t, std::string&) { ++result.mtp_reservations; return true; }
+    } mtp{result};
     const int n_pipe = 1;
     // (only passed through to the stub below; the real PoolMultiFn would pull the CUDA headers into this CPU harness)
     const int win_pool_fn = 0;
-    void* win_pool_user = nullptr;
-    struct VerifierStub {
-        int64_t windows = 0;
-        double ms_host = 0.0;
-        bool batch_busy() const { return false; }
-        int batch_serve(int, void*) { return 0; }
-        void set_external_serve(bool) {}
+    void* win_pool_user = &concurrent_state.pool[0];
+    auto group_pool_user = [&](int owner) -> void* { return &concurrent_state.pool[(size_t)owner]; };
+    auto stage_verifier = [&](int) -> ReaderVerifier& { return concurrent_state.verifier[0]; };
+    auto stage_peer = [&](int) -> ReaderVerifier& { return concurrent_state.verifier[1]; };
+    auto stage_third = [&](int) -> ReaderVerifier& { return concurrent_state.verifier[2]; };
+    auto pump = [&](bool may_start) { return concurrent ? concurrent_pump(may_start, false) : true; };
+    auto pipeline_step = [&](bool may_start) {
+        return batch_mtp_pipeline ? pump_mtp(may_start) : concurrent ? concurrent_pump(may_start, batch_mtp) : pump(may_start);
     };
-    VerifierStub verifier_stub;
-    auto stage_verifier = [&](int) -> VerifierStub& { return verifier_stub; };
-    auto pump = [&](bool) { return true; };
     std::mutex bell_mu;
     std::condition_variable bell_cv;
     std::atomic<bool> bell_waiting{false};
@@ -533,7 +702,24 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
     result.okay = read_part(begin_at, n, e);
     result.fatal = batch_fatal;
     result.error = e;
-    if (!retained_prefill && !expects_yield && !cancel_first_launch &&
+    if (concurrent) {
+        result.concurrent_chunks = concurrent_state.chunks;
+        for (int probe = 0; probe <= 1000; ++probe)
+            if (time_budget.decode_allowed(probe)) ++result.credit_after_overlap;
+        credit_service(); // the production request-scope destructor also runs after the read
+        for (int probe = 0; probe <= 1000; ++probe)
+            if (time_budget.decode_allowed(probe)) ++result.credit_after_exit;
+        result.external_balanced = true;
+        for (size_t owner = 0; owner < concurrent_state.verifier.size(); ++owner) {
+            const auto& v = concurrent_state.verifier[owner];
+            result.doorbell_served[owner] = v.served;
+            result.external_on[owner] = v.on;
+            result.external_off[owner] = v.off;
+            result.external_balanced &= !v.external && v.on == v.off;
+            result.doorbell_context_errors += v.wrong_pool;
+        }
+    }
+    if (!concurrent && !retained_prefill && !expects_yield && !cancel_first_launch &&
         (!result.okay || !e.empty() || batch_fatal || in_prompt_read || yielded_at != -1 || yielded_slot != -1))
         throw std::runtime_error("read_part did not finish: " + e);
     result.interleave_boundaries = il_parts;
@@ -736,9 +922,86 @@ static void test_retained_budget() {
     CHECK(legacy.okay && legacy.drain_observed && legacy.estimate_ms == 0 && legacy.credited_ms == 0);
 }
 
+static void test_concurrent_reader() {
+    const auto run = [](const ConcurrentSchedule& schedule, double budget = 1000, bool debt = false, bool drain = true) {
+        return read_prompt(budget, true, true, true, 4, nullptr, drain, 16384, 60,
+                           false, -1, debt, false, 2048, 0, 0, nullptr, &schedule);
+    };
+    for (bool pipeline : {false, true}) {
+        const ConcurrentSchedule on{.pipeline = pipeline, .third = pipeline};
+        const auto overlap = run(on);
+        CHECK(overlap.okay && !overlap.fatal && overlap.final_frontier == 16384);
+        CHECK(overlap.concurrent_chunks == 8 && overlap.concurrent_starts > 0 && overlap.plain_pumps == 0);
+        CHECK(overlap.mtp_reservations == 1 && overlap.drain_observed && !overlap.final_inflight);
+        CHECK(overlap.uncredited_starts == 0 && overlap.first_concurrent_start_ms < 1000);
+        CHECK(overlap.estimate_ms == 60 && overlap.decode_estimate_ms == 0);
+        CHECK(overlap.credit_after_exit == overlap.credit_after_overlap && overlap.request_scope_credit_ms == 0);
+        CHECK(overlap.external_balanced && overlap.doorbell_context_errors == 0);
+        for (int owner = 0; owner < (pipeline ? 3 : 1); ++owner) {
+            CHECK(overlap.doorbell_served[(size_t)owner] > 0);
+            CHECK(overlap.external_on[(size_t)owner] == 1 && overlap.external_off[(size_t)owner] == 1);
+        }
+        const auto debt = run(on, 1000, true);
+        CHECK(debt.okay && debt.concurrent_starts > 0 && debt.uncredited_starts == 0);
+        CHECK(debt.decode_estimate_ms == 5 && debt.estimate_ms == 60);
+        CHECK(debt.credit_after_exit == debt.credit_after_overlap && debt.request_scope_credit_ms == 0);
+        const auto no_budget = run(on, 0);
+        CHECK(no_budget.okay && no_budget.concurrent_starts > 0 && no_budget.external_balanced);
+
+        auto off = on;
+        off.enabled = false;
+        const auto control = run(off);
+        const auto sequential = read_prompt(1000, true, true, true, 4, nullptr, true, 16384, 60);
+        CHECK(control.okay && control.concurrent_chunks == 0 && control.concurrent_starts == 0);
+        CHECK(control.reads == sequential.reads && control.decode_positions == sequential.decode_positions);
+        CHECK(control.estimate_ms == sequential.estimate_ms && control.mtp_reservations == 0);
+        off = on;
+        off.source_refused = true;
+        const auto gated = run(off);
+        CHECK(gated.okay && gated.reads == sequential.reads && gated.concurrent_chunks == 0);
+    }
+    ConcurrentSchedule plain;
+    plain.mtp = plain.pipeline = false;
+    const auto legacy_overlap = run(plain);
+    CHECK(legacy_overlap.okay && legacy_overlap.plain_pumps > 0 && legacy_overlap.mtp_reservations == 0);
+
+    ConcurrentSchedule yielded;
+    yielded.yield = true;
+    const auto parked = run(yielded);
+    CHECK(!parked.okay && !parked.fatal && parked.error == "yield");
+    CHECK(parked.parked_at > 0 && parked.parked_at < 16384 && parked.parked_at % 2048 == 0);
+    CHECK(parked.parked_at == parked.final_frontier && parked.drain_observed && !parked.final_inflight);
+    CHECK(parked.external_balanced && parked.fence_violations == 0);
+    ConcurrentSchedule stopped;
+    stopped.cancel = true;
+    const auto cancelled = run(stopped);
+    CHECK(!cancelled.okay && !cancelled.fatal && cancelled.error == "cancelled");
+    CHECK(cancelled.final_frontier == 2048 && cancelled.external_balanced && cancelled.drain_observed);
+    CHECK(!cancelled.final_inflight && cancelled.credit_after_exit == cancelled.credit_after_overlap);
+    ConcurrentSchedule resident_stop;
+    resident_stop.cancel_resident = true;
+    const auto retired = run(resident_stop);
+    CHECK(retired.okay && retired.cancel_controls == 1 && retired.retirement_decode_ms >= 1000);
+    CHECK(retired.starts_after_retirement == 0 && !retired.decode_credit);
+    CHECK(retired.decode_estimate_ms == 0 && retired.external_balanced && !retired.final_inflight);
+    for (int failure = 0; failure < 3; ++failure) {
+        ConcurrentSchedule failed;
+        failed.fail_read = failure == 0;
+        failed.fail_pump = failure == 1;
+        failed.fail_retire = failure == 2;
+        const auto terminal = run(failed);
+        CHECK(!terminal.okay && (failure == 0 || terminal.fatal));
+        CHECK(terminal.drain_observed && !terminal.final_inflight && terminal.external_balanced);
+        CHECK(terminal.credit_after_exit == terminal.credit_after_overlap);
+    }
+    const auto failed_drain = run({}, 1000, false, false);
+    CHECK(!failed_drain.okay && failed_drain.fatal && failed_drain.external_balanced && failed_drain.drain_observed);
+}
+
 int main() {
     split_setting(nullptr); // Ambient experiment settings must not change the legacy regressions.
     test_retained_budget();
+    test_concurrent_reader();
     // Piped groups return piece=0 in the unchanged upstream helper, even beside decoding slots.
     CHECK(strata::program::batch_read_piece(true, true, true, true, 2048, 8) == 0);
     const std::vector<std::pair<int64_t, int64_t>> whole{{0, 10000}};

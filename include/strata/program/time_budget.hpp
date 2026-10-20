@@ -56,6 +56,14 @@ public:
         // at each boundary. Decode-only periods update cost, not background debt.
         if (charge) decode_credit_ms_ -= wall_ms;
     }
+    // Settle disjoint intervals of a concurrent read, including its final drain.
+    // Only non-decode wall earns credit; overlap cannot train sequential costs.
+    void overlapped(double read_wall_ms, double decode_wall_ms) {
+        if (!enabled() || !std::isfinite(read_wall_ms) || read_wall_ms < 0 ||
+            !std::isfinite(decode_wall_ms) || decode_wall_ms < 0) return;
+        background_work(std::max(0.0, read_wall_ms - decode_wall_ms));
+        decode_credit_ms_ -= decode_wall_ms;
+    }
     double chunk_ms() const { return chunk_ms_; }
     // Policy decisions may only use a cost measured for this exact allocation.
     double chunk_ms(int64_t memory_chunk) const { return chunk_tokens_ == memory_chunk ? chunk_ms_ : 0; }

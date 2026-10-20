@@ -83,13 +83,44 @@ int main() {
         check(p.lookup.support == ep::Support::conditional && has(p.lookup.reason, "solo serial") &&
               has(p.lookup.reason, "resident decode"),
               "lookup is conditional: solo serial serving can execute it, resident decode cannot");
-        check(p.concurrent_reader.support == ep::Support::off && has(p.concurrent_reader.reason, "batched MTP"),
-              "the concurrent reader names batched MTP as its first conflict");
+        check(p.concurrent_reader.support == ep::Support::conditional && p.concurrent_reader.reason.empty(),
+              "batched MTP composes with the opt-in reader, subject to runtime source checks");
         check(p.budget.support == ep::Support::off, "no budget was requested");
         const std::string json = p.to_json();
         check(has(json, "\"mode\":\"resident\"") && has(json, "\"proposal\":\"batched_pipeline\""),
               "the JSON report carries the resolved mode and proposal");
         check(has(json, "\"suspension\":{\"mode\":\"resend\""), "the JSON report carries the suspension mode");
+    }
+    {
+        for (bool mtp : {false, true}) {
+            auto in = resident_batch();
+            in.batch_mtp = in.batch_mtp_pipeline = mtp;
+            in.foreground_budget_ms = 1000;
+            in.prompt_cache = true;
+            const auto p = ep::resolve_execution_plan(in);
+            check(!p.refused && p.budget.support == ep::Support::on &&
+                  p.concurrent_reader.support == ep::Support::conditional && p.concurrent_reader.reason.empty(),
+                  "the foreground budget composes with the reader, with and without batched MTP");
+            check(has(p.to_json(), "\"concurrent_reader\":{\"support\":\"conditional\",\"reason\":\"\"}"),
+                  "the report retains the reader's conditional support and empty option refusal");
+        }
+        using Input = ep::ExecutionPlanInput;
+        const std::pair<bool Input::*, const char*> refusals[] = {
+            {&Input::retained_prefill, "retained prefill"}, {&Input::resident_multiplex, "--resident-multiplex"},
+            {&Input::judge_lane, "the judge lane"}, {&Input::adapt_async, "--adapt-async"},
+            {&Input::spec_split, "--spec-split"}, {&Input::prefill_pipe, "STRATA_PREFILL_PIPE"}
+        };
+        for (const auto& [field, reason] : refusals) {
+            auto in = resident_batch();
+            in.*field = true;
+            const auto p = ep::resolve_execution_plan(in);
+            check(p.concurrent_reader.support == ep::Support::off && p.concurrent_reader.reason == reason,
+                  "unrelated reader exclusions keep their original precise reason");
+        }
+        auto in = resident_batch();
+        in.piped_concurrent = false;
+        check(ep::resolve_execution_plan(in).concurrent_reader.support == ep::Support::off,
+              "unsetting the opt-in keeps the sequential path selected");
     }
     {
         ep::ExecutionPlan p = ep::resolve_execution_plan(resident_batch());

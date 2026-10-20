@@ -673,6 +673,43 @@ void test_measured_prefill_quanta_and_bounded_decode_share() {
     warm.background_work(std::numeric_limits<double>::quiet_NaN());
     warm.background_work(std::numeric_limits<double>::infinity());
     require(!warm.decode_allowed(0), "invalid service samples forgave outstanding decode debt");
+
+    TimeBudget overlap(1000, .25);
+    overlap.prefilled(20, 1, 2048);
+    overlap.decoded(10);
+    overlap.overlapped(100, 40); // 50 + 3*(100-40) - 40 = 190, not 310
+    require(overlap.decode_allowed(189) && !overlap.decode_allowed(190),
+            "concurrent decode was credited as prompt work or charged twice");
+    require(overlap.chunk_ms() == 20 && overlap.decode_ms() == 10,
+            "overlap trained the sequential prefill/decode estimate");
+    overlap.overlapped(10, 200); // no negative background credit; debt = -10
+    require(!overlap.decode_allowed(0), "decode overrun did not carry debt");
+    for (const auto invalid : {std::nan(""), std::numeric_limits<double>::infinity(), -1.0}) {
+        overlap.overlapped(invalid, 0);
+        overlap.overlapped(100, invalid);
+    }
+    require(!overlap.decode_allowed(0), "invalid overlap samples forgave debt");
+    overlap.overlapped(4, 0); // debt cleared by non-decode time, without decode_due(age)
+    require(overlap.decode_allowed(1) && !overlap.decode_allowed(2) &&
+            !overlap.decode_due(0, 2048), "concurrent start gate still waits for the foreground age");
+    overlap.overlapped(100000, 0);
+    require(overlap.decode_allowed(999) && !overlap.decode_allowed(1000), "overlap exceeded bounded credit");
+    TimeBudget disabled(0, .25);
+    disabled.overlapped(100, 20);
+    require(!disabled.decode_allowed(0) && disabled.decode_ms() == 0 && disabled.chunk_ms() == 0,
+            "disabled overlap mutated scheduling state");
+
+    // Live read intervals replenish carried debt. Settling only at the part's
+    // end would either starve every cold start or cap all decode at 1000 ms.
+    TimeBudget live(100, .25);
+    double overlapped_decode = 0;
+    for (int interval = 0; interval < 10000; ++interval) {
+        const double decoding = live.decode_allowed(0) ? 4.0 : 0.0;
+        live.overlapped(4, decoding);
+        overlapped_decode += decoding;
+    }
+    require(std::abs(overlapped_decode / 40000.0 - .75) < .001,
+            "live overlap violated the background share or stopped replenishing");
 }
 
 }  // namespace

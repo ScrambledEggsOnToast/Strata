@@ -106,10 +106,11 @@ def pct(v, p):
 
 
 def smooth(ts, lo, hi):
-    """One stream's arrivals in [lo, hi]: tokens, the longest and p99 gap, and the time in gaps above 0.5 s."""
+    """Interior content gaps intersecting [lo, hi], including the p95/p99 and stalls above 0.5 s."""
     inside = [t for t in ts if lo <= t <= hi]
     gaps = [b - a for a, b in zip(ts, ts[1:]) if b >= lo and a <= hi]
-    return {"tokens": len(inside), "max_gap_s": round(max(gaps or [0]), 3), "p99_gap_s": round(pct(gaps, 99), 3),
+    return {"tokens": len(inside), "max_gap_s": round(max(gaps or [0]), 3),
+            "p95_gap_s": round(pct(gaps, 95), 3), "p99_gap_s": round(pct(gaps, 99), 3),
             "stalled_s": round(sum(g for g in gaps if g > 0.5), 3)}
 
 

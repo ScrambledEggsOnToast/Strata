@@ -137,10 +137,19 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 MtpDrafter::Operation::Operation(MtpDrafter& owner, std::string& err, int slot, cudaStream_t external,
                                 int32_t token, int32_t position)
-    : owner_(owner), slot_(slot), external_(external) {
-    if (owner_.async_owned_ && !owner_.chain_live_ && !owner_.idle(err)) return;
-    acquired_ = !owner_.scratch_owned_.test_and_set(std::memory_order_acquire);
-    if (!acquired_) { err = "mtp: operation scratch is in flight or poisoned by a failed operation"; return; }
+    : owner_(owner), lease_(owner.scratch_), slot_(slot), external_(external) {
+    if (!lease_) {
+        err = lease_.failure() == OperationLease::Failure::timeout
+            ? "mtp: operation lease wait exceeded 2000 ms" : "mtp: operation scratch is poisoned by a failed operation";
+        return;
+    }
+    if (owner_.chain_live_) {
+        lease_.complete();
+        err = "mtp: a pipelined chain still owns operation scratch";
+        return;
+    }
+    if (owner_.async_owned_ && !owner_.idle_owned(err)) return;
+    acquired_ = true;
     owner_.pending_writes_ = owner_.pending_boundary_ = false;
     owner_.pending_slot_ = slot_;
     owner_.canary_.begin(slot_, owner_.cs_, token, position);
@@ -162,10 +171,10 @@ bool MtpDrafter::Operation::finish(std::string& err) {
         err = "mtp: external prefill stream failed"; return false;
     }
     owner_.canary_.check(slot_, owner_.cs_);
-    if (!owner_.idle(err) || !owner_.canary_.validate("mtp", err)) return false;
+    if (!owner_.idle_owned(err) || !owner_.canary_.validate("mtp", err)) return false;
     owner_.complete_writes();
     finished_ = true;
-    owner_.scratch_owned_.clear(std::memory_order_release);
+    lease_.complete();
     return true;
 }
 
@@ -283,6 +292,14 @@ void MtpDrafter::restored_snapshot(const SavedConversation& image, int64_t cells
 }
 
 bool MtpDrafter::idle(std::string& err) {
+    OperationLease::Guard lease(scratch_, std::try_to_lock);
+    if (!lease || chain_live_) { err = "mtp: operation scratch is in flight or poisoned"; if (lease) lease.complete(); return false; }
+    if (!idle_owned(err)) return false;
+    lease.complete();
+    return true;
+}
+
+bool MtpDrafter::idle_owned(std::string& err) {
     const OnDevice on_device(device_);
     if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) {
         invalidate_coverage(); err = "mtp: its stream failed"; return false;
@@ -291,7 +308,6 @@ bool MtpDrafter::idle(std::string& err) {
         if (!canary_.validate("mtp", err)) { invalidate_coverage(); return false; }
         complete_writes();
         async_owned_ = false;
-        scratch_owned_.clear(std::memory_order_release);
     }
     return true;
 }
@@ -303,7 +319,9 @@ bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
     if (!request || (slot != 8 && !slot_state(slot))) {
         err = "mtp: invalid request destination"; return false;
     }
-    if (scratch_owned_.test_and_set(std::memory_order_acquire)) {
+    OperationLease::Guard lease(scratch_, std::try_to_lock);
+    if (!lease || async_owned_) {
+        if (lease) lease.complete();
         err = "mtp: owner rebind while scratch is in flight or poisoned"; return false;
     }
     const bool ok = canary_.bind(slot, request, err);
@@ -319,19 +337,25 @@ bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
             }
             target.request = request;
         }
-        scratch_owned_.clear(std::memory_order_release);
+        lease.complete();
     }
     return ok;
 }
 
-bool MtpDrafter::context_idle(std::string& err) {
-    if (scratch_owned_.test_and_set(std::memory_order_acquire)) {
+bool MtpDrafter::scratch_idle(std::string& err, bool wait) {
+    // try_lock_for(0) is a nonblocking lifecycle preflight. Resident commits
+    // wait for the prompt's bounded scratch pass, not for its separate K/V.
+    OperationLease::Guard lease(scratch_, wait ? OperationLease::wait_limit : std::chrono::milliseconds(0));
+    if (!lease || async_owned_) {
+        if (lease) lease.complete();
         err = "mtp: operation scratch is in flight or poisoned"; return false;
     }
-    // Every successful operation drains before releasing this lease. Don't add
-    // another CUDA synchronization to each resident committed row.
-    scratch_owned_.clear(std::memory_order_release);
+    lease.complete();
     return true;
+}
+
+bool MtpDrafter::context_idle(std::string& err) {
+    return scratch_idle(err, false);
 }
 
 
@@ -1646,7 +1670,7 @@ bool MtpDrafter::prefill_slot(int slot, const float* residuals, const int32_t* n
         canary_.check_inputs(tok_, step_, pos_, count, (int) g_->n_head, cs_);
         if (cudaMemcpyAsync(Rin_, residuals + offset * HCN, (size_t) count * HCN * sizeof(float),
                             cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-            !record_front(count, 0, cs_, err, &target.state) || !idle(err)) {
+            !record_front(count, 0, cs_, err, &target.state) || !idle_owned(err)) {
             if (err.empty()) err = "mtp: direct prompt front failed";
             return false;
         }
@@ -1677,7 +1701,7 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
     const auto start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Operation operation(*this, err);
     if (!operation) return false;
-    if (!idle(err)) return false;
+    if (!idle_owned(err)) return false;
     const QsaState& target = slots_[(size_t) slot].state;
     if (resident_direct_copy_enabled()) {
         if (!conversation_kv_copy(st_, target, *g_, cells, false, err)) return false;
@@ -1790,7 +1814,7 @@ bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_toke
     for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[h] = (int32_t) cell;
     if (cudaMemcpyAsync(Rin_, residual, (size_t) (g_->hc * g_->n_embd) * sizeof(float),
                         cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-        cudaGraphLaunch(slots_[(size_t) slot].advance, cs_) != cudaSuccess || !idle(err)) {
+        cudaGraphLaunch(slots_[(size_t) slot].advance, cs_) != cudaSuccess || !idle_owned(err)) {
         if (err.empty()) err = "mtp: resident slot advance failed";
         return false;
     }
@@ -1836,7 +1860,7 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
             (long long) (target ? target->prompt_len : -1), (long long) window_);
         err = detail; return false;
     }
-    if (!context_idle(err)) return false;
+    if (!scratch_idle(err, true)) return false;
     auto& target = slots_[(size_t) slot];
     if (target.proposal >= 0 && target.proposal < n_vocab_ &&
         target.proposal_cell == cell && target.proposal_token == next_token) {
@@ -1853,7 +1877,7 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
     for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[h] = (int32_t) cell;
     if (cudaMemcpyAsync(Rin_, residual, (size_t) (g_->hc * g_->n_embd) * sizeof(float),
                         cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-        cudaGraphLaunch(slots_[(size_t) slot].advance, cs_) != cudaSuccess || !idle(err)) {
+        cudaGraphLaunch(slots_[(size_t) slot].advance, cs_) != cudaSuccess || !idle_owned(err)) {
         if (err.empty()) err = "mtp: resident proposal failed";
         return false;
     }
@@ -1899,7 +1923,7 @@ bool MtpDrafter::check_input_graphs(std::string& err) {
     if (T < 3 || st_.max_cells < 8 || n_vocab_ <= 76) {
         err = "mtp graph canary probe requires width >=3 and bounded input cells"; return false;
     }
-    if (!idle(err)) return false;
+    if (!idle_owned(err)) return false;
     int graphs = 0, controls = 0;
     const int32_t expected[] = {71, 72, 73, 74};
     for (int variant = 0; variant < (coupled_ok_ ? 6 : 4); ++variant) {
@@ -1939,7 +1963,7 @@ bool MtpDrafter::check_input_graphs(std::string& err) {
                 cudaMemsetAsync(const_cast<float*>(window_R_), 0, residual_bytes, cs_) != cudaSuccess ||
                 cudaGraphLaunch(graph, cs_) != cudaSuccess) { err = "mtp graph canary probe launch failed"; return false; }
             canary_.check(8, cs_); // later owner-only checks must preserve the detected corruption
-            if (!idle(err)) return false;
+            if (!idle_owned(err)) return false;
             std::string observed;
             const bool valid = canary_.validate("mtp-probe", observed);
             if (valid != (fault == 0)) {

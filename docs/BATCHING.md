@@ -722,16 +722,46 @@ so the slots never wait for the read and the read is one run with no drain insid
   where serving a doorbell makes a CUDA call (`--pcie-mode dma`, `STRATA_FS_SLOTS`, the helper caches
   `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
   unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
-  pictures is read the usual way. This fork also keeps it off beside the foreground budget, batched MTP
-  (`--batch-mtp`, `--batch-mtp-pipeline`), packed or retained prefill, `--resident-multiplex`, the judge lane,
-  `--adapt-async` and `--spec-split`: each of those owns the slots or the drafter the reader would share, and the
-  reason is printed once. One exception: a **retired** windowed ring (`--retire-resident-source`, whose fill is
-  complete and which can hand out no more buffers) is allowed, because nothing reads from it during serving - the
-  fully-resident case this mode is for.
+  pictures is read the usual way. Packed or retained prefill, retained prompts,
+  `--resident-multiplex`, the judge lane, `--adapt-async`, `--spec-split` and
+  `STRATA_PREFILL_PIPE` still exclude it; the reason is printed once. A **retired**
+  windowed ring (`--retire-resident-source`) is allowed because its completed fill
+  cannot hand out or recycle more buffers during serving.
 
-One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
-decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default
-stream priority, and is not run on a GPU here); SYCL does not have it.
+With a positive foreground budget, concurrent reads use **credit-only** starts:
+`decode_allowed(0)`, not the sequential path's age-based `decode_due`. Disjoint
+intervals of each part credit `max(0, read wall - decode service wall)` and debit
+decode service once, including the final drain. Intervals settle while reading so
+carried debt can recover; accounting only at the part's end would starve a cold
+start. The budget remains the credit cap and allows an indivisible round to
+overrun. Request-scope service credit is disabled once a concurrent read starts,
+and overlap never trains isolated prefill/decode cost estimates. With share 0.25,
+debt D needs at least D/3 ms of non-decode read wall before another start; an
+in-flight round still drains regardless of credit.
+
+Batched MTP remains enabled on both sides. The prompt's private draft K/V and
+resident slots' private draft K/V share one scratch/stream owner with a bounded
+2000 ms host wait. Failed operations drain and preserve poison through later
+refusals; a timeout does not poison the current owner. The lock remains held
+through final mapped-output reads. Detached work is validated/drained by its next
+owner before reuse. Public lifecycle checks remain fail-fast; resident preflight
+may wait for the prompt pass. No extra device buffers, streams, graphs or canaries
+are allocated. The fixed host mutex replaces the former atomic flag.
+
+The doorbell thread serves every group-owned verifier through that owner's pool
+context (including peer/third dispatch), and both helpers use off-host CPU
+placement. The doorbell never uses the drafter: a scratch holder waits only for
+its own resident drafter stream, not for the other submitter. The sequential E9
+pass uses its already-owned stream boundary; exact-cut restore releases its
+completed lease before boundary catchup. `STRATA_SPLIT_MTP_BATCH` still stays off
+beside the reader because that pass can allocate/free on its thread. Unsetting
+`STRATA_PIPED_CONCURRENT` keeps the existing sequential scheduling path; this
+composition is opt-in, not a daily-profile promotion or a measured speed claim.
+
+One log line per part reports read wall, frontier, decoded rows (or committed MTP
+tokens), their rate and all owners' stage windows/host time. CUDA and HIP build
+the reader; HIP keeps default stream priority. This fork's CPU scheduling/lease
+tests are not GPU, numerical-quality or tail-latency qualification.
 
 Measured on 2x RTX 5090 (Swift 1.5 IQ3_S, split 25, `--batch 6 --batch-groups 2`, resident experts, k8v4, 262K,
 `--kv-resident 32768`, the engine-default decode share): main (`a0116b27`) against this mode, a fresh engine per arm in

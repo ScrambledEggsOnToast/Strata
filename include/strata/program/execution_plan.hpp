@@ -229,13 +229,11 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         else if (in.packed_prefill) p.concurrent_reader.reason = "packed prefill";
         else if (in.retained_prompt) p.concurrent_reader.reason = "retained prompt";
         else if (in.retained_prefill) p.concurrent_reader.reason = "retained prefill";
-        else if (in.batch_mtp || in.batch_mtp_pipeline) p.concurrent_reader.reason = "batched MTP";
         else if (in.resident_multiplex) p.concurrent_reader.reason = "--resident-multiplex";
         else if (in.judge_lane) p.concurrent_reader.reason = "the judge lane";
         else if (in.adapt_async) p.concurrent_reader.reason = "--adapt-async";
         else if (in.spec_split) p.concurrent_reader.reason = "--spec-split";
         else if (in.prefill_pipe) p.concurrent_reader.reason = "STRATA_PREFILL_PIPE";
-        else if (in.foreground_budget_ms > 0) p.concurrent_reader.reason = "the foreground budget";
         if (!p.concurrent_reader.reason.empty()) p.concurrent_reader.support = Support::off;
         else p.concurrent_reader.support = Support::conditional;  // runtime source/helper checks remain
     }
