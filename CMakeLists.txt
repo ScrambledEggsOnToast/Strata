@@ -283,6 +283,11 @@ add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
+# Serial working-owner facade has no device/resource-pool dependency.
+add_library(strata_streaming STATIC src/program/streaming_executor.cpp)
+target_include_directories(strata_streaming PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_streaming PRIVATE strata_warnings)
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
@@ -895,7 +900,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_library(strata_resident STATIC src/program/resident_slots.cpp src/program/resident_executor.cpp
     src/program/serial_judge.cpp)
-  target_link_libraries(strata_resident PUBLIC strata_prefill strata_engine)
+  target_link_libraries(strata_resident PUBLIC strata_prefill strata_engine strata_streaming)
   if(STRATA_BUILD_TESTS)
     add_executable(resident_slots_test tests/core/resident_slots_test.cpp)
     target_link_libraries(resident_slots_test PRIVATE strata_resident)
@@ -1638,6 +1643,11 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(execution_plan_test tests/program/execution_plan_test.cpp)
   target_include_directories(execution_plan_test PRIVATE include)
   add_test(NAME execution_plan_test COMMAND execution_plan_test)
+  # Pure streaming lifecycle: explicit admission, no model/device/resource-pool dependencies.
+  add_executable(streaming_executor_test tests/program/streaming_executor_test.cpp)
+  target_link_libraries(streaming_executor_test PRIVATE strata_streaming)
+  add_test(NAME streaming_executor_contract COMMAND streaming_executor_test)
+  set_tests_properties(streaming_executor_contract PROPERTIES TIMEOUT 60)
   # weighted decode service with bounded background progress (header-only, CPU)
   add_executable(decode_service_test tests/program/decode_service_test.cpp)
   target_include_directories(decode_service_test PRIVATE include)

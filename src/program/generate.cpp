@@ -103,6 +103,7 @@
 #include "strata/program/time_budget.hpp"
 #include "strata/program/execution_plan.hpp"
 #include "strata/program/resident_executor.hpp"
+#include "strata/program/streaming_executor.hpp"
 #include "strata/program/decode_service.hpp"
 #include "strata/program/native_admission.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -12358,6 +12359,37 @@ int main(int argc, char** argv) {
         std::array<strata::program::ResidentExecutor, 4> resident_executors{
             strata::program::ResidentExecutor(resident), strata::program::ResidentExecutor(resident),
             strata::program::ResidentExecutor(resident), strata::program::ResidentExecutor(resident)};
+        strata::program::StreamingExecutor streaming_executor;
+        // Incremental cutover: only the fixed, local, live-windowed text GEN profile.
+        // Every other supported source, seat, image and dynamic-owner path stays where it is.
+        const bool streaming_profile = !batch_requested && o.batch == 0 && o.windowed_experts &&
+            !o.retire_resident_source && !strata::prefill::Prefill::cpu_share_enabled() &&
+            !o.prefill_auto && !o.prefill_head_alias && !o.prefill_helpers && !o.remote_expert_opt &&
+            o.peer_device < 0 && o.pipeline_windows == 0 && !o.adapt_async && o.adapt_swaps == 0 &&
+            !o.kv_grow && !o.vram_elastic && !o.judge_context && !o.judge_overlap && !o.spec_split &&
+            !drive.d.fs && o.score_reference.empty() && sp.owns_work_buffers() &&
+            std::all_of(stages.begin(), stages.end(), [](const auto& stage) { return stage->sp.owns_work_buffers(); }) &&
+            std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int64_t slots) { return slots != 0; }) &&
+            std::none_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(), [](bool on) { return on; });
+        strata::program::StreamingSelection streaming_selection;
+        if (streaming_profile) {
+            streaming_selection.serve = o.serve;
+            streaming_selection.effective_batch = o.batch;
+            streaming_selection.destination = -1;
+            streaming_selection.stages = n_stages;
+            streaming_selection.source = strata::program::StreamingSource::windowed;
+            streaming_selection.source_ready = windowed_src.ready() &&
+                std::all_of(stage_sources.begin(), stage_sources.end(), [](const auto& source) { return source->ready(); });
+            streaming_selection.source_retired = windowed_src.io_retired() ||
+                std::any_of(stage_sources.begin(), stage_sources.end(), [](const auto& source) { return source->io_retired(); });
+            streaming_selection.source_lanes = 1 + (int) stage_sources.size();
+            streaming_selection.cpu_share_resolved = true; // frozen before the existing #151 admission
+            const auto capability = strata::program::streaming_capability(execution_plan, admission, streaming_selection);
+            if (capability.support != strata::program::Support::on) {
+                std::fprintf(stderr, "strata serve: streaming executor refused: %s\n", capability.reason.c_str());
+                return 1;
+            }
+        }
         if (o.batch > 0 && !resident.init_resources(err)) {
             std::fprintf(stderr, "strata serve: --batch: %s\n", err.c_str());
             return 1;
@@ -20146,6 +20178,29 @@ int main(int argc, char** argv) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
             }
             const auto& req_sp = resident.working().sampling;
+            strata::program::StreamingWorkHandle streaming_work;
+            if (streaming_profile && !geni && admit_slot < 0) {
+                streaming_work = streaming_executor.submit({&resident.working().request, &stop_req},
+                    execution_plan, admission, streaming_selection, err);
+                if (!streaming_work) { phase_error("ERR %s\n", err.c_str()); return 1; }
+            }
+            auto emit_serial = [&](int32_t token, int64_t frontier) -> bool {
+                if (streaming_work) {
+                    // The sole host caller records the intention; an issued commit still publishes.
+                    if (stop_req.load() && !streaming_executor.request_cancel(streaming_work,
+                        strata::program::StreamingTerminal::cancelled, err)) return false;
+                    if (!streaming_executor.committed(streaming_work, token, frontier, err)) return false;
+                    const auto output = streaming_executor.observe(streaming_work, err);
+                    if (!output || output.event != strata::program::StreamingEvent::committed_token) {
+                        if (err.empty()) err = "streaming executor: committed publication was not observable";
+                        return false;
+                    }
+                    token = output.token;
+                }
+                std::printf("T %d\n", (int) token);
+                strata::core::progress_beat();
+                return true;
+            };
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -22368,6 +22423,13 @@ int main(int argc, char** argv) {
                 }
             };
             report_prompt_work(merge_at >= 0 ? merge_at : std::max(at, pp_reached));
+            if (streaming_work) {
+                if (!streaming_executor.prefilled(streaming_work,
+                    merge_at >= 0 ? merge_at : std::max(at, pp_reached), err) ||
+                    !streaming_executor.observe(streaming_work, err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             if (!o.score_reference.empty()) {
                 // The prompt reader stops at n-1. Consume its final input token,
@@ -22975,8 +23037,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         if (produced_n == 0) report_prompt_work(n);
-                        std::printf("T %d\n", (int) outp[(size_t) i]);
-                        strata::core::progress_beat();
+                        if (!emit_serial(outp[(size_t) i], A.p + i + 1)) return die(err);
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
@@ -23396,8 +23457,9 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = emit_begin; i < keep; ++i) {
                     if (produced_n == 0) report_prompt_work(n);
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-                    strata::core::progress_beat();
+                    if (!emit_serial(outv[(size_t) i], p + i + 1)) {
+                        phase_error("ERR %s\n", err.c_str()); return 1;
+                    }
                     ++produced_n;
                     if (o.suffix_draft > 0 || o.lookup_chain > 0) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
@@ -23555,6 +23617,39 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            if (streaming_work) {
+                if ((cancelled || std::strcmp(finish, "cancel") == 0) &&
+                    !streaming_executor.request_cancel(streaming_work,
+                        strata::program::StreamingTerminal::cancelled, err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+                // Match the working-owner rebind preflight: operation owners certify their
+                // own complete consumers. Never cancel a worker or infer drain from ring readiness.
+                if (std::any_of(drive.d.completion.begin(), drive.d.completion.end(),
+                    [](const auto& completion) { return completion.active(); })) {
+                    phase_error("ERR streaming executor: expert consumers still own an operation\n"); return 1;
+                }
+                for (int stage = 0; stage < n_stages; ++stage)
+                    if (!stage_ver(stage).context_idle(err)) { phase_error("ERR %s\n", err.c_str()); return 1; }
+                if (!sp.context_idle(err) || !mtp.context_idle(err)) {
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+                strata::program::StreamingDrainReceipt drained{
+                    streaming_work, cancelled ? std::max(at, pp_reached) : p, produced_n};
+                drained.verifier = drained.prefill_chain = drained.draft = drained.experts = true;
+                // This selected profile has no adaptive/peer/helper/pipeline transfer owner;
+                // verifier and recursive prefill idle checks cover its source/stager/GPU readers.
+                drained.transfers = true;
+                const auto terminal = streaming_executor.drain(streaming_work, drained, err,
+                    std::strcmp(finish, "nonfinite") == 0 ? strata::program::StreamingTerminal::failed :
+                    cancelled || std::strcmp(finish, "cancel") == 0 ? strata::program::StreamingTerminal::cancelled :
+                    strata::program::StreamingTerminal::completed);
+                if (!terminal || terminal.event != strata::program::StreamingEvent::terminal ||
+                    !terminal.fresh || terminal.committed != produced_n) {
+                    if (err.empty()) err = "streaming executor: terminal precedes committed output";
+                    phase_error("ERR %s\n", err.c_str()); return 1;
+                }
+            }
             if (judge_lane) judge_lane->observe_generation();
             if (admit_slot < 0)
                 phase_finish(yielded_at >= 0 ? "yielded" : std::strcmp(finish, "cancel") == 0 ? "cancelled" :
@@ -23570,6 +23665,9 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            if (streaming_work && !streaming_executor.retire(streaming_work, err)) {
+                phase_error("ERR %s\n", err.c_str()); return 1;
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

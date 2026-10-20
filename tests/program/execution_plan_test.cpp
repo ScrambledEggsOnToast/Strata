@@ -169,6 +169,11 @@ int main() {
         check(!p.refused && p.lookup.support == ep::Support::on && p.suspension.support == ep::Support::off,
               "serial generation consumes lookup and has no suspension");
         in.serve = true;
+        const auto serial = ep::resolve_execution_plan(in);
+        check(serial.mode == ep::ServeMode::streaming && serial.batch_slots == 0 &&
+              serial.lookup.support == ep::Support::on && serial.admission.support == ep::Support::off,
+              "explicit zero-seat serving is streaming and consumes serial lookup without native admission");
+        check(has(serial.to_json(), "\"mode\":\"streaming\""), "serial-serving JSON reports the working-owner path");
         in.spec_requested = 1;
         const ep::ExecutionPlan q = ep::resolve_execution_plan(in);
         check(q.lookup.support == ep::Support::off && has(q.lookup.reason, "spec"),

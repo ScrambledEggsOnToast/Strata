@@ -118,7 +118,7 @@ inline const char* support_name(Support s) {
 // this function owns the composition rules that decide whether the selected mode can run at all.
 inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     ExecutionPlan p;
-    p.mode = in.serve ? ServeMode::resident : ServeMode::streaming;
+    p.mode = in.serve && in.batch_requested > 0 ? ServeMode::resident : ServeMode::streaming;
     p.stages = 1 + std::max(0, in.later_stages);
     p.batch_slots = batch_groups::normalized_slots(in.batch_requested, 8);
     // A slot's session must fit before the count is effective; keep the request and label the fit conditional.

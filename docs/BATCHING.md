@@ -172,6 +172,35 @@ For a bounded synthetic acceptance cohort, `STRATA_BATCH_TRACE=1` writes complet
 `BDONE`, drafts and inert descriptors are not output. This opt-in trace does not change the default path,
 and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage and slot request IDs.
 
+### Serial streaming executor (incremental scope)
+
+The `StreamingExecutor` candidate binds only the serial working request (`GEN`, destination `-1`),
+not a `ResidentSlot` seat. Initial integration selects **original and effective batch zero**, a
+live `--windowed-experts` source, fixed independently owned prefill scratch on every stage, and
+`STRATA_PREFILL_CPU_SHARE=0`. Adaptive, elastic, peer/helper/remote, lookahead, judge, image,
+head-alias and score-reference compositions keep their existing paths. Selection uses those
+resolved ownership facts and accepted memory admission, never the plan's `mode` label alone.
+Serial zero-seat serving is labeled `streaming`; that is a request-path label, not a claim that
+experts or KV are fully resident.
+
+The adapter borrows only the working request identity and existing STOP atomic. Expert sources,
+their independent per-stage rings, CPU pools, prefill scratch/loans, KV and continuation histories
+remain with their existing owners. Each selected token passes through the adapter at the existing
+`T` publication point; no per-token synchronization or speculative-acceptance change is added.
+Before `DONE`, the host checks expert completion ledgers, every stage's verifier, recursive prefill
+and draft idleness, then observes the one terminal and retires the scalar binding. STOP records an
+intention without dropping an already-issued publication or releasing another owner's resources.
+`STRATA_EXECUTOR_TRACE=1` includes `STREAMING_EXECUTOR` lifecycle receipts.
+
+Unknown or omitted memory demand refuses rather than becoming zero, including a missing
+`prefill_cpu_share_buffers` price. The explicitly disabled share has a known admitted zero;
+this does **not** qualify #151's unrun share-enabled CUDA acceptance. Arena/mapped sources,
+positive-batch and fit-to-zero fallback, batch-enabled solo `GEN`, retained/native/packed,
+`GENI`, remote/helper and KV streaming/hybrid/elastic modes are preserved but not newly qualified.
+CPU fixtures test the scalar contract and the existing frontend's legacy transport separately;
+caller-attested drain flags alone are not proof of physical consumer drain. Real integrated
+request and SM70/SM86 execution acceptance remain pending; no speedup or promotion is claimed.
+
 ### Static expert residency
 
 `--serve --batch` (including `--slots`, grouped MTP and resident multiplexing) assumes a **statically resident
