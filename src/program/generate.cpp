@@ -80,8 +80,6 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/serve_controls.hpp"
 #include "strata/program/logits_selection.hpp"
-#include "strata/program/score_protocol.hpp"
-#include "strata/program/readout_reference.hpp"
 #include "logits_dump.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/checkpoint_preservation.hpp"
@@ -91,7 +89,6 @@
 #include "strata/program/phase_receipts.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/program/resident_slots.hpp"
-#include "strata/program/serial_judge.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -358,37 +355,6 @@ bool refill_blocking() {
 using Clock = std::chrono::steady_clock;
 namespace phase = strata::program::phase;
 
-struct JudgeCommitTrace {
-    struct Record {
-        int64_t ns = 0, position = 0, committed = 0;
-        uint64_t request = 0;
-        int slot = -1;
-    };
-    std::array<Record, 8192> records{};
-    size_t used = 0;
-    uint64_t dropped = 0;
-    void add(int slot, uint64_t request, int64_t position, int64_t committed) {
-        if (used == records.size()) { ++dropped; return; }
-        records[used++] = {
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(),
-            position, committed, request, slot};
-    }
-    void flush() {
-        if (!used && !dropped) return;
-        const auto begin = Clock::now();
-        for (size_t i = 0; i < used; ++i) {
-            const auto& r = records[i];
-            std::fprintf(stderr, "JUDGE_GEN ns=%lld request=%llu slot=%d position=%lld committed=%lld\n",
-                         (long long)r.ns, (unsigned long long)r.request, r.slot,
-                         (long long)r.position, (long long)r.committed);
-        }
-        std::fprintf(stderr, "JUDGE_GEN_END records=%zu dropped=%llu complete=%d write_us=%lld\n",
-                     used, (unsigned long long)dropped, dropped == 0 ? 1 : 0,
-                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count());
-        used = 0; dropped = 0;
-    }
-};
-
 struct HostAdmissionSnapshot {
     uint64_t available = 0, allocation = 0, resident = 0;
     uint64_t host_reserve = 0, guest_reserve = 0, worker_limit = 0;
@@ -617,8 +583,6 @@ private:
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
-    std::string score_reference;     // standalone fresh serial readout, not a generation request
-    std::vector<int64_t> score_select;
     int64_t max_new = 16;
     int64_t max_context = 4096;
     bool greedy = true;
@@ -726,11 +690,6 @@ struct Options {
     /// admissible only inside an enforced worker cgroup ceiling, so it requires the protected
     /// supervisor's measured worker limit and refuses without it.
     uint64_t guest_opaque_allowance_bytes = 0;      // --guest-opaque-allowance-bytes
-    int64_t judge_context = 0;                      // --judge-context: one independent serial state, not a slot
-    int64_t judge_quantum = 0;                     // optional complete-prefill span before a drained peer round
-    bool judge_overlap = false;                   // distinct-device stage leases, not simultaneous same-device owners
-    uint64_t judge_library_allowance_bytes = 0;     // incremental first-use/driver allowance; unknown if absent
-    uint64_t judge_runtime_allowance_bytes = 0;     // incremental host allocator/driver/test instrumentation
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
@@ -1076,14 +1035,6 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --judge-context N    opt-in serial short scoring state (1..4096); shares actual prompt/head owners\n"
-                 "  --judge-library-allowance-bytes N  additional per-device first-use/driver bound (required)\n"
-                 "  --judge-runtime-allowance-bytes N  additional host opaque-storage bound (required)\n"
-                 "  --judge-quantum N    yield between scoring spans of N tokens (1..4096); 0 keeps serial scoring\n"
-                 "  --judge-overlap      overlap released generation stages with scoring tails; needs quantum and batch MTP pipeline\n"
-                 "  --score-reference PATH  create a fresh serial final-position JSON readout, then exit; needs\n"
-                 "                       --serve, --tokens[-file], --score-select, no MTP/batch/prefix cache\n"
-                 "  --score-select LIST  every requested token ID, in output order (no top-k truncation)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
@@ -2852,13 +2803,6 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
-        else if (a == "--score-reference") o.score_reference = next("--score-reference");
-        else if (a == "--score-select") {
-            std::string e;
-            if (!parse_i64_list(next("--score-select"), o.score_select, e)) {
-                std::fprintf(stderr, "strata reference: %s\n", e.c_str()); return 2;
-            }
-        }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
@@ -2975,21 +2919,6 @@ int main(int argc, char** argv) {
         else if (a == "--graph-capture-allowance-bytes") o.graph_capture_allowance_bytes = bytes_flag(next("--graph-capture-allowance-bytes"), "--graph-capture-allowance-bytes");
         else if (a == "--prefill-library-allowance-bytes") o.prefill_library_allowance_bytes = bytes_flag(next("--prefill-library-allowance-bytes"), "--prefill-library-allowance-bytes");
         else if (a == "--guest-opaque-allowance-bytes") o.guest_opaque_allowance_bytes = bytes_flag(next("--guest-opaque-allowance-bytes"), "--guest-opaque-allowance-bytes");
-        else if (a == "--judge-context") {
-            const auto cells = bytes_flag(next("--judge-context"), "--judge-context");
-            if (cells < 1 || cells > 4096) { std::fprintf(stderr, "--judge-context requires 1..4096 cells\n"); return 2; }
-            o.judge_context = (int64_t)cells;
-        }
-        else if (a == "--judge-quantum") {
-            const auto quantum = bytes_flag(next("--judge-quantum"), "--judge-quantum");
-            if (quantum > 4096) { std::fprintf(stderr, "--judge-quantum requires 0..4096 tokens\n"); return 2; }
-            o.judge_quantum = (int64_t)quantum;
-        }
-        else if (a == "--judge-overlap") o.judge_overlap = true;
-        else if (a == "--judge-library-allowance-bytes")
-            o.judge_library_allowance_bytes = bytes_flag(next("--judge-library-allowance-bytes"), "--judge-library-allowance-bytes");
-        else if (a == "--judge-runtime-allowance-bytes")
-            o.judge_runtime_allowance_bytes = bytes_flag(next("--judge-runtime-allowance-bytes"), "--judge-runtime-allowance-bytes");
         else if (a == "--host-native") o.host_native = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
@@ -3381,11 +3310,6 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.prefill_head_alias && o.judge_context > 0) {
-        // Next commit: keep the independent judge lane's head bindings valid across head-alias transitions.
-        std::fprintf(stderr, "strata generate: --prefill-head-alias with --judge-context awaits the score-lane head ownership port\n");
-        return 2;
-    }
     const char* pipe_env = std::getenv("STRATA_PREFILL_PIPE");
     const bool pipe_active = o.prefill_pipe >= 0 ? o.prefill_pipe > 0
         : pipe_env != nullptr && std::atof(pipe_env) > 0;
@@ -3412,24 +3336,6 @@ int main(int argc, char** argv) {
                                  "per-device first-stage admission is not ported\n");
             return 2;
         }
-    }
-    if (!o.score_reference.empty() || !o.score_select.empty()) {
-        if (o.score_reference.empty() || o.score_select.empty() || !have_tokens ||
-            !std::filesystem::path(o.score_reference).is_absolute() ||
-            std::filesystem::exists(o.score_reference) || !o.serve || o.spec < 2 ||
-            o.batch > 0 || o.batch_mtp || o.batch_mtp_pipeline || o.pipeline_windows != 0 ||
-            o.spec_split || o.no_pool || o.no_capture || !o.mtp.empty() || o.suffix_draft != 0 ||
-            o.lookup_chain != 0 || o.adapt_async || o.adapt_swaps != 0 ||
-            o.prompt_cache != 0 || o.conversation_cache_mib != 0 || !o.conversation_cache_dir.empty() || !o.greedy ||
-            !o.dump_logits.empty() || !o.dump_layers.empty() ||
-            std::getenv("STRATA_DUMP_TEACHER_LOGITS") || std::getenv("STRATA_DUMP_COMMITTED_LOGITS") ||
-            std::getenv("STRATA_DUMP_FIRST_LOGITS") || std::getenv("STRATA_LOGPOS")) {
-            std::fprintf(stderr, "strata reference: needs an absolute create-only output, explicit prompt/selected IDs, "
-                                 "serial captured --serve --spec >= 2, real pool, no MTP/draft/batch/pipeline/"
-                                 "adaptive swaps/prefix cache/sampling or diagnostic dumps\n");
-            return 2;
-        }
-        o.max_new = 1; // serve's internal admission placeholder; the readout never enters decode
     }
     // ---- the persistent conversation store's eligibility -------------------
     // Persistence extends the RAM parking envelope, so it needs parking to be on, a private root directory and both
@@ -3514,13 +3420,12 @@ int main(int argc, char** argv) {
         pin.retained_prompt = retained_prompt;
         pin.prefill_chunk = o.prefill_chunk;
         pin.private_preparation_static = !o.prefill_auto && !o.vision && !o.kv_grow && !o.vram_elastic &&
-            o.pipeline_windows <= 0 && !o.judge_context && !o.judge_overlap && !o.adapt_async &&
-            o.adapt_swaps == 0 && o.peer_device < 0 && !o.prefill_helpers && !o.spec_split && !o.resident_multiplex;
+            o.pipeline_windows <= 0 && !o.adapt_async && o.adapt_swaps == 0 && o.peer_device < 0 &&
+            !o.prefill_helpers && !o.spec_split && !o.resident_multiplex;
         pin.retained_prefill = retained_env2 && std::strcmp(retained_env2, "0") != 0;
         pin.foreground_budget_ms = o.foreground_budget_ms;
         pin.background_share = o.background_share;
         pin.piped_concurrent = piped_env != nullptr && std::atoi(piped_env) != 0;
-        pin.judge_lane = o.judge_context > 0 || o.judge_overlap;
         pin.spec_split = o.spec_split;
         pin.prefill_pipe = pipe_active;
         return pin;
@@ -3576,10 +3481,10 @@ int main(int argc, char** argv) {
         ? size_t(4) * (size_t(std::max<int64_t>(o.max_context, 1)) * 11 + 4096) + 16 : 0;
     if (private_preparation && (!o.serve || o.batch < 1 || o.batch > 4 || o.mtp.empty() ||
         o.spec < 2 || o.prefill_chunk != 2048 || o.prefill_auto || o.vision || o.kv_grow ||
-        o.vram_elastic || o.pipeline_windows > 0 || o.judge_context || o.adapt_async ||
+        o.vram_elastic || o.pipeline_windows > 0 || o.adapt_async ||
         o.adapt_swaps != 0 || o.peer_device >= 0 || o.prefill_helpers || o.spec_split)) {
         std::fprintf(stderr, "strata packed prefill: requires --serve, 1..4 resident slots, MTP/spec, "
-                             "fixed 2048 scratch and static text-only owners; no elastic/adaptive/helper/judge composition\n");
+                             "fixed 2048 scratch and static text-only owners; no elastic/adaptive/helper composition\n");
         return 2;
     }
     if (private_preparation) o.no_prefill_borrow = true; // priced before any cache grant or stage arena layout
@@ -3619,31 +3524,6 @@ int main(int argc, char** argv) {
         }
     }
     const char* causal_prefix = std::getenv("STRATA_CROSS_HELP_CAPTURE");
-    if (o.judge_context && (!o.serve || !o.no_prefill_borrow || o.prefill_auto || o.prefill_chunk <= 0 ||
-        o.judge_context > o.max_context || o.kv_grow || o.vram_elastic || o.adapt_async || o.adapt_swaps != 0 ||
-        o.pipeline_windows > 0 || o.prefill_helpers || o.peer_device >= 0 || o.vision)) {
-        std::fprintf(stderr, "strata judge: needs serial --serve, fixed --prefill, --no-prefill-borrow, "
-                             "resident nonelastic KV, no adaptive/peer/helper/vision paths; generation geometry is never reduced\n");
-        return 2;
-    }
-    const char* judge_no_peer = std::getenv("STRATA_JUDGE_NO_PEER");
-    if (judge_no_peer && std::strcmp(judge_no_peer, "0") != 0 && std::strcmp(judge_no_peer, "1") != 0) {
-        std::fprintf(stderr, "STRATA_JUDGE_NO_PEER requires 0 or 1\n"); return 2;
-    }
-    if (o.judge_quantum > o.judge_context || (judge_no_peer && !o.judge_quantum)) {
-        std::fprintf(stderr, "strata judge: quantum requires --judge-context and must fit it; "
-                             "STRATA_JUDGE_NO_PEER requires a nonzero quantum\n"); return 2;
-    }
-    const bool judge_cooperate = !judge_no_peer || std::strcmp(judge_no_peer, "0") == 0;
-    if (o.judge_overlap && (!o.judge_quantum || o.judge_quantum > o.prefill_chunk ||
-                            !judge_cooperate || o.batch <= 0 || o.batch_groups <= 1 || !o.batch_mtp_pipeline)) {
-        std::fprintf(stderr, "strata judge: overlap needs a quantum within prefill, enabled peers and batch MTP groups\n");
-        return 2;
-    }
-    if (!o.judge_context && (o.judge_library_allowance_bytes || o.judge_runtime_allowance_bytes ||
-                             std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE"))) {
-        std::fprintf(stderr, "strata judge: allowances/probe require --judge-context\n"); return 2;
-    }
     const bool causal_requested = causal_prefix != nullptr;
     if (causal_requested) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
@@ -4002,11 +3882,11 @@ int main(int argc, char** argv) {
     if (o.retire_resident_source &&
         (!o.host_native || !o.windowed_experts || !o.serve || o.batch < 2 || o.prefill_chunk <= 0 ||
          o.kv_grow || o.vram_elastic || o.adapt_async || o.adapt_swaps != 0 || o.peer_device >= 0 ||
-         o.remote_expert_opt || o.prefill_helpers || o.spec_split || o.judge_context || o.resident_multiplex ||
+         o.remote_expert_opt || o.prefill_helpers || o.spec_split || o.resident_multiplex ||
          std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int64_t n) { return n != 0; }) ||
          std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(), [](bool on) { return on; }))) {
         std::fprintf(stderr, "strata generate: --retire-resident-source requires batched host-native windowed serve "
-                             "with fixed prefill, static local caches and no elastic/adaptive/peer/helper/judge mode\n");
+                             "with fixed prefill, static local caches and no elastic/adaptive/peer/helper mode\n");
         return 2;
     }
     if (o.retire_resident_source) {
@@ -4054,14 +3934,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.batch_mtp_third && (!o.serve || !o.batch_mtp_floating || !o.batch_mtp_pipeline ||
-            o.batch != 4 || o.batch_groups != 2 || o.pipeline_windows > 0 || o.judge_context ||
+            o.batch != 4 || o.batch_groups != 2 || o.pipeline_windows > 0 ||
             !multi_gpu || split_auto || split_same || split_devs.size() != 2 || o.split_skip_if_fits ||
             o.spec != 4 || o.prefill_chunk != 2048 ||
             o.resident_multiplex || o.adapt_swaps != 0 || o.adapt_async || o.peer_device >= 1 ||
             o.remote_expert_opt || o.prefill_helpers || o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --batch-mtp-third requires serving floating four-slot/two-group MTP, "
                              "explicit distinct-device split, --spec 4 --prefill 2048 and static full local residency; "
-                             "no judge, multiplex, pipeline-windows, adaptive or helper composition\n");
+                             "no multiplex, pipeline-windows, adaptive or helper composition\n");
         return 2;
     }
     const size_t helper_count = (size_t) std::count_if(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
@@ -5057,11 +4937,6 @@ int main(int argc, char** argv) {
     // One startup resolution for every owner role. Captured graph keys omit residency;
     // these values feed both admission prices and fresh-owner carves, never live rebinding.
     const int draft_rows = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
-    if (strata::core::shared_rope_enabled() && o.judge_context > o.max_context) {
-        std::fprintf(stderr, "strata generate: --judge-context exceeds the generation table capacity; "
-                             "STRATA_SHARED_ROPE borrows compatible shorter tables without growing them\n");
-        return 1;
-    }
     const auto kv_roles = strata::core::qsa_role_placements(g, o.max_context,
         o.slot_kv_window.value_or(-1), o.mtp_window, draft_rows);
     const int requested_slots = strata::program::batch_groups::normalized_slots(o.batch, strata::kernels::kVerifyMaxT);
@@ -5080,12 +4955,7 @@ int main(int argc, char** argv) {
     // not exact carves and therefore do not arm the runtime equality checks.
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> admitted_slot_session_bytes{};
-    strata::plan::QsaPlacement judge_placement;
-    if (o.judge_context) judge_placement = strata::core::qsa_state_placement(g, o.judge_context, 0, o.judge_context);
-    std::array<strata::program::JudgeStageBytes, SplitDrive::kMax> admitted_judge_bytes{};
-    std::array<uint64_t, SplitDrive::kMax> judge_generation_cache_bytes{};
-    const int judge_generation_slots = o.batch;
-    const int64_t judge_generation_context = o.max_context, judge_generation_chunk = o.prefill_chunk;
+    std::array<uint64_t, SplitDrive::kMax> full_generation_cache_bytes{};
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -5867,20 +5737,18 @@ int main(int argc, char** argv) {
                    "auto: floor((min(driver total, free) - fixed classes - headroom)/max_blob) slots");
         }
 
-        // #232: retain the already committed cache BUDGETS. Price their concrete all-pair
-        // allocations, rather than spending the residual budget a second time or taking
-        // any residency to fund the judge or third replay owner. Runtime proves these exact extents/residency.
-        uint64_t judge_host_init_peak = 0;
-        if (o.judge_context || o.batch_mtp_third) {
+        // Retain the already committed cache budgets for the third replay owner.
+        // Price their concrete all-pair allocations without spending the residual
+        // budget a second time or reducing residency. Runtime proves these extents.
+        if (o.batch_mtp_third) {
             if (split_auto || split_same || !native_pack || g.n_layers * g.n_expert != 24576) {
-                v0.add_unknown(o.batch_mtp_third ? "third_execution_geometry" : "judge_execution_geometry",
+                v0.add_unknown("third_execution_geometry",
                                "requires native frozen geometry and explicit stage ranges");
             } else {
                 const auto& layout = strata::kernels::cpu::expert_layout();
                 for (size_t st = 0; st <= split_devs.size(); ++st) {
                     const int64_t lo = st ? split_at[st - 1] : 0;
                     const int64_t hi = st < split_at.size() ? split_at[st] : g.n_layers;
-                    const int dev = st ? split_devs[st - 1] : 0;
                     auto& demand = devs[st].vram;
                     const char* cache_class = st ? "split_expert_caches" : "expert_cache";
                     uint64_t full_cache = 0;
@@ -5890,43 +5758,15 @@ int main(int argc, char** argv) {
                     auto cache = std::find_if(demand.classes.begin(), demand.classes.end(),
                         [&](const auto& allocation) { return allocation.name == cache_class; });
                     if (!layout.native || cache == demand.classes.end() || cache->bytes < full_cache) {
-                        demand.add_unknown(o.batch_mtp_third ? "third_generation_capacity" : "judge_generation_capacity",
+                        demand.add_unknown("third_generation_capacity",
                                            "cache budget cannot retain every existing expert pair");
                     } else {
                         cache->bytes = full_cache;
                         cache->source = "concrete existing all-pair stage allocation: ExpertCache::slot_stride with slot guard; original budget unchanged";
-                        judge_generation_cache_bytes[st] = full_cache;
-                        demand.add(o.batch_mtp_third ? "third_generation_cache_granule" : "judge_generation_cache_granule", ((full_cache + (2ull << 20) - 1) / (2ull << 20)) * (2ull << 20) - full_cache,
+                        full_generation_cache_bytes[st] = full_cache;
+                        demand.add("third_generation_cache_granule", ((full_cache + (2ull << 20) - 1) / (2ull << 20)) * (2ull << 20) - full_cache,
                                    "existing cache allocation rounded to a 2 MiB device granule; no cache bytes removed");
                     }
-                    if (!o.judge_context) continue; // third owner preserves the same concrete full expert cache
-                    auto& bytes = admitted_judge_bytes[st];
-                    if (!strata::program::judge_stage_bytes(g, o.judge_context, K, lo, hi, n_vocab,
-                            hi == g.n_layers, judge_placement, bytes)) {
-                        demand.add_unknown("judge_short_session", "independent short owner/branch/readback price unavailable");
-                        continue;
-                    }
-                    demand.add("judge_short_session", bytes.session.device, "derived SessionOwner: GDN/QSA/MoE/block/PLE, complete independent short arena");
-                    demand.add("judge_operation_canary", bytes.device_canary, "derived 280 B per-stage operation owner; existing prefill canary also retained");
-                    demand.add("judge_head_output", bytes.device_head_output, "derived one full vocabulary FP32 row on actual native-head device");
-                    demand.add("judge_allocator_granule", bytes.device_allocator_padding, "derived separate session/canary/output allocations rounded to 2 MiB granules");
-                    demand.add("judge_shared_prefill_gemm_workspace", 0, "same initialized Prefill/Gemm/cuBLAS scratch/workspace: full generation prefill_buffers retained; deferred conversion/MMQ buffers charged in judge_library_first_use_driver");
-                    demand.add("judge_shared_native_head", 0, "same actual native weights/Q8_1 head scratch: generation native-head charge retained in full");
-                    if (o.judge_library_allowance_bytes)
-                        demand.add("judge_library_first_use_driver", o.judge_library_allowance_bytes,
-                            "additional finite first-use envelope: explicit shared-owner BF16 conversion/MMQ buffers plus CUDA/cuBLAS/library/driver commitment; generation allowance also retained");
-                    else demand.add_unknown("judge_library_first_use_driver", "no incremental first-use/driver bound supplied");
-                    judge_host_init_peak = std::max(judge_host_init_peak, bytes.session.host_transient);
-                    std::fprintf(stderr, "JUDGE_STATIC device=%d cells=%lld session_device=%llu canary_device=%llu head_output_device=%llu "
-                                         "allocator_padding_device=%llu session_pinned_host=%llu session_heap_host=%llu canary_host=%llu "
-                                         "checkpoint_host=%llu readback_host=%llu metadata_host=%llu init_host_transient=%llu library_allowance=%llu\n",
-                        dev, (long long)o.judge_context, (unsigned long long)bytes.session.device,
-                        (unsigned long long)bytes.device_canary, (unsigned long long)bytes.device_head_output,
-                        (unsigned long long)bytes.device_allocator_padding, (unsigned long long)bytes.session.host_pinned,
-                        (unsigned long long)bytes.session.host_heap, (unsigned long long)bytes.host_canary,
-                        (unsigned long long)bytes.host_checkpoint, (unsigned long long)bytes.host_readback,
-                        (unsigned long long)bytes.host_metadata, (unsigned long long)bytes.session.host_transient,
-                        (unsigned long long)o.judge_library_allowance_bytes);
                 }
             }
         }
@@ -5963,29 +5803,6 @@ int main(int argc, char** argv) {
             ram("shared_rope_registry", strata::core::shared_rope_host_bytes(),
                 "fixed device registry and initialization mutex; no per-session heap entries");
         startup_only.add("session_host_init_transient", session_allocation.host_transient, "serial RoPE/page-table construction");
-        if (o.judge_context) {
-            for (size_t stage = 0; stage < stage_count; ++stage) {
-                const auto& bytes = admitted_judge_bytes[stage];
-                ram("judge_session_host_pinned", bytes.session.host_pinned, "derived independent short SessionOwner mapped QSA controls");
-                ram("judge_session_host_heap", bytes.session.host_heap, "derived SessionOwner plus global QsaState array ABI");
-                ram("judge_operation_canary_host", bytes.host_canary, "derived 108 B per stage staging/readback");
-                ram("judge_branch_checkpoint_host", bytes.host_checkpoint, "derived retained GDN/PLE/indexer state plus bounded token IDs and 12.5% capacity margin");
-                ram("judge_head_readback_host", bytes.host_readback, "derived one full native-head row; no per-position full-logit matrix");
-                ram("judge_metadata_host", bytes.host_metadata, "derived stage/module/callback/checkpoint object storage; SessionOwner not duplicated");
-            }
-            startup_only.add("judge_session_init_transient", judge_host_init_peak,
-                "conservative maximum serial short-owner RoPE/page-table payload; shared-RoPE borrow builds no table, retained bound includes a hypothetical short build");
-            if (o.judge_runtime_allowance_bytes)
-                ram("judge_opaque_runtime_host", o.judge_runtime_allowance_bytes,
-                    "additional finite allocator/driver/initialization/instrumentation commitment within measured worker ceiling");
-            else ram_unknown("judge_opaque_runtime_host", "no additional host allocator/driver/initialization bound supplied");
-            ram("judge_request_input_host", (uint64_t)o.judge_context * sizeof(int64_t),
-                "one bounded caller-owned prompt vector for the serial lane");
-        }
-        if (const char* timing = std::getenv("STRATA_JUDGE_TIMING");
-            requested_slots && timing && std::strcmp(timing, "1") == 0)
-            ram("judge_commit_trace", sizeof(JudgeCommitTrace),
-                "fixed 8192-record host buffer; overflow marks the diagnostic incomplete, never wraps");
         if (o.spec > 0 || !o.mtp.empty() || requested_slots)
             ram("verifier_canary_host", byte_mul(stage_count, strata::core::kVerifyCanaryHostBytes), "mapped per-stage operation identity staging/readback");
         ram("operation_canary_host", byte_mul(stage_count, 2 * strata::core::kOperationCanaryHostBytes),
@@ -6592,26 +6409,6 @@ int main(int argc, char** argv) {
                     (unsigned long long) admission.host_ceiling_bytes,
                     (unsigned long long) admitted_cache_bytes, admission.limiting_term.c_str());
         std::fflush(stdout);
-        if (o.judge_context > 0) {
-            std::fprintf(stderr, "JUDGE_ADMISSION admit=%d verified=%d unknown_classes=%zu devices=%zu "
-                                 "guest_fits=%d host_fits=%d guest_demand_bytes=%llu host_demand_bytes=%llu "
-                                 "guest_ceiling_bytes=%llu host_ceiling_bytes=%llu runtime_allowance=%llu\n",
-                         admission.admitted ? 1 : 0, admission.verified ? 1 : 0, admission.unknown_classes.size(),
-                         admission.devices.size(), admission.guest_fits ? 1 : 0, admission.host_fits ? 1 : 0,
-                         (unsigned long long)admission.guest_demand_bytes,
-                         (unsigned long long)admission.host_demand_bytes,
-                         (unsigned long long)admission.guest_ceiling_bytes,
-                         (unsigned long long)admission.host_ceiling_bytes,
-                         (unsigned long long)o.judge_runtime_allowance_bytes);
-            for (size_t i = 0; i < admission.devices.size(); ++i) {
-                const auto& line = admission.devices[i];
-                std::fprintf(stderr, "JUDGE_DEVICE_ADMISSION device=%zu name=%s demand_bytes=%llu "
-                                     "ceiling_bytes=%llu headroom_bytes=%llu fits=%d\n",
-                             i, line.name.c_str(), (unsigned long long)line.demand_bytes,
-                             (unsigned long long)line.ceiling_bytes, (unsigned long long)line.headroom_bytes,
-                             line.fits ? 1 : 0);
-            }
-        }
         if (!admission.admitted) {
             for (const auto& r : admission.reasons)
                 std::fprintf(stderr, "strata generate: admission refused: limiting=%s %s\n",
@@ -8334,12 +8131,6 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
-    if (!o.score_reference.empty() &&
-        (!strata::program::readout_reference::valid_ids(o.tokens, n_vocab, err) ||
-         !strata::program::readout_reference::valid_ids(o.score_select, n_vocab, err))) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 2;
-    }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -9148,7 +8939,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (o.judge_context || !auto_cache || attempt - failed >= 6) break;
+            if (!auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -9819,7 +9610,7 @@ int main(int argc, char** argv) {
     if (o.batch_mtp_third) {
         for (size_t st = 0; st <= stages.size(); ++st) {
             const auto& cache = st ? stages[st - 1]->cache : xcache;
-            if ((uint64_t)cache.bytes() != judge_generation_cache_bytes[st]) {
+            if ((uint64_t)cache.bytes() != full_generation_cache_bytes[st]) {
                 std::fprintf(stderr, "strata third owner: concrete full expert allocation differs from admission\n"); return 1;
             }
         }
@@ -11771,7 +11562,7 @@ int main(int argc, char** argv) {
             int dev = 0;
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
-                if (o.judge_context || o.batch_mtp_third) {
+                if (o.batch_mtp_third) {
                     std::fprintf(stderr, "strata fixed-capacity mode: generation prefill geometry does not fit; refusing, never resizing it\n");
                     return 1;
                 }
@@ -11793,7 +11584,7 @@ int main(int argc, char** argv) {
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
-            if (o.judge_context || o.batch_mtp_third) {
+            if (o.batch_mtp_third) {
                 std::fprintf(stderr, "strata fixed-capacity mode: %s; refusing, never retrying with reduced generation capacity\n", err.c_str());
                 return 1;
             }
@@ -12368,8 +12159,7 @@ int main(int argc, char** argv) {
             !o.retire_resident_source && !strata::prefill::Prefill::cpu_share_enabled() &&
             !o.prefill_auto && !o.prefill_head_alias && !o.prefill_helpers && !o.remote_expert_opt &&
             o.peer_device < 0 && o.pipeline_windows == 0 && !o.adapt_async && o.adapt_swaps == 0 &&
-            !o.kv_grow && !o.vram_elastic && !o.judge_context && !o.judge_overlap && !o.spec_split &&
-            !drive.d.fs && o.score_reference.empty() && sp.owns_work_buffers() &&
+            !o.kv_grow && !o.vram_elastic && !o.spec_split && !drive.d.fs && sp.owns_work_buffers() &&
             std::all_of(stages.begin(), stages.end(), [](const auto& stage) { return stage->sp.owns_work_buffers(); }) &&
             std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int64_t slots) { return slots != 0; }) &&
             std::none_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(), [](bool on) { return on; });
@@ -12476,37 +12266,6 @@ int main(int argc, char** argv) {
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
-        std::unique_ptr<strata::program::SerialJudgeLane> judge_lane;
-        if (o.judge_context) {
-            if (o.batch != judge_generation_slots || o.max_context != judge_generation_context ||
-                o.prefill_chunk != judge_generation_chunk || host_res.size() != 24576 ||
-                !std::all_of(host_res.begin(), host_res.end(), [](int32_t slot) { return slot >= 0; })) {
-                std::fprintf(stderr, "strata judge: refuses reduced generation geometry or incomplete expert residency\n"); return 1;
-            }
-            std::vector<strata::program::JudgeStage> bindings;
-            bindings.reserve(stages.size() + 1);
-            for (size_t k = 0; k <= stages.size(); ++k) {
-                auto& cache = k == 0 ? xcache : stages[k - 1]->cache;
-                if (cache.bytes() <= 0 || (uint64_t)cache.bytes() != judge_generation_cache_bytes[k]) {
-                    std::fprintf(stderr, "strata judge: concrete generation cache extent differs from the all-pair ledger\n"); return 1;
-                }
-                strata::program::JudgeStage stage;
-                stage.generation = k == 0 ? &session_owner : &stages[k - 1]->session_owner;
-                stage.prompt = k == 0 ? &sp : &stages[k - 1]->sp;
-                stage.verifier = &stage_ver((int)k);
-                stage.batch_peer = batch_mtp_pipeline ? &stage_peer((int)k) : nullptr;
-                stage.weights = k == 0 ? &wt : &stages[k - 1]->wt;
-                stage.stream = k == 0 ? main_cs : (void*)stages[k - 1]->stream;
-                bindings.push_back(stage);
-            }
-            judge_lane = std::make_unique<strata::program::SerialJudgeLane>();
-            if (!judge_lane->init(g, o.judge_context, K, n_vocab, judge_placement, bindings,
-                    stages.empty() ? native_head : stages.back()->head, use_mtp ? &mtp : nullptr, admission, err)) {
-                std::fprintf(stderr, "strata judge: %s\n", err.c_str()); return 1;
-            }
-            std::fprintf(stderr, "JUDGE_CAPACITY context=%lld batch_slots=%d prefill_chunk=%lld resident_pairs=24576 drafter_slots=%d independent=1\n",
-                         (long long)o.max_context, o.batch, (long long)o.prefill_chunk, o.batch);
-        }
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -15741,7 +15500,6 @@ int main(int argc, char** argv) {
             std::deque<std::string> lines;
             bool eof = false;
             std::atomic<uint64_t> command_epoch{0};
-            strata::program::score::Pending score_pending;
             // Transport registration fences only: no model state or admission policy
             // lives on the reader. Entries retire after the owner's terminal write.
             std::array<std::string, strata::program::native_submission_limit> native_tags;
@@ -15754,33 +15512,22 @@ int main(int argc, char** argv) {
         std::deque<std::string>& in_lines = in_shared->lines;
         bool& in_eof = in_shared->eof;
         std::atomic<uint64_t>& command_epoch = in_shared->command_epoch;
-        auto& score_pending = in_shared->score_pending;
-        auto score_write = [](const std::string& reply) {
+        auto write_reply = [](const std::string& reply) {
             std::printf("%s", reply.c_str());       // one stdio call: never interleave terminal bytes
             std::fflush(stdout);
         };
-        auto score_finish = [&](std::string_view id, std::string_view status,
-                                const strata::program::score::Request* request,
-                                const std::vector<float>* values, std::string_view error) {
-            std::lock_guard<std::mutex> lk(in_mu);
-            score_write(strata::program::score::terminal(id, status, request, values, error));
-            score_pending.complete(id);            // ownership ends only after terminal publication
-        };
-        std::thread([st = in_shared, private_preparation, retained_prompt, packed_frame_bytes, score_write] {
+        std::thread([st = in_shared, private_preparation, retained_prompt, packed_frame_bytes, write_reply] {
             auto& stop_req = st->stop_req;
             auto& in_mu = st->mu;
             auto& in_cv = st->cv;
             auto& in_lines = st->lines;
             auto& in_eof = st->eof;
             auto& command_epoch = st->command_epoch;
-            auto& score_pending = st->score_pending;
             strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
             std::string l, buf;
-            std::string oversized_id;
-            bool oversized_score = false;
             char chunk[4096];
             auto getline_fd = [&](std::string& out) -> bool {
                 for (;;) {
@@ -15791,10 +15538,7 @@ int main(int argc, char** argv) {
                             std::fflush(stdout);
                             std::_Exit(1);
                         }
-                        if (oversized_score) {
-                            out = "SCORE " + oversized_id + " oversized";
-                            oversized_score = false;
-                        } else out.assign(buf, 0, nlpos);
+                        out.assign(buf, 0, nlpos);
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
@@ -15804,12 +15548,6 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         std::_Exit(1);
                     }
-                    if (oversized_score) buf.clear();
-                    else if (buf.size() > strata::program::score::max_wire_bytes && buf.rfind("SCORE ", 0) == 0) {
-                        oversized_id = strata::program::score::request_id(std::string_view(buf).substr(0, 72));
-                        oversized_score = true;
-                        buf.clear();
-                    }
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
 #else
@@ -15817,18 +15555,13 @@ int main(int argc, char** argv) {
                     if (n < 0 && errno == EINTR) continue;
 #endif
                     if (n <= 0) {
-                        if (private_preparation && (!buf.empty() || oversized_score)) {
+                        if (private_preparation && !buf.empty()) {
                             std::fprintf(stdout, "FATAL incomplete command frame at EOF\n");
                             std::fflush(stdout);
                             std::_Exit(1);
                         }
-                        if (oversized_score) {
-                            out = "SCORE " + oversized_id + " oversized";
-                            oversized_score = false;
-                        } else {
-                            if (buf.empty()) return false;
-                            out.swap(buf);
-                        }
+                        if (buf.empty()) return false;
+                        out.swap(buf);
                         buf.clear();
                         return true;
                     }
@@ -15851,7 +15584,7 @@ int main(int argc, char** argv) {
                                          text.starts_with("BQRESUME ");
                     if (registration || input || control) {
                         if (!phase::valid_request(tag)) {
-                            score_write("FATAL malformed native submission tag\n"); std::_Exit(1);
+                            write_reply("FATAL malformed native submission tag\n"); std::_Exit(1);
                         }
                         size_t found = st->native_tags.size(), empty = found;
                         for (size_t i = 0; i < st->native_tags.size(); ++i) {
@@ -15860,10 +15593,10 @@ int main(int argc, char** argv) {
                         }
                         if (registration) {
                             if (found != st->native_tags.size()) {
-                                score_write("FATAL duplicate native submission tag\n"); std::_Exit(1);
+                                write_reply("FATAL duplicate native submission tag\n"); std::_Exit(1);
                             }
                             if (empty == st->native_tags.size()) {
-                                score_write("BQREJECT " + std::string(tag) + " -1 queue_full\n");
+                                write_reply("BQREJECT " + std::string(tag) + " -1 queue_full\n");
                                 continue;
                             }
                             st->native_tags[empty].assign(tag);
@@ -15874,7 +15607,7 @@ int main(int argc, char** argv) {
                             continue; // retired generations cannot create another terminal
                         } else if (input) {
                             if (st->native_input[found]) {
-                                score_write("FATAL duplicate native submission input\n"); std::_Exit(1);
+                                write_reply("FATAL duplicate native submission input\n"); std::_Exit(1);
                             }
                             st->native_input[found] = true;
                             const auto frames = std::count_if(in_lines.begin(), in_lines.end(),
@@ -15902,36 +15635,15 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (in_lines.size() >= strata::program::native_submission_limit * 5 + kPackedQueuedFrames) {
-                        score_write("FATAL native transport metadata bound exceeded\n"); std::_Exit(1);
+                        write_reply("FATAL native transport metadata bound exceeded\n"); std::_Exit(1);
                     }
                 } else {
                     while (private_preparation && in_lines.size() >= kPackedQueuedFrames)
                         in_cv.wait_for(lk, std::chrono::milliseconds(100));
                 }
-                if (l.rfind("SCANCEL ", 0) == 0) {
-                    const std::string_view id(l.data() + 8, l.size() - 8);
-                    if (strata::program::score::valid_id(id)) score_pending.cancel(id);
-                    continue;                       // no STOP and no cancellation of unrelated generation
-                }
-                if (l.rfind("SCORE ", 0) == 0) {
-                    const auto id = strata::program::score::request_id(l);
-                    if (!strata::program::score::valid_id(id)) {
-                        score_write(strata::program::score::terminal("-", "ERROR", nullptr, nullptr, "invalid score ID"));
-                        std::_Exit(1);              // no unrouteable/ambiguous owner may survive
-                    }
-                    const auto admitted = score_pending.admit(id);
-                    if (admitted == strata::program::score::Pending::Admission::duplicate) {
-                        score_write(strata::program::score::terminal(id, "ERROR", nullptr, nullptr, "duplicate score ID"));
-                        std::_Exit(1);
-                    }
-                    if (admitted == strata::program::score::Pending::Admission::full) {
-                        score_write(strata::program::score::terminal(id, "REJECT", nullptr, nullptr, "score queue is full"));
-                        continue;
-                    }
-                }
                 if (private_preparation) {
                     if (command_epoch.load() == UINT64_MAX) {
-                        score_write("FATAL command epoch exhausted\n");
+                        write_reply("FATAL command epoch exhausted\n");
                         std::_Exit(1);
                     }
                     command_epoch.fetch_add(1);
@@ -15943,7 +15655,7 @@ int main(int argc, char** argv) {
             in_eof = true;
             if (private_preparation) {
                 if (command_epoch.load() == UINT64_MAX) {
-                    score_write("FATAL command epoch exhausted at EOF\n");
+                    write_reply("FATAL command epoch exhausted at EOF\n");
                     std::_Exit(1);
                 }
                 command_epoch.fetch_add(1);
@@ -16124,9 +15836,6 @@ int main(int argc, char** argv) {
                         mtp.slot_state(b), page_size);
                 }
             }
-            std::printf("INFO score=1 score_version=1 score_max_prompt=%zu score_max_selected=%zu score_max_pending=%zu\n",
-                        strata::program::score::max_prompt_tokens, strata::program::score::max_selected_tokens,
-                        strata::program::score::max_pending);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -16186,31 +15895,6 @@ int main(int argc, char** argv) {
                         std::abort();
                     }
                 }).detach();
-        }
-        // First-authorised-run ownership reconciliation; no serving transport or deployment.
-        // Public token IDs only, bounded by the admitted lane. The same engine then serves
-        // ordinary generation requests, proving that the original execution binding resumed.
-        if (const char* text = std::getenv("STRATA_JUDGE_OWNERSHIP_PROBE")) {
-            std::vector<int64_t> probe;
-            if (!judge_lane || std::strlen(text) > 65536 || !parse_i64_list(text, probe, err) ||
-                probe.empty() || probe.size() > (size_t)o.judge_context) {
-                std::fprintf(stderr, "strata judge: invalid bounded ownership probe\n"); return 2;
-            }
-            uint64_t checksum = 0;
-            for (int pass = 0; pass < 2; ++pass) {
-                if (!judge_lane->run(UINT64_MAX - pass, probe.data(), (int64_t)probe.size(), err)) {
-                    std::fprintf(stderr, "strata judge: ownership probe: %s\n", err.c_str()); return 1;
-                }
-                const float* row = judge_lane->logits();
-                const uint64_t current = fnv1a(row, (size_t)n_vocab * sizeof(float));
-                if (pass && current != checksum) {
-                    std::fprintf(stderr, "strata judge: repeated fresh lease produced different native-head bytes\n"); return 1;
-                }
-                checksum = current;
-                std::fprintf(stderr, "JUDGE_PROBE pass=%d tokens=%zu vocabulary=%lld head_fnv64=%016llx argmax=%lld restored=1\n",
-                             pass, probe.size(), (long long)n_vocab, (unsigned long long)current,
-                             (long long)(std::max_element(row, row + n_vocab) - row));
-            }
         }
         // Advertise before readiness, including replicas that have not received work yet.
         if (report_throughput) std::printf("INFO throughput_progress=1\n");
@@ -16689,7 +16373,6 @@ int main(int argc, char** argv) {
             auto& counts = batch_drafts[b];
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-            if (judge_lane) judge_lane->observe_generation();
             phase_resident_done(b, reason);
             if (!packed_done(b, reason))
                 print_legacy_bdone(b, reason, ms, &counts);
@@ -16703,14 +16386,7 @@ int main(int argc, char** argv) {
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
         uint64_t batch_commit_epoch = 0; // monotonic across the resettable batch timing windows
-        const char* judge_timing_env = std::getenv("STRATA_JUDGE_TIMING");
-        const bool judge_timing = judge_timing_env && std::strcmp(judge_timing_env, "1") == 0;
-        const auto judge_commits = judge_timing && o.batch > 0 ? std::make_unique<JudgeCommitTrace>() : nullptr;
         auto emit_batch_token = [&](int slot, int32_t token) {
-            if (judge_commits) {
-                const auto& state = bs[(size_t)slot];
-                judge_commits->add(slot, state.request, state.p, state.produced);
-            }
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
                 !packed_owners[size_t(slot)].tag.empty()) {
                 const auto observation = resident_executors[size_t(slot)].observe(packed_owners[size_t(slot)].work, err);
@@ -17030,7 +16706,6 @@ int main(int argc, char** argv) {
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
-                if (judge_commits) judge_commits->flush();
             }
             return true;
         };
@@ -17044,9 +16719,6 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
             return v != nullptr && std::atoi(v) != 0;
         }();
-        if (o.judge_overlap && (!piped || !batch_mtp_pipeline || split_same)) {
-            std::fprintf(stderr, "strata judge: overlap requires the distinct-device batch-MTP pipeline\n"); return 2;
-        }
         if (synchronous_batch_mtp)
             std::fprintf(stderr, "strata generate: --batch-mtp forces the synchronous layer-split schedule: "
                                  "one eight-row quantum retained through target acceptance and prefix commit "
@@ -17259,7 +16931,6 @@ int main(int argc, char** argv) {
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_windows = bt_rows = 0;
-                if (judge_commits) judge_commits->flush();
                 // (not while a prompt is read in a request: its windows ran beside it, and the watchdog stays on for
                 // the rest of the read, STRATA_PIPED_CONCURRENT; the request's end turns it off)
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
@@ -17274,10 +16945,10 @@ int main(int argc, char** argv) {
         auto group_pool_user = [&](int group) -> void* {
             return group == 0 ? win_pool_user : group == 1 ? (void*)&split_drive_b : (void*)third_drive.get();
         };
-        auto pump_mtp = [&](bool may_start, int released_stages = INT_MAX, bool may_retire = true) -> bool {
+        auto pump_mtp = [&](bool may_start) -> bool {
             ++pipe_tick;
             if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
-            for (int k = 0; k < std::min(n_pipe, released_stages); ++k) {
+            for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
                 const int r = group_verifier(k, gi).batch_poll(win_pool_fn, group_pool_user(gi), err);
@@ -17298,7 +16969,7 @@ int main(int argc, char** argv) {
                 if (gi >= 0) host_experts_running = host_experts_running ||
                     group_verifier(k, gi).batch_uses_host_experts();
             }
-            if (may_retire && !host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
+            if (!host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
                 PGroup& G = pg[(size_t) gi];
                 if (!G.inflight || G.stage != n_pipe) continue;
                 strata::core::Verifier& head = group_verifier(n_pipe - 1, gi);
@@ -17370,7 +17041,7 @@ int main(int argc, char** argv) {
                 G.inflight = false;
             }
             for (int k = n_pipe - 1; k >= 0; --k) {
-                if (k >= released_stages || k == retained_blocked_stage) continue;
+                if (k == retained_blocked_stage) continue;
                 if (stage_group[(size_t) k] >= 0) continue;
                 int pick = -1;
                 if (k > 0) {
@@ -17382,15 +17053,6 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!may_retire) {
-                            bool stopped = false;
-                            for (int t = 0; t < (o.batch_mtp_floating ? 4 : GS); ++t) {
-                                if (o.batch_mtp_floating && seat_leased(t)) continue;
-                                const auto& slot = bs[(size_t)(o.batch_mtp_floating ? t : gi * GS + t)];
-                                stopped = stopped || (slot.active && slot.stop);
-                            }
-                            if (stopped) continue; // retain the group's bounded-round opportunity until retirement is safe
-                        }
                         if (!pg[(size_t) gi].inflight && group_active(gi) &&
                             (!bounded_round || !pg[(size_t) gi].round_started)) pick = gi;
                     }
@@ -17501,7 +17163,7 @@ int main(int argc, char** argv) {
                     G.inflight = true;
                     G.stage = 0;
                     drive.d.failed = false;
-                    if (may_retire) apply_pending(false);
+                    apply_pending(false);
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::Verifier& owner = group_verifier(k, pick);
@@ -17546,7 +17208,6 @@ int main(int argc, char** argv) {
                                          (long long) v.windows, v.ms_commit, v.ms_commit / (double) v.windows);
                         }
                 bt_windows = bt_rows = bt_tokens = 0;
-                if (judge_commits) judge_commits->flush();
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
             }
             return true;
@@ -17618,7 +17279,7 @@ int main(int argc, char** argv) {
             }
             return command.rfind("BYIELD", 0) == 0;
         };
-        auto score_controls = [&](bool consume_yield = true) {
+        auto generation_controls = [&](bool consume_yield = true) {
             // Do not lift slot-number controls past admissions: that would cancel
             // the wrong incarnation. Only consume a contiguous control prefix.
             for (;;) {
@@ -17655,102 +17316,6 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             return true;
         };
-        auto score_peer_round = [&](std::string& why) {
-            score_controls();
-            if (batch_on() && !decode_round(false)) {
-                why = err.empty() ? "score peer decode failed" : err;
-                return false;
-            }
-            strata::core::progress().busy.store(true);
-            strata::core::progress_at("scoring prompt");
-            return true;
-        };
-        // One pointer-sized capture; do not allocate a new callback per span.
-        const std::function<bool(std::string&)> judge_peer =
-            [&score_peer_round](std::string& why) { return score_peer_round(why); };
-        const std::function<bool(std::string&)> no_judge_peer;
-        bool score_overlap_seen = false;
-        int score_overlap_device = -1, generation_overlap_device = -1;
-        int64_t overlap_query_begin = 0, overlap_query_end = 0;
-        auto score_stage_progress = [&](size_t released, std::string& why) {
-            if (released > (size_t)n_pipe) { why = "score released-stage range invalid"; return false; }
-            if (released == 0) {
-                if (pipe_inflight()) { why = "score overlap entered with live generation owners"; return false; }
-                score_controls();
-                bounded_round = true;
-                for (auto& group : pg) group.round_started = false;
-                score_overlap_seen = false;
-                score_overlap_device = generation_overlap_device = -1;
-                overlap_query_begin = overlap_query_end = 0;
-                return true;
-            }
-            const bool all_released = released == (size_t)n_pipe;
-            score_controls();
-            do {
-                if (!pump_mtp(true, (int)released, all_released)) {
-                    why = err.empty() ? "score overlapped generation failed" : err;
-                    return false;
-                }
-                // A bounded diagnostic witness: both streams outstanding during
-                // the same host query bracket, not synchronized GPU-clock arithmetic.
-                if (judge_timing && !all_released && !score_overlap_seen) {
-                    for (int k = 0; k < (int)released && !score_overlap_seen; ++k) {
-                        const int gi = stage_group[(size_t)k];
-                        if (gi < 0) continue;
-                        auto& generation = group_verifier(k, gi);
-                        for (int s = (int)released; s < n_pipe && !score_overlap_seen; ++s) {
-                            auto& scoring = stages[(size_t)s - 1]->sp;
-                            const auto begin = Clock::now();
-                            cudaError_t first, middle, last;
-                            {
-                                const strata::core::OnDevice on(scoring.device());
-                                first = cudaStreamQuery((cudaStream_t)scoring.stream());
-                            }
-                            {
-                                const strata::core::OnDevice on(generation.device());
-                                middle = cudaStreamQuery(generation.stream());
-                            }
-                            {
-                                const strata::core::OnDevice on(scoring.device());
-                                last = cudaStreamQuery((cudaStream_t)scoring.stream());
-                            }
-                            for (cudaError_t status : {first, middle, last})
-                                if (status != cudaSuccess && status != cudaErrorNotReady) {
-                                    why = "score overlap stream observation failed"; return false;
-                                }
-                            if (first == cudaErrorNotReady && middle == cudaErrorNotReady && last == cudaErrorNotReady) {
-                                score_overlap_seen = true;
-                                score_overlap_device = scoring.device();
-                                generation_overlap_device = generation.device();
-                                overlap_query_begin = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    begin.time_since_epoch()).count();
-                                overlap_query_end = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    Clock::now().time_since_epoch()).count();
-                            }
-                        }
-                    }
-                }
-                if (!all_released) return true;
-                bool pending = pipe_inflight();
-                for (size_t group = 0; group < pg.size(); ++group)
-                    pending = pending || (group_active((int)group) && !pg[group].round_started);
-                if (!pending) break;
-            } while (true);
-            bounded_round = false;
-            last_decode = Clock::now();
-            strata::core::progress().busy.store(true);
-            strata::core::progress_at("scoring prompt");
-            if (judge_timing)
-                std::fprintf(stderr, "JUDGE_OVERLAP request=%llu observed=%d scoring_device=%d generation_device=%d "
-                                     "query_begin_ns=%lld query_end_ns=%lld scope=outstanding_streams\n",
-                             (unsigned long long)resident.working().request, score_overlap_seen ? 1 : 0,
-                             score_overlap_device, generation_overlap_device,
-                             (long long)overlap_query_begin, (long long)overlap_query_end);
-            return true;
-        };
-        const std::function<bool(size_t, std::string&)> judge_overlap =
-            [&score_stage_progress](size_t released, std::string& why) { return score_stage_progress(released, why); };
-        const std::function<bool(size_t, std::string&)> no_judge_overlap;
         uint64_t working_capacity = 0, resident_capacity = 0;
         for (size_t k = 0; k <= stages.size(); ++k) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
@@ -17766,8 +17331,6 @@ int main(int argc, char** argv) {
             working_capacity += working;
             resident_capacity += resident;
         }
-        strata::program::score::Request score_request; // retain bounded host staging across scoring requests
-        std::vector<float> score_values;
         size_t native_capacity = 0;
         auto native_reject = [&](PackedOwner& owner, const char* reason) {
             std::printf("BQREJECT %s -1 %s\n", owner.tag.c_str(), reason);
@@ -18054,8 +17617,7 @@ int main(int argc, char** argv) {
                 for (int64_t token : owner.tokens)
                     if (token < 0 || token >= n_vocab) why = "token outside vocabulary";
                 if (owner.input.shared_scope.valid() && (!store_on || !owner.input.scope.valid() ||
-                    !o.score_reference.empty() || owner.input.pin <= 0 ||
-                    owner.input.pin >= int64_t(owner.tokens.size()) - 1 ||
+                    owner.input.pin <= 0 || owner.input.pin >= int64_t(owner.tokens.size()) - 1 ||
                     !owner.input.checkpoint || o.prompt_cache < 3)) {
                     std::fprintf(stderr, "strata serve: shared prefix ignored: no usable private scope, store, text pin seam\n");
                     owner.input.shared_scope = {}; // ordinary/private pin semantics are unchanged
@@ -19137,7 +18699,6 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count(), next_phase);
             return true;
         };
-        bool reference_pending = !o.score_reference.empty();
         for (;;) {
             line_drain_ms = 0.0;
             if (retained_prompt) {
@@ -19192,7 +18753,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (time_budget.enabled()) {
-                score_controls();
+                generation_controls();
                 if (!retire_stopped()) return 1;
                 bool generation_waiting = false;
                 {
@@ -19211,12 +18772,6 @@ int main(int argc, char** argv) {
                 }
             }
             bool drain_pipe_for_command = false;
-            if (reference_pending) {
-                line = "GEN 1 ckpt=0 ";
-                for (size_t i = 0; i < o.tokens.size(); ++i)
-                    line += (i ? "," : "") + std::to_string(o.tokens[i]);
-                reference_pending = false;
-            } else
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     // No admission is waiting: keep the native pipeline filled.
@@ -19288,14 +18843,7 @@ int main(int argc, char** argv) {
                     return group.inflight;
                 }) : 0;
                 const auto td = Clock::now();
-                if (!pipe_drain()) {
-                    if (line.rfind("SCORE ", 0) == 0) {
-                        score_finish(strata::program::score::request_id(line), "ERROR", nullptr, nullptr,
-                                     "score pipeline drain failed");
-                        std::_Exit(1);
-                    }
-                    return 1;
-                }
+                if (!pipe_drain()) return 1;
                 if (trace) {
                     line_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     std::fprintf(stderr, "strata trace: drain for %.*s: %d groups in flight, %.1f ms\n",
@@ -19407,7 +18955,7 @@ int main(int argc, char** argv) {
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
-            if (line.rfind("SCORE ", 0) != 0 && !adapt_tick(true)) {
+            if (!adapt_tick(true)) {
                 phase_error("ERR an adaptive refill failed\n");
                 return 1;
             }
@@ -19448,147 +18996,6 @@ int main(int argc, char** argv) {
                     strata::core::progress_at("idle");
                 }
             } busy_scope;
-            if (line.rfind("SCORE ", 0) == 0) {
-                namespace score = strata::program::score;
-                auto& request = score_request;
-                std::string score_error;
-                const auto id = score::request_id(line);
-                bool parsed = false;
-                try {
-                    parsed = score::parse(line, o.max_context, n_vocab, request, score_error);
-                } catch (const std::exception& failure) {
-                    score_finish(id, "ERROR", nullptr, nullptr, failure.what());
-                    std::_Exit(1);
-                }
-                if (!parsed) {
-                    score_finish(id, "REJECT", nullptr, nullptr, score_error);
-                    continue;                       // ordinary refusal: no working-state mutation
-                }
-                auto cancelled = [&] {
-                    std::lock_guard<std::mutex> lk(in_mu);
-                    return in_eof || score_pending.cancelled(id);
-                };
-                if (cancelled()) {
-                    score_finish(id, "CANCELLED", nullptr, nullptr, "cancelled before prompt read");
-                    continue;
-                }
-                const float* score_row = logits.data();
-                auto run_score = [&]() -> bool {
-                    if (!adapt_tick(true) || !restore_alias_head(score_error, "score") ||
-                        !resident.begin_score(score_error)) return false;
-                    if (judge_lane && request.prompt.size() <= (size_t)o.judge_context) {
-                        std::printf("SADMIT %s v1 prompt_tokens=%zu selected_tokens=%zu\n",
-                                    request.id.c_str(), request.prompt.size(), request.selected.size());
-                        std::fflush(stdout);
-                        if (judge_timing)
-                            std::fprintf(stderr, "JUDGE_DISPATCH wire=%s request=%llu ns=%lld\n", request.id.c_str(),
-                                         (unsigned long long)resident.working().request,
-                                         (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             Clock::now().time_since_epoch()).count());
-                        if (!judge_lane->run(resident.working().request, request.prompt.data(),
-                                             (int64_t)request.prompt.size(), score_error, cancelled, o.judge_quantum,
-                                             o.judge_quantum && judge_cooperate && !o.judge_overlap && batch_on()
-                                                 ? judge_peer : no_judge_peer,
-                                             o.judge_overlap && batch_on() ? judge_overlap : no_judge_overlap)) return false;
-                        score_row = judge_lane->logits();
-                        return cancelled() || score_row != nullptr;
-                    }
-                    if (!ver.set_logit_bias({}, score_error)) return false;
-                    ver.set_history(nullptr, 0);
-                    // The transient working state is never a cached generation prefix.
-                    live_ok = false;
-                    live.clear(); live_imgs.clear(); checks.clear();
-                    live_scope = {};
-                    tail_ckpt_len = -1;
-                    conversations.limit_reuse(0);
-                    if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(true);
-                    auto quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
-                    if (kvg.on && !kvg_ensure((int64_t) request.prompt.size(), quiesce)) {
-                        score_error = "score working KV capacity failed"; return false;
-                    }
-                    if (!mrope_identity) {
-                        const size_t cells = mrope_host.size() / 3;
-                        for (size_t cell = 0; cell < cells; ++cell)
-                            for (size_t axis = 0; axis < 3; ++axis)
-                                mrope_host[cell * 3 + axis] = (int32_t) cell;
-                        auto upload = [&](int32_t* device, cudaStream_t stream) {
-                            return cudaMemcpyAsync(device, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                                   cudaMemcpyHostToDevice, stream) == cudaSuccess &&
-                                   cudaStreamSynchronize(stream) == cudaSuccess;
-                        };
-                        if (!upload(d_mrope, main_stream)) { score_error = "score position upload failed"; return false; }
-                        for (auto& stage : stages) {
-                            const strata::core::OnDevice on(stage->dev);
-                            if (!upload(stage->mrope, stage->stream)) {
-                                score_error = "score stage position upload failed"; return false;
-                            }
-                        }
-                        mrope_identity = true;
-                    }
-                    strata::core::session_zero(ss, g, nullptr, main_cs);
-                    if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
-                        score_error = "score session reset failed"; return false;
-                    }
-                    for (auto& stage : stages) {
-                        const strata::core::OnDevice on(stage->dev);
-                        strata::core::session_zero(stage->ss, g, nullptr, (void*) stage->stream);
-                        if (cudaStreamSynchronize(stage->stream) != cudaSuccess) {
-                            score_error = "score stage reset failed"; return false;
-                        }
-                    }
-                    std::printf("SADMIT %s v1 prompt_tokens=%zu selected_tokens=%zu\n",
-                                request.id.c_str(), request.prompt.size(), request.selected.size());
-                    std::fflush(stdout);
-                    int32_t tokens[strata::kernels::kVerifyMaxT], unused[strata::kernels::kVerifyMaxT];
-                    int final_row = 0;
-                    for (size_t position = 0; position < request.prompt.size();) {
-                        if (cancelled()) return true;  // the last launched window has already drained
-                        const int count = (int) std::min<size_t>((size_t) o.spec, request.prompt.size() - position);
-                        for (int row = 0; row < count; ++row) tokens[row] = (int32_t) request.prompt[position + row];
-                        struct NoSampling {
-                            strata::core::Verifier& verifier;
-                            explicit NoSampling(strata::core::Verifier& v) : verifier(v) { verifier.set_head_sampling(false); }
-                            ~NoSampling() { verifier.set_head_sampling(true); }
-                        } no_sampling(ver);
-                        drive.d.layers = drive.d.experts = 0;
-                        drive.d.failed = false;
-                        if (!ver.run(count, tokens, (int64_t) position, win_pool_fn, win_pool_user, unused, score_error) ||
-                            drive.d.failed || ver.nonfinite_row() >= 0) {
-                            if (drive.d.failed && drive.d.fail) score_error = drive.d.fail;
-                            else if (ver.nonfinite_row() >= 0) score_error = "non-finite score prompt logits";
-                            return false;
-                        }
-                        if (!ver.commit(count, score_error) || !ver.wait_commit(score_error)) return false;
-                        final_row = count - 1;
-                        position += (size_t) count;
-                        strata::core::progress_beat();
-                        if (position < request.prompt.size() && batch_on()) {
-                            ver.set_head_sampling(true);  // unrelated resident rows keep their own generation policy
-                            if (!decode_round(false)) { score_error = "score peer decode failed"; return false; }
-                        }
-                    }
-                    if (cancelled()) return true;
-                    return ver.read_logits_rows(final_row, final_row + 1, logits.data(), score_error);
-                };
-                auto& values = score_values;
-                values.clear();
-                bool ok = false;
-                try {
-                    ok = run_score();
-                    if (ok && !cancelled())
-                        ok = score::select_logits(score_row, n_vocab, request.selected, values, score_error);
-                } catch (const std::exception& failure) {
-                    score_error = failure.what();
-                }
-                if (!ok) {
-                    score_finish(id, "ERROR", nullptr, nullptr,
-                                 score_error.empty() ? "score device/working state failed" : score_error);
-                    std::_Exit(1);                  // no destructor or later owner may touch the poisoned state
-                }
-                if (cancelled()) score_finish(id, "CANCELLED", nullptr, nullptr, "cancelled during prompt read");
-                else score_finish(id, "OK", &request, &values, {});
-                continue;                           // no T/BT/DONE/BDONE and no sampling or MTP leg
-            }
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;
@@ -19995,7 +19402,7 @@ int main(int argc, char** argv) {
             }
             const int64_t n = (int64_t) ids.size();
             if (req_shared_scope.valid() && (!store_on || !req_scope.valid() || geni ||
-                !o.score_reference.empty() || req_pin <= 0 || req_pin >= n - 1 || !req_ckpt || o.prompt_cache < 3)) {
+                req_pin <= 0 || req_pin >= n - 1 || !req_ckpt || o.prompt_cache < 3)) {
                 std::fprintf(stderr, "strata serve: shared prefix ignored: no usable private scope, store, text pin seam\n");
                 req_shared_scope = {};
             }
@@ -21571,7 +20978,7 @@ int main(int argc, char** argv) {
                 if (!time_budget.enabled()) return true;
                 credit_service();
                 const auto begin = Clock::now();
-                score_controls(false); // a BYIELD stays ordered until it can park
+                generation_controls(false); // a BYIELD stays ordered until it can park
                 const bool was_reading = in_prompt_read;
                 in_prompt_read = true;
                 bool okay = retire_stopped();
@@ -21723,7 +21130,7 @@ int main(int argc, char** argv) {
                 auto prompt_controls = [&](int64_t q) -> bool {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     if (q <= read_from) return true; // no zero-progress re-yield of a restored native leg
-                    score_controls(false);
+                    generation_controls(false);
                     if (!retire_stopped()) { batch_fatal = true; e = "resident cancellation failed"; return false; }
                     for (;;) {
                         std::string control;
@@ -21769,7 +21176,7 @@ int main(int argc, char** argv) {
                             for (size_t k = 0; k < stages.size(); ++k)
                                 if (owner == &stages[k]->sp) stage = (int)k + 1;
                             if (stage < 0) { why = "retained prefill: unknown device owner"; return false; }
-                            score_controls(false);
+                            generation_controls(false);
                             bool may_start = true;
                             bool work = pipe_inflight();
                             if (time_budget.enabled()) {
@@ -21981,7 +21388,7 @@ int main(int argc, char** argv) {
                                 decode_ms += std::chrono::duration<double, std::milli>(last_decode - begin).count();
                                 if (!okay) { pump_ok = false; break; }
                             }
-                            score_controls(false);   // BSTOP/BPRIORITY, a contiguous prefix: never past an admission
+                            generation_controls(false);   // BSTOP/BPRIORITY, a contiguous prefix: never past an admission
                             const double retired_mark = resident_round_ms;
                             const bool retired = retire_stopped();
                             decode_ms += std::max(0.0, resident_round_ms - retired_mark);
@@ -22495,32 +21902,6 @@ int main(int argc, char** argv) {
                 }
             }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-            if (!o.score_reference.empty()) {
-                // The prompt reader stops at n-1. Consume its final input token,
-                // without a pick, to obtain the prediction for position n.
-                if (cancelled || nf_hit || resume != 0 || ids != o.tokens || at != n - 1) {
-                    std::fprintf(stderr, "strata reference: incomplete or nonfresh prompt read\n");
-                    return 1;
-                }
-                ver.set_head_sampling(false);
-                const int32_t last = (int32_t) ids.back();
-                int32_t unused = 0;
-                drive.d.layers = drive.d.experts = 0;
-                drive.d.failed = false;
-                if (!ver.run(1, &last, n - 1, win_pool_fn, win_pool_user, &unused, err) ||
-                    drive.d.failed || nonfinite_hit(ver, "reference") ||
-                    !ver.read_logits_rows(0, 1, logits.data(), err) ||
-                    !ver.commit(1, err) || !ver.wait_commit(err) ||
-                    !strata::program::readout_reference::write(o.score_reference, logits.data(), n_vocab,
-                                                             n, o.score_select, err)) {
-                    std::fprintf(stderr, "strata reference: %s\n", err.empty() ? "verification failed" : err.c_str());
-                    return 1;
-                }
-                std::printf("REFERENCE position=%lld selected=%zu mode=fresh engine_mode=serial_solo generated_tokens=0\n",
-                            (long long) n, o.score_select.size());
-                std::fflush(stdout);
-                return 0;
-            }
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
@@ -23714,7 +23095,6 @@ int main(int argc, char** argv) {
                     phase_error("ERR %s\n", err.c_str()); return 1;
                 }
             }
-            if (judge_lane) judge_lane->observe_generation();
             if (admit_slot < 0)
                 phase_finish(yielded_at >= 0 ? "yielded" : std::strcmp(finish, "cancel") == 0 ? "cancelled" :
                     std::strcmp(finish, "nonfinite") == 0 ? "error" : "completed");

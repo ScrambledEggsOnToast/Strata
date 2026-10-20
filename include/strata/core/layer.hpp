@@ -304,10 +304,8 @@ bool shared_rope_enabled();
 uint64_t shared_rope_device_bytes(const ModelGeometry& g, int64_t max_cells);
 uint64_t shared_rope_host_bytes();
 /// Preallocation compatibility check, without publishing or changing registrations.
-/// require_existing is used by the short lane: it may borrow, never build a second table.
 /// Returns a precise static refusal reason, or nullptr (also when process sharing is off).
-const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device,
-                                      bool require_existing = false);
+const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device);
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
                          const strata::plan::QsaPlacement* placement = nullptr);

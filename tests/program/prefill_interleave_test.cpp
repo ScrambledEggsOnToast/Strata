@@ -350,12 +350,12 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
         // #255: the concurrent gate reads these; the harness never enables it.
         const char* pcie_mode = "pinned";
         int expert_cache_remote[3] = {0, 0, 0};
-        bool resident_multiplex = false, judge_context = false, judge_overlap = false;
+        bool resident_multiplex = false;
         bool adapt_async = false, spec_split = false;
         bool batch_mtp_third = false;
     };
     const Options o{batch, 6, 32, budget_ms, retained_schedule ? retained_schedule->checkpoint_every : 0,
-                    "pinned", {0, 0, 0}, false, false, false, false, false, concurrent && concurrent->third};
+                    "pinned", {0, 0, 0}, false, false, false, concurrent && concurrent->third};
     std::vector<int64_t> ids((size_t) n);
     for (int64_t i = 0; i < n; ++i) ids[(size_t)i] = i;
     struct Stage { strata::prefill::Prefill sp; };
@@ -608,7 +608,7 @@ static Result read_prompt(double budget_ms, bool piped, bool split, bool active,
             ++result.cancel_controls;
         }
     };
-    const auto score_controls = [&](bool consume_yield) {
+    const auto generation_controls = [&](bool consume_yield) {
         for (;;) {
             std::string control;
             {

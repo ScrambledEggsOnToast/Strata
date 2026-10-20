@@ -177,8 +177,8 @@ and its arrival/promotion/refusal boundaries can be reconciled with HTTP usage a
 The `StreamingExecutor` candidate binds only the serial working request (`GEN`, destination `-1`),
 not a `ResidentSlot` seat. Initial integration selects **original and effective batch zero**, a
 live `--windowed-experts` source, fixed independently owned prefill scratch on every stage, and
-`STRATA_PREFILL_CPU_SHARE=0`. Adaptive, elastic, peer/helper/remote, lookahead, judge, image,
-head-alias and score-reference compositions keep their existing paths. Selection uses those
+`STRATA_PREFILL_CPU_SHARE=0`. Adaptive, elastic, peer/helper/remote, lookahead, image and
+head-alias compositions keep their existing paths. Selection uses those
 resolved ownership facts and accepted memory admission, never the plan's `mode` label alone.
 Serial zero-seat serving is labeled `streaming`; that is a request-path label, not a claim that
 experts or KV are fully resident.
@@ -723,7 +723,7 @@ so the slots never wait for the read and the read is one run with no drain insid
   `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
   unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
   pictures is read the usual way. Packed or retained prefill, retained prompts,
-  `--resident-multiplex`, the judge lane, `--adapt-async`, `--spec-split` and
+  `--resident-multiplex`, `--adapt-async`, `--spec-split` and
   `STRATA_PREFILL_PIPE` still exclude it; the reason is printed once. A **retired**
   windowed ring (`--retire-resident-source`) is allowed because its completed fill
   cannot hand out or recycle more buffers during serving.

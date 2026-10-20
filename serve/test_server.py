@@ -2371,7 +2371,7 @@ class CrossConversationPrefix(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.svc.lifecycle_local.record = {
-            "_cache_principal": ("principal", "client-key", credential_fingerprint("client-key")), "_score": False}
+            "_cache_principal": ("principal", "client-key", credential_fingerprint("client-key"))}
         self.httpd = None
 
     def post(self, body, *, path="/v1/chat/completions", token="client-key", tenant=None):
@@ -2565,12 +2565,8 @@ class CrossConversationPrefix(unittest.TestCase):
         self.assertNotIn("_strata_cache_shared_scope", request)
         self.assertIn("image omitted", messages[2]["content"][0]["text"])
 
-    def test_score_and_fallback_rendering_never_share(self):
-        self.svc.lifecycle_local.record["_score"] = True
+    def test_fallback_rendering_never_shares(self):
         request = {"strata_shared_prefix": {"tokens": 4}}
-        self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
-        self.assertNotIn("_strata_cache_shared_scope", request)
-        self.svc.lifecycle_local.record["_score"] = False
         self.svc.template_fallback = True
         self.svc.prepare(SharedPrefix.MSGS, None, {}, 4, req=request)
         self.assertNotIn("_strata_cache_shared_scope", request)

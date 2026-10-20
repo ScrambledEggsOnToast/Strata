@@ -785,15 +785,14 @@ uint64_t shared_rope_device_bytes(const ModelGeometry& g, int64_t cells) {
 uint64_t shared_rope_host_bytes() {
     return shared_rope_enabled() ? sizeof(shared_rope) + sizeof(shared_rope_mutex) : 0;
 }
-const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device,
-                                      bool require_existing) {
+const char* shared_rope_session_invalid(const ModelGeometry& g, int64_t cells, int device) {
     if (!shared_rope_enabled()) return nullptr;
     if (device < 0 || device >= kSharedRopeDevices) return "shared RoPE: allocation device is outside the registry";
     const auto shape = qsa_shapes(g);
     if (const char* why = SharedRopeTable::invalid_geometry(cells, shape.n_rot)) return why;
     const std::lock_guard<std::mutex> lock(shared_rope_mutex);
     const auto& entry = shared_rope[device];
-    if (!entry.data && !require_existing) return nullptr; // first generation owner will publish
+    if (!entry.data) return nullptr; // first generation owner will publish
     SharedRopeView view;
     return entry.borrow(device, device, cells, shape.n_rot, strata::kernels::rope_scaling(), view);
 }

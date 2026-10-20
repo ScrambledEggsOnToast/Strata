@@ -142,9 +142,6 @@ int main() {
         kernels::rope_scaling_set(changed_scaling); // deliberate invalid test input; no captured graph or inference
         refused(geometry, cells, "shared RoPE: frequency base differs");
         kernels::rope_scaling_set(scaling);
-        const char* why = core::shared_rope_session_invalid(geometry, cells, 1, true);
-        check(why && std::strcmp(why, "shared RoPE: no published process-owned table on this device") == 0,
-              "judge preflight requires an existing table on each actual generation device");
         {
             core::SessionOwner failed;
             fail_copy = 0; // reused table needs no upload; fail the short page-table initialization

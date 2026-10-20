@@ -71,11 +71,6 @@ public:
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
 
-    /// Retained first-use BF16 conversion buffers, distinct from the borrowed initialized workspace.
-    uint64_t bf16_conversion_bytes() const {
-        return (uint64_t)(tc_w_elems_ + tc_x_elems_) * sizeof(uint16_t);
-    }
-
     /// Opt-in native dequant/GEMM event envelopes; fixed storage, no added joins.
     static uint64_t native_profile_host_bytes();
     void native_profile_context(uint64_t request, int64_t position);

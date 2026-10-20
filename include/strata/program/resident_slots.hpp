@@ -226,8 +226,6 @@ public:
     // yielded resend or solo-to-parked-slot promotion retains identity and seed.
     bool begin(int destination, const std::vector<int64_t>& prompt, const ResidentRequest& request,
                std::string& error);
-    // Fresh transient scoring identity, no generated-token budget, draft or resident admission.
-    bool begin_score(std::string& error);
     const ResidentWorking& working() const { return working_; }
     int64_t take_prefill_split_until() { return std::exchange(working_.prefill_split_until, 0); }
     // The plan of the read being resumed after a BYIELD, so it goes on in the same chunks (read_part).

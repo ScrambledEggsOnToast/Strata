@@ -162,18 +162,7 @@ public:
     bool release_dflash2_capture(core::dflash2::CaptureOwner owner, std::string& err);
     bool context_idle(std::string& err) const;
 
-    /// Serial, allocation-free session lease. The caller stops all generation submitters first.
-    /// Accepts only independently owned resident state with identical artifact/stage/KV geometry,
-    /// on the original device and stream, within the retained max-block scratch. No relayout,
-    /// new Gemm/cuBLAS handle, cache loan or graph capture occurs. Validate every stage before
-    /// rebinding any stage; restore every original session/request before generation resumes.
-    bool validate_rebind(const core::SessionState& ss, void* stream, uint64_t request, std::string& err) const;
-    bool rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err);
-    core::SessionState* bound_session() const;
-    const void* gemm_owner() const;
-    uint64_t bf16_conversion_bytes() const;
     void* stream() const;
-    uint64_t bound_request() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
@@ -317,13 +306,6 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
-    /// One bounded private-state span. A non-null callback argument certifies that
-    /// stage's complete local execution; only that callback may restore its original
-    /// generation binding while descendants retain their handoffs. Null calls pump
-    /// already-released peers. The callback must drain peers on the final release.
-    /// All descendants are joined on every return, including callback failures.
-    bool run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
-                    const std::function<bool(Prefill*, std::string&)>& step);
 
     /// Same arithmetic as run(), with disjoint owner intervals in one union-row chunk. The command predicate
     /// is checked only before stage 0 issues a pack; pending commands drain the issued chain and return

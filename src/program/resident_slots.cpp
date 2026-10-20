@@ -139,28 +139,6 @@ bool ResidentSlots::begin(int destination, const std::vector<int64_t>& prompt,
     return true;
 }
 
-bool ResidentSlots::begin_score(std::string& error) {
-    if (working_failed_ || stages_.empty() || next_request_ == UINT64_MAX) {
-        error = "score working owner unavailable"; return false;
-    }
-    if (!idle(error)) return false;
-    working_failed_ = true;
-    working_.prefill_split_until = 0;
-    ResidentWorking next;
-    next.request = ++next_request_;
-    next.sampling.greedy = true;
-    next.sampling.temperature = 0;
-    if (!stages_[0].verifier->set_request_id(next.request, error)) return false;
-    stages_[0].verifier->set_sampling(next.sampling);
-    dispatch_.request_generation = next.request;
-    working_ = next;
-    input_ = {};
-    destination_ = -1;
-    working_prompt_ = nullptr;
-    working_failed_ = false;
-    return true;
-}
-
 ResidentSlots::~ResidentSlots() {
     // The resource owners outlive us. Drain before histories borrowed by a
     // verifier are destroyed, including on a failed transition/early return.

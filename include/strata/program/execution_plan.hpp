@@ -43,10 +43,10 @@ struct ExecutionPlanInput {
     bool resident_multiplex = false, prompt_cache = false, packed_prefill = false, retained_prefill = false;
     bool retained_prompt = false; ///< serial private preparation, independent of union-row/layer experiments
     int64_t prefill_chunk = 2048;
-    bool private_preparation_static = true; ///< fixed text owners; no auto/elastic/adaptive/helper/judge composition
+    bool private_preparation_static = true; ///< fixed text owners; no auto/elastic/adaptive/helper composition
     double foreground_budget_ms = 0, background_share = 0.25;
     bool piped_concurrent = false;
-    bool judge_lane = false, spec_split = false, prefill_pipe = false;
+    bool spec_split = false, prefill_pipe = false;
 };
 
 // One admitted memory class, as priced by the admission decision's scope. `unknown` classes carry no byte
@@ -230,7 +230,6 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         else if (in.retained_prompt) p.concurrent_reader.reason = "retained prompt";
         else if (in.retained_prefill) p.concurrent_reader.reason = "retained prefill";
         else if (in.resident_multiplex) p.concurrent_reader.reason = "--resident-multiplex";
-        else if (in.judge_lane) p.concurrent_reader.reason = "the judge lane";
         else if (in.adapt_async) p.concurrent_reader.reason = "--adapt-async";
         else if (in.spec_split) p.concurrent_reader.reason = "--spec-split";
         else if (in.prefill_pipe) p.concurrent_reader.reason = "STRATA_PREFILL_PIPE";
@@ -247,8 +246,6 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
             refusal = "retained prompt needs batch MTP and --spec >= 2";
         else if (in.packed_prefill || in.retained_prefill)
             refusal = "retained prompt excludes packed and retained-layer execution";
-        else if (in.judge_lane)
-            refusal = "retained prompt excludes the judge lane: private preparation ownership is not ported";
         else if (in.prefill_chunk != 2048 || !in.private_preparation_static)
             refusal = "retained prompt needs fixed 2048 scratch and static text owners";
         if (!refusal.empty()) {

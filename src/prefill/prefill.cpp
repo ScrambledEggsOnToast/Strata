@@ -1060,8 +1060,6 @@ struct Prefill::Impl {
     bool retained_cancel_requested = false, retained_cancelled = false;
     std::thread::id callback_thread;
     const OwnerSegment* callback_segment = nullptr;
-    std::thread::id release_thread;
-    uint64_t generation_request = 0;
     bool draft_active = false;
     std::vector<void*> owned;
     // chunk buffers
@@ -1955,96 +1953,7 @@ bool Prefill::bind_request(uint64_t request, std::string& err) {
     return !next_ || next_->bind_request(request, err);
 }
 
-core::SessionState* Prefill::bound_session() const { return impl_->ss; }
-const void* Prefill::gemm_owner() const { return &impl_->gemm; }
-uint64_t Prefill::bf16_conversion_bytes() const { return impl_->gemm.bf16_conversion_bytes(); }
 void* Prefill::stream() const { return impl_->cs; }
-uint64_t Prefill::bound_request() const { return impl_->bound_request; }
-
-bool Prefill::validate_rebind(const core::SessionState& ss, void* stream, uint64_t request,
-                             std::string& err) const {
-    const Impl& m = *impl_;
-    if (m.release_thread == std::this_thread::get_id()) {
-        if (&ss != m.original_ss || request != m.generation_request || !local_idle(err)) {
-            if (err.empty()) err = "prefill: stage release permits only the saved generation binding";
-            return false;
-        }
-    } else if (!context_idle(err)) return false;
-    if (!request && &ss != m.original_ss) {
-        err = "prefill: non-generation rebind requires a nonzero request canary"; return false;
-    }
-    if (!m.initialized || !m.ss || !m.g || m.device < 0 || m.borrowed || stream != m.cs ||
-        ss.allocation_device != m.device || !ss.allocation_id || ss.k != m.ss->k ||
-        ss.layer_lo != stage_lb_ || ss.layer_hi != stage_le_ || ss.max_cells <= 0 ||
-        ss.gdn_alloc != m.ss->gdn_alloc || ss.gdn_ord0 != m.ss->gdn_ord0 ||
-        ss.qsa_alloc != m.ss->qsa_alloc || ss.qsa_ord0 != m.ss->qsa_ord0 ||
-        !ss.qsa_states || !ss.R || !ss.gdn_state || !ss.ple_hist) {
-        err = "prefill: session rebind has wrong owner/device/stream/stage geometry or borrowed scratch";
-        return false;
-    }
-    const int64_t core::ModelGeometry::* dims[] = {
-        &core::ModelGeometry::n_embd, &core::ModelGeometry::n_layers, &core::ModelGeometry::qsa_interval,
-        &core::ModelGeometry::ssm_state_size, &core::ModelGeometry::ssm_k_heads,
-        &core::ModelGeometry::ssm_v_heads, &core::ModelGeometry::ssm_d_conv,
-        &core::ModelGeometry::ssm_conv_channels, &core::ModelGeometry::ssm_value_dim,
-        &core::ModelGeometry::n_head, &core::ModelGeometry::n_head_kv, &core::ModelGeometry::head_dim,
-        &core::ModelGeometry::idx_q_heads, &core::ModelGeometry::idx_key_dim,
-        &core::ModelGeometry::hc, &core::ModelGeometry::hc_lr,
-        &core::ModelGeometry::n_expert, &core::ModelGeometry::n_ff
-    };
-    for (auto dim : dims) if (ss.allocation_geometry.*dim != m.g->*dim) {
-        err = "prefill: session rebind artifact geometry mismatch"; return false;
-    }
-    const auto shape = strata::kernels::qsa_real_shapes();
-    if (ss.max_cells / shape.idx_block + 2 > m.max_blocks) {
-        err = "prefill: session rebind exceeds retained max-block scratch"; return false;
-    }
-    const core::OnDevice on(m.device);
-    auto device_pointer = [&](const void* ptr) {
-        cudaPointerAttributes attr{};
-        return ptr && cudaPointerGetAttributes(&attr, ptr) == cudaSuccess &&
-               attr.type == cudaMemoryTypeDevice && attr.device == m.device;
-    };
-    if (!device_pointer(ss.R) || !device_pointer(ss.gdn_state) || !device_pointer(ss.ple_hist) ||
-        !device_pointer(ss.block.mixed) || !device_pointer(ss.block_arena)) {
-        err = "prefill: session rebind state pointers are not owned by the stage device"; return false;
-    }
-    for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
-        const auto& q = ss.qsa_states[ss.qsa_ord0 + j];
-        const auto& previous = m.ss->qsa_states[m.ss->qsa_ord0 + j];
-        if (q.kv_mode != 0 || previous.kv_mode != 0 || q.kv_elastic >= 0 ||
-            q.max_cells != ss.max_cells || q.n_pages != (ss.max_cells + shape.page_size - 1) / shape.page_size ||
-            q.n_slots != q.n_pages || q.idx_pooled_rows != ss.max_cells / shape.idx_block + 2 ||
-            q.kv_int8 != previous.kv_int8 || q.kv_q4 != previous.kv_q4 ||
-            q.kv_hybrid != previous.kv_hybrid || q.kv_rot != previous.kv_rot) {
-            err = "prefill: session rebind QSA placement/format/max-block geometry mismatch"; return false;
-        }
-        for (const void* ptr : std::array<const void*, 7>{q.page_table, q.idx_tail, q.idx_dead,
-                                                       q.idx_pooled, q.idx_block_pos, q.cos_tab, q.sin_tab}) {
-            if (!device_pointer(ptr)) { err = "prefill: session rebind QSA device ownership mismatch"; return false; }
-        }
-        const void* k = q.kv_hybrid || q.kv_int8 ? static_cast<const void*>(q.k_q)
-                     : q.kv_q4 ? static_cast<const void*>(q.k_q4) : q.k_pool;
-        const void* v = q.kv_hybrid || q.kv_q4 ? static_cast<const void*>(q.v_q4)
-                     : q.kv_int8 ? static_cast<const void*>(q.v_q) : q.v_pool;
-        if (!device_pointer(k) || !device_pointer(v) ||
-            ((q.kv_hybrid || q.kv_int8) && !device_pointer(q.k_scale)) ||
-            (q.kv_int8 && !device_pointer(q.v_scale))) {
-            err = "prefill: session rebind KV device ownership mismatch"; return false;
-        }
-    }
-    return true;
-}
-
-bool Prefill::rebind_session(core::SessionState& ss, void* stream, uint64_t request, std::string& err) {
-    if (!validate_rebind(ss, stream, request, err)) return false;
-    Impl& m = *impl_;
-    if (m.ss == m.original_ss && &ss != m.original_ss) m.generation_request = m.bound_request;
-    if (!m.canary.bind(8, request, err)) return false;
-    m.ss = &ss;
-    m.bound_request = request;
-    return true;
-}
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err, const char** why, int slot, int64_t prompt_length) {
@@ -6811,80 +6720,6 @@ bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::
         if (cancelled) err = "cancelled";
         else if (err.empty() || err == "cancelled") err = "prefill: retained cancellation cleanup failed";
     }
-    return okay;
-}
-
-bool Prefill::run_staged(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
-                        const std::function<bool(Prefill*, std::string&)>& step) {
-    if (!step || n < 1 || !context_idle(err)) {
-        if (err.empty()) err = "prefill: staged run requires a bounded private span";
-        return false;
-    }
-    for (Prefill* owner = this; owner; owner = owner->next_) {
-        const auto& state = *owner->impl_;
-        if (n > state.T || state.ss == state.original_ss || state.borrowed ||
-            owner->helper_ || state.help_pp || !state.pps.empty()) {
-            err = "prefill: staged run refuses shared/helper/borrowed or oversized execution"; return false;
-        }
-        for (Prefill* previous = this; previous != owner; previous = previous->next_)
-            if (previous->impl_->device == state.device) {
-                err = "prefill: staged release requires distinct devices"; return false;
-            }
-    }
-    if (public_running_.exchange(true)) { err = "prefill: public run already in flight"; return false; }
-    struct PublicLease {
-        std::atomic<bool>& running;
-        ~PublicLease() { running.store(false); }
-    } lease{public_running_};
-    bool okay = false;
-    try {
-        okay = run_impl(tokens, n, pos0, err);
-        for (Prefill* owner = this; okay;) {
-            if (!owner->local_idle(err)) { okay = false; break; }
-            {
-                struct Release {
-                    Impl& state;
-                    explicit Release(Impl& value) : state(value) {
-                        state.release_thread = std::this_thread::get_id();
-                    }
-                    ~Release() { state.release_thread = {}; }
-                } release{*owner->impl_};
-                okay = step(owner, err);
-            }
-            if (!okay || !owner->next_) break;
-            if (!owner->next_packet_ || !owner->next_packet_->pending()) {
-                err = "prefill: staged successor did not retain its completion owner"; okay = false; break;
-            }
-            while (!owner->next_packet_->ready()) {
-                if (!step(nullptr, err)) { okay = false; break; }
-                std::this_thread::yield();
-            }
-            if (!okay) break;
-            if (owner->join_successor(err) != StagePacket::Outcome::complete) { okay = false; break; }
-            owner = owner->next_;
-        }
-    } catch (const std::exception& failure) {
-        err = failure.what(); okay = false;
-    } catch (...) {
-        err = "prefill: staged callback or execution exception"; okay = false;
-    }
-    // Retain the public lease and every handoff until all captured descendants end.
-    // A broken generation peer is not resumed; the caller's scoring path fails closed.
-    std::string drain_error;
-    try {
-        if (drain_pipeline(drain_error) != StagePacket::Outcome::complete) {
-            if (okay) err = drain_error;
-            okay = false;
-        }
-    } catch (...) {
-        // A future exception cannot skip the recursive descendants it may have launched.
-        for (Prefill* owner = next_; owner; owner = owner->next_) {
-            try { std::string ignored; owner->drain_pipeline(ignored); } catch (...) {}
-        }
-        err = "prefill: staged descendant failed during drain"; okay = false;
-    }
-    for (Prefill* owner = this; owner; owner = owner->next_)
-        owner->impl_->gemm.flush_native_profile(okay);
     return okay;
 }
 

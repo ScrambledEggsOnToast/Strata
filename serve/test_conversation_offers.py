@@ -441,7 +441,7 @@ class StableScope(unittest.TestCase):
         request = {"strata_shared_prefix": {"tokens": 2}}
         ids = [1, 2, 3, 4]
         service = self.shared_service()
-        for flags in ({"has_images": True}, {"fallback": True}, {"score": True}):
+        for flags in ({"has_images": True}, {"fallback": True}):
             with self.subTest(flags=flags):
                 self.assertIsNone(service.shared_cache_scope(request, principal, ids, **flags))
         for unauthorized in (None, ("gateway", "", principal[2]), ("gateway", "tenant-a", ""),
@@ -1279,22 +1279,22 @@ class FrontierOrder(unittest.TestCase):
     def test_solo_foreground_precedes_eligible_but_not_a_due_background(self):
         eligible, _ = self.queue("an ordinary foreground turn")
         solo, _ = self.queue("the priority foreground turn", packing="solo")
-        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 0, 2)],
+        self.assertEqual([r["id"] for r in self.svc.selector_order(self.svc.admission_waiters, 0, 2)],
                          [solo["id"], eligible["id"]],
                          "a solo foreground waiter must reach a slot before an earlier eligible one")
         background, _ = self.queue("the background turn", priority="background")
-        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 3, 3)],
+        self.assertEqual([r["id"] for r in self.svc.selector_order(self.svc.admission_waiters, 3, 3)],
                          [background["id"], solo["id"], eligible["id"]],
                          "the existing 3:1 background admission still precedes the solo preference")
         later, _ = self.queue("a later priority turn", packing="solo")
-        self.assertEqual([r["id"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 0, 2)],
+        self.assertEqual([r["id"] for r in self.svc.selector_order(self.svc.admission_waiters, 0, 2)],
                          [solo["id"], later["id"]], "solo waiters keep their arrival order")
 
     def test_sustained_solo_admissions_give_ordinary_one_turn_after_four(self):
         eligible, _ = self.queue("an ordinary foreground turn")
         solo, _ = self.queue("the priority foreground turn", packing="solo")
-        self.assertEqual(self.svc.selector_order(False, self.svc.admission_waiters, 0, 1, 3)[0]["id"], solo["id"])
-        self.assertEqual(self.svc.selector_order(False, self.svc.admission_waiters, 0, 1, 4)[0]["id"],
+        self.assertEqual(self.svc.selector_order(self.svc.admission_waiters, 0, 1, 3)[0]["id"], solo["id"])
+        self.assertEqual(self.svc.selector_order(self.svc.admission_waiters, 0, 1, 4)[0]["id"],
                          eligible["id"], "ordinary admission must progress under sustained priority traffic")
 
     def test_only_the_selector_frontier_is_prepared_and_in_its_order(self):
@@ -1302,11 +1302,11 @@ class FrontierOrder(unittest.TestCase):
             record, _req = self.queue(f"an earlier foreground turn {i}")
             self.svc.acquire_request(record)    # admitted at once (the slot is free)
             self.svc.finish_lifecycle(record)
-        self.assertEqual(self.svc.admission_foreground[False], 3)
+        self.assertEqual(self.svc.admission_foreground, 3)
         head, head_req = self.queue("the foreground turn", priority="foreground")
         behind, behind_req = self.queue("a later foreground turn", priority="foreground")
         background, background_req = self.queue("the background turn", priority="background")
-        self.assertEqual([r["priority"] for r in self.svc.selector_order(False, self.svc.admission_waiters, 3, 3)],
+        self.assertEqual([r["priority"] for r in self.svc.selector_order(self.svc.admission_waiters, 3, 3)],
                          ["background", "foreground", "foreground"])
         self.prepare(head, head_req)            # the oldest waiter, and not the selector's next admission
         self.prepare(behind, behind_req)        # a later one: behind the frontier either way
@@ -1319,7 +1319,6 @@ class FrontierOrder(unittest.TestCase):
         self.assertIsNone(behind.get("_prepared"))
         self.assertIsNotNone(background.get("_prepared"))
         self.assertEqual(self.svc.offer_stats()["prepared_requests"], 1)
-        self.assertEqual([r["priority"] for r in self.svc.selector_order(True, self.svc.admission_waiters, 1, 1)], [])
 
     def test_later_background_frontier_revokes_an_earlier_foreground_offer(self):
         for i in range(3):
