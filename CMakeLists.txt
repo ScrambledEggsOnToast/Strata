@@ -764,7 +764,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # OpenSSL stays private to the store's translation units: no other CUDA TU gains an include root, and the crypto
   # dependency reaches consumers only as a link-only requirement of this static library.
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-  target_link_libraries(strata_engine PRIVATE OpenSSL::Crypto)
+  target_link_libraries(strata_engine PRIVATE OpenSSL::Crypto strata_native_identity)
   if(STRATA_BUILD_DFLASH2_BRIDGE)
     target_sources(strata_engine PRIVATE src/core/dflash2_native_target.cpp)
     target_include_directories(strata_engine PRIVATE ${_strata_gpu_include_directories})
