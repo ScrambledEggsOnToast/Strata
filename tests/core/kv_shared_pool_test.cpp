@@ -642,11 +642,68 @@ void stage_contract(int count) {
                 "per-stage measured release incomplete");
         std::printf("KV_SHARE_STAGE device=%d immediate_release_chunks=%llu deferred_release_chunks=%llu "
             "measured_release_bytes=%llu immediate_handoff_ms=%.6f deferred_handoff_ms=%.6f "
-            "host_metadata_bytes=%llu capacity_bytes=%llu scope=stage_fixture_not_full_model\n",
+            "immediate_host_metadata_bytes=%llu deferred_host_metadata_bytes=%llu capacity_bytes=%llu "
+            "scope=stage_fixture_not_full_model\n",
             device, (unsigned long long) immediate.release_chunks, (unsigned long long) deferred.release_chunks,
             (unsigned long long) (immediate.release_chunks * plan::kKvShareChunk), immediate.handoff_ms,
             deferred.handoff_ms, (unsigned long long) immediate.host_bytes,
-            (unsigned long long) devices[device].capacity);
+            (unsigned long long) deferred.host_bytes, (unsigned long long) devices[device].capacity);
+    }
+    // Batch-policy measurement on real device chunks: synchronous 2 MiB calls versus coalesced 8-chunk runs
+    // and one deferred 32-chunk worker batch. Each policy frees a fresh 32-chunk VA range on this device.
+    for (int device = 0; device < count; ++device) {
+        check(cudaSetDevice(device), "stage device");
+        struct PolicyRun {
+            const char* name;
+            plan::KvDeviceReclaimPolicy policy;
+            bool worker;
+        };
+        const std::array policies{
+            PolicyRun{"synchronous", {devices[device].uuid, plan::KvReclaimMode::synchronous, 1, 1}, false},
+            PolicyRun{"coalesced", {devices[device].uuid, plan::KvReclaimMode::coalesced, 8, 8}, false},
+            PolicyRun{"deferred", {devices[device].uuid, plan::KvReclaimMode::deferred, 8, 32}, true}};
+        constexpr int64_t chunks = 32;
+        const core::KvOwnerKey owner{701, 1, uint64_t(device + 1)};
+        const core::KvPipelineKey pipeline{owner, 1};
+        for (const auto& selected : policies) {
+            core::VmmRange range;
+            require(range.reserve(uint64_t(chunks) * plan::kKvShareChunk) &&
+                range.map_range(0, chunks, [] { return core::VmmChunk{0}; }),
+                "batch-policy chunks did not map on this stage");
+            std::array<uint64_t, plan::kKvShareMaxStages> charged{};
+            charged[size_t(device)] = uint64_t(chunks) * plan::kKvShareChunk;
+            core::KvPipelineLifetime lifetime(pipeline, 1u << device, charged);
+            require(lifetime.local_drain(pipeline, uint32_t(device)) && lifetime.terminal_drain(pipeline),
+                "batch-policy pipeline did not drain");
+            core::KvReclaimRun run(keys[device], selected.policy, pipeline, 0, uint64_t(chunks));
+            const auto unmap = [&](const plan::KvTopologyKey&, uint64_t index) { return range.unmap(int64_t(index)); };
+            const auto release = [&](const plan::KvTopologyKey&, core::VmmChunk chunk) { return core::vmm_chunk_free(chunk); };
+            const auto started = std::chrono::steady_clock::now();
+            uint64_t calls = 0, released = 0;
+            if (selected.worker) {
+                // A deferred policy only hands the run over; the worker then releases it in its own batch.
+                const auto queued = run.reclaim(lifetime, devices[device].uuid, false, true, unmap, release);
+                ++calls;
+                require(queued.success && queued.action == plan::KvReclaimAction::enqueue,
+                    "deferred batch policy did not hand off the run");
+            }
+            while (run.released_bytes() < uint64_t(chunks) * plan::kKvShareChunk) {
+                const auto progress = run.reclaim(lifetime, devices[device].uuid, selected.worker, true, unmap, release);
+                ++calls;
+                require(progress.success, "batch-policy reclaim failed");
+                released += progress.released_chunks;
+                require(calls <= uint64_t(chunks) + 2, "batch-policy reclaim did not terminate");
+            }
+            const double cost_us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - started).count();
+            require(run.released_bytes() == uint64_t(chunks) * plan::kKvShareChunk && run.charged_bytes() == 0 &&
+                released == uint64_t(chunks), "batch-policy release accounting is not exact");
+            std::printf("KV_SHARE_STAGE_BATCH device=%d policy=%s calls=%llu released_chunks=%llu "
+                "released_bytes=%llu unmap_release_us=%.3f\n", device, selected.name,
+                (unsigned long long) calls, (unsigned long long) (released),
+                (unsigned long long) run.released_bytes(), cost_us);
+            range.release();
+        }
     }
     // The per-UUID policy plans, keyed by the real device identity.
     for (int device = 0; device < count; ++device) {
