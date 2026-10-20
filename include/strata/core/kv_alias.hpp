@@ -1,6 +1,7 @@
 // Generation-fenced common-pool ownership. One host submitter; no CUDA calls.
 #pragma once
 #include "strata/plan/kv_share.hpp"
+#include "strata/plan/kv_share_topology.hpp"
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -14,6 +15,71 @@ struct KvOwnerKey {
     bool operator==(const KvOwnerKey& b) const {
         return request == b.request && incarnation == b.incarnation && allocation == b.allocation;
     }
+};
+struct KvPipelineKey {
+    KvOwnerKey owner;
+    uint64_t submission = 0;
+    bool valid() const { return owner.valid() && submission; }
+    bool operator==(const KvPipelineKey&) const = default;
+};
+class KvAliasState;
+// One submitter, one pipeline submission. Completion notifications carry the
+// submission identity even when a reset reuses the same owner key. Cancellation
+// does not drain. Local drains arrive in pipeline order, then an explicit terminal
+// barrier covers downstream/host-mediated consumers. Reference charges persist
+// until each stage's ownership retirement succeeds after that barrier.
+class KvPipelineLifetime {
+public:
+    KvPipelineLifetime(KvPipelineKey key, uint32_t mandatory,
+                       std::array<uint64_t, plan::kKvShareMaxStages> charged)
+        : key_(key), bytes_(charged), mandatory_(mandatory) {
+        if (!key.valid() || !mandatory || (mandatory >> plan::kKvShareMaxStages))
+            throw std::invalid_argument("KV pipeline: invalid identity/stage set");
+        for (uint32_t stage = 0; stage < bytes_.size(); ++stage)
+            if (!(mandatory & (1u << stage)) && bytes_[stage])
+                throw std::invalid_argument("KV pipeline: charge outside mandatory stage set");
+    }
+    KvPipelineLifetime(const KvPipelineLifetime&) = delete;
+    KvPipelineLifetime& operator=(const KvPipelineLifetime&) = delete;
+    bool cancel(const KvPipelineKey& key) {
+        if (!(key == key_) || terminal_) return false;
+        cancelled_ = true; return true;
+    }
+    bool local_drain(const KvPipelineKey& key, uint32_t stage) {
+        if (!(key == key_) || terminal_ || stage >= bytes_.size()) return false;
+        const uint32_t bit = 1u << stage, prior = mandatory_ & (bit - 1);
+        if (!(mandatory_ & bit) || (local_ & bit) || (local_ & prior) != prior) return false;
+        local_ |= bit; return true;
+    }
+    bool terminal_drain(const KvPipelineKey& key) {
+        if (!(key == key_) || terminal_ || local_ != mandatory_) return false;
+        terminal_ = true; return true;
+    }
+    bool terminal_for(const KvOwnerKey& owner, uint32_t stage) const {
+        if (!(key_.owner == owner) || !terminal_ || stage >= bytes_.size()) return false;
+        const uint32_t bit = 1u << stage;
+        return (mandatory_ & bit) && !(retired_ & bit);
+    }
+    uint64_t charged(uint32_t stage) const {
+        return stage < bytes_.size() && !(retired_ & (1u << stage)) ? bytes_[stage] : 0;
+    }
+    bool cancelled() const { return cancelled_; }
+    bool drained() const { return terminal_; }
+    bool drained_for(const KvPipelineKey& key, uint32_t stage) const {
+        return key == key_ && terminal_ && stage < bytes_.size() && (mandatory_ & (1u << stage));
+    }
+    const KvPipelineKey& key() const { return key_; }
+private:
+    friend class KvAliasState;
+    KvPipelineKey key_;
+    std::array<uint64_t, plan::kKvShareMaxStages> bytes_{};
+    struct StageBinding {
+        const KvAliasState* state = nullptr;
+        uint64_t owner = 0, generation = 0;
+    };
+    std::array<StageBinding, plan::kKvShareMaxStages> bindings_{};
+    uint32_t mandatory_ = 0, local_ = 0, retired_ = 0;
+    bool cancelled_ = false, terminal_ = false;
 };
 struct KvPageBinding {
     uint64_t extent = UINT64_MAX, generation = 0;
@@ -30,8 +96,9 @@ struct KvAliasOwner {
     uint64_t pending_source = UINT64_MAX, pending_pages = 0, pending_page = 0;
     KvPageBinding pending_private;
     uint64_t pins = 0;
-    bool active = false, preparing = false, cancelled = false, retained = false;
-    uint8_t reserved[44]{};
+    uint64_t lifetime_generation = 0;
+    bool active = false, preparing = false, cancelled = false, retained = false, pipeline_bound = false;
+    uint8_t reserved[35]{};
 };
 static_assert(sizeof(KvPageBinding) == plan::kKvShareBindingBytes);
 static_assert(sizeof(KvExtentRecord) == plan::kKvShareExtentBytes);
@@ -92,7 +159,9 @@ public:
         if (owner >= owners_.size() || !key.valid() || owners_[(size_t) owner].active ||
             free_pages() < pages_) return false;
         auto& o = owners_[(size_t) owner];
-        o = {}; o.key = key; o.active = o.preparing = true;
+        if (o.lifetime_generation == UINT64_MAX) return false;
+        const uint64_t generation = o.lifetime_generation + 1;
+        o = {}; o.key = key; o.active = o.preparing = true; o.lifetime_generation = generation;
         for (uint64_t page = 0; page < pages_; ++page) at(owner, page) = new_extent();
         return true;
     }
@@ -191,7 +260,29 @@ public:
             return true;
         }
         for (uint64_t p = 0; p < pages_; ++p) { drop(at(owner, p)); at(owner, p) = {}; }
-        o = {};
+        const uint64_t generation = o.lifetime_generation;
+        o = {}; o.lifetime_generation = generation;
+        return true;
+    }
+    // Bind before any drain notification. The state must outlive this pipeline.
+    // A submission identity alone cannot fence a reset that reuses its owner key.
+    bool bind_pipeline(uint64_t owner, const KvOwnerKey& key, KvPipelineLifetime& pipeline, uint32_t stage) {
+        if (!owns(owner, key) || owners_[(size_t) owner].pipeline_bound || !(pipeline.key_.owner == key) ||
+            pipeline.local_ || pipeline.terminal_ || stage >= pipeline.bindings_.size() ||
+            !(pipeline.mandatory_ & (1u << stage)) || pipeline.bindings_[stage].state) return false;
+        pipeline.bindings_[stage] = {this, owner, owners_[(size_t) owner].lifetime_generation};
+        owners_[(size_t) owner].pipeline_bound = true;
+        return true;
+    }
+    // Pipeline users must not substitute a local-device boolean drain. Releasing
+    // this stage does not retire any other stage's charge or its peer's pages.
+    bool terminal_pipeline(uint64_t owner, const KvOwnerKey& key, KvPipelineLifetime& pipeline, uint32_t stage) {
+        if (!owns(owner, key) || !pipeline.terminal_for(key, stage)) return false;
+        const auto& binding = pipeline.bindings_[stage];
+        if (binding.state != this || binding.owner != owner ||
+            binding.generation != owners_[(size_t) owner].lifetime_generation ||
+            !terminal(owner, key, true)) return false;
+        pipeline.retired_ |= 1u << stage;
         return true;
     }
     const KvPageBinding& binding(uint64_t owner, uint64_t page) const { return at(owner, page); }

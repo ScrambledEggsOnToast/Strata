@@ -132,6 +132,60 @@ keeps the whole-model bound for the first stage and one primary QSA, its PLE his
 stage. Admission also includes the existing 12.5% payload-capacity margin and 4 KiB metadata allowance per stage,
 for every retained checkpoint and the checkpoint being captured. This is separate from the parked-history envelope.
 
+**Topology-aware shared target K/V policy (CPU-only, default off, #310).** The no-load interface in
+`include/strata/plan/kv_share_topology.hpp` is for the three-stage PCIe/PHB layout (two 32 GiB V100s and one
+24 GiB 3090, no NVLink). `kv_share_topology_eligible` adds the raw device UUID, stage, target-K8V4 layer family
+and pool-allocation generation to the existing owner/certified-prefix check. Every stage in the mandatory
+stage mask must be present exactly once and match. A refusal selects the existing copy path for the whole
+placement, not partial aliasing, P2P aliasing or host-bounce aliasing. Individual layers still use their own
+pool: a matching family does not make different layers interchangeable. Recurrent, draft and PLE families
+are never alias-eligible.
+
+`kv_share_stage_quote` prices unique shared backing once, plus private recurrent/draft/PLE state, mutable
+tails, operation scratch and simultaneous transient COW backing. These input classes must be disjoint;
+`resident_other` excludes them, and mutable tails exclude shared backing. Multiple stages on the same UUID
+share one capacity and reserve. Each device refuses independently; spare V100 capacity cannot rescue the
+24 GiB stage. Host images (including leased images), metadata and transient COW are a separate partition
+of the host envelope, not another charge of that whole envelope. The older aggregate `KvShareQuote` net
+saving is scenario arithmetic, not per-device admission credit. Unreleased reclaim debt remains resident.
+
+`core::KvPipelineLifetime` binds local drains and a subsequent explicit terminal pipeline barrier to an
+owner and submission generation. Before any drain notification, `KvAliasState::bind_pipeline` binds each
+stage to its exact state, owner slot and monotonic ownership lifetime. Same-key reset advances that lifetime,
+so an old drained but unconsumed proof cannot retire replacement ownership; another pending proof cannot
+bind the same owner. Bound states must outlive the pipeline. Local drain or cancellation alone cannot retire pages.
+`KvAliasState::terminal_pipeline` retires one stage's references and charge only after that barrier; the
+other stages and retained peers remain charged. Per-UUID reclaim policies select synchronous chunks,
+coalesced contiguous batches or deferred handoff. Thresholds and batch limits are explicit inputs, not
+measured V100/3090 tuning. `core::KvReclaimRun` distinguishes queued, successfully unmapped and physically
+released bytes. Enqueue and unmap grant no release credit; a failed physical free retains its handle and
+charge for retry. Batching separate allocation handles does not claim a single driver release call.
+
+The merged header also retains #268's owned-worker `KvReclaimLedger`, atomic physical-byte snapshots,
+ticketed completion and fixed worker-stack charge. For policy dispatch, construct that ledger with its
+immutable topology key; an unkeyed legacy diagnostic ledger cannot dispatch the new policy, and another
+device/stage/family/allocation generation cannot borrow its accounting. `KvReclaimLedger::dispatch`
+combines that same physical snapshot with `KvReclaimWindow`: current charged bytes plus other device
+demand, incoming private/scratch/COW peak and reserve must fit independently. Pending bytes are already
+inside charged bytes; they are neither subtracted nor charged again.
+
+With sufficient current headroom, a deferred policy may enqueue a bounded contiguous run only at a
+scheduler-designated idle window; a busy window holds it. Pressure or an explicit retirement flush selects
+inline release, and an existing pending batch selects join/wait instead of a second dispatch. None of
+those decisions grants capacity before actual physical completion; admission must be quoted again after
+release. Idle is an explicit scheduler signal, not a measured reclaim-duration or performance guarantee.
+
+The CPU regression is `kv_share_test` (configure with `STRATA_ENABLE_CUDA=OFF`, `STRATA_ENABLE_HIP=OFF`,
+`STRATA_NATIVE_EXPERTS=OFF`, `STRATA_BUILD_TESTS=ON`). It covers placement refusal, independent 24 GiB and host
+pressure, exact byte totals, ordered/stale-proof pipeline retirement, deferred/coalesced failure accounting,
+concurrent #268 ledger snapshots and headroom/idle-window decisions. This CPU merge preserves the frozen
+#268 diagnostic worker/allocator source and GPU fixture. Its existing alias dispatch does not automatically
+consume the new ledger policy decisions: this is the CPU policy seam and merge plan, not new native/client
+enablement. The default-off controls, four-cell software page, K8V4/image encoding and kernel interface remain
+unchanged. No new GPU fixture, reclaim timing, full-model/client acceptance or default promotion is
+established here; new GPU evidence requires a separately owned measurement window. Rollback is to omit the
+topology/policy overlay while retaining the independently frozen #268 deferral delta.
+
 **The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
 layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the
 prompt path does it in batches (`Prefill::draft_kv`, a few large matrix products per chunk); on a split the drafter's own

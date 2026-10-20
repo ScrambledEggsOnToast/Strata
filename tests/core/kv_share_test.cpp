@@ -1,6 +1,7 @@
 #include "strata/core/kv_alias.hpp"
 #include "strata/core/logical_kv.hpp"
 #include "strata/core/kv_reclaim.hpp"
+#include "strata/plan/kv_share_topology.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <thread>
@@ -14,6 +15,228 @@ program::ContinuationCertificate cut(core::KvOwnerKey key, int64_t cells) {
     in.committed_tokens = cells;
     in.needs_qsa = in.needs_gdn = in.needs_ple = in.needs_stages = true;
     return program::certify_continuation(in);
+}
+plan::KvTopologyKey topology(uint32_t stage, uint8_t device, uint64_t generation = 7) {
+    plan::KvTopologyKey key;
+    key.device_uuid[0] = device; key.stage = stage;
+    key.family = plan::KvLayerFamily::target_k8v4; key.allocation_generation = generation;
+    return key;
+}
+void topology_alias() {
+    using namespace plan;
+    std::array<KvStageAlias, 3> stages{};
+    for (uint32_t i = 0; i < stages.size(); ++i) stages[i] = {topology(i, uint8_t(i + 1)), topology(i, uint8_t(i + 1))};
+    require(kv_share_topology(KvShareMode::alias, stages, 7).alias, "same-stage/device/generation placement refused");
+    KvShareEligibility eligible{KvShareMode::alias, 1, 2, 3, 3, 65539, 262144, true, true, false, true};
+    auto certificate = cut({1, 2, 3}, 65539);
+    require(kv_share_topology_eligible(eligible, certificate, stages, 7).alias,
+        "topology-aware continuation eligibility refused a compatible cut");
+    certificate.certified = false;
+    require(!kv_share_topology_eligible(eligible, certificate, stages, 7).alias,
+        "matching topology bypassed continuation certification");
+    certificate = cut({1, 2, 3}, 65539);
+    stages[1].target.stage = 2;
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "cross-stage alias accepted");
+    stages[1].target = topology(1, 3);
+    const auto foreign = kv_share_topology(KvShareMode::alias, stages, 7);
+    require(!foreign.alias && foreign.refused_stage == 1, "cross-device alias accepted or refusal scope lost");
+    require(!kv_share_topology_eligible(eligible, certificate, stages, 7).alias,
+        "valid continuation bypassed the foreign-device refusal");
+    stages[1].target = topology(1, 2, 8);
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "stale pool allocation generation aliased");
+    stages[1].target = topology(1, 2);
+    stages[1].target.family = KvLayerFamily::draft;
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "cross-family alias accepted");
+    stages[1].source.family = KvLayerFamily::draft;
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "private draft family shared");
+    stages[1] = {topology(1, 2), topology(1, 2)};
+    require(!kv_share_topology(KvShareMode::alias, std::span(stages).first(2), 7).alias,
+        "missing mandatory downstream stage produced a partial alias plan");
+    stages[2] = stages[1];
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "duplicate stage hid missing placement");
+    stages[2] = {topology(2, 3), topology(2, 3)};
+    stages[2].target.device_uuid = {};
+    require(!kv_share_topology(KvShareMode::alias, stages, 7).alias, "unknown device UUID admitted");
+    require(kv_share_topology(KvShareMode::alias, std::span(stages).first(2), 3).alias,
+        "matching declared mandatory stages refused");
+    require(!kv_share_topology(KvShareMode::off, stages, 7).alias &&
+        !kv_share_topology(KvShareMode::pool, stages, 7).alias &&
+        !kv_share_topology(KvShareMode::alias, stages, 0).alias, "off/pool/empty placement enabled aliasing");
+}
+void topology_admission() {
+    using namespace plan;
+    constexpr uint64_t mib = 1ull << 20, gib = 1ull << 30;
+    std::array<KvDeviceBudget, 3> devices{};
+    std::array<KvStageDemand, 3> stages{};
+    for (uint32_t i = 0; i < stages.size(); ++i) {
+        const auto key = topology(i, uint8_t(i + 1));
+        devices[i] = {key.device_uuid, (i == 2 ? 24 : 32) * gib, 20 * gib, gib};
+        stages[i] = {key, 2 * gib, 128 * mib, 256 * mib, 32 * mib, 64 * mib, 512 * mib, 256 * mib};
+    }
+    KvShareHostBudget host{12 * gib, gib, gib, 8 * gib, 256 * mib, mib};
+    auto q = kv_share_stage_quote(KvShareMode::alias, devices, stages, host);
+    require(q.known && !q.admitted && q.refused_stage == 2 &&
+        std::strcmp(q.refusal, "stage_capacity") == 0, "24GiB pressure borrowed aggregate V100 credit");
+    require(q.stages[2].steady == 2528 * mib && q.stages[2].peak == 3296 * mib &&
+        q.devices[2].required == 24800 * mib, "stage private/scratch/COW demand underpriced or counted twice");
+    require(q.host.required == 10497 * mib, "host image/metadata/COW scopes counted twice");
+    devices[2].resident_other -= 224 * mib;
+    q = kv_share_stage_quote(KvShareMode::alias, devices, stages, host);
+    require(q.admitted && q.devices[2].required == 24 * gib, "exact 24GiB fit refused");
+    ++stages[2].transient_cow;
+    require(!kv_share_stage_quote(KvShareMode::alias, devices, stages, host).admitted,
+        "one-byte transient stage overage admitted");
+    --stages[2].transient_cow;
+    host.capacity = host.resident_other + host.reserve + host.cache_images + host.shared_metadata + host.transient_cow - 1;
+    q = kv_share_stage_quote(KvShareMode::pool, devices, stages, host);
+    require(q.known && !q.admitted && std::strcmp(q.refusal, "host_capacity") == 0,
+        "host pressure borrowed device capacity");
+    host.capacity = 12 * gib;
+    stages[1].key.device_uuid = stages[0].key.device_uuid;
+    devices[0].capacity = 27 * gib;
+    q = kv_share_stage_quote(KvShareMode::alias, devices, stages, host);
+    require(q.known && !q.admitted && q.devices[0].required == 28096 * mib,
+        "two stages on one device each spent the same capacity");
+    stages[1].key = stages[0].key;
+    require(!kv_share_stage_quote(KvShareMode::alias, devices, stages, host).known,
+        "duplicate stage double counted instead of refusing");
+    stages[1].key = topology(1, 2);
+    stages[0].shared_bytes = UINT64_MAX;
+    require(!kv_share_stage_quote(KvShareMode::alias, devices, stages, host).known, "overflow became admission credit");
+    const auto off = kv_share_stage_quote(KvShareMode::off, devices, stages, host);
+    require(off.known && off.admitted && off.devices[0].required == 0 && off.host.required == 0,
+        "default-off topology pricing added allocator demand");
+}
+void pipeline_lifetime() {
+    using namespace core;
+    std::array<KvAliasState, 3> pools{{{2, 4}, {2, 4}, {2, 4}}};
+    const KvOwnerKey owner{77, 2, 9}, peer{78, 1, 10};
+    const KvPipelineKey submission{owner, 11}, stale{owner, 10};
+    KvPipelineLifetime lifetime(submission, 7, {13056, 13056, 13056, 0});
+    for (uint32_t i = 0; i < pools.size(); ++i)
+        require(pools[i].begin(0, owner) && pools[i].begin(1, peer) &&
+            pools[i].bind_pipeline(0, owner, lifetime, i), "pipeline owner/binding setup failed");
+    require(!lifetime.local_drain(submission, 2) && !lifetime.local_drain(stale, 0) &&
+        !lifetime.terminal_drain(submission), "out-of-order or stale pipeline drain accepted");
+    require(lifetime.local_drain(submission, 0) && !lifetime.local_drain(submission, 0),
+        "local pipeline drain was not exactly once");
+    require(lifetime.cancel(submission) && lifetime.cancelled() &&
+        !pools[0].terminal_pipeline(0, owner, lifetime, 0) && lifetime.charged(0) == 13056 &&
+        pools[0].extent(pools[0].binding(0, 0).extent).references == 1,
+        "cancel/local drain released pages still visible downstream");
+    require(lifetime.local_drain(submission, 1) && !lifetime.terminal_drain(submission) &&
+        lifetime.charged(1) == 13056, "intermediate stage drain released a pipeline charge");
+    require(lifetime.local_drain(submission, 2) && !pools[2].terminal_pipeline(0, owner, lifetime, 2),
+        "local drains were mistaken for the explicit terminal pipeline barrier");
+    require(lifetime.terminal_drain(submission) && !lifetime.terminal_drain(submission) &&
+        lifetime.charged(2) == 13056, "terminal drain itself invented a physical/reference release");
+    require(!pools[0].terminal_pipeline(1, peer, lifetime, 0) &&
+        !pools[0].terminal_pipeline(0, owner, lifetime, 3) &&
+        !pools[1].terminal_pipeline(0, owner, lifetime, 0), "foreign owner/stage/pool consumed pipeline proof");
+    for (uint32_t i = 0; i < pools.size(); ++i) {
+        require(pools[i].terminal_pipeline(0, owner, lifetime, i) && lifetime.charged(i) == 0 &&
+            !pools[i].terminal_pipeline(0, owner, lifetime, i), "pipeline retirement leaked or released twice");
+        require(pools[i].owns(1, peer) && pools[i].terminal(1, peer, true), "pipeline retirement damaged peer");
+    }
+}
+void stale_pipeline_reuse() {
+    using namespace core;
+    KvAliasState pool(2, 4);
+    const KvOwnerKey owner{81, 1, 13};
+    const KvPipelineKey old_submission{owner, 14};
+    KvPipelineLifetime old(old_submission, 1, {13056, 0, 0, 0});
+    require(pool.begin(0, owner) && pool.bind_pipeline(0, owner, old, 0) && old.local_drain(old_submission, 0) &&
+        old.terminal_drain(old_submission), "stale pipeline setup failed");
+    require(pool.terminal(0, owner, true) && pool.begin(0, owner), "same-key legacy reset setup failed");
+    require(!pool.terminal_pipeline(0, owner, old, 0) && old.charged(0) == 13056 &&
+        pool.owns(0, owner), "old unconsumed pipeline proof retired a same-key replacement owner");
+    require(!pool.bind_pipeline(0, owner, old, 0), "drained old proof rebound after same-key reset");
+    const KvPipelineKey current_submission{owner, 15};
+    KvPipelineLifetime current(current_submission, 1, {13056, 0, 0, 0});
+    KvPipelineLifetime duplicate({owner, 16}, 1, {13056, 0, 0, 0});
+    require(pool.bind_pipeline(0, owner, current, 0) && !pool.bind_pipeline(0, owner, duplicate, 0) &&
+        !pool.terminal_pipeline(0, owner, old, 0) && current.charged(0) == 13056,
+        "stale/duplicate lifetime consumed replacement ownership or charge");
+    require(current.local_drain(current_submission, 0) && current.terminal_drain(current_submission) &&
+        pool.terminal_pipeline(0, owner, current, 0) && !current.charged(0),
+        "current bound pipeline could not retire after rejecting stale proof");
+    std::printf("KV_SHARE_PIPELINE same_key_reset_stale_proof_refused=1 current_replacement_retired=1\n");
+}
+void reclaim_policy() {
+    using namespace plan;
+    using namespace core;
+    const auto a = topology(0, 1), b = topology(1, 2), c = topology(2, 3);
+    const KvDeviceReclaimPolicy synchronous{a.device_uuid, KvReclaimMode::synchronous, 1, 1};
+    const KvDeviceReclaimPolicy coalesced{b.device_uuid, KvReclaimMode::coalesced, 4, 8};
+    const KvDeviceReclaimPolicy deferred{c.device_uuid, KvReclaimMode::deferred, 8, 32};
+    require(kv_reclaim_plan(synchronous, a, 25, true, false).chunks == 1 &&
+        kv_reclaim_plan(coalesced, b, 25, true, false).chunks == 8 &&
+        kv_reclaim_plan(deferred, c, 25, true, false).action == KvReclaimAction::enqueue,
+        "per-device synchronous/coalesced/deferred choice collapsed to uniform calls");
+    require(kv_reclaim_plan(coalesced, b, 3, true, false).action == KvReclaimAction::hold &&
+        kv_reclaim_plan(coalesced, b, 3, true, true).chunks == 3 &&
+        kv_reclaim_plan(deferred, c, 25, false, true).action == KvReclaimAction::wait_pipeline &&
+        kv_reclaim_plan(deferred, a, 25, true, true).action == KvReclaimAction::refuse,
+        "run threshold/flush/pipeline/UUID reclaim contract weakened");
+    const KvOwnerKey owner{91, 1, 17};
+    const KvPipelineKey submission{owner, 18};
+    KvPipelineLifetime lifetime(submission, 7, {0, 0, 3 * kKvShareChunk, 0});
+    const KvDeviceReclaimPolicy worker_policy{c.device_uuid, KvReclaimMode::deferred, 1, 2};
+    KvReclaimRun run(c, worker_policy, submission, 40, 3);
+    uint64_t unmap_calls = 0, free_calls = 0;
+    bool free_ok = false, unmap_ok = true;
+    auto unmap = [&](const KvTopologyKey& key, uint64_t chunk) {
+        require(key == c && chunk == 40 + unmap_calls, "reclaim crossed placement or unmapped a chunk twice");
+        ++unmap_calls;
+        return unmap_ok ? chunk + 100 : uint64_t{0};
+    };
+    auto release = [&](const KvTopologyKey& key, uint64_t handle) {
+        require(key == c && handle >= 140 && handle <= 142, "physical release lost device/run identity");
+        ++free_calls; return free_ok;
+    };
+    auto step = [&](bool worker, bool flush = false) {
+        return run.reclaim(lifetime, c.device_uuid, worker, flush, unmap, release);
+    };
+    require(step(false).action == KvReclaimAction::wait_pipeline &&
+        run.charged_bytes() == 3 * kKvShareChunk && !unmap_calls, "reclaim ran before terminal pipeline drain");
+    require(lifetime.local_drain(submission, 0) && lifetime.local_drain(submission, 1) &&
+        lifetime.local_drain(submission, 2) && lifetime.terminal_drain(submission), "reclaim pipeline setup failed");
+    require(step(false).action == KvReclaimAction::enqueue && step(false).action == KvReclaimAction::wait_worker &&
+        run.released_bytes() == 0 && run.charged_bytes() == 3 * kKvShareChunk && !free_calls,
+        "deferred enqueue released physical credit or queued twice");
+    require(!run.reclaim(lifetime, a.device_uuid, true, false, unmap, release).success && !unmap_calls,
+        "foreign-device worker touched a reclaim run");
+    require(!step(true).success && unmap_calls == 1 && free_calls == 1 &&
+        run.unmapped_bytes() == kKvShareChunk && run.released_bytes() == 0 &&
+        run.charged_bytes() == 3 * kKvShareChunk, "unmap/failed physical release was reported as released");
+    free_ok = true;
+    require(step(true).success && unmap_calls == 2 && free_calls == 3 &&
+        run.released_bytes() == 2 * kKvShareChunk && run.charged_bytes() == kKvShareChunk,
+        "retry re-unmapped a held handle or double counted release");
+    require(step(false).action == KvReclaimAction::enqueue && step(true).success &&
+        run.unmapped_bytes() == 3 * kKvShareChunk && run.released_bytes() == 3 * kKvShareChunk &&
+        !run.charged_bytes() && unmap_calls == 3 && free_calls == 4 &&
+        step(false).action == KvReclaimAction::complete, "final deferred run accounting is not exact");
+    KvReclaimRun failed(a, synchronous, submission, 43, 1);
+    unmap_ok = false;
+    const auto failed_unmap = failed.reclaim(lifetime, a.device_uuid, false, true,
+        [&](const KvTopologyKey&, uint64_t) { ++unmap_calls; return uint64_t{0}; }, release);
+    require(!failed_unmap.success && !failed.unmapped_bytes() && !failed.released_bytes() &&
+        failed.charged_bytes() == kKvShareChunk && free_calls == 4, "failed unmap released or lost physical charge");
+    KvReclaimRun partial(b, coalesced, submission, 10, 7);
+    uint64_t physical_frees = 0;
+    bool fail_once = true;
+    auto unmap_partial = [&](const KvTopologyKey&, uint64_t chunk) {
+        if (chunk == 14 && fail_once) { fail_once = false; return uint64_t{0}; }
+        return chunk + 100;
+    };
+    auto free_partial = [&](const KvTopologyKey&, uint64_t) { ++physical_frees; return true; };
+    require(!partial.reclaim(lifetime, b.device_uuid, false, false, unmap_partial, free_partial).success &&
+        partial.charged_bytes() == 3 * kKvShareChunk && physical_frees == 4,
+        "partial coalesced unmap failure lost successful physical releases");
+    require(partial.reclaim(lifetime, b.device_uuid, false, false, unmap_partial, free_partial).success &&
+        partial.released_bytes() == 7 * kKvShareChunk && !partial.charged_bytes() && physical_frees == 7,
+        "coalesced retry stranded the short remainder of an already admitted batch");
 }
 void policy() {
     using namespace plan;
@@ -341,10 +564,79 @@ void failed_worker_startup() {
     }
     std::puts("KV_SHARE_WORKER_STARTUP create_failure=no_thread thread_failure=joined_once ready=retained poison_cleanup=safe release_credit=0");
 }
+void headroom_idle_dispatch() {
+    using namespace plan;
+    using namespace core;
+    constexpr uint64_t gib = 1ull << 30, chunk = kKvShareChunk;
+    const auto v100 = topology(0, 1), rtx = topology(2, 3);
+    const KvDeviceReclaimPolicy sync{v100.device_uuid, KvReclaimMode::synchronous, 1, 1};
+    const KvDeviceReclaimPolicy deferred{rtx.device_uuid, KvReclaimMode::deferred, 2, 4};
+    KvReclaimLedger ledger(rtx), v100_ledger(v100);
+    for (uint64_t i = 0; i < 4; ++i)
+        require(ledger.mapped(i) && v100_ledger.mapped(i), "headroom mapping failed");
+    const KvPipelineKey submission{{101, 1, 111}, 1};
+    KvPipelineLifetime pipeline(submission, 7, {});
+    KvReclaimWindow window{24 * gib, 23 * gib - 5 * chunk, chunk, gib, false, false};
+    auto dispatch = [&] { return ledger.dispatch(deferred, rtx, pipeline, submission, 4, window); };
+    require(dispatch().action == KvReclaimAction::wait_pipeline &&
+        pipeline.local_drain(submission, 0) && pipeline.local_drain(submission, 1) &&
+        pipeline.local_drain(submission, 2) && pipeline.terminal_drain(submission),
+        "headroom/idle policy bypassed terminal pipeline order");
+    auto decision = dispatch();
+    require(decision.known && decision.admission_ready && decision.required_before == 24 * gib &&
+        decision.headroom_bytes == chunk && decision.action == KvReclaimAction::hold,
+        "busy window launched reclaim or double-counted charged backing/reserve");
+    window.idle = true;
+    decision = dispatch();
+    require(decision.action == KvReclaimAction::enqueue && decision.chunks == 4 &&
+        ledger.snapshot().charged_bytes == 4 * chunk, "idle window lost per-device batch or pre-credited its release");
+    ++window.incoming;
+    decision = dispatch();
+    require(!decision.admission_ready && decision.action == KvReclaimAction::release_inline,
+        "24GiB pressure was deferred despite insufficient current headroom");
+    auto larger = window; larger.capacity = 32 * gib;
+    const auto v100_decision = v100_ledger.dispatch(sync, v100, pipeline, submission, 4, larger);
+    require(v100_decision.admission_ready && v100_decision.action == KvReclaimAction::release_inline &&
+        v100_decision.chunks == 1 && !dispatch().admission_ready,
+        "V100 headroom or policy rescued the independently constrained 24GiB stage");
+    require(ledger.dispatch(sync, v100, pipeline, submission, 4, larger).action == KvReclaimAction::refuse,
+        "foreign device dispatched using another worker's physical ledger");
+    auto replacement_key = rtx; ++replacement_key.allocation_generation;
+    require(ledger.dispatch(deferred, replacement_key, pipeline, submission, 4, window).action == KvReclaimAction::refuse,
+        "replacement pool generation borrowed a stale worker ledger");
+    const auto ticket = ledger.begin();
+    for (uint64_t i = 0; i < 4; ++i) require(ledger.queue(ticket, i), "idle dispatch enqueue failed");
+    decision = dispatch();
+    require(!decision.admission_ready && decision.action == KvReclaimAction::wait_worker &&
+        ledger.snapshot().charged_bytes == 4 * chunk && ledger.snapshot().pending_bytes == 4 * chunk,
+        "pending worker debt was discounted or dispatched a second time");
+    require(ledger.complete(ticket, 0), "idle worker physical completion failed");
+    decision = dispatch();
+    require(decision.admission_ready && decision.action == KvReclaimAction::wait_worker &&
+        decision.headroom_bytes == 2 * chunk && decision.required_before == 24 * gib - chunk + 1,
+        "completed bytes or pending debt counted twice in headroom");
+    for (uint64_t i = 1; i < 4; ++i) require(ledger.complete(ticket, i), "idle worker completion leaked");
+    require(ledger.mapped(5), "short retirement run setup failed");
+    window.idle = false; window.flush = true;
+    require(ledger.dispatch(deferred, rtx, pipeline, submission, 1, window).action == KvReclaimAction::release_inline &&
+        ledger.dispatch(deferred, rtx, pipeline, submission, 1, window).chunks == 1,
+        "explicit retirement flush stranded a short run outside an idle window");
+    auto stale = submission; ++stale.submission;
+    require(ledger.dispatch(deferred, rtx, pipeline, stale, 4, window).action == KvReclaimAction::wait_pipeline,
+        "stale dispatcher submission borrowed another pipeline barrier");
+    window.other_charged = UINT64_MAX;
+    require(!dispatch().known && dispatch().action == KvReclaimAction::refuse,
+        "overflow created fictitious stage headroom");
+}
 }
 int main() {
-    try { policy(); ownership(); cancelled_preparation(); retention(); logical_images(); borrowed_sources(); acquire_rollback(); deferred_charge(); concurrent_reclaim_observer(); failed_worker_startup(); }
+    try {
+        topology_alias(); topology_admission(); pipeline_lifetime(); stale_pipeline_reuse(); reclaim_policy();
+        policy(); ownership(); cancelled_preparation(); retention(); logical_images(); borrowed_sources(); acquire_rollback();
+        deferred_charge(); concurrent_reclaim_observer(); failed_worker_startup(); headroom_idle_dispatch();
+    }
     catch (const std::exception& e) { std::fprintf(stderr, "kv_share_test: %s\n", e.what()); return 1; }
-    std::printf("kv_share_test: policy, eligibility, carve, refcount, generation, COW, drained cancellation and concurrent physical charging passed\n");
+    std::printf("kv_share_test: topology, per-stage admission, pipeline lifetime, reclaim accounting, "
+        "headroom/idle-window, default-off carve, retention, generation, COW and concurrent deferred charging passed (CPU/no-load)\n");
     return 0;
 }
