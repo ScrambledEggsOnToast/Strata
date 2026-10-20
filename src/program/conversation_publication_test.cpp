@@ -1952,6 +1952,56 @@ void check_facade_optional_failure_and_peer() {
     reopened.close();
 }
 
+// A failed owner-neutral shared export must not damage the same request's mandatory private publication: the
+// private head stays stored and restorable, the store stays healthy, and only the optional export fails.
+void check_optional_shared_export_failure_preserves_private_state() {
+    TempRoot root;
+    ConversationStore store(options_for(root.path));
+    Sink sink(store);
+    ContinuationPublisher publisher;
+    publisher.configure(&store, std::move(sink.out));
+    const SavedConversation private_image = stored_record(321, 64);
+    const auto private_capture = facade_capture(publisher, sink, 0, 1, private_image);
+    check(private_capture.queued, "the mandatory private continuation is captured before the optional export");
+    settle(publisher);
+    PublicationReceipt receipt;
+    check(publisher.take_receipt(private_capture.handle, receipt) &&
+          receipt.status == PublicationStatus::stored && receipt.head && receipt.released,
+          "the mandatory private continuation stores before the optional export");
+    const uint64_t private_head = receipt.head;
+    const uint64_t private_generation = publisher.owner(0).generation;
+
+    SavedConversation shared = private_image;
+    shared.scope.value[0] ^= 0x80;
+    shared.checkpoints.clear();
+    shared.freeze();
+    store.set_publish_fault_for_test("objects");
+    auto entry = capture_of(UINT64_MAX, 2, 0, false, shared, store.epoch(), ++sink.next_ticket);
+    entry.shared_prefix = true;
+    auto image = shared;
+    const auto shared_capture = publisher.capture(sink.cache, std::move(image), std::move(entry),
+                                                  size_t(store.ram_held_bytes()), 0);
+    check(shared_capture.queued, "the optional owner-neutral shared export is captured");
+    settle(publisher);
+    check(publisher.take_receipt(shared_capture.handle, receipt) &&
+          receipt.status == PublicationStatus::failed && !receipt.head && receipt.released,
+          "a failed optional shared export drops only that export");
+    check(publisher.owner(0).generation == private_generation &&
+          publisher.owner(0).lineage.head == private_head,
+          "the failed optional export leaves the private lineage untouched");
+    const auto ready = publisher.readiness();
+    check(ready.enabled && ready.healthy && !ready.outstanding,
+          "a failed optional export leaves persistence healthy with no outstanding ownership");
+    check_eq(publisher.counters().published, 1, "only the mandatory private continuation counts as published");
+    const auto shared_query = query_of(shared, 3302, 1);
+    check(!ConversationPublicationQueue::shared_prefix_exists(store, shared_query.selector, shared_query.tokens, 64, 1),
+          "the failed shared export establishes no durable shared prefix");
+    store.close();
+    ConversationStore reopened(options_for(root.path));
+    check_record_restores(reopened, private_image, 3301, true);
+    reopened.close();
+}
+
 void check_facade_bounded_receipts() {
     TempRoot root;
     ConversationStore store(options_for(root.path));
@@ -2721,6 +2771,7 @@ int main(int argc, char** argv) {
     check_facade_receipts_and_identity();
     check_facade_cancel_with_consumers();
     check_facade_optional_failure_and_peer();
+    check_optional_shared_export_failure_preserves_private_state();
     check_facade_bounded_receipts();
     check_facade_uncertain_publication();
 #ifdef STRATA_STORE_TEST_HOOKS
