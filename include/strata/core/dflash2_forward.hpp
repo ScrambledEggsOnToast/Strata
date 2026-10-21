@@ -104,8 +104,8 @@ public:
     // fences the caller stream before metadata publication. Once submitted work
     // fails, both the touched context and shared scratch remain poisoned.
     bool forward(DeviceContext&, const FeatureView& newly_committed,
-                 const uint16_t* device_raw_embeddings, int frontier,
-                 uint16_t* device_hidden_four_rows, void* stream, std::string& error,
+                 const uint16_t* device_raw_embeddings, int rows, int frontier,
+                 uint16_t* device_hidden_rows, void* stream, std::string& error,
                  ForwardTraceSink* trace = nullptr);
     // Commit context without constructing a proposal (prefill/catch-up).
     bool ingest(DeviceContext&, const FeatureView&, int frontier, void* stream, std::string& error,

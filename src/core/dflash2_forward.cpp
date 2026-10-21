@@ -375,55 +375,55 @@ struct DeviceForward::Impl {
         }
     }
     void block_layer(Execution& e, DeviceContext::Impl& c, int begin, int frontier,
-                     int new_rows, int index) const {
+                     int new_rows, int index, int block) const {
         const auto& l = layer[size_t(index)];
         normalize(e, "input_layernorm.normalized", "input_layernorm.weighted", index,
-                  s.hidden, s.normalized, l.input_norm, block_size, hidden_size, frontier);
+                  s.hidden, s.normalized, l.input_norm, block, hidden_size, frontier);
         project(e, "attention_conv.kernel_projection", index, s.normalized, l.attention_projection,
-                s.dynamic, block_size, hidden_size, gpu::dynamic_width, frontier);
+                s.dynamic, block, hidden_size, gpu::dynamic_width, frontier);
         convolve(e, s.normalized, l.attention_base, true, 0, index, frontier);
-        project(e, "block.q_proj", index, s.convolved, l.q, s.query, block_size, hidden_size, gpu::query_width, frontier);
+        project(e, "block.q_proj", index, s.convolved, l.q, s.query, block, hidden_size, gpu::query_width, frontier);
         normalize(e, "block.q_norm.normalized", "block.q_norm.weighted", index, s.query, s.query,
-                  l.q_norm, block_size * gpu::query_heads, gpu::head_dim, frontier);
-        project(e, "block.k_proj", index, s.convolved, l.k, s.block_k, block_size, hidden_size, gpu::kv_width, frontier);
-        project(e, "block.v_proj", index, s.convolved, l.v, s.block_v, block_size, hidden_size, gpu::kv_width, frontier);
+                  l.q_norm, block * gpu::query_heads, gpu::head_dim, frontier);
+        project(e, "block.k_proj", index, s.convolved, l.k, s.block_k, block, hidden_size, gpu::kv_width, frontier);
+        project(e, "block.v_proj", index, s.convolved, l.v, s.block_v, block, hidden_size, gpu::kv_width, frontier);
         normalize(e, "block.k_norm.normalized", "block.k_norm.weighted", index, s.block_k, s.block_k,
-                  l.k_norm, block_size * gpu::kv_heads, gpu::head_dim, frontier);
+                  l.k_norm, block * gpu::kv_heads, gpu::head_dim, frontier);
         const auto* cos = s.cosine + size_t(new_rows) * 64;
         const auto* sin = s.sine + size_t(new_rows) * 64;
-        e.must(gpu::rotary_bf16(s.query, cos, sin, block_size, gpu::query_heads, s.status, e.stream), "query RoPE");
-        e.emit("block.q_rope", index, s.query, ForwardTrace::Type::bf16, {block_size, gpu::query_heads, gpu::head_dim}, frontier);
-        e.must(gpu::rotary_bf16(s.block_k, cos, sin, block_size, gpu::kv_heads, s.status, e.stream), "block key RoPE");
-        e.emit("block.k_rope", index, s.block_k, ForwardTrace::Type::bf16, {block_size, gpu::kv_heads, gpu::head_dim}, frontier);
-        const int keys = frontier - begin + block_size;
+        e.must(gpu::rotary_bf16(s.query, cos, sin, block, gpu::query_heads, s.status, e.stream), "query RoPE");
+        e.emit("block.q_rope", index, s.query, ForwardTrace::Type::bf16, {block, gpu::query_heads, gpu::head_dim}, frontier);
+        e.must(gpu::rotary_bf16(s.block_k, cos, sin, block, gpu::kv_heads, s.status, e.stream), "block key RoPE");
+        e.emit("block.k_rope", index, s.block_k, ForwardTrace::Type::bf16, {block, gpu::kv_heads, gpu::head_dim}, frontier);
+        const int keys = frontier - begin + block;
         e.must(gpu::attention_scores(s.query, s.block_k, c.ring(), s.scores, index, begin, frontier, s.status, e.stream), "absolute-window attention scores");
-        e.emit("attention.scaled_masked_scores", index, s.scores, ForwardTrace::Type::fp32, {gpu::query_heads, block_size, keys}, begin);
+        e.emit("attention.scaled_masked_scores", index, s.scores, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
         e.must(gpu::attention_softmax(s.scores, s.probabilities, s.statistics, keys, s.status, e.stream), "FP32 attention softmax");
-        e.emit("attention.softmax", index, s.probabilities, ForwardTrace::Type::fp32, {gpu::query_heads, block_size, keys}, begin);
-        e.emit("attention.max_and_sum", index, s.statistics, ForwardTrace::Type::fp32, {gpu::query_heads, block_size, 2}, frontier);
+        e.emit("attention.softmax", index, s.probabilities, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
+        e.emit("attention.max_and_sum", index, s.statistics, ForwardTrace::Type::fp32, {gpu::query_heads, block, 2}, frontier);
         e.must(gpu::attention_values(s.probabilities, s.block_v, c.ring(), s.attention, index, begin, frontier, s.status, e.stream), "FP32 attention value product");
-        e.emit("attention.value_product", index, s.attention, ForwardTrace::Type::bf16, {block_size, gpu::query_width}, frontier);
-        project(e, "attention.o_proj", index, s.attention, l.o, s.normalized, block_size, gpu::query_width, hidden_size, frontier);
+        e.emit("attention.value_product", index, s.attention, ForwardTrace::Type::bf16, {block, gpu::query_width}, frontier);
+        project(e, "attention.o_proj", index, s.attention, l.o, s.normalized, block, gpu::query_width, hidden_size, frontier);
         convolve(e, s.normalized, l.attention_base, true, 1, index, frontier);
-        e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block_size * hidden_size, s.status, e.stream), "attention residual add");
-        e.emit("attention.residual", index, s.hidden, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier);
+        e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block * hidden_size, s.status, e.stream), "attention residual add");
+        e.emit("attention.residual", index, s.hidden, ForwardTrace::Type::bf16, {block, hidden_size}, frontier);
         normalize(e, "post_attention_layernorm.normalized", "post_attention_layernorm.weighted", index,
-                  s.hidden, s.normalized, l.post_norm, block_size, hidden_size, frontier);
+                  s.hidden, s.normalized, l.post_norm, block, hidden_size, frontier);
         project(e, "mlp_conv.kernel_projection", index, s.normalized, l.mlp_projection,
-                s.dynamic, block_size, hidden_size, gpu::dynamic_width, frontier);
+                s.dynamic, block, hidden_size, gpu::dynamic_width, frontier);
         convolve(e, s.normalized, l.mlp_base, false, 0, index, frontier);
-        project(e, "mlp.gate_proj", index, s.convolved, l.gate, s.gate, block_size, hidden_size, gpu::intermediate, frontier);
-        project(e, "mlp.up_proj", index, s.convolved, l.up, s.up, block_size, hidden_size, gpu::intermediate, frontier);
-        e.must(gpu::silu_bf16(s.gate, block_size * gpu::intermediate, s.status, e.stream), "SiLU gate");
-        e.emit("mlp.silu", index, s.gate, ForwardTrace::Type::bf16, {block_size, gpu::intermediate}, frontier);
-        e.must(gpu::multiply_bf16(s.gate, s.up, s.gate, block_size * gpu::intermediate, s.status, e.stream), "SiLU/up BF16 product");
-        e.emit("mlp.gate_up_product", index, s.gate, ForwardTrace::Type::bf16, {block_size, gpu::intermediate}, frontier);
-        project(e, "mlp.down_proj", index, s.gate, l.down, s.normalized, block_size, gpu::intermediate, hidden_size, frontier);
+        project(e, "mlp.gate_proj", index, s.convolved, l.gate, s.gate, block, hidden_size, gpu::intermediate, frontier);
+        project(e, "mlp.up_proj", index, s.convolved, l.up, s.up, block, hidden_size, gpu::intermediate, frontier);
+        e.must(gpu::silu_bf16(s.gate, block * gpu::intermediate, s.status, e.stream), "SiLU gate");
+        e.emit("mlp.silu", index, s.gate, ForwardTrace::Type::bf16, {block, gpu::intermediate}, frontier);
+        e.must(gpu::multiply_bf16(s.gate, s.up, s.gate, block * gpu::intermediate, s.status, e.stream), "SiLU/up BF16 product");
+        e.emit("mlp.gate_up_product", index, s.gate, ForwardTrace::Type::bf16, {block, gpu::intermediate}, frontier);
+        project(e, "mlp.down_proj", index, s.gate, l.down, s.normalized, block, gpu::intermediate, hidden_size, frontier);
         convolve(e, s.normalized, l.mlp_base, false, 1, index, frontier);
-        e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block_size * hidden_size, s.status, e.stream), "MLP residual add");
-        e.emit("mlp.residual", index, s.hidden, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier);
+        e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block * hidden_size, s.status, e.stream), "MLP residual add");
+        e.emit("mlp.residual", index, s.hidden, ForwardTrace::Type::bf16, {block, hidden_size}, frontier);
     }
-    bool run(DeviceContext::Impl& c, const FeatureView& features, const uint16_t* embeddings,
+    bool run(DeviceContext::Impl& c, const FeatureView& features, const uint16_t* embeddings, int proposal_rows,
              int frontier, uint16_t* output, void* stream, std::string& error, ForwardTraceSink* trace) {
         OperationLease::Guard guard(lease);
         if (!acquire(guard, error)) return false;
@@ -461,7 +461,7 @@ struct DeviceForward::Impl {
                 normalize(e, "hidden_norm.normalized", "hidden_norm.weighted", -1,
                           s.target, s.target, hidden_norm, features.count, hidden_size, features.start);
             }
-            const int positions = features.count + (proposal ? block_size : 0);
+            const int positions = features.count + (proposal ? proposal_rows : 0);
             if (positions) {
                 e.must(gpu::rotary_tables(s.inverse, s.cosine, s.sine, features.start, positions, s.status, stream), "absolute RoPE tables");
                 e.emit("rope.inverse_frequencies", -1, s.inverse, ForwardTrace::Type::fp32, {64}, 0);
@@ -469,19 +469,19 @@ struct DeviceForward::Impl {
                 e.emit("rope.sine", -1, s.sine, ForwardTrace::Type::bf16, {positions, 64}, features.start);
             }
             if (proposal) {
-                e.must(cudaMemcpyAsync(s.hidden, embeddings, block_size * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
+                e.must(cudaMemcpyAsync(s.hidden, embeddings, size_t(proposal_rows) * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                        static_cast<cudaStream_t>(stream)), "stage four raw borrowed embedding rows");
-                e.must(gpu::finite_bf16(s.hidden, block_size * hidden_size, s.status, stream), "validate raw embedding finiteness");
-                e.emit("raw_embeddings", -1, s.hidden, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier);
+                e.must(gpu::finite_bf16(s.hidden, size_t(proposal_rows) * hidden_size, s.status, stream), "validate raw embedding finiteness");
+                e.emit("raw_embeddings", -1, s.hidden, ForwardTrace::Type::bf16, {proposal_rows, hidden_size}, frontier);
             }
             for (int index = 0; index < gpu::layers; ++index) {
                 context_layer(e, c, features, index);
-                if (proposal) block_layer(e, c, begin, frontier, features.count, index);
+                if (proposal) block_layer(e, c, begin, frontier, features.count, index, proposal_rows);
             }
             if (proposal) {
                 normalize(e, "norm.normalized", "norm.weighted", -1, s.hidden, s.hidden,
                           final_norm, block_size, hidden_size, frontier);
-                e.must(cudaMemcpyAsync(output, s.hidden, block_size * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
+                e.must(cudaMemcpyAsync(output, s.hidden, size_t(proposal_rows) * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                        static_cast<cudaStream_t>(stream)), "publish four normalized BF16 hidden rows");
             }
             e.must(cudaMemcpyAsync(&numeric, s.status, sizeof(numeric), cudaMemcpyDeviceToHost,
@@ -624,13 +624,15 @@ std::unique_ptr<DeviceContextSnapshot> DeviceForward::create_snapshot() const {
         std::make_unique<DeviceContextSnapshot::Impl>(impl_->manifest, impl_->target_identity)));
 }
 bool DeviceForward::forward(DeviceContext& context, const FeatureView& features, const uint16_t* embeddings,
-                            int frontier, uint16_t* output, void* stream, std::string& error, ForwardTraceSink* trace) {
-    if (!embeddings || !output) return refuse(error, "proposal requires four embedding/output rows");
-    return impl_->run(*context.impl_, features, embeddings, frontier, output, stream, error, trace);
+                            int rows, int frontier, uint16_t* output, void* stream, std::string& error,
+                            ForwardTraceSink* trace) {
+    if (!embeddings || !output) return refuse(error, "proposal requires embedding and output rows");
+    if (rows < 1 || rows > block_size) return refuse(error, "proposal row count is outside the block capacity");
+    return impl_->run(*context.impl_, features, embeddings, rows, frontier, output, stream, error, trace);
 }
 bool DeviceForward::ingest(DeviceContext& context, const FeatureView& features, int frontier,
                            void* stream, std::string& error, ForwardTraceSink* trace) {
-    return impl_->run(*context.impl_, features, nullptr, frontier, nullptr, stream, error, trace);
+    return impl_->run(*context.impl_, features, nullptr, 0, frontier, nullptr, stream, error, trace);
 }
 bool DeviceForward::reset(DeviceContext& context, int origin, std::string& error) const {
     OperationLease::Guard guard(impl_->lease);

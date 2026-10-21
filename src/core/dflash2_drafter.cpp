@@ -480,7 +480,7 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
         std::array<char, 21> id{};
         const auto end = std::to_chars(id.data(), id.data() + id.size(), expected.request);
         empty.request_id = {id.data(), size_t(end.ptr - id.data())};
-        if (!impl_->forward->forward(*request->context, empty, impl_->embedding_bf16,
+        if (!impl_->forward->forward(*request->context, empty, impl_->embedding_bf16, rows + 1,
                                      frontier, impl_->hidden, cs_, error)) return false;
         if (impl_->head.device() != device_) {
             const OnDevice head_device(impl_->head.device());
