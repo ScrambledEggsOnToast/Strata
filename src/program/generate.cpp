@@ -16568,8 +16568,9 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
-        const int S_mtp = use_dflash ? std::min(4, o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S) :
-            o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;
+        const int S_mtp = use_dflash
+            ? std::min(int(strata::kernels::kVerifyMaxT), o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S)
+            : o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
@@ -17186,7 +17187,9 @@ int main(int argc, char** argv) {
             }
             for (int row = 0; row < count; ++row) {
                 if (row == 0 || rows[row] != rows[row - 1]) { ++owners; depth = 0; }
-                if (++depth > 4) { why = "native decode owner exceeds its four-row proposal block"; return false; }
+                if (++depth > int(strata::kernels::kVerifyMaxT)) {
+                    why = "native decode owner exceeds the verifier row capacity"; return false;
+                }
             }
             if (owners > 2) { why = "native decode frame exceeds its two-owner graph/key family"; return false; }
             std::array<strata::core::BatchRow, strata::kernels::kVerifyMaxT> metadata;

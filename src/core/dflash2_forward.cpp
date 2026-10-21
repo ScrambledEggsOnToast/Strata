@@ -360,18 +360,18 @@ struct DeviceForward::Impl {
         e.must(gpu::store_context(s.context_k, s.context_v, c.ring(), index, f.start, f.count, s.status, e.stream), "write committed context KV");
     }
     void convolve(Execution& e, const uint16_t* input, const uint16_t* base,
-                  bool attention, int stage, int index, int frontier) const {
+                  bool attention, int stage, int index, int frontier, int block) const {
         const char* product = attention ? "attention_conv.base_product" : "mlp_conv.base_product";
         const char* addition = attention ? "attention_conv.base_add" : "mlp_conv.base_add";
         const char* dynamic = attention ? "attention_conv.addcmul" : "mlp_conv.addcmul";
-        e.must(cudaMemsetAsync(s.convolved, 0, block_size * hidden_size * sizeof(uint16_t), static_cast<cudaStream_t>(e.stream)), "reset block-local convolution");
+        e.must(cudaMemsetAsync(s.convolved, 0, size_t(block) * hidden_size * sizeof(uint16_t), static_cast<cudaStream_t>(e.stream)), "reset block-local convolution");
         for (int offset = 0; offset < 2; ++offset) {
-            e.must(gpu::convolution_product(input, base, s.product, stage, offset, s.status, e.stream), product);
-            e.emit(product, index, s.product, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier, stage, offset);
-            e.must(gpu::add_bf16(s.convolved, s.product, s.convolved, block_size * hidden_size, s.status, e.stream), addition);
-            e.emit(addition, index, s.convolved, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier, stage, offset);
-            e.must(gpu::convolution_addcmul(s.convolved, s.dynamic, input, stage, offset, s.status, e.stream), dynamic);
-            e.emit(dynamic, index, s.convolved, ForwardTrace::Type::bf16, {block_size, hidden_size}, frontier, stage, offset);
+            e.must(gpu::convolution_product(input, base, s.product, block, stage, offset, s.status, e.stream), product);
+            e.emit(product, index, s.product, ForwardTrace::Type::bf16, {block, hidden_size}, frontier, stage, offset);
+            e.must(gpu::add_bf16(s.convolved, s.product, s.convolved, size_t(block) * hidden_size, s.status, e.stream), addition);
+            e.emit(addition, index, s.convolved, ForwardTrace::Type::bf16, {block, hidden_size}, frontier, stage, offset);
+            e.must(gpu::convolution_addcmul(s.convolved, s.dynamic, input, block, stage, offset, s.status, e.stream), dynamic);
+            e.emit(dynamic, index, s.convolved, ForwardTrace::Type::bf16, {block, hidden_size}, frontier, stage, offset);
         }
     }
     void block_layer(Execution& e, DeviceContext::Impl& c, int begin, int frontier,
@@ -381,7 +381,7 @@ struct DeviceForward::Impl {
                   s.hidden, s.normalized, l.input_norm, block, hidden_size, frontier);
         project(e, "attention_conv.kernel_projection", index, s.normalized, l.attention_projection,
                 s.dynamic, block, hidden_size, gpu::dynamic_width, frontier);
-        convolve(e, s.normalized, l.attention_base, true, 0, index, frontier);
+        convolve(e, s.normalized, l.attention_base, true, 0, index, frontier, block);
         project(e, "block.q_proj", index, s.convolved, l.q, s.query, block, hidden_size, gpu::query_width, frontier);
         normalize(e, "block.q_norm.normalized", "block.q_norm.weighted", index, s.query, s.query,
                   l.q_norm, block * gpu::query_heads, gpu::head_dim, frontier);
@@ -396,22 +396,22 @@ struct DeviceForward::Impl {
         e.must(gpu::rotary_bf16(s.block_k, cos, sin, block, gpu::kv_heads, s.status, e.stream), "block key RoPE");
         e.emit("block.k_rope", index, s.block_k, ForwardTrace::Type::bf16, {block, gpu::kv_heads, gpu::head_dim}, frontier);
         const int keys = frontier - begin + block;
-        e.must(gpu::attention_scores(s.query, s.block_k, c.ring(), s.scores, index, begin, frontier, s.status, e.stream), "absolute-window attention scores");
+        e.must(gpu::attention_scores(s.query, s.block_k, c.ring(), s.scores, index, begin, frontier, block, s.status, e.stream), "absolute-window attention scores");
         e.emit("attention.scaled_masked_scores", index, s.scores, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
         e.must(gpu::attention_softmax(s.scores, s.probabilities, s.statistics, keys, s.status, e.stream), "FP32 attention softmax");
         e.emit("attention.softmax", index, s.probabilities, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
         e.emit("attention.max_and_sum", index, s.statistics, ForwardTrace::Type::fp32, {gpu::query_heads, block, 2}, frontier);
-        e.must(gpu::attention_values(s.probabilities, s.block_v, c.ring(), s.attention, index, begin, frontier, s.status, e.stream), "FP32 attention value product");
+        e.must(gpu::attention_values(s.probabilities, s.block_v, c.ring(), s.attention, index, begin, frontier, block, s.status, e.stream), "FP32 attention value product");
         e.emit("attention.value_product", index, s.attention, ForwardTrace::Type::bf16, {block, gpu::query_width}, frontier);
         project(e, "attention.o_proj", index, s.attention, l.o, s.normalized, block, gpu::query_width, hidden_size, frontier);
-        convolve(e, s.normalized, l.attention_base, true, 1, index, frontier);
+        convolve(e, s.normalized, l.attention_base, true, 1, index, frontier, block);
         e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block * hidden_size, s.status, e.stream), "attention residual add");
         e.emit("attention.residual", index, s.hidden, ForwardTrace::Type::bf16, {block, hidden_size}, frontier);
         normalize(e, "post_attention_layernorm.normalized", "post_attention_layernorm.weighted", index,
                   s.hidden, s.normalized, l.post_norm, block, hidden_size, frontier);
         project(e, "mlp_conv.kernel_projection", index, s.normalized, l.mlp_projection,
                 s.dynamic, block, hidden_size, gpu::dynamic_width, frontier);
-        convolve(e, s.normalized, l.mlp_base, false, 0, index, frontier);
+        convolve(e, s.normalized, l.mlp_base, false, 0, index, frontier, block);
         project(e, "mlp.gate_proj", index, s.convolved, l.gate, s.gate, block, hidden_size, gpu::intermediate, frontier);
         project(e, "mlp.up_proj", index, s.convolved, l.up, s.up, block, hidden_size, gpu::intermediate, frontier);
         e.must(gpu::silu_bf16(s.gate, block * gpu::intermediate, s.status, e.stream), "SiLU gate");
@@ -419,7 +419,7 @@ struct DeviceForward::Impl {
         e.must(gpu::multiply_bf16(s.gate, s.up, s.gate, block * gpu::intermediate, s.status, e.stream), "SiLU/up BF16 product");
         e.emit("mlp.gate_up_product", index, s.gate, ForwardTrace::Type::bf16, {block, gpu::intermediate}, frontier);
         project(e, "mlp.down_proj", index, s.gate, l.down, s.normalized, block, gpu::intermediate, hidden_size, frontier);
-        convolve(e, s.normalized, l.mlp_base, false, 1, index, frontier);
+        convolve(e, s.normalized, l.mlp_base, false, 1, index, frontier, block);
         e.must(gpu::add_bf16(s.hidden, s.convolved, s.hidden, block * hidden_size, s.status, e.stream), "MLP residual add");
         e.emit("mlp.residual", index, s.hidden, ForwardTrace::Type::bf16, {block, hidden_size}, frontier);
     }

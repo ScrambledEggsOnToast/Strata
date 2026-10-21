@@ -13,7 +13,7 @@ inline constexpr int kv_heads = 8;
 inline constexpr int head_dim = 128;
 inline constexpr int query_width = query_heads * head_dim;
 inline constexpr int kv_width = kv_heads * head_dim;
-inline constexpr int block = 4;   // rows at or below this use the reference-validated small path
+inline constexpr int block = 8;   // rows at or below this use the reference-validated small path
 inline constexpr int capacity = 2047;
 inline constexpr int groups = hidden / 16;
 inline constexpr int dynamic_width = 2 * 2 * groups;
@@ -47,12 +47,12 @@ int silu_bf16(uint16_t* values, int count, uint32_t* status, void* stream);
 // One pair of independent stage kernels per convolution. Dynamic storage is
 // [4,2 stages,2 offsets,160 groups]. Each offset has THREE BF16 boundaries:
 // base*shifted input, accumulator+that product, addcmul(acc,dynamic,input).
-// No input is ever read outside this four-row block.
+// No input is ever read outside the block's rows block.
 int convolution_product(const uint16_t* input, const uint16_t* base,
-                         uint16_t* product, int stage, int offset,
+                         uint16_t* product, int rows, int stage, int offset,
                          uint32_t* status, void* stream);
 int convolution_addcmul(uint16_t* accumulator, const uint16_t* dynamic,
-                        const uint16_t* input, int stage, int offset,
+                        const uint16_t* input, int rows, int stage, int offset,
                         uint32_t* status, void* stream);
 
 int inverse_frequencies(float* output, void* stream);
@@ -73,10 +73,10 @@ int store_context(const uint16_t* keys, const uint16_t* values, uint16_t* ring,
 // sqrt(128**-0.5), and keeps scores, softmax and PV accumulation in FP32.
 int attention_scores(const uint16_t* query, const uint16_t* block_keys,
                       const uint16_t* ring, float* scores, int layer,
-                      int context_begin, int frontier, uint32_t* status, void* stream);
+                      int context_begin, int frontier, int rows, uint32_t* status, void* stream);
 int attention_softmax(const float* scores, float* probabilities, float* statistics,
                       int keys, uint32_t* status, void* stream);
 int attention_values(const float* probabilities, const uint16_t* block_values,
                      const uint16_t* ring, uint16_t* output, int layer,
-                     int context_begin, int frontier, uint32_t* status, void* stream);
+                     int context_begin, int frontier, int rows, uint32_t* status, void* stream);
 } // namespace strata::kernels::dflash2

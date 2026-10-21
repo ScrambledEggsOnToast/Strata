@@ -7,6 +7,7 @@
 // helper caches) stay explicit inputs and are reported as conditional, never as observed capabilities.
 #pragma once
 #include "strata/core/draft_state.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/time_budget.hpp"
 
@@ -228,9 +229,12 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     p.mtp_max_t = std::min(mtp_max, spec);
     if (in.dflash2_configured) {
         // Keep the legacy caller's prefix field bounded too; lookup only expands the target verifier window.
-        p.mtp_max_t = std::min({mtp_max > 0 ? mtp_max : in.spec_requested, spec, 4});
-        p.draft_max_t = 4;
-        p.proposal_positions = std::clamp(p.mtp_max_t - 1, 0, 3);
+        // The cap is the verifier's physical row capacity, not the old four-row block: the drafter's proposal
+        // width is bounded separately by its own block capacity and the validated proposal contract.
+        const int rows = strata::kernels::kVerifyMaxT;
+        p.mtp_max_t = std::min({mtp_max > 0 ? mtp_max : in.spec_requested, spec, rows});
+        p.draft_max_t = rows;
+        p.proposal_positions = std::clamp(p.mtp_max_t - 1, 0, rows - 1);
     } else if (in.mtp_configured) {
         p.draft_max_t = p.mtp_max_t > 0 ? p.mtp_max_t : spec;
         p.proposal_positions = spec >= 2 ? 1 : 0;

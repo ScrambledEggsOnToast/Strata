@@ -128,17 +128,17 @@ __global__ void silu_kernel(uint16_t* values, int count, uint32_t* status) {
     }
 }
 __global__ void conv_product_kernel(const uint16_t* input, const uint16_t* base,
-                                     uint16_t* output, int stage, int offset, uint32_t* status) {
+                                     uint16_t* output, int rows, int stage, int offset, uint32_t* status) {
     const int i = int(blockIdx.x) * threads + int(threadIdx.x);
-    if (i >= block * hidden) return;
+    if (i >= size_t(rows) * hidden) return;
     const int row = i / hidden, d = i % hidden;
     const float x = row >= offset ? f32_from_bf16(input[(row - offset) * hidden + d]) : 0.0f;
     output[i] = rounded(__fmul_rn(f32_from_bf16(base[(stage * 2 + offset) * hidden + d]), x), status);
 }
 __global__ void conv_addcmul_kernel(uint16_t* accumulator, const uint16_t* dynamic,
-                                     const uint16_t* input, int stage, int offset, uint32_t* status) {
+                                     const uint16_t* input, int rows, int stage, int offset, uint32_t* status) {
     const int i = int(blockIdx.x) * threads + int(threadIdx.x);
-    if (i >= block * hidden) return;
+    if (i >= size_t(rows) * hidden) return;
     const int row = i / hidden, d = i % hidden;
     const float x = row >= offset ? f32_from_bf16(input[(row - offset) * hidden + d]) : 0.0f;
     const float coefficient = f32_from_bf16(dynamic[row * dynamic_width + (stage * 2 + offset) * groups + d / 16]);
@@ -189,15 +189,15 @@ __global__ void store_kernel(const uint16_t* keys, const uint16_t* values, uint1
 }
 __global__ void score_kernel(const uint16_t* query, const uint16_t* block_keys,
                               const uint16_t* ring, float* scores, int layer,
-                              int begin, int frontier, uint32_t* status) {
+                              int begin, int frontier, int rows, uint32_t* status) {
     const int key = int(blockIdx.x) * 8 + int(threadIdx.x >> 5);
-    const int keys = frontier - begin + block;
+    const int keys = frontier - begin + rows;
     if (key >= keys) return;
-    const int hq = int(blockIdx.y) / block, row = int(blockIdx.y) % block;
+    const int hq = int(blockIdx.y) / rows, row = int(blockIdx.y) % rows;
     const int hk = hq / (query_heads / kv_heads), lane = int(threadIdx.x & 31);
     const int context = frontier - begin, position = key < context ? begin + key : frontier + key - context;
     const int distance = frontier + row - position;
-    const size_t out = (size_t(hq) * block + row) * keys + key;
+    const size_t out = (size_t(hq) * rows + row) * keys + key;
     if (distance <= -2048 || distance >= 2048) {
         if (lane == 0) scores[out] = -CUDART_INF_F;
         return;
@@ -256,11 +256,11 @@ __global__ void softmax_kernel(const float* scores, float* probabilities, float*
 }
 __global__ void value_kernel(const float* probabilities, const uint16_t* block_values,
                               const uint16_t* ring, uint16_t* output, int layer,
-                              int begin, int frontier, uint32_t* status) {
-    const int hq = int(blockIdx.x) / block, row = int(blockIdx.x) % block;
+                              int begin, int frontier, int rows, uint32_t* status) {
+    const int hq = int(blockIdx.x) / rows, row = int(blockIdx.x) % rows;
     const int hk = hq / (query_heads / kv_heads), d = int(threadIdx.x);
-    const int context = frontier - begin, keys = context + block;
-    const size_t base = (size_t(hq) * block + row) * keys;
+    const int context = frontier - begin, keys = context + rows;
+    const size_t base = (size_t(hq) * rows + row) * keys;
     float sum = 0.0f;
     for (int k = 0; k < keys; ++k) {
         const uint16_t v = k < context
@@ -324,17 +324,17 @@ int silu_bf16(uint16_t* values, int count, uint32_t* status, void* stream) {
     return launched();
 }
 int convolution_product(const uint16_t* input, const uint16_t* base, uint16_t* product,
-                         int stage, int offset, uint32_t* status, void* stream) {
-    if (!input || !base || !product || stage < 0 || stage > 1 || offset < 0 || offset > 1)
+                         int rows, int stage, int offset, uint32_t* status, void* stream) {
+    if (!input || !base || !product || rows < 1 || rows > block || stage < 0 || stage > 1 || offset < 0 || offset > 1)
         return int(cudaErrorInvalidValue);
-    conv_product_kernel<<<blocks(block * hidden), threads, 0, (cudaStream_t)stream>>>(input, base, product, stage, offset, status);
+    conv_product_kernel<<<blocks(size_t(rows) * hidden), threads, 0, (cudaStream_t)stream>>>(input, base, product, rows, stage, offset, status);
     return launched();
 }
 int convolution_addcmul(uint16_t* accumulator, const uint16_t* dynamic, const uint16_t* input,
-                        int stage, int offset, uint32_t* status, void* stream) {
-    if (!accumulator || !dynamic || !input || stage < 0 || stage > 1 || offset < 0 || offset > 1)
+                        int rows, int stage, int offset, uint32_t* status, void* stream) {
+    if (!accumulator || !dynamic || !input || rows < 1 || rows > block || stage < 0 || stage > 1 || offset < 0 || offset > 1)
         return int(cudaErrorInvalidValue);
-    conv_addcmul_kernel<<<blocks(block * hidden), threads, 0, (cudaStream_t)stream>>>(accumulator, dynamic, input, stage, offset, status);
+    conv_addcmul_kernel<<<blocks(size_t(rows) * hidden), threads, 0, (cudaStream_t)stream>>>(accumulator, dynamic, input, rows, stage, offset, status);
     return launched();
 }
 int inverse_frequencies(float* output, void* stream) {
@@ -363,11 +363,11 @@ int store_context(const uint16_t* keys, const uint16_t* values, uint16_t* ring,
     return launched();
 }
 int attention_scores(const uint16_t* query, const uint16_t* block_keys, const uint16_t* ring,
-                      float* scores, int layer, int begin, int frontier, uint32_t* status, void* stream) {
-    if (!query || !block_keys || !ring || !scores || layer < 0 || layer >= layers ||
-        begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - block)
+                      float* scores, int layer, int begin, int frontier, int rows, uint32_t* status, void* stream) {
+    if (!query || !block_keys || !ring || !scores || layer < 0 || layer >= layers || rows < 1 || rows > block ||
+        begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - rows)
         return int(cudaErrorInvalidValue);
-    score_kernel<<<dim3(unsigned((frontier - begin + block + 7) / 8), query_heads * block), threads, 0, (cudaStream_t)stream>>>(query, block_keys, ring, scores, layer, begin, frontier, status);
+    score_kernel<<<dim3(unsigned((frontier - begin + rows + 7) / 8), query_heads * rows), threads, 0, (cudaStream_t)stream>>>(query, block_keys, ring, scores, layer, begin, frontier, rows, status);
     return launched();
 }
 int attention_softmax(const float* scores, float* probabilities, float* statistics,
@@ -378,11 +378,11 @@ int attention_softmax(const float* scores, float* probabilities, float* statisti
 }
 int attention_values(const float* probabilities, const uint16_t* block_values,
                      const uint16_t* ring, uint16_t* output, int layer,
-                     int begin, int frontier, uint32_t* status, void* stream) {
-    if (!probabilities || !block_values || !ring || !output || layer < 0 || layer >= layers ||
-        begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - block)
+                     int begin, int frontier, int rows, uint32_t* status, void* stream) {
+    if (!probabilities || !block_values || !ring || !output || layer < 0 || layer >= layers || rows < 1 || rows > block ||
+        begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - rows)
         return int(cudaErrorInvalidValue);
-    value_kernel<<<query_heads * block, head_dim, 0, (cudaStream_t)stream>>>(probabilities, block_values, ring, output, layer, begin, frontier, status);
+    value_kernel<<<query_heads * rows, head_dim, 0, (cudaStream_t)stream>>>(probabilities, block_values, ring, output, layer, begin, frontier, rows, status);
     return launched();
 }
 } // namespace strata::kernels::dflash2

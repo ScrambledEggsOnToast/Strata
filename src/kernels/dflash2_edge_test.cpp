@@ -38,10 +38,10 @@ constexpr size_t logit_elements = size_t(gpu::selector_rows) * gpu::selector_voc
 constexpr double attention_absolute_tolerance = 1e-3;
 constexpr double probability_absolute_tolerance = 2e-6;
 constexpr double probability_mass_tolerance = 16 * double(std::numeric_limits<float>::epsilon());
-static_assert(gpu::capacity == 2047 && gpu::block == 4 && gpu::layers == 5);
+static_assert(gpu::capacity == 2047 && gpu::block == 8 && gpu::layers == 5);
 static_assert(gpu::query_heads == 32 && gpu::kv_heads == 8 && gpu::head_dim == 128);
 static_assert(gpu::hidden == 2560 && gpu::groups == 160 && gpu::dynamic_width == 640);
-static_assert(gpu::selector_rows == 3 && gpu::selector_candidates == 16);
+static_assert(gpu::selector_rows == 7 && gpu::selector_candidates == 16);
 static_assert(gpu::selector_hidden == gpu::hidden && gpu::selector_rank == 256);
 static_assert(gpu::selector_vocabulary == 248320);
 
@@ -457,7 +457,7 @@ void attention_edges(DevicePayload& device, HostPayload& host) {
                                        layer, origin, gpu::capacity, &device.status, nullptr),
                      "store_context");
         kernel_check(gpu::attention_scores(device.query, device.block_keys, device.ring, device.scores,
-                                          layer, origin, frontier, &device.status, nullptr),
+                                          layer, origin, frontier, 4, &device.status, nullptr),
                      "attention_scores");
         cuda_check(cudaMemcpy(host.scores, device.scores, sizeof(device.scores), cudaMemcpyDeviceToHost),
                    "attention scores readback");
@@ -510,7 +510,7 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
                               cudaMemcpyHostToDevice), "convolution product/accumulator poison");
         cuda_check(cudaMemset(&device.status, 0, sizeof(device.status)), "convolution status reset");
         kernel_check(gpu::convolution_product(device.convolution_input, device.convolution_base,
-                                             device.convolution_output, stage, offset, &device.status, nullptr),
+                                             device.convolution_output, 4, stage, offset, &device.status, nullptr),
                      "convolution_product");
         cuda_check(cudaMemcpy(host.staging, device.convolution_output, sizeof(device.convolution_output),
                               cudaMemcpyDeviceToHost), "convolution product readback");
@@ -525,7 +525,7 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
         // The first pass has replaced every poisoned element, including row zero.
         // The second pass adds only this block's shifted input; no history is supplied.
         kernel_check(gpu::convolution_addcmul(device.convolution_output, device.convolution_dynamic,
-                                             device.convolution_input, stage, offset, &device.status, nullptr),
+                                             device.convolution_input, 4, stage, offset, &device.status, nullptr),
                      "convolution_addcmul");
         cuda_check(cudaMemcpy(host.staging, device.convolution_output, sizeof(device.convolution_output),
                               cudaMemcpyDeviceToHost), "convolution addcmul readback");
