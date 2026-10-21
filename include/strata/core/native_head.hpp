@@ -30,7 +30,12 @@ public:
     // scratch. No target mixer/final norm, allocation or synchronization.
     bool run_with_scratch(const float* hidden, float* logits, void* scratch, size_t scratch_bytes,
                           void* stream, std::string& err) const;
-    size_t projection_scratch_bytes() const;
+    // Multi-column projection: `ncols` contiguous hidden rows (column-major by row) produce `ncols` contiguous
+    // logits rows. Each column is bitwise equal to the same single-column call (native multi-column exact mode),
+    // so batching three drafter rows is an arithmetic-preserving scheduling change, not a new contract.
+    bool run_rows_with_scratch(const float* hidden_rows, float* logits_rows, int ncols, void* scratch,
+                               size_t scratch_bytes, void* stream, std::string& err) const;
+    size_t projection_scratch_bytes(int ncols = 1) const;
     const NativeTensorIdentity& identity() const { return identity_; }
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }

@@ -127,25 +127,29 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     }
 }
 
-size_t NativeHead::projection_scratch_bytes() const {
-    return n_in_ > 0 ? strata::kernels::native_q8_1_bytes(n_in_, 1) : 0;
+size_t NativeHead::projection_scratch_bytes(int ncols) const {
+    return n_in_ > 0 ? strata::kernels::native_q8_1_bytes(n_in_, ncols) : 0;
 }
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
     return run_with_scratch(mixed, logits, scratch_, projection_scratch_bytes(), stream, err);
 }
 bool NativeHead::run_with_scratch(const float* mixed, float* logits, void* scratch, size_t scratch_bytes,
                                   void* stream, std::string& err) const {
-    if (!loaded() || !mixed || !logits || !stream || !scratch ||
-        scratch_bytes < projection_scratch_bytes()) {
+    return run_rows_with_scratch(mixed, logits, 1, scratch, scratch_bytes, stream, err);
+}
+bool NativeHead::run_rows_with_scratch(const float* mixed, float* logits, int ncols, void* scratch,
+                                       size_t scratch_bytes, void* stream, std::string& err) const {
+    if (!loaded() || !mixed || !logits || !stream || !scratch || ncols < 1 || ncols > 8 ||
+        scratch_bytes < projection_scratch_bytes(ncols)) {
         err = "native head requires loaded weights, device buffers, bounded scratch and an explicit stream";
         return false;
     }
     try {
         if (type_ == 13) {
-            strata::kernels::native_q5_k_f32(weights_, mixed, scratch, logits, n_in_, n_out_, 1, stream);
+            strata::kernels::native_q5_k_f32(weights_, mixed, scratch, logits, n_in_, n_out_, ncols, stream);
         } else {
-            strata::kernels::native_quantize_q8_1(mixed, scratch, n_in_, 1, stream);
-            strata::kernels::native_mmvq(type_, weights_, scratch, logits, n_in_, n_out_, 1, stream);
+            strata::kernels::native_quantize_q8_1(mixed, scratch, n_in_, ncols, stream);
+            strata::kernels::native_mmvq(type_, weights_, scratch, logits, n_in_, n_out_, ncols, stream);
         }
     } catch (const std::exception& error) {
         err = std::string("native head launch: ") + error.what();

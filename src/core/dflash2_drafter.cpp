@@ -32,6 +32,8 @@ constexpr size_t raw_float_bytes = block_size * hidden_size * sizeof(float);
 constexpr size_t raw_bf16_bytes = block_size * hidden_size * sizeof(uint16_t);
 constexpr size_t hidden_three_bytes = 3 * hidden_size * sizeof(uint16_t);
 constexpr size_t head_row_bytes = hidden_size * sizeof(float);
+constexpr size_t head_three_rows = 3;   // anchor + three mask rows are proposed in one batched head call
+constexpr size_t head_three_row_bytes = head_three_rows * head_row_bytes;
 constexpr size_t vocabulary_row_bytes = vocabulary_size * sizeof(float);
 constexpr size_t feature_tags_bytes = context_rows * sizeof(int64_t);
 constexpr size_t feature_owner_bytes = max_feature_bytes + feature_tags_bytes;
@@ -79,7 +81,7 @@ struct DflashNativeDrafter::Impl {
     Impl(const RuntimeWeights& weights, VerifiedDailyTarget verified,
          const NativeEmbed& embedding, const NativeHead& head, int device)
         : weights(weights), verified(std::move(verified)), embedding(embedding), head(head), device(device),
-          head_scratch_bytes(head.projection_scratch_bytes()) {}
+          head_scratch_bytes(head.projection_scratch_bytes(int(head_three_rows))) {}
     Request* request(int slot) { return slot >= 0 && slot <= 8 ? requests[size_t(slot)].get() : nullptr; }
     const Request* request(int slot) const { return slot >= 0 && slot <= 8 ? requests[size_t(slot)].get() : nullptr; }
     void check_target() const {
@@ -198,9 +200,10 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
         state->head_hidden = state->hidden + hidden_size; state->head_logits = state->logits;
         if (head.device() != device) {
             cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->head_hidden), hidden_three_bytes), "native head BF16 transfer");
-            cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->head_logits), vocabulary_row_bytes), "native head transfer logits");
+            cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->head_logits), head_three_rows * vocabulary_row_bytes),
+                         "native head transfer logits");
         }
-        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->head_float), head_row_bytes), "native head float input");
+        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->head_float), head_three_row_bytes), "native head float input");
         cuda_require(cudaMalloc(&state->head_scratch, state->head_scratch_bytes), "native dedicated head scratch");
     }
     impl_ = std::move(state);
@@ -220,7 +223,7 @@ DraftAllocationPlan DflashNativeDrafter::planned_allocation(int device, size_t d
     plan.shared_device = dense_bytes + DeviceForward::scratch_bytes() + DeviceSelector::scratch_bytes() +
         2 * raw_bf16_bytes + logits_bytes + kOperationCanaryDeviceBytes;
     if (embedding_device == device) plan.shared_device += block_size * sizeof(int32_t) + raw_float_bytes;
-    if (head_device == device) plan.shared_device += head_row_bytes + head_scratch_bytes;
+    if (head_device == device) plan.shared_device += head_three_row_bytes + head_scratch_bytes;
     plan.shared_host = DeviceSelector::pinned_bytes() + kOperationCanaryHostBytes + max_feature_bytes +
                        sizeof(DflashNativeDrafter) + sizeof(Impl) + 65536;
     plan.owner_device = DeviceForward::context_bytes();
@@ -243,7 +246,8 @@ DraftAllocationPlan DflashNativeDrafter::planned_target_allocation(int device, i
     if (device != drafter_device && device == embedding_device)
         plan.shared_device += block_size * sizeof(int32_t) + raw_float_bytes + raw_bf16_bytes;
     if (device != drafter_device && device == head_device)
-        plan.shared_device += hidden_three_bytes + head_row_bytes + vocabulary_row_bytes + head_scratch_bytes;
+        plan.shared_device += hidden_three_bytes + head_three_row_bytes + head_three_rows * vocabulary_row_bytes +
+                              head_scratch_bytes;
     return plan;
 }
 DraftAllocationPlan DflashNativeDrafter::target_allocation_plan(int device) const {
@@ -480,24 +484,24 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
             cuda_require(cudaMemcpyPeerAsync(impl_->head_hidden, impl_->head.device(), impl_->hidden + hidden_size,
                 device_, hidden_three_bytes, impl_->head_stream), "draft hidden device transfer");
         }
-        for (int row = 0; row < 3; ++row) {
-            {
-                const OnDevice head_device(impl_->head.device());
-                require(kernels::dflash2::widen_bf16(impl_->head_hidden + row * hidden_size, impl_->head_float,
-                        hidden_size, impl_->head_stream) == 0, "draft hidden BF16 widening launch failed");
-                float* logits = impl_->head.device() == device_ ? impl_->logits + size_t(row) * vocabulary_size :
-                                                                  impl_->head_logits;
-                if (!impl_->head.run_with_scratch(impl_->head_float, logits, impl_->head_scratch,
-                        impl_->head_scratch_bytes, impl_->head_stream, error)) return false;
-                cuda_require(cudaStreamSynchronize(impl_->head_stream), "native draft head completion");
+        {
+            const OnDevice head_device(impl_->head.device());
+            // One batched projection for all three proposed rows: same weights, same exact-mode arithmetic per
+            // column as three single-column calls, one drain instead of three host round trips.
+            for (size_t row = 0; row < head_three_rows; ++row) {
+                require(kernels::dflash2::widen_bf16(impl_->head_hidden + row * hidden_size,
+                        impl_->head_float + row * hidden_size, hidden_size, impl_->head_stream) == 0,
+                        "draft hidden BF16 widening launch failed");
             }
-            if (impl_->head.device() != device_) {
-                cuda_require(cudaMemcpyPeerAsync(impl_->logits + size_t(row) * vocabulary_size, device_,
-                    impl_->head_logits, impl_->head.device(), vocabulary_row_bytes, cs_), "native logit device transfer");
-                // The head's one-row scratch/logit output is reused by the next
-                // serial projection only after this cross-device read drains.
-                cuda_require(cudaStreamSynchronize(cs_), "native logit transfer completion");
-            }
+            float* logits = impl_->head.device() == device_ ? impl_->logits : impl_->head_logits;
+            if (!impl_->head.run_rows_with_scratch(impl_->head_float, logits, int(head_three_rows),
+                    impl_->head_scratch, impl_->head_scratch_bytes, impl_->head_stream, error)) return false;
+            cuda_require(cudaStreamSynchronize(impl_->head_stream), "native draft head completion");
+        }
+        if (impl_->head.device() != device_) {
+            cuda_require(cudaMemcpyPeerAsync(impl_->logits, device_, impl_->head_logits, impl_->head.device(),
+                head_three_rows * vocabulary_row_bytes, cs_), "native logit device transfer");
+            cuda_require(cudaStreamSynchronize(cs_), "native logit transfer completion");
         }
         auto& selected = impl_->selection;
         if (!impl_->selector->select(impl_->hidden + hidden_size, impl_->logits, anchor,
