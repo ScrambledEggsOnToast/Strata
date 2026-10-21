@@ -69,7 +69,10 @@ std::optional<std::string> measure_verity(const std::string& path) {
     if (fd < 0) return std::nullopt;
     const int status = ::ioctl(fd, FS_IOC_MEASURE_VERITY, request);
     ::close(fd);
-    if (status != 0 || request->digest_size == 0 || request->digest_size > 64) return std::nullopt;
+    // Only the algorithm the release pins use can be compared with its root text; any
+    // other algorithm takes the full content read, as the launcher's own policy does.
+    if (status != 0 || request->digest_algorithm != FS_VERITY_HASH_ALG_SHA256 ||
+        request->digest_size != 32) return std::nullopt;
     static constexpr char hex[] = "0123456789abcdef";
     std::string text;
     text.reserve(size_t(request->digest_size) * 2);
