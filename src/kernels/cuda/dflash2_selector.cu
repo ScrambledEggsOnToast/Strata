@@ -178,7 +178,7 @@ __device__ bool stage_succeeded(SelectorWorkspace* work, int32_t* stage_status) 
 
 __global__ void walk_kernel(const uint16_t* predecessor_codebook, const uint16_t* successor_codebook,
                             int32_t anchor, float temperature, float uniform0, float uniform1, float uniform2,
-                            SelectorWorkspace* work) {
+                            int rows, SelectorWorkspace* work) {
     const int t = int(threadIdx.x);
     const int lane = t & 31;
     const int candidate = t >> 5;
@@ -192,7 +192,7 @@ __global__ void walk_kernel(const uint16_t* predecessor_codebook, const uint16_t
     }
     __syncthreads();
     if (stage_status != 0) return;
-    for (int row = 0; row < selector_rows; ++row) {
+    for (int row = 0; row < rows; ++row) {
         const int32_t token = work->result.candidates[row][candidate];
         float dot = 0.0f;
         for (int rank = lane; rank < selector_rank; rank += 32) {
@@ -274,27 +274,28 @@ __global__ void walk_kernel(const uint16_t* predecessor_codebook, const uint16_t
 }
 } // namespace
 
-int selector_select(const uint16_t* hidden, const float* logits, const uint16_t* hidden_projection,
+int selector_select(int rows, const uint16_t* hidden, const float* logits, const uint16_t* hidden_projection,
                     const uint16_t* predecessor_codebook, const uint16_t* successor_codebook,
                     int32_t anchor, float temperature, float uniform0, float uniform1, float uniform2,
                     SelectorWorkspace* workspace, void* stream) {
+    if (rows < 1 || rows > selector_rows) return int(cudaErrorInvalidValue);
     const auto cuda_stream = static_cast<cudaStream_t>(stream);
     cudaError_t status = cudaMemsetAsync(&workspace->result, 0, sizeof(SelectorResult), cuda_stream);
     if (status != cudaSuccess) return int(status);
-    const int projection = linear_bf16(hidden, hidden_projection, &workspace->projected[0][0], selector_rows,
+    const int projection = linear_bf16(hidden, hidden_projection, &workspace->projected[0][0], rows,
                                        selector_hidden, selector_rank, stream);
     if (projection != int(cudaSuccess)) return projection;
-    tile_top_kernel<<<dim3(selector_tiles, selector_rows), tile_threads, 0, cuda_stream>>>(logits, workspace);
+    tile_top_kernel<<<dim3(selector_tiles, rows), tile_threads, 0, cuda_stream>>>(logits, workspace);
     status = cudaGetLastError();
     if (status != cudaSuccess) return int(status);
-    merge_top_kernel<<<selector_rows, 32, 0, cuda_stream>>>(workspace);
+    merge_top_kernel<<<rows, 32, 0, cuda_stream>>>(workspace);
     status = cudaGetLastError();
     if (status != cudaSuccess) return int(status);
-    replay_ties_kernel<<<selector_rows, 32, 0, cuda_stream>>>(logits, workspace);
+    replay_ties_kernel<<<rows, 32, 0, cuda_stream>>>(logits, workspace);
     status = cudaGetLastError();
     if (status != cudaSuccess) return int(status);
     walk_kernel<<<1, selector_candidates * 32, 0, cuda_stream>>>(predecessor_codebook, successor_codebook,
-        anchor, temperature, uniform0, uniform1, uniform2, workspace);
+        anchor, temperature, uniform0, uniform1, uniform2, rows, workspace);
     return int(cudaGetLastError());
 }
 

@@ -364,8 +364,8 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     if (!p.refused && in.dflash2_configured) {
         if (in.mtp_configured) p.refusal = "--dflash2 and --mtp are mutually exclusive";
         else if (!in.serve) p.refusal = "native DFlash2 needs --serve";
-        else if (in.spec_requested < 2 || in.spec_requested > 4)
-            p.refusal = "native DFlash2 needs neural --spec 2 through 4; lookup may expand only the target window";
+        else if (in.spec_requested < 2 || in.spec_requested > 8)
+            p.refusal = "native DFlash2 needs neural --spec 2 through 8 (the verifier's row capacity)";
         else if (in.batch_requested > 4) p.refusal = "native DFlash2 supports at most four resident slots";
         else if (in.batch_mtp_third) p.refusal = "native DFlash2 does not support --batch-mtp-third";
         if (!p.refusal.empty()) p.refused = true;

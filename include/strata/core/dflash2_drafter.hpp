@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strata/kernels/dflash2_selector.hpp"
+
 #include "strata/core/neural_drafter.hpp"
 #include "strata/core/dflash2_capture.hpp"
 #include "strata/core/dflash2_target.hpp"
@@ -20,8 +22,8 @@ struct ProposalCapture {
     const uint16_t* hidden_device = nullptr;         // four normalized BF16 rows
     const float* logits_device = nullptr;           // three full FP32 vocabulary rows
     DraftProposal proposal;
-    std::array<std::array<int32_t, 16>, 3> candidates{};
-    std::array<std::array<float, 16>, 3> conditional_probabilities{};
+    std::array<std::array<int32_t, 16>, kernels::dflash2::selector_rows> candidates{};
+    std::array<std::array<float, 16>, kernels::dflash2::selector_rows> conditional_probabilities{};
     float temperature = 0;
     std::array<float, 3> uniforms{};
     int device = -1;

@@ -47,7 +47,7 @@ bool device_pointer(const void* pointer, int device, const char* name, std::stri
 } // namespace
 
 void Selection::fill_probability_rows(int32_t* destination) const noexcept {
-    for (int row = 0; row < 3; ++row) {
+    for (int row = 0; row < kernels::dflash2::selector_rows; ++row) {
         int32_t* output = destination + size_t(row) * kSpecQStride;
         std::fill(output, output + kSpecQEntries, int32_t(-1));
         std::fill(output + kSpecQEntries, output + kSpecQStride, int32_t(0));
@@ -143,7 +143,7 @@ DeviceSelector::DeviceSelector(int device, const uint16_t* hidden_projection, co
     : impl_(std::make_unique<Impl>(device, hidden_projection, predecessor_codebook, successor_codebook)) {}
 DeviceSelector::~DeviceSelector() = default;
 
-bool DeviceSelector::select(const uint16_t* hidden, const float* logits, int32_t anchor, float temperature,
+bool DeviceSelector::select(int rows, const uint16_t* hidden, const float* logits, int32_t anchor, float temperature,
                             const std::array<float, 3>& uniforms, Selection& output, void* stream, std::string& error) {
     auto& state = *impl_;
     error.clear();
@@ -154,6 +154,10 @@ bool DeviceSelector::select(const uint16_t* hidden, const float* logits, int32_t
         return false;
     }
     // Argument refusals occur before any scratch mutation and do not poison a healthy owner.
+    if (rows < 1 || rows > selector::selector_rows) {
+        error = "dflash2 selector: proposal row count is outside 1..selector_rows";
+        lease.complete(); return false;
+    }
     if (anchor < 0 || anchor >= selector::selector_vocabulary || !std::isfinite(temperature) || temperature < 0.0f) {
         error = "dflash2 selector: anchor or temperature is outside the reference contract";
         lease.complete(); return false;
@@ -178,7 +182,7 @@ bool DeviceSelector::select(const uint16_t* hidden, const float* logits, int32_t
         lease.complete(); return false;
     }
     Impl::PendingDrain pending(state, cuda_stream, error);
-    status = static_cast<cudaError_t>(selector::selector_select(hidden, logits, state.hidden_projection,
+    status = static_cast<cudaError_t>(selector::selector_select(rows, hidden, logits, state.hidden_projection,
         state.predecessor_codebook, state.successor_codebook, anchor, temperature, uniforms[0], uniforms[1], uniforms[2],
         state.scratch, stream));
     if (status != cudaSuccess) { error = cuda_failure("kernel submission", status); return false; }

@@ -17,7 +17,18 @@ namespace strata::core::dflash2 {
 inline constexpr int hidden_size = 2560;
 inline constexpr int vocabulary_size = 248320;
 inline constexpr int mask_token = 248077;
-inline constexpr int block_size = 4;
+inline constexpr int block_size = 8;
+
+// Proposals constructed per verification step (1..block_size-1). The checkpoint publishes block_size 8; the
+// reference exercised 4 positions, so the default keeps the long-validated width while widths above it can be
+// measured without a rebuild. Set once at startup before any drafter is constructed.
+inline int& draft_positions_storage() { static int value = 3; return value; }
+inline int draft_positions() { return draft_positions_storage(); }
+inline bool set_draft_positions(int positions) {
+    if (positions < 1 || positions >= block_size) return false;
+    draft_positions_storage() = positions;
+    return true;
+}   // published block_size; the draft position count is per-request
 inline constexpr int max_verify_rows = 8; // engine mixed-policy target window, not the fixed drafter block
 inline constexpr int context_rows = 2047;
 inline constexpr int max_position = 262144;

@@ -30,9 +30,9 @@ void cuda_require(cudaError_t status, const char* message) {
 bool refuse(std::string& error, const char* message) { error = std::string("dflash2 drafter: ") + message; return false; }
 constexpr size_t raw_float_bytes = block_size * hidden_size * sizeof(float);
 constexpr size_t raw_bf16_bytes = block_size * hidden_size * sizeof(uint16_t);
-constexpr size_t hidden_three_bytes = 3 * hidden_size * sizeof(uint16_t);
+constexpr size_t hidden_three_bytes = (block_size - 1) * hidden_size * sizeof(uint16_t);
 constexpr size_t head_row_bytes = hidden_size * sizeof(float);
-constexpr size_t head_three_rows = 3;   // anchor + three mask rows are proposed in one batched head call
+constexpr size_t head_three_rows = block_size - 1;   // proposal rows, batched into one exact head call
 constexpr size_t head_three_row_bytes = head_three_rows * head_row_bytes;
 constexpr size_t vocabulary_row_bytes = vocabulary_size * sizeof(float);
 constexpr size_t feature_tags_bytes = context_rows * sizeof(int64_t);
@@ -456,15 +456,18 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
     const auto& sampling = sampling_[size_t(expected.seat)];
     const bool sampled = !sampling.greedy && sampling.temperature > 0;
     const auto uniforms = request->uniforms;
-    const std::array<int32_t, 4> ids{anchor, mask_token, mask_token, mask_token};
+    const int rows = std::max(1, std::min(draft_positions(), int(block_size) - 1));
+    std::array<int32_t, block_size> ids{};
+    ids[0] = anchor;
+    for (int row = 1; row < rows + 1; ++row) ids[size_t(row)] = mask_token;
     request->uniforms_valid = false;
     try {
         impl_->check_target();
         {
             const OnDevice on(impl_->embedding.device());
-            cuda_require(cudaMemcpyAsync(impl_->tokens, ids.data(), sizeof(ids), cudaMemcpyHostToDevice,
+            cuda_require(cudaMemcpyAsync(impl_->tokens, ids.data(), sizeof(int32_t) * size_t(rows + 1), cudaMemcpyHostToDevice,
                                           impl_->embedding_stream), "native embedding token upload");
-            impl_->embedding.gather_dev(impl_->tokens, block_size, impl_->raw, impl_->embedding_stream);
+            impl_->embedding.gather_dev(impl_->tokens, rows + 1, impl_->raw, impl_->embedding_stream);
             kernels::f32_to_bf16_bulk(impl_->raw, impl_->raw_bf16, block_size * hidden_size, impl_->embedding_stream);
             cuda_require(cudaStreamSynchronize(impl_->embedding_stream), "native raw embedding completion");
         }
@@ -486,29 +489,29 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
         }
         {
             const OnDevice head_device(impl_->head.device());
-            // One batched projection for all three proposed rows: same weights, same exact-mode arithmetic per
-            // column as three single-column calls, one drain instead of three host round trips.
-            for (size_t row = 0; row < head_three_rows; ++row) {
+            // One batched projection for all proposed rows: same weights, same exact-mode arithmetic per column
+            // as single-column calls, one drain instead of per-row host round trips.
+            for (int row = 0; row < rows; ++row) {
                 require(kernels::dflash2::widen_bf16(impl_->head_hidden + row * hidden_size,
                         impl_->head_float + row * hidden_size, hidden_size, impl_->head_stream) == 0,
                         "draft hidden BF16 widening launch failed");
             }
             float* logits = impl_->head.device() == device_ ? impl_->logits : impl_->head_logits;
-            if (!impl_->head.run_rows_with_scratch(impl_->head_float, logits, int(head_three_rows),
+            if (!impl_->head.run_rows_with_scratch(impl_->head_float, logits, rows,
                     impl_->head_scratch, impl_->head_scratch_bytes, impl_->head_stream, error)) return false;
             cuda_require(cudaStreamSynchronize(impl_->head_stream), "native draft head completion");
         }
         if (impl_->head.device() != device_) {
             cuda_require(cudaMemcpyPeerAsync(impl_->logits, device_, impl_->head_logits, impl_->head.device(),
-                head_three_rows * vocabulary_row_bytes, cs_), "native logit device transfer");
+                size_t(rows) * vocabulary_row_bytes, cs_), "native logit device transfer");
             cuda_require(cudaStreamSynchronize(cs_), "native logit transfer completion");
         }
         auto& selected = impl_->selection;
-        if (!impl_->selector->select(impl_->hidden + hidden_size, impl_->logits, anchor,
+        if (!impl_->selector->select(rows, impl_->hidden + hidden_size, impl_->logits, anchor,
                 sampled ? sampling.temperature : 0.f, uniforms, selected, cs_, error)) return false;
         impl_->check_target();
-        result.count = 3;
-        for (int row = 0; row < 3; ++row) {
+        result.count = rows;
+        for (int row = 0; row < rows; ++row) {
             result.tokens[row] = selected.tokens[row]; result.confidence[row] = selected.confidence[row];
         }
         result.owner = operation.identity(); result.frontier = frontier;

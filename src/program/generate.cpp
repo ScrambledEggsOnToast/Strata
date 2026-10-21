@@ -938,6 +938,7 @@ struct Options {
     double spec_min_p = 0.0;
     bool dflash2_accept_hist = false;   // opt-in: per-(offered,accepted) histogram on resident completion
     int dflash2_max_proposals = 3;      // native drafter: proposals verified per step (1..3); lossless truncation
+    int dflash2_draft_positions = 3;    // native drafter: proposals constructed per step (1..7)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -3127,10 +3128,17 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--dflash2-accept-hist") o.dflash2_accept_hist = true;
+        else if (a == "--dflash2-draft-positions") {
+            o.dflash2_draft_positions = std::atoi(next("--dflash2-draft-positions"));
+            if (o.dflash2_draft_positions < 1 || o.dflash2_draft_positions > 7) {
+                std::fprintf(stderr, "strata generate: --dflash2-draft-positions takes 1..7\n");
+                return 2;
+            }
+        }
         else if (a == "--dflash2-proposals") {
             o.dflash2_max_proposals = std::atoi(next("--dflash2-proposals"));
-            if (o.dflash2_max_proposals < 1 || o.dflash2_max_proposals > 3) {
-                std::fprintf(stderr, "strata generate: --dflash2-proposals takes 1, 2 or 3\n");
+            if (o.dflash2_max_proposals < 1 || o.dflash2_max_proposals > 7) {
+                std::fprintf(stderr, "strata generate: --dflash2-proposals takes 1..7\n");
                 return 2;
             }
         }
@@ -4136,6 +4144,11 @@ int main(int argc, char** argv) {
         o.prefill_chunk = 2048;
     }
     set_accept_hist(o.dflash2_accept_hist);
+    if (!strata::core::dflash2::set_draft_positions(o.dflash2_draft_positions)) {
+        std::fprintf(stderr, "strata generate: --dflash2-draft-positions is outside 1..%d\n",
+                     strata::core::dflash2::block_size - 1);
+        return 2;
+    }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;

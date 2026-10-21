@@ -7,21 +7,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include "strata/kernels/dflash2_selector.hpp"
+
 #include <string>
 
 namespace strata::core::dflash2 {
 
 struct Selection {
-    static constexpr size_t probability_row_slots = 3 * kSpecQStride;
-    std::array<int32_t, 3> tokens{};
-    std::array<std::array<int32_t, 16>, 3> candidates{};
+    static constexpr size_t probability_row_slots = kernels::dflash2::selector_rows * kSpecQStride;
+    std::array<int32_t, kernels::dflash2::selector_rows> tokens{};
+    std::array<std::array<int32_t, 16>, kernels::dflash2::selector_rows> candidates{};
     // Conditional on anchor and the already drawn proposal prefix, in candidates' original order.
     // Greedy selection has no q distribution: all entries are zero and sampled is false.
-    std::array<std::array<float, 16>, 3> conditional_probabilities{};
+    std::array<std::array<float, 16>, kernels::dflash2::selector_rows> conditional_probabilities{};
     // Draft-family confidence, not calibrated target acceptance: chosen-token
     // probability over these predecessor-conditioned candidates. Greedy uses
     // unit temperature without exporting a sampled verifier q distribution.
-    std::array<float, 3> confidence{};
+    std::array<float, kernels::dflash2::selector_rows> confidence{};
     bool sampled = false;
 
     // Writes exactly 3*kSpecQStride int32 slots: ids[0..15], then -1 through id[63];
@@ -64,7 +66,7 @@ public:
     // to drain is fail-stop rather than freeing storage still owned by a GPU consumer.
     // If a failed consumer cannot drain, retain borrowed inputs and its stream as well as
     // weights until explicit drain succeeds or destruction takes the fail-stop path.
-    bool select(const uint16_t* device_hidden_three_rows, const float* device_logits_three_rows,
+    bool select(int rows, const uint16_t* device_hidden_rows, const float* device_logits_rows,
                 int32_t anchor, float temperature, const std::array<float, 3>& uniforms,
                 Selection& output, void* stream, std::string& error);
 

@@ -6,7 +6,7 @@
 
 namespace strata::kernels::dflash2 {
 
-inline constexpr int selector_rows = 3;
+inline constexpr int selector_rows = 7;
 inline constexpr int selector_hidden = 2560;
 inline constexpr int selector_vocabulary = 248320;
 inline constexpr int selector_rank = 256;
@@ -47,8 +47,12 @@ struct SelectorWorkspace {
     int32_t replay[selector_rows];
     SelectorResult result;
 };
-static_assert(sizeof(SelectorResult) == 412);
-static_assert(sizeof(SelectorWorkspace) == 101296);
+// Sizes follow selector_rows; kept as compile-time guards, not tuned constants.
+static_assert(sizeof(SelectorResult) == 136 * selector_rows + 4);
+static_assert(sizeof(SelectorWorkspace) ==
+              selector_rows * (selector_tiles * selector_tile_keep * sizeof(SelectorCandidate) +
+                               selector_rank * sizeof(uint16_t) + selector_candidates * sizeof(float) +
+                               sizeof(int32_t)) + sizeof(SelectorResult));
 
 inline constexpr size_t selector_workspace_bytes() noexcept { return sizeof(SelectorWorkspace); }
 inline constexpr size_t selector_result_bytes() noexcept { return sizeof(SelectorResult); }
@@ -56,8 +60,9 @@ inline constexpr size_t selector_result_bytes() noexcept { return sizeof(Selecto
 // Returns a cudaError_t encoded as int. No allocation, synchronization, RNG, acceptance loop,
 // exceptions, or process exit. The caller owns serialization, stream completion, and poisoning.
 // Input: BF16 [3,2560], FP32 [3,248320], BF16 weights [256,2560]/[248320,256].
-// The supplied uniforms are used only for temperature > 0 and must be finite in [0,1).
-int selector_select(const uint16_t* hidden, const float* logits, const uint16_t* hidden_projection,
+// `rows` is the number of proposals to select (1..selector_rows); it must be no larger than the caller's
+// logits/hidden rows. The supplied uniforms are used only for temperature > 0 and must be finite in [0,1).
+int selector_select(int rows, const uint16_t* hidden, const float* logits, const uint16_t* hidden_projection,
                     const uint16_t* predecessor_codebook, const uint16_t* successor_codebook,
                     int32_t anchor, float temperature, float uniform0, float uniform1, float uniform2,
                     SelectorWorkspace* workspace, void* stream);

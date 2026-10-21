@@ -6098,14 +6098,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // image. Copy only this chunk's intersection with the retained
                 // absolute tail, keeping every stage/chunk in position order.
                 if (dflash2_enabled_ && half == 1 && m.dflash2_capture.copying()) {
+                    // Opt-in attribution: how much of prefill is capture bookkeeping (device publish plus the
+                    // host-side reduce that reads it) rather than target attention. Silent unless requested.
+                    static const bool capture_timing = std::getenv("STRATA_DFLASH2_CAPTURE_TIMING") != nullptr;
+                    static auto capture_publish_s = 0.0, capture_record_s = 0.0;
+                    static long capture_rows = 0;
+                    const auto capture_clock = [] { return std::chrono::steady_clock::now(); };
                     const auto part = m.dflash2_capture.slice(p0, T);
                     if (part.count)
                         for (size_t tap = 0; tap < core::dflash2::tap_layers.size(); ++tap)
                             if (l == core::dflash2::tap_layers[tap] && m.dflash2_mapped[tap]) {
+                                const auto capture_begin = capture_timing ? capture_clock() : decltype(capture_clock()){};
                                 strata::kernels::tap_publish(m.R + size_t(part.source_row) * D,
                                     m.dflash2_mapped[tap] + size_t(part.staging_row) * D,
                                     int64_t(part.count) * D, m.dflash2_on_mapped, m.cs);
+                                const auto capture_published = capture_timing ? capture_clock() : decltype(capture_clock()){};
                                 if (!m.dflash2_capture.record(int(tap), part, err)) return false;
+                                if (capture_timing) {
+                                    const auto capture_done = capture_clock();
+                                    const auto publish_s = std::chrono::duration<double>(capture_published - capture_begin).count();
+                                    const auto record_s = std::chrono::duration<double>(capture_done - capture_published).count();
+                                    capture_publish_s += publish_s; capture_record_s += record_s;
+                                    capture_rows += part.count;
+                                    std::fprintf(stderr, "DFLASH2_CAPTURE tap=%zu layer=%zu rows=%lld publish_s=%.6f "
+                                                 "record_s=%.6f total_publish_s=%.6f total_record_s=%.6f total_rows=%ld\n",
+                                                 tap, l, (long long) part.count, publish_s, record_s,
+                                                 capture_publish_s, capture_record_s, capture_rows);
+                                    std::fflush(stderr);
+                                }
                             }
                 }
 #endif

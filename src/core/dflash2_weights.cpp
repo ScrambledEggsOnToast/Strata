@@ -276,7 +276,7 @@ Json expected_contract() {
         {"query_heads", 32}, {"kv_heads", 8}, {"head_dim", 128},
         {"kv_layout", "batch,kv_head,absolute_context_row,head_dim"},
         {"kv_bytes_per_context_row", 20480}, {"sliding_window", 2048}, {"is_causal", false},
-        {"published_block_size", 8}, {"reference_block_positions", block_size},
+        {"published_block_size", 8}, {"reference_block_positions", 4},
         {"features", {{"tap_layers", tap_layers}, {"tap_reduction", "arithmetic_mean_of_four_unmixed_streams"},
                       {"width", feature_width}, {"projection", "hidden_norm(fc(concat(tap_means)))"},
                       {"normalization", "ordinary_rmsnorm"}, {"rms_norm_eps", 1e-6},
