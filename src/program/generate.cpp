@@ -201,6 +201,24 @@ int residency_model_checks(const strata::core::WeightTable&, const strata::core:
 #endif
 
 namespace {
+// Opt-in acceptance histogram: hist[offered][accepted]. Position i is accepted when accepted >= i, so per-position
+// acceptance and the value of one more verified row are recovered from it. Silent by default.
+bool g_accept_hist = false;
+void set_accept_hist(bool on) { g_accept_hist = on; }
+bool accept_hist_enabled() { return g_accept_hist; }
+uint64_t accept_hist[strata::kernels::kVerifyMaxT + 1][strata::kernels::kVerifyMaxT + 1] = {};
+void record_accept_hist(int offered, int accepted) {
+    if (!accept_hist_enabled() || offered < 0 || offered > int(strata::kernels::kVerifyMaxT) ||
+        accepted < 0 || accepted > offered) return;
+    ++accept_hist[offered][accepted];
+}
+void print_accept_hist() {
+    if (!accept_hist_enabled()) return;
+    for (int o = 0; o <= int(strata::kernels::kVerifyMaxT); ++o)
+        for (int a = 0; a <= o; ++a)
+            if (accept_hist[o][a])
+                std::fprintf(stderr, "ACCEPT o=%d a=%d n=%llu\n", o, a, (unsigned long long) accept_hist[o][a]);
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -918,6 +936,7 @@ struct Options {
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    bool dflash2_accept_hist = false;   // opt-in: per-(offered,accepted) histogram on resident completion
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -3106,6 +3125,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
+        else if (a == "--dflash2-accept-hist") o.dflash2_accept_hist = true;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -4107,6 +4127,7 @@ int main(int argc, char** argv) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
+    set_accept_hist(o.dflash2_accept_hist);
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;
@@ -16879,6 +16900,7 @@ int main(int argc, char** argv) {
                         (long long)owner.draft_accepted, (long long)owner.draft_offered,
                         (long long)owner.resume, (long long)read, waits);
             std::fflush(stdout);
+            print_accept_hist();
             if (slot >= 0) native_seat_used[size_t(slot)] = now;
             native_retire_transport(owner.tag);
             owner = {};
@@ -16994,6 +17016,7 @@ int main(int argc, char** argv) {
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
             counts.offered += offered;
             counts.accepted += keep - 1;
+            record_accept_hist(offered, keep - 1);
             if (private_preparation && size_t(b) < packed_owners.size() &&
                 packed_owners[size_t(b)].lease.request == sl.request) {
                 packed_owners[size_t(b)].draft_offered += offered;
