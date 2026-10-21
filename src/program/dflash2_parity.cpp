@@ -299,14 +299,14 @@ int run(const Options& o) {
     view.segments[0] = {reinterpret_cast<const uint16_t*>(features.data()), size_t(count) * df::feature_width};
     view.generations[0] = generations;
     TraceWriter trace(output, written);
-    io::require(forward.forward(*context, view, raw.as<uint16_t>(), frontier, hidden.as<uint16_t>(), stream.get(), error, &trace), error);
+    io::require(forward.forward(*context, view, raw.as<uint16_t>(), 4, frontier, hidden.as<uint16_t>(), stream.get(), error, &trace), error);
     Json outputs;
     outputs["replay_hidden"] = trace.download("replay-hidden.bf16", "bf16", {4, df::hidden_size}, hidden.as<void>(),
         4 * df::hidden_size * sizeof(uint16_t), stream);
     project(head, hidden, widened, logits, head_scratch, stream, error);
     outputs["replay_logits"] = trace.download("replay-logits.f32", "f32", {3, df::vocabulary_size}, logits.as<void>(), df::logits_bytes, stream);
     df::Selection selected;
-    io::require(selector.select(hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
+    io::require(selector.select(3, hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
         selected, stream.get(), error), error);
     Json result = {{"schema", 1}, {"kind", "strata-dflash2-native-parity-replay"}, {"status", "DIAGNOSTIC_ONLY"},
         {"runtime_manifest_sha256", o.manifest}, {"target", io::target_document(verified.binding().identity)},
@@ -323,7 +323,7 @@ int run(const Options& o) {
         outputs["reference_head_logits"] = trace.download("reference-head-logits.f32", "f32", {3, df::vocabulary_size},
             logits.as<void>(), df::logits_bytes, stream);
         df::Selection reference_selection;
-        io::require(selector.select(hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
+        io::require(selector.select(3, hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
             reference_selection, stream.get(), error), error);
         result["reference_hidden_native_selection"] = selection_document(reference_selection);
         result["reference_head_source"] = "same verified loaded quantized NativeHead::run_with_scratch; BF16 widening only, no target norm";

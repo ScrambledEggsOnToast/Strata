@@ -38,10 +38,10 @@ constexpr size_t logit_elements = size_t(gpu::selector_rows) * gpu::selector_voc
 constexpr double attention_absolute_tolerance = 1e-3;
 constexpr double probability_absolute_tolerance = 2e-6;
 constexpr double probability_mass_tolerance = 16 * double(std::numeric_limits<float>::epsilon());
-static_assert(gpu::capacity == 2047 && gpu::block == 4 && gpu::layers == 5);
+static_assert(gpu::capacity == 2047 && gpu::block == 8 && gpu::layers == 5);
 static_assert(gpu::query_heads == 32 && gpu::kv_heads == 8 && gpu::head_dim == 128);
 static_assert(gpu::hidden == 2560 && gpu::groups == 160 && gpu::dynamic_width == 640);
-static_assert(gpu::selector_rows == 3 && gpu::selector_candidates == 16);
+static_assert(gpu::selector_rows == 7 && gpu::selector_candidates == 16);
 static_assert(gpu::selector_hidden == gpu::hidden && gpu::selector_rank == 256);
 static_assert(gpu::selector_vocabulary == 248320);
 
@@ -547,7 +547,7 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
 void select(DeviceSelector& selector, DevicePayload& device, HostPayload& host, float temperature,
             const std::array<float, 3>& uniforms) {
     std::string error;
-    if (!selector.select(device.hidden, device.logits, 2, temperature, uniforms, host.selection, nullptr, error))
+    if (!selector.select(3, device.hidden, device.logits, 2, temperature, uniforms, host.selection, nullptr, error))
         throw std::runtime_error("DeviceSelector.select: " + error);
     require(!selector.poisoned(), "successful selector is unexpectedly poisoned");
     require(host.selection.sampled == (temperature > 0.0f), "selector sampled mode disagrees with temperature");

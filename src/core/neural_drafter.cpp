@@ -15,7 +15,7 @@ NeuralDrafter::~NeuralDrafter() {
 }
 bool DraftProposal::validate(int64_t vocabulary, std::string& error, DraftKind kind) const {
     if (!owner.request || !owner.incarnation || !owner.generation || frontier < 0 ||
-        count < 1 || count > kNeuralDraftMax || (kind == DraftKind::dflash2 && count > 3)) {
+        count < 1 || count > kNeuralDraftMax) {
         error = "neural draft: unowned or unbounded proposal"; return false;
     }
     for (int row = 0; row < count; ++row) {
